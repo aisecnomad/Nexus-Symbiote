@@ -20,7 +20,8 @@ src/nexus_symbiote/
   advisories.py                        — Explicit, bounded OSV queries for exact package identities
   modes.py                             — Offline by default; live mode is opt-in
   scanner_catalog.py                   — Built-in collector universe for coverage checks
-  cli.py, live_cli.py, supply_chain_cli.py — Click CLI entrypoints
+  cli.py, inventory_cli.py, review_cli.py — Click CLI root, shared helpers, offline inventory/review commands
+  live_cli.py, supply_chain_cli.py — Live-mode and supply-chain commands
 ```
 
 ## Build and test

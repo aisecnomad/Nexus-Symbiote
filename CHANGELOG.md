@@ -66,10 +66,12 @@ First alpha of the AgentBOM toolkit under the Hunzee-VC organization. Not yet ta
 
 ### Fixed
 
+- Detect a pathname replacement during pinned-descriptor reads on filesystems that do not refresh change time on rename-over: the before/after invariance check now includes the link count (shared `file_invariance` helper), so a swapped model or configuration artifact cannot bind its inspected structure and digest to the new pathname. The same check previously relied on ctime/mtime updates that not every Linux filesystem performs for an open, unlinked inode.
 - Report a collector that produced a conflicting duplicate component or a dangling dependency edge as failed in `collectors_completed`, not only in `scanner_status`. A clean `ScanResult` no longer lets an orchestration-level failure be recorded as completed collection, or raise the inventory's completeness assurance to `observed` on its own. Gates were already failing through `scan_failures`; the emitted coverage record was the inaccurate part.
 
 ### Changed
 
+- Split the CLI implementation: `cli.py` keeps the root group and shared helpers (`_get_scanners` patching seam unchanged), and the offline commands move to `inventory_cli.py` (scan, import-shadowscan, verify-artifact, verify-discovery) and `review_cli.py` (validate, risk, diff, summary, blast-radius, init). No command names, options or output changed.
 - Enforce the canonical repository owner for tracked documentation and workflow metadata in the required quality job. Absolute GitHub URLs are outside the inline local-link check, so the `aisecnomad` to `Hunzee-VC` transfer had left stale links in `CITATION.cff`, `README.md`, `SUPPORT.md`, `GOVERNANCE.md`, `MAINTAINERS.md`, both issue templates, `examples/README.md`, `benchmarks/inventory/README.md` and `docs/repository-controls.md`. Dated audits keep the owner recorded at the time.
 - Remove the duplicated collector list and coverage-gap sentence from the README; both are stated under "How it works".
 
