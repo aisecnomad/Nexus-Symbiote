@@ -304,10 +304,14 @@ class ModelScanner(Scanner):
             fmt_key, fmt_name = MODEL_EXTENSIONS[ext]
             fingerprint: dict[str, str] = {}
             try:
+                identity_before = self._files.path_identity(path)
                 with self._files.open_regular(path, max_bytes=MAX_HASH_SIZE) as stream:
                     safety, format_evidence, weight_hash = inspect_model_artifact(
                         path, stream=stream, metadata=fingerprint
                     )
+                    identity_after = self._files.path_identity(path)
+                if identity_before is None or identity_after != identity_before:
+                    raise OSError("model artifact replaced or renamed during scanning")
             except (OSError, ValueError):
                 self._files._fail(path, "model inspection or hashing failed")
                 safety, format_evidence = (

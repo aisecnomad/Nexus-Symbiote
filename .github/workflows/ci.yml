@@ -105,7 +105,7 @@ jobs:
           python -m pip install --no-deps --no-build-isolation -e .
       - run: ruff check src tests scripts
       - run: ruff format --check src tests scripts
-      - run: mypy src/nexus_symbiote
+      - run: mypy src/nexus_symbiote scripts
       - run: python scripts/check_workflows.py
       - run: python scripts/check_repository_hygiene.py
   distribution:

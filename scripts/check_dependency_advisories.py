@@ -32,7 +32,7 @@ def installed_packages() -> list[dict[str, str]]:
     """Include the actual environment, excluding only this source-built project."""
     packages: dict[str, str] = {}
     for distribution in importlib.metadata.distributions():
-        name = distribution.metadata.get("Name", "")
+        name = (distribution.metadata.get_all("Name") or [""])[0]
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", name) is None:
             raise ValueError("installed distribution has no valid PyPI identity")
         name = re.sub(r"[-_.]+", "-", name).lower()
@@ -86,7 +86,7 @@ def audit(
     deadline = time.monotonic() + TOTAL_TIMEOUT_SECONDS
     try:
         for start in range(0, len(queries), BATCH_SIZE):
-            pending = [
+            pending: list[tuple[int, dict[str, Any], set[str]]] = [
                 (i, queries[i], set()) for i in range(start, min(start + BATCH_SIZE, len(queries)))
             ]
             for _ in range(MAX_PAGES):

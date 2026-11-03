@@ -117,3 +117,38 @@ def test_path_replacement_during_confined_read_is_refused(tmp_path: Path) -> Non
         # Swap the pathname while the pinned descriptor is still open.
         replacement.replace(tmp_path / "model.bin")
     assert failures
+
+
+def test_path_identity_tracks_content_not_timestamps(tmp_path: Path) -> None:
+    target = tmp_path / "model.safetensors"
+    target.write_bytes(b"original")
+    with ConfinedCollection(tmp_path, []) as files:
+        before = files.path_identity(target)
+        assert before is not None
+        assert before == files.path_identity("model.safetensors")
+        target.write_bytes(b"edited!!")
+        target.touch()
+        assert files.path_identity(target) == before
+
+
+def test_path_identity_observes_replacement_and_removal(tmp_path: Path) -> None:
+    target = tmp_path / "model.safetensors"
+    target.write_bytes(b"original")
+    with ConfinedCollection(tmp_path, []) as files:
+        before = files.path_identity(target)
+        assert before is not None
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(b"not a tensor container")
+        replacement.replace(target)
+        assert files.path_identity(target) not in (None, before)
+        target.unlink()
+        assert files.path_identity(target) is None
+
+
+def test_path_identity_refuses_outside_and_missing_paths(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    with ConfinedCollection(root, []) as files:
+        assert files.path_identity("../outside") is None
+        assert files.path_identity(tmp_path) is None
+        assert files.path_identity("missing.bin") is None

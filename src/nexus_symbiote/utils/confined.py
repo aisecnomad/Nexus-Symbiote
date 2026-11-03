@@ -309,6 +309,39 @@ class ConfinedCollection:
         finally:
             stream.close()
 
+    def path_identity(self, path: str | Path) -> tuple[int, int] | None:
+        """Device and inode pair a confined pathname currently resolves to.
+
+        The pair is a content handle: unchanged by atime/mtime/ctime updates,
+        changed whenever the pathname is renamed, removed, or replaced by any
+        other object (including a symlink, whose reported inode is the link
+        itself and cannot match a stream opened with O_NOFOLLOW). Compare the
+        pair before and after a bounded read to prove the name kept resolving
+        to the same object. This is portable across filesystems; the
+        invariance tuple checks on an owned descriptor additionally detect
+        in-place mutation and link-count drops.
+
+        ``None`` means the pathname is unavailable, excluded by policy, or
+        outside the collection boundary. A ``None`` before-to-after pair must
+        be treated as inspection failure, never as a match.
+        """
+        try:
+            relative = self._relative(path)
+            if self.excluded(relative) or not relative.parts:
+                return None
+            parent = self._open_parent(relative)
+            try:
+                info = os.stat(
+                    relative.name,
+                    dir_fd=parent,
+                    follow_symlinks=False,
+                )
+            finally:
+                os.close(parent)
+        except (OSError, CollectionError):
+            return None
+        return (info.st_dev, info.st_ino)
+
     def hash_file(self, path: str | Path, *, max_bytes: int | None = None) -> str | None:
         """Stream SHA-256 beneath the root, with explicit individual/total bounds.
 

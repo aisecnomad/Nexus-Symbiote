@@ -8,6 +8,11 @@ source, an A2A agent card, a container image and a coding-agent configuration.
 It exists to be inventoried. Nothing in it is installed, built or run, and the
 whole walkthrough below works without network access or credentials.
 
+For a target you did not author, see the tutorial on
+[scanning a public agent project](../docs/tutorials/scanning-a-public-agent.md):
+it walks through the same inventory against a real open-source repository
+pinned to a reviewed revision.
+
 Run it from a repository checkout (the wheel does not include the examples):
 
 ```bash

@@ -62,11 +62,8 @@ def main() -> int:
     direct_url = json.loads(installed.read_text("direct_url.json") or "{}")
     installed_hash = direct_url.get("archive_info", {}).get("hashes", {}).get("sha256")
     origin = Path(nexus_symbiote.__file__).resolve()
-    if (
-        not sys.flags.isolated
-        or digest != installed_hash
-        or origin != installed.locate_file("nexus_symbiote/__init__.py").resolve()
-    ):
+    located_init = Path(str(installed.locate_file("nexus_symbiote/__init__.py"))).resolve()
+    if not sys.flags.isolated or digest != installed_hash or origin != located_init:
         parser.error("use python -I and pip-install the exact wheel in the test environment")
     print(f"Testing {wheel.name} sha256={digest} from {origin}", flush=True)
 

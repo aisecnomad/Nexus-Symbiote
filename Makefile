@@ -22,7 +22,7 @@ format-check: ## Check code formatting with ruff
 
 .PHONY: typecheck
 typecheck: ## Run mypy strict type checking
-	mypy src/nexus_symbiote
+	mypy src/nexus_symbiote scripts
 
 .PHONY: quality
 quality: lint format-check typecheck workflow-check hygiene ## Run all quality checks

@@ -66,7 +66,8 @@ First alpha of the AgentBOM toolkit under the Hunzee-VC organization. Not yet ta
 
 ### Fixed
 
-- Detect a pathname replacement during pinned-descriptor reads on filesystems that do not refresh change time on rename-over: the before/after invariance check now includes the link count (shared `file_invariance` helper), so a swapped model or configuration artifact cannot bind its inspected structure and digest to the new pathname. The same check previously relied on ctime/mtime updates that not every Linux filesystem performs for an open, unlinked inode.
+- Detect a pathname replacement during pinned-descriptor reads on filesystems that do not refresh change time on rename-over: the before/after invariance check now includes the link count (shared `file_invariance` helper) and model scanning additionally verifies the confined pathname's `(st_dev, st_ino)` identity (`ConfinedCollection.path_identity`), so a swapped model or configuration artifact cannot bind its inspected structure and digest to the new pathname.
+- Fix strict `mypy` annotations in `scripts/check_wheel_security.py` and `scripts/check_dependency_advisories.py` and include `scripts/` in the `typecheck` quality gate.
 - Report a collector that produced a conflicting duplicate component or a dangling dependency edge as failed in `collectors_completed`, not only in `scanner_status`. A clean `ScanResult` no longer lets an orchestration-level failure be recorded as completed collection, or raise the inventory's completeness assurance to `observed` on its own. Gates were already failing through `scan_failures`; the emitted coverage record was the inaccurate part.
 
 ### Changed

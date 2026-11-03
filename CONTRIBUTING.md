@@ -48,6 +48,8 @@ Exporter changes must validate against the pinned official schema and preserve r
 
 Explain the concrete problem, resulting behavior, validation, and material limitations. Keep changes focused and include applicable documentation. Do not claim production enforcement for execution paths that bypass the adapter. Add no network access, executable discovery, or credential collection without an explicit design and tests.
 
+During the interim single-maintainer period (see [repository controls](docs/repository-controls.md)), keep every change on a pull request and leave behavior- or security-changing pull requests open for a soak window of at least 24 hours before merging; re-read the full rendered diff after `Verified CI` completes and treat it as the reviewed artifact. Small documentation-only fixes may merge once CI is green. High-volume days of self-merged reviews are where defects slip through; the soak window is the control that compensates for the absent second reviewer.
+
 The quality job also checks tracked source for conflict markers, inline local documentation links, package/distribution version agreement and the vendored schemas' recorded SHA-256 digests. These checks are offline and do not authenticate an upstream publisher. Review changes to schema bytes and their provenance manifest together. Keep experimental-branch merges and manually ported changes distinct from ancestry on `main`; the [closed-PR audit](docs/audits/closed-pr-review-2026-11-02.md) records that distinction.
 
 Read [SECURITY.md](SECURITY.md) before reporting security-sensitive defects. This project is licensed under MIT as specified in [LICENSE](LICENSE).
