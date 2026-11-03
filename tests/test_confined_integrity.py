@@ -8,7 +8,7 @@ import pytest
 
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.models import ModelComponent, PromptComponent
-from nexus_symbiote.utils.confined import hash_confined_file
+from nexus_symbiote.utils.confined import ConfinedCollection, hash_confined_file
 from nexus_symbiote.validators.integrity import IntegrityValidator
 
 
@@ -88,3 +88,42 @@ def test_fifo_rejected_without_blocking(tmp_path: Path) -> None:
     os.mkfifo(tmp_path / "pipe")
     with pytest.raises(OSError):
         hash_confined_file(tmp_path, "pipe")
+
+
+def test_path_identity_tracks_content_not_timestamps(tmp_path: Path) -> None:
+    target = tmp_path / "model.safetensors"
+    target.write_bytes(b"original")
+    with ConfinedCollection(tmp_path, []) as files:
+        before = files.path_identity(target)
+        assert before is not None
+        assert before == files.path_identity("model.safetensors")
+        # An in-place rewrite keeps the same object: content checks elsewhere
+        # (size, mtime) still govern; identity alone must not fire.
+        target.write_bytes(b"edited!!")
+        target.touch()
+        assert files.path_identity(target) == before
+
+
+def test_path_identity_observes_replacement_and_removal(tmp_path: Path) -> None:
+    target = tmp_path / "model.safetensors"
+    target.write_bytes(b"original")
+    with ConfinedCollection(tmp_path, []) as files:
+        before = files.path_identity(target)
+        assert before is not None
+        # Rename-replacement swaps the object behind the pathname even where
+        # the filesystem never stamps the disowned inode's status times.
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(b"not a tensor container")
+        replacement.replace(target)
+        assert files.path_identity(target) not in (None, before)
+        target.unlink()
+        assert files.path_identity(target) is None
+
+
+def test_path_identity_refuses_outside_and_missing_paths(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    with ConfinedCollection(root, []) as files:
+        assert files.path_identity("../outside") is None
+        assert files.path_identity(tmp_path) is None
+        assert files.path_identity("missing.bin") is None

@@ -229,7 +229,12 @@ def inspect_model_artifact(
 
     The caller must hold a confined regular-file context.
     A pathname replacement cannot substitute different bytes between inspection
-    and hashing because neither operation reopens that pathname.
+    and hashing because neither operation reopens that pathname. The caller
+    must additionally reject the result unless the pathname's device/inode
+    identity (ConfinedCollection.path_identity) is unchanged: a replacement can
+    disown this descriptor without touching the read timestamps on every
+    filesystem, and exports must never attribute inspected bytes to a pathname
+    that now resolves elsewhere.
     """
     before = os.fstat(stream.fileno())
     if before.st_size > MAX_HASH_SIZE:
@@ -305,10 +310,22 @@ class ModelScanner(Scanner):
             fmt_key, fmt_name = MODEL_EXTENSIONS[ext]
             fingerprint: dict[str, str] = {}
             try:
+                # Renaming or replacing an artifact during the bounded read can
+                # disown the opened descriptor without updating its read
+                # timestamps on every filesystem, so compare the pathname's
+                # object identity before the stream closes as well as the
+                # descriptor's timestamp tuple. A replacement that lands only
+                # after this stream closes does not void the recorded evidence:
+                # the digest still describes the inspected bytes, and drift
+                # against the later bytes is a diff concern.
+                identity_before = self._files.path_identity(path)
                 with self._files.open_regular(path, max_bytes=MAX_HASH_SIZE) as stream:
                     safety, format_evidence, weight_hash = inspect_model_artifact(
                         path, stream=stream, metadata=fingerprint
                     )
+                    identity_after = self._files.path_identity(path)
+                if identity_before is None or identity_after != identity_before:
+                    raise OSError("model artifact replaced or renamed during scanning")
             except (OSError, ValueError):
                 self._files._fail(path, "model inspection or hashing failed")
                 safety, format_evidence = (

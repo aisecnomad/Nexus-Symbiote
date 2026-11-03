@@ -66,6 +66,7 @@ First alpha of the AgentBOM toolkit under the Hunzee-VC organization. Not yet ta
 
 ### Fixed
 
+- Detect model-artifact pathname replacement or removal mid-scan by comparing the pathname's device/inode identity around the bounded read (`ConfinedCollection.path_identity`), instead of relying on the disowned inode's status-time change. That timestamp signal is not portable: on filesystems that do not stamp the disowned inode (observed on overlayfs-style mounts), a rename-replacement during inspection previously produced a `SAFE` verdict and a weight hash attributed to a pathname that no longer resolves to the inspected bytes. Scans on those filesystems now fail closed, matching existing behavior elsewhere: safety `UNKNOWN`, hashes withheld, failure recorded.
 - Report a collector that produced a conflicting duplicate component or a dangling dependency edge as failed in `collectors_completed`, not only in `scanner_status`. A clean `ScanResult` no longer lets an orchestration-level failure be recorded as completed collection, or raise the inventory's completeness assurance to `observed` on its own. Gates were already failing through `scan_failures`; the emitted coverage record was the inaccurate part.
 
 ### Changed
