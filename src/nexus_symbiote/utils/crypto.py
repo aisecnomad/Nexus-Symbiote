@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from nexus_symbiote.core.hashing import normalize_digest, open_regular_file
+from nexus_symbiote.core.hashing import file_invariance, normalize_digest, open_regular_file
 
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 MAX_SIGNED_ARTIFACT_BYTES = 5 * 1024 * 1024 * 1024
@@ -181,11 +181,7 @@ def compute_file_hash(path: Path, algorithm: str = "sha256") -> str | None:
                     return None
                 h.update(chunk)
             after = os.fstat(stream.fileno())
-            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            ):
+            if file_invariance(before) != file_invariance(after):
                 return None
         return f"{algorithm}:{h.hexdigest()}"
     except (OSError, ValueError):

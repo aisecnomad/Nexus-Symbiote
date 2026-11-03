@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
+from nexus_symbiote.core.hashing import file_invariance
+
 MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_ENTRIES = 20_000
 MAX_DEPTH = 32
@@ -244,11 +246,7 @@ class ConfinedCollection:
                 if length > self.max_file_bytes:
                     raise CollectionError("file byte limit exceeded")
                 after = os.fstat(fd)
-                if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-                    after.st_size,
-                    after.st_mtime_ns,
-                    after.st_ctime_ns,
-                ):
+                if file_invariance(before) != file_invariance(after):
                     raise CollectionError("file changed during collection")
                 return b"".join(chunks)
             finally:
@@ -305,11 +303,7 @@ class ConfinedCollection:
         try:
             yield cast(BinaryIO, stream)
             after = os.fstat(fd)
-            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            ):
+            if file_invariance(before) != file_invariance(after):
                 self._fail(relative, "file changed during collection")
                 raise OSError("artifact changed during collection")
         finally:
@@ -352,11 +346,7 @@ class ConfinedCollection:
                         raise CollectionError("byte limit exceeded")
                     digest.update(chunk)
                 after = os.fstat(fd)
-                if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-                    after.st_size,
-                    after.st_mtime_ns,
-                    after.st_ctime_ns,
-                ):
+                if file_invariance(before) != file_invariance(after):
                     raise CollectionError("file changed during collection")
                 return "sha256:" + digest.hexdigest()
             finally:

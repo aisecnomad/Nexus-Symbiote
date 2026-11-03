@@ -74,6 +74,17 @@ def normalize_digest(expected_hash: str, algorithm: str | None = None) -> tuple[
     return algorithm, digest.lower()
 
 
+def file_invariance(status: os.stat_result) -> tuple[int, int, int, int]:
+    """Capture the pinned-descriptor identity that must hold across a read.
+
+    Link count is part of the invariant: renaming a replacement file over the
+    scanned path unlinks the open inode even on filesystems that do not refresh
+    its change time, so the substitution is still detected and a digest is
+    never bound to a pathname that now refers to different bytes.
+    """
+    return (status.st_nlink, status.st_size, status.st_mtime_ns, status.st_ctime_ns)
+
+
 def open_regular_file(path: Path) -> BinaryIO:
     """Open a regular file without following any symlink or blocking on a FIFO.
 

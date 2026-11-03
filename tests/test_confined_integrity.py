@@ -7,8 +7,9 @@ from pathlib import Path
 import pytest
 
 from nexus_symbiote.core.aibom import AIBOM
+from nexus_symbiote.core.hashing import file_invariance
 from nexus_symbiote.core.models import ModelComponent, PromptComponent
-from nexus_symbiote.utils.confined import hash_confined_file
+from nexus_symbiote.utils.confined import ConfinedCollection, hash_confined_file
 from nexus_symbiote.validators.integrity import IntegrityValidator
 
 
@@ -88,3 +89,31 @@ def test_fifo_rejected_without_blocking(tmp_path: Path) -> None:
     os.mkfifo(tmp_path / "pipe")
     with pytest.raises(OSError):
         hash_confined_file(tmp_path, "pipe")
+
+
+def test_file_invariance_tracks_link_count(tmp_path: Path) -> None:
+    target = tmp_path / "model.bin"
+    target.write_bytes(b"data")
+    before = os.stat(target)
+    (tmp_path / "link.bin").hardlink_to(target)
+    after = os.stat(target)
+    # The link count is the first member of the invariance tuple: a rename-over
+    # drops it even on filesystems that do not refresh change time.
+    assert file_invariance(before)[0] != file_invariance(after)[0]
+    assert file_invariance(before) != file_invariance(after)
+
+
+def test_path_replacement_during_confined_read_is_refused(tmp_path: Path) -> None:
+    (tmp_path / "model.bin").write_bytes(b"original")
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"replacement")
+    failures: list[str] = []
+    with (
+        ConfinedCollection(tmp_path, failures) as files,
+        pytest.raises(OSError, match="changed during collection"),
+        files.open_regular("model.bin") as stream,
+    ):
+        stream.read(64)
+        # Swap the pathname while the pinned descriptor is still open.
+        replacement.replace(tmp_path / "model.bin")
+    assert failures
