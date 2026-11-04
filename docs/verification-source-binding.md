@@ -198,7 +198,7 @@ host.
 `tests/test_a2a_source_binding.py` exercises the CLI gates, same-origin path and
 authentication changes, both client lists, client authentication export,
 canonicalization, redaction, key requirements and stretching, loss and rotation,
-and legacy snapshots. These cases are also required against the installed release
-wheel. `tests/test_a2a_v1_cards.py` covers v1 and legacy interfaces in both
-spellings and the authentication requirement forms, including v1 requirements
-checked against `securitySchemes`.
+and legacy snapshots. `tests/test_a2a_v1_cards.py` covers v1 and legacy
+interfaces in both spellings and the authentication requirement forms, including
+v1 requirements checked against `securitySchemes`. The cases in both files are
+also required against the installed release wheel.

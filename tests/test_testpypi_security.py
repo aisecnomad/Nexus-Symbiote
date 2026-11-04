@@ -1,5 +1,6 @@
 """Test-index publication must preserve the release verification boundary."""
 
+import runpy
 from pathlib import Path
 
 import yaml
@@ -41,6 +42,11 @@ def test_testpypi_publication_requires_the_same_source_and_wheel_gates():
     assert "python -I scripts/check_wheel_security.py dist/*.whl" in source
     assert "--no-index --no-deps --force-reinstall dist/*.whl" in source
     assert source.index("check_repository_controls.py") < source.index("python -m build")
+
+
+def test_built_wheel_runs_every_a2a_card_regression():
+    cases = runpy.run_path(str(ROOT / "scripts" / "check_wheel_security.py"))["CASES"]
+    assert {"test_a2a_source_binding.py", "test_a2a_v1_cards.py"} <= set(cases)
 
 
 def test_testpypi_is_opt_in_main_only_and_keeps_oidc_away_from_source_execution():
