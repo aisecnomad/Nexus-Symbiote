@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,10 @@ from nexus_symbiote.validators.completeness import CompletenessValidator
 
 KEY = "33bae3789fcae05905b4a79a0a0080ba5f2084a987561c189a623cfa4e2f4b6c"
 OTHER_KEY = "42400744ed7a69e916ab8621bdc4502b1f5482ee5d766447e1bfee5801278b06"
+KEY_FAILURE = (
+    f"{SOURCE_BINDING_KEY_ENV} is not valid random key material; "
+    "MCP server declarations were not bound"
+)
 
 
 def _baseline(
@@ -236,8 +241,135 @@ def test_short_source_binding_key_is_rejected(tmp_path, monkeypatch):
     monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, "too-short")
     (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": {"db": _db("x")}}))
     result = MCPScanner().scan(tmp_path)
-    assert result.scan_failures
-    assert not any(isinstance(c, MCPServerComponent) for c in result.components)
+    assert result.scan_failures == [KEY_FAILURE]
+    server = next(c for c in result.components if isinstance(c, MCPServerComponent))
+    assert "static_value_binding" not in server.properties
+
+
+def _servers(result) -> dict[str, MCPServerComponent]:
+    return {c.name: c for c in result.components if isinstance(c, MCPServerComponent)}
+
+
+@pytest.mark.parametrize("key", ["too-short", "ab" * 32])
+def test_mcp_invalid_key_is_one_failure_and_keeps_servers_unbound(tmp_path, monkeypatch, key):
+    config = {
+        "mcpServers": {
+            "notes": {
+                "command": "npx",
+                "args": ["-y", "notes@1.0.0"],
+                "tools": [{"name": "read_note", "description": "Read a note"}],
+            },
+            "tickets": {"url": "https://mcp.example.com/mcp"},
+        }
+    }
+    (tmp_path / ".mcp.json").write_text(json.dumps(config))
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, key)
+    result = MCPScanner().scan(tmp_path)
+    assert result.scan_failures == [KEY_FAILURE]
+    servers = _servers(result)
+    assert set(servers) == {"notes", "tickets"}
+    assert not any("static_value_binding" in s.properties for s in servers.values())
+    assert [c.name for c in result.components if isinstance(c, ToolComponent)] == ["read_note"]
+
+
+def test_mcp_invalid_key_is_not_reported_without_servers(tmp_path, monkeypatch):
+    (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": {}}))
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, "too-short")
+    assert MCPScanner().scan(tmp_path).scan_failures == []
+
+
+@pytest.mark.parametrize(
+    ("relative", "content"),
+    [
+        (
+            ".mcp.json",
+            '{"mcpServers": {"bad": {"command": "node", "args": ["s.js"], "env": {"T": "\\ud800"}},'
+            ' "good": {"command": "node", "args": ["s.js"]}}}',
+        ),
+        (
+            ".codex/config.toml",
+            '[mcp_servers.bad]\ncommand = "node"\n[mcp_servers.bad.tools.t]\n'
+            "output_token_limit = 9007199254740993\n"
+            '[mcp_servers.good]\ncommand = "node"\n',
+        ),
+        (
+            ".codex/config.toml",
+            '[mcp_servers.bad]\ncommand = "node"\nstartup_timeout_sec = inf\n'
+            '[mcp_servers.good]\ncommand = "node"\n',
+        ),
+    ],
+    ids=["json-lone-surrogate", "toml-integer-beyond-2^53", "toml-infinity"],
+)
+def test_mcp_values_outside_i_json_are_a_distinct_binding_failure(
+    tmp_path, monkeypatch, relative, content
+):
+    monkeypatch.delenv(SOURCE_BINDING_KEY_ENV, raising=False)
+    (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / relative).write_text(content)
+    assert set(_servers(MCPScanner().scan(tmp_path))) == {"bad", "good"}
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
+    result = MCPScanner().scan(tmp_path)
+    assert result.scan_failures == [
+        f"{relative}: MCP server declaration cannot be canonicalized for binding"
+    ]
+    assert set(_servers(result)) == {"good"}
+
+
+def test_mcp_redaction_work_is_bounded(tmp_path, monkeypatch):
+    monkeypatch.delenv(SOURCE_BINDING_KEY_ENV, raising=False)
+    config = {
+        "mcpServers": {
+            "wide": {
+                "command": "node",
+                "args": ["s.js"],
+                "env": {f"k{i}": f"v{i}" for i in range(3000)},
+                "tools": [
+                    {
+                        "name": "t",
+                        "description": "d",
+                        "inputSchema": {
+                            "type": "object",
+                            "required": [f"r{j}" for j in range(3000)],
+                        },
+                    }
+                ],
+            },
+            "other": {"command": "node", "args": ["s.js"]},
+        }
+    }
+    (tmp_path / ".mcp.json").write_text(json.dumps(config))
+    started = time.monotonic()
+    result = MCPScanner().scan(tmp_path)
+    assert time.monotonic() - started < 5
+    assert result.scan_failures == ["MCP configuration: MCP server redaction work limit exceeded"]
+    assert set(_servers(result)) == {"other"}
+
+
+def test_ordinary_mcp_configuration_is_within_the_redaction_budget(tmp_path, monkeypatch):
+    monkeypatch.delenv(SOURCE_BINDING_KEY_ENV, raising=False)
+    servers = {
+        f"server{s}": {
+            "command": "npx",
+            "args": ["-y", f"server-{s}@1.0.0"],
+            "env": {f"TOKEN_{e}": f"secret-value-{s}-{e}-abcdef" for e in range(10)},
+            "tools": [
+                {
+                    "name": f"tool_{t}",
+                    "description": "Read a file from the workspace.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {f"p{p}": {"type": "string"} for p in range(8)},
+                    },
+                }
+                for t in range(50)
+            ],
+        }
+        for s in range(20)
+    }
+    (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": servers}))
+    result = MCPScanner().scan(tmp_path)
+    assert not result.scan_failures
+    assert len(_servers(result)) == 20
 
 
 @pytest.mark.parametrize(

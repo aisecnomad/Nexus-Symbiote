@@ -37,6 +37,8 @@ from nexus_symbiote.core.hashing import (
 )
 from nexus_symbiote.core.hashing import (
     TOOL_DEFINITION_HASH_VERSION,
+    SourceBindingKeyError,
+    SourceBindingValueError,
     bind_source_values,
     extract_version_pin,
     hash_canonical,
@@ -59,11 +61,16 @@ MAX_CODEX_LAYERS = 16
 _CODEX_APPROVAL_MODES = frozenset({"auto", "prompt", "writes", "approve"})
 # Launchers named in clear; any other command is a local path or name that may be private.
 _SHOWN_COMMANDS = frozenset({"npx", "bunx", "uvx", "pipx", "docker", "node", "python", "python3"})
-# Each recorded name of a Codex server is redacted against every secret value of
-# that server, and a nested layer can merge an ancestor's server in a few bytes.
-# Bound the names-by-secrets product over the collection: about a second of work.
+# Each recorded string of a server is redacted against every secret value of that
+# server, and a nested Codex layer can merge an ancestor's server in a few bytes.
+# Bound the strings-by-secrets product over the collection: about a second of work.
 MAX_CODEX_REDACTION_WORK = 4_000_000
 _CODEX_REDACTION_LIMIT = "Codex configuration: MCP server redaction work limit exceeded"
+_JSON_REDACTION_LIMIT = "MCP configuration: MCP server redaction work limit exceeded"
+_KEY_FAILURE = (
+    f"{SOURCE_BINDING_KEY_ENV} is not valid random key material; "
+    "MCP server declarations were not bound"
+)
 
 
 def is_codex_config(path: str) -> bool:
@@ -112,6 +119,25 @@ def _codex_redaction_work(config: dict[str, Any]) -> int:
         names += len(config.get(key, ()))
     secrets = len(config.get("env", {})) + len(config.get("http_headers", {}))
     return names * max(secrets, 1)
+
+
+def _json_redaction_work(config: dict[str, Any]) -> int:
+    """The strings a JSON server record redacts, times its distinct secret values.
+
+    Without secrets, redaction costs only time linear in the bounded input.
+    """
+    strings = 4 + len(config.get("args", []))
+    pending: list[Any] = [config.get("tools", [])]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            strings += len(value)
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, str):
+            strings += 1
+    return strings * len({value for value in config.get("env", {}).values() if value})
 
 
 def _codex_server_policy(config: dict[str, Any], secrets: list[str]) -> dict[str, Any]:
@@ -269,6 +295,7 @@ class MCPScanner(Scanner):
             # Server tables of the Codex layers read so far, ancestors first.
             codex_tables: list[tuple[str, PurePosixPath, dict[str, Any]]] = []
             codex_work = 0
+            json_work = 0
             for config_name in [*MCP_CONFIG_FILES, *nested]:
                 config_path = files.root / config_name
                 codex = is_codex_config(config_name)
@@ -321,10 +348,14 @@ class MCPScanner(Scanner):
                         continue
                     if codex:
                         codex_work += _codex_redaction_work(server_config)
-                        if codex_work > MAX_CODEX_REDACTION_WORK:
-                            if _CODEX_REDACTION_LIMIT not in result.scan_failures:
-                                result.scan_failures.append(_CODEX_REDACTION_LIMIT)
-                            continue
+                        over, limit = codex_work, _CODEX_REDACTION_LIMIT
+                    else:
+                        json_work += _json_redaction_work(server_config)
+                        over, limit = json_work, _JSON_REDACTION_LIMIT
+                    if over > MAX_CODEX_REDACTION_WORK:
+                        if limit not in result.scan_failures:
+                            result.scan_failures.append(limit)
+                        continue
                     try:
                         mcp_comp, tool_comps = self._parse_server(
                             server_name,
@@ -335,6 +366,30 @@ class MCPScanner(Scanner):
                     except (TypeError, ValueError, RecursionError):
                         result.scan_failures.append(f"{config_name}: invalid tool definition")
                         continue
+                    # Bound after parsing, so a value that cannot be hashed for export
+                    # still fails as an invalid definition with or without the key.
+                    try:
+                        value_binding = _value_binding(server_config)
+                    except SourceBindingKeyError:
+                        # A configuration error, not a property of this server: report it
+                        # once and keep the inventory unbound.
+                        if _KEY_FAILURE not in result.scan_failures:
+                            result.scan_failures.append(_KEY_FAILURE)
+                        value_binding = None
+                    except SourceBindingValueError:
+                        result.scan_failures.append(
+                            f"{config_name}: MCP server declaration cannot be canonicalized "
+                            "for binding"
+                        )
+                        continue
+                    if value_binding:
+                        mcp_comp.properties.update(
+                            {
+                                "static_value_binding": value_binding[0],
+                                "static_value_binding_key_id": value_binding[1],
+                                "static_value_binding_profile": STATIC_VALUE_BINDING_PROFILE,
+                            }
+                        )
                     result.components.append(mcp_comp)
                     result.components.extend(tool_comps)
                     server_refs.append(mcp_comp.bom_ref)
@@ -493,7 +548,6 @@ class MCPScanner(Scanner):
         source_config_hash = hash_canonical(
             {"profile": STATIC_CONFIG_HASH_PROFILE, "structure": structure}
         )
-        value_binding = _value_binding(config)
 
         package_ref = self._extract_package_ref(command, args)
         launcher_package = self._launcher_package(command, package_ref) if package_ref else None
@@ -571,15 +625,6 @@ class MCPScanner(Scanner):
                 "endpoint_credentials_omitted": bool(endpoint_url),
                 "static_config_hash": source_config_hash,
                 "static_config_hash_profile": STATIC_CONFIG_HASH_PROFILE,
-                **(
-                    {
-                        "static_value_binding": value_binding[0],
-                        "static_value_binding_key_id": value_binding[1],
-                        "static_value_binding_profile": STATIC_VALUE_BINDING_PROFILE,
-                    }
-                    if value_binding
-                    else {}
-                ),
             },
         )
 
