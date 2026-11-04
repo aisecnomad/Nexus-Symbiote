@@ -205,3 +205,56 @@ def test_worker_import_skips_format_checkers_and_fits_the_cpu_budget():
     assert loaded == "[]"
     # The worker's RLIMIT_CPU is 1 second; startup and imports must leave most of it.
     assert float(cpu) < 0.5
+
+
+def _cyclic() -> list[object]:
+    value: list[object] = []
+    value.append(value)
+    return value
+
+
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        (float("nan"), "outside the JSON domain"),
+        (float("inf"), "outside the JSON domain"),
+        (2**53, "integer exceeds canonical JSON domain"),
+        (-(2**53), "integer exceeds canonical JSON domain"),
+        (b"bytes", "outside the JSON domain"),
+        ({"set": {1}}, "outside the JSON domain"),
+        ({1: "non-string key"}, "invalid or oversized JSON object key"),
+        ({"k" * 65: "oversized key"}, "invalid or oversized JSON object key"),
+        ("x" * 65, "budget"),
+        ([0] * (validation.MAX_JSON_NODES + 1), "budget"),
+        (dict.fromkeys(map(str, range(validation.MAX_JSON_NODES + 1)), 0), "budget"),
+    ],
+    ids=[
+        "nan",
+        "infinity",
+        "integer-above-safe-range",
+        "integer-below-safe-range",
+        "bytes",
+        "set",
+        "non-string-key",
+        "oversized-key",
+        "oversized-string",
+        "oversized-array",
+        "oversized-object",
+    ],
+)
+def test_budget_rejects_values_outside_the_canonical_json_domain(value, reason):
+    # Agent-supplied tool-call arguments reach this check before any worker starts;
+    # each rejection is a separate guard and needs its own regression.
+    with pytest.raises(validation.ValidationBudgetError, match=reason):
+        validation.check_json_budget(value, maximum=64)
+
+
+def test_cyclic_arguments_exhaust_the_depth_budget_instead_of_recursing():
+    with pytest.raises(validation.ValidationBudgetError, match="complexity"):
+        validation.check_json_budget(_cyclic(), maximum=validation.MAX_ARGUMENT_BYTES)
+
+
+def test_budget_accepts_the_edges_of_the_canonical_json_domain():
+    for value in (2**53 - 1, -(2**53 - 1), 0.5, True, None, "x" * 62):
+        validation.check_json_budget(value, maximum=64)
+    validation.check_json_budget({"k" * 64: 0}, maximum=128)
