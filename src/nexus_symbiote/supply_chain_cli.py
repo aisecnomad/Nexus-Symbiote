@@ -12,7 +12,7 @@ import click
 from nexus_symbiote import modes
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.utils.files import write_output_file
-from nexus_symbiote.utils.terminal import one_line
+from nexus_symbiote.utils.terminal import inert_json, one_line
 
 
 def register_supply_chain_commands(main: click.Group) -> None:
@@ -74,10 +74,10 @@ def register_supply_chain_commands(main: click.Group) -> None:
                 record_candidate(bom, report)
             except ValueError:
                 raise click.ClickException("incomplete inventory; candidate not emitted") from None
-            click.echo(bom.to_json())
+            click.echo(inert_json(bom.to_json()))
             return
         if json_output:
-            click.echo(json.dumps(report.to_dict(), indent=2))
+            click.echo(inert_json(json.dumps(report.to_dict(), indent=2)))
         else:
             click.echo(
                 f"Live descriptor observation: {report.servers_reachable}/{report.servers_checked} servers; "
@@ -159,7 +159,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
         if output:
             write_output_file(output, text)
         else:
-            click.echo(text)
+            click.echo(inert_json(text))
 
     @main.command()
     @click.argument("aibom_path", type=click.Path(exists=True, path_type=Path))
@@ -184,6 +184,6 @@ def register_supply_chain_commands(main: click.Group) -> None:
         if output:
             write_output_file(output, text)
         else:
-            click.echo(text)
+            click.echo(inert_json(text))
         if report.errors:
             raise click.exceptions.Exit(1)

@@ -220,3 +220,21 @@ def test_one_line_replaces_every_line_boundary_and_undecodable_name():
     # os.fsdecode maps undecodable file-name bytes to lone surrogates.
     assert one_line("model\udc80.pt") == "model\ufffd.pt"
     assert one_line("tab\tkept") == "tab\tkept"
+
+
+def test_legacy_workflow_commands_are_inert_in_text_and_json_output(tmp_path):
+    # The runner parses "##[command]" anywhere in a line, not only at its start.
+    name = "ok ##[error title=Nexus SymBiote]All checks passed"
+    old, new = tmp_path / "old.json", tmp_path / "new.json"
+    old.write_text(AIBOM().to_json())
+    new.write_text(AIBOM(components=[PromptComponent(bom_ref="prompt:1", name=name)]).to_json())
+    runner = CliRunner()
+    text = runner.invoke(main, ["diff", str(old), str(new)])
+    assert text.exit_code == 0, text.output
+    assert "All checks passed" in text.output
+    assert "##[" not in text.output
+    result = runner.invoke(main, ["diff", str(old), str(new), "--json-output"])
+    assert "##[" not in result.stdout
+    added = json.loads(result.stdout)["components_added"]
+    assert [component["name"] for component in added] == [name]
+    assert one_line(name).count("##") == 1 and "##[" not in one_line(name)

@@ -25,7 +25,7 @@ from nexus_symbiote.policy import Policy
 from nexus_symbiote.runtime_cli import register_runtime_commands
 from nexus_symbiote.supply_chain_cli import register_supply_chain_commands
 from nexus_symbiote.utils.files import write_output_file
-from nexus_symbiote.utils.terminal import one_line
+from nexus_symbiote.utils.terminal import inert_json, one_line
 
 if TYPE_CHECKING:
     from nexus_symbiote.scanners.base import ScanResult
@@ -409,7 +409,7 @@ def scan(
         write_output_file(Path(output), out_data)
         console.print(f"[bold green]Saved[/] {_safe(output)}")
     else:
-        click.echo(out_data)
+        click.echo(inert_json(out_data))
 
     if risk_report.warning_threshold_exceeded:
         err_console.print(f"[yellow]Risk warning:[/] score {risk_report.overall_score:.1f}")
@@ -799,15 +799,17 @@ def risk(
                 reasons.append("No local project subject was available to reconcile.")
             if json_output:
                 click.echo(
-                    json.dumps(
-                        {
-                            "assessment_basis": "project-reconciliation-failed",
-                            "overall_score": None,
-                            "risk_level": "unknown",
-                            "coverage_status": "unreconciled",
-                            "gate_reasons": reasons,
-                        },
-                        indent=2,
+                    inert_json(
+                        json.dumps(
+                            {
+                                "assessment_basis": "project-reconciliation-failed",
+                                "overall_score": None,
+                                "risk_level": "unknown",
+                                "coverage_status": "unreconciled",
+                                "gate_reasons": reasons,
+                            },
+                            indent=2,
+                        )
                     )
                 )
             else:
@@ -827,7 +829,9 @@ def risk(
     passed, report = scorer.passes_gate(bom)
 
     if json_output:
-        click.echo(json.dumps({**report.to_dict(), "assessment_basis": basis}, indent=2))
+        click.echo(
+            inert_json(json.dumps({**report.to_dict(), "assessment_basis": basis}, indent=2))
+        )
         sys.exit(0 if passed else 1)
 
     level_colors = {
@@ -895,7 +899,7 @@ def diff(old_path: str, new_path: str, json_output: bool, fail_on_alert: bool = 
     result = differ.diff(old_bom, new_bom)
 
     if json_output:
-        click.echo(json.dumps(result.to_dict(), indent=2))
+        click.echo(inert_json(json.dumps(result.to_dict(), indent=2)))
     else:
         if not result.has_changes:
             console.print("[green]No changes detected.[/]")
@@ -964,7 +968,7 @@ def blast_radius_command(aibom_path: str, component_ref: str, json_output: bool)
     except ValueError as exc:
         raise click.ClickException(one_line(exc)) from exc
     if json_output:
-        click.echo(json.dumps(result, indent=2))
+        click.echo(inert_json(json.dumps(result, indent=2)))
     else:
         console.print(
             "[bold]Potential blast radius[/] (repository association; effective authority unknown)"

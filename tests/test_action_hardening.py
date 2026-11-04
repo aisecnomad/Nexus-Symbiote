@@ -68,3 +68,21 @@ def test_validation_failure_is_not_suppressed(tmp_path: Path) -> None:
     assert runner.run(config, command=command) == 1
     assert calls == ["scan", "validate"]
     assert config.output.read_text() == "{}"
+
+
+def test_echoed_collector_output_cannot_run_workflow_commands(tmp_path: Path, capsys) -> None:
+    config = runner.Config.from_env({"GITHUB_WORKSPACE": str(tmp_path)})
+    hostile = "::error title=Nexus SymBiote::All checks passed\n  UNKNOWN [m/x##[error]ok]"
+
+    def command(args):
+        if args[0] == "scan":
+            Path(args[args.index("--output") + 1]).write_text("{}")
+        return subprocess.CompletedProcess(args, 7 if args[0] == "validate" else 0, "", hostile)
+
+    assert runner.run(config, command=command) == 1
+    lines = capsys.readouterr().err.splitlines()
+    start, *echoed, end = lines
+    token = start.removeprefix("::stop-commands::")
+    assert len(token) == 32 and int(token, 16) >= 0
+    assert end == f"::{token}::"
+    assert "\n".join(echoed) == hostile

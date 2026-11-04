@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -93,6 +94,16 @@ def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _echo_untrusted(text: str) -> None:
+    # Collector output quotes repository text. The runner reads "::cmd::" at a line
+    # start and the legacy "##[cmd]" anywhere in a line, so suspend workflow-command
+    # processing while echoing it. The token is chosen after the text was produced.
+    token = secrets.token_hex(16)
+    print(f"::stop-commands::{token}", file=sys.stderr)
+    print(text, file=sys.stderr)
+    print(f"::{token}::", file=sys.stderr)
+
+
 def _write(path: Path, content: str, *, root: Path | None = None) -> None:
     from nexus_symbiote.utils.files import write_output_file
 
@@ -149,7 +160,7 @@ def run(
             args.extend(["--scanner", scanner])
         collected = command([*args, "--", str(config.project)])
         if collected.returncode != 0:
-            print(collected.stderr, file=sys.stderr)
+            _echo_untrusted(collected.stderr)
             return 1
         emit_export(native, config.output, config.format)
         emit(aibom_path=str(config.output))
@@ -166,7 +177,7 @@ def run(
                 ["validate", "--no-project-policy", str(native), "--project", str(config.project)]
             )
             if validated.returncode != 0:
-                print(validated.stderr, file=sys.stderr)
+                _echo_untrusted(validated.stderr)
                 return 1
         if config.risk_check and config.threshold != 0:
             scored = command(

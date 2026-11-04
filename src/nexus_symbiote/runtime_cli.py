@@ -27,6 +27,7 @@ from nexus_symbiote.runtime import (
     strict_json,
     verify_contract,
 )
+from nexus_symbiote.utils.terminal import inert_json
 
 Purpose = Literal["snapshot", "approval", "trust", "model"]
 
@@ -226,7 +227,7 @@ def verify(
             "accepted_signers": sorted(accepted),
             "invocation_authorized": False,
         }
-        click.echo(json.dumps(result, indent=2))
+        click.echo(inert_json(json.dumps(result, indent=2)))
     except (ValueError, OSError) as exc:
         raise click.ClickException(_safe_error(exc, "verification")) from None
 
