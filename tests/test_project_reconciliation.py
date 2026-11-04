@@ -13,6 +13,18 @@ from nexus_symbiote.scanner_catalog import BUILTIN_SCANNER_NAMES
 from nexus_symbiote.validators.completeness import CompletenessValidator
 
 
+@pytest.fixture(autouse=True)
+def unrelated_ancestor_policy(tmp_path):
+    # Policy lookup walks every ancestor of a project, and each project here sits
+    # below tmp_path. No test in this module is about project policy.
+    (tmp_path / ".nexus-symbiote.yaml").write_text(
+        "scan:\n"
+        "  scanners: [prompt, mcp]\n"
+        "  exclude_paths: [AGENTS.md]\n"
+        "  failure_mode: report-only\n"
+    )
+
+
 def _claimed_complete(project: Path, target: Path) -> AIBOM:
     run = CliRunner().invoke(
         main, ["scan", "--report-only", "--no-project-policy", str(project), "-o", str(target)]
@@ -162,7 +174,9 @@ def test_cli_rejects_forged_discovery_projection_in_combined_bom(tmp_path, edit)
     )
     target = tmp_path / "bom.json"
     runner = CliRunner()
-    result = runner.invoke(main, ["scan", "--report-only", str(root), "-o", str(target)])
+    result = runner.invoke(
+        main, ["scan", "--report-only", "--no-project-policy", str(root), "-o", str(target)]
+    )
     assert result.exit_code == 0, result.output
     args = ["validate", "--project", str(root), "--no-project-policy", str(target)]
     original = runner.invoke(main, args)
@@ -214,7 +228,8 @@ def test_project_gates_bind_repository_relationships(tmp_path, edit):
     (project / "CLAUDE.md").write_text("Check scope.")
     runner = CliRunner()
     output = tmp_path / "bom.json"
-    assert runner.invoke(main, ["scan", str(project), "-o", str(output)]).exit_code == 0
+    scan = ["scan", str(project), "--no-project-policy", "-o", str(output)]
+    assert runner.invoke(main, scan).exit_code == 0
     validate = ["validate", str(output), "--project", str(project), "--no-project-policy"]
     risk = ["risk", str(output), "--project", str(project), "--no-project-policy", "--json-output"]
     assert runner.invoke(main, validate).exit_code == 0
@@ -252,7 +267,8 @@ def test_project_reconciliation_preserves_supplementary_live_edges(tmp_path):
     (project / ".mcp.json").write_text('{"mcpServers":{"local":{"command":"node"}}}')
     output = tmp_path / "bom.json"
     runner = CliRunner()
-    assert runner.invoke(main, ["scan", str(project), "-o", str(output)]).exit_code == 0
+    scan = ["scan", str(project), "--no-project-policy", "-o", str(output)]
+    assert runner.invoke(main, scan).exit_code == 0
     bom = AIBOM.load(output)
     server = next(c for c in bom.components if c.component_type.value == "mcp-server")
     runtime_tool = ToolComponent(
@@ -293,7 +309,8 @@ def test_relative_subjects_still_reconcile_after_moving_a_checkout(tmp_path):
     (root / "AGENTS.md").write_text("Check scope.")
     output = tmp_path / "bom.json"
     runner = CliRunner()
-    assert runner.invoke(main, ["scan", str(root), "-o", str(output)]).exit_code == 0
+    scan = ["scan", str(root), "--no-project-policy", "-o", str(output)]
+    assert runner.invoke(main, scan).exit_code == 0
     bom = AIBOM.load(output)
     prompt = bom.get_component("prompt:AGENTS.md")
     prompt.source_path = "AGENTS.md"
@@ -301,7 +318,8 @@ def test_relative_subjects_still_reconcile_after_moving_a_checkout(tmp_path):
     moved = tmp_path / "relocated" / "agent"
     moved.parent.mkdir()
     root.rename(moved)
-    checked = runner.invoke(main, ["risk", str(output), "--project", str(moved), "--json-output"])
+    risk = ["risk", str(output), "--project", str(moved), "--no-project-policy", "--json-output"]
+    checked = runner.invoke(main, risk)
     assert (
         checked.exit_code == 0
         and json.loads(checked.stdout)["assessment_basis"] == "project-reconciled"
