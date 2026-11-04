@@ -1,0 +1,44 @@
+name: Scheduled dependency advisories
+# CI audits the locked dependencies only when something is pushed, and Dependabot's
+# pip updates change pyproject.toml ranges, never the hash locks that CI, the Action
+# and releases install. Without a schedule, a new advisory against a locked version
+# goes unnoticed until the next push. This stays separate from ci.yml on purpose: the
+# publication preflight reads the newest ci.yml run for a commit and accepts only
+# push and manual runs, so a scheduled ci.yml run could block publication.
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: dependency-audit
+  cancel-in-progress: false
+jobs:
+  dependency-audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install the reviewed dependency inventory
+        run: |
+          python -m pip install --require-hashes -r requirements-ci.lock
+          python -m pip install --no-deps --no-build-isolation -e .
+      - name: Require complete OSV lookups and no known advisories
+        env:
+          ADVISORY_REPORT: ${{ runner.temp }}/dependency-advisories.json
+        run: python scripts/check_dependency_advisories.py --out "$ADVISORY_REPORT"
+      - name: Retain exact dependency and advisory evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scheduled-dependency-advisory-evidence
+          path: ${{ runner.temp }}/dependency-advisories.json
+          if-no-files-found: error
+          retention-days: 14

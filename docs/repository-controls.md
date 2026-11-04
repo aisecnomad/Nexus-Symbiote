@@ -121,6 +121,15 @@ lookups and identified by the reviewed source revision instead. An empty OSV
 response means no advisory known to OSV for that queried version; it does not
 establish absence of vulnerabilities, malicious packages or undisclosed defects.
 
+CI runs this audit only when something is pushed, so
+`.github/workflows/dependency-audit.yml` repeats the same job daily, and on
+manual dispatch, against `main`'s locks. A new advisory against a locked version
+then fails that run, and so does the next pull request; refresh the locks in a
+dedicated pull request. The scheduled run is not publication evidence: it is a
+separate workflow because the preflight accepts only push and manual runs of
+`ci.yml`. GitHub disables scheduled workflows in a public repository after 60
+days without repository activity.
+
 ## Operator prerequisites
 
 Status of the controls tracked in

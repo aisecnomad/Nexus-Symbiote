@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from nexus_symbiote.scanners.live_mcp import HTTPReply
 
@@ -157,6 +158,30 @@ def test_dependency_cli_audits_installed_and_locked_identities(monkeypatch, tmp_
     names = {package["name"] for package in audited}
     assert {"pip", "zipp", "importlib-metadata"} <= names
     assert "nexus-symbiote" not in names
+
+
+def test_scheduled_advisory_audit_repeats_the_ci_audit_outside_publication_evidence():
+    workflows = ROOT / ".github" / "workflows"
+    scheduled = yaml.safe_load((workflows / "dependency-audit.yml").read_text())
+    ci = yaml.safe_load((workflows / "ci.yml").read_text())
+    assert set(scheduled.get("on", scheduled.get(True))) == {"schedule", "workflow_dispatch"}
+    assert scheduled["permissions"] == {"contents": "read"}
+    # The publication preflight reads the newest ci.yml run for the release commit and
+    # accepts only push and manual runs, so the schedule must not move into ci.yml.
+    assert "schedule" not in ci.get("on", ci.get(True))
+
+    def steps(job):
+        normalized = []
+        for step in job["steps"]:
+            step = copy.deepcopy(step)
+            if "uses" in step:
+                # Dependabot moves the action pins of both workflows together.
+                step["uses"] = step["uses"].split("@", 1)[0]
+                step.get("with", {}).pop("name", None)
+            normalized.append(step)
+        return normalized
+
+    assert steps(scheduled["jobs"]["dependency-audit"]) == steps(ci["jobs"]["dependency-audit"])
 
 
 def test_unreadable_lock_fails_the_dependency_cli_closed(monkeypatch, tmp_path):
