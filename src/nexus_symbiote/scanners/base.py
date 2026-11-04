@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -115,11 +116,20 @@ class Scanner(ABC):
     def _read_mapping(
         self, path: Path, result: ScanResult, *, missing_ok: bool = True
     ) -> dict[str, Any] | None:
-        """Read a bounded static JSON/YAML mapping and retain parse failures."""
+        """Read a bounded static JSON/YAML/TOML mapping and retain parse failures."""
         if self._files is None:
             raise RuntimeError("_read_mapping called outside a _collection context")
         if path.suffix.lower() == ".json":
             data = self._files.read_json(path, missing_ok=missing_ok)
+        elif path.suffix.lower() == ".toml":
+            text = self._files.read_text(path, missing_ok=missing_ok)
+            if text is None:
+                return None
+            try:
+                data = tomllib.loads(text)
+            except (ValueError, RecursionError):
+                result.scan_failures.append(f"{path.name}: TOML mapping parse failed")
+                return None
         else:
             text = self._files.read_text(path, missing_ok=missing_ok)
             if text is None:

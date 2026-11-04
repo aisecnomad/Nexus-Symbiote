@@ -12,6 +12,7 @@ policy neither verifies a signature nor authorizes artifact execution.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import urlsplit
@@ -31,6 +32,17 @@ _FIELDS = frozenset({"artifact_path", "bundle_path", "expected_identity", "expec
 
 class SignaturePolicyError(ValueError):
     """The selected policy cannot be used safely; messages omit input values."""
+
+
+def unmatched_policy_entries(
+    policies: Iterable[SigstoreArtifactPolicy], checked_policies: set[SigstoreArtifactPolicy]
+) -> list[str]:
+    """Identify every unchecked artifact by its one-based position in the operator policy."""
+    return [
+        f"Signature policy artifact #{index} did not match a collected model"
+        for index, policy in enumerate(policies, start=1)
+        if policy not in checked_policies
+    ]
 
 
 def _required_string(record: dict[str, Any], field: str) -> str:

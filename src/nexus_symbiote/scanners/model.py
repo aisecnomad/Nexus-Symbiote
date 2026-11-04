@@ -15,6 +15,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
+from nexus_symbiote import signature_policy
 from nexus_symbiote.core.enums import (
     RiskSeverity,
     SerializationSafety,
@@ -278,6 +279,7 @@ class ModelScanner(Scanner):
 
     def scan(self, project_root: Path) -> ScanResult:
         result = ScanResult(scanner_name=self.name)
+        checked_policies: set[SigstoreArtifactPolicy] = set()
         # One deterministic walk and one aggregate budget for all model/config
         # reads. Large weights are streamed; metadata remains capped at four MiB.
         with self._collection(
@@ -295,10 +297,17 @@ class ModelScanner(Scanner):
                 result.surfaces_scanned.append("model-weights (no model files found)")
             for model_dir in model_dirs:
                 result.surfaces_scanned.append(str(model_dir))
-                result.components.extend(self._scan_model_directory(model_dir))
+                result.components.extend(self._scan_model_directory(model_dir, checked_policies))
+        result.scan_failures.extend(
+            signature_policy.unmatched_policy_entries(
+                self._signature_policies.values(), checked_policies
+            )
+        )
         return result
 
-    def _scan_model_directory(self, model_dir: Path) -> list[ModelComponent]:
+    def _scan_model_directory(
+        self, model_dir: Path, checked_policies: set[SigstoreArtifactPolicy]
+    ) -> list[ModelComponent]:
         components: list[ModelComponent] = []
         model_name = model_dir.name
 
@@ -331,7 +340,14 @@ class ModelScanner(Scanner):
                 weight_hash = None
                 fingerprint.clear()
 
-            signing_status, signing_identity = self._check_signing(path, weight_hash)
+            signing_status, signing_identity = self._check_signing(
+                path, weight_hash, checked_policies
+            )
+            if signing_status == "verification-failed":
+                self._files._fail(
+                    path.relative_to(self._files.root),
+                    "explicit signature policy verification failed",
+                )
             risks = self._assess_model_risks(path, fmt_key, safety, signing_status, config)
 
             trust_tier = TrustTier.UNKNOWN
@@ -407,9 +423,12 @@ class ModelScanner(Scanner):
                     return data
         return None
 
-    def _check_signing(self, artifact: Path, weight_hash: str | None) -> tuple[str, str | None]:
+    def _check_signing(
+        self, artifact: Path, weight_hash: str | None, checked_policies: set[SigstoreArtifactPolicy]
+    ) -> tuple[str, str | None]:
         policy = self._signature_policies.get(artifact.resolve())
         if policy is not None:
+            checked_policies.add(policy)
             if weight_hash is None:
                 return "verification-failed", None
             result = verify_sigstore_bundle(

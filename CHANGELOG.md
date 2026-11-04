@@ -8,6 +8,10 @@ First alpha of the AgentBOM toolkit under the Hunzee-VC organization. Not yet ta
 
 ### Security
 
+- Check each artifact named in an operator signer policy. An unrelated file with a valid hash can no longer satisfy an unmatched policy entry.
+- Reconcile repository dependency records during project validation and risk scoring. The drift gate now alerts on added delegations, removed controls and changes to other recorded relationships.
+- Read A2A v1 interface preferences and security requirements, and collect project-local Codex TOML declarations for sandbox access, approval policy and MCP servers.
+- Reject ShadowScan summaries whose error totals or incomplete-reason counts contradict their connector records.
 - Bind confined reads, streams, hashes and model inspection to the open descriptor's device, inode and link count as well as its size and timestamps. A rename-over that lands within the same coarse-grained kernel timestamp tick previously left the replaced inode's size, mtime and ctime unchanged, so the swap went undetected and the replacement bytes could be classified as a safe tensor container. The unlinked inode's link count drops to zero regardless of timestamp granularity.
 - Raise dependency minimums past known advisories: cryptography 50, sigstore 4.4 with tuf 7, and pytest 9.0.3 for development. Sigstore 3.x is no longer supported.
 - Lock dependency versions without known advisories (cryptography 50.0.2, sigstore 4.5.1, tuf 7.0.1, pytest 9.2.0) so the required OSV audit of the locked environment passes.

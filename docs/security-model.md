@@ -32,11 +32,15 @@ nexus-symbiote risk inventory.json --project /reviewed/checkout --no-project-pol
 ```
 
 Project reconciliation reruns the supported static collectors and compares
-their security-relevant fields and findings with the supplied BOM. A mismatch
+their components, findings and repository relationships with the supplied BOM. A mismatch
 makes the project-backed risk command exit unsuccessfully with an unknown risk
 level and a null score. Without a project, `risk` scores the supplied claims
 and labels the result `supplied-bom`. For an operator-configured signature
-check, supply the trusted signer policy when validating the project.
+check, supply the trusted signer policy when validating the project. Each entry
+must match a collected model and verify under the specified identity and issuer.
+An unsupported model, an excluded model or an invalid signature fails the gate,
+even if other files have valid hashes. Use `scan --report-only` to retain the
+partial inventory and its failures for inspection.
 
 A mediated action needs a trusted approver, snapshot binding, authenticated workload and endpoint, action/resource constraints, validity, current revocation state, rollback protection, and any action-specific approval. One-use approval must bind to the action and arguments it authorizes. Adapter checks cannot govern tools invoked through an unmediated route; deployments need their own network, identity, and sandbox controls to make mediation complete.
 
@@ -69,6 +73,14 @@ For trusted local projects, standalone `scan`, `validate` and `risk` load projec
 | Runtime contracts | Ed25519-signed snapshots, approvals and trust status bound to authenticated context in a reference adapter; deployments must prevent bypass and protect state |
 | Impact analysis | Potential graph reachability through recorded relationships, not proof that an exploit executed |
 | GitHub Action | One collected inventory, caller-owned gates and optional SARIF upload; disabled or skipped gates are visible policy choices |
+
+A2A v1 cards retain the preferred interface and ordered alternatives from
+`supportedInterfaces`, including each origin, protocol binding and version.
+A change to a recorded interface or to declared card or skill security requirements
+raises a high-severity drift alert. URL userinfo, paths, queries, fragments and
+opaque tenant values are omitted. A same-origin path or tenant change alone is
+therefore outside this comparison. Authentication requirements describe the card's
+declarations. Verifying the remote endpoint and its enforcement requires separate evidence.
 
 Project validation compares static MCP records and configured tool fingerprints with fresh local evidence. A structure binding detects added or removed arguments, environment variables and tools. With `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` set, a keyed binding also detects same-version package swaps and changed argument, environment and endpoint values, without exporting anything a secret could be guessed from. MCP references include the relative configuration path and declared name. Legacy snapshots without the binding, or with name-only identities, need recollection; see [source reconciliation and migration](verification-source-binding.md). Python source declaration collection has bounded application-file coverage and reports unresolved or dynamic registrations as gaps.
 

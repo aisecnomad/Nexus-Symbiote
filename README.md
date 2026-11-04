@@ -70,8 +70,8 @@ Eight built-in collectors read declared configuration and artifacts from the pro
 | `prompt` | `CLAUDE.md`, `AGENTS.md`, `CODEX.md`, Copilot/Codex instructions, skill and command files | Instruction and skill digests, hidden-character findings |
 | `rag` | `rag_config.*`, `retrieval_config.json`, `vector_store_config.json` | Declared retrieval sources and controls |
 | `registry` | `package.json`, lockfiles, `requirements*.txt`, `pyproject.toml`, Dockerfiles | AI package identities, pins, lockfile integrity; container images and digests |
-| `a2a` | `.well-known/agent.json`, `agent-card.json`, A2A client config | Agent cards, endpoints, declared authentication |
-| `ide_agents` | Settings for Claude Code, Cursor, Codex, Windsurf, Cline, Copilot and others | Agent configuration and declared permissions |
+| `a2a` | `.well-known/agent-card.json`, legacy agent cards, A2A client config | Preferred interface, advertised transports and endpoint origins, declared authentication |
+| `ide_agents` | Settings for Claude Code, Cursor, Codex (including `.codex/config.toml`), Windsurf, Cline, Copilot and others | Agent configuration, declared permissions and approval settings |
 | `shadowscan` | [Nexus-ShadowScan](https://github.com/Hunzee-VC/Nexus-ShadowScan) reports | Imported discovery claims, kept separate from local evidence |
 
 ### What it checks

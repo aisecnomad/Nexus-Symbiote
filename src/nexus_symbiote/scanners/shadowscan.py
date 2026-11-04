@@ -82,6 +82,15 @@ def _short_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _incomplete_reasons(record: dict[str, Any]) -> dict[str, int]:
+    reasons = record.get("incomplete_reasons", {})
+    if not isinstance(reasons, dict) or any(
+        type(count) is not int or count < 1 for count in reasons.values()
+    ):
+        raise ValueError("invalid ShadowScan incomplete reason counts")
+    return reasons
+
+
 def _risks(level: Any, shadow: Any) -> list[RiskAssessment]:
     findings: list[RiskAssessment] = []
     levels = {x.value: x for x in RiskSeverity}
@@ -279,6 +288,8 @@ class ShadowScanImporter(Scanner):
         complete = summary.get("complete") is True and bool(stats)
         if "status" in summary and summary["status"] != "complete":
             complete = False
+        error_count = 0
+        reason_counts: Counter[str] = Counter()
         for stat in stats:
             if (
                 not isinstance(stat, dict)
@@ -287,16 +298,26 @@ class ShadowScanImporter(Scanner):
                 or not isinstance(stat.get("incomplete"), bool)
             ):
                 raise ValueError("invalid ShadowScan connector statistics")
+            error_count += len(stat["errors"])
+            reason_counts.update(_incomplete_reasons(stat))
             if stat["errors"] or stat["skipped"] or stat["incomplete"]:
                 complete = False
             omissions = stat.get("declared_omissions", 0)
             if not isinstance(omissions, int) or isinstance(omissions, bool) or omissions != 0:
                 complete = False
+        if "errors" in summary and (
+            type(summary["errors"]) is not int or summary["errors"] != error_count
+        ):
+            raise ValueError("ShadowScan summary error count disagrees with connector statistics")
+        if "incomplete_reasons" in summary and _incomplete_reasons(summary) != dict(reason_counts):
+            raise ValueError(
+                "ShadowScan summary incomplete reasons disagree with connector statistics"
+            )
         for key in ("declared_omissions", "tolerated_gaps"):
             value = summary.get(key)
             if not isinstance(value, int) or isinstance(value, bool) or value != 0:
                 complete = False
-        return complete
+        return complete and not reason_counts
 
     @staticmethod
     def _project_native_findings(findings: list[Any], result: ImportedReport) -> None:

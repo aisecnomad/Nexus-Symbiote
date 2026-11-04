@@ -7,13 +7,14 @@ unauthorized component additions, and trust tier downgrades.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
 from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
 from nexus_symbiote.core.enums import TrustTier
 from nexus_symbiote.core.hashing import TOOL_DEFINITION_HASH_VERSION
-from nexus_symbiote.core.models import MCPServerComponent
+from nexus_symbiote.core.models import A2AServerComponent, MCPServerComponent
 
 TRUST_TIER_ORDER = {
     TrustTier.INTERNAL_VERIFIED: 0,
@@ -126,8 +127,13 @@ def _semantic_value(value: Any, path: tuple[str, ...]) -> Any:
     return value
 
 
-def _edge_key(edge: DependencyEdge) -> str:
-    return json.dumps(edge.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+def _dependency_records(edges: list[DependencyEdge]) -> dict[tuple[str, str, str], Counter[str]]:
+    records: dict[tuple[str, str, str], Counter[str]] = {}
+    for edge in edges:
+        binding = (edge.source_ref, edge.target_ref, edge.relationship)
+        key = json.dumps(edge.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        records.setdefault(binding, Counter())[key] += 1
+    return records
 
 
 @dataclass
@@ -473,6 +479,19 @@ class AIBOMDiffer:
             severity = "medium"
             if key in _SECURITY_FIELDS or key.endswith("_refs") or key.endswith("_ref"):
                 severity = "high"
+            if (
+                key == "properties"
+                and isinstance(new, A2AServerComponent)
+                and any(
+                    old.properties.get(field) != new.properties.get(field)
+                    for field in (
+                        "supported_interfaces",
+                        "security_requirements",
+                        "skill_security_requirements",
+                    )
+                )
+            ):
+                severity = "high"
             if (key == "trust_remote_code" and new_value is True) or key in {
                 "input_schema",
                 "description_text",
@@ -508,42 +527,51 @@ class AIBOMDiffer:
             )
 
     def _diff_dependencies(self, old: AIBOM, new: AIBOM, report: DiffReport) -> None:
-        old_deps = {_edge_key(edge): edge for edge in old.dependencies}
-        new_deps = {_edge_key(edge): edge for edge in new.dependencies}
-        for key in sorted(new_deps.keys() - old_deps.keys()):
-            edge = new_deps[key]
-            report.dependencies_added.append(
-                DependencyChange(
-                    source_ref=edge.source_ref,
-                    target_ref=edge.target_ref,
-                    relationship=edge.relationship,
-                    change_type="added",
-                    assurance_level=edge.assurance_level,
-                    conditions=edge.conditions,
-                )
+        old_records = _dependency_records(old.dependencies)
+        new_records = _dependency_records(new.dependencies)
+        for binding in sorted(old_records.keys() | new_records.keys()):
+            before = old_records.get(binding, Counter())
+            after = new_records.get(binding, Counter())
+            if before == after:
+                continue
+            source, target, relationship = binding
+            for kind, delta, changes in (
+                ("added", after - before, report.dependencies_added),
+                ("removed", before - after, report.dependencies_removed),
+            ):
+                for key, count in sorted(delta.items()):
+                    edge = DependencyEdge.model_validate_json(key)
+                    changes.extend(
+                        DependencyChange(
+                            source,
+                            target,
+                            relationship,
+                            kind,
+                            edge.assurance_level,
+                            edge.conditions,
+                        )
+                        for _ in range(count)
+                    )
+            # Qualifiers and multiplicity belong to the binding. Keep one alert
+            # and retain the complete added/removed records for the reviewer.
+            if before and after:
+                action = "changed assurance, conditions or record count"
+            else:
+                action = "added" if after else "removed"
+            high = bool(before and after) or relationship in {
+                "acts-as-identity",
+                "approved-under",
+                "delegates-to",
+                "invokes",
+                "uses-guardrail",
+            }
+            report.security_alerts.append(
+                {
+                    "severity": "high" if high else "medium",
+                    "component": source,
+                    "alert": f"Dependency {relationship} from '{source}' to '{target}' {action}.",
+                }
             )
-        for key in sorted(old_deps.keys() - new_deps.keys()):
-            edge = old_deps[key]
-            report.dependencies_removed.append(
-                DependencyChange(
-                    source_ref=edge.source_ref,
-                    target_ref=edge.target_ref,
-                    relationship=edge.relationship,
-                    change_type="removed",
-                    assurance_level=edge.assurance_level,
-                    conditions=edge.conditions,
-                )
-            )
-        old_bindings = {(e.source_ref, e.target_ref, e.relationship) for e in old.dependencies}
-        for change in report.dependencies_added:
-            if (change.source_ref, change.target_ref, change.relationship) in old_bindings:
-                report.security_alerts.append(
-                    {
-                        "severity": "high",
-                        "component": change.source_ref,
-                        "alert": "Dependency assurance or conditions changed; review the full edge records.",
-                    }
-                )
 
     def _generate_security_alerts(self, report: DiffReport) -> None:
         # An in-place change is at least as consequential as an addition, which
