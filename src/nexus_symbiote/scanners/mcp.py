@@ -51,6 +51,7 @@ from nexus_symbiote.core.models import (
     RiskAssessment,
     ToolComponent,
 )
+from nexus_symbiote.core.textsafety import HiddenKind, hidden_character_kinds
 from nexus_symbiote.scanners.base import Scanner, ScanResult, sanitized_origin
 from nexus_symbiote.utils.secrets import REDACTED, redact_descriptor, redact_text
 
@@ -333,6 +334,44 @@ def _launcher(command: str) -> tuple[str, bool]:
     stem, dot, suffix = parts[-1].rpartition(".")
     name = stem if dot and suffix.lower() in _WINDOWS_EXECUTABLE_SUFFIXES else parts[-1]
     return name.lower(), len(parts) > 1
+
+
+# Same categories and severities as the instruction-file checks in scanners/prompt.py.
+_HIDDEN_TEXT_FINDINGS: dict[HiddenKind, tuple[RiskSeverity, str, str]] = {
+    "bidi": (
+        RiskSeverity.CRITICAL,
+        "bidi_override",
+        "Bidirectional control characters in tool fields: {}. "
+        "Displayed text can differ from what the model reads.",
+    ),
+    "tag": (
+        RiskSeverity.CRITICAL,
+        "tag_characters",
+        "Unicode tag characters in tool fields: {}. "
+        "They are invisible and can carry hidden instructions.",
+    ),
+    "invisible": (
+        RiskSeverity.HIGH,
+        "invisible_characters",
+        "Invisible or format characters in tool fields: {}. "
+        "They can hide text from reviewers and split words that name checks match.",
+    ),
+}
+
+
+def _hidden_text_risks(fields: dict[str, object]) -> list[RiskAssessment]:
+    """Name the affected fields only: the text itself may carry the hidden payload."""
+    found = {field: hidden_character_kinds(value) for field, value in fields.items()}
+    return [
+        RiskAssessment(
+            severity=severity,
+            category=category,
+            detail=detail.format(", ".join(field for field in fields if kind in found[field])),
+            recommendation="Remove the hidden characters, then review the visible tool text.",
+        )
+        for kind, (severity, category, detail) in _HIDDEN_TEXT_FINDINGS.items()
+        if any(kind in kinds for kinds in found.values())
+    ]
 
 
 class MCPScanner(Scanner):
@@ -828,6 +867,14 @@ class MCPScanner(Scanner):
 
                     side_effect = self._classify_side_effects(t_annotations, t_name)
                     caps = self._infer_capabilities(t_name, t_desc, t_annotations)
+                    hidden_text = _hidden_text_risks(
+                        {
+                            "name": t_name,
+                            "description": t_desc,
+                            "inputSchema": t_schema,
+                            "annotations": t_annotations,
+                        }
+                    )
                     safe = redact_descriptor(
                         {
                             "name": t_name,
@@ -855,6 +902,7 @@ class MCPScanner(Scanner):
                                 recommendation="Ensure human-in-the-loop approval for destructive operations.",
                             )
                         )
+                    risks.extend(hidden_text)
 
                     tool_comps.append(
                         ToolComponent(
