@@ -25,14 +25,14 @@ from nexus_symbiote.policy import Policy
 from nexus_symbiote.runtime_cli import register_runtime_commands
 from nexus_symbiote.supply_chain_cli import register_supply_chain_commands
 from nexus_symbiote.utils.files import write_output_file
-from nexus_symbiote.utils.terminal import inert_json, one_line
+from nexus_symbiote.utils.terminal import InertStream, inert_json, one_line
 
 if TYPE_CHECKING:
     from nexus_symbiote.scanners.base import ScanResult
     from nexus_symbiote.utils.crypto import SigstoreArtifactPolicy
 
 # Emoji shortcodes such as :white_check_mark: would render inside escaped text.
-console = Console(stderr=True, emoji=False)
+console = Console(file=InertStream("stderr"), emoji=False)  # type: ignore[arg-type]
 err_console = console
 
 

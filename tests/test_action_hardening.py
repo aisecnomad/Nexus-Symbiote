@@ -86,3 +86,17 @@ def test_echoed_collector_output_cannot_run_workflow_commands(tmp_path: Path, ca
     assert len(token) == 32 and int(token, 16) >= 0
     assert end == f"::{token}::"
     assert "\n".join(echoed) == hostile
+
+
+def test_echoed_collection_failure_cannot_run_workflow_commands(tmp_path: Path, capsys) -> None:
+    config = runner.Config.from_env({"GITHUB_WORKSPACE": str(tmp_path)})
+    hostile = "::error title=Nexus SymBiote::Collection passed\nscan x##[error]ok"
+
+    def command(args):
+        return subprocess.CompletedProcess(args, 1, "", hostile)
+
+    assert runner.run(config, command=command) == 1
+    start, *echoed, end = capsys.readouterr().err.splitlines()
+    token = start.removeprefix("::stop-commands::")
+    assert len(token) == 32 and end == f"::{token}::"
+    assert "\n".join(echoed) == hostile

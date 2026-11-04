@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import re
+import sys
 import unicodedata
+from typing import Any, TextIO
 
 # Controls (Cc) move the cursor, rewrite earlier output or break the line; in CI a
 # line that starts with "::" is a workflow command. Format characters (Cf), such as
@@ -15,8 +18,10 @@ _INVISIBLE = frozenset("\u034f\u115f\u1160\u3164\uffa0")
 
 
 # The GitHub Actions runner also parses the legacy "##[command]" syntax anywhere
-# in a line, not only at its start.
+# in a line, not only at its start. Rich drops an escaping backslash before "[",
+# so "##" followed by backslashes and "[" can render as the command as well.
 _LEGACY_COMMAND = "##["
+_LEGACY_COMMAND_SOURCE = re.compile(r"##(?=\\*\[)")
 
 
 def one_line(value: object) -> str:
@@ -28,7 +33,7 @@ def one_line(value: object) -> str:
         else character
         for character in str(value)
     )
-    return text.replace(_LEGACY_COMMAND, "##\ufffd[")
+    return _LEGACY_COMMAND_SOURCE.sub("##\ufffd", text)
 
 
 def inert_json(text: str) -> str:
@@ -39,3 +44,27 @@ def inert_json(text: str) -> str:
     so no line can start with "::".
     """
     return text.replace(_LEGACY_COMMAND, "##\\u005b")
+
+
+class InertStream:
+    """Write to the current stdout or stderr without emitting "##[" in rendered text.
+
+    Rich renders markup before writing, so this catches the command syntax however a
+    rendered line was assembled. The stream is looked up at each write, so a test
+    runner or a redirect that replaces sys.stderr keeps working.
+    """
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    @property
+    def _stream(self) -> TextIO:
+        stream: TextIO = getattr(sys, self._name)
+        return stream
+
+    def write(self, text: str) -> int:
+        self._stream.write(text.replace(_LEGACY_COMMAND, "##\ufffd["))
+        return len(text)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)

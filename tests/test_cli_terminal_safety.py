@@ -238,3 +238,53 @@ def test_legacy_workflow_commands_are_inert_in_text_and_json_output(tmp_path):
     added = json.loads(result.stdout)["components_added"]
     assert [component["name"] for component in added] == [name]
     assert one_line(name).count("##") == 1 and "##[" not in one_line(name)
+
+
+def test_backslash_escaped_command_syntax_cannot_render_as_a_command(tmp_path):
+    # Rich drops the backslash in "\[" when it renders, which would rebuild "##[".
+    name = "ok ##\\[error title=Nexus SymBiote[]All checks passed"
+    old, new = tmp_path / "old.json", tmp_path / "new.json"
+    old.write_text(AIBOM().to_json())
+    new.write_text(AIBOM(components=[PromptComponent(bom_ref="prompt:1", name=name)]).to_json())
+    result = CliRunner().invoke(main, ["diff", str(old), str(new)])
+    assert result.exit_code == 0, result.output
+    assert "All checks passed" in result.output
+    assert "##[" not in result.output
+    assert "##[" not in one_line("##\\\\[x") and "##[" not in one_line("a###[b")
+
+
+def _risky_bom(tmp_path, name):
+    from nexus_symbiote.core.enums import RiskSeverity
+    from nexus_symbiote.core.models import RiskAssessment
+
+    path = tmp_path / "risky.json"
+    risk = RiskAssessment(
+        severity=RiskSeverity.MEDIUM, category="completeness", detail=name, recommendation="x"
+    )
+    path.write_text(
+        AIBOM(components=[PromptComponent(bom_ref="prompt:1", name=name, risks=[risk])]).to_json()
+    )
+    return path
+
+
+def test_json_reports_on_stdout_carry_no_legacy_command_syntax(tmp_path):
+    name = "ok ##[error title=Nexus SymBiote]All checks passed"
+    path = _risky_bom(tmp_path, name)
+    runner = CliRunner()
+    for command in (
+        ["risk", str(path), "--no-project-policy", "--json-output"],
+        ["vex", str(path)],
+    ):
+        result = runner.invoke(main, command)
+        assert "##[" not in result.stdout, command
+        assert name in json.dumps(json.loads(result.stdout)), command
+
+
+def test_live_advisories_errors_cannot_forge_output_lines(tmp_path):
+    document = json.loads(AIBOM().to_json())
+    document["metadata"]["x\n::error title=Nexus SymBiote::No advisories"] = 1
+    path = tmp_path / "bom.json"
+    path.write_text(json.dumps(document))
+    result = CliRunner().invoke(main, ["--live", "advisories", str(path)])
+    assert result.exit_code != 0, result.output
+    assert _workflow_command_lines(result.output) == []

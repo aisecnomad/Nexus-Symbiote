@@ -44,6 +44,9 @@ CASES = (
     "test_cli_terminal_safety.py::test_literal_text_renders_no_emoji_or_invisible_characters",
     "test_cli_terminal_safety.py::test_one_line_replaces_every_line_boundary_and_undecodable_name",
     "test_cli_terminal_safety.py::test_legacy_workflow_commands_are_inert_in_text_and_json_output",
+    "test_cli_terminal_safety.py::test_backslash_escaped_command_syntax_cannot_render_as_a_command",
+    "test_cli_terminal_safety.py::test_json_reports_on_stdout_carry_no_legacy_command_syntax",
+    "test_cli_terminal_safety.py::test_live_advisories_errors_cannot_forge_output_lines",
 )
 
 
