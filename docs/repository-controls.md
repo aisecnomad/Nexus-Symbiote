@@ -126,7 +126,7 @@ any row; this table is a dated record, not enforcement.
 | Control | Observed state | Required action |
 | --- | --- | --- |
 | Hosted CI matrix and CodeQL | Passing. The earlier failures were a runtime-validation CPU budget and real dependency advisories, fixed in [#97](https://github.com/Hunzee-VC/Nexus-Symbiote/pull/97) and [#98](https://github.com/Hunzee-VC/Nexus-Symbiote/pull/98) | None; keep `Verified CI` required |
-| Branch protection on `main` | Not protected: `protected: false`, and `GET /branches/main/protection` returns 404. 20 of the 92 first-parent commits on `main` were pushed directly rather than merged through a pull request | Apply the interim configuration above |
+| Branch protection on `main` | Not protected: `protected: false`, and `GET /branches/main/protection` returns 404. At `c31d1ef`, 11 of the 94 first-parent commits on `main` were pushed directly rather than merged through a pull request; the other 20 without a pull-request number in their subject were committed by GitHub's merge or squash web flow | Apply the interim configuration above |
 | Repository ruleset `main` | Enforcement `active`, but `conditions.ref_name.include` is empty, so it targets no branch and its pull-request, code-scanning and non-fast-forward rules are inert; its required-checks list is also empty | Delete it, or deliberately retarget it in addition to classic protection |
 | Private vulnerability reporting | Disabled, although [SECURITY.md](../SECURITY.md) directs reporters to it | Enable it under *Settings → Code security* |
 | Secret scanning and push protection | Disabled | Enable both; they are free for public repositories |
