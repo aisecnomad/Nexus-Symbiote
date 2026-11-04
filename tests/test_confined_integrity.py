@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
+from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.models import ModelComponent, PromptComponent
 from nexus_symbiote.utils import confined, crypto
@@ -269,3 +271,32 @@ def test_signed_artifact_hash_refuses_a_swapped_pathname(
 
     monkeypatch.setattr(crypto, "open_regular_file", open_then_swap)
     assert crypto.compute_file_hash(target) is None
+
+
+def test_non_utf8_file_names_are_not_collected(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    try:
+        name = os.path.join(os.fsencode(project), b"agent\xff.py")
+        with open(name, "w") as stream:
+            stream.write("from mcp import ClientSession\n")
+    except OSError:
+        pytest.skip("filesystem rejects file names that are not valid UTF-8")
+    output = tmp_path / "bom.json"
+    run = CliRunner().invoke(
+        main,
+        [
+            "scan",
+            str(project),
+            "--no-project-policy",
+            "--report-only",
+            "--scanner",
+            "mcp",
+            "-o",
+            str(output),
+        ],
+    )
+    assert run.exit_code == 0, run.output
+    completeness = AIBOM.load(output).metadata.completeness
+    assert completeness is not None
+    assert ".: file name is not valid UTF-8" in completeness.scan_failures

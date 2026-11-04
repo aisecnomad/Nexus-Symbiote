@@ -184,6 +184,7 @@ def _merge_scan_result(
     scan_failures: list[str],
 ) -> None:
     from nexus_symbiote.core.models import ClaimEvidence
+    from nexus_symbiote.scanners.base import exportable
 
     accepted_refs: set[str] = set()
     for comp in result.components:
@@ -201,6 +202,11 @@ def _merge_scan_result(
         )
         if comp.assurance_level is AssuranceLevel.VERIFIED:
             comp.assurance_level = AssuranceLevel.DECLARED
+        if not exportable(comp):
+            message = f"{name}: component text cannot be encoded for export"
+            if message not in scan_failures:
+                scan_failures.append(message)
+            continue
         existing = collected.get(comp.bom_ref)
         if existing is not None and existing != comp:
             scan_failures.append(f"{name}: conflicting duplicate component {comp.bom_ref}")

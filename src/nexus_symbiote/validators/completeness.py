@@ -29,6 +29,7 @@ from nexus_symbiote.scanners.a2a import (
     A2A_STATIC_MODES,
     has_a2a_source_binding,
 )
+from nexus_symbiote.scanners.base import exportable
 
 if TYPE_CHECKING:
     from nexus_symbiote.scanners.base import ScanResult
@@ -259,6 +260,9 @@ class CompletenessValidator:
                     incomplete(scanner.name, reason)
             expected.dependencies.extend(local.dependencies)
             for component in local.components:
+                if not exportable(component):
+                    incomplete(scanner.name, "Local component text cannot be encoded for export.")
+                    continue
                 previous = observed.setdefault(component.bom_ref, component)
                 if previous != component:
                     incomplete(scanner.name, f"Conflicting local reference: {component.bom_ref}")

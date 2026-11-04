@@ -745,3 +745,81 @@ def test_non_string_collection_mode_is_reviewed_not_a_crash(tmp_path, monkeypatc
         main, ["diff", str(path), str(path), "--json-output", "--fail-on-alert"]
     )
     assert run.exit_code == 1 and json.loads(run.stdout)["security_alerts"], run.output
+
+
+UNENCODABLE = {
+    "card-name": (".well-known/agent.json", '{"name": "a\\ud800", "url": "https://a.example"}'),
+    "card-version": (
+        ".well-known/agent.json",
+        '{"name": "a", "version": "1\\ud800", "url": "https://a.example"}',
+    ),
+    "skill-id-under-requirement": (
+        ".well-known/agent.json",
+        '{"name": "a", "url": "https://a.example", "securitySchemes": {"k": {"type": "apiKey"}},'
+        ' "skills": [{"id": "s\\ud800", "name": "n", "security": [{"k": []}]}]}',
+    ),
+    "interface-binding": (
+        ".well-known/agent.json",
+        '{"name": "a", "supportedInterfaces": [{"url": "https://a.example",'
+        ' "protocolBinding": "JSONRPC\\ud800", "protocolVersion": "1.0"}]}',
+    ),
+    "client-name": ("a2a.json", '{"clients": [{"name": "c\\ud800", "url": "https://a.example"}]}'),
+    "client-url-host": (
+        "a2a.json",
+        '{"clients": [{"name": "c", "url": "https://a\\ud800.example"}]}',
+    ),
+}
+
+
+@pytest.mark.parametrize("output_format", ["json", "cyclonedx", "spdx", "sarif"])
+@pytest.mark.parametrize("case", sorted(UNENCODABLE))
+def test_unencodable_text_never_crashes_an_export(tmp_path, case, output_format):
+    # Without a key nothing canonicalizes these values, and a lone surrogate cannot be
+    # encoded as UTF-8 by any export.
+    relative, content = UNENCODABLE[case]
+    project = tmp_path / "project"
+    (project / relative).parent.mkdir(parents=True, exist_ok=True)
+    (project / relative).write_text(content)
+    output = tmp_path / "out.json"
+    run = CliRunner().invoke(
+        main,
+        [
+            "scan",
+            str(project),
+            "--no-project-policy",
+            "--report-only",
+            "--scanner",
+            "a2a",
+            "-f",
+            output_format,
+            "-o",
+            str(output),
+        ],
+    )
+    assert run.exception is None or isinstance(run.exception, SystemExit), repr(run.exception)
+    assert run.exit_code == 0, run.output
+    output.read_text(encoding="utf-8")
+    if output_format == "json":
+        completeness = AIBOM.load(output).metadata.completeness
+        assert completeness is not None
+        assert "a2a: component text cannot be encoded for export" in completeness.scan_failures
+
+
+@pytest.mark.parametrize("command", ["validate", "risk"])
+def test_project_reconciliation_fails_closed_on_unencodable_local_text(tmp_path, command):
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    (clean / "agent.json").write_text('{"name": "a", "url": "https://a.example"}')
+    bom = tmp_path / "bom.json"
+    run = CliRunner().invoke(
+        main, ["scan", str(clean), "--no-project-policy", "--report-only", "-o", str(bom)]
+    )
+    assert run.exit_code == 0, run.output
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    (hostile / "agent.json").write_text('{"name": "a\\ud800", "url": "https://a.example"}')
+    run = CliRunner().invoke(
+        main, [command, str(bom), "--no-project-policy", "--project", str(hostile)]
+    )
+    assert run.exception is None or isinstance(run.exception, SystemExit), repr(run.exception)
+    assert run.exit_code == 1

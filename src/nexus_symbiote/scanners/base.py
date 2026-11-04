@@ -112,6 +112,19 @@ def hash_regular_file(path: Path, *, max_bytes: int = MAX_MODEL_BYTES) -> str:
     return digest
 
 
+def exportable(component: AnyComponent) -> bool:
+    """Whether every export can encode a component's text as UTF-8.
+
+    Collectors read JSON escapes and YAML as Python strings, which may hold lone
+    surrogates. Pydantic raises PydanticSerializationError, a ValueError, for them.
+    """
+    try:
+        component.model_dump_json()
+    except ValueError:
+        return False
+    return True
+
+
 def sanitized_origin(value: str) -> str:
     """Omit paths as well as userinfo, queries and fragments from URL output."""
     try:

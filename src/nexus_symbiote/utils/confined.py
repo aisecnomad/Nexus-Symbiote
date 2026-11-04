@@ -448,6 +448,13 @@ class ConfinedCollection:
                 child = relative / name
                 if self.excluded(child):
                     continue
+                try:
+                    name.encode("utf-8")
+                except UnicodeEncodeError:
+                    # os.scandir decodes such bytes to lone surrogates, which no export
+                    # can encode; report the parent, whose name is valid.
+                    self._fail(relative, "file name is not valid UTF-8")
+                    continue
                 metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 if stat.S_ISLNK(metadata.st_mode):
                     self._fail(child, "symlink excluded")
