@@ -556,23 +556,42 @@ def verify_artifact(
 
 @main.command("verify-export")
 @click.argument("export_path", type=click.Path(exists=True, dir_okay=False))
-@click.option("--format", "export_format", required=True, type=click.Choice(["cyclonedx", "spdx"]))
+@click.option(
+    "--format",
+    "export_format",
+    required=True,
+    type=click.Choice(["cyclonedx", "spdx"]),
+    help="Standard format of the received export.",
+)
 def verify_export(export_path: str, export_format: str) -> None:
-    """Check a standard export retains its native inventory and projection."""
+    """Check that a received export equals the projection of its embedded inventory."""
     from nexus_symbiote.core.hashing import parse_json_strict
     from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
     from nexus_symbiote.generators.spdx import SPDXGenerator
+    from nexus_symbiote.generators.validation import VerificationLimitError
     from nexus_symbiote.scanners.base import read_regular_text
 
     limit = 16 * 1024 * 1024
     try:
         text = read_regular_text(Path(export_path), max_bytes=limit)
+    except Exception as exc:
+        raise click.ClickException(
+            "Cannot read the export: a regular UTF-8 file of at most 16 MiB is required, "
+            "and no part of its path may be a symbolic link"
+        ) from exc
+    # Any exception raised by hostile input is a verification failure. Its text can
+    # quote the input, so only these fixed messages are printed.
+    try:
         document = parse_json_strict(text, max_bytes=limit)
         if not isinstance(document, dict):
             raise ValueError("export must be an object")
         generator = CycloneDXGenerator if export_format == "cyclonedx" else SPDXGenerator
         generator.recover(document)
-    except (OSError, UnicodeError, ValueError, TypeError, KeyError, RecursionError) as exc:
+    except VerificationLimitError as exc:
+        raise click.ClickException(
+            "Export exceeds the verification limits and was not verified"
+        ) from exc
+    except Exception as exc:
         raise click.ClickException(
             "Export or embedded native inventory failed verification"
         ) from exc

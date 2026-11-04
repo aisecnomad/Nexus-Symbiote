@@ -38,7 +38,11 @@ from nexus_symbiote.generators.package_identifiers import (
     package_identifier,
     package_identifier_properties,
 )
-from nexus_symbiote.generators.validation import require_valid
+from nexus_symbiote.generators.validation import (
+    require_inventory_limits,
+    require_received_limits,
+    require_valid,
+)
 
 COMPONENT_TYPE_MAP: dict[ComponentType, str] = {
     ComponentType.AGENT: "application",
@@ -100,16 +104,31 @@ class CycloneDXGenerator(Generator):
         ]
 
     @staticmethod
-    def _public_view(document: dict[str, Any]) -> dict[str, Any]:
+    def _public_view(document: dict[str, Any], native: AIBOM) -> dict[str, Any]:
         view = dict(document)
-        # The upstream SDK supplies the schema hint and an extra ref-only row
-        # for known components without emitted edges. Never discard targets.
+        # The upstream SDK supplies the schema hint and a ref-only row for each
+        # component without emitted edges. Such a row declares that the component
+        # has no dependencies, which a native depends-on edge contradicts even when
+        # its conditions keep it out of the standard graph. Never discard targets.
         if view.get("$schema") == "http://cyclonedx.org/schema/bom-1.7.schema.json":
             del view["$schema"]
         view.setdefault("components", [])
-        view["dependencies"] = [
-            edge for edge in view.get("dependencies", []) if set(edge) != {"ref"}
-        ]
+        dependent = {
+            edge.source_ref for edge in native.dependencies if edge.relationship == "depends-on"
+        }
+        independent = {component.bom_ref for component in native.components} - dependent
+        rows = view.get("dependencies", [])
+        if isinstance(rows, list):
+            view["dependencies"] = [
+                row
+                for row in rows
+                if not (
+                    isinstance(row, dict)
+                    and list(row) == ["ref"]
+                    and isinstance(row["ref"], str)
+                    and row["ref"] in independent
+                )
+            ]
         return view
 
     @classmethod
@@ -117,17 +136,32 @@ class CycloneDXGenerator(Generator):
         cls, document: dict[str, Any], *, allow_legacy_relationships: bool = False
     ) -> AIBOM:
         """Require agreement with the embedded inventory; legacy mode checks the exact old graph."""
-        require_valid(document, "cyclonedx")
-        recovered = recover_document(document.get("metadata", {}).get("properties", []))
+        require_received_limits(document, "cyclonedx")
+        metadata = document.get("metadata", {})
+        properties = metadata.get("properties", []) if isinstance(metadata, dict) else None
+        if not isinstance(properties, list) or not all(
+            isinstance(prop, dict)
+            and isinstance(prop.get("name"), str)
+            and isinstance(prop.get("value", ""), str)
+            for prop in properties
+        ):
+            raise ValueError("invalid CycloneDX metadata properties")
+        recovered = recover_document(properties)
+        require_inventory_limits(recovered)
         exporter = cls()
         expected = exporter._projection(recovered)
-        actual = cls._public_view(document)
+        actual = cls._public_view(document, recovered)
         if allow_legacy_relationships and unordered_projection(
             actual["dependencies"]
         ) == unordered_projection(cls._dependencies(recovered, historical=True)):
             expected["dependencies"] = actual["dependencies"]
-        if unordered_projection(actual) != unordered_projection(cls._public_view(expected)):
+        if unordered_projection(actual) != unordered_projection(
+            cls._public_view(expected, recovered)
+        ):
             raise ValueError("CycloneDX projection conflicts with the embedded native document")
+        # Costly schema validation runs only on what this generator emits for a
+        # bounded inventory, never on arbitrary received content.
+        require_valid(document, "cyclonedx")
         return recovered
 
     def _metadata(self, aibom: AIBOM) -> dict[str, Any]:

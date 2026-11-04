@@ -5,13 +5,63 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from importlib.resources import files
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from jsonschema import Draft7Validator, Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT7
 
 from nexus_symbiote.generators._spdx_dispatch import dispatched_spdx_schema
+
+if TYPE_CHECKING:
+    from nexus_symbiote.core.aibom import AIBOM
+
+# Received exports are checked against these limits before schema validation, whose
+# cost grows quadratically with CycloneDX components and dependency rows (uniqueItems)
+# and by up to a few tenths of a second per SPDX graph entry.
+MAX_RECEIVED_DEPTH = 32
+MAX_RECEIVED_VALUES = 1_000_000
+MAX_RECEIVED_COMPONENTS = 2_000
+MAX_RECEIVED_SPDX_ELEMENTS = 1_000
+MAX_RECEIVED_RELATIONSHIPS = 10_000
+
+
+class VerificationLimitError(ValueError):
+    """A received export is larger than verification accepts."""
+
+
+def require_received_limits(document: Any, fmt: str) -> None:
+    """Refuse an oversized received export before any costly or recursive check."""
+    pending: list[tuple[Any, int]] = [(document, 1)]
+    remaining = MAX_RECEIVED_VALUES
+    while pending:
+        value, depth = pending.pop()
+        if isinstance(value, dict | list):
+            remaining -= len(value)
+            if depth > MAX_RECEIVED_DEPTH or remaining < 0:
+                raise VerificationLimitError("export exceeds the verification limits")
+            children = value.values() if isinstance(value, dict) else value
+            pending.extend((child, depth + 1) for child in children)
+    if not isinstance(document, dict):
+        raise ValueError("export must be a JSON object")
+    if fmt == "spdx":
+        collections = [(document.get("@graph"), MAX_RECEIVED_SPDX_ELEMENTS)]
+    else:
+        collections = [
+            (document.get("components"), MAX_RECEIVED_COMPONENTS),
+            (document.get("dependencies"), MAX_RECEIVED_COMPONENTS),
+        ]
+    if any(isinstance(items, list) and len(items) > limit for items, limit in collections):
+        raise VerificationLimitError("export exceeds the verification limits")
+
+
+def require_inventory_limits(bom: AIBOM) -> None:
+    """Bound the projection rebuilt from an embedded, unauthenticated inventory."""
+    if (
+        len(bom.components) > MAX_RECEIVED_COMPONENTS
+        or len(bom.dependencies) > MAX_RECEIVED_RELATIONSHIPS
+    ):
+        raise VerificationLimitError("embedded inventory exceeds the verification limits")
 
 
 def _schema(name: str) -> dict[str, Any]:
@@ -101,17 +151,17 @@ def validate_spdx(document: dict[str, Any]) -> list[str]:
                 )
                 if isinstance(value, str) and value not in known and not standard_license:
                     errors.append(f"unresolved SPDX {field}: {value}")
+    outgoing: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for node in graph:
+        source, kind = node.get("from"), node.get("relationshipType")
+        if node.get("type") == "Relationship" and isinstance(source, str) and isinstance(kind, str):
+            outgoing.setdefault((source, kind), []).append(node)
     for package in graph:
         if package.get("type") not in {"ai_AIPackage", "dataset_DatasetPackage"}:
             continue
         for kind in ("hasDeclaredLicense", "hasConcludedLicense"):
-            relations = [
-                node
-                for node in graph
-                if node.get("type") == "Relationship"
-                and node.get("from") == package.get("spdxId")
-                and node.get("relationshipType") == kind
-            ]
+            package_id = package.get("spdxId")
+            relations = outgoing.get((package_id, kind), []) if isinstance(package_id, str) else []
             if len(relations) != 1 or len(relations[0].get("to", [])) != 1:
                 errors.append(f"SPDX {package.get('spdxId')} requires exactly one {kind} target")
     return errors

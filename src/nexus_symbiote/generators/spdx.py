@@ -28,7 +28,11 @@ from nexus_symbiote.generators.package_identifiers import (
     package_identifier,
     package_identifier_properties,
 )
-from nexus_symbiote.generators.validation import require_valid
+from nexus_symbiote.generators.validation import (
+    require_inventory_limits,
+    require_received_limits,
+    require_valid,
+)
 
 SPDX_TYPE_MAP = {
     ComponentType.AGENT: "ai_AIPackage",
@@ -41,6 +45,10 @@ SPDX_TYPE_MAP = {
 
 
 NO_ASSERTION_LICENSE = "https://spdx.org/rdf/3.0.1/terms/Licensing/NoAssertion"
+
+
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
 
 
 def _extension(properties: list[dict[str, str]]) -> list[dict[str, Any]]:
@@ -104,14 +112,15 @@ class SPDXGenerator(Generator):
             "summary": aibom.metadata.tool_version,
         }
         assert aibom.metadata.timestamp is not None
+        try:
+            created = aibom.metadata.timestamp.astimezone(UTC)
+        except OverflowError as exc:
+            raise ValueError("export timestamp cannot be represented in UTC") from exc
         creation = {
             "type": "CreationInfo",
             "@id": ci,
             "specVersion": "3.0.1",
-            "created": aibom.metadata.timestamp.astimezone(UTC)
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z"),
+            "created": created.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             "createdBy": [producer_id],
             "createdUsing": [tool_id],
         }
@@ -284,32 +293,43 @@ class SPDXGenerator(Generator):
 
     @staticmethod
     def recover(document: dict[str, Any]) -> AIBOM:
-        require_valid(document, "spdx")
-        docs = [node for node in document["@graph"] if node["type"] == "SpdxDocument"]
+        require_received_limits(document, "spdx")
+        graph = document.get("@graph")
+        if not isinstance(graph, list) or not all(isinstance(node, dict) for node in graph):
+            raise ValueError("expected an SPDX graph of objects")
+        docs = [node for node in graph if node.get("type") == "SpdxDocument"]
         if len(docs) != 1:
             raise ValueError("expected exactly one SPDX document")
         doc = docs[0]
-        namespace, separator, _revision = doc["spdxId"].rpartition("/document/")
+        spdx_id = doc.get("spdxId")
+        identifier = spdx_id if isinstance(spdx_id, str) else ""
+        namespace, separator, _revision = identifier.rpartition("/document/")
         if not namespace or not separator:
             raise ValueError("unrecognized SPDX export document identifier")
         properties = [
             {"name": prop["extension_cdxPropName"], "value": prop.get("extension_cdxPropValue", "")}
-            for extension in doc.get("extension", [])
+            for extension in _list(doc.get("extension"))
             if isinstance(extension, dict)
             and extension.get("type") == "extension_CdxPropertiesExtension"
-            for prop in extension.get("extension_cdxProperty", [])
+            for prop in _list(extension.get("extension_cdxProperty"))
             if isinstance(prop, dict) and "extension_cdxPropName" in prop
         ]
+        if not all(isinstance(p["name"], str) and isinstance(p["value"], str) for p in properties):
+            raise ValueError("invalid SPDX extension properties")
         recovered = recover_document(properties)
+        require_inventory_limits(recovered)
         expected = SPDXGenerator(namespace)._projection(recovered)
         # A conforming JSON-LD consumer can omit an empty root element set.
         actual = {
             **document,
             "@graph": [
                 {**node, "rootElement": node.get("rootElement", [])} if node is doc else node
-                for node in document["@graph"]
+                for node in graph
             ],
         }
         if unordered_projection(actual) != unordered_projection(expected):
             raise ValueError("SPDX projection conflicts with the embedded native document")
+        # Costly schema validation runs only on what this generator emits for a
+        # bounded inventory, never on arbitrary received content.
+        require_valid(document, "spdx")
         return recovered

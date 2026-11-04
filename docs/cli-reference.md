@@ -287,21 +287,6 @@ nexus-symbiote verify-artifact [OPTIONS] ARTIFACT_PATH
 | `--signer-identity` `TEXT` | Expected Sigstore signing identity |
 | `--issuer` `TEXT` | Expected Sigstore OIDC issuer |
 
-### `verify-export`
-
-Check a CycloneDX or SPDX export against its embedded native inventory. The
-command fails if required extension properties are missing or the standard
-projection disagrees with the embedded inventory. A match does not authenticate
-the producer or establish that the inventory is complete.
-
-```text
-nexus-symbiote verify-export --format cyclonedx|spdx EXPORT_PATH
-```
-
-| Option | Description |
-|---|---|
-| `--format` | Required export format: `cyclonedx` or `spdx` |
-
 ### `verify-discovery`
 
 Verify source bytes and optionally their native projection and producer.
@@ -316,6 +301,36 @@ nexus-symbiote verify-discovery [OPTIONS] AIBOM_PATH REPORT_PATH
 | `--bundle` `FILE` | Verify the report producer's Sigstore bundle and the direct native projection. |
 | `--signer-identity` `TEXT` | Expected report signer from operator policy. |
 | `--issuer` `TEXT` | Expected OIDC issuer from operator policy. |
+
+### `verify-export`
+
+Check that a received export equals the projection of its embedded inventory.
+
+The command parses the file strictly, rejecting duplicate object keys, recovers
+the embedded `nexus-symbiote:document` and checks its digest. It regenerates the
+standard projection with the installed version, requires the whole received
+document to equal it, then validates it against the pinned schema. It tolerates
+only array order and the few differences listed in
+[export portability](export-portability.md#verifying-a-received-export). Added
+standard data, such as a `vulnerabilities` array, and exports from versions with a
+different projection fail. A match does not authenticate the producer or establish
+that the inventory is complete or accurate.
+
+```text
+nexus-symbiote verify-export [OPTIONS] EXPORT_PATH
+```
+
+| Option | Description |
+|---|---|
+| `--format` `cyclonedx\|spdx` | Standard format of the received export. (required) |
+
+If the export cannot be verified, the command exits 1 with one of three fixed
+messages that never quote the input: the file could not be read, the export
+exceeds the [verification limits](export-portability.md#verification-limits), or
+verification failed. The file must be a regular UTF-8 file of at most 16 MiB,
+opened without following a symbolic link in any part of its absolute path; a
+relative path starts at the physical working directory. On macOS, for example,
+pass `/private/tmp/...` rather than `/tmp/...`.
 
 ### `verify-live`
 
