@@ -6,8 +6,10 @@ checks for model signing, and computes weight hashes.
 
 from __future__ import annotations
 
+import builtins
 import hashlib
 import io
+import json
 import os
 import pickletools
 import zipfile
@@ -45,12 +47,11 @@ MODEL_EXTENSIONS = {
     ".h5": ("hdf5", "keras-hdf5"),
     ".hdf5": ("hdf5", "keras-hdf5"),
     ".keras": ("keras", "keras"),
-    ".sav": ("pickle", "pickle"),
-    ".dill": ("pickle", "dill"),
+    ".dill": ("dill", "dill"),
 }
 # Pickle and joblib dumps are often compressed; their loaders decompress and unpickle.
 _COMPRESSED_PICKLE_SUFFIXES = frozenset({".gz", ".bz2", ".xz", ".lzma", ".z"})
-_COMPRESSIBLE_PICKLE_SUFFIXES = frozenset({".pkl", ".pickle", ".joblib", ".sav", ".dill"})
+_COMPRESSIBLE_PICKLE_SUFFIXES = frozenset({".pkl", ".pickle", ".joblib", ".dill"})
 # Generic protobuf files are not models; only the SavedModel graph name is.
 NAMED_MODEL_FILES = {"saved_model.pb": ("pb", "tensorflow-savedmodel")}
 
@@ -102,14 +103,15 @@ _UNSAFE_SUFFIXES = {
     ".joblib",
     ".ckpt",
     ".pdparams",
-    ".sav",
     ".dill",
 }
 # Formats first inventoried with these keys use the root-relative path as their
 # subject: fixed file names (saved_model.pb) and versioned layouts such as
 # <model>/<version>/ or lightning_logs/version_N/checkpoints/ would otherwise
 # collide on the parent directory's name.
-_PATH_SUBJECT_FORMATS = frozenset({"ckpt", "pdparams", "hdf5", "keras", "pb", "compressed-pickle"})
+_PATH_SUBJECT_FORMATS = frozenset(
+    {"ckpt", "pdparams", "hdf5", "keras", "pb", "dill", "compressed-pickle"}
+)
 _HDF5_SUFFIXES = frozenset({".h5", ".hdf5"})
 _HDF5_SIGNATURE = b"\x89HDF\r\n\x1a\n"
 # Keras stores these as HDF5 attribute names. Only a full-model save has a model
@@ -121,7 +123,9 @@ _HDF5_UNMARKED = "HDF5 container without Keras model configuration or weights ma
 _MAX_KERAS_MEMBERS = 10_000
 _MAX_KERAS_CONFIG_BYTES = 16 * 1024 * 1024
 _MAX_KERAS_CONFIG_NODES = 1_000_000
-_MAX_KERAS_INSPECTION_BYTES = 64 * 1024 * 1024
+# A Keras archive holds config.json, metadata.json and the weights. Exceeding these
+# bounds on a readable archive is treated as evasion, never as "unknown".
+_MAX_KERAS_INSPECTION_BYTES = 24 * 1024 * 1024
 
 
 def _name_suffix(path: Path) -> str:
@@ -130,8 +134,15 @@ def _name_suffix(path: Path) -> str:
     return path.suffix.lower() or (name if name.startswith(".") and name.count(".") == 1 else "")
 
 
+def _name_suffixes(path: Path) -> list[str]:
+    name = path.name.lower()
+    if name.startswith("."):
+        return ["." + part for part in name[1:].split(".")]
+    return [suffix.lower() for suffix in path.suffixes]
+
+
 def _compressed_pickle(path: Path) -> bool:
-    suffixes = [suffix.lower() for suffix in path.suffixes[-2:]]
+    suffixes = _name_suffixes(path)[-2:]
     return (
         len(suffixes) == 2
         and suffixes[1] in _COMPRESSED_PICKLE_SUFFIXES
@@ -146,13 +157,39 @@ def model_format(path: Path) -> tuple[str, str] | None:
     return MODEL_EXTENSIONS.get(_name_suffix(path)) or NAMED_MODEL_FILES.get(path.name.lower())
 
 
+class _Members(dict[str, Any]):
+    """A JSON object that also keeps every member, including duplicate keys."""
+
+    def __init__(self, members: list[tuple[str, Any]]) -> None:
+        super().__init__(members)
+        self.members = members
+
+
+_CODE_LAYERS = frozenset({"Lambda", "__lambda__", "TFOpLambda"})
+_KERAS_PACKAGES = frozenset({"keras", "tf_keras", "keras_hub", "keras_nlp", "keras_cv"})
+
+
+def _foreign_function(module: str, names: list[Any]) -> bool:
+    if module.split(".", 1)[0] in _KERAS_PACKAGES:
+        return False
+    if module == "builtins":
+        # Keras serializes its own losses and metrics with module "builtins" and resolves
+        # them in its namespaces first; only a name defined by Python's builtins module
+        # can reach Python code there.
+        return not names or any(
+            not isinstance(name, str) or hasattr(builtins, name) for name in names
+        )
+    return True
+
+
 def _keras_config_executes(document: object) -> bool:
     """Report Keras configuration constructs that carry or reference code to run.
 
-    Lambda layers carry serialized Python code, and a function reference outside
-    Keras names arbitrary code for the loader to import (CVE-2025-1550). Classes
-    from extension libraries such as KerasHub are not flagged. Oversized
-    configurations fail closed.
+    Lambda layers carry serialized Python code, and a function reference outside the
+    Keras packages names arbitrary code for the loader to import (CVE-2025-1550).
+    Every value of a duplicated key is examined. Classes are not flagged, so models
+    from extension libraries such as KerasHub stay unknown. Oversized configurations
+    fail closed.
     """
     pending = [document]
     visited = 0
@@ -162,21 +199,27 @@ def _keras_config_executes(document: object) -> bool:
         if visited > _MAX_KERAS_CONFIG_NODES:
             return True
         if isinstance(node, dict):
-            module = node.get("module")
-            class_name = node.get("class_name")
-            if class_name in {"Lambda", "__lambda__", "TFOpLambda"}:
+            members = node.members if isinstance(node, _Members) else list(node.items())
+            values: dict[str, list[Any]] = {}
+            for key, value in members:
+                values.setdefault(key, []).append(value)
+            class_names = [name for name in values.get("class_name", []) if isinstance(name, str)]
+            if _CODE_LAYERS.intersection(class_names):
                 return True
-            if (
-                class_name == "function"
-                and isinstance(module, str)
-                and module != "keras"
-                and not module.startswith("keras.")
+            if "function" in class_names and any(
+                _foreign_function(module, values.get("config", []))
+                for module in values.get("module", [])
+                if isinstance(module, str)
             ):
                 return True
-            pending.extend(node.values())
+            pending.extend(value for _, value in members)
         elif isinstance(node, list):
             pending.extend(node)
     return False
+
+
+class _InspectionBudgetError(OSError):
+    """The archive needs more inspection than any ordinary Keras archive."""
 
 
 class _ArchiveView(io.RawIOBase):
@@ -208,7 +251,10 @@ class _ArchiveView(io.RawIOBase):
         return self._stream.tell() if self._stream.seekable() else os.lseek(self._fd, 0, 1)
 
     def read(self, size: int | None = -1) -> bytes:
-        wanted = self._budget if size is None or size < 0 else min(size, self._budget)
+        unbounded = size is None or size < 0
+        if not unbounded and size is not None and size > self._budget:
+            raise _InspectionBudgetError("archive inspection byte limit exceeded")
+        wanted = self._budget if unbounded or size is None else size
         chunks = []
         while wanted > 0:
             chunk = self._stream.read(min(wanted, 1024 * 1024))
@@ -217,8 +263,8 @@ class _ArchiveView(io.RawIOBase):
             chunks.append(chunk)
             wanted -= len(chunk)
             self._budget -= len(chunk)
-        if size is not None and size > 0 and wanted > 0 and self._budget == 0:
-            raise OSError("archive inspection byte limit exceeded")
+        if unbounded and self._budget == 0 and self._stream.read(1):
+            raise _InspectionBudgetError("archive inspection byte limit exceeded")
         return b"".join(chunks)
 
 
@@ -226,14 +272,21 @@ def _inspect_keras_archive(stream: BinaryIO) -> tuple[SerializationSafety, str]:
     """Inspect a Keras v3 archive's members and configuration without loading it.
 
     The stream is the pinned descriptor that was hashed, so no pathname is reopened.
+    The configuration is parsed exactly as Keras parses it: json.loads on the raw
+    bytes, where the last duplicate key wins and NaN or oversized integers are valid.
     """
+    over_budget = (
+        SerializationSafety.UNSAFE_CODE_EXECUTION,
+        "Keras archive exceeds the inspection limits of an ordinary archive; its "
+        "configuration cannot be ruled out as code-carrying",
+    )
     try:
         view = _ArchiveView(stream, _MAX_KERAS_INSPECTION_BYTES)
         view.seek(0)
         with zipfile.ZipFile(cast(BinaryIO, view)) as archive:
             members = archive.infolist()
             if len(members) > _MAX_KERAS_MEMBERS:
-                return SerializationSafety.UNKNOWN, "Keras archive exceeds the member limit"
+                return over_budget
             names = [member.filename for member in members]
             if len(names) != len(set(names)):
                 # zipfile and Keras read the last duplicate; a reviewer may see the first.
@@ -251,11 +304,13 @@ def _inspect_keras_archive(stream: BinaryIO) -> tuple[SerializationSafety, str]:
             with archive.open("config.json") as member:
                 raw = member.read(_MAX_KERAS_CONFIG_BYTES + 1)
         if len(raw) > _MAX_KERAS_CONFIG_BYTES:
-            return SerializationSafety.UNKNOWN, "Keras configuration exceeds the inspection limit"
-        document = parse_json_strict(raw, max_bytes=_MAX_KERAS_CONFIG_BYTES)
+            return over_budget
+    except _InspectionBudgetError:
+        return over_budget
     except (
         OSError,
         ValueError,
+        OverflowError,
         RuntimeError,
         NotImplementedError,
         EOFError,
@@ -264,6 +319,11 @@ def _inspect_keras_archive(stream: BinaryIO) -> tuple[SerializationSafety, str]:
         zlib.error,
     ):
         return SerializationSafety.UNKNOWN, "Malformed or unsupported Keras archive"
+    try:
+        document = json.loads(raw, object_pairs_hook=_Members)
+    except (ValueError, RecursionError):
+        # Keras cannot load a configuration that json.loads rejects.
+        return SerializationSafety.UNKNOWN, "Keras configuration is not loadable JSON"
     if _keras_config_executes(document):
         return (
             SerializationSafety.UNSAFE_CODE_EXECUTION,
@@ -525,7 +585,13 @@ class ModelScanner(Scanner):
         components: list[ModelComponent] = []
         model_name = model_dir.name
 
-        config = self._read_model_config(model_dir)
+        formats = {
+            detected[0]
+            for path in self._discovered_paths
+            if path.parent == model_dir and (detected := model_format(path)) is not None
+        }
+        # An HDF5 file is often a dataset; a JSON list beside it is not a model claim.
+        config = self._read_model_config(model_dir, strict=formats != {"hdf5"})
         tokenizer_hash = self._hash_tokenizer(model_dir)
         chat_template_hash = self._hash_chat_template(model_dir, config)
 
@@ -575,7 +641,7 @@ class ModelScanner(Scanner):
 
             subject = (
                 path.relative_to(self._files.root).as_posix()
-                if fmt_key in _PATH_SUBJECT_FORMATS
+                if fmt_key in _PATH_SUBJECT_FORMATS or not path.suffix
                 else f"{model_name}/{path.name}"
             )
             comp = ModelComponent(
@@ -603,7 +669,7 @@ class ModelScanner(Scanner):
 
         return components
 
-    def _read_model_config(self, model_dir: Path) -> dict[str, Any] | None:
+    def _read_model_config(self, model_dir: Path, *, strict: bool = True) -> dict[str, Any] | None:
         if self._files is None:
             raise RuntimeError("_read_model_config called outside a _collection context")
         for cfg_name in MODEL_CONFIG_FILES:
@@ -611,7 +677,8 @@ class ModelScanner(Scanner):
             if cfg_path in self._discovered_paths:
                 data = self._files.read_json(cfg_path)
                 if data is not None and not isinstance(data, dict):
-                    self._files._fail(cfg_path, "model configuration must be an object")
+                    if strict:
+                        self._files._fail(cfg_path, "model configuration must be an object")
                     continue
                 if isinstance(data, dict):
                     invalid_fields = [
