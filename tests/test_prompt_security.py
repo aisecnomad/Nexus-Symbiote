@@ -146,3 +146,44 @@ class TestPromptScannerTrojanDetection:
             )
             == 0
         )
+
+
+def _hidden_findings(tmp_path, text: str) -> list[tuple[str, str]]:
+    (tmp_path / "CLAUDE.md").write_text(text, encoding="utf-8")
+    comp = PromptScanner().scan(tmp_path).components[0]
+    return [
+        (r.severity.value, r.category)
+        for r in comp.risks
+        if r.category in ("invisible_characters", "bidi_override", "tag_characters")
+    ]
+
+
+class TestInstructionFilesUseToolTextRules:
+    """Instruction files classify hidden characters like MCP tool definitions."""
+
+    @staticmethod
+    def _carried(carrier: str) -> str:
+        payload = b"rm -rf ~"
+        return "".join(
+            carrier + (chr(0xFE00 + byte) if byte < 16 else chr(0xE0100 + byte - 16))
+            for byte in payload
+        )
+
+    def test_variation_selector_payload_is_reported(self, tmp_path):
+        text = "Read a file" + self._carried("⠀")
+        assert _hidden_findings(tmp_path, text) == [("high", "invisible_characters")]
+
+    def test_other_format_characters_are_reported(self, tmp_path):
+        risks = detect_invisible_characters("Read⁡ a file", "CLAUDE.md")
+        assert [(r.severity.value, r.category) for r in risks] == [("high", "invisible_characters")]
+        assert "format characters" in risks[0].detail
+
+    def test_zero_width_joiner_inside_emoji_sequence_is_not_reported(self, tmp_path):
+        assert _hidden_findings(tmp_path, "Family \U0001f468‍\U0001f469 rules") == []
+
+    def test_leading_byte_order_mark_is_not_reported(self, tmp_path):
+        assert _hidden_findings(tmp_path, "﻿You are a helpful assistant.") == []
+
+    def test_byte_order_mark_after_the_start_is_reported(self, tmp_path):
+        text = "﻿﻿You are helpful."
+        assert _hidden_findings(tmp_path, text) == [("high", "invisible_characters")]

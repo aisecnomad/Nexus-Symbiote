@@ -8,6 +8,7 @@ from pathlib import Path
 from nexus_symbiote.core.enums import RiskSeverity, TrustTier
 from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.models import PromptComponent, RiskAssessment, SkillPackageComponent
+from nexus_symbiote.core.textsafety import hidden_character_kinds
 from nexus_symbiote.scanners.base import Scanner, ScanResult, case_variants
 
 INVISIBLE_CHARS: dict[str, str] = {
@@ -38,24 +39,31 @@ def detect_invisible_characters(content: str, source_name: str) -> list[RiskAsse
 
     Checks for zero-width characters, bidirectional overrides, and deprecated
     tag characters — all of which are invisible in most editors and can alter
-    LLM interpretation of prompts.
+    LLM interpretation of prompts. Other hidden characters follow the rules for
+    MCP tool text, so variation selectors without a matching base are reported
+    and a zero-width joiner inside an emoji sequence is not.
     """
     risks: list[RiskAssessment] = []
 
-    found_invisible = []
-    for char, name in INVISIBLE_CHARS.items():
-        count = content.count(char)
-        if count > 0:
-            found_invisible.append(f"{name} (U+{ord(char):04X}) x{count}")
-
-    if found_invisible:
+    # Editors commonly save a leading byte order mark, and it hides nothing.
+    if "invisible" in hidden_character_kinds(content.removeprefix("\ufeff")):
+        found_invisible = []
+        for char, name in INVISIBLE_CHARS.items():
+            count = content.count(char)
+            if count > 0:
+                found_invisible.append(f"{name} (U+{ord(char):04X}) x{count}")
+        listed = (
+            ", ".join(found_invisible)
+            if found_invisible
+            else "variation selectors or other format characters"
+        )
         risks.append(
             RiskAssessment(
                 severity=RiskSeverity.HIGH,
                 category="invisible_characters",
                 detail=(
                     f"'{source_name}' contains invisible Unicode characters: "
-                    f"{', '.join(found_invisible)}. "
+                    f"{listed}. "
                     "These are invisible in most editors and may alter LLM behavior."
                 ),
                 recommendation="Remove all zero-width characters or document their purpose.",
