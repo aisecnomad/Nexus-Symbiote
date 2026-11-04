@@ -31,7 +31,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError
 
 from nexus_symbiote.core.hashing import hash_canonical
@@ -39,6 +39,10 @@ from nexus_symbiote.utils.secrets import redact_descriptor, redact_text
 
 PROTOCOL_VERSION = "2025-06-18"
 _RESOLVER_SLOTS = threading.BoundedSemaphore(2)
+# Meta-validate tool schemas with the "regex" check of every install, never whatever
+# format checkers happen to be installed: with rfc3986-validator, "$ref" values that
+# jsonschema resolves fail "uri-reference", and None would skip invalid patterns.
+SCHEMA_FORMAT_CHECKER = FormatChecker(formats=("regex",))
 
 
 class DiscoveryError(ValueError):
@@ -485,7 +489,7 @@ def _tool(raw: Any, secrets: list[str]) -> ObservedTool:
             if not isinstance(schema, dict) or schema.get("type") != "object":
                 raise DiscoveryError("tool schemas must declare object type")
             try:
-                Draft202012Validator.check_schema(schema)
+                Draft202012Validator.check_schema(schema, format_checker=SCHEMA_FORMAT_CHECKER)
             except (SchemaError, RecursionError) as exc:
                 raise DiscoveryError("invalid MCP tool JSON Schema") from exc
     annotations = raw.get("annotations", {})

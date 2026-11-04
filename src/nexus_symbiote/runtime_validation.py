@@ -131,9 +131,10 @@ def validate_arguments(schema: Any, arguments: dict[str, Any]) -> None:
 def _disable_unused_format_checkers() -> None:
     """Keep optional format checkers out of the worker before jsonschema loads.
 
-    The worker never asserts "format" (no FormatChecker), so these modules cannot
-    change a result. Some do expensive import-time work (rfc3987-syntax compiles a
-    grammar), which would spend the CPU budget meant for the untrusted input.
+    Meta-validation checks only "regex" and argument validation asserts no format,
+    so these modules cannot change a result. Some do expensive import-time work
+    (rfc3987-syntax compiles a grammar), which would spend the CPU budget meant for
+    the untrusted input.
     """
     for name in _UNUSED_FORMAT_MODULES:
         sys.modules[name] = None  # type: ignore[assignment]
@@ -150,7 +151,7 @@ def _worker() -> int:
         resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         _disable_unused_format_checkers()
-        from jsonschema import Draft202012Validator
+        from jsonschema import Draft202012Validator, FormatChecker
         from referencing import Registry
 
         maximum = MAX_SCHEMA_BYTES + MAX_ARGUMENT_BYTES + 64
@@ -165,7 +166,7 @@ def _worker() -> int:
             return 1
         check_json_budget(schema, maximum=MAX_SCHEMA_BYTES)
         check_json_budget(arguments, maximum=MAX_ARGUMENT_BYTES)
-        Draft202012Validator.check_schema(schema)
+        Draft202012Validator.check_schema(schema, format_checker=FormatChecker(formats=("regex",)))
         Draft202012Validator(schema, registry=Registry()).validate(arguments)
         sys.stdout.buffer.write(_VALID)
         return 0

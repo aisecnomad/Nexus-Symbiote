@@ -18,6 +18,7 @@ from nexus_symbiote.core.hashing import (
 from nexus_symbiote.core.models import MCPServerComponent, ToolComponent
 from nexus_symbiote.graph import validate_graph
 from nexus_symbiote.live.stdio import list_pinned_tools
+from nexus_symbiote.scanners.live_mcp import SCHEMA_FORMAT_CHECKER
 from nexus_symbiote.utils.secrets import redact_descriptor
 
 
@@ -156,7 +157,7 @@ def verify_mcp_servers(
                 schema = tool.get("inputSchema")
                 if not isinstance(schema, dict) or schema.get("type") != "object":
                     raise ValueError("MCP tools require an object input schema")
-                Draft202012Validator.check_schema(schema)
+                Draft202012Validator.check_schema(schema, format_checker=SCHEMA_FORMAT_CHECKER)
                 for hint in ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"):
                     if annotations and hint in annotations and type(annotations[hint]) is not bool:
                         raise ValueError("invalid MCP annotation hint")

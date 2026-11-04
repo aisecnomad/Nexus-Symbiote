@@ -6,8 +6,9 @@ metaschema. These checkers must not come with the core dependencies, which the
 GitHub Action's lock also installs. rfc3987-syntax checks each "iri-reference" with
 an Earley parser that spends about half a millisecond of CPU and 16 KB of memory per
 character, so one long IRI in a received export could exhaust the host. With
-rfc3986-validator, check_schema() asserts "uri-reference" on "$ref" and "$id", so live
-discovery would refuse tool schemas that jsonschema resolves and the runtime
+rfc3986-validator, a plain check_schema() asserts "uri-reference" on "$ref" and "$id",
+so tool schemas are meta-validated with a checker limited to "regex" instead; otherwise
+live discovery would refuse tool schemas that jsonschema resolves and the runtime
 validation worker accepts. The GPL-licensed rfc3987 checks the same formats.
 
 The behavioral tests run in a simulated core install: a subprocess that hides every
@@ -26,6 +27,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from jsonschema import FormatChecker
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
@@ -175,3 +177,25 @@ def test_runtime_worker_resolves_a_ref_that_is_not_a_uri_reference():
         validate_arguments(
             ORDER_INPUT, {"billing address": address, "shipping address": {"city": "Lyon"}}
         )
+
+
+@pytest.mark.skipif(
+    "uri-reference" not in FormatChecker().checkers,
+    reason="needs an install whose jsonschema asserts uri-reference, as the dev extras do",
+)
+def test_installed_format_checkers_do_not_refuse_tool_schemas(monkeypatch):
+    from nexus_symbiote.core.aibom import AIBOM
+    from nexus_symbiote.core.models import MCPServerComponent
+    from nexus_symbiote.live import verify
+    from nexus_symbiote.scanners.live_mcp import DiscoveryError, _tool
+
+    assert [_tool(tool, []).name for tool in TOOLS] == ["create_order", "describe_city"]
+    monkeypatch.setattr(verify, "fetch_tools_from_config", lambda *a, **k: ("stdio", TOOLS))
+    server = MCPServerComponent(bom_ref="mcp:orders", name="orders")
+    assert verify.verify_mcp_servers(AIBOM(components=[server])).complete is True
+    bad_pattern = {"type": "object", "properties": {"q": {"type": "string", "pattern": "("}}}
+    with pytest.raises(DiscoveryError):
+        _tool({"name": "search", "inputSchema": bad_pattern}, [])
+    bad_tool = {"name": "search", "inputSchema": bad_pattern}
+    monkeypatch.setattr(verify, "fetch_tools_from_config", lambda *a, **k: ("stdio", [bad_tool]))
+    assert verify.verify_mcp_servers(AIBOM(components=[server])).complete is False
