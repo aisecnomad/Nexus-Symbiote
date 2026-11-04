@@ -70,25 +70,14 @@ neither makes a guessable key safe:
   candidates.
 
 An invalid key fails collection with a message that names the variable and never
-contains the key. Each collector reports it once. The A2A collector keeps the
-unbound declarations in the inventory:
+contains the key. The A2A collector reports it once and keeps the unbound
+declarations in the inventory:
 
 ```text
 NEXUS_SYMBIOTE_SOURCE_BINDING_KEY is not valid random key material; A2A declarations were not bound
 ```
 
-The MCP collector leaves the configured servers and their tools out of the
-inventory:
-
-```text
-NEXUS_SYMBIOTE_SOURCE_BINDING_KEY is not valid random key material; MCP servers were not collected
-```
-
-With a valid key, an MCP server declaration that RFC 8785 cannot canonicalize,
-such as one with an integer beyond 2^53, a non-finite or overflowing number or a
-TOML date, fails that server alone with
-`<file>: MCP server declaration cannot be canonicalized for binding`.
-
+The MCP collector records each affected server as an invalid tool definition.
 Moving from an older key to a new one changes every binding: recollect the
 baseline and its candidates with the new key. Earlier builds used the key without
 deriving one from it, so their snapshots carry a different key identifier and

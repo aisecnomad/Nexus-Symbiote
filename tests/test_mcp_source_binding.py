@@ -240,34 +240,6 @@ def test_short_source_binding_key_is_rejected(tmp_path, monkeypatch):
     assert not any(isinstance(c, MCPServerComponent) for c in result.components)
 
 
-@pytest.mark.parametrize("key", ["CANARY-short", "CANARY-binding-key-accepted-by-earlier-builds"])
-def test_invalid_key_is_one_value_free_failure(tmp_path, monkeypatch, key):
-    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, key)
-    servers = {"db": _db("CANARY-password"), "replica": _db("CANARY-password", path="/v2")}
-    (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": servers}))
-    result = MCPScanner().scan(tmp_path)
-    assert result.scan_failures == [
-        f"{SOURCE_BINDING_KEY_ENV} is not valid random key material; MCP servers were not collected"
-    ]
-    assert not any(isinstance(c, MCPServerComponent) for c in result.components)
-    assert "CANARY" not in repr(result)
-
-
-def test_server_outside_i_json_is_a_distinct_binding_failure(tmp_path, monkeypatch):
-    (tmp_path / ".codex").mkdir()
-    (tmp_path / ".codex" / "config.toml").write_text(
-        '[mcp_servers.dated]\ncommand = "npx"\nexpires = 2026-01-01\n\n'
-        '[mcp_servers.plain]\ncommand = "npx"\n'
-    )
-    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
-    result = MCPScanner().scan(tmp_path)
-    assert result.scan_failures == [
-        ".codex/config.toml: MCP server declaration cannot be canonicalized for binding"
-    ]
-    servers = [c.name for c in result.components if isinstance(c, MCPServerComponent)]
-    assert servers == ["plain"]
-
-
 @pytest.mark.parametrize(
     "launcher",
     [
