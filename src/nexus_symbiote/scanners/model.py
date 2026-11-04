@@ -10,9 +10,11 @@ import hashlib
 import io
 import os
 import pickletools
+import zipfile
+import zlib
 from collections.abc import Sequence
 from contextlib import nullcontext
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, cast
 
 from nexus_symbiote.core.enums import (
@@ -43,7 +45,12 @@ MODEL_EXTENSIONS = {
     ".h5": ("hdf5", "keras-hdf5"),
     ".hdf5": ("hdf5", "keras-hdf5"),
     ".keras": ("keras", "keras"),
+    ".sav": ("pickle", "pickle"),
+    ".dill": ("pickle", "dill"),
 }
+# Pickle and joblib dumps are often compressed; their loaders decompress and unpickle.
+_COMPRESSED_PICKLE_SUFFIXES = frozenset({".gz", ".bz2", ".xz", ".lzma", ".z"})
+_COMPRESSIBLE_PICKLE_SUFFIXES = frozenset({".pkl", ".pickle", ".joblib", ".sav", ".dill"})
 # Generic protobuf files are not models; only the SavedModel graph name is.
 NAMED_MODEL_FILES = {"saved_model.pb": ("pb", "tensorflow-savedmodel")}
 
@@ -86,12 +93,204 @@ _DTYPE_BYTES = {
     "U64": 8,
     "F64": 8,
 }
-_UNSAFE_SUFFIXES = {".pickle", ".pkl", ".pt", ".pth", ".bin", ".joblib", ".ckpt", ".pdparams"}
+_UNSAFE_SUFFIXES = {
+    ".pickle",
+    ".pkl",
+    ".pt",
+    ".pth",
+    ".bin",
+    ".joblib",
+    ".ckpt",
+    ".pdparams",
+    ".sav",
+    ".dill",
+}
+# Formats first inventoried with these keys use the root-relative path as their
+# subject: fixed file names (saved_model.pb) and versioned layouts such as
+# <model>/<version>/ or lightning_logs/version_N/checkpoints/ would otherwise
+# collide on the parent directory's name.
+_PATH_SUBJECT_FORMATS = frozenset({"ckpt", "pdparams", "hdf5", "keras", "pb", "compressed-pickle"})
+_HDF5_SUFFIXES = frozenset({".h5", ".hdf5"})
+_HDF5_SIGNATURE = b"\x89HDF\r\n\x1a\n"
+# Keras stores these as HDF5 attribute names. Only a full-model save has a model
+# configuration; a weights file has only the weights markers.
+_KERAS_MODEL_MARKER = b"model_config"
+_KERAS_WEIGHT_MARKERS = (b"keras_version", b"layer_names", b"model_weights")
+_KERAS_MARKERS = (_KERAS_MODEL_MARKER, *_KERAS_WEIGHT_MARKERS)
+_HDF5_UNMARKED = "HDF5 container without Keras model configuration or weights markers"
+_MAX_KERAS_MEMBERS = 10_000
+_MAX_KERAS_CONFIG_BYTES = 16 * 1024 * 1024
+_MAX_KERAS_CONFIG_NODES = 1_000_000
+_MAX_KERAS_INSPECTION_BYTES = 64 * 1024 * 1024
+
+
+def _name_suffix(path: Path) -> str:
+    """Return the lowercase suffix, treating a dotfile name such as '.ckpt' as one."""
+    name = path.name.lower()
+    return path.suffix.lower() or (name if name.startswith(".") and name.count(".") == 1 else "")
+
+
+def _compressed_pickle(path: Path) -> bool:
+    suffixes = [suffix.lower() for suffix in path.suffixes[-2:]]
+    return (
+        len(suffixes) == 2
+        and suffixes[1] in _COMPRESSED_PICKLE_SUFFIXES
+        and suffixes[0] in _COMPRESSIBLE_PICKLE_SUFFIXES
+    )
 
 
 def model_format(path: Path) -> tuple[str, str] | None:
     """Return the (format key, format name) of a supported model file, or ``None``."""
-    return MODEL_EXTENSIONS.get(path.suffix.lower()) or NAMED_MODEL_FILES.get(path.name.lower())
+    if _compressed_pickle(path):
+        return ("compressed-pickle", "compressed-pickle")
+    return MODEL_EXTENSIONS.get(_name_suffix(path)) or NAMED_MODEL_FILES.get(path.name.lower())
+
+
+def _keras_config_executes(document: object) -> bool:
+    """Report Keras configuration constructs that carry or reference code to run.
+
+    Lambda layers carry serialized Python code, and a function reference outside
+    Keras names arbitrary code for the loader to import (CVE-2025-1550). Classes
+    from extension libraries such as KerasHub are not flagged. Oversized
+    configurations fail closed.
+    """
+    pending = [document]
+    visited = 0
+    while pending:
+        node = pending.pop()
+        visited += 1
+        if visited > _MAX_KERAS_CONFIG_NODES:
+            return True
+        if isinstance(node, dict):
+            module = node.get("module")
+            class_name = node.get("class_name")
+            if class_name in {"Lambda", "__lambda__", "TFOpLambda"}:
+                return True
+            if (
+                class_name == "function"
+                and isinstance(module, str)
+                and module != "keras"
+                and not module.startswith("keras.")
+            ):
+                return True
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
+    return False
+
+
+class _ArchiveView(io.RawIOBase):
+    """Random access over a pinned stream for bounded archive inspection.
+
+    Positioning uses the same descriptor (an unbuffered confined stream cannot
+    seek itself); every byte still comes from the stream's own bounded read(), so
+    confined collection budgets keep applying.
+    """
+
+    def __init__(self, stream: BinaryIO, budget: int) -> None:
+        self._stream = stream
+        self._fd = stream.fileno()
+        self._budget = budget
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        # A buffered stream must reposition itself, or its read-ahead goes stale.
+        if self._stream.seekable():
+            return self._stream.seek(offset, whence)
+        return os.lseek(self._fd, offset, whence)
+
+    def tell(self) -> int:
+        return self._stream.tell() if self._stream.seekable() else os.lseek(self._fd, 0, 1)
+
+    def read(self, size: int | None = -1) -> bytes:
+        wanted = self._budget if size is None or size < 0 else min(size, self._budget)
+        chunks = []
+        while wanted > 0:
+            chunk = self._stream.read(min(wanted, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            wanted -= len(chunk)
+            self._budget -= len(chunk)
+        if size is not None and size > 0 and wanted > 0 and self._budget == 0:
+            raise OSError("archive inspection byte limit exceeded")
+        return b"".join(chunks)
+
+
+def _inspect_keras_archive(stream: BinaryIO) -> tuple[SerializationSafety, str]:
+    """Inspect a Keras v3 archive's members and configuration without loading it.
+
+    The stream is the pinned descriptor that was hashed, so no pathname is reopened.
+    """
+    try:
+        view = _ArchiveView(stream, _MAX_KERAS_INSPECTION_BYTES)
+        view.seek(0)
+        with zipfile.ZipFile(cast(BinaryIO, view)) as archive:
+            members = archive.infolist()
+            if len(members) > _MAX_KERAS_MEMBERS:
+                return SerializationSafety.UNKNOWN, "Keras archive exceeds the member limit"
+            names = [member.filename for member in members]
+            if len(names) != len(set(names)):
+                # zipfile and Keras read the last duplicate; a reviewer may see the first.
+                return (
+                    SerializationSafety.UNSAFE_CODE_EXECUTION,
+                    "Keras archive has duplicate member names; the loaded configuration is ambiguous",
+                )
+            if any(PurePosixPath(name).suffix.lower() in {".pkl", ".pickle"} for name in names):
+                return (
+                    SerializationSafety.UNSAFE_CODE_EXECUTION,
+                    "Archive contains a pickle member; object loading can execute code",
+                )
+            if "config.json" not in names:
+                return SerializationSafety.UNKNOWN, "Keras archive has no config.json"
+            with archive.open("config.json") as member:
+                raw = member.read(_MAX_KERAS_CONFIG_BYTES + 1)
+        if len(raw) > _MAX_KERAS_CONFIG_BYTES:
+            return SerializationSafety.UNKNOWN, "Keras configuration exceeds the inspection limit"
+        document = parse_json_strict(raw, max_bytes=_MAX_KERAS_CONFIG_BYTES)
+    except (
+        OSError,
+        ValueError,
+        RuntimeError,
+        NotImplementedError,
+        EOFError,
+        RecursionError,
+        zipfile.BadZipFile,
+        zlib.error,
+    ):
+        return SerializationSafety.UNKNOWN, "Malformed or unsupported Keras archive"
+    if _keras_config_executes(document):
+        return (
+            SerializationSafety.UNSAFE_CODE_EXECUTION,
+            "Keras configuration carries a Lambda layer or a function outside Keras; "
+            "loading can run that code",
+        )
+    return (
+        SerializationSafety.UNKNOWN,
+        "Keras configuration carries no Lambda layer or function outside Keras; loader "
+        "behavior remains unverified",
+    )
+
+
+def _classify_hdf5(prefix: bytes, found: set[bytes]) -> tuple[SerializationSafety, str]:
+    # Without an HDF5 parser the configuration cannot be read, so even a full model
+    # stays unknown; the evidence tells the reviewer which loader question to ask.
+    if _KERAS_MODEL_MARKER in found:
+        return (
+            SerializationSafety.UNKNOWN,
+            "Keras HDF5 model configuration; Keras 3.0.0-3.11.2 run Lambda-layer code from it "
+            "while loading, even in safe mode (CVE-2025-9905)",
+        )
+    if found:
+        return SerializationSafety.UNKNOWN, "Keras HDF5 weights without a model configuration"
+    if prefix.startswith(_HDF5_SIGNATURE):
+        return SerializationSafety.UNKNOWN, _HDF5_UNMARKED
+    return SerializationSafety.UNKNOWN, "No bounded structural validator for this format/loader"
 
 
 def _recognized_binary_pickle(stream: BinaryIO, prefix: bytes, size: int) -> bool:
@@ -173,7 +372,7 @@ def inspect_model_format(
     layout. It is not a claim about model behavior, parser vulnerabilities,
     adjacent repository code, or the safety of the eventual loader.
     """
-    if path.suffix.lower() in _UNSAFE_SUFFIXES:
+    if _name_suffix(path) in _UNSAFE_SUFFIXES or _compressed_pickle(path):
         return SerializationSafety.UNSAFE_CODE_EXECUTION, "Potential code-executing loader format"
     try:
         context = nullcontext(stream) if stream is not None else open_regular_file(path)
@@ -215,11 +414,15 @@ def inspect_model_format(
 class _HashingModelReader:
     """Hash the inspected prefix and remaining bytes from one pinned stream."""
 
-    def __init__(self, stream: BinaryIO) -> None:
+    def __init__(self, stream: BinaryIO, markers: Sequence[bytes] = ()) -> None:
         self.stream = stream
         self.digest = hashlib.sha256()
         self.bytes_read = 0
         self.prefix = bytearray()
+        self.markers = tuple(markers)
+        self.found: set[bytes] = set()
+        self._overlap = max((len(marker) for marker in self.markers), default=1) - 1
+        self._tail = b""
 
     def fileno(self) -> int:
         return self.stream.fileno()
@@ -233,6 +436,10 @@ class _HashingModelReader:
             raise OSError("model artifact exceeds the hash byte limit")
         self.digest.update(content)
         self.prefix.extend(content[: max(0, MAX_MODEL_HEADER_BYTES + 8 - len(self.prefix))])
+        if self.markers and content:
+            window = self._tail + content
+            self.found.update(marker for marker in self.markers if marker in window)
+            self._tail = window[-self._overlap :] if self._overlap else b""
         return content
 
 
@@ -251,10 +458,15 @@ def inspect_model_artifact(
     before = os.fstat(stream.fileno())
     if before.st_size > MAX_HASH_SIZE:
         raise OSError("model artifact exceeds the hash byte limit")
-    observed = _HashingModelReader(stream)
+    suffix = _name_suffix(path)
+    observed = _HashingModelReader(stream, _KERAS_MARKERS if suffix in _HDF5_SUFFIXES else ())
     safety, explanation = inspect_model_format(path, stream=cast(BinaryIO, observed))
     while observed.read(65536):
         pass
+    if safety == SerializationSafety.UNKNOWN and suffix in _HDF5_SUFFIXES:
+        safety, explanation = _classify_hdf5(bytes(observed.prefix[:8]), observed.found)
+    elif safety == SerializationSafety.UNKNOWN and suffix == ".keras":
+        safety, explanation = _inspect_keras_archive(stream)
     if metadata is not None and safety == SerializationSafety.SAFE:
         metadata.update(
             fingerprint_stream(io.BytesIO(observed.prefix), artifact_size=before.st_size)
@@ -361,9 +573,14 @@ class ModelScanner(Scanner):
                 configured_remote_code if isinstance(configured_remote_code, bool) else None
             )
 
+            subject = (
+                path.relative_to(self._files.root).as_posix()
+                if fmt_key in _PATH_SUBJECT_FORMATS
+                else f"{model_name}/{path.name}"
+            )
             comp = ModelComponent(
-                bom_ref=f"model:{model_name}/{path.name}",
-                name=f"{model_name}/{path.name}",
+                bom_ref=f"model:{subject}",
+                name=subject,
                 serialization_format=fmt_name,
                 serialization_safety=safety,
                 signing_status=signing_status,

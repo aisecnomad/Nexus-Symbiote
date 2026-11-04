@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,6 +15,7 @@ from nexus_symbiote.core.hashing import (
     hash_tool_definition,
     normalize_digest,
     open_regular_file,
+    pathname_identity,
 )
 from nexus_symbiote.core.models import (
     AnyComponent,
@@ -325,6 +327,9 @@ class IntegrityValidator:
                     actual, explanation, inspected_digest = inspect_model_artifact(
                         path, stream=stream
                     )
+                    after = os.fstat(stream.fileno())
+                    if pathname_identity(path) != (after.st_dev, after.st_ino):
+                        raise OSError("model artifact pathname changed during inspection")
                 _, expected_digest = normalize_digest(comp.hashes.get("sha256", ""), "sha256")
                 if inspected_digest != f"sha256:{expected_digest}":
                     report.issues.append(

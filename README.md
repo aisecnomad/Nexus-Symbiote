@@ -66,7 +66,7 @@ Eight built-in collectors read declared configuration and artifacts from the pro
 | Collector | Reads | Records |
 | --- | --- | --- |
 | `mcp` | MCP config files (`.mcp.json`, `.claude/mcp.json`, `.cursor/mcp.json`, `claude_desktop_config.json`) and server source | Clients, servers, launchers, pinned versions, transports, endpoints, tool fingerprints |
-| `model` | `.safetensors`, `.gguf`, `.ggml`, `.onnx`, Keras (`.h5`, `.hdf5`, `.keras`), `saved_model.pb` and pickle-family files (including `.ckpt` and `.pdparams`), with their config | SHA-256 hashes, serialization safety, SafeTensors structure, signature status |
+| `model` | `.safetensors`, `.gguf`, `.ggml`, `.onnx`, Keras (`.h5`, `.hdf5`, `.keras`), `saved_model.pb` and pickle-family files (including `.ckpt`, `.pdparams`, `.sav`, `.dill` and compressed dumps), with their config | SHA-256 hashes, serialization safety, SafeTensors structure, signature status |
 | `prompt` | `CLAUDE.md`, `AGENTS.md`, `CODEX.md`, Copilot/Codex instructions, skill and command files | Instruction and skill digests, hidden-character findings |
 | `rag` | `rag_config.*`, `retrieval_config.json`, `vector_store_config.json` | Declared retrieval sources and controls |
 | `registry` | `package.json`, lockfiles, `requirements*.txt`, `pyproject.toml`, Dockerfiles | AI package identities, pins, lockfile integrity; container images and digests |
