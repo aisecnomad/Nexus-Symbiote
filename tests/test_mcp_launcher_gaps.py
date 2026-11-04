@@ -185,3 +185,70 @@ def test_path_qualified_launcher_scores_like_the_bare_launcher(tmp_path):
         assert report["assessment_basis"] == "project-reconciled"
         scores[name] = report["overall_score"]
     assert scores == {"bare": 11.0, "path": 11.0}
+
+
+ENV_NAME = "GITHUB_PERSONAL_ACCESS_TOKEN"
+
+
+@pytest.mark.parametrize(
+    "command,args,identity",
+    [
+        (
+            "docker",
+            ["run", "-i", "--rm", "-e", ENV_NAME, "ghcr.io/github/github-mcp-server"],
+            "oci:ghcr.io/github/github-mcp-server",
+        ),
+        (
+            "docker",
+            ["run", "--env=X=1", "-v", "/srv:/srv", "--init", "registry.test/team/server"],
+            "oci:registry.test/team/server",
+        ),
+        ("npx", ["-y", "--package=some-mcp-server@latest", "srv"], "npm:some-mcp-server"),
+        ("npx", ["-p", "some-mcp-server@latest", "srv"], "npm:some-mcp-server"),
+        ("npx", ["--quiet", "some-mcp-server@latest"], "npm:some-mcp-server"),
+        ("npx", ["-y", "--", "some-mcp-server@latest"], "npm:some-mcp-server"),
+    ],
+)
+def test_package_after_value_option_keeps_pinning_finding(tmp_path, command, args, identity):
+    server = scan_server(tmp_path, command, args)
+    assert ("high", "version_pinning") in findings(server)
+    assert server.version_pinned is False
+    assert server.launcher_package == identity
+
+
+def test_option_values_are_skipped_without_being_recorded(tmp_path):
+    secret = "ghp_" + "Z" * 36
+    args = ["run", "-i", "--rm", "-e", f"{ENV_NAME}={secret}", "ghcr.io/github/github-mcp-server"]
+    server = scan_server(tmp_path, "docker", args)
+    assert server.launcher_package == "oci:ghcr.io/github/github-mcp-server"
+    dump = server.model_dump_json()
+    assert secret not in dump
+    assert ENV_NAME not in dump
+
+
+def test_pinned_image_after_environment_option_has_no_finding(tmp_path):
+    digest = "sha256:" + "b" * 64
+    args = ["run", "-i", "--rm", "-e", ENV_NAME, f"ghcr.io/github/github-mcp-server@{digest}"]
+    server = scan_server(tmp_path, "docker", args)
+    assert server.version == digest
+    assert server.version_pinned is True
+    assert ("high", "version_pinning") not in findings(server)
+
+
+@pytest.mark.parametrize(
+    "command,args",
+    [
+        ("npx", ["--registry", "https://registry.test/", "some-mcp-server@1.2.3"]),
+        ("npx", ["-p", "a@1.0.0", "-p", "b@latest", "srv"]),
+        ("uvx", []),
+        ("docker", ["run", "--platform", "linux/amd64", "registry.test/team/server:1.2.3"]),
+    ],
+)
+def test_undetermined_package_reference_is_a_finding(tmp_path, command, args):
+    server = scan_server(tmp_path, command, args)
+    assert server.version_pinned is None
+    assert server.launcher_package is None
+    pinning = [risk for risk in server.risks if risk.category == "version_pinning"]
+    assert [risk.severity.value for risk in pinning] == ["high"]
+    assert "could not be determined" in pinning[0].detail
+    assert "registry.test" not in server.model_dump_json()

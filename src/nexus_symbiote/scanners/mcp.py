@@ -324,6 +324,27 @@ _PYTHON_SOURCE_OPTIONS = frozenset(
     }
 )
 _PACKAGE_LAUNCHERS = frozenset({"npx", "bunx", "uvx", "pipx", "docker"})
+_DOCKER_RUN_FLAGS = frozenset({"--rm", "-i", "-t", "-it", "-d", "--detach", "--init"})
+# Skipped without reading their values, which can hold credentials such as -e TOKEN=...
+_DOCKER_RUN_VALUE_OPTIONS = frozenset(
+    {
+        "-e",
+        "--env",
+        "--env-file",
+        "-v",
+        "--volume",
+        "--mount",
+        "--name",
+        "--network",
+        "-p",
+        "--publish",
+        "-w",
+        "--workdir",
+        "-u",
+        "--user",
+        "--pull",
+    }
+)
 _WINDOWS_EXECUTABLE_SUFFIXES = frozenset({"exe", "cmd", "bat", "ps1"})
 
 
@@ -701,6 +722,25 @@ class MCPScanner(Scanner):
                     recommendation="Pin to an exact version and store a hash of the tool schema.",
                 )
             )
+        elif (
+            package_ref is None
+            and launcher in _PACKAGE_LAUNCHERS
+            and (launcher != "docker" or args[:1] == ["run"])
+        ):
+            risks.append(
+                RiskAssessment(
+                    severity=RiskSeverity.HIGH,
+                    category="version_pinning",
+                    detail=(
+                        f"MCP server '{name}' starts a package launcher whose package could "
+                        "not be determined, so its pinning is unknown (arguments omitted)."
+                    ),
+                    recommendation=(
+                        "Name the package before any other launcher option, pinned to an "
+                        "exact version."
+                    ),
+                )
+            )
 
         if transport == "stdio" and command:
             risks.append(
@@ -769,8 +809,13 @@ class MCPScanner(Scanner):
     def _extract_package_ref(self, command: str, args: list[str]) -> str | None:
         if command in {"uvx", "pipx", "npx", "bunx"}:
             values = args[1:] if command == "pipx" and args[:1] == ["run"] else args
-            for index, arg in enumerate(values):
-                if arg in {"-y", "--yes", "--no", "-n"}:
+            npm = command in {"npx", "bunx"}
+            packages: list[str] = []
+            index = 0
+            while index < len(values):
+                arg = values[index]
+                if arg in {"-y", "--yes", "--no", "-n"} or (npm and arg in {"-q", "--quiet"}):
+                    index += 1
                     continue
                 if (command == "uvx" and arg == "--from") or (
                     command == "pipx" and arg == "--spec"
@@ -780,19 +825,43 @@ class MCPScanner(Scanner):
                         if index + 1 < len(values)
                         else None
                     )
+                if npm and arg in {"-p", "--package"}:
+                    if index + 1 == len(values):
+                        return None
+                    packages.append(values[index + 1])
+                    index += 2
+                    continue
+                if npm and arg.startswith("--package="):
+                    packages.append(arg.split("=", 1)[1])
+                    index += 1
+                    continue
+                if npm and arg == "--":
+                    index += 1
+                    break
                 # Unknown options may consume a secret in the next position.
                 if arg.startswith("-"):
                     return None
-                if command in {"uvx", "pipx"}:
-                    return self._python_package_ref(command, arg)
-                return (
-                    arg
-                    if len(arg) <= 2048 and re.fullmatch(rf"{_NPM_NAME}(?:@.+)?", arg, re.ASCII)
-                    else None
-                )
+                break
+            if packages:
+                # With --package the next argument names a binary, not a package.
+                return self._npm_package_ref(packages[0]) if len(packages) == 1 else None
+            if index >= len(values):
+                return None
+            if npm:
+                return self._npm_package_ref(values[index])
+            return self._python_package_ref(command, values[index])
         if command == "docker" and args and args[0] == "run":
-            for arg in args[1:]:
-                if arg in {"--rm", "-i", "-t", "-it", "-d", "--detach"}:
+            index = 1
+            while index < len(args):
+                arg = args[index]
+                if arg in _DOCKER_RUN_FLAGS:
+                    index += 1
+                    continue
+                if arg in _DOCKER_RUN_VALUE_OPTIONS:
+                    index += 2
+                    continue
+                if arg.startswith("--") and arg.split("=", 1)[0] in _DOCKER_RUN_VALUE_OPTIONS:
+                    index += 1
                     continue
                 if arg.startswith("-"):
                     return None
@@ -803,6 +872,14 @@ class MCPScanner(Scanner):
                     else None
                 )
         return None
+
+    @staticmethod
+    def _npm_package_ref(value: str) -> str | None:
+        return (
+            value
+            if len(value) <= 2048 and re.fullmatch(rf"{_NPM_NAME}(?:@.+)?", value, re.ASCII)
+            else None
+        )
 
     @staticmethod
     def _launcher_package(command: str, reference: str) -> str | None:
