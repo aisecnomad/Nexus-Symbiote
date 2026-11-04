@@ -1005,10 +1005,13 @@ class MCPScanner(Scanner):
     def _classify_side_effects(
         self, annotations: dict[str, Any], tool_name: str
     ) -> SideEffectProfile:
+        """Infer the profile from the name; a self-declared hint may only raise it.
+
+        The tool's own readOnlyHint is an unverified claim. It must not hide a
+        destructive name from the capability-scope finding or narrow an unknown profile.
+        """
         if annotations.get("destructiveHint"):
             return SideEffectProfile.DESTRUCTIVE
-        if annotations.get("readOnlyHint"):
-            return SideEffectProfile.READ_ONLY
         name_lower = tool_name.lower()
         if any(w in name_lower for w in ("delete", "remove", "drop", "destroy", "purge")):
             return SideEffectProfile.DESTRUCTIVE
