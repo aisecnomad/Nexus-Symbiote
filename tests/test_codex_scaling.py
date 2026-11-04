@@ -5,12 +5,25 @@ from pathlib import Path
 
 from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.models import IDEAgentComponent, MCPServerComponent
+from nexus_symbiote.scanners.base import ScanResult
 from nexus_symbiote.scanners.ide_agents import IDEAgentScanner
 from nexus_symbiote.scanners.mcp import MCPScanner
 
 LIMIT = "Codex configuration: MCP server redaction work limit exceeded"
 PROFILE_LIMIT = "Codex configuration: permission profile work limit exceeded"
 FULL_ACCESS = "Codex declares unrestricted filesystem access."
+# The limit assertions catch a removed or loosened budget. The time bound catches only
+# catastrophic regressions: unbounded collection of these shapes took minutes to hours.
+# It counts this process's CPU time, so a busy machine cannot fail it, and leaves room
+# for branch-coverage tracing, which slows collection several times.
+CPU_SECONDS = 30
+
+
+def bounded_scan(scanner: IDEAgentScanner | MCPScanner, root: Path) -> ScanResult:
+    started = time.process_time()
+    result = scanner.scan(root)
+    assert time.process_time() - started < CPU_SECONDS
+    return result
 
 
 def write_layer(root: Path, value: str, directory: str = ".") -> None:
@@ -28,9 +41,7 @@ def heavy_server(secrets: int, names: int) -> str:
 def test_redacting_many_names_against_many_secrets_is_bounded(tmp_path: Path) -> None:
     # Every recorded name is redacted against every secret value of its server.
     write_layer(tmp_path, heavy_server(8000, 12000))
-    started = time.monotonic()
-    result = MCPScanner().scan(tmp_path)
-    assert time.monotonic() - started < 5
+    result = bounded_scan(MCPScanner(), tmp_path)
     assert result.scan_failures == [LIMIT]
     assert not any(isinstance(c, MCPServerComponent) for c in result.components)
 
@@ -40,9 +51,7 @@ def test_inherited_servers_cannot_multiply_redaction_work(tmp_path: Path) -> Non
     write_layer(tmp_path, heavy_server(1900, 1900))
     for index in range(15):
         write_layer(tmp_path, "[mcp_servers.s]\nenabled = false\n", f"p{index:02d}")
-    started = time.monotonic()
-    result = MCPScanner().scan(tmp_path)
-    assert time.monotonic() - started < 5
+    result = bounded_scan(MCPScanner(), tmp_path)
     assert result.scan_failures == [LIMIT]
     assert len([c for c in result.components if isinstance(c, MCPServerComponent)]) == 1
 
@@ -63,9 +72,7 @@ def test_growing_profile_grants_across_layers_are_bounded(tmp_path: Path) -> Non
         )
         offset += 500
         directory = "d0" if directory == "." else f"{directory}/d{depth}"
-    started = time.monotonic()
-    result = IDEAgentScanner().scan(tmp_path)
-    assert time.monotonic() - started < 5
+    result = bounded_scan(IDEAgentScanner(), tmp_path)
     assert result.scan_failures == [PROFILE_LIMIT]
 
 
@@ -97,9 +104,7 @@ def test_large_profile_selected_in_every_layer_is_bounded(tmp_path: Path) -> Non
             directory,
         )
         directory = "d0" if directory == "." else f"{directory}/d{depth}"
-    started = time.monotonic()
-    result = IDEAgentScanner().scan(tmp_path)
-    assert time.monotonic() - started < 5
+    result = bounded_scan(IDEAgentScanner(), tmp_path)
     assert result.scan_failures == [PROFILE_LIMIT]
 
 
@@ -111,9 +116,7 @@ def test_long_permission_profile_chain_resolves_quickly(tmp_path: Path) -> None:
         '[permissions.p0]\nextends = ":danger-full-access"\n'
         + "".join(f'[permissions.p{i}]\nextends = "p{i - 1}"\n' for i in range(1, count)),
     )
-    started = time.monotonic()
-    result = IDEAgentScanner().scan(tmp_path)
-    assert time.monotonic() - started < 5
+    result = bounded_scan(IDEAgentScanner(), tmp_path)
     assert not result.scan_failures
     agent = next(c for c in result.components if isinstance(c, IDEAgentComponent))
     assert agent.permission_mode == f"profile:p{count - 1}"
