@@ -160,6 +160,16 @@ private-repository plan restriction recorded by the 2026-11-02 audit no longer
 applies. An administrator applies these settings. Repository changes cannot.
 Do not remove the acceptance gates to work around an unavailable platform feature.
 
+A gap review on 2026-11-04 recorded these further items, which issue #74 did not
+track:
+
+| Setting | Observed state | Required action |
+| --- | --- | --- |
+| Dependabot alerts and security updates | Not recorded. Dependabot version updates change only `pyproject.toml` ranges, never the hash locks that CI, the Action and releases install | Enable both (step 6 below). The scheduled `dependency-audit.yml` workflow audits the locked versions daily |
+| Automatically delete head branches | Off in effect: the head branches of 86 merged pull requests remained | Enable it (step 7) |
+| Stale branches | 119 branches besides `main`: 96 preserved, meaning every commit is on `main` or in a pull-request ref, among them the open #118 head; 23 hold commits found nowhere else | Delete the preserved ones as described in [delete preserved branches](#delete-preserved-branches); tag or deliberately abandon the rest |
+| Issue labels | The feature-request form applies `enhancement`, which the label list recorded for the review (bug, core, dependencies, documentation, scanner, security, testing) lacks; issue forms skip labels the repository does not define | Create the label (step 8), or change the form |
+
 ### Apply the outstanding controls
 
 Run these as a repository administrator, after reviewing each configuration:
@@ -184,6 +194,17 @@ JSON
 
 # 5. Remove the ruleset that targets no branch (or retarget it deliberately)
 gh api --method DELETE repos/Hunzee-VC/Nexus-Symbiote/rulesets/26325547
+
+# 6. Enable Dependabot alerts and Dependabot security updates
+gh api --method PUT repos/Hunzee-VC/Nexus-Symbiote/vulnerability-alerts
+gh api --method PUT repos/Hunzee-VC/Nexus-Symbiote/automated-security-fixes
+
+# 7. Delete head branches automatically once their pull request merges
+gh api --method PATCH repos/Hunzee-VC/Nexus-Symbiote -F delete_branch_on_merge=true
+
+# 8. Define the label the feature-request form applies
+gh api --method POST repos/Hunzee-VC/Nexus-Symbiote/labels \
+  -f name=enhancement -f color=a2eeef -f description='New feature or request'
 ```
 
 After step 1, a commit can reach `main`, including the maintainer's own, only
@@ -194,3 +215,41 @@ the `testpypi` and `pypi` environments' reviewers and main-only deployment
 restriction as described in [releasing](releasing.md), and confirm them by adding
 `--environment testpypi` and then `--environment pypi` to step 2, before
 requesting publication.
+
+### Delete preserved branches
+
+A branch is preserved when every commit on it is reachable from `main` or from a
+pull-request ref, which GitHub keeps after the branch is deleted, so deleting it
+loses no commit. Keep the head and base branches of open pull requests: deleting
+either closes the pull request. With push access, this lists the preserved
+branches and leases each deletion to the commit that was checked:
+
+```sh
+repo=Hunzee-VC/Nexus-Symbiote
+url="https://github.com/$repo.git"
+git fetch --no-tags "$url" '+refs/heads/*:refs/audit/heads/*' '+refs/pull/*/head:refs/audit/pull/*'
+keep=$(gh api --paginate "repos/$repo/pulls?state=open&per_page=100" --jq '.[] | .base.ref, .head.label')
+set --
+for ref in $(git for-each-ref --format='%(refname:strip=3)' refs/audit/heads/); do
+  [ "$ref" = main ] && continue
+  printf '%s\n' "$keep" | grep -qxF -e "$ref" -e "${repo%%/*}:$ref" && continue
+  sha=$(git rev-parse "refs/audit/heads/$ref")
+  [ -z "$(git rev-list -n 1 "$sha" --not refs/audit/heads/main --glob='refs/audit/pull/*')" ] || continue
+  echo "delete $ref $sha"
+  set -- "$@" "--force-with-lease=refs/heads/$ref:$sha" ":refs/heads/$ref"
+done
+```
+
+Review the printed list, then delete those branches in one atomic push from the
+same shell. A branch that moved after it was checked fails its lease, and the
+whole push then deletes nothing:
+
+```sh
+[ "$#" -gt 0 ] && git push --atomic "$url" "$@"
+git for-each-ref --format='delete %(refname)' refs/audit/ | git update-ref --stdin
+```
+
+Branches that hold commits found nowhere else are left in place. Tag the ones
+worth keeping, for example
+`git push "$url" "refs/audit/heads/<branch>:refs/tags/archive/<branch>"`, before
+deleting them deliberately.

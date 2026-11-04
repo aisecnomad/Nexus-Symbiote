@@ -43,7 +43,7 @@ The earlier `fix/audit-remediation` branch also recorded a false rug-pull alert 
 
 114 branches other than `main` existed at review time.
 
-- **92 are preserved** and safe to delete. Delete them in one atomic push that leases each deletion to its verified SHA, so a branch that moved after the review is kept: `git push --atomic origin --force-with-lease=refs/heads/<branch>:<sha> :refs/heads/<branch> …`.
+- **92 are preserved** and safe to delete. Delete them in one atomic push that leases each deletion to its verified SHA, so a branch that moved after the review is kept: `git push --atomic origin --force-with-lease=refs/heads/<branch>:<sha> :refs/heads/<branch> …`. The runbook's [delete preserved branches](../repository-controls.md#delete-preserved-branches) procedure selects them and runs that push.
 - **22 hold commits found nowhere else**, under 13 roots:
   - The `claude/*` experimental foundation line (`claude/symbiote-foundation`, `claude/reconcile-main`, `claude/integration-staging` and the `claude/wp-*` work packages), including two commits added to `claude/wp-05-snapshot-2` and `claude/wp-10-live-collectors` after their pull requests merged. The [roadmap](../../ROADMAP.md) records that this line is not a supported interface. Keep or tag it before deleting.
   - `codex/runtime-lineage`, `codex/security-conformance` and `codex/validate-wire-exports` each hold only the merge commit of a pull request whose content reached `main` through #57 or #48.
