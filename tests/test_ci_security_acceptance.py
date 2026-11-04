@@ -86,6 +86,87 @@ def test_dependency_policy_checks_every_batch_with_the_exact_version():
     ]
 
 
+def test_locked_inventory_includes_pins_for_other_interpreters_and_platforms(tmp_path):
+    lock = tmp_path / "requirements.lock"
+    lock.write_text(
+        "# generated\n"
+        "\n"
+        "Annotated_Types==0.8.0 \\\n"
+        "    --hash=sha256:00\n"
+        "    # via pydantic\n"
+        "zipp==4.1.2 ; python_full_version < '3.12' \\\n"
+        "    --hash=sha256:11\n"
+        "colorama==0.4.6 ; sys_platform == 'win32'\n"
+    )
+    assert advisories.locked_packages((lock,)) == [
+        {"name": "annotated-types", "version": "0.8.0"},
+        {"name": "colorama", "version": "0.4.6"},
+        {"name": "zipp", "version": "4.1.2"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "loose>=1.0",
+        "wildcard==1.*",
+        "bounded==1.0,<2",
+        "extra[socks]==1.0",
+        "arbitrary===1.0",
+        "-r other-requirements.txt",
+        "--extra-index-url https://packages.example.invalid/simple",
+    ],
+)
+def test_lock_entries_that_are_not_exact_pins_fail_the_audit(tmp_path, entry):
+    lock = tmp_path / "requirements.lock"
+    lock.write_text("good==1.0 \\\n    --hash=sha256:00\n" + entry + "\n")
+    with pytest.raises(ValueError, match="exact pin"):
+        advisories.locked_packages((lock,))
+
+
+def test_reviewed_locks_cover_pins_the_audit_interpreter_does_not_install():
+    pins = [
+        line
+        for path in advisories.LOCK_FILES
+        for line in path.read_text().splitlines()
+        if line[:1].isalnum()
+    ]
+    locked = advisories.locked_packages(advisories.LOCK_FILES)
+    names = {package["name"] for package in locked}
+    assert len(locked) == len({line.split(" ", 1)[0].lower() for line in pins})
+    # Python 3.11 backports and Windows-only packages are installed elsewhere.
+    for name in ("zipp", "importlib-metadata", "backports-tarfile", "colorama", "pywin32-ctypes"):
+        assert name in names
+    installed = [{"name": "pip", "version": "26.3"}, {"name": "zipp", "version": "0.1"}]
+    merged = {(p["name"], p["version"]) for p in advisories.inventory(installed, locked)}
+    assert merged == {("pip", "26.3"), ("zipp", "0.1")} | {
+        (p["name"], p["version"]) for p in locked
+    }
+
+
+def test_dependency_cli_audits_installed_and_locked_identities(monkeypatch, tmp_path):
+    audited = []
+
+    def audit(packages, *, transport=None):
+        audited.extend(packages)
+        return {"complete": True, "passed": True, "advisories": [], "errors": []}
+
+    monkeypatch.setattr(advisories, "audit", audit)
+    monkeypatch.setattr("sys.argv", ["check", "--out", str(tmp_path / "report.json")])
+    assert advisories.main() == 0
+    names = {package["name"] for package in audited}
+    assert {"pip", "zipp", "importlib-metadata"} <= names
+    assert "nexus-symbiote" not in names
+
+
+def test_unreadable_lock_fails_the_dependency_cli_closed(monkeypatch, tmp_path):
+    monkeypatch.setattr(advisories, "LOCK_FILES", (tmp_path / "missing.lock",))
+    monkeypatch.setattr("sys.argv", ["check", "--out", str(tmp_path / "report.json")])
+    assert advisories.main() == 1
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["passed"] is False and report["complete"] is False
+
+
 def sarif(score="7.5"):
     return {
         "version": "2.1.0",

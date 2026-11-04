@@ -45,6 +45,7 @@ First alpha of the AgentBOM toolkit under the Hunzee-VC organization. Not yet ta
 - Omit schema literals from MCP descriptor exports and corroborate the original static definition against project evidence.
 - Reject contradictory native ShadowScan finding counts and conflicting public fields during CycloneDX and SPDX recovery. Emit only unconditional dependencies in the standard CycloneDX graph.
 - Require successful canonical CI-workflow evidence for the exact publication source SHA, in addition to protected-branch settings.
+- Audit every exact pin in `requirements-ci.lock` and `requirements-action.lock` for OSV advisories, not only the distributions installed on the Python 3.12 audit job. The Python 3.11 backports (`zipp`, `importlib-metadata`, `backports-tarfile`), which the 3.11 test job installs, and the Windows-only pins were never queried. A lock entry that is not an exact pin now fails the audit.
 - Enforce offline tracked-source hygiene and vendored schema provenance digests in the required quality job.
 - Check trust-status signers against the previous tenant revocation list and recheck the accepted status when consuming a tool approval. Upgrading an existing gateway may require replaying its last accepted trust status.
 - Reconcile supplied BOMs with the project's static inventory. A completed search can record zero matches. Skipped collectors, failed reads, and unmapped discovery evidence still block the default repository gate.

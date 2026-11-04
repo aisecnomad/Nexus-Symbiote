@@ -104,7 +104,12 @@ Weekly/manual CodeQL runs apply the same policy; only the exact-source CI run
 supplies publication acceptance.
 
 `Dependency advisories` audits exact installed distribution versions after the
-hashed CI lock is installed. It reuses the bounded HTTPS transport and follows
+hashed CI lock is installed, together with every exact pin in
+`requirements-ci.lock` and `requirements-action.lock`. The locks also pin packages
+that only other Python versions or platforms install, such as the Python 3.11
+backports the 3.11 test job uses, which the single audit interpreter would
+otherwise never query. A lock entry that is not an exact pin fails the audit. It
+reuses the bounded HTTPS transport and follows
 [OSV's per-query batch pagination](https://google.github.io/osv.dev/post-v1-querybatch/)
 with package, page, response and total-time limits. Every query must complete;
 transport errors, malformed results and missing pages deny acceptance and retain

@@ -1,4 +1,4 @@
-"""Fail CI on known OSV advisories or incomplete checks of installed PyPI versions.
+"""Fail CI on known OSV advisories or incomplete checks of installed and locked PyPI versions.
 
 Batch ordering and per-query pagination: https://google.github.io/osv.dev/post-v1-querybatch/
 """
@@ -26,6 +26,13 @@ BATCH_SIZE = 100
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_PAGES = 10
 TOTAL_TIMEOUT_SECONDS = 120
+# The locks also pin packages that only other Pythons or platforms install, such as
+# the Python 3.11 backports; the single interpreter running this audit never has them.
+ROOT = Path(__file__).resolve().parents[1]
+LOCK_FILES = (ROOT / "requirements-ci.lock", ROOT / "requirements-action.lock")
+LOCK_PIN = re.compile(
+    r"([A-Za-z0-9][A-Za-z0-9_.-]{0,199})==([0-9A-Za-z][0-9A-Za-z.+!_-]{0,199})(?=[ \t;\\]|$)"
+)
 
 
 def installed_packages() -> list[dict[str, str]]:
@@ -47,6 +54,31 @@ def installed_packages() -> list[dict[str, str]]:
     if not packages or len(packages) > MAX_PACKAGES:
         raise ValueError("installed dependency inventory is empty or exceeds the limit")
     return [{"name": name, "version": version} for name, version in sorted(packages.items())]
+
+
+def locked_packages(paths: tuple[Path, ...]) -> list[dict[str, str]]:
+    """Every exact pin in the reviewed locks, whatever its environment marker."""
+    packages: set[tuple[str, str]] = set()
+    for path in paths:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip() or line.startswith(("#", " ", "\t")):
+                continue  # Blank lines, comments, hashes and annotations.
+            match = LOCK_PIN.match(line)
+            if match is None:
+                # Options, includes, ranges and extras would leave identities unaudited.
+                raise ValueError("lock entry is not an exact pin")
+            packages.add((re.sub(r"[-_.]+", "-", match[1]).lower(), match[2]))
+    if not packages:
+        raise ValueError("reviewed locks contain no exact pins")
+    return [{"name": name, "version": version} for name, version in sorted(packages)]
+
+
+def inventory(
+    installed: list[dict[str, str]], locked: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    """Union of exact identities; one name locked and installed at two versions gets both."""
+    identities = {(package["name"], package["version"]) for package in [*installed, *locked]}
+    return [{"name": name, "version": version} for name, version in sorted(identities)]
 
 
 def audit(
@@ -73,7 +105,10 @@ def audit(
         "schema_version": 1,
         "source_sha": os.environ.get("GITHUB_SHA"),
         "checked_at": datetime.now(UTC).isoformat(),
-        "scope": "installed exact PyPI versions; source project excluded; OSV knowledge is incomplete",
+        "scope": (
+            "installed and reviewed-lock exact PyPI versions; source project excluded; "
+            "OSV knowledge is incomplete"
+        ),
         "packages": packages,
         "inventory_sha256": hashlib.sha256(
             json.dumps(packages, sort_keys=True, separators=(",", ":")).encode()
@@ -149,7 +184,7 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     try:
-        report = audit(installed_packages())
+        report = audit(inventory(installed_packages(), locked_packages(LOCK_FILES)))
     except (OSError, ValueError, TypeError):
         report = {
             "complete": False,
