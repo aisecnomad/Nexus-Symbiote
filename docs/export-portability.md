@@ -67,10 +67,10 @@ policy before relying on the result. See [security model](security-model.md) and
 
 ### Verification limits
 
-A received export is untrusted, and its schema validation is costly: quadratic in
-the number of CycloneDX components and dependency rows, and up to a few tenths of
-a second per SPDX graph entry. The command therefore refuses a larger export
-before any validation:
+A received export is untrusted, and checking it is costly. Comparing it with the
+projection and validating it take time that grows with its size, and SPDX schema
+validation takes up to a few tenths of a second per graph entry. The command
+therefore refuses a larger export before comparing or validating it:
 
 | Limit | Value |
 | --- | --- |
@@ -86,9 +86,12 @@ before any validation:
 except the file limit, and raise `VerificationLimitError`, a `ValueError`. Larger
 exports can be generated but not verified. A document that does not equal the
 projection of its embedded inventory is rejected before schema validation, so only
-a matching export reaches it. At the limits, that validation takes seconds for
-CycloneDX and can take several minutes for SPDX; apply a timeout when verifying
-exports from untrusted senders automatically.
+a matching export reaches it. The CycloneDX requirement that components and
+dependency rows be unique is checked in time linear in their size, whatever the
+order of members in each object. At the limits, verification takes tens of seconds
+for CycloneDX and several minutes for SPDX. When verifying exports from untrusted
+senders automatically, allow for these durations in the command's timeout, and
+treat a timeout as a failed verification.
 
 If the export cannot be verified, the command exits 1 with one of three fixed
 messages that never quote the input:

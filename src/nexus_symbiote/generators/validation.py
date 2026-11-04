@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Hashable, Iterator
 from functools import lru_cache
 from importlib.resources import files
 from typing import TYPE_CHECKING, Any
 
-from jsonschema import Draft7Validator, Draft202012Validator, FormatChecker
+from jsonschema import Draft7Validator, Draft202012Validator, FormatChecker, ValidationError
+from jsonschema.validators import extend
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT7
 
@@ -16,9 +18,9 @@ from nexus_symbiote.generators._spdx_dispatch import dispatched_spdx_schema
 if TYPE_CHECKING:
     from nexus_symbiote.core.aibom import AIBOM
 
-# Received exports are checked against these limits before schema validation, whose
-# cost grows quadratically with CycloneDX components and dependency rows (uniqueItems)
-# and by up to a few tenths of a second per SPDX graph entry.
+# Received exports are checked against these limits before the projection comparison
+# and schema validation. Both take time that grows with the size of the export, and
+# SPDX schema validation takes up to a few tenths of a second per graph entry.
 MAX_RECEIVED_DEPTH = 32
 MAX_RECEIVED_VALUES = 1_000_000
 MAX_RECEIVED_COMPONENTS = 2_000
@@ -73,6 +75,56 @@ def _schema(name: str) -> dict[str, Any]:
     return schema
 
 
+def _equality_key(value: Any) -> Hashable:
+    """Hashable key that two JSON values share exactly when JSON Schema deems them equal.
+
+    Object members are unordered, numbers compare by value (1 equals 1.0) and
+    booleans never equal numbers, as in jsonschema's own comparison. Every leaf is
+    text, whose hash is randomized per process, so input cannot force collisions.
+    Any value that JSON parsing does not produce raises TypeError.
+    """
+    kind = type(value)
+    if kind is str:
+        return ("string", value)
+    if kind is dict and all(type(key) is str for key in value):
+        return ("object", frozenset((key, _equality_key(item)) for key, item in value.items()))
+    if kind is list:
+        return ("array", tuple(_equality_key(item) for item in value))
+    if value is None or kind is bool:
+        return ("literal", str(value))
+    if kind is int or (kind is float and value.is_integer()):
+        return ("number", hex(int(value)))
+    if kind is float:
+        return ("number", value.hex())
+    raise TypeError("not a JSON value")
+
+
+def _unique_items(
+    validator: Any, unique: Any, instance: Any, schema: Any
+) -> Iterator[ValidationError]:
+    """uniqueItems in time linear in the size of the array.
+
+    jsonschema compares every pair of objects member by member, in the received
+    member order, so an export that matches its projection could put identical
+    members first and make validation take minutes.
+    """
+    if not unique or not validator.is_type(instance, "array"):
+        return
+    try:
+        distinct = len({_equality_key(item) for item in instance})
+    except TypeError:
+        # Not JSON data, such as a Python object passed directly: compare pairwise.
+        yield from Draft7Validator.VALIDATORS["uniqueItems"](validator, unique, instance, schema)
+        return
+    if distinct != len(instance):
+        yield ValidationError("array has non-unique elements")
+
+
+# extend() keeps Draft 7's other keywords and its rule that $ref ignores siblings;
+# its stub is untyped.
+_CycloneDXValidator = extend(Draft7Validator, {"uniqueItems": _unique_items})  # type: ignore[no-untyped-call]
+
+
 @lru_cache(maxsize=2)
 def _validator(fmt: str) -> Any:
     if fmt == "spdx":
@@ -89,7 +141,7 @@ def _validator(fmt: str) -> Any:
             _schema("cyclonedx/" + name), default_specification=DRAFT7
         )
         schemas.extend([(directory + name, resource), (name, resource)])
-    return Draft7Validator(
+    return _CycloneDXValidator(
         main, registry=Registry().with_resources(schemas), format_checker=FormatChecker()
     )
 

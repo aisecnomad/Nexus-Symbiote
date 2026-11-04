@@ -160,7 +160,8 @@ class CycloneDXGenerator(Generator):
         ):
             raise ValueError("CycloneDX projection conflicts with the embedded native document")
         # Costly schema validation runs only on what this generator emits for a
-        # bounded inventory, never on arbitrary received content.
+        # bounded inventory, never on arbitrary received content. The received array
+        # and member order is kept, so its cost must not depend on that order.
         require_valid(document, "cyclonedx")
         return recovered
 

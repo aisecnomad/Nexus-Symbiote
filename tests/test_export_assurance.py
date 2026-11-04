@@ -417,3 +417,121 @@ def test_spdx_license_cardinality_check_is_linear(monkeypatch):
     errors = validation.validate_spdx(_minimal_spdx(20_000))
     assert time.monotonic() - started < 10
     assert sum("requires exactly one" in error for error in errors) == 40_000
+
+
+def _member_reordered_cyclonedx(agents: int, shared_refs: int, tools: int) -> dict:
+    """A matching export whose objects list identical members first and bom-ref last.
+
+    Every agent carries the same tool references and depends on the same tools.
+    The projection comparison ignores member and array order, so the export still
+    verifies, but comparing two components or dependency rows member by member
+    walks every shared member before reaching the first difference.
+    """
+    tool_refs = [f"tool:{i:03d}" for i in range(tools)]
+    agent_refs = [f"agent:{i:04d}" for i in range(agents)]
+    bom = AIBOM(
+        components=[
+            *(ToolComponent(bom_ref=ref, name="t") for ref in tool_refs),
+            *(
+                AgentComponent(
+                    bom_ref=ref, name="a", tool_refs=[f"ref:{j}" for j in range(shared_refs)]
+                )
+                for ref in agent_refs
+            ),
+        ],
+        dependencies=[
+            DependencyEdge(source_ref=source, target_ref=target, relationship="depends-on")
+            for source in agent_refs
+            for target in tool_refs
+        ],
+    )
+    document = CycloneDXGenerator().generate(bom)
+    document["components"] = [
+        {
+            "properties": sorted(
+                component["properties"], key=lambda p: p["name"] != "nexus-symbiote:toolRef"
+            ),
+            **{k: v for k, v in component.items() if k not in {"properties", "bom-ref"}},
+            "bom-ref": component["bom-ref"],
+        }
+        for component in document["components"]
+    ]
+    document["dependencies"] = [
+        {"dependsOn": row["dependsOn"], "ref": row["ref"]} for row in document["dependencies"]
+    ]
+    return document
+
+
+def test_verify_export_uniqueness_check_does_not_compare_items_pairwise(tmp_path, monkeypatch):
+    import jsonschema._utils
+
+    document = _member_reordered_cyclonedx(agents=300, shared_refs=50, tools=20)
+    path = tmp_path / "reordered.cdx.json"
+    path.write_text(json.dumps(document))
+    comparisons = 0
+    equal = jsonschema._utils.equal
+
+    def counted(one, two):
+        nonlocal comparisons
+        comparisons += 1
+        return equal(one, two)
+
+    # jsonschema's uniqueItems compares every pair of objects member by member, in
+    # the received member order: here about 8 million comparisons and minutes for a
+    # 16 MiB export. Uniqueness must not depend on the number of pairs.
+    monkeypatch.setattr(jsonschema._utils, "equal", counted)
+    result = _verify(path, "cyclonedx")
+    assert result.exit_code == 0, result.output
+    assert "match" in result.output
+    assert comparisons < len(document["components"])
+
+
+@pytest.mark.parametrize(
+    "items,unique",
+    [
+        ([{"a": 1, "b": {"c": [1, None]}}, {"b": {"c": [1, None]}, "a": 1.0}], False),
+        ([{"a": 1}, {"a": 1, "b": 2}], True),
+        ([{"a": 1}, {"b": 1}], True),
+        ([{"a": True}, {"a": 1}], True),
+        ([[True], [1]], True),
+        ([[1, 2], [2, 1]], True),
+        ([[], []], False),
+        ([{}, {}], False),
+        ([[], {}], True),
+        ([1, True], True),
+        ([0, False], True),
+        ([True, True], False),
+        ([None, False], True),
+        ([None, None], False),
+        (["1", 1], True),
+        (["a", "b", "a"], False),
+        ([1, 1.0], False),
+        ([-0.0, 0], False),
+        ([0.5, 0.5], False),
+        ([0.5, 1], True),
+        ([1e20, 10**20], False),
+        ([2**53 + 1, 2.0**53], True),
+        # Not JSON data: jsonschema's own pairwise comparison applies.
+        ([(1, 2), [1, 2]], False),
+        ([(1, 2), (2, 1)], True),
+    ],
+)
+def test_cyclonedx_uniqueness_follows_json_schema_equality(items, unique):
+    from jsonschema import Draft7Validator
+
+    from nexus_symbiote.generators.validation import _validator
+
+    schema = {"uniqueItems": True}
+    assert Draft7Validator(schema).is_valid(items) is unique
+    assert _validator("cyclonedx").evolve(schema=schema).is_valid(items) is unique
+
+
+@pytest.mark.parametrize("collection", ["components", "dependencies"])
+def test_cyclonedx_validation_rejects_duplicates_in_any_member_order(collection):
+    from nexus_symbiote.generators.validation import validate_cyclonedx
+
+    document = _member_reordered_cyclonedx(agents=2, shared_refs=2, tools=2)
+    assert validate_cyclonedx(document) == []
+    first = document[collection][0]
+    document[collection].append(dict(reversed(first.items())))
+    assert validate_cyclonedx(document) == [f"{collection}: array has non-unique elements"]
