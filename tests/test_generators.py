@@ -152,7 +152,9 @@ class TestCycloneDXSchemaFormats:
             "metadata/timestamp: 'not-a-timestamp' is not a 'date-time'",
             "metadata/supplier/url/0: 'https://exa mple.test/' is not a 'iri-reference'",
         ]
-        with pytest.raises(ValueError, match="invalid cyclonedx export"):
+        # A received export must equal the projection of its embedded inventory, which
+        # never carries these values, so recover() rejects it before schema validation.
+        with pytest.raises(ValueError, match="conflicts with the embedded native document"):
             CycloneDXGenerator.recover(document)
 
 
