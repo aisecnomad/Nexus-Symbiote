@@ -303,6 +303,62 @@ def test_project_reconciliation_preserves_supplementary_live_edges(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    ("claimed", "asserted", "relationship", "inbound"),
+    [
+        ("observed", "verified", "uses-guardrail", False),
+        ("verified", "verified", "uses-guardrail", False),
+        ("declared", "observed", "uses-guardrail", False),
+        ("observed", "verified", "invokes", True),
+    ],
+)
+def test_supplementary_relationships_cannot_exceed_their_own_observation(
+    tmp_path, claimed, asserted, relationship, inbound
+):
+    from nexus_symbiote.core.aibom import DependencyEdge
+    from nexus_symbiote.core.models import ClaimEvidence, GuardrailComponent
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("Review requests.")
+    output = tmp_path / "bom.json"
+    runner = CliRunner()
+    scan = ["scan", str(project), "--no-project-policy", "-o", str(output)]
+    assert runner.invoke(main, scan).exit_code == 0
+    bom = AIBOM.load(output)
+    agent = next(c for c in bom.components if c.component_type.value == "agent")
+    guardrail = GuardrailComponent(
+        bom_ref="guardrail:approval-gate",
+        name="human approval gate",
+        claims={
+            "enforcement": ClaimEvidence(assurance=claimed, method="runtime-trace", scope="runtime")
+        },
+    )
+    bom.add_component(guardrail)
+    agent.guardrail_refs.append(guardrail.bom_ref)
+    source, target = agent.bom_ref, guardrail.bom_ref
+    if inbound:
+        source, target = target, source
+    bom.add_dependency(
+        DependencyEdge(
+            source_ref=source,
+            target_ref=target,
+            relationship=relationship,
+            assurance_level=asserted,
+            conditions="all tool calls mediated",
+        )
+    )
+    assert not validate_graph(bom)
+    bom.save(output)
+    against = [str(output), "--project", str(project), "--no-project-policy"]
+    result = runner.invoke(main, ["validate", *against])
+    assert result.exit_code == 1, result.output
+    assert guardrail.bom_ref in result.output
+    result = runner.invoke(main, ["risk", *against, "--json-output"])
+    assert result.exit_code == 1, result.output
+    assert json.loads(result.stdout)["assessment_basis"] == "project-reconciliation-failed"
+
+
 def test_relative_subjects_still_reconcile_after_moving_a_checkout(tmp_path):
     root = tmp_path / "original" / "agent"
     root.mkdir(parents=True)

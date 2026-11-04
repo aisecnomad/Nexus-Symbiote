@@ -370,6 +370,7 @@ class CompletenessValidator:
                     actual.bom_ref,
                     f"Missing or mismatched local component from {source_kind}: {actual.bom_ref}",
                 )
+        supplementary: dict[str, AnyComponent] = {}
         for extra in supplied.values():
             # Supplementary runtime observations have their own provenance. Missing
             # repository subjects cannot be explained by an unrelated observation.
@@ -383,6 +384,23 @@ class CompletenessValidator:
                     extra.bom_ref,
                     f"Supplied component has no matching local evidence: {extra.bom_ref}",
                 )
+            else:
+                supplementary[extra.bom_ref] = extra
+        # Nothing here checks a supplementary observation, so a relationship that binds
+        # it to a local subject can be no stronger than the observation, nor verified.
+        rank: dict[str | None, int] = {None: 0, "declared": 1, "observed": 2, "verified": 3}
+        for edge in bom.dependencies:
+            ends = {edge.source_ref, edge.target_ref}
+            if not ends & projected_refs:
+                continue
+            for ref in ends & supplementary.keys():
+                claimed = max(rank[c.assurance.value] for c in supplementary[ref].claims.values())
+                if rank[edge.assurance_level] > min(claimed, rank["observed"]):
+                    incomplete(
+                        ref,
+                        f"Relationship {edge.relationship} with supplementary component {ref} "
+                        "claims more assurance than its unverified claims support.",
+                    )
         return report
 
     @staticmethod

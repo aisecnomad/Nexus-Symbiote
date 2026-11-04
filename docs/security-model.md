@@ -34,7 +34,15 @@ nexus-symbiote risk inventory.json --project /reviewed/checkout --no-project-pol
 Project reconciliation reruns the supported static collectors and compares
 their components, findings and repository relationships with the supplied BOM. A mismatch
 makes the project-backed risk command exit unsuccessfully with an unknown risk
-level and a null score. Without a project, `risk` scores the supplied claims
+level and a null score. A supplied component that no collector produced, such
+as a tool recorded by `verify-live --record`, is supplementary when it has
+claims but no local path and no claim scoped to the repository, a source
+declaration or dependency resolution. Reconciliation keeps it with its own
+provenance and does not verify it. A dependency record between it and a local
+subject can claim no more assurance than the component's own claims, and never
+`verified`; otherwise reconciliation fails. An agent's or MCP server's references
+to it, such as `tool_refs`, state no assurance and are accepted as supplied.
+Without a project, `risk` scores the supplied claims
 and labels the result `supplied-bom`. For an operator-configured signature
 check, supply the trusted signer policy when validating the project. Each entry
 must match a collected model and verify under the specified identity and issuer.
