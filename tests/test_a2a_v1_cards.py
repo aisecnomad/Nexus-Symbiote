@@ -6,7 +6,10 @@ import pytest
 from click.testing import CliRunner
 
 from nexus_symbiote.cli import main
+from nexus_symbiote.core.hashing import SOURCE_BINDING_KEY_ENV
 from nexus_symbiote.scanners.a2a import A2AScanner
+
+KEY = "a2a-v1-test-operator-key-with-at-least-32-characters"
 
 
 def _card():
@@ -94,9 +97,11 @@ def test_invalid_v1_declaration_is_a_collection_failure(tmp_path, field, invalid
 
 
 @pytest.mark.parametrize(
-    "change", ["preferred_downgrade", "fallback_repoint", "reorder", "change_scopes"]
+    "change",
+    ["preferred_downgrade", "fallback_repoint", "reorder", "change_scopes", "same_origin_path"],
 )
-def test_cli_fails_on_v1_card_drift(tmp_path, change):
+def test_cli_fails_on_v1_card_drift(tmp_path, monkeypatch, change):
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
     project = tmp_path / "project"
     location = project / ".well-known"
     location.mkdir(parents=True)
@@ -114,6 +119,9 @@ def test_cli_fails_on_v1_card_drift(tmp_path, change):
         card["supportedInterfaces"][1]["url"] = "https://different.example"
     elif change == "reorder":
         card["supportedInterfaces"].reverse()
+    elif change == "same_origin_path":
+        # The exported origin is unchanged; only the keyed source binding sees this.
+        card["supportedInterfaces"][0]["url"] = "https://primary.example/admin"
     else:
         card["securityRequirements"][0]["schemes"]["oauth2"]["list"] = ["write"]
     card_path.write_text(json.dumps(card))
@@ -129,3 +137,26 @@ def test_cli_fails_on_v1_card_drift(tmp_path, change):
     )
     assert diff.exit_code == 1, diff.output
     assert any(a["severity"] == "high" for a in json.loads(diff.stdout)["security_alerts"])
+
+
+@pytest.mark.parametrize(
+    "extra, expected",
+    [
+        ({"security": [{"bearer": []}]}, True),
+        ({"security": [{"bearer": []}], "securityRequirements": [{"schemes": {}}]}, False),
+        ({"security": [{}]}, False),
+        ({"authentication": {"schemes": ["Bearer"]}}, True),
+        ({"authentication": {"schemes": []}}, False),
+        ({"authentication": {"credentials": "unsupported form"}}, None),
+        ({"securityRequirements": []}, False),
+    ],
+)
+def test_declared_requirement_forms_combine_conservatively(tmp_path, extra, expected):
+    card = {**_card(), **extra}
+    (tmp_path / "agent-card.json").write_text(json.dumps(card))
+    result = A2AScanner().scan(tmp_path)
+    assert not result.scan_failures
+    (server,) = result.components
+    assert server.authentication_required is expected
+    unknown = any("semantics are unknown" in item for item in result.surfaces_excluded)
+    assert unknown == (expected is None)

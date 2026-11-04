@@ -82,11 +82,13 @@ when both unbound snapshots look identical. Missing legacy bindings, malformed
 values, incompatible profiles and key rotation require recollection and review.
 They cannot establish an unchanged A2A declaration.
 
-The collector interprets legacy `authentication.schemes` and the A2A 0.3
-[`security` alternatives](https://a2a-protocol.org/v0.3.0/specification/#55-agentcard-object-structure).
-An empty alternative permits anonymous use and does not establish required
-authentication. Unsupported authentication forms remain unknown coverage. This
-collector is not a complete A2A protocol conformance validator.
+The collector interprets legacy `authentication.schemes`, the A2A 0.3
+[`security` alternatives](https://a2a-protocol.org/v0.3.0/specification/#55-agentcard-object-structure)
+and A2A v1 `securityRequirements`. An empty alternative permits anonymous use and
+does not establish required authentication. A card can declare several of these
+forms for different clients: if any declared form permits anonymous use,
+authentication is not required, and an unsupported form leaves the requirement
+unknown coverage. This collector is not a complete A2A protocol conformance validator.
 
 `tests/test_a2a_source_binding.py` exercises the CLI gates, same-origin path and
 authentication changes, canonicalization, redaction, key loss/rotation and legacy

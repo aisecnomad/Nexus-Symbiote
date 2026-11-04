@@ -87,9 +87,11 @@ A2A v1 cards retain the preferred interface and ordered alternatives from
 `supportedInterfaces`, including each origin, protocol binding and version.
 A change to a recorded interface or to declared card or skill security requirements
 raises a high-severity drift alert. URL userinfo, paths, queries, fragments and
-opaque tenant values are omitted. A same-origin path or tenant change alone is
-therefore outside this comparison. Authentication requirements describe the card's
-declarations. Verifying the remote endpoint and its enforcement requires separate evidence.
+opaque tenant values are omitted from the export. Only the keyed source binding
+above covers them: with the operator key, a same-origin path or tenant change
+raises a high-severity alert; without it, the card is partial coverage and the
+default gates fail. Authentication requirements describe the card's declarations.
+Verifying the remote endpoint and its enforcement requires separate evidence.
 
 Project validation compares static MCP records and configured tool fingerprints with fresh local evidence. A structure binding detects added or removed arguments, environment variables and tools. With `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` set, a keyed binding also detects same-version package swaps and changed argument, environment and endpoint values, without exporting anything a secret could be guessed from. MCP references include the relative configuration path and declared name. Legacy snapshots without the binding, or with name-only identities, need recollection; see [source reconciliation and migration](verification-source-binding.md). Python source declaration collection has bounded application-file coverage and reports unresolved or dynamic registrations as gaps.
 
