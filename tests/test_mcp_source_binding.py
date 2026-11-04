@@ -15,7 +15,8 @@ from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolCo
 from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV, MCPScanner
 from nexus_symbiote.validators.completeness import CompletenessValidator
 
-KEY = "k" * 40
+KEY = "33bae3789fcae05905b4a79a0a0080ba5f2084a987561c189a623cfa4e2f4b6c"
+OTHER_KEY = "42400744ed7a69e916ab8621bdc4502b1f5482ee5d766447e1bfee5801278b06"
 
 
 def _baseline(
@@ -226,7 +227,7 @@ def test_keyed_bom_fails_closed_when_validated_without_its_key(tmp_path, monkeyp
     monkeypatch.delenv(SOURCE_BINDING_KEY_ENV)
     run = _validate(root, output)
     assert run.exit_code == 1, run.output
-    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, "j" * 40)
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, OTHER_KEY)
     run = _validate(root, output)
     assert run.exit_code == 1, run.output
 

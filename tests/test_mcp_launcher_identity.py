@@ -151,7 +151,10 @@ def test_local_or_alternate_index_launchers_have_no_registry_identity(tmp_path, 
 def test_drift_gate_reports_redacted_source_changes_as_critical(
     tmp_path, monkeypatch, before, after
 ):
-    monkeypatch.setenv("NEXUS_SYMBIOTE_SOURCE_BINDING_KEY", "k" * 40)
+    monkeypatch.setenv(
+        "NEXUS_SYMBIOTE_SOURCE_BINDING_KEY",
+        "79209c4244e765a38d59849bdfffa982a7eaeaacd42af7151072fc7f6c2eaf0a",
+    )
     project = tmp_path / "project"
     project.mkdir()
     runner = CliRunner()

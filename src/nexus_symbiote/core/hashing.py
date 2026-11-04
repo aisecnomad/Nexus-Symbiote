@@ -6,6 +6,8 @@ hashing of tool definitions, prompt templates, and other mutable artifacts.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -30,17 +32,58 @@ def canonical_json(data: Any) -> str:
 
 
 SOURCE_BINDING_KEY_ENV = "NEXUS_SYMBIOTE_SOURCE_BINDING_KEY"
+_HEX_KEY = re.compile(r"(?:[0-9a-fA-F]{2}){32,}")
+_BASE64URL_KEY = re.compile(r"[A-Za-z0-9_-]{43,}={0,2}")
+
+
+class SourceBindingKeyError(ValueError):
+    """The operator key is not random key material. The message never contains the key."""
+
+
+class SourceBindingValueError(ValueError):
+    """A declaration contains values that RFC 8785 cannot canonicalize for binding."""
+
+
+def source_binding_key() -> bytes | None:
+    """Return the operator binding key, or ``None`` when values are not bound.
+
+    Every BOM exports a key identifier, and a binding over a public declaration is
+    also known input, so either confirms guesses for a passphrase offline. Only
+    encoded random key material is accepted.
+    """
+    key = os.environ.get(SOURCE_BINDING_KEY_ENV, "")
+    if not key:
+        return None
+    material = b""
+    if _HEX_KEY.fullmatch(key):
+        material = bytes.fromhex(key)
+    elif (
+        _BASE64URL_KEY.fullmatch(key)
+        and any(char.isupper() for char in key)
+        and any(char.islower() for char in key)
+    ):
+        try:
+            material = base64.b64decode(key + "=" * (-len(key) % 4), b"-_", validate=True)
+        except binascii.Error:
+            material = b""
+    # A random 32-byte key repeats few byte values; patterns and repetitions repeat many.
+    if len(material) < 32 or len(set(material)) < 16:
+        raise SourceBindingKeyError(
+            f"{SOURCE_BINDING_KEY_ENV} must be random key material: at least 64 hexadecimal "
+            "characters, or base64url encoding at least 32 random bytes; never a passphrase"
+        )
+    return key.encode("utf-8")
 
 
 def bind_source_values(config: dict[str, Any], *, profile: str) -> tuple[str, str] | None:
     """Bind private source values without exporting a digest usable to guess secrets."""
-    key = os.environ.get(SOURCE_BINDING_KEY_ENV, "")
-    if not key:
+    material = source_binding_key()
+    if material is None:
         return None
-    if len(key) < 32:
-        raise ValueError(f"{SOURCE_BINDING_KEY_ENV} must contain at least 32 characters")
-    material = key.encode("utf-8")
-    message = canonical_json({"profile": profile, "configuration": config})
+    try:
+        message = canonical_json({"profile": profile, "configuration": config})
+    except (TypeError, ValueError, RecursionError):
+        raise SourceBindingValueError("declaration cannot be canonicalized for binding") from None
     mac = hmac.new(material, message.encode("utf-8"), "sha256").hexdigest()
     key_id = hmac.new(material, b"nexus-symbiote/source-binding-key-id", "sha256").hexdigest()
     return "hmac-sha256:" + mac, key_id[:32]

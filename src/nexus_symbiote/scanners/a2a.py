@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import ast
+import ipaddress
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from nexus_symbiote.core.enums import RiskSeverity, TrustTier
 from nexus_symbiote.core.hashing import (
     SOURCE_BINDING_KEY_ENV,
+    SourceBindingKeyError,
+    SourceBindingValueError,
     bind_source_values,
     canonical_json,
 )
@@ -25,6 +29,7 @@ AGENT_CARD_FILES = [
     "a2a/agent.json",
 ]
 A2A_CONFIG_FILES = ["a2a.json", "a2a.yaml", "a2a.yml", "a2a_config.json"]
+A2A_CLIENT_LISTS = ("clients", "remoteAgents")
 A2A_SOURCE_BINDING_PROFILE = "nexus-symbiote/a2a-static-values/v1"
 A2A_SOURCE_BINDING_FIELDS = (
     "a2a_source_binding",
@@ -32,6 +37,32 @@ A2A_SOURCE_BINDING_FIELDS = (
     "a2a_source_binding_profile",
 )
 A2A_STATIC_MODES = {"static-agent-card", "static-config"}
+UNRECOGNIZED_AUTHENTICATION = "[unrecognized]"
+
+_KEY_FAILURE = (
+    f"{SOURCE_BINDING_KEY_ENV} is not valid random key material; A2A declarations were not bound"
+)
+_ANONYMOUS_SCHEMES = frozenset({"", "none", "public", "anonymous", "noauth", "unauthenticated"})
+_CLIENT_SCHEMES = frozenset(
+    {"bearer", "basic", "digest", "apikey", "oauth2", "openidconnect", "oidc", "mutualtls", "mtls"}
+)
+_SCHEME_TYPES = frozenset({"apiKey", "http", "oauth2", "openIdConnect", "mutualTLS"})
+_SCHEME_VARIANTS = {
+    "apiKeySecurityScheme": "apiKey",
+    "api_key_security_scheme": "apiKey",
+    "httpAuthSecurityScheme": "http",
+    "http_auth_security_scheme": "http",
+    "oauth2SecurityScheme": "oauth2",
+    "oauth2_security_scheme": "oauth2",
+    "openIdConnectSecurityScheme": "openIdConnect",
+    "open_id_connect_security_scheme": "openIdConnect",
+    "mtlsSecurityScheme": "mutualTLS",
+    "mtls_security_scheme": "mutualTLS",
+}
+_HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_HOSTNAME = re.compile(rf"{_HOST_LABEL}(?:\.{_HOST_LABEL})*")
+
+Requirements = list[dict[str, list[str]]]
 
 
 def has_a2a_source_binding(component: A2AClientComponent | A2AServerComponent) -> bool:
@@ -45,53 +76,107 @@ def has_a2a_source_binding(component: A2AClientComponent | A2AServerComponent) -
     )
 
 
-def _source_binding(data: dict[str, Any], kind: str) -> dict[str, Any]:
-    binding = bind_source_values(
-        {"kind": kind, "declaration": data}, profile=A2A_SOURCE_BINDING_PROFILE
-    )
-    return {
-        "a2a_source_binding_profile": A2A_SOURCE_BINDING_PROFILE,
-        **(
-            {"a2a_source_binding": binding[0], "a2a_source_binding_key_id": binding[1]}
-            if binding
-            else {}
-        ),
-    }
+def _scheme_token(value: str) -> str:
+    return re.sub(r"[\s_-]+", "", value).lower()
+
+
+def _anonymous(scheme: str) -> bool:
+    return _scheme_token(scheme) in _ANONYMOUS_SCHEMES
+
+
+def _string_list(value: Any) -> list[str] | None:
+    if not isinstance(value, list) or len(value) > 1000:
+        return None
+    if not all(isinstance(item, str) for item in value):
+        return None
+    return list(value)
+
+
+def _v03_requirements(value: Any) -> Requirements | None:
+    """Return A2A 0.3 OR-alternatives of AND-ed scheme names, or None for another shape."""
+    if not isinstance(value, list) or len(value) > 1000:
+        return None
+    alternatives: Requirements = []
+    for requirement in value:
+        if not isinstance(requirement, dict) or len(requirement) > 1000:
+            return None
+        alternative: dict[str, list[str]] = {}
+        for name, scopes in requirement.items():
+            scope_list = _string_list(scopes)
+            if not isinstance(name, str) or scope_list is None:
+                return None
+            alternative[name] = scope_list
+        alternatives.append(alternative)
+    return alternatives
+
+
+def _supported_scheme(definition: Any) -> bool:
+    """Accept A2A 0.3 typed or v1 ProtoJSON scheme definitions that require credentials."""
+    if not isinstance(definition, dict):
+        return False
+    kind = definition.get("type")
+    if kind is None:
+        variants = [key for key in definition if key in _SCHEME_VARIANTS]
+        if len(variants) != 1 or not isinstance(definition[variants[0]], dict):
+            return False
+        kind = _SCHEME_VARIANTS[variants[0]]
+        definition = definition[variants[0]]
+    if not isinstance(kind, str) or kind not in _SCHEME_TYPES:
+        return False
+    if kind == "http":
+        scheme = definition.get("scheme")
+        return isinstance(scheme, str) and not _anonymous(scheme)
+    return True
+
+
+def _requirement_semantics(alternatives: Requirements, schemes: Any) -> bool | None:
+    """Requirements are OR alternatives; an empty alternative permits anonymous use."""
+    if not alternatives or not all(alternatives):
+        return False
+    if isinstance(schemes, dict) and all(
+        _supported_scheme(schemes.get(name)) for alternative in alternatives for name in alternative
+    ):
+        return True
+    # An undeclared, anonymous or unsupported scheme definition has unknown semantics.
+    return None
+
+
+def _legacy_authentication(value: Any) -> bool | None:
+    """Interpret pre-0.3 AgentAuthentication; anonymous scheme names permit anonymous use."""
+    if not isinstance(value, dict):
+        return None
+    schemes = value.get("schemes")
+    if schemes is None:
+        return None if any(item is not None for item in value.values()) else False
+    schemes = _string_list([schemes] if isinstance(schemes, str) else schemes)
+    if schemes is None:
+        return None
+    return bool(schemes) and not any(_anonymous(scheme) for scheme in schemes)
 
 
 def _authentication_required(
-    data: dict[str, Any], v1_requirements: list[dict[str, list[str]]] | None
+    data: dict[str, Any], v1_requirements: Requirements | None, skills: list[bool | None]
 ) -> bool | None:
     """Combine every declared requirement form; any form permitting anonymous use wins."""
     declared: list[bool | None] = []
-    if "security" in data:
-        requirements = data["security"]
-        if not isinstance(requirements, list) or len(requirements) > 1000:
-            raise ValueError("invalid security requirements")
-        for requirement in requirements:
-            if not isinstance(requirement, dict):
-                raise ValueError("invalid security requirement")
-            for scopes in requirement.values():
-                if not isinstance(scopes, list):
-                    raise ValueError("invalid security scopes")
-                _strings(scopes)
-        # Requirements are OR alternatives; an empty alternative permits anonymous use.
-        declared.append(bool(requirements) and all(bool(item) for item in requirements))
+    if data.get("security") is not None:
+        alternatives = _v03_requirements(data["security"])
+        declared.append(
+            None
+            if alternatives is None
+            else _requirement_semantics(alternatives, data.get("securitySchemes"))
+        )
     if v1_requirements is not None:
         declared.append(bool(v1_requirements) and all(v1_requirements))
-    authentication = data.get("authentication")
-    if authentication is not None:
-        if not isinstance(authentication, dict):
-            raise ValueError("invalid legacy authentication")
-        if "schemes" in authentication:
-            declared.append(bool(_strings(authentication["schemes"])))
-        else:
-            declared.append(None if authentication else False)
-    # A client may use any declared form, so one anonymous form makes authentication
-    # optional; an unsupported form leaves the requirement unknown.
-    if not declared or False in declared:
+    if data.get("authentication") is not None:
+        declared.append(_legacy_authentication(data["authentication"]))
+    # A client may use any declared form and any skill can relax the card's forms, so one
+    # anonymous form makes authentication optional; an unsupported form leaves the
+    # requirement unknown. A card that declares no card-level form requires nothing.
+    combined = [*(declared or [False]), *skills]
+    if False in combined:
         return False
-    return None if None in declared else True
+    return None if None in combined else True
 
 
 def _strings(value: Any) -> list[str]:
@@ -106,6 +191,26 @@ def _strings(value: Any) -> list[str]:
     return [redact_text(item) for item in value]
 
 
+def _redacted(alternatives: Requirements) -> Requirements:
+    """Redact requirement names and scopes for export, rejecting ambiguous redactions."""
+    records = []
+    for alternative in alternatives:
+        record: dict[str, list[str]] = {}
+        for name, scopes in alternative.items():
+            safe_name = redact_text(name)
+            if safe_name in record:
+                raise ValueError("ambiguous redacted security scheme")
+            record[safe_name] = sorted({redact_text(scope) for scope in scopes})
+        records.append(record)
+    return records
+
+
+def _canonical(alternatives: Requirements) -> Requirements:
+    return sorted(
+        {canonical_json(item): item for item in alternatives}.values(), key=canonical_json
+    )
+
+
 def _proto_fields(data: dict[str, Any], *names: str) -> dict[str, Any]:
     """Accept both ProtoJSON field spellings and reject ambiguous duplicates."""
     normalized = data.copy()
@@ -116,6 +221,40 @@ def _proto_fields(data: dict[str, Any], *names: str) -> dict[str, Any]:
                 raise ValueError("duplicate A2A protocol field")
             normalized[name] = normalized.pop(snake)
     return normalized
+
+
+def _grpc_authority(address: str) -> str:
+    """Accept the authority-only ``host:port`` form that A2A v1 specifies for gRPC."""
+    try:
+        parsed = urlsplit("//" + address)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("invalid gRPC address") from None
+    host = parsed.hostname
+    if parsed.netloc != address or "@" in address or not host or not port:
+        raise ValueError("invalid gRPC address")
+    if ":" in host:
+        host = f"[{ipaddress.IPv6Address(host)}]"
+    elif len(host) > 253 or not _HOSTNAME.fullmatch(host):
+        raise ValueError("invalid gRPC host")
+    # The address does not say whether the channel uses TLS; grpc:// marks it unknown.
+    return f"grpc://{host}:{port}"
+
+
+def _interface_origin(url: str, binding: str) -> str:
+    # urlsplit silently drops tabs and line breaks, which would record another host.
+    if any(char.isspace() or not char.isprintable() for char in url):
+        raise ValueError("invalid A2A interface URL")
+    if binding.strip().upper() == "GRPC" and "://" not in url:
+        return _grpc_authority(url)
+    return sanitized_origin(url)
+
+
+def _transport_security(origin: str) -> bool | None:
+    scheme = origin.partition("://")[0]
+    if scheme in {"https", "grpcs"}:
+        return True
+    return None if scheme == "grpc" else False
 
 
 def _interfaces(value: Any) -> list[dict[str, str]]:
@@ -137,8 +276,8 @@ def _interfaces(value: Any) -> list[dict[str, str]]:
             r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", version
         ):
             raise ValueError("invalid A2A interface protocol version")
-        origin = sanitized_origin(url)
-        if origin == "[redacted]" or any(char.isspace() or ord(char) < 32 for char in url):
+        origin = _interface_origin(url, binding)
+        if origin == "[redacted]":
             raise ValueError("invalid A2A interface origin")
         # Paths, userinfo, queries, fragments and opaque tenant routing values
         # can contain credentials. Compare only the exported origins and bindings.
@@ -152,30 +291,105 @@ def _interfaces(value: Any) -> list[dict[str, str]]:
     return interfaces
 
 
-def _security_requirements(value: Any) -> list[dict[str, list[str]]]:
+def _legacy_interfaces(data: dict[str, Any], endpoint: str | None) -> list[dict[str, str]]:
+    """Origins of the A2A 0.3 url and additionalInterfaces, which 0.3 clients route on."""
+    declared: list[Any] = []
+    if endpoint:
+        transport = data.get("preferredTransport") or "JSONRPC"
+        declared.append({"url": endpoint, "transport": transport})
+    additional = data.get("additionalInterfaces")
+    if additional is not None:
+        if not isinstance(additional, list) or len(additional) > 1000:
+            raise ValueError("invalid additionalInterfaces")
+        declared.extend(additional)
+    interfaces = []
+    for item in declared:
+        if not isinstance(item, dict):
+            raise ValueError("invalid A2A interface")
+        url, transport = item.get("url"), item.get("transport")
+        if not isinstance(url, str) or not isinstance(transport, str) or not transport.strip():
+            raise ValueError("invalid A2A interface URL or transport")
+        interfaces.append(
+            {"origin": _interface_origin(url, transport), "transport": redact_text(transport)}
+        )
+    return interfaces
+
+
+def _security_requirements(value: Any) -> Requirements:
     """Collect v1 SecurityRequirement.schemes, whose scope values are StringList objects."""
     if not isinstance(value, list) or len(value) > 1000:
         raise ValueError("invalid security requirements")
-    requirements = []
+    alternatives: Requirements = []
     for requirement in value:
         if not isinstance(requirement, dict) or requirement.keys() - {"schemes"}:
             raise ValueError("invalid security requirement")
         schemes = requirement.get("schemes", {})
         if not isinstance(schemes, dict) or len(schemes) > 1000:
             raise ValueError("invalid security schemes")
-        alternative = {}
+        alternative: dict[str, list[str]] = {}
         for name, scope_list in schemes.items():
             if not name or not isinstance(scope_list, dict) or scope_list.keys() - {"list"}:
                 raise ValueError("invalid named security requirement")
-            scopes = scope_list.get("list", [])
-            if not isinstance(scopes, list):
+            scopes = _string_list(scope_list.get("list", []))
+            if scopes is None:
                 raise ValueError("invalid scope list")
-            safe_name = redact_text(name)
-            if safe_name in alternative:
-                raise ValueError("ambiguous redacted security scheme")
-            alternative[safe_name] = sorted(set(_strings(scopes)))
-        requirements.append(alternative)
-    return sorted(requirements, key=canonical_json)
+            alternative[name] = scopes
+        alternatives.append(alternative)
+    return _canonical(_redacted(alternatives))
+
+
+def _skill_security(
+    skill: dict[str, Any], schemes: Any
+) -> tuple[list[bool | None], Requirements | None]:
+    """Evaluate and record a skill's A2A 0.3 security and v1 securityRequirements."""
+    semantics: list[bool | None] = []
+    recorded: Requirements | None = None
+    if skill.get("security") is not None:
+        alternatives = _v03_requirements(skill["security"])
+        if alternatives is None:
+            semantics.append(None)
+        else:
+            semantics.append(_requirement_semantics(alternatives, schemes))
+            recorded = _canonical(_redacted(alternatives))
+    if skill.get("securityRequirements") is not None:
+        requirements = _security_requirements(skill["securityRequirements"])
+        semantics.append(bool(requirements) and all(requirements))
+        recorded = _canonical([*(recorded or []), *requirements])
+    return semantics, recorded
+
+
+def _client_method(item: Any) -> str:
+    if (
+        isinstance(item, str)
+        and len(item) <= 64
+        and item.isascii()
+        and _scheme_token(item) in _CLIENT_SCHEMES | _ANONYMOUS_SCHEMES
+    ):
+        return item
+    return UNRECOGNIZED_AUTHENTICATION
+
+
+def _client_authentication(config: dict[str, Any]) -> list[str]:
+    """Export only allowlisted scheme identifiers; credentials stay in the keyed input."""
+    declared: list[Any] = []
+    for field in ("authMethods", "authentication"):
+        value = config.get(field)
+        if isinstance(value, dict):
+            schemes = value.get("schemes")
+            value = [key for key in value if key != "schemes"] if schemes is None else schemes
+        if isinstance(value, str):
+            value = [value]
+        if isinstance(value, list) and len(value) <= 1000:
+            declared.extend(value)
+        elif value is not None:
+            declared.append(None)
+    return list(dict.fromkeys(_client_method(item) for item in declared))
+
+
+def _failure(relative: str, label: str, error: Exception) -> str:
+    if isinstance(error, SourceBindingValueError):
+        return f"{relative}: A2A declaration cannot be canonicalized for binding"
+    return f"{relative}: invalid A2A {label} field types"
 
 
 class A2AScanner(Scanner):
@@ -191,34 +405,69 @@ class A2AScanner(Scanner):
                     continue
                 result.surfaces_scanned.append(str(path))
                 try:
-                    component = self._parse_agent_card(data, relative, path)
-                    result.components.append(component)
-                    self._record_binding_gap(component, relative, result)
-                except (TypeError, ValueError):
-                    result.scan_failures.append(f"{relative}: invalid A2A card field types")
+                    binding = self._source_binding(data, "agent-card", result)
+                    component = self._parse_agent_card(data, relative, path, binding)
+                except (TypeError, ValueError, RecursionError) as error:
+                    result.scan_failures.append(_failure(relative, "card", error))
+                    continue
+                result.components.append(component)
+                self._record_binding_gap(component, relative, result)
             for relative in A2A_CONFIG_FILES:
                 path = files.root / relative
                 data = self._read_mapping(path, result)
                 if data is None:
                     continue
                 result.surfaces_scanned.append(str(path))
-                clients = data.get("clients", data.get("remoteAgents", []))
-                if not isinstance(clients, list) or len(clients) > 1000:
-                    result.scan_failures.append(f"{relative}: invalid or oversized A2A client list")
-                    continue
-                for client in clients:
-                    try:
-                        if not isinstance(client, dict):
-                            raise ValueError("invalid client")
-                        client_component = self._parse_a2a_client(client, path)
+                if any(
+                    value is not None for key, value in data.items() if key not in A2A_CLIENT_LISTS
+                ):
+                    result.surfaces_excluded.append(
+                        f"{relative}: unrecognized A2A client configuration fields "
+                        "are unknown coverage"
+                    )
+                for field in A2A_CLIENT_LISTS:
+                    clients = data.get(field)
+                    if clients is None:
+                        continue
+                    if not isinstance(clients, list) or len(clients) > 1000:
+                        result.scan_failures.append(
+                            f"{relative}: invalid or oversized A2A client list"
+                        )
+                        continue
+                    for client in clients:
+                        try:
+                            if not isinstance(client, dict):
+                                raise ValueError("invalid client")
+                            binding = self._source_binding(client, "client", result)
+                            client_component = self._parse_a2a_client(client, path, binding)
+                        except (TypeError, ValueError, RecursionError) as error:
+                            result.scan_failures.append(_failure(relative, "client", error))
+                            continue
                         result.components.append(client_component)
                         self._record_binding_gap(client_component, relative, result)
-                    except (TypeError, ValueError):
-                        result.scan_failures.append(f"{relative}: invalid A2A client field types")
             self._scan_code_patterns(files.root, result)
         if not result.components and not result.scan_failures and not result.surfaces_excluded:
             result.surfaces_scanned.append("a2a (no A2A configurations found)")
         return result
+
+    @staticmethod
+    def _source_binding(
+        declaration: dict[str, Any], kind: str, result: ScanResult
+    ) -> dict[str, Any]:
+        properties: dict[str, Any] = {"a2a_source_binding_profile": A2A_SOURCE_BINDING_PROFILE}
+        try:
+            binding = bind_source_values(
+                {"kind": kind, "declaration": declaration}, profile=A2A_SOURCE_BINDING_PROFILE
+            )
+        except SourceBindingKeyError:
+            # A configuration error, not a property of this declaration: report it once
+            # and keep the inventory, which stays partial coverage without a binding.
+            if _KEY_FAILURE not in result.scan_failures:
+                result.scan_failures.append(_KEY_FAILURE)
+            return properties
+        if binding is not None:
+            properties["a2a_source_binding"], properties["a2a_source_binding_key_id"] = binding
+        return properties
 
     @staticmethod
     def _record_binding_gap(
@@ -233,12 +482,18 @@ class A2AScanner(Scanner):
             result.surfaces_excluded.append(
                 f"{relative}: A2A authentication requirement semantics are unknown"
             )
+        if (
+            isinstance(component, A2AClientComponent)
+            and UNRECOGNIZED_AUTHENTICATION in component.authentication_methods
+        ):
+            result.surfaces_excluded.append(
+                f"{relative}: A2A client authentication semantics are unknown"
+            )
 
     def _parse_agent_card(
-        self, data: dict[str, Any], rel_path: str, card_path: Path
+        self, data: dict[str, Any], rel_path: str, card_path: Path, binding: dict[str, Any]
     ) -> A2AServerComponent:
-        declaration = data
-        data = _proto_fields(data, "supportedInterfaces", "securityRequirements")
+        data = _proto_fields(data, "supportedInterfaces", "securityRequirements", "securitySchemes")
         name, version = data.get("name", "unnamed-agent"), data.get("version")
         endpoint = data.get("url") or data.get("endpoint")
         if (
@@ -253,20 +508,30 @@ class A2AScanner(Scanner):
             "collection_mode": "static-agent-card",
             "authentication_evidence": "declaration-only",
         }
-        origins = [sanitized_origin(endpoint)] if endpoint else []
+        # A2A 0.3 clients route on url and additionalInterfaces even when a card also
+        # declares v1 supportedInterfaces, so their origins stay recorded and checked.
+        legacy = _legacy_interfaces(data, endpoint)
+        origins = [item["origin"] for item in legacy]
+        endpoint_url = origins[0] if endpoint else None
         if "supportedInterfaces" in data:
             interfaces = _interfaces(data["supportedInterfaces"])
             properties["supported_interfaces"] = interfaces
-            origins = [item["origin"] for item in interfaces]
+            endpoint_url = interfaces[0]["origin"]
+            origins = [*(item["origin"] for item in interfaces), *origins]
             protocols = list(dict.fromkeys(item["protocol_binding"] for item in interfaces))
+        if legacy:
+            properties["legacy_interfaces"] = legacy
         declared_skills = data.get("skills", [])
         if not isinstance(declared_skills, list) or len(declared_skills) > 1000:
             raise ValueError("invalid skills")
         skills = []
+        skill_semantics: list[bool | None] = []
         for skill in declared_skills:
             if isinstance(skill, dict):
                 skill = _proto_fields(skill, "securityRequirements")
-                if "securityRequirements" in skill:
+                semantics, requirements = _skill_security(skill, data.get("securitySchemes"))
+                skill_semantics.extend(semantics)
+                if requirements is not None:
                     skill_id = skill.get("id")
                     if not isinstance(skill_id, str) or not skill_id:
                         raise ValueError("missing skill identifier for security requirements")
@@ -274,7 +539,7 @@ class A2AScanner(Scanner):
                     safe_id = redact_text(skill_id)
                     if safe_id in declarations:
                         raise ValueError("duplicate skill security identifier")
-                    declarations[safe_id] = _security_requirements(skill["securityRequirements"])
+                    declarations[safe_id] = requirements
                 skill = skill.get("name", skill.get("id", "unknown"))
             if not isinstance(skill, str):
                 raise ValueError("invalid skill name")
@@ -282,18 +547,28 @@ class A2AScanner(Scanner):
         # This records declarations only; neither a card nor this collector proves
         # that an endpoint actually enforces authentication.
         requirements = None
-        if "securityRequirements" in data:
+        if data.get("securityRequirements") is not None:
             requirements = _security_requirements(data["securityRequirements"])
             properties["security_requirements"] = requirements
-        auth_required = _authentication_required(data, requirements)
+        auth_required = _authentication_required(data, requirements, skill_semantics)
         risks: list[RiskAssessment] = []
-        if any(not origin.startswith("https://") for origin in origins):
+        transport = [_transport_security(origin) for origin in origins]
+        if False in transport:
             risks.append(
                 RiskAssessment(
                     severity=RiskSeverity.HIGH,
                     category="transport_security",
                     detail=f"A2A agent '{name}' declares an endpoint without HTTPS.",
                     recommendation="Use authenticated HTTPS transport for agent endpoints.",
+                )
+            )
+        elif None in transport:
+            risks.append(
+                RiskAssessment(
+                    severity=RiskSeverity.MEDIUM,
+                    category="transport_security",
+                    detail=f"A2A agent '{name}' declares a gRPC address without declaring TLS.",
+                    recommendation="Declare a TLS endpoint and verify the channel independently.",
                 )
             )
         if not auth_required:
@@ -319,26 +594,25 @@ class A2AScanner(Scanner):
             name=name,
             version=redact_text(version) if version else None,
             agent_card_path=rel_path,
-            endpoint_url=origins[0] if origins else None,
+            endpoint_url=endpoint_url,
             supported_protocols=protocols,
             skills_declared=skills,
             authentication_required=auth_required,
             source_path=str(card_path),
             trust_tier=TrustTier.INTERNAL_UNVERIFIED,
             risks=risks,
-            properties={**properties, **_source_binding(declaration, "agent-card")},
+            properties={**properties, **binding},
         )
 
-    def _parse_a2a_client(self, config: dict[str, Any], config_path: Path) -> A2AClientComponent:
+    def _parse_a2a_client(
+        self, config: dict[str, Any], config_path: Path, binding: dict[str, Any]
+    ) -> A2AClientComponent:
         name = config.get("name", config.get("agentName", "unnamed-client"))
         card_url = config.get("agentCardUrl", config.get("url", config.get("endpoint")))
-        auth_methods = config.get("authMethods", config.get("authentication", []))
-        if isinstance(auth_methods, dict):
-            auth_methods = list(auth_methods)
-        auth_methods = _strings(auth_methods)
         if not isinstance(name, str) or (card_url is not None and not isinstance(card_url, str)):
             raise ValueError("invalid client identity")
         name = redact_text(name)
+        auth_methods = _client_authentication(config)
         risks = []
         if card_url and not card_url.lower().startswith("https://"):
             risks.append(
@@ -349,12 +623,16 @@ class A2AScanner(Scanner):
                     recommendation="Use authenticated HTTPS for agent card retrieval.",
                 )
             )
-        if not auth_methods:
+        # Every declared method is an alternative the client may use, so an anonymous or
+        # unrecognized one means authentication is not established as mandatory.
+        if not auth_methods or any(
+            method == UNRECOGNIZED_AUTHENTICATION or _anonymous(method) for method in auth_methods
+        ):
             risks.append(
                 RiskAssessment(
                     severity=RiskSeverity.MEDIUM,
                     category="authentication",
-                    detail=f"A2A client '{name}' has no authentication method declared.",
+                    detail=f"A2A client '{name}' does not declare a mandatory, recognized authentication method.",
                     recommendation="Configure and independently verify remote-agent authentication.",
                 )
             )
@@ -369,7 +647,7 @@ class A2AScanner(Scanner):
             properties={
                 "collection_mode": "static-config",
                 "remote_agent_contacted": False,
-                **_source_binding(config, "client"),
+                **binding,
             },
         )
 

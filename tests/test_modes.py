@@ -363,7 +363,8 @@ def test_every_static_command_runs_under_the_offline_guard(tmp_path):
 
 def test_documented_offline_demo_collects_every_surface(tmp_path, monkeypatch):
     monkeypatch.setenv(
-        "NEXUS_SYMBIOTE_SOURCE_BINDING_KEY", "offline-demo-test-key-at-least-32-characters"
+        "NEXUS_SYMBIOTE_SOURCE_BINDING_KEY",
+        "27ac76f7408dd6bd3f7da261e2121d13ff74ca2c484986570dcb86d9592c0199",
     )
     demo = REPOSITORY / "examples" / "demo-agent"
     if not demo.is_dir():

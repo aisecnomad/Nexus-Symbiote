@@ -333,7 +333,8 @@ class TestNewComponentTypes:
 
 
 class TestNewCollectorBoundaries:
-    def test_a2a_yaml_configuration_and_secret_url_minimization(self, tmp_path):
+    def test_a2a_yaml_configuration_and_secret_url_minimization(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("NEXUS_SYMBIOTE_SOURCE_BINDING_KEY", raising=False)
         (tmp_path / "a2a.yaml").write_text(
             "clients:\n  - name: docs-agent\n    agentCardUrl: 'https://user:CANARY@agent.example/private/CANARY?token=CANARY'\n"
         )

@@ -102,7 +102,8 @@ CHANGES = {
 @pytest.mark.parametrize("change", sorted(CHANGES))
 def test_in_place_change_fails_the_drift_gate(tmp_path, monkeypatch, change):
     monkeypatch.setenv(
-        "NEXUS_SYMBIOTE_SOURCE_BINDING_KEY", "drift-fixture-operator-key-at-least-32-characters"
+        "NEXUS_SYMBIOTE_SOURCE_BINDING_KEY",
+        "4c5672f4e58d6dbe13e2c70c004d3232e25f2457a2dd5709d8a86eb156cc2c13",
     )
     relative, old, new, component = CHANGES[change]
     project = tmp_path / "project"

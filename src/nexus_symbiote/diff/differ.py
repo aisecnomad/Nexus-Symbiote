@@ -293,7 +293,11 @@ class AIBOMDiffer:
         if isinstance(old, (A2AClientComponent, A2AServerComponent)) and isinstance(
             new, (A2AClientComponent, A2AServerComponent)
         ):
-            if any(c.properties.get("collection_mode") in A2A_STATIC_MODES for c in (old, new)):
+            # A supplied BOM can carry any JSON value here; a malformed mode needs review.
+            if any(
+                mode is not None and (not isinstance(mode, str) or mode in A2A_STATIC_MODES)
+                for mode in (c.properties.get("collection_mode") for c in (old, new))
+            ):
                 if not all(has_a2a_source_binding(c) for c in (old, new)):
                     modifications.append(
                         {
@@ -513,6 +517,7 @@ class AIBOMDiffer:
                     old.properties.get(field) != new.properties.get(field)
                     for field in (
                         "supported_interfaces",
+                        "legacy_interfaces",
                         "security_requirements",
                         "skill_security_requirements",
                     )
