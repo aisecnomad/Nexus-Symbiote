@@ -87,21 +87,28 @@ def test_dependency_policy_checks_every_batch_with_the_exact_version():
     ]
 
 
+HASH = "--hash=sha256:" + "0" * 64
+
+
 def test_locked_inventory_includes_pins_for_other_interpreters_and_platforms(tmp_path):
     lock = tmp_path / "requirements.lock"
     lock.write_text(
         "# generated\n"
         "\n"
         "Annotated_Types==0.8.0 \\\n"
-        "    --hash=sha256:00\n"
+        f"    {HASH} \\\n"
+        f"    {HASH}\n"
         "    # via pydantic\n"
         "zipp==4.1.2 ; python_full_version < '3.12' \\\n"
-        "    --hash=sha256:11\n"
+        f"    {HASH}\n"
         "colorama==0.4.6 ; sys_platform == 'win32'\n"
+        # pip strips indentation, so it installs an indented pin like any other.
+        f"  indented==2.0 {HASH}\n"
     )
     assert advisories.locked_packages((lock,)) == [
         {"name": "annotated-types", "version": "0.8.0"},
         {"name": "colorama", "version": "0.4.6"},
+        {"name": "indented", "version": "2.0"},
         {"name": "zipp", "version": "4.1.2"},
     ]
 
@@ -116,11 +123,22 @@ def test_locked_inventory_includes_pins_for_other_interpreters_and_platforms(tmp
         "arbitrary===1.0",
         "-r other-requirements.txt",
         "--extra-index-url https://packages.example.invalid/simple",
+        # pip strips indentation before it reads an entry, so indenting hides nothing.
+        "  loose>=1.0",
+        "\t-r other-requirements.txt",
+        "  --extra-index-url https://packages.example.invalid/simple",
+        # A hash line that continues no entry is an option line; pip follows the rest.
+        f"    {HASH} -r other-requirements.txt",
+        f"    {HASH} --extra-index-url https://packages.example.invalid/simple",
+        # Only a line holding one whole SHA-256 digest is skipped as a hash.
+        "    --hash=sha256:00",
     ],
 )
 def test_lock_entries_that_are_not_exact_pins_fail_the_audit(tmp_path, entry):
     lock = tmp_path / "requirements.lock"
-    lock.write_text("good==1.0 \\\n    --hash=sha256:00\n" + entry + "\n")
+    lock.write_text(f"good==1.0 \\\n    {HASH}\n    # via something\n")
+    assert advisories.locked_packages((lock,)) == [{"name": "good", "version": "1.0"}]
+    lock.write_text(lock.read_text() + entry + "\n")
     with pytest.raises(ValueError, match="exact pin"):
         advisories.locked_packages((lock,))
 

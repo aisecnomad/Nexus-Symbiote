@@ -33,6 +33,9 @@ LOCK_FILES = (ROOT / "requirements-ci.lock", ROOT / "requirements-action.lock")
 LOCK_PIN = re.compile(
     r"([A-Za-z0-9][A-Za-z0-9_.-]{0,199})==([0-9A-Za-z][0-9A-Za-z.+!_-]{0,199})(?=[ \t;\\]|$)"
 )
+# A hash line that continues no entry is an option line, and pip honors an include or
+# index option after its hash, so a skipped hash line must hold the hash alone.
+LOCK_HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}(?:[ \t]*\\)?")
 
 
 def installed_packages() -> list[dict[str, str]]:
@@ -61,9 +64,12 @@ def locked_packages(paths: tuple[Path, ...]) -> list[dict[str, str]]:
     packages: set[tuple[str, str]] = set()
     for path in paths:
         for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip() or line.startswith(("#", " ", "\t")):
-                continue  # Blank lines, comments, hashes and annotations.
-            match = LOCK_PIN.match(line)
+            # pip strips every line's indentation, so indenting a pin, include or index
+            # option changes nothing. Skip only blanks, comments and bare hash lines.
+            entry = line.strip()
+            if not entry or entry.startswith("#") or LOCK_HASH.fullmatch(entry):
+                continue
+            match = LOCK_PIN.match(entry)
             if match is None:
                 # Options, includes, ranges and extras would leave identities unaudited.
                 raise ValueError("lock entry is not an exact pin")
