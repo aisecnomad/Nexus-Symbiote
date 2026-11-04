@@ -69,6 +69,16 @@ approval. Independently authenticate the exact received bytes and the producer's
 policy before relying on the result. See [security model](security-model.md) and
 [ShadowScan integration](shadowscan-integration.md) for source verification.
 
+Schema validation, when exporting and in `verify-export`, includes the `format`
+assertions of the pinned CycloneDX schema: `date-time`, `date`, `idn-email`,
+`iri-reference` and `uri`. A malformed timestamp or IRI therefore fails the
+export or the check. The `date-time`, `iri-reference` and `uri` checkers come
+from the core `jsonschema[format-nongpl]` dependency, which the Action's locked
+environment also installs. jsonschema skips a `format` whose checker is not
+installed instead of failing, so install the package with its dependencies or
+from the provided locks. The SPDX 3.0.1 schema has no `format` assertions; it
+constrains timestamps with patterns.
+
 ### Verification limits
 
 A received export is untrusted, and checking it is costly. Comparing it with the
