@@ -3,6 +3,17 @@ description: Collect one agent inventory, validate it, and export reviewable sup
 branding:
   icon: shield
   color: blue
+# Operator binding key. The collector reads NEXUS_SYMBIOTE_SOURCE_BINDING_KEY from the
+# environment; it is not an input. Generate a random key once, never a passphrase,
+# for example with
+#   python -c 'import secrets; print(secrets.token_hex(32))'
+# store it as a repository secret, and pass it to this Action as step-level env:
+#   - uses: Hunzee-VC/Nexus-Symbiote@<reviewed-40-character-commit-sha>
+#     env:
+#       NEXUS_SYMBIOTE_SOURCE_BINDING_KEY: ${{ secrets.NEXUS_SYMBIOTE_SOURCE_BINDING_KEY }}
+# Without a valid key, A2A declarations are partial coverage and the validate and
+# risk gates fail. Pull requests from forks receive no secrets, so in a repository
+# with A2A declarations their runs fail closed.
 inputs:
   scan-path:
     description: Project directory within the checked-out workspace

@@ -39,9 +39,14 @@ nexus-symbiote --version
 Static collection is offline by default and does not execute project modules,
 MCP launchers or model loaders. Scan the target you detached in step 1, with
 project-supplied policy disabled so an untrusted checkout cannot pick its own
-gates:
+gates. First create a random operator binding key and keep it exported for the
+rest of this tutorial. A2A cards and client declarations need it for complete
+coverage, and the later steps compare against collections made with the same key.
+The key must be random, never a passphrase. See
+[the operator binding key](../verification-source-binding.md#the-operator-binding-key).
 
 ```bash
+export NEXUS_SYMBIOTE_SOURCE_BINDING_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 nexus-symbiote scan public-mcp-servers \
   --no-project-policy \
   -o public.aibom.json
@@ -121,11 +126,12 @@ nexus-symbiote scan public-mcp-servers --no-project-policy -o current.aibom.json
 nexus-symbiote diff reviewed.aibom.json current.aibom.json --fail-on-alert
 ```
 
-`--fail-on-alert` fails on in-place changes rated medium or higher: an MCP
-server package bumped at the same version, a swapped lockfile integrity value,
-a replaced MCP tool implementation, an A2A card URL moved to plain HTTP, or
-newly broad IDE agent allowances. The alert set is the one documented in the
-[CHANGELOG](../../CHANGELOG.md) and exercised by the regression suite.
+Collect both inventories with the same binding key. `--fail-on-alert` fails on
+in-place changes rated medium or higher: an MCP server package bumped at the same
+version, a swapped lockfile integrity value, a replaced MCP tool implementation,
+an A2A card URL moved to plain HTTP, or newly broad IDE agent allowances. The
+alert set is the one documented in the [CHANGELOG](../../CHANGELOG.md) and
+exercised by the regression suite.
 
 ## 7. Wire it into a reviewing repository's CI
 
@@ -145,6 +151,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: Hunzee-VC/Nexus-Symbiote@<reviewed-40-character-commit-sha>
+        env:
+          NEXUS_SYMBIOTE_SOURCE_BINDING_KEY: ${{ secrets.NEXUS_SYMBIOTE_SOURCE_BINDING_KEY }}
         with:
           scan-path: .
           output-file: agentbom.json
@@ -156,9 +164,15 @@ jobs:
 
 The Action installs its own reviewed source and ignores policy files supplied
 by the scanned checkout, so a hostile PR cannot pick the gates it is reviewed
-under. SARIF upload needs `security-events: write` added to the job and the
-repository's code-scanning entitlement; fork pull requests may have restricted
-tokens, in which case the retained evidence is the fallback.
+under. Generate the binding key once, store it as the repository secret
+`NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`, and pass it to the Action as step-level `env`
+as shown; it is not an input. Use the same secret for every workflow whose
+inventories you compare. Pull requests from forks receive no secrets, so for a
+repository with A2A declarations their run fails closed; review such changes
+from a branch of the repository itself. SARIF upload needs
+`security-events: write` added to the job and the repository's code-scanning
+entitlement; fork pull requests may have restricted tokens, in which case the
+retained evidence is the fallback.
 
 ## 8. What you have, and what you don't
 

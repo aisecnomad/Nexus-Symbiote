@@ -11,10 +11,10 @@ in clear, so it reveals nothing about secret values. It detects added or removed
 arguments, environment variables, fields and tools, and changed endpoint origins.
 
 Values are bound only when the operator sets `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` to
-a secret of at least 32 characters during collection and validation. Records then
-also carry `static_value_binding`, an HMAC-SHA256 under that key over the original
-server object (profile `nexus-symbiote/mcp-static-values/v1`), and a key
-identifier. This detects a different package with the same version, changed
+[random key material](#the-operator-binding-key) during collection and validation.
+Records then also carry `static_value_binding`, an HMAC-SHA256 under that key over
+the original server object (profile `nexus-symbiote/mcp-static-values/v1`), and a
+key identifier. This detects a different package with the same version, changed
 arguments, environment values, endpoint paths and opaque launchers. The key never
 enters the BOM; without it, the binding cannot be used to test guesses for a
 secret. Keep the key in the CI secret store, use the same key for a baseline and
@@ -35,12 +35,47 @@ an edited supplied descriptor establishes only self-consistency and cannot make
 it match a different local declaration. An asserted live-observation claim does
 not substitute for the static configuration evidence.
 
+## The operator binding key
+
+MCP and A2A collection read the same key from `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`.
+It must be random key material: at least 64 hexadecimal characters, or base64url
+(`A`-`Z`, `a`-`z`, `0`-`9`, `-` and `_`, optionally padded with `=`) that decodes
+to at least 32 bytes. Generate it; never use a passphrase:
+
+```sh
+python -c 'import secrets; print(secrets.token_hex(32))'
+```
+
+`openssl rand -hex 32` works as well. Every BOM carries the key identifier, and a
+binding over a public agent card is computed from known input, so either one lets
+anyone holding the BOM test guesses for the key offline. A recovered key would
+then confirm guesses for secrets inside the bound declarations and forge
+bindings. Collection therefore rejects shorter keys, other encodings (including
+standard base64 with `+` or `/`), surrounding whitespace or line breaks, base64url
+keys without both upper- and lower-case letters, and keys whose decoded bytes
+repeat few values. The check cannot tell a random-looking passphrase from random
+bytes, so generate the key rather than composing one.
+
+An invalid key fails collection with a message that names the variable and never
+contains the key. The A2A collector reports it once and keeps the unbound
+declarations in the inventory:
+
+```text
+NEXUS_SYMBIOTE_SOURCE_BINDING_KEY is not valid random key material; A2A declarations were not bound
+```
+
+The MCP collector records each affected server as an invalid tool definition.
+Moving from an older key to a new one changes every binding: recollect the
+baseline and its candidates with the new key.
+
 ## Upgrade existing snapshots
 
 Older static MCP snapshots lack the source binding and configured tool locators.
 They cannot establish this stronger reconciliation contract. Missing or unknown
 binding profiles fail validation and require recollection; copying a newly
-calculated digest into an old approved snapshot is not a migration.
+calculated digest into an old approved snapshot is not a migration. The same
+applies to A2A snapshots without a binding, and to snapshots bound under a key
+that collection no longer accepts.
 
 ```sh
 nexus-symbiote scan /path/to/project --no-project-policy --report-only -o candidate.json
@@ -67,29 +102,83 @@ Static A2A cards and client entries bind their entire original declaration using
 RFC 8785 and HMAC-SHA256 under `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`. The profile is
 `nexus-symbiote/a2a-static-values/v1`; the HMAC input includes the declaration kind
 (`agent-card` or `client`). Endpoints continue to expose only their origin.
-Authentication declarations, endpoint paths, queries, fragments, credentials,
-scheme definitions and skill metadata stay inside the keyed input. Object-key
-ordering and whitespace are insignificant; array order is retained conservatively.
-The binding is a measurement for comparison, not a publisher signature or evidence
-of effective endpoint authentication.
+Credentials and other authentication values, endpoint paths, queries, fragments,
+scheme definitions and skill metadata are covered only by the keyed input; the
+export keeps origins, recognized scheme identifiers, requirement names and scopes.
+Object-key ordering and whitespace are insignificant; array order is retained
+conservatively. The binding is a measurement for comparison, not a publisher
+signature or evidence of effective endpoint authentication.
 
 Use the same operator key for the reviewed baseline, candidates and project-backed
-validation/risk checks. The key must have at least 32 characters and stay outside
-the scanned checkout. A short key fails collection. Without a key, inventory
-output remains available but A2A value coverage is partial and default gates fail;
-use `--report-only` for inspection. `diff --fail-on-alert` requires review even
-when both unbound snapshots look identical. Missing legacy bindings, malformed
-values, incompatible profiles and key rotation require recollection and review.
-They cannot establish an unchanged A2A declaration.
+validation/risk checks; `diff` itself does not read the key. The key must be
+[random key material](#the-operator-binding-key) and stay outside the scanned
+checkout. Without a valid key, inventory output remains available but A2A value
+coverage is partial and default gates fail; use `--report-only` for inspection.
+`diff --fail-on-alert` requires review even when both unbound snapshots look
+identical. Missing legacy bindings, malformed values, incompatible profiles and
+key rotation require recollection and review. They cannot establish an unchanged
+A2A declaration.
+
+Keyed binding canonicalizes each declaration with RFC 8785, which accepts I-JSON
+only. A YAML date, an integer beyond 2^53, a non-finite number, a non-string key
+or nesting too deep to canonicalize in a card or client entry fails that
+declaration alone, and the other cards and clients are still collected:
+
+```text
+<file>: A2A declaration cannot be canonicalized for binding
+```
+
+Client configurations (`a2a.json`, `a2a.yaml`, `a2a.yml`, `a2a_config.json`) may
+list entries under `clients`, `remoteAgents` or both. Every entry in either list
+is collected and bound separately. Any other top-level field with a value is
+recorded as unknown coverage, because the collector cannot tell how it changes
+the clients. A client exports only recognized authentication scheme identifiers,
+compared without regard to case, spaces, hyphens or underscores: `bearer`,
+`basic`, `digest`, `apiKey`, `oauth2`, `openIdConnect` (`oidc`), `mutualTLS`
+(`mtls`), and the anonymous forms `none`, `public`, `anonymous`, `noauth`,
+`unauthenticated` and the empty string. Any other value, such as a token, is
+exported as `[unrecognized]` and recorded as unknown coverage; the value itself
+stays inside the keyed input. A missing, anonymous or unrecognized method raises
+an authentication finding.
 
 The collector interprets legacy `authentication.schemes`, the A2A 0.3
 [`security` alternatives](https://a2a-protocol.org/v0.3.0/specification/#55-agentcard-object-structure)
-and A2A v1 `securityRequirements`. An empty alternative permits anonymous use and
-does not establish required authentication. A card can declare several of these
-forms for different clients: if any declared form permits anonymous use,
-authentication is not required, and an unsupported form leaves the requirement
-unknown coverage. This collector is not a complete A2A protocol conformance validator.
+and A2A v1 `securityRequirements`, on the card and on each skill. An empty list
+or an empty alternative permits anonymous use and does not establish required
+authentication, and so does a legacy scheme named `none`, `public`, `anonymous`,
+`noauth`, `unauthenticated` or the empty string. A card can declare several of
+these forms for different clients, and a skill's requirements can relax the
+card's: if any declared form, on the card or on any skill, permits anonymous use,
+authentication is not required. A card that declares no card-level form does not
+require authentication. Skill-level requirements of either version are recorded
+in `skill_security_requirements`, keyed by skill identifier, so a skill that
+declares requirements needs a unique `id`.
+
+An unsupported form leaves the requirement unknown coverage: an A2A 0.3
+requirement that names a scheme missing from `securitySchemes`, or a scheme
+whose definition is not one of `apiKey`, `http` with a non-anonymous scheme,
+`oauth2`, `openIdConnect` or `mutualTLS` (in the 0.3 `type` form or the v1
+ProtoJSON form); a legacy `authentication` value that is not a mapping, has other
+fields but no scheme list, or lists something other than strings; and a
+`security` value of any other shape. Such cards stay in the inventory. A `null`
+field counts as absent. A2A v1 requirements are not yet checked against
+`securitySchemes`. This collector is not a complete A2A protocol conformance
+validator.
+
+The origins and transports of a card's A2A 0.3 `url` (with `preferredTransport`)
+and `additionalInterfaces` are recorded in `legacy_interfaces`, also when the card
+declares v1 `supportedInterfaces`, because 0.3 clients still route on them. They
+are part of the HTTPS check, and a change raises a high-severity drift alert, like
+a change to `supported_interfaces`. A gRPC interface may use the `host:port` address form that
+A2A v1 specifies. It is exported as `grpc://host:port` with its TLS use unknown,
+which raises a medium transport finding; `grpcs://` and `https://` addresses
+count as TLS. Interface URLs containing whitespace or control characters fail
+collection, because URL parsing would silently drop them and record a different
+host.
 
 `tests/test_a2a_source_binding.py` exercises the CLI gates, same-origin path and
-authentication changes, canonicalization, redaction, key loss/rotation and legacy
+authentication changes, both client lists, client authentication export,
+canonicalization, redaction, key requirements, loss and rotation, and legacy
 snapshots. These cases are also required against the installed release wheel.
+`tests/test_a2a_v1_cards.py` covers v1 and legacy interfaces and the
+authentication requirement forms.

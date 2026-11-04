@@ -86,14 +86,19 @@ nexus-symbiote scan /tmp/demo-agent -o after.json
 nexus-symbiote diff before.json after.json --fail-on-alert
 ```
 
-`diff` reports exactly two changes, a critical alert for the changed `tickets`
-endpoint and a high alert for the removed version pin, and exits 1:
+With the binding key from step 1 still exported, `diff` reports exactly two
+changes, both critical, and exits 1. The keyed source binding flags the changed
+`tickets` endpoint as well as the removed `notes` version pin:
 
 ```text
 Security Alerts:
   [CRITICAL] Critical change in 'tickets': MCP server endpoint changed. Review before execution.; MCP server static source binding changed: launcher, arguments, environment, endpoint or declared tools differ, or the binding key changed. Review before execution.; endpoint_url changed.; properties changed.
-  [HIGH] High change in 'notes': Version changed: 2025.8.21 → None; Version pin removed — now floating or unknown.; risks changed.
+  [CRITICAL] Critical change in 'notes': MCP server static source binding changed: launcher, arguments, environment, endpoint or declared tools differ, or the binding key changed. Review before execution.; Version changed: 2025.8.21 → None; Version pin removed — now floating or unknown.; properties changed.; risks changed.
 ```
+
+Without the key, both scans exit 1 because the demo's A2A card is unbound, and
+`diff` reports a third change: that card's unknown source binding, which needs
+review in every unkeyed comparison.
 
 Compare snapshots taken from the same checkout path: an inventory records where
 each file was found, so scanning a copy in another directory also reports

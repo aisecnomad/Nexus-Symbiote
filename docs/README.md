@@ -27,7 +27,7 @@ Reference material: exact behavior, fields and limits.
 | [CLI reference](cli-reference.md) | Every command, option and exit code, kept in sync with the CLI by a test |
 | [AgentBOM schemas](../schemas/README.md) | The native AgentBOM JSON Schema, the deployment-profile schema and a minimal example |
 | [Export portability](export-portability.md) | Standard field mappings, native extension loss and checking received exports |
-| [Source binding](verification-source-binding.md) | How static MCP records are bound to their configuration and reconciled with a project |
+| [Source binding](verification-source-binding.md) | How static MCP and A2A records are bound to their declarations under a random operator key, and reconciled with a project |
 | [TypeScript inventory](typescript-inventory.md) | Static collection of MCP tool registrations from TypeScript servers, and its limits |
 | [npm lockfile evidence](npm-lockfile-evidence.md) | What the registry collector records from `package.json` and npm lockfiles |
 | [Deployment evidence](deployment-evidence.md) | The optional deployment profile and its scoped authority claims |
@@ -52,7 +52,7 @@ Reference material: exact behavior, fields and limits.
 | --- | --- |
 | [Tool fingerprint migration](fingerprint-migration.md) | Re-collect tool definitions hashed by an older serializer |
 | [Security defaults migration](security-defaults-migration.md) | Handle security fields that are now unknown instead of an invented default |
-| [Upgrade existing snapshots](verification-source-binding.md#upgrade-existing-snapshots) | Re-collect MCP snapshots that predate source binding |
+| [Upgrade existing snapshots](verification-source-binding.md#upgrade-existing-snapshots) | Re-collect MCP and A2A snapshots that predate source binding or a new binding key |
 
 ### Contribute, operate and release
 

@@ -115,4 +115,9 @@ nexus-symbiote import-shadowscan tests/fixtures/shadowscan/code-report-0.1.4.jso
   --report-only -o imported.aibom.json
 ```
 
+The first command creates the random
+[operator binding key](verification-source-binding.md#the-operator-binding-key)
+that A2A declarations need for complete coverage; never use a passphrase. Keep it
+exported for later commands that collect or compare this project.
+
 See [`examples/README.md`](../examples/README.md) for the full walkthrough.
