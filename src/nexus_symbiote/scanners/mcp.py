@@ -37,6 +37,8 @@ from nexus_symbiote.core.hashing import (
 )
 from nexus_symbiote.core.hashing import (
     TOOL_DEFINITION_HASH_VERSION,
+    SourceBindingKeyError,
+    SourceBindingValueError,
     bind_source_values,
     extract_version_pin,
     hash_canonical,
@@ -190,6 +192,9 @@ _OCI_REPOSITORY = (
 # Values are bound by an HMAC under an operator key that never enters the BOM.
 STATIC_CONFIG_HASH_PROFILE = "nexus-symbiote/mcp-static-config/v2"
 STATIC_VALUE_BINDING_PROFILE = "nexus-symbiote/mcp-static-values/v1"
+_KEY_FAILURE = (
+    f"{SOURCE_BINDING_KEY_ENV} is not valid random key material; MCP servers were not collected"
+)
 
 
 def _value_binding(config: dict[str, Any]) -> tuple[str, str] | None:
@@ -332,6 +337,18 @@ class MCPScanner(Scanner):
                             config_path,
                             inherited_from=[label for label, _ in contributions],
                         )
+                    except SourceBindingKeyError:
+                        # A configuration error, not a property of this server: report it
+                        # once. A record without the requested binding is not collected.
+                        if _KEY_FAILURE not in result.scan_failures:
+                            result.scan_failures.append(_KEY_FAILURE)
+                        continue
+                    except SourceBindingValueError:
+                        result.scan_failures.append(
+                            f"{config_name}: MCP server declaration cannot be canonicalized "
+                            "for binding"
+                        )
+                        continue
                     except (TypeError, ValueError, RecursionError):
                         result.scan_failures.append(f"{config_name}: invalid tool definition")
                         continue
