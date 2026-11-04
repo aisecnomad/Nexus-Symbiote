@@ -71,5 +71,6 @@ Reference material: exact behavior, fields and limits.
 | [Roadmap](../ROADMAP.md) | Near-term priorities and explicit non-goals |
 | [Closed-PR audit, 2026-11-02](audits/closed-pr-review-2026-11-02.md) | Disposition of every closed pull request up to #73, and what reached the supported package |
 | [Pull-request, branch and issue review, 2026-11-03](audits/closed-pr-review-2026-11-03.md) | Pull requests #74–#116, every branch, and the issues still open on 2026-11-03 |
+| [Pull-request, patch, branch and gap review, 2026-11-04](audits/review-2026-11-04.md) | Pull request #118, the three submitted patches, every branch, and the repository gaps closed on 2026-11-04 |
 
 Documentation changes follow the same review as code. Local links, including links to headings, are checked in CI by `scripts/check_repository_hygiene.py`; run `make hygiene` before you open a pull request.
