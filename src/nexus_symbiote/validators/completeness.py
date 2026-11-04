@@ -387,22 +387,144 @@ class CompletenessValidator:
                 )
             else:
                 supplementary[extra.bom_ref] = extra
-        # Nothing here checks a supplementary observation, so a relationship that binds
-        # it to a local subject can be no stronger than the observation, nor verified.
-        rank: dict[str | None, int] = {None: 0, "declared": 1, "observed": 2, "verified": 3}
-        for edge in bom.dependencies:
-            ends = {edge.source_ref, edge.target_ref}
-            if not ends & projected_refs:
-                continue
-            for ref in ends & supplementary.keys():
-                claimed = max(rank[c.assurance.value] for c in supplementary[ref].claims.values())
-                if rank[edge.assurance_level] > min(claimed, rank["observed"]):
-                    incomplete(
+        local_servers = {
+            c.bom_ref for c in expected.components if isinstance(c, MCPServerComponent)
+        }
+        for ref, reason in (
+            *self._unestablished_verification(bom, supplementary),
+            *self._unreconciled_attachments(bom, projected_refs, local_servers, supplementary),
+        ):
+            incomplete(ref, reason)
+        return report
+
+    @staticmethod
+    def _unestablished_verification(
+        bom: AIBOM, supplementary: dict[str, AnyComponent]
+    ) -> list[tuple[str, str]]:
+        """Report verification that no collector, live record or offline check establishes.
+
+        Local subjects must already match the projection's assurance and trust tier, but
+        a supplier can add claims to them. Nothing else checks supplementary components.
+        """
+        unestablished = "which project reconciliation cannot establish."
+        verified_tiers = {TrustTier.INTERNAL_VERIFIED, TrustTier.THIRD_PARTY_SIGNED}
+        problems: list[tuple[str, str]] = []
+        for component in bom.components:
+            ref = component.bom_ref
+            if ref in supplementary and component.assurance_level is AssuranceLevel.VERIFIED:
+                problems.append(
+                    (
                         ref,
-                        f"Relationship {edge.relationship} with supplementary component {ref} "
+                        f"Supplementary component {ref} claims verified assurance, {unestablished}",
+                    )
+                )
+            if ref in supplementary and component.trust_tier in verified_tiers:
+                tier = component.trust_tier.value
+                problems.append(
+                    (ref, f"Supplementary component {ref} claims {tier} trust, {unestablished}")
+                )
+            problems.extend(
+                (ref, f"Claim {name} on {ref} is verified, {unestablished}")
+                for name, claim in component.claims.items()
+                if claim.assurance is AssuranceLevel.VERIFIED
+            )
+        problems.extend(
+            (
+                "graph",
+                f"Relationship {edge.relationship} {edge.source_ref} -> {edge.target_ref} "
+                f"is verified, {unestablished}",
+            )
+            for edge in bom.dependencies
+            if edge.assurance_level == "verified"
+        )
+        return problems
+
+    @staticmethod
+    def _unreconciled_attachments(
+        bom: AIBOM,
+        projected_refs: set[str],
+        local_servers: set[str],
+        supplementary: dict[str, AnyComponent],
+    ) -> list[tuple[str, str]]:
+        """Admit only the attachment that verify-live --record makes to local subjects.
+
+        It records a tool served by a local MCP server, lists it in that server's
+        tool_refs and links it by provides-tool from that server; an agent may also
+        list the tool. Any other reference or relationship between a local subject
+        and a supplementary component would attach an unchecked claim, such as a
+        control, to the repository.
+        """
+        rank: dict[str | None, int] = {None: 0, "declared": 1, "observed": 2, "verified": 3}
+
+        def server_of(ref: str) -> str | None:
+            tool = supplementary.get(ref)
+            if isinstance(tool, ToolComponent) and tool.mcp_server_ref in local_servers:
+                return tool.mcp_server_ref
+            return None
+
+        problems: list[tuple[str, str]] = []
+        for component in bom.components:
+            for name in type(component).model_fields:
+                if name == "bom_ref" or not name.endswith(("_ref", "_refs")):
+                    continue
+                value = getattr(component, name)
+                for ref in value if isinstance(value, list) else [value] if value else []:
+                    if component.bom_ref in projected_refs and ref in supplementary:
+                        extra = ref
+                        allowed = (
+                            name == "tool_refs"
+                            and server_of(ref) is not None
+                            and (
+                                isinstance(component, AgentComponent)
+                                or component.bom_ref == server_of(ref)
+                            )
+                        )
+                    elif component.bom_ref in supplementary and ref in projected_refs:
+                        extra = component.bom_ref
+                        allowed = name == "mcp_server_ref" and server_of(extra) == ref
+                    else:
+                        continue
+                    if not allowed:
+                        problems.append(
+                            (
+                                extra,
+                                f"Reference {component.bom_ref}.{name} attaches supplementary "
+                                f"component {extra} to a local subject; only a tool served by a "
+                                "local MCP server can be attached.",
+                            )
+                        )
+        for edge in bom.dependencies:
+            if edge.source_ref in projected_refs and edge.target_ref in supplementary:
+                extra = edge.target_ref
+            elif edge.target_ref in projected_refs and edge.source_ref in supplementary:
+                extra = edge.source_ref
+            else:
+                continue
+            if (
+                edge.relationship != "provides-tool"
+                or edge.target_ref != extra
+                or edge.source_ref != server_of(extra)
+            ):
+                problems.append(
+                    (
+                        extra,
+                        f"Relationship {edge.relationship} {edge.source_ref} -> "
+                        f"{edge.target_ref} attaches supplementary component {extra} to a local "
+                        "subject; only provides-tool from the local MCP server serving that "
+                        "tool can.",
+                    )
+                )
+            elif rank[edge.assurance_level] > max(
+                rank[claim.assurance.value] for claim in supplementary[extra].claims.values()
+            ):
+                problems.append(
+                    (
+                        extra,
+                        f"Relationship {edge.relationship} with supplementary component {extra} "
                         "claims more assurance than its unverified claims support.",
                     )
-        return report
+                )
+        return problems
 
     @staticmethod
     def _retains_local_evidence(

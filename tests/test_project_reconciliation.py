@@ -303,60 +303,256 @@ def test_project_reconciliation_preserves_supplementary_live_edges(tmp_path):
     )
 
 
+TWO_SERVERS = '{"mcpServers":{"local":{"command":"node"},"other":{"command":"deno"}}}'
+
+
+def _scanned(tmp_path: Path, files: dict[str, str]) -> tuple[Path, Path, AIBOM]:
+    project = tmp_path / "project"
+    project.mkdir()
+    for name, text in files.items():
+        (project / name).write_text(text)
+    output = tmp_path / "bom.json"
+    scan = ["scan", str(project), "--no-project-policy", "-o", str(output)]
+    assert CliRunner().invoke(main, scan).exit_code == 0
+    return project, output, AIBOM.load(output)
+
+
+def _assert_reconciled(project: Path, output: Path) -> None:
+    args = ["risk", str(output), "--project", str(project), "--no-project-policy", "--json-output"]
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["assessment_basis"] == "project-reconciled"
+
+
+def _assert_unreconciled(project: Path, output: Path, culprit: str) -> None:
+    runner = CliRunner()
+    against = [str(output), "--project", str(project), "--no-project-policy"]
+    result = runner.invoke(main, ["validate", *against])
+    assert result.exit_code == 1, result.output
+    assert culprit in result.output
+    result = runner.invoke(main, ["risk", *against, "--json-output"])
+    assert result.exit_code == 1, result.output
+    report = json.loads(result.stdout)
+    assert report["assessment_basis"] == "project-reconciliation-failed"
+    assert any(culprit in reason for reason in report["gate_reasons"])
+
+
 @pytest.mark.parametrize(
-    ("claimed", "asserted", "relationship", "inbound"),
+    ("claimed", "level", "trust", "edge", "referenced"),
     [
-        ("observed", "verified", "uses-guardrail", False),
-        ("verified", "verified", "uses-guardrail", False),
-        ("declared", "observed", "uses-guardrail", False),
-        ("observed", "verified", "invokes", True),
+        # A record stronger than the supplementary observation.
+        ("observed", "declared", "unknown", ("out", "uses-guardrail", "verified"), True),
+        ("verified", "declared", "unknown", ("out", "uses-guardrail", "verified"), True),
+        ("declared", "declared", "unknown", ("out", "uses-guardrail", "observed"), True),
+        ("observed", "declared", "unknown", ("in", "invokes", "verified"), True),
+        # A weaker record, or a reference alone, attaches the same control.
+        ("verified", "verified", "internal-verified", ("out", "uses-guardrail", "observed"), True),
+        ("verified", "verified", "internal-verified", ("out", "uses-guardrail", None), True),
+        ("verified", "verified", "internal-verified", None, True),
+        ("observed", "observed", "unknown", ("out", "uses-guardrail", "observed"), True),
+        ("observed", "observed", "unknown", None, True),
+        ("observed", "observed", "unknown", ("in", "invokes", "observed"), False),
+        # Nothing offline establishes verified assurance or trust, attached or not.
+        ("declared", "verified", "unknown", None, False),
+        ("verified", "declared", "unknown", None, False),
+        ("observed", "observed", "internal-verified", None, False),
+        ("observed", "observed", "third-party-signed", None, False),
+    ],
+    ids=[
+        "verified-record",
+        "verified-claim-and-record",
+        "record-exceeds-claim",
+        "inbound-verified-record",
+        "verified-claim-observed-record",
+        "verified-claim-unqualified-record",
+        "verified-claim-reference-only",
+        "observed-record",
+        "observed-reference-only",
+        "inbound-observed-record",
+        "unattached-verified-component",
+        "unattached-verified-claim",
+        "unattached-verified-trust",
+        "unattached-signed-trust",
     ],
 )
-def test_supplementary_relationships_cannot_exceed_their_own_observation(
-    tmp_path, claimed, asserted, relationship, inbound
+def test_supplementary_controls_cannot_attach_to_local_subjects(
+    tmp_path, claimed, level, trust, edge, referenced
 ):
     from nexus_symbiote.core.aibom import DependencyEdge
     from nexus_symbiote.core.models import ClaimEvidence, GuardrailComponent
 
-    project = tmp_path / "project"
-    project.mkdir()
-    (project / "AGENTS.md").write_text("Review requests.")
-    output = tmp_path / "bom.json"
-    runner = CliRunner()
-    scan = ["scan", str(project), "--no-project-policy", "-o", str(output)]
-    assert runner.invoke(main, scan).exit_code == 0
-    bom = AIBOM.load(output)
+    project, output, bom = _scanned(tmp_path, {"AGENTS.md": "Review requests."})
     agent = next(c for c in bom.components if c.component_type.value == "agent")
     guardrail = GuardrailComponent(
         bom_ref="guardrail:approval-gate",
         name="human approval gate",
+        assurance_level=level,
+        trust_tier=trust,
         claims={
             "enforcement": ClaimEvidence(assurance=claimed, method="runtime-trace", scope="runtime")
         },
     )
     bom.add_component(guardrail)
-    agent.guardrail_refs.append(guardrail.bom_ref)
-    source, target = agent.bom_ref, guardrail.bom_ref
-    if inbound:
-        source, target = target, source
-    bom.add_dependency(
-        DependencyEdge(
-            source_ref=source,
-            target_ref=target,
-            relationship=relationship,
-            assurance_level=asserted,
-            conditions="all tool calls mediated",
+    if referenced:
+        agent.guardrail_refs.append(guardrail.bom_ref)
+    if edge:
+        direction, relationship, asserted = edge
+        source, target = agent.bom_ref, guardrail.bom_ref
+        if direction == "in":
+            source, target = target, source
+        bom.add_dependency(
+            DependencyEdge(
+                source_ref=source,
+                target_ref=target,
+                relationship=relationship,
+                assurance_level=asserted,
+                conditions="all tool calls mediated",
+            )
         )
-    )
     assert not validate_graph(bom)
     bom.save(output)
-    against = [str(output), "--project", str(project), "--no-project-policy"]
-    result = runner.invoke(main, ["validate", *against])
-    assert result.exit_code == 1, result.output
-    assert guardrail.bom_ref in result.output
-    result = runner.invoke(main, ["risk", *against, "--json-output"])
-    assert result.exit_code == 1, result.output
-    assert json.loads(result.stdout)["assessment_basis"] == "project-reconciliation-failed"
+    _assert_unreconciled(project, output, guardrail.bom_ref)
+
+
+def test_unattached_supplementary_observation_is_kept_unverified(tmp_path):
+    from nexus_symbiote.core.models import ClaimEvidence, GuardrailComponent
+
+    project, output, bom = _scanned(tmp_path, {"AGENTS.md": "Review requests."})
+    bom.add_component(
+        GuardrailComponent(
+            bom_ref="guardrail:approval-gate",
+            name="human approval gate",
+            claims={
+                "enforcement": ClaimEvidence(
+                    assurance="observed", method="runtime-trace", scope="runtime"
+                )
+            },
+        )
+    )
+    bom.save(output)
+    _assert_reconciled(project, output)
+
+
+def test_supplied_verified_claim_on_a_local_subject_is_unreconciled(tmp_path):
+    from nexus_symbiote.core.models import ClaimEvidence
+
+    project, output, bom = _scanned(tmp_path, {"AGENTS.md": "Review requests."})
+    agent = next(c for c in bom.components if c.component_type.value == "agent")
+    agent.claims["human_approval"] = ClaimEvidence(
+        assurance="verified", method="runtime-trace", scope="runtime"
+    )
+    bom.save(output)
+    _assert_unreconciled(project, output, agent.bom_ref)
+
+
+@pytest.mark.parametrize("attachment", ["delegating-agent", "unserved-server"])
+def test_other_supplementary_components_cannot_attach_to_local_subjects(tmp_path, attachment):
+    from nexus_symbiote.core.models import AgentComponent, ClaimEvidence, MCPServerComponent
+
+    project, output, bom = _scanned(tmp_path, {"AGENTS.md": "Review requests."})
+    agent = next(c for c in bom.components if c.component_type.value == "agent")
+    runtime = {
+        "observation": ClaimEvidence(assurance="observed", method="runtime-trace", scope="runtime")
+    }
+    extra: AgentComponent | MCPServerComponent
+    if attachment == "delegating-agent":
+        extra = AgentComponent(bom_ref="agent:orchestrator", name="orchestrator", claims=runtime)
+    else:
+        extra = MCPServerComponent(bom_ref="mcp:remote", name="remote", claims=runtime)
+    bom.add_component(extra)
+    bom.save(output)
+    _assert_reconciled(project, output)
+    if isinstance(extra, AgentComponent):
+        extra.sub_agent_refs.append(agent.bom_ref)
+    else:
+        agent.tool_refs.append(extra.bom_ref)
+    assert not validate_graph(bom)
+    bom.save(output)
+    _assert_unreconciled(project, output, extra.bom_ref)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "foreign-provider",
+        "foreign-listing",
+        "verified-provider",
+        "unsupported-provider",
+        "invoked",
+        "unserved",
+    ],
+)
+def test_recorded_tools_attach_only_through_their_serving_server(tmp_path, variant):
+    from nexus_symbiote.core.aibom import DependencyEdge
+    from nexus_symbiote.core.enums import AssuranceLevel
+    from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolComponent
+
+    project, output, bom = _scanned(tmp_path, {".mcp.json": TWO_SERVERS})
+    local, other = sorted(
+        (c for c in bom.components if isinstance(c, MCPServerComponent)), key=lambda c: c.name
+    )
+    agent = next(c for c in bom.components if c.component_type.value == "agent")
+    served = ClaimEvidence(
+        assurance="observed", scope="served-descriptor", method="operator-pinned-stdio-tools-list"
+    )
+    tool = ToolComponent(
+        bom_ref="tool:observed",
+        name="observed",
+        mcp_server_ref=local.bom_ref,
+        assurance_level="observed",
+        claims={"tool_definition": served},
+    )
+    bom.add_component(tool)
+    provided = DependencyEdge(
+        source_ref=local.bom_ref,
+        target_ref=tool.bom_ref,
+        relationship="provides-tool",
+        assurance_level="observed",
+    )
+    bom.add_dependency(provided)
+    local.tool_refs.append(tool.bom_ref)
+    agent.tool_refs.append(tool.bom_ref)
+    bom.save(output)
+    _assert_reconciled(project, output)
+
+    if variant == "foreign-provider":
+        bom.add_dependency(provided.model_copy(update={"source_ref": other.bom_ref}))
+    elif variant == "foreign-listing":
+        other.tool_refs.append(tool.bom_ref)
+    elif variant == "verified-provider":
+        provided.assurance_level = "verified"
+    elif variant == "unsupported-provider":
+        served.assurance = AssuranceLevel.DECLARED
+    elif variant == "invoked":
+        invoked = {"source_ref": agent.bom_ref, "relationship": "invokes"}
+        bom.add_dependency(provided.model_copy(update=invoked))
+    else:
+        tool.mcp_server_ref = None
+    assert not validate_graph(bom)
+    bom.save(output)
+    _assert_unreconciled(project, output, tool.bom_ref)
+
+
+def test_recorded_live_observation_still_reconciles(tmp_path, monkeypatch):
+    from nexus_symbiote.live.verify import record_candidate, verify_mcp_servers
+
+    project, output, bom = _scanned(tmp_path, {".mcp.json": TWO_SERVERS})
+    served = {
+        "name": "observed",
+        "description": "Served at run time only",
+        "inputSchema": {"type": "object", "properties": {}},
+    }
+    monkeypatch.setattr(
+        "nexus_symbiote.live.verify.fetch_tools_from_config",
+        lambda *args, **kwargs: ("stdio", [served]),
+    )
+    report = verify_mcp_servers(bom)
+    assert [f.status for r in report.results for f in r.tool_findings] == ["new", "new"]
+    record_candidate(bom, report)
+    bom.save(output)
+    checked = CompletenessValidator().validate_against_project(bom, project)
+    assert checked.is_complete, [issue.description for issue in checked.issues]
+    _assert_reconciled(project, output)
 
 
 @pytest.mark.parametrize("basename", ["agent", "agent-ci-clone"])
