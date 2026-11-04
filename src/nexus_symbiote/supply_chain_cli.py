@@ -12,6 +12,7 @@ import click
 from nexus_symbiote import modes
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.utils.files import write_output_file
+from nexus_symbiote.utils.terminal import one_line
 
 
 def register_supply_chain_commands(main: click.Group) -> None:
@@ -154,7 +155,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
         try:
             text = VEXGenerator().generate_json(AIBOM.load(aibom_path))
         except (OSError, ValueError) as exc:
-            raise click.ClickException(str(exc)) from exc
+            raise click.ClickException(one_line(exc)) from exc
         if output:
             write_output_file(output, text)
         else:
@@ -178,7 +179,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
         try:
             report = fetch_advisories(AIBOM.load(aibom_path))
         except (OSError, ValueError) as exc:
-            raise click.ClickException(str(exc)) from exc
+            raise click.ClickException(one_line(exc)) from exc
         text = json.dumps(report.to_dict(), indent=2)
         if output:
             write_output_file(output, text)

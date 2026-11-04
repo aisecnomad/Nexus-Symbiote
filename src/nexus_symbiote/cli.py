@@ -25,12 +25,14 @@ from nexus_symbiote.policy import Policy
 from nexus_symbiote.runtime_cli import register_runtime_commands
 from nexus_symbiote.supply_chain_cli import register_supply_chain_commands
 from nexus_symbiote.utils.files import write_output_file
+from nexus_symbiote.utils.terminal import one_line
 
 if TYPE_CHECKING:
     from nexus_symbiote.scanners.base import ScanResult
     from nexus_symbiote.utils.crypto import SigstoreArtifactPolicy
 
-console = Console(stderr=True)
+# Emoji shortcodes such as :white_check_mark: would render inside escaped text.
+console = Console(stderr=True, emoji=False)
 err_console = console
 
 
@@ -56,21 +58,12 @@ def _policy(root: Path, *, ignore_project: bool = False) -> Policy:
     try:
         return load_policy(root) or default_policy()
     except PolicyError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-
-# C0/C1 controls move the cursor or rewrite earlier output; bidirectional and
-# invisible format characters disguise text. Inventory data may contain any of them.
-# Line breaks are included: a file name or component name containing one could
-# forge whole output lines, and in CI a line starting with "::" is a workflow command.
-_UNSAFE_TEXT = re.compile(
-    r"[\x00-\x08\x0a-\x1f\x7f-\x9f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
-)
+        raise click.ClickException(one_line(exc)) from exc
 
 
 def _safe(value: object) -> str:
     """Render untrusted text literally: no Rich markup and no terminal control sequences."""
-    return escape(_UNSAFE_TEXT.sub("\ufffd", str(value)))
+    return escape(one_line(value))
 
 
 def _load_bom(path: str | Path) -> AIBOM:
@@ -94,7 +87,7 @@ def _signer_policies(path: Path | None, project: Path | None) -> list[SigstoreAr
     try:
         return load_signature_policies(path, project)
     except ValueError as exc:
-        raise click.ClickException(str(exc)) from None
+        raise click.ClickException(one_line(exc)) from None
 
 
 def _get_scanners() -> dict[str, type]:
@@ -369,7 +362,7 @@ def scan(
     try:
         assemble_repository_agent(aibom, root)
     except (PolicyError, ValueError, OSError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(one_line(exc)) from exc
     scan_failures.extend(validate_graph(aibom))
     aibom.metadata.completeness = CompletenessClaim(
         scope="repository+shadowscan" if source_report_digest else "repository",
@@ -819,8 +812,10 @@ def risk(
                 )
             else:
                 click.echo("Risk unknown. Project reconciliation failed.", err=True)
+                # A fixed marker keeps every reason off column 0, where the GitHub
+                # Actions runner would read inventory text such as "::error" as a command.
                 for reason in reasons:
-                    click.echo(_UNSAFE_TEXT.sub("\ufffd", reason), err=True)
+                    click.echo(f"  - {one_line(reason)}", err=True)
             raise click.exceptions.Exit(1)
         basis = "project-reconciled"
     scorer = RiskScorer(
@@ -967,7 +962,7 @@ def blast_radius_command(aibom_path: str, component_ref: str, json_output: bool)
     try:
         result = blast_radius(bom, component_ref)
     except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(one_line(exc)) from exc
     if json_output:
         click.echo(json.dumps(result, indent=2))
     else:
