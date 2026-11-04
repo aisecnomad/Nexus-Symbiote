@@ -15,6 +15,7 @@ from tempfile import TemporaryDirectory
 import pytest
 
 import nexus_symbiote
+from nexus_symbiote.core.hashing import SOURCE_BINDING_KEY_ENV
 
 TESTS = Path(__file__).resolve().parents[1] / "tests"
 CASES = (
@@ -101,6 +102,9 @@ def main() -> int:
         try:
             os.chdir(tests)
             os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+            # The copied cases run without tests/conftest.py, so nothing else unsets an
+            # operator key exported in the shell, and a key collection rejects fails them.
+            os.environ.pop(SOURCE_BINDING_KEY_ENV, None)
             required = RequireExecution()
             status = pytest.main(["-v", "--import-mode=importlib", *CASES], plugins=[required])
             if required.skipped:
