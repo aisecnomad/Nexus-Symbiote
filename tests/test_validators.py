@@ -179,7 +179,9 @@ class TestIntegrityValidator:
         )
         iv = IntegrityValidator()
         report = iv.validate(bom)
-        assert report.hashes_verified == 1
+        assert report.tool_descriptors_self_consistent == 1
+        assert report.hashes_verified == 0
+        assert report.status == "unknown"
         assert report.hashes_failed == 0
 
     def test_unsafe_model_flagged(self):

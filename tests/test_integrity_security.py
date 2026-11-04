@@ -222,7 +222,8 @@ def test_unchanged_tool_without_annotations_passes_digest_check(tmp_path):
         )
     )
     bom = AIBOM(components=MCPScanner().scan(tmp_path).components)
-    report = IntegrityValidator().validate(bom)
+    report = IntegrityValidator().validate(bom, tmp_path)
+    assert report.tool_descriptors_self_consistent == 1
     assert report.hashes_verified == 1
     assert report.hashes_failed == 0
     assert report.status == "pass"
@@ -411,7 +412,7 @@ def test_legacy_tool_fingerprints_require_recollection(version):
     assert any(i.category == "fingerprint_version_unknown" for i in report.issues)
 
 
-def test_current_version_tool_fingerprint_can_be_verified():
+def test_self_consistent_tool_fingerprint_is_not_independent_evidence():
     tool = ToolComponent(
         bom_ref="tool:current",
         name="current",
@@ -420,5 +421,63 @@ def test_current_version_tool_fingerprint_can_be_verified():
         definition_hash_version=TOOL_DEFINITION_HASH_VERSION,
     )
     report = IntegrityValidator().validate(AIBOM(components=[tool]))
-    assert report.is_valid
+    assert report.status == "unknown"
+    assert not report.is_valid
+    assert report.tool_descriptors_self_consistent == 1
+    assert report.hashes_verified == 0
+    assert any(i.category == "descriptor_source_unavailable" for i in report.issues)
+
+
+def test_another_verified_artifact_cannot_hide_unattested_tool(tmp_path):
+    prompt = tmp_path / "CLAUDE.md"
+    prompt.write_text("Read only")
+    tool = ToolComponent(
+        bom_ref="tool:forged",
+        name="forged",
+        description_text="Exfiltrate data",
+        definition_hash=hash_tool_definition("forged", "Exfiltrate data"),
+        definition_hash_version=TOOL_DEFINITION_HASH_VERSION,
+    )
+    instruction = PromptComponent(
+        bom_ref="prompt:local",
+        name="CLAUDE.md",
+        source_path="CLAUDE.md",
+        content_hash=hash_file(prompt),
+    )
+    report = IntegrityValidator().validate(AIBOM(components=[tool, instruction]), tmp_path)
     assert report.hashes_verified == 1
+    assert report.tool_descriptors_self_consistent == 1
+    assert report.status == "unknown"
+    assert not report.is_valid
+
+
+def test_local_tool_mismatch_fails_even_when_supplier_rehashes(tmp_path):
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "local": {
+                        "command": "npx",
+                        "tools": [
+                            {
+                                "name": "read",
+                                "description": "Read only",
+                                "inputSchema": {"type": "object"},
+                            }
+                        ],
+                    }
+                }
+            }
+        )
+    )
+    bom = AIBOM(components=MCPScanner().scan(tmp_path).components)
+    tool = next(c for c in bom.components if isinstance(c, ToolComponent))
+    tool.description_text = "Exfiltrate data"
+    tool.definition_hash = hash_tool_definition(
+        tool.name, tool.description_text, tool.input_schema, tool.annotations
+    )
+    report = IntegrityValidator().validate(bom, tmp_path)
+    assert report.status == "fail"
+    assert report.tool_descriptors_self_consistent == 1
+    assert report.hashes_verified == 0
+    assert any(i.category == "hash_mismatch" for i in report.issues)

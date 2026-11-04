@@ -99,6 +99,9 @@ The [CLI reference](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/docs/c
 | CycloneDX VEX | `vex` | Findings marked `in_triage`, with no exploitability claim |
 
 Standard exports embed the native inventory in a digest-bound extension. Keep that extension to recover full semantics.
+After interchange, use `nexus-symbiote verify-export --format cyclonedx received.json`
+(or `--format spdx`) to detect missing or conflicting extension data. The check
+does not authenticate the producer. See the [portability matrix](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/docs/export-portability.md).
 
 ### See it on the demo agent
 
@@ -258,7 +261,7 @@ The [documentation hub](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/do
 
 ## Project status
 
-Nexus SymBiote is **alpha** with a single maintainer: APIs, formats and policy semantics may change, and there is no SLA. CI, including CodeQL, runs on every push and pull request. Branch protection and PyPI trusted publishing still need administrator action: [issue #74](https://github.com/Hunzee-VC/Nexus-Symbiote/issues/74) records their status, and the [roadmap](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/ROADMAP.md) tracks them with the rest of the planned work. Changes are in the [changelog](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/CHANGELOG.md).
+Nexus SymBiote is **alpha** with a single maintainer: APIs, formats and policy semantics may change, and there is no SLA. CI, including CodeQL, runs on every push and pull request. Branch protection and PyPI trusted publishing still need administrator action: [repository controls](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/docs/repository-controls.md) describes the settings, the closed [issue #74](https://github.com/Hunzee-VC/Nexus-Symbiote/issues/74) records their status, and the [roadmap](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/ROADMAP.md) tracks them with the rest of the planned work. Changes are in the [changelog](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/CHANGELOG.md).
 
 [Nexus-ShadowScan](https://github.com/Hunzee-VC/Nexus-ShadowScan) is the companion discovery engine — it finds agents across many surfaces, and Nexus SymBiote turns its reports into AgentBOMs with local artifact and supply-chain verification.
 

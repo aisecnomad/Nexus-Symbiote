@@ -3,9 +3,12 @@
 import json
 
 import pytest
+from click.testing import CliRunner
 
+from nexus_symbiote.cli import main
 from nexus_symbiote.core.hashing import canonical_json
 from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
+from nexus_symbiote.generators.spdx import SPDXGenerator
 from tests.test_generators import _sample_aibom
 
 
@@ -74,4 +77,51 @@ def test_diff_does_not_compare_legacy_and_new_fingerprints():
     assert result.has_changes
     assert any(
         "unknown or incompatible" in item for c in result.components_modified for item in c.details
+    )
+
+
+@pytest.mark.parametrize(
+    "fmt,generator", [("cyclonedx", CycloneDXGenerator), ("spdx", SPDXGenerator)]
+)
+def test_verify_export_rejects_extension_loss_and_projection_tampering(tmp_path, fmt, generator):
+    path = tmp_path / "export.json"
+    original = generator().generate(_sample_aibom())
+    runner = CliRunner()
+    args = ["verify-export", "--format", fmt, str(path)]
+
+    path.write_text(json.dumps(original))
+    result = runner.invoke(main, args)
+    assert result.exit_code == 0, result.output
+    assert "not authenticated" in result.output
+
+    altered = json.loads(json.dumps(original))
+    if fmt == "cyclonedx":
+        altered["metadata"]["properties"] = [
+            p for p in altered["metadata"]["properties"] if p["name"] != "nexus-symbiote:document"
+        ]
+    else:
+        document = next(n for n in altered["@graph"] if n["type"] == "SpdxDocument")
+        properties = document["extension"][0]["extension_cdxProperty"]
+        properties[:] = [
+            p for p in properties if p["extension_cdxPropName"] != "nexus-symbiote:document"
+        ]
+    path.write_text(json.dumps(altered))
+    assert runner.invoke(main, args).exit_code != 0
+
+    altered = json.loads(json.dumps(original))
+    if fmt == "cyclonedx":
+        altered["components"][0]["name"] = "altered"
+    else:
+        node = next(n for n in altered["@graph"] if n["type"] == "software_Package")
+        node["name"] = "altered"
+    path.write_text(json.dumps(altered))
+    assert runner.invoke(main, args).exit_code != 0
+
+
+def test_verify_export_rejects_duplicate_json_keys(tmp_path):
+    path = tmp_path / "duplicate.json"
+    path.write_text('{"bomFormat":"CycloneDX","bomFormat":"CycloneDX"}')
+    assert (
+        CliRunner().invoke(main, ["verify-export", "--format", "cyclonedx", str(path)]).exit_code
+        != 0
     )

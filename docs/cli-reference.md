@@ -29,6 +29,7 @@ selects the mode; without either, the mode is offline. See
 | [`scan`](#scan) | offline | Inventory a project and write an AgentBOM (native JSON, CycloneDX, SPDX or SARIF) |
 | [`import-shadowscan`](#import-shadowscan) | offline | Convert a Nexus ShadowScan report into an AgentBOM of imported claims |
 | [`validate`](#validate) | offline | Check an AgentBOM's completeness and integrity, optionally against the project |
+| [`verify-export`](#verify-export) | offline | Check a portable export retains its matching native inventory |
 | [`risk`](#risk) | offline | Score findings and apply the risk gate |
 | [`diff`](#diff) | offline | Compare two AgentBOMs and report security-relevant drift |
 | [`summary`](#summary) | offline | Print component and risk counts |
@@ -237,6 +238,11 @@ nexus-symbiote summary [OPTIONS] AIBOM_PATH
 
 Validate an AIBOM for completeness and integrity.
 
+Tool descriptor self-consistency is reported separately from a matching local
+configuration. Without source corroboration the integrity verdict is `UNKNOWN`
+and the gate exits nonzero. Local matching alone does not authenticate the source
+or a live endpoint.
+
 ```text
 nexus-symbiote validate [OPTIONS] AIBOM_PATH
 ```
@@ -262,6 +268,21 @@ nexus-symbiote verify-artifact [OPTIONS] ARTIFACT_PATH
 | `--bundle` `FILE` | Optional Sigstore bundle |
 | `--signer-identity` `TEXT` | Expected Sigstore signing identity |
 | `--issuer` `TEXT` | Expected Sigstore OIDC issuer |
+
+### `verify-export`
+
+Check a CycloneDX or SPDX export against its embedded native inventory. The
+command fails if required extension properties are missing or the standard
+projection disagrees with the embedded inventory. A match does not authenticate
+the producer or establish that the inventory is complete.
+
+```text
+nexus-symbiote verify-export --format cyclonedx|spdx EXPORT_PATH
+```
+
+| Option | Description |
+|---|---|
+| `--format` | Required export format: `cyclonedx` or `spdx` |
 
 ### `verify-discovery`
 

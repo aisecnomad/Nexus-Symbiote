@@ -50,6 +50,7 @@ class IntegrityReport:
     signatures_checked: int = 0
     signatures_verified: int = 0
     issues: list[IntegrityIssue] = field(default_factory=list)
+    tool_descriptors_self_consistent: int = 0
 
     @property
     def status(self) -> Literal["pass", "fail", "unknown"]:
@@ -71,6 +72,7 @@ class IntegrityReport:
             "is_valid": self.is_valid,
             "status": self.status,
             "components_checked": self.components_checked,
+            "tool_descriptors_self_consistent": self.tool_descriptors_self_consistent,
             "hashes_verified": self.hashes_verified,
             "hashes_failed": self.hashes_failed,
             "signatures_checked": self.signatures_checked,
@@ -243,6 +245,7 @@ class IntegrityValidator:
             raw_hash = f"{algorithm}:{expected}"
             if recomputed != (comp.redacted_definition_hash or raw_hash):
                 raise ValueError("Tool definition differs from its declared digest")
+            report.tool_descriptors_self_consistent += 1
             if comp.bom_ref in local_tools:
                 local = local_tools[comp.bom_ref]
                 if (
@@ -252,12 +255,12 @@ class IntegrityValidator:
                     or comp.redacted_definition_hash != local.redacted_definition_hash
                 ):
                     raise ValueError("Tool fingerprint differs from its local configuration")
-            elif comp.redacted_definition_hash is not None:
+            else:
                 report.issues.append(
                     IntegrityIssue(
                         comp.bom_ref,
                         "descriptor_source_unavailable",
-                        "Redacted representation matches; original descriptor requires matching source evidence",
+                        "Descriptor is internally consistent but has no matching local configuration evidence",
                         "unknown",
                     )
                 )

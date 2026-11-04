@@ -93,6 +93,14 @@ declarations. Verifying the remote endpoint and its enforcement requires separat
 
 Project validation compares static MCP records and configured tool fingerprints with fresh local evidence. A structure binding detects added or removed arguments, environment variables and tools. With `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` set, a keyed binding also detects same-version package swaps and changed argument, environment and endpoint values, without exporting anything a secret could be guessed from. MCP references include the relative configuration path and declared name. Legacy snapshots without the binding, or with name-only identities, need recollection; see [source reconciliation and migration](verification-source-binding.md). Python source declaration collection has bounded application-file coverage and reports unresolved or dynamic registrations as gaps.
 
+Integrity validation reports a tool descriptor's internal consistency separately
+from a fresh local configuration match. A matching digest contained only in the
+supplied BOM is not source evidence and leaves integrity unknown, including when
+other artifact hashes match. Configured tools can be corroborated with `--project`;
+tools lacking a matching supported configuration remain unknown. Such local
+matches do not authenticate the BOM, checkout, producer or a live endpoint. Use
+independent signer and source policy when those properties are needed.
+
 CycloneDX 1.7 and SPDX 3.0.1 exports use supported standard structures and a digest-bound native extension. Consumers must retain that extension to recover full native semantics and inspect the selected-field loss report. A digest detects changes; it does not authenticate the producer. SPDX identities are scoped to each inventory revision. SARIF contains reviewable findings rather than an admission decision, and standalone ShadowScan imports do not support SARIF. VEX output marks findings `in_triage` and does not assert exploitability. Schema validity alone establishes neither semantic equivalence nor complete collection.
 
 Inventories can expose infrastructure, permissions, source references and instruction fingerprints. Restrict evidence access and retention, and review artifacts before sharing them. Use independent expected digests and signer/issuer policies; a signature or registry label does not establish content safety. IDE permission records describe collected project declarations: Claude's `permissions.defaultMode` and broad tool allowances are retained, while user/managed policy, workspace trust, deny/ask precedence and session flags remain outside effective-authorization verification. Scanner failures emit application-owned diagnostic codes; raw exception text and invalid model configuration values are omitted from failure reports.

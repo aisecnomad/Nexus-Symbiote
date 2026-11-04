@@ -60,6 +60,14 @@ def _validate(root: Path, output: Path):
     )
 
 
+def test_cli_labels_unmatched_tool_evidence_unknown_without_project(tmp_path):
+    _, output, _ = _baseline(tmp_path)
+    result = CliRunner().invoke(main, ["validate", "--no-project-policy", str(output)])
+    assert result.exit_code == 1, result.output
+    assert "Status: UNKNOWN" in result.output
+    assert "Descriptor is internally consistent" in result.output
+
+
 @pytest.mark.parametrize("field", ["description", "inputSchema", "annotations"])
 def test_changed_local_descriptor_rejects_unchanged_baseline(tmp_path, field):
     root, output, config = _baseline(tmp_path)

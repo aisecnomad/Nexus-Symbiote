@@ -8,6 +8,8 @@ First alpha of the AgentBOM toolkit under the Hunzee-VC organization. Not yet ta
 
 ### Security
 
+- **Breaking:** tool descriptor hashes that match only the supplied BOM now leave integrity unknown. Validation reports internal consistency separately and requires matching local configuration evidence; neither matching nor a digest authenticates its source.
+- Add `verify-export` to check retained native extensions and standard projection consistency on received CycloneDX and SPDX exports. It does not authenticate producers or claims.
 - **Breaking:** Bind static A2A cards and client declarations with an operator-keyed, RFC 8785 HMAC. Without `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`, A2A values remain partial coverage and default gates fail. Drift and project reconciliation reject missing, incompatible or changed bindings, including same-origin endpoint paths, authentication schemes and scopes. Recollect legacy snapshots with the same operator key before reviewing them.
 - Reject unknown fields on native dependency edges instead of silently discarding them; regenerate the native schema and enforce this in built-wheel acceptance.
 - Treat an empty A2A security alternative as anonymous access, and record unsupported authentication semantics as unknown coverage.

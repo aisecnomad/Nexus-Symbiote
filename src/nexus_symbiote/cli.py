@@ -549,6 +549,34 @@ def verify_artifact(
         )
 
 
+@main.command("verify-export")
+@click.argument("export_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("--format", "export_format", required=True, type=click.Choice(["cyclonedx", "spdx"]))
+def verify_export(export_path: str, export_format: str) -> None:
+    """Check a standard export retains its native inventory and projection."""
+    from nexus_symbiote.core.hashing import parse_json_strict
+    from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
+    from nexus_symbiote.generators.spdx import SPDXGenerator
+    from nexus_symbiote.scanners.base import read_regular_text
+
+    limit = 16 * 1024 * 1024
+    try:
+        text = read_regular_text(Path(export_path), max_bytes=limit)
+        document = parse_json_strict(text, max_bytes=limit)
+        if not isinstance(document, dict):
+            raise ValueError("export must be an object")
+        generator = CycloneDXGenerator if export_format == "cyclonedx" else SPDXGenerator
+        generator.recover(document)
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, RecursionError) as exc:
+        raise click.ClickException(
+            "Export or embedded native inventory failed verification"
+        ) from exc
+    click.echo(
+        "Embedded inventory and standard projection match. "
+        "Producer identity, inventory completeness and claims are not authenticated."
+    )
+
+
 @main.command("verify-discovery")
 @click.argument("aibom_path", type=click.Path(exists=True, dir_okay=False))
 @click.argument("report_path", type=click.Path(exists=True, dir_okay=False))
@@ -703,10 +731,15 @@ def validate(
             Path(project).resolve() if project else None,
             exclude_paths=policy.scan.exclude_paths,
         )
-        console.print("  Status: " + ("[green]PASS[/]" if i_report.is_valid else "[red]FAIL[/]"))
+        color = {"pass": "green", "fail": "red", "unknown": "yellow"}[i_report.status]
+        console.print(f"  Status: [{color}]{i_report.status.upper()}[/]")
+        console.print(
+            f"  Tool descriptors internally consistent: {i_report.tool_descriptors_self_consistent}"
+        )
         console.print(
             f"  Hashes verified: {i_report.hashes_verified}, failed: {i_report.hashes_failed}"
         )
+        console.print("  Local matches do not authenticate the BOM, source, or a live endpoint.")
         for integrity_issue in i_report.issues:
             console.print(
                 f"  {_safe(integrity_issue.severity.upper())} \\[{_safe(integrity_issue.component_ref)}] "
