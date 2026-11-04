@@ -154,7 +154,9 @@ keep tool approval modes, tool allow and deny lists, OAuth scopes, the stdio
 working directory and the names of forwarded environment variables (`env_vars`,
 `env_http_headers` and `bearer_token_env_var`). An `http_headers_helper` command
 is recorded by its argument count, and by its program only when that is a known
-launcher, as for a stdio command. The structure binding covers all of these
+launcher, as for a stdio command. These names are redacted only against secret
+values of at least 8 characters, and distinct names that redaction would merge
+are a collection failure. The structure binding covers all of these
 without the operator key; other values, such as the helper's arguments, are
 bound only by the keyed binding. Values the collectors cannot validate are
 collection failures, and settings they do not interpret, such as profile network

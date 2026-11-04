@@ -357,6 +357,57 @@ def test_codex_server_policy_edits_fail_the_drift_gate_without_the_binding_key(
     )
 
 
+SHORT_ENV = '[mcp_servers.fs]\ncommand = "npx"\nenv = { DEBUG = "1", LEVEL = "2" }\n'
+
+
+def test_short_secret_values_do_not_rewrite_recorded_names(tmp_path: Path) -> None:
+    write_config(
+        tmp_path,
+        SHORT_ENV + '[mcp_servers.fs.tools.read1]\napproval_mode = "approve"\n'
+        '[mcp_servers.fs.tools.read2]\napproval_mode = "prompt"\n',
+    )
+    result = MCPScanner().scan(tmp_path)
+    assert not result.scan_failures
+    server = next(c for c in result.components if isinstance(c, MCPServerComponent))
+    assert server.properties["tool_approval_modes"] == {"read1": "approve", "read2": "prompt"}
+
+
+def test_names_that_collide_after_redaction_are_a_collection_failure(tmp_path: Path) -> None:
+    write_config(
+        tmp_path,
+        '[mcp_servers.fs]\ncommand = "npx"\n'
+        'env = { A = "secretvalue-alpha1", B = "secretvalue-alpha2" }\n'
+        'disabled_tools = ["secretvalue-alpha1", "secretvalue-alpha2"]\n',
+    )
+    result = MCPScanner().scan(tmp_path)
+    assert result.scan_failures == [
+        ".codex/config.toml: Codex MCP server names collide after secret redaction"
+    ]
+    assert not any(isinstance(c, MCPServerComponent) for c in result.components)
+    assert "secretvalue-alpha" not in repr(result)
+
+
+def test_approval_change_beside_a_similar_name_fails_the_drift_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(SOURCE_BINDING_KEY_ENV, raising=False)
+    root = tmp_path / "project"
+    outputs = []
+    for index, mode in enumerate(("prompt", "approve")):
+        write_config(
+            root,
+            SHORT_ENV + f'[mcp_servers.fs.tools.read1]\napproval_mode = "{mode}"\n'
+            '[mcp_servers.fs.tools.read2]\napproval_mode = "approve"\n',
+        )
+        output = tmp_path / f"bom{index}.json"
+        CliRunner().invoke(
+            main, ["scan", str(root), "--no-project-policy", "--report-only", "-o", str(output)]
+        )
+        outputs.append(str(output))
+    run = CliRunner().invoke(main, ["diff", *outputs, "--json-output", "--fail-on-alert"])
+    assert run.exit_code == 1, run.output
+
+
 @pytest.mark.parametrize("scanner", [MCPScanner, IDEAgentScanner])
 @pytest.mark.parametrize(
     "body",

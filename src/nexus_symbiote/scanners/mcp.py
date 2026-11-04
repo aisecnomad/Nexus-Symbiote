@@ -73,6 +73,10 @@ _KEY_FAILURE = (
 )
 
 
+class _NameCollisionError(ValueError):
+    """Distinct declared names of one Codex server field redact to the same text."""
+
+
 def is_codex_config(path: str) -> bool:
     return path == CODEX_CONFIG or path.endswith("/" + CODEX_CONFIG)
 
@@ -140,44 +144,62 @@ def _json_redaction_work(config: dict[str, Any]) -> int:
     return strings * len({value for value in config.get("env", {}).values() if value})
 
 
+def _redacted_names(
+    names: Iterable[tuple[str, ...]], secrets: list[str]
+) -> dict[tuple[str, ...], tuple[str, ...]]:
+    """Redact each distinct declared name, refusing names that redaction would merge.
+
+    A merged entry would hide a change to either name from the unkeyed binding.
+    """
+    redacted = {name: tuple(redact_text(part, secrets) for part in name) for name in set(names)}
+    if len(set(redacted.values())) < len(redacted):
+        raise _NameCollisionError
+    return redacted
+
+
 def _codex_server_policy(config: dict[str, Any], secrets: list[str]) -> dict[str, Any]:
     """Tool approval, forwarded host-environment names, OAuth scopes, the working
     directory and the header helper's shape. Secret values never appear."""
     policy: dict[str, Any] = {}
-    modes = {
-        redact_text(name, secrets): entry["approval_mode"]
+    # As for launcher identities, short values are flags such as "1", not credentials;
+    # redacting names against them would rewrite and merge ordinary names.
+    identity_secrets = [s for s in secrets if len(s) >= _MIN_IDENTITY_SECRET_LENGTH]
+    approvals = {
+        name: entry["approval_mode"]
         for name, entry in config.get("tools", {}).items()
         if "approval_mode" in entry
     }
-    if modes:
-        policy["tool_approval_modes"] = dict(sorted(modes.items()))
+    names = _redacted_names(((name,) for name in approvals), identity_secrets)
+    if approvals:
+        policy["tool_approval_modes"] = dict(
+            sorted((names[(name,)][0], mode) for name, mode in approvals.items())
+        )
     if "default_tools_approval_mode" in config:
         policy["default_tools_approval_mode"] = config["default_tools_approval_mode"]
-    for key in ("enabled_tools", "disabled_tools"):
+    for key in ("enabled_tools", "disabled_tools", "scopes"):
         if key in config:
-            policy[key] = sorted({redact_text(name, secrets) for name in config[key]})
+            names = _redacted_names(((name,) for name in config[key]), identity_secrets)
+            policy[key] = sorted(name for (name,) in names.values())
     if "env_vars" in config:
-        forwarded = {
-            (redact_text(item, secrets), "local")
-            if isinstance(item, str)
-            else (redact_text(item["name"], secrets), item.get("source", "local"))
-            for item in config["env_vars"]
-        }
+        names = _redacted_names(
+            (
+                (item, "local")
+                if isinstance(item, str)
+                else (item["name"], item.get("source", "local"))
+                for item in config["env_vars"]
+            ),
+            identity_secrets,
+        )
         policy["env_vars"] = [
-            {"name": name, "source": source} for name, source in sorted(forwarded)
+            {"name": name, "source": source} for name, source in sorted(names.values())
         ]
     if "env_http_headers" in config:
-        headers = {
-            (redact_text(header, secrets), redact_text(variable, secrets))
-            for header, variable in config["env_http_headers"].items()
-        }
+        names = _redacted_names(config["env_http_headers"].items(), identity_secrets)
         policy["env_http_headers"] = [
-            {"header": header, "env_var": variable} for header, variable in sorted(headers)
+            {"header": header, "env_var": variable} for header, variable in sorted(names.values())
         ]
     if "bearer_token_env_var" in config:
         policy["bearer_token_env_var"] = redact_text(config["bearer_token_env_var"], secrets)
-    if "scopes" in config:
-        policy["scopes"] = sorted({redact_text(scope, secrets) for scope in config["scopes"]})
     if "cwd" in config:
         policy["cwd"] = redact_text(config["cwd"], secrets)
     if "http_headers_helper" in config:
@@ -363,6 +385,11 @@ class MCPScanner(Scanner):
                             config_path,
                             inherited_from=[label for label, _ in contributions],
                         )
+                    except _NameCollisionError:
+                        result.scan_failures.append(
+                            f"{config_name}: Codex MCP server names collide after secret redaction"
+                        )
+                        continue
                     except (TypeError, ValueError, RecursionError):
                         result.scan_failures.append(f"{config_name}: invalid tool definition")
                         continue
