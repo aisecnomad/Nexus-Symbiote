@@ -100,7 +100,7 @@ These are current behaviors, not guarantees. Review them before relying on a gat
 
 A successful scan is an inventory result. It does not establish that a model is benign, that a tool backend obeys its description, or that every agent action was mediated. Inspect the exit status and the inventory's coverage, exclusions and failures: a command may write evidence and still return a failing gate, and exit code `0` for informational commands, report-only output and skipped gates does not establish approval.
 
-Collection is static by default and does not execute project modules, model loaders, hooks or MCP launch commands. A completed search can find no matching files; unsupported declarations and failed reads remain coverage gaps, and collectors omitted from `--scanner` remain unknown. Configuration presence does not prove that a server is running or that its live tool definitions match the declaration. `verify-live` is a separate explicit execution operation requiring an independently pinned launcher policy and external isolation, and `discover-mcp` is an explicit HTTPS observation operation. Neither calls tools.
+Collection is static by default and does not execute project modules, model loaders, hooks or MCP launch commands. A completed search can find no matching files; unsupported declarations and failed reads remain coverage gaps, and collectors omitted from `--scanner` remain unknown. Configuration paths are matched case-sensitively. Hosts on case-insensitive filesystems, the macOS and Windows defaults, also load case variants such as `.Codex/config.toml` or `.Claude/settings.json`, which the collectors neither record nor report. Configuration presence does not prove that a server is running or that its live tool definitions match the declaration. `verify-live` is a separate explicit execution operation requiring an independently pinned launcher policy and external isolation, and `discover-mcp` is an explicit HTTPS observation operation. Neither calls tools.
 
 For trusted local projects, standalone `scan`, `validate` and `risk` load project policy by default. Pass `--no-project-policy` when the scanned checkout must not choose your verification policy. Standalone ShadowScan imports require a new output path and retain partial coverage; `--report-only` is an explicit inspection mode. Imported discovery remains a source claim and does not establish deployment, effective access or authorization.
 
@@ -136,7 +136,11 @@ table by table, so a package layer may override a single field of a root MCP
 server or approval policy; only a merged value that Codex would refuse is a
 collection failure. The IDE record keeps each layer's own sandbox mode, approval
 policy and reviewer, `default_permissions`, `[permissions]` profiles and
-`[sandbox_workspace_write]` settings. As in Codex, a layer's `default_permissions`
+`[sandbox_workspace_write]` settings. Only identifier-like permission profile
+names, matching `[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}`, reach the inventory: Codex
+also accepts names with spaces, non-ASCII names and longer names, but the
+collectors record those as collection failures so that arbitrary text stays out
+of the BOM. As in Codex, a layer's `default_permissions`
 takes precedence over its `sandbox_mode`. Full access by any route and writable
 paths outside the project are high-severity findings. Codex refuses a profile
 that extends a built-in other than `:read-only` or `:workspace`, such as
@@ -167,7 +171,10 @@ key, the values of these settings are bound, so an edit to them fails the drift
 gate; settings that RFC 8785 cannot canonicalize are a collection failure. Codex TOML
 larger than 256 KiB, nested more than 32 levels or with more than 16 unquoted
 dots on one line is recorded as a collection failure without being parsed. The
-registry collector applies the same limits to `pyproject.toml`.
+registry collector applies the same limits to `pyproject.toml`. Within these
+limits, parsing sixteen maximum-size layers can take each collector several
+CPU-seconds, and `scan`, `validate --project` and `risk --project` each run both
+Codex collectors.
 Redacting each MCP server's recorded names, strings and tool descriptors against
 its secret values, and resolving and checking permission profiles, are bounded
 over the collection (4 million string-by-secret checks for Codex layers and
