@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
 from nexus_symbiote.core.enums import SerializationSafety
@@ -20,6 +23,7 @@ from nexus_symbiote.core.models import (
 )
 from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
 from nexus_symbiote.generators.spdx import SPDXGenerator
+from nexus_symbiote.generators.validation import validate_cyclonedx
 
 
 def _sample_aibom() -> AIBOM:
@@ -125,6 +129,26 @@ class TestCycloneDXGenerator:
         tools = result["metadata"]["tools"]["components"]
         assert len(tools) == 1
         assert tools[0]["name"] == "nexus-symbiote"
+
+
+class TestCycloneDXSchemaFormats:
+    def test_export_rejects_a_timestamp_outside_rfc3339(self):
+        bom = _sample_aibom()
+        # Python allows UTC offsets with seconds; RFC 3339 date-time does not.
+        bom.metadata.timestamp = datetime(2026, 11, 1, 12, tzinfo=timezone(timedelta(seconds=30)))
+        with pytest.raises(ValueError, match=r"metadata/timestamp: .* is not a 'date-time'"):
+            CycloneDXGenerator().generate(bom)
+
+    def test_received_document_formats_are_enforced(self):
+        document = CycloneDXGenerator().generate(_sample_aibom())
+        document["metadata"]["timestamp"] = "not-a-timestamp"
+        document["metadata"]["supplier"] = {"name": "Example", "url": ["https://exa mple.test/"]}
+        assert validate_cyclonedx(document) == [
+            "metadata/timestamp: 'not-a-timestamp' is not a 'date-time'",
+            "metadata/supplier/url/0: 'https://exa mple.test/' is not a 'iri-reference'",
+        ]
+        with pytest.raises(ValueError, match="invalid cyclonedx export"):
+            CycloneDXGenerator.recover(document)
 
 
 class TestSPDXGenerator:
