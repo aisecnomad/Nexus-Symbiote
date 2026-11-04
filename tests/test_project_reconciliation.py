@@ -543,6 +543,45 @@ def test_recorded_tools_attach_only_through_their_serving_server(tmp_path, varia
     _assert_unreconciled(project, output, tool.bom_ref)
 
 
+def test_recorded_tool_with_an_additional_weaker_claim_still_reconciles(tmp_path):
+    from nexus_symbiote.core.aibom import DependencyEdge
+    from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolComponent
+
+    project, output, bom = _scanned(tmp_path, {".mcp.json": TWO_SERVERS})
+    local = min(
+        (c for c in bom.components if isinstance(c, MCPServerComponent)), key=lambda c: c.name
+    )
+    # The provides-tool record may claim as much as the tool's strongest claim.
+    tool = ToolComponent(
+        bom_ref="tool:observed",
+        name="observed",
+        mcp_server_ref=local.bom_ref,
+        assurance_level="observed",
+        claims={
+            "tool_definition": ClaimEvidence(
+                assurance="observed",
+                scope="served-descriptor",
+                method="operator-pinned-stdio-tools-list",
+            ),
+            "publisher_listing": ClaimEvidence(
+                assurance="declared", scope="vendor-listing", method="supplier-statement"
+            ),
+        },
+    )
+    bom.add_component(tool)
+    local.tool_refs.append(tool.bom_ref)
+    bom.add_dependency(
+        DependencyEdge(
+            source_ref=local.bom_ref,
+            target_ref=tool.bom_ref,
+            relationship="provides-tool",
+            assurance_level="observed",
+        )
+    )
+    bom.save(output)
+    _assert_reconciled(project, output)
+
+
 def test_recorded_live_observation_still_reconciles(tmp_path, monkeypatch):
     from nexus_symbiote.live.verify import record_candidate, verify_mcp_servers
 

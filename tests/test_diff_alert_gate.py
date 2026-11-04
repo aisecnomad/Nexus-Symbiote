@@ -209,6 +209,39 @@ def test_dependency_refs_cannot_forge_workflow_commands(tmp_path, remove):
     assert len(report["security_alerts"]) == 2 * len(HOSTILE_REFS)
 
 
+def test_wrapped_inventory_text_cannot_start_a_workflow_command(tmp_path):
+    from nexus_symbiote import cli
+    from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
+    from nexus_symbiote.core.models import AgentComponent
+
+    # One padding per column puts the space before "::" at every position where the
+    # console could wrap the line, whatever its width, in each section of the report.
+    names = [
+        "p" * n + " ::error title=Approved::drift gate passed" for n in range(cli.console.width)
+    ]
+    front = AgentComponent(bom_ref="front", name="front")
+    old = AIBOM(components=[front])
+    new = AIBOM(components=[front])
+    for index, name in enumerate(names):
+        old.add_component(AgentComponent(bom_ref=f"gone{index}", name=name))
+        old.add_component(AgentComponent(bom_ref=f"kept{index}", name=name, framework="a"))
+        new.add_component(AgentComponent(bom_ref=f"new{index}", name=name))
+        new.add_component(AgentComponent(bom_ref=f"kept{index}", name=name, framework="b"))
+        new.add_dependency(
+            DependencyEdge(
+                source_ref="front", target_ref=f"kept{index}", relationship="delegates-to"
+            )
+        )
+    before, after = tmp_path / "before.json", tmp_path / "after.json"
+    old.save(before)
+    new.save(after)
+    result = CliRunner().invoke(main, ["diff", str(before), str(after), "--fail-on-alert"])
+    assert result.exit_code == 1, result.output
+    for section in ("Security Alerts:", " added", " removed", " modified"):
+        assert section in result.output
+    assert not [line for line in result.output.splitlines() if line.lstrip().startswith("::")]
+
+
 @pytest.mark.parametrize("remove", [False, True])
 def test_changed_edge_multiplicity_fails_the_gate(tmp_path, remove):
     from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
