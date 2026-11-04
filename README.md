@@ -61,7 +61,7 @@ The full trust model, design principles and offline-by-default enforcement are i
 
 ### What it inventories
 
-Eight built-in collectors read declared configuration and artifacts from the project directory. Select a subset with `--scanner`; collectors you leave out are recorded as unknown, not clean.
+Eight built-in collectors read declared configuration and artifacts from the project directory. Configuration files are read from fixed paths at the scanned root, so scan each agent's own root rather than a parent directory or monorepo root; only model files, retrieval configuration and MCP server source code are also found in subdirectories ([known false-negative classes](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/docs/security-model.md#known-false-positive-and-false-negative-classes)). Select a subset with `--scanner`; collectors you leave out are recorded as unknown, not clean.
 
 | Collector | Reads | Records |
 | --- | --- | --- |
@@ -69,7 +69,7 @@ Eight built-in collectors read declared configuration and artifacts from the pro
 | `model` | `.safetensors`, `.gguf`, `.ggml`, `.onnx`, Keras (`.h5`, `.hdf5`, `.keras`), `saved_model.pb` and pickle-family files (including `.ckpt`, `.pdparams`, `.dill` and compressed dumps), with their config | SHA-256 hashes, serialization safety, SafeTensors structure, signature status |
 | `prompt` | `CLAUDE.md`, `AGENTS.md`, `CODEX.md`, Copilot/Codex instructions, skill and command files | Instruction and skill digests, hidden-character findings |
 | `rag` | `rag_config.*`, `retrieval_config.json`, `vector_store_config.json` | Declared retrieval sources and controls |
-| `registry` | `package.json`, lockfiles, `requirements*.txt`, `pyproject.toml`, Dockerfiles | AI package identities, pins, lockfile integrity; container images and digests |
+| `registry` | `package.json` and its `package-lock.json`, `requirements.txt`, `requirements-dev.txt`, `requirements-ml.txt`, `pyproject.toml`, `Dockerfile`, `Dockerfile.agent`, `docker-compose.yml` or `.yaml` | AI package identities, pins, lockfile integrity; container images and digests |
 | `a2a` | `.well-known/agent-card.json`, legacy agent cards, A2A client config | Preferred interface, advertised transports and endpoint origins, declared authentication |
 | `ide_agents` | Settings for Claude Code, Cursor, Codex (each `.codex/config.toml` in the project), Windsurf, Cline, Copilot and others | Agent configuration, declared permissions (for Codex, sandbox modes, permission profiles and writable roots) and approval settings |
 | `shadowscan` | [Nexus-ShadowScan](https://github.com/Hunzee-VC/Nexus-ShadowScan) reports | Imported discovery claims, kept separate from local evidence |

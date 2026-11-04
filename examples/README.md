@@ -130,13 +130,24 @@ The demo declares no exact PyPI or npm package URLs, so `advisories` checks none
 and reports that. Point it at your own inventory to query OSV. See
 [offline and live modes](../docs/offline-and-live-modes.md).
 
-## Collector demo
+## Choosing collectors
 
-From a reviewed checkout of the repository:
+Most collectors read their configuration files at the root of the directory
+you scan, so point `scan` at the agent's own root, as above. Scanning `examples/`
+instead of `examples/demo-agent/` still finds the model and the retrieval
+configuration, which are searched for throughout the tree, but none of the MCP
+servers, the instruction file, the A2A card, the IDE settings or the container
+image. Every collector still reports complete coverage, so even the default scan
+gate passes. See
+[known false-positive and false-negative classes](../docs/security-model.md#known-false-positive-and-false-negative-classes).
+
+Select collectors with `--scanner`, once per collector:
 
 ```bash
-nexus-symbiote scan examples --no-project-policy --report-only -o demo-agentbom.json
-nexus-symbiote summary demo-agentbom.json
+nexus-symbiote scan examples/demo-agent --scanner mcp --scanner model --report-only -o partial.aibom.json
+nexus-symbiote summary partial.aibom.json
 ```
 
-This exercises the eight built-in collectors (`shadowscan`, `mcp`, `model`, `prompt`, `rag`, `registry`, `a2a`, `ide_agents`) against the files in this directory. A completed search may report zero matches for some collectors; that is expected and is recorded as coverage information rather than a failure.
+The partial inventory records 6 components. The six collectors left out are
+recorded as unknown, not clean: without `--report-only` the scan exits 1, and
+`validate` fails completeness for each of them.
