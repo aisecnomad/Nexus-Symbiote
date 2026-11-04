@@ -114,8 +114,14 @@ The pin and launcher path come from operator-controlled configuration, not the
 scanned project. The adapter refuses arguments, project environment and working
 directory, reconnects, repeated calls, invalid JSON-RPC and list pagination beyond
 its limits. Protocol reads and writes share a deadline starting after launcher
-staging and process startup. This does not bound staging, authentication,
-scope resolution, state storage or other synchronous gateway work. Operators
+staging and process startup. Startup retries one failure only: the kernel's
+refusal (`ETXTBSY`) to execute the staged copy while another process holds it
+open for writing, which a child forked by another thread during staging causes
+until it starts its own program. The same private copy is retried for at most
+about 0.4 seconds, then the launch fails closed; an embedding process that forks
+without starting a new program during staging can exhaust that budget. The
+deadline does not bound staging, authentication, scope resolution, state
+storage or other synchronous gateway work. Operators
 must impose an external end-to-end deadline on the invocation and its adapters.
 
 Use `invoke_pinned_stdio(gateway, call, command=..., sha256=..., snapshot=...,

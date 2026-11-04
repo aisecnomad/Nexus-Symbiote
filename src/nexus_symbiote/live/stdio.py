@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -22,6 +23,38 @@ MAX_LINE = 1024 * 1024
 MAX_BYTES = 8 * MAX_LINE
 MAX_TOOLS = 4096
 DEADLINE_SECONDS = 20.0
+# Bounded backoff (about 0.4 s in total) for a staged copy the kernel reports busy.
+EXEC_BUSY_RETRY_DELAYS = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2)
+
+
+def spawn_staged(binary: Path, work: Path) -> subprocess.Popen[bytes]:
+    """Start the private launcher copy without a shell, environment or terminal.
+
+    A process forked by any other thread while the copy's write descriptor was
+    open holds a duplicate of it until that child execs or closes it, and Linux
+    refuses to execute a file that is open for writing (ETXTBSY). The refused
+    exec ran nothing, so only that refusal is retried, briefly, on the same
+    private copy; every other error propagates unchanged.
+    """
+    delays = iter(EXEC_BUSY_RETRY_DELAYS)
+    while True:
+        try:
+            # The executable is the private copy checked against the operator digest.
+            return subprocess.Popen(  # noqa: S603
+                [str(binary)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                cwd=work,
+                env={"PATH": os.defpath},
+                start_new_session=True,
+                bufsize=0,
+            )
+        except OSError as exc:
+            delay = next(delays, None)
+            if exc.errno != errno.ETXTBSY or delay is None:
+                raise
+        time.sleep(delay)
 
 
 def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -73,16 +106,7 @@ def _frames(fd: int, deadline: float) -> Iterator[dict[str, Any]]:
 
 def _capture(binary: Path, work: Path) -> list[dict[str, Any]]:
     # Executable is the private copy checked against the operator digest in list_pinned_tools.
-    with subprocess.Popen(  # noqa: S603
-        [str(binary)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        cwd=work,
-        env={"PATH": os.defpath},
-        start_new_session=True,
-        bufsize=0,
-    ) as proc:
+    with spawn_staged(binary, work) as proc:
         assert proc.stdin is not None and proc.stdout is not None
         inbox = proc.stdin.fileno()
         deadline = time.monotonic() + DEADLINE_SECONDS

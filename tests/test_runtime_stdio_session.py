@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import nexus_symbiote.live.session as pinned_session
+from nexus_symbiote.live import stdio
 from nexus_symbiote.live.session import PinnedStdioSession, invoke_pinned_stdio
 from nexus_symbiote.runtime import AuthorizationError, digest, sign_contract
 from tests.test_runtime_authorization import DEFINITION, fixture
@@ -134,6 +140,102 @@ def test_concurrent_replay_allows_only_one_call(tmp_path):
     assert sorted(results) == ["denied", "executed"]
     records = [json.loads(line) for line in log.read_text().splitlines()]
     assert sum(row[0] == "tools/call" for row in records) == 1
+
+
+def release(holder: subprocess.Popen[bytes]) -> None:
+    holder.kill()
+    holder.wait()
+
+
+def busy_staged_copy(tmp_path: Path) -> tuple[Path, subprocess.Popen[bytes]]:
+    """Stage a launcher copy whose write descriptor another process still holds.
+
+    This is the state a concurrent session leaves behind when another thread
+    forks while the copy is open for writing: the child keeps the descriptor
+    until it execs or exits.
+    """
+    path, _, _ = launcher(tmp_path)
+    staged = tmp_path / "staged"
+    with staged.open("xb") as out:
+        out.write(path.read_bytes())
+        holder = subprocess.Popen(  # noqa: S603
+            [sys.executable, "-c", "import time; time.sleep(60)"], pass_fds=(out.fileno(),)
+        )
+    staged.chmod(0o500)
+    try:
+        subprocess.run([str(staged)], stdin=subprocess.DEVNULL, check=False)  # noqa: S603
+    except OSError as exc:
+        if exc.errno == errno.ETXTBSY:
+            return staged, holder
+        release(holder)
+        raise
+    release(holder)
+    pytest.skip("this kernel executes files that are still open for writing")
+
+
+def test_staged_launch_retries_until_the_forked_child_releases_the_copy(tmp_path, monkeypatch):
+    staged, holder = busy_staged_copy(tmp_path)
+    delays: list[float] = []
+
+    def wait(seconds: float) -> None:
+        delays.append(seconds)
+        release(holder)
+
+    monkeypatch.setattr(stdio, "time", SimpleNamespace(sleep=wait))
+    try:
+        process = stdio.spawn_staged(staged, tmp_path)
+    finally:
+        release(holder)
+    with process:
+        assert process.stdin is not None
+        process.stdin.close()
+        assert process.wait(timeout=10) == 0
+    # The first exec was refused while another process held the copy open for writing.
+    assert delays == [stdio.EXEC_BUSY_RETRY_DELAYS[0]]
+
+
+def test_staged_launch_busy_wait_is_bounded(tmp_path, monkeypatch):
+    staged, holder = busy_staged_copy(tmp_path)
+    delays: list[float] = []
+    monkeypatch.setattr(stdio, "time", SimpleNamespace(sleep=delays.append))
+    try:
+        with pytest.raises(OSError) as raised:
+            stdio.spawn_staged(staged, tmp_path)
+    finally:
+        release(holder)
+    assert raised.value.errno == errno.ETXTBSY
+    assert delays == list(stdio.EXEC_BUSY_RETRY_DELAYS)
+
+
+def test_staged_launch_does_not_retry_other_exec_failures(tmp_path, monkeypatch):
+    staged = tmp_path / "staged"
+    staged.write_bytes(b"#!/bin/sh\nexit 0\n")
+    staged.chmod(0o600)
+    delays: list[float] = []
+    monkeypatch.setattr(stdio, "time", SimpleNamespace(sleep=delays.append))
+    with pytest.raises(PermissionError):
+        stdio.spawn_staged(staged, tmp_path)
+    assert delays == []
+
+
+@pytest.mark.parametrize("entry", ["session", "listing"])
+def test_both_launch_paths_start_the_copy_through_the_busy_retry(tmp_path, monkeypatch, entry):
+    path, pin, _ = launcher(tmp_path)
+    started: list[str] = []
+    spawn = stdio.spawn_staged
+
+    def spy(binary: Path, work: Path) -> subprocess.Popen[bytes]:
+        started.append(binary.name)
+        return spawn(binary, work)
+
+    monkeypatch.setattr(pinned_session, "spawn_staged", spy)
+    monkeypatch.setattr(stdio, "spawn_staged", spy)
+    if entry == "session":
+        with PinnedStdioSession(command=str(path), sha256=pin, server_id="server:mail"):
+            pass
+    else:
+        assert [tool["name"] for tool in stdio.list_pinned_tools(str(path), pin)] == ["send"]
+    assert started == ["server"]
 
 
 def test_session_rejects_call_for_different_tool_and_repeat(tmp_path):

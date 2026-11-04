@@ -96,6 +96,7 @@ First alpha of the AgentBOM toolkit under the Hunzee-VC organization. Not yet ta
 ### Fixed
 
 - CycloneDX export fails on an empty digest value, as SPDX export already did, instead of silently dropping that hash.
+- Retry briefly when the kernel refuses to execute a just-staged pinned stdio launcher copy with `ETXTBSY`. A child forked by another thread while the copy was open for writing keeps that descriptor until it starts its own program, so concurrent pinned sessions, and `test_concurrent_replay_allows_only_one_call`, failed intermittently. Only that refusal is retried, for at most about 0.4 seconds; every other launch error still fails at once.
 - Report a collector that produced a conflicting duplicate component or a dangling dependency edge as failed in `collectors_completed`, not only in `scanner_status`. A clean `ScanResult` no longer lets an orchestration-level failure be recorded as completed collection, or raise the inventory's completeness assurance to `observed` on its own. Gates were already failing through `scan_failures`; the emitted coverage record was the inaccurate part.
 
 ### Changed

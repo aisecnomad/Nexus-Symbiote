@@ -19,7 +19,14 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from nexus_symbiote.core.hashing import open_regular_file
-from nexus_symbiote.live.stdio import DEADLINE_SECONDS, MAX_TOOLS, PROTOCOL, _frames, _ready
+from nexus_symbiote.live.stdio import (
+    DEADLINE_SECONDS,
+    MAX_TOOLS,
+    PROTOCOL,
+    _frames,
+    _ready,
+    spawn_staged,
+)
 from nexus_symbiote.runtime import (
     AuthorizationError,
     Envelope,
@@ -82,16 +89,7 @@ class PinnedStdioSession:
             if self.sha256 != "sha256:" + hasher.hexdigest():
                 raise AuthorizationError("launcher differs from approved digest")
             staged.chmod(0o500)
-            self._process = subprocess.Popen(  # noqa: S603
-                [str(staged)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                cwd=work,
-                env={"PATH": os.defpath},
-                start_new_session=True,
-                bufsize=0,
-            )
+            self._process = spawn_staged(staged, work)
             assert self._process.stdin is not None and self._process.stdout is not None
             os.set_blocking(self._process.stdin.fileno(), False)
             os.set_blocking(self._process.stdout.fileno(), False)
