@@ -147,21 +147,29 @@ key rotation require recollection and review. They cannot establish an unchanged
 A2A declaration.
 
 Keyed binding canonicalizes each declaration with RFC 8785, which accepts I-JSON
-only. A YAML date, an integer beyond 2^53, a non-finite number, a non-string key
-or nesting too deep to canonicalize in a card or client entry fails that
-declaration alone, and the other cards and clients are still collected:
+only. A YAML date or timestamp, an integer beyond 2^53, a YAML `.nan` or `.inf`, a
+JSON number too large for a double such as `1e400`, or JSON nesting too deep to
+canonicalize, in a card or client entry, fails that declaration alone, and the
+other cards and clients are still collected:
 
 ```text
 <file>: A2A declaration cannot be canonicalized for binding
 ```
+
+A file that cannot be parsed fails as a whole, with every entry in it, with or
+without the key: JSON with a `NaN` or `Infinity` literal, a duplicate key or
+nesting too deep to parse, and YAML with a non-string or duplicate key, an
+anchor, alias or tag, more than 20,000 tokens or nesting too deep to parse. Each
+card file and client configuration is read separately, so the entries in other
+files are still collected.
 
 Client configurations (`a2a.json`, `a2a.yaml`, `a2a.yml`, `a2a_config.json`) may
 list entries under `clients`, `remoteAgents` or both. Every entry in either list
 is collected and bound separately. Any other top-level field with a value is
 recorded as unknown coverage, because the collector cannot tell how it changes
 the clients. An entry names its agent with `name` or `agentName` and its endpoint
-with `agentCardUrl`, `url` or `endpoint`; a `null` field counts as absent. A
-client may use any of these URLs, so each one is checked: a URL that is not
+with `agentCardUrl`, `url` or `endpoint`; a `null` client field counts as absent.
+A client may use any of these URLs, so each one is checked: a URL that is not
 `https://` raises a high transport finding, and the origin of the first one is
 exported as `agent_card_url`. A client exports only recognized authentication
 scheme identifiers, compared without regard to case, spaces, hyphens or
@@ -177,14 +185,20 @@ The collector interprets legacy `authentication.schemes`, the A2A 0.3
 and A2A v1 `securityRequirements`. An empty list or an empty alternative permits
 anonymous use and does not establish required authentication, and so does a
 legacy scheme named `none`, `public`, `anonymous`, `noauth`, `unauthenticated` or
-the empty string. A card can declare several of these forms for different
-clients: if any card-level form permits anonymous use, authentication is not
-required. A card that declares no card-level form does not require
-authentication. Card-level requirements of both versions are recorded together
-in `security_requirements`. Skill-level requirements of either version add
-requirements for that skill; the card-level requirement applies to every
-request, so they never relax it. They are recorded in
-`skill_security_requirements`, keyed by skill identifier, so a skill that
+the empty string, compared without regard to case, spaces, hyphens or
+underscores. Only these names are anonymous: any other legacy scheme name, and
+any other `scheme` of an `http` definition, such as `guest` or `anon`, counts as
+requiring credentials. Client methods are checked against an allowlist instead,
+so an unrecognized one is unknown coverage. Applying that allowlist to legacy and
+`http` scheme names would make every unlisted name unknown coverage and fail the
+default gates; whether to do so remains a maintainer decision. A card can declare
+several of these forms for different clients: if any card-level form permits
+anonymous use, authentication is not required. A card that declares no
+card-level form does not require authentication. Card-level requirements of both
+versions are recorded together in `security_requirements`. Skill-level
+requirements of either version add requirements for that skill; the card-level
+requirement applies to every request, so they never relax it. They are recorded
+in `skill_security_requirements`, keyed by skill identifier, so a skill that
 declares requirements needs a unique `id`, and an unsupported skill-level form is
 recorded as unknown coverage.
 
@@ -194,9 +208,20 @@ whose definition is not one of `apiKey`, `http` with a non-anonymous scheme,
 `oauth2`, `openIdConnect` or `mutualTLS` (in the 0.3 `type` form or the v1
 ProtoJSON form); a legacy `authentication` value that is not a mapping, has other
 fields but no scheme list, or lists something other than strings; and a
-`security` value of any other shape. Such cards stay in the inventory. A `null`
-field counts as absent. This collector is not a complete A2A protocol conformance
-validator.
+`security` value of any other shape. Such cards stay in the inventory. Scheme
+definitions are checked for their type, not for completeness: an `oauth2`
+definition without `flows`, or an `apiKey` definition without `in` and `name`,
+counts as requiring credentials. Recording an incomplete definition as unknown
+coverage instead remains a maintainer decision. This collector is not a complete
+A2A protocol conformance validator.
+
+A `null` optional or authentication field counts as absent: `version`, `url`,
+`additionalInterfaces`, `preferredTransport`, `security`, `securityRequirements`,
+`securitySchemes` and `authentication` on a card, and `id`, `security` and
+`securityRequirements` on a skill. A `null` card `name`, `skills`, `protocols` or
+`supportedInterfaces`, or a `null` skill `name`, fails collection of the card. A
+card that uses both spellings of one field fails collection even when one of them
+is `null`.
 
 The origins and transports of a card's A2A 0.3 `url` (with `preferredTransport`)
 and `additionalInterfaces` are recorded in `legacy_interfaces`, also when the card

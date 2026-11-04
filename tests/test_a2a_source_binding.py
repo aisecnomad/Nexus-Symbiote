@@ -569,6 +569,84 @@ def test_values_outside_i_json_are_a_distinct_binding_failure(
     assert not result.components
 
 
+GOOD_YAML = (
+    "clients:\n  - name: good\n    url: https://agent.example/a2a\n    authMethods: [bearer]\n"
+)
+GOOD_JSON = '{"name": "good", "url": "https://agent.example/a2a", "authMethods": ["bearer"]}'
+
+
+@pytest.mark.parametrize(
+    ("relative", "content"),
+    [
+        ("a2a.yaml", GOOD_YAML + "  - name: bad\n    expires: 2025-01-01T10:00:00Z\n"),
+        ("a2a.yaml", GOOD_YAML + "  - name: bad\n    limit: 9007199254740993\n"),
+        ("a2a.yaml", GOOD_YAML + "  - name: bad\n    limit: .nan\n"),
+        ("a2a.yaml", GOOD_YAML + "  - name: bad\n    limit: -.inf\n"),
+        ("a2a.json", '{"clients": [' + GOOD_JSON + ', {"name": "bad", "limit": 1e400}]}'),
+        (
+            "a2a.json",
+            '{"clients": ['
+            + GOOD_JSON
+            + ', {"name": "bad", "x": '
+            + "[" * 1200
+            + "]" * 1200
+            + "}]}",
+        ),
+    ],
+    ids=[
+        "yaml-timestamp",
+        "yaml-integer-beyond-2^53",
+        "yaml-nan",
+        "yaml-inf",
+        "json-overflow",
+        "json-nesting",
+    ],
+)
+def test_values_outside_i_json_fail_only_their_declaration(
+    tmp_path, monkeypatch, relative, content
+):
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
+    (tmp_path / relative).write_text(content)
+    result = A2AScanner().scan(tmp_path)
+    assert result.scan_failures == [
+        f"{relative}: A2A declaration cannot be canonicalized for binding"
+    ]
+    assert [component.name for component in result.components] == ["good"]
+
+
+@pytest.mark.parametrize(
+    ("relative", "content", "failure"),
+    [
+        (
+            "a2a.yaml",
+            GOOD_YAML + "  - name: bad\n    extra: {1: x}\n",
+            "a2a.yaml: YAML mapping parse failed or unsupported",
+        ),
+        (
+            "a2a.yaml",
+            GOOD_YAML + "  - name: bad\n    extra: " + "[" * 1200 + "]" * 1200 + "\n",
+            "a2a.yaml: YAML mapping parse failed or unsupported",
+        ),
+        (
+            "a2a.json",
+            '{"clients": [' + GOOD_JSON + ', {"name": "bad", "limit": NaN}]}',
+            "a2a.json: invalid JSON or duplicate keys",
+        ),
+    ],
+    ids=["yaml-non-string-key", "yaml-nesting", "json-nan-literal"],
+)
+def test_a_file_that_cannot_be_parsed_fails_every_entry_in_it(
+    tmp_path, monkeypatch, relative, content, failure
+):
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
+    (tmp_path / relative).write_text(content)
+    (tmp_path / "agent.json").write_text(json.dumps(_card()))
+    result = A2AScanner().scan(tmp_path)
+    (reported,) = result.scan_failures
+    assert reported.endswith(failure)
+    assert [component.name for component in result.components] == ["reviewed-agent"]
+
+
 def test_deeply_nested_card_is_a_per_file_failure(tmp_path, monkeypatch):
     monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
     nested = "[" * 1500 + "]" * 1500

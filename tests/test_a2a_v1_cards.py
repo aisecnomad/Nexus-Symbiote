@@ -385,6 +385,9 @@ LEGACY = {
         ({"authentication": {"schemes": ["bearer", "Anonymous"]}}, False),
         ({"authentication": {"schemes": [""]}}, False),
         ({"authentication": {"schemes": [" "]}}, False),
+        ({"authentication": {"schemes": ["No-Auth"]}}, False),
+        ({"authentication": {"schemes": ["guest"]}}, True),
+        ({"authentication": {"schemes": ["anon"]}}, True),
         ({"authentication": {"schemes": None}}, False),
         ({"authentication": {"schemes": None, "credentials": "token"}}, None),
         ({"authentication": {"schemes": [1]}}, None),
@@ -409,6 +412,13 @@ LEGACY = {
             None,
         ),
         ({"security": [{"x": []}], "securitySchemes": {"x": {"type": "http"}}}, None),
+        (
+            {"security": [{"x": []}], "securitySchemes": {"x": {"type": "http", "scheme": "anon"}}},
+            True,
+        ),
+        # Definitions are checked for their type only, not for completeness.
+        ({"security": [{"x": []}], "securitySchemes": {"x": {"type": "oauth2"}}}, True),
+        ({"security": [{"x": []}], "securitySchemes": {"x": {"type": "apiKey"}}}, True),
         (
             {
                 "security": [{"key": ["read"], "tls": []}],
@@ -545,6 +555,42 @@ def test_skill_requirements_never_relax_the_card_level_requirement(
         assert "skill_security_requirements" not in server.properties
     else:
         assert server.properties["skill_security_requirements"] == {"refund": recorded}
+
+
+NULL_ABSENT = (
+    "version",
+    "url",
+    "additionalInterfaces",
+    "preferredTransport",
+    "security",
+    "securityRequirements",
+    "securitySchemes",
+    "authentication",
+)
+NULL_FAILS = ("name", "protocols", "skills", "supportedInterfaces")
+
+
+@pytest.mark.parametrize(
+    "level, field, collected",
+    [
+        *(("card", field, True) for field in NULL_ABSENT),
+        *(("card", field, False) for field in NULL_FAILS),
+        *(("skill", field, True) for field in ("id", "security", "securityRequirements")),
+        ("skill", "name", False),
+    ],
+)
+def test_a_null_field_counts_as_absent_unless_a_name_or_list_is_required(
+    tmp_path, level, field, collected
+):
+    skill = {"id": "s", "name": "s"}
+    card = {**LEGACY, "authentication": {"schemes": ["bearer"]}, "skills": [skill]}
+    (card if level == "card" else skill)[field] = None
+    (tmp_path / "agent.json").write_text(json.dumps(card))
+    result = A2AScanner().scan(tmp_path)
+    assert bool(result.components) is collected
+    assert result.scan_failures == (
+        [] if collected else ["agent.json: invalid A2A card field types"]
+    )
 
 
 def test_skill_requirements_need_a_unique_identifier(tmp_path):
