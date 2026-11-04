@@ -167,7 +167,7 @@ def _authentication_required(
             else _requirement_semantics(alternatives, data.get("securitySchemes"))
         )
     if v1_requirements is not None:
-        declared.append(bool(v1_requirements) and all(v1_requirements))
+        declared.append(_requirement_semantics(v1_requirements, data.get("securitySchemes")))
     if data.get("authentication") is not None:
         declared.append(_legacy_authentication(data["authentication"]))
     # A client may use any declared form and any skill can relax the card's forms, so one
@@ -315,8 +315,8 @@ def _legacy_interfaces(data: dict[str, Any], endpoint: str | None) -> list[dict[
     return interfaces
 
 
-def _security_requirements(value: Any) -> Requirements:
-    """Collect v1 SecurityRequirement.schemes, whose scope values are StringList objects."""
+def _v1_requirements(value: Any) -> Requirements:
+    """Parse v1 SecurityRequirement.schemes, whose scope values are StringList objects."""
     if not isinstance(value, list) or len(value) > 1000:
         raise ValueError("invalid security requirements")
     alternatives: Requirements = []
@@ -335,7 +335,7 @@ def _security_requirements(value: Any) -> Requirements:
                 raise ValueError("invalid scope list")
             alternative[name] = scopes
         alternatives.append(alternative)
-    return _canonical(_redacted(alternatives))
+    return alternatives
 
 
 def _skill_security(
@@ -352,9 +352,9 @@ def _skill_security(
             semantics.append(_requirement_semantics(alternatives, schemes))
             recorded = _canonical(_redacted(alternatives))
     if skill.get("securityRequirements") is not None:
-        requirements = _security_requirements(skill["securityRequirements"])
-        semantics.append(bool(requirements) and all(requirements))
-        recorded = _canonical([*(recorded or []), *requirements])
+        requirements = _v1_requirements(skill["securityRequirements"])
+        semantics.append(_requirement_semantics(requirements, schemes))
+        recorded = _canonical([*(recorded or []), *_redacted(requirements)])
     return semantics, recorded
 
 
@@ -493,7 +493,16 @@ class A2AScanner(Scanner):
     def _parse_agent_card(
         self, data: dict[str, Any], rel_path: str, card_path: Path, binding: dict[str, Any]
     ) -> A2AServerComponent:
-        data = _proto_fields(data, "supportedInterfaces", "securityRequirements", "securitySchemes")
+        # a2a-python 0.3 accepts field names as well as aliases and routes on either
+        # spelling of preferredTransport and additionalInterfaces.
+        data = _proto_fields(
+            data,
+            "supportedInterfaces",
+            "securityRequirements",
+            "securitySchemes",
+            "additionalInterfaces",
+            "preferredTransport",
+        )
         name, version = data.get("name", "unnamed-agent"), data.get("version")
         endpoint = data.get("url") or data.get("endpoint")
         if (
@@ -548,8 +557,8 @@ class A2AScanner(Scanner):
         # that an endpoint actually enforces authentication.
         requirements = None
         if data.get("securityRequirements") is not None:
-            requirements = _security_requirements(data["securityRequirements"])
-            properties["security_requirements"] = requirements
+            requirements = _v1_requirements(data["securityRequirements"])
+            properties["security_requirements"] = _canonical(_redacted(requirements))
         auth_required = _authentication_required(data, requirements, skill_semantics)
         risks: list[RiskAssessment] = []
         transport = [_transport_security(origin) for origin in origins]

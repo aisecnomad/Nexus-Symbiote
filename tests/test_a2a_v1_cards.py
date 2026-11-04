@@ -13,6 +13,18 @@ from nexus_symbiote.scanners.a2a import A2AScanner
 
 KEY = "d4ac09449d3f1d08cc8a12a5b50d38fdbfc21374368055004fae7837133830b9"
 BEARER = {"bearer": {"type": "http", "scheme": "bearer"}}
+OAUTH2 = {
+    "oauth2": {
+        "oauth2SecurityScheme": {
+            "flows": {
+                "clientCredentials": {
+                    "tokenUrl": "https://auth.example/token",
+                    "scopes": {"read": "Read plans", "write": "Change plans"},
+                }
+            }
+        }
+    }
+}
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +49,7 @@ def _card():
             },
         ],
         "securityRequirements": [{"schemes": {"oauth2": {"list": ["read"]}}}],
+        "securitySchemes": OAUTH2,
         "skills": [{"name": "plan"}],
     }
 
@@ -203,6 +216,7 @@ def test_snake_case_protojson_and_skill_requirements(tmp_path):
     interface["protocol_binding"] = interface.pop("protocolBinding")
     card["supported_interfaces"] = [interface]
     card["security_requirements"] = card.pop("securityRequirements")
+    card["security_schemes"] = {**card.pop("securitySchemes"), "mtls": {"mtls_security_scheme": {}}}
     card["skills"] = [{"id": "plan", "security_requirements": [{"schemes": {"mtls": {}}}]}]
     path = tmp_path / "agent-card.json"
     path.write_text(json.dumps(card))
@@ -210,7 +224,7 @@ def test_snake_case_protojson_and_skill_requirements(tmp_path):
     assert not result.scan_failures
     (server,) = result.components
     assert server.endpoint_url == "https://primary.example"
-    assert server.authentication_required
+    assert server.authentication_required is True
     assert server.properties["skill_security_requirements"] == {"plan": [{"mtls": []}]}
     card["supportedInterfaces"] = []
     path.write_text(json.dumps(card))
@@ -283,11 +297,11 @@ def test_cli_fails_on_v1_card_drift(tmp_path, monkeypatch, change):
 @pytest.mark.parametrize(
     "extra, expected",
     [
-        ({"security": [{"bearer": []}], "securitySchemes": BEARER}, True),
+        ({"security": [{"bearer": []}], "securitySchemes": {**OAUTH2, **BEARER}}, True),
         (
             {
                 "security": [{"bearer": []}],
-                "securitySchemes": BEARER,
+                "securitySchemes": {**OAUTH2, **BEARER},
                 "securityRequirements": [{"schemes": {}}],
             },
             False,
@@ -463,3 +477,109 @@ def test_card_level_anonymous_access_is_not_hidden_by_skill_requirements(tmp_pat
     server, unknown = _server(tmp_path, card)
     assert server.authentication_required is False
     assert not unknown
+
+
+@pytest.mark.parametrize("with_v1_interfaces", [False, True], ids=["v0.3", "dual"])
+def test_snake_case_routing_fields_are_recorded_and_checked(tmp_path, with_v1_interfaces):
+    """a2a-python 0.3 accepts field names as well as aliases and routes on both."""
+    card = {
+        **LEGACY,
+        "authentication": {"schemes": ["bearer"]},
+        "preferred_transport": "HTTP+JSON",
+        "additional_interfaces": [{"url": "http://attacker.example/a2a", "transport": "JSONRPC"}],
+    }
+    if with_v1_interfaces:
+        card["supportedInterfaces"] = _card()["supportedInterfaces"]
+    server, _ = _server(tmp_path, card)
+    assert server.properties["legacy_interfaces"] == [
+        {"origin": "https://agent.example", "transport": "HTTP+JSON"},
+        {"origin": "http://attacker.example", "transport": "JSONRPC"},
+    ]
+    assert _transport_risks(server) == ["high"]
+
+
+@pytest.mark.parametrize(
+    "field, snake, value",
+    [
+        (
+            "additionalInterfaces",
+            "additional_interfaces",
+            [{"url": "https://agent.example/b", "transport": "GRPC"}],
+        ),
+        ("preferredTransport", "preferred_transport", "GRPC"),
+    ],
+)
+def test_both_spellings_of_a_routing_field_fail_collection(tmp_path, field, snake, value):
+    (tmp_path / "agent.json").write_text(json.dumps({**LEGACY, field: value, snake: value}))
+    result = A2AScanner().scan(tmp_path)
+    assert result.scan_failures and not result.components
+
+
+ANONYMOUS_HTTP = {"anon": {"httpAuthSecurityScheme": {"scheme": "none"}}}
+
+
+@pytest.mark.parametrize(
+    "extra, expected",
+    [
+        ({}, True),
+        ({"securitySchemes": {"oauth2": {"type": "oauth2", "flows": {}}}}, True),
+        ({"securitySchemes": None}, None),
+        ({"securitySchemes": ["oauth2"]}, None),
+        ({"securitySchemes": BEARER}, None),
+        ({"securitySchemes": {"oauth2": {"httpAuthSecurityScheme": {"scheme": "none"}}}}, None),
+        ({"securitySchemes": {"oauth2": {"type": "custom"}}}, None),
+        ({"securityRequirements": [{"schemes": {"oauth2": {}, "ghost": {}}}]}, None),
+        ({"securityRequirements": [{"schemes": {"oauth2": {}}}, {"schemes": {"ghost": {}}}]}, None),
+        ({"securityRequirements": [{"schemes": {"ghost": {}}}, {"schemes": {}}]}, False),
+    ],
+)
+def test_v1_requirements_are_checked_against_security_schemes(tmp_path, extra, expected):
+    server, unknown = _server(tmp_path, {**_card(), **extra})
+    assert server.authentication_required is expected
+    assert unknown == (expected is None)
+    assert any(r.category == "authentication" for r in server.risks) == (expected is not True)
+
+
+@pytest.mark.parametrize(
+    "schemes, expected",
+    [({"oauth2": {"list": ["write"]}}, True), ({"ghost": {}}, None), ({"anon": {}}, None)],
+)
+def test_v1_skill_requirements_are_checked_against_security_schemes(tmp_path, schemes, expected):
+    card = {**_card(), "securitySchemes": {**OAUTH2, **ANONYMOUS_HTTP}}
+    card["skills"] = [
+        {"id": "plan", "name": "plan", "securityRequirements": [{"schemes": schemes}]}
+    ]
+    server, unknown = _server(tmp_path, card)
+    assert server.authentication_required is expected
+    assert unknown == (expected is None)
+    assert list(server.properties["skill_security_requirements"]["plan"][0]) == list(schemes)
+
+
+@pytest.mark.parametrize("schemes", [ANONYMOUS_HTTP, {}], ids=["anonymous", "undeclared"])
+@pytest.mark.parametrize(
+    "requirement",
+    [{"security": [{"anon": []}]}, {"securityRequirements": [{"schemes": {"anon": {"list": []}}}]}],
+    ids=["v0.3", "v1"],
+)
+def test_requirement_versions_get_the_same_scan_gate(tmp_path, monkeypatch, requirement, schemes):
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
+    project = tmp_path / "project"
+    project.mkdir()
+    card = {
+        "name": "planner",
+        "supportedInterfaces": _card()["supportedInterfaces"],
+        "securitySchemes": schemes,
+        "skills": [{"id": "plan", "name": "plan"}],
+        **requirement,
+    }
+    (project / "agent-card.json").write_text(json.dumps(card))
+    output = tmp_path / "bom.json"
+    scan = ["scan", str(project), "--no-project-policy", "-o", str(output)]
+    result = CliRunner().invoke(main, scan)
+    assert result.exit_code == 1, result.output
+    bom = json.loads(output.read_text())
+    (server,) = [c for c in bom["components"] if c["name"] == "planner"]
+    assert server.get("authentication_required") is None
+    assert bom["metadata"]["completeness"]["surfaces_excluded"] == [
+        "agent-card.json: A2A authentication requirement semantics are unknown"
+    ]
