@@ -445,6 +445,16 @@ def test_supplied_verified_claim_on_a_local_subject_is_unreconciled(tmp_path):
     _assert_unreconciled(project, output, agent.bom_ref)
 
 
+def test_supplied_verified_completeness_claim_is_unreconciled(tmp_path):
+    from nexus_symbiote.core.enums import AssuranceLevel
+
+    project, output, bom = _scanned(tmp_path, {"AGENTS.md": "Review requests."})
+    assert bom.metadata.completeness is not None
+    bom.metadata.completeness.assurance_level = AssuranceLevel.VERIFIED
+    bom.save(output)
+    _assert_unreconciled(project, output, "Completeness claim is verified")
+
+
 @pytest.mark.parametrize("attachment", ["delegating-agent", "unserved-server"])
 def test_other_supplementary_components_cannot_attach_to_local_subjects(tmp_path, attachment):
     from nexus_symbiote.core.models import AgentComponent, ClaimEvidence, MCPServerComponent

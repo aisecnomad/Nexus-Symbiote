@@ -44,11 +44,11 @@ that command links a tool served by a local MCP server: through the tool's
 record from that server that claims no more assurance than the tool's own
 claims. Any other reference or dependency record between a local subject and a
 supplementary component fails reconciliation. So does `verified` assurance in a
-supplied component, claim or dependency record, or an `internal-verified` or
-`third-party-signed` trust tier on a supplementary component, because no
-offline check establishes them. Otherwise, fields and claims that no collector
-populates, and relationships among supplementary components, are accepted as
-supplied and not verified.
+supplied component, claim, dependency record or completeness claim, or an
+`internal-verified` or `third-party-signed` trust tier on a supplementary
+component, because no offline check establishes them. Otherwise, fields and
+claims that no collector populates, and relationships among supplementary
+components, are accepted as supplied and not verified.
 Without a project, `risk` scores the supplied claims
 and labels the result `supplied-bom`. For an operator-configured signature
 check, supply the trusted signer policy when validating the project. Each entry

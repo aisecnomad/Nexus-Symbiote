@@ -437,6 +437,10 @@ class CompletenessValidator:
             for edge in bom.dependencies
             if edge.assurance_level == "verified"
         )
+        coverage = bom.metadata.completeness
+        if coverage is not None and coverage.assurance_level is AssuranceLevel.VERIFIED:
+            # Collection records observed or declared coverage, never verified.
+            problems.append(("metadata", f"Completeness claim is verified, {unestablished}"))
         return problems
 
     @staticmethod
