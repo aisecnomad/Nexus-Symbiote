@@ -109,6 +109,7 @@ First alpha of the AgentBOM toolkit under the Hunzee-VC organization. Not yet ta
 - Type-check `scripts/` under strict mypy in CI, the release workflow and `make typecheck`, and fix the three errors that surfaced in `check_dependency_advisories.py` and `check_wheel_security.py`. The release and publication gate scripts were previously unchecked.
 - Ask for a 24-hour soak window on behavior- and security-changing pull requests while the project has a single maintainer, in place of a second reviewer.
 - Reject relative links and images in the README named by `pyproject.toml`, which is also the PyPI description. `twine check` does not render Markdown, so nothing caught the 32 relative links, banner included, that the previous `main` would have published broken.
+- Stop the test session at startup when `python -I` would import a different `nexus_symbiote` than the tests do. The Action runner, the runtime validation worker and several tests start isolated subprocesses, which ignore `PYTHONPATH` and import the installed package, so a virtual environment shared by several checkouts tested the installed copy instead of the code under review.
 
 ### Notes
 
