@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -100,6 +101,77 @@ def test_incomplete_source_writes_partial_bom_and_fails(tmp_path):
     assert result.exit_code != 0 and out.exists()
     claim = AIBOM.load(out).metadata.completeness
     assert claim.source_report_status == "incomplete" and claim.scan_failures
+
+
+def test_baseline_rejects_contradictory_shadowscan_diagnostics(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "CLAUDE.md").write_text("Review the release.")
+    source = project / "shadowscan.json"
+    fixture = Path(__file__).parent / "fixtures/shadowscan/code-report-0.1.4.json"
+    report = json.loads(fixture.read_bytes())
+    source.write_text(json.dumps(report))
+    runner = CliRunner()
+    assert (
+        runner.invoke(main, ["baseline", str(project), "-o", str(tmp_path / "good")]).exit_code == 0
+    )
+    report["summary"].update(errors=99, incomplete_reasons={"permission-denied": 99})
+    source.write_text(json.dumps(report))
+    baseline = tmp_path / "bad"
+    assert runner.invoke(main, ["baseline", str(project), "-o", str(baseline)]).exit_code == 1
+    assert not baseline.exists()
+    direct = tmp_path / "direct"
+    result = runner.invoke(
+        main, ["import-shadowscan", str(source), "-o", str(direct), "--report-only"]
+    )
+    assert result.exit_code == 1 and not direct.exists()
+
+
+@pytest.mark.parametrize(
+    ("scope", "field", "value"),
+    [
+        ("summary", "errors", True),
+        ("summary", "errors", -1),
+        ("summary", "errors", "0"),
+        ("summary", "incomplete_reasons", []),
+        ("summary", "incomplete_reasons", {"timeout": False}),
+        ("summary", "incomplete_reasons", {"timeout": -1}),
+        ("stats", "incomplete_reasons", None),
+        ("stats", "incomplete_reasons", {"timeout": "1"}),
+    ],
+)
+def test_malformed_shadowscan_diagnostics_cannot_establish_coverage(scope, field, value):
+    report = _report()
+    (report["summary"] if scope == "summary" else report["stats"][0])[field] = value
+    with pytest.raises(ValueError):
+        ShadowScanImporter().parse_report(json.dumps(report))
+
+
+def test_incomplete_reasons_and_error_totals_match_connectors_and_retain_provenance():
+    report = _report()
+    status = {"errors": ["diagnostic"], "incomplete": True, "incomplete_reasons": {"timeout": 1}}
+    report["stats"][0].update(status)
+    report["stats"].append({**status, "skipped": False})
+    report["summary"].update(
+        complete=False, status="incomplete", errors=2, incomplete_reasons={"timeout": 2}
+    )
+    raw = json.dumps(report).encode()
+    bom = ShadowScanImporter().parse_report(raw).to_native_bom()
+    assert bom.metadata.completeness.source_report_status == "incomplete"
+    assert (
+        bom.metadata.completeness.source_report_digest
+        == "sha256:" + hashlib.sha256(raw).hexdigest()
+    )
+    assert all(component.assurance_level == AssuranceLevel.DECLARED for component in bom.components)
+    report["summary"]["incomplete_reasons"] = {"other": 2}
+    with pytest.raises(ValueError):
+        ShadowScanImporter().parse_report(json.dumps(report))
+
+
+def test_connector_reasons_prevent_complete_status_even_without_summary_diagnostics():
+    report = _report()
+    report["stats"][0]["incomplete_reasons"] = {"timeout": 1}
+    assert ShadowScanImporter().parse_report(json.dumps(report)).source_status == "incomplete"
 
 
 def test_source_cannot_be_overwritten(tmp_path):

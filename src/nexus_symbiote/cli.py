@@ -287,6 +287,8 @@ def scan(
     output_format = output_format or policy.output.default_format
     all_scanners = _get_scanners()
     selected = scanners or tuple(policy.scan.scanners)
+    if signature_policies and "model" not in selected:
+        raise click.BadParameter("--signature-policy requires the model scanner")
     unknown = set(selected) - set(all_scanners)
     if unknown:
         raise click.BadParameter(
@@ -667,6 +669,8 @@ def validate(
         Path(project).resolve() if project else Path(aibom_path).parent,
         ignore_project=no_project_policy,
     )
+    if signature_policies and not policy.validation.require_integrity:
+        raise click.BadParameter("--signature-policy requires integrity validation")
     valid = True
     console.print("[bold]Completeness check[/]")
     if policy.validation.require_completeness:

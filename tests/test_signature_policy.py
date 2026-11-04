@@ -5,8 +5,14 @@ from __future__ import annotations
 import json
 
 import pytest
+from click.testing import CliRunner
 
+from nexus_symbiote.cli import main
+from nexus_symbiote.core.aibom import AIBOM
+from nexus_symbiote.scanners.model import ModelScanner
 from nexus_symbiote.signature_policy import SignaturePolicyError, load_signature_policies
+from nexus_symbiote.validators.integrity import IntegrityValidator
+from tests.test_integrity_security import write_safetensors
 
 
 @pytest.fixture
@@ -149,3 +155,99 @@ def test_size_limit_and_missing_files_are_explicit_errors(policy_inputs, monkeyp
     (project / "model.bin").unlink()
     with pytest.raises(SignaturePolicyError):
         load_signature_policies(policy, project)
+
+
+def test_unmatched_explicit_subject_fails_each_project_gate(policy_inputs, tmp_path):
+    project, policy, record = policy_inputs
+    (project / "model.bin").rename(project / "weights.unrecognized")
+    write_records(policy, [{**record, "artifact_path": "weights.unrecognized"}])
+    (project / "CLAUDE.md").write_text("Use the reviewed tools.")
+    runner = CliRunner()
+    original = tmp_path / "original.json"
+    scan = ["scan", str(project), "--no-project-policy"]
+    assert runner.invoke(main, [*scan, "-o", str(original)]).exit_code == 0
+    checked = tmp_path / "checked.json"
+    explicit = ["--signature-policy", str(policy)]
+    failure = "Signature policy artifact #1 did not match a collected model"
+    result = runner.invoke(main, [*scan, *explicit, "-o", str(checked)])
+    assert result.exit_code == 1
+    coverage = AIBOM.load(checked).metadata.completeness
+    assert coverage is not None and coverage.scanner_status["model"] == "failed"
+    assert failure in coverage.scan_failures
+    # Use the original inventory so each project gate must rediscover the omission.
+    against_project = [str(original), "--project", str(project), "--no-project-policy", *explicit]
+    result = runner.invoke(main, ["validate", *against_project])
+    assert result.exit_code == 1 and failure in result.output
+    result = runner.invoke(main, ["risk", *against_project, "--json-output"])
+    assert result.exit_code == 1
+    assessment = json.loads(result.output)
+    assert assessment["assessment_basis"] == "project-reconciliation-failed"
+    assert any(failure in reason for reason in assessment["gate_reasons"])
+
+
+def test_policy_entries_are_accounted_individually(policy_inputs):
+    project, policy, record = policy_inputs
+    (project / "weights.unrecognized").write_bytes(b"second artifact")
+    write_records(policy, [record, {**record, "artifact_path": "weights.unrecognized"}])
+    policies = load_signature_policies(policy, project)
+    local = ModelScanner(policies).scan(project)
+    failure = "Signature policy artifact #2 did not match a collected model"
+    assert local.scan_failures == [
+        "model.bin: explicit signature policy verification failed",
+        failure,
+    ]
+    report = IntegrityValidator(policies).validate(AIBOM(components=local.components), project)
+    assert report.signatures_checked == 1 and report.signatures_verified == 0
+    assert [
+        issue.detail for issue in report.issues if issue.category == "unmatched_signature_policy"
+    ] == [failure]
+    assert any(issue.category == "signature_verification_failed" for issue in report.issues)
+
+
+def test_failed_signature_on_valid_safetensors_blocks_scan_and_risk(policy_inputs, tmp_path):
+    project, policy, record = policy_inputs
+    (project / "model.bin").unlink()
+    write_safetensors(project / "model.safetensors")
+    write_records(policy, [{**record, "artifact_path": "model.safetensors"}])
+    runner = CliRunner()
+    checked = tmp_path / "checked.json"
+    explicit = ["--signature-policy", str(policy), "--no-project-policy"]
+    scan = ["scan", str(project), *explicit, "-o", str(checked)]
+    assert runner.invoke(main, scan).exit_code == 1
+    assert runner.invoke(main, [*scan, "--report-only"]).exit_code == 0
+    bom = AIBOM.load(checked)
+    failure = "model.safetensors: explicit signature policy verification failed"
+    coverage = bom.metadata.completeness
+    assert coverage is not None and coverage.scanner_status["model"] == "failed"
+    assert failure in coverage.scan_failures
+    model = next(c for c in bom.components if c.component_type.value == "model")
+    assert (
+        model.serialization_safety.value == "safe" and model.signing_status == "verification-failed"
+    )
+    # Remove the stored failure to ensure risk rechecks the explicit policy itself.
+    coverage.scan_failures.clear()
+    coverage.scanner_status["model"] = "complete"
+    coverage.collectors_completed.append("model")
+    bom.save(checked)
+    result = runner.invoke(
+        main, ["risk", str(checked), "--project", str(project), *explicit, "--json-output"]
+    )
+    assert result.exit_code == 1
+    assessment = json.loads(result.output)
+    assert assessment["assessment_basis"] == "project-reconciliation-failed"
+    assert any(failure in reason for reason in assessment["gate_reasons"])
+
+
+def test_explicit_policy_cannot_be_silently_disabled(policy_inputs, tmp_path):
+    project, policy, _ = policy_inputs
+    runner = CliRunner()
+    explicit = ["--signature-policy", str(policy)]
+    result = runner.invoke(
+        main, ["scan", str(project), "--scanner", "prompt", "--report-only", *explicit]
+    )
+    assert result.exit_code != 0 and "requires the model scanner" in result.output
+    (project / ".nexus-symbiote.yaml").write_text("validate: {require_integrity: false}")
+    bom = tmp_path / "bom.json"
+    AIBOM().save(bom)
+    result = runner.invoke(main, ["validate", str(bom), "--project", str(project), *explicit])
+    assert result.exit_code != 0 and "requires integrity validation" in result.output

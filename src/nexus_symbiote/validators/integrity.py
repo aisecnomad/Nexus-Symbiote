@@ -26,6 +26,7 @@ from nexus_symbiote.core.models import (
 )
 from nexus_symbiote.scanners.mcp import MCPScanner
 from nexus_symbiote.scanners.model import inspect_model_artifact
+from nexus_symbiote.signature_policy import unmatched_policy_entries
 from nexus_symbiote.utils.crypto import (
     SigstoreArtifactPolicy,
     verify_file_hash,
@@ -113,6 +114,7 @@ class IntegrityValidator:
         exclude_paths: Sequence[str] = (),
     ) -> IntegrityReport:
         report = IntegrityReport()
+        checked_policies: set[SigstoreArtifactPolicy] = set()
         local_tools: dict[str, ToolComponent | None] = {}
         if project_root is not None and any(isinstance(c, ToolComponent) for c in bom.components):
             # Resolve configuration only inside the operator's root. Never use a BOM-supplied
@@ -127,7 +129,7 @@ class IntegrityValidator:
             if isinstance(comp, ToolComponent):
                 self._check_tool_hash(comp, report, local_tools)
             elif isinstance(comp, ModelComponent):
-                self._check_model_integrity(comp, project_root, report)
+                self._check_model_integrity(comp, project_root, report, checked_policies)
                 self._check_tensor_metadata(comp, project_root, report)
             elif isinstance(comp, PromptComponent):
                 self._check_prompt_hash(comp, project_root, report)
@@ -155,6 +157,10 @@ class IntegrityValidator:
                         )
                     )
             self._check_file_hash(comp, project_root, report)
+        for issue in unmatched_policy_entries(self._signature_policies.values(), checked_policies):
+            report.issues.append(
+                IntegrityIssue("signature-policy", "unmatched_signature_policy", issue)
+            )
         return report
 
     def _check_tensor_metadata(
@@ -297,7 +303,11 @@ class IntegrityValidator:
         return candidate
 
     def _check_model_integrity(
-        self, comp: ModelComponent, project_root: Path | None, report: IntegrityReport
+        self,
+        comp: ModelComponent,
+        project_root: Path | None,
+        report: IntegrityReport,
+        checked_policies: set[SigstoreArtifactPolicy],
     ) -> None:
         if comp.serialization_safety in {
             SerializationSafety.UNSAFE_CODE_EXECUTION,
@@ -382,6 +392,7 @@ class IntegrityValidator:
                 )
             )
             return
+        checked_policies.add(policy)
         report.signatures_checked += 1
         result = verify_sigstore_bundle(
             path, policy.bundle_path, policy.expected_identity, policy.expected_issuer

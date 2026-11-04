@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -224,6 +225,7 @@ class CompletenessValidator:
         report = self.validate(bom)
         root = project_root.absolute()
         observed: dict[str, AnyComponent] = {}
+        expected = AIBOM()
 
         def incomplete(surface: str, description: str, severity: str = "error") -> None:
             report.is_complete = False
@@ -248,23 +250,70 @@ class CompletenessValidator:
             if scanner.name == "shadowscan":
                 for reason in self._discovery_mismatches(bom, local):
                     incomplete(scanner.name, reason)
+            expected.dependencies.extend(local.dependencies)
             for component in local.components:
                 previous = observed.setdefault(component.bom_ref, component)
                 if previous != component:
                     incomplete(scanner.name, f"Conflicting local reference: {component.bom_ref}")
 
-        expected = AIBOM(components=list(observed.values()))
+        expected.components.extend(observed.values())
         try:
             agent = assemble_repository_agent(expected, root)
         except (OSError, ValueError, RecursionError):
             incomplete("agent.yaml", "Local agent manifest could not be reconciled.")
         else:
             if agent.properties.get("identity_source") == "repository-path":
-                # An inferred, checkout-specific root is not itself a project artifact.
-                expected.components.remove(agent)
+                roots = [
+                    c
+                    for c in bom.components
+                    if isinstance(c, AgentComponent)
+                    and c.properties.get("identity_source") == "repository-path"
+                ]
+                if len(roots) > 1:
+                    incomplete("graph", "Multiple agents claim to be the inferred checkout root.")
+                elif len(roots) == 1 and re.fullmatch(
+                    r"agent:repository:[0-9a-f]{24}", roots[0].bom_ref
+                ):
+                    # This ID names a checkout path, not an artifact. Reconcile its
+                    # contents and bindings even when the checkout moved.
+                    for edge in expected.dependencies:
+                        if edge.source_ref == agent.bom_ref:
+                            edge.source_ref = roots[0].bom_ref
+                    agent.bom_ref = roots[0].bom_ref
+                elif not roots and not any(
+                    edge.source_ref == agent.bom_ref for edge in expected.dependencies
+                ):
+                    # Older inventories can lack an inferred container if it has
+                    # no local associations. It never contributes a local subject.
+                    expected.components.remove(agent)
+
+        # Compare complete records, including multiplicity, assurance and conditions.
+        # A live-only endpoint is outside the static projection and cannot replace
+        # a required static edge. ShadowScan edges are also checked against their source.
+        projected_refs = {c.bom_ref for c in expected.components}
+        supplied_edges = Counter(
+            canonical_json(edge.model_dump(mode="json"))
+            for edge in bom.dependencies
+            if edge.source_ref in projected_refs and edge.target_ref in projected_refs
+        )
+        expected_edges = Counter(
+            canonical_json(edge.model_dump(mode="json")) for edge in expected.dependencies
+        )
+        if supplied_edges != expected_edges:
+            missing = (expected_edges - supplied_edges).total()
+            unexpected = (supplied_edges - expected_edges).total()
+            incomplete(
+                "graph",
+                f"Repository dependency records differ from the local projection "
+                f"({missing} missing, {unexpected} unexpected).",
+            )
 
         report.local_subjects = sum(
             c.properties.get("collection_mode") != "imported-unverified-report"
+            and not (
+                isinstance(c, AgentComponent)
+                and c.properties.get("identity_source") == "repository-path"
+            )
             for c in expected.components
         )
         supplied = {c.bom_ref: c for c in bom.components}
@@ -288,7 +337,7 @@ class CompletenessValidator:
             if (
                 declared is None
                 or not self._same_subject(root, declared, actual)
-                or not self._retains_local_evidence(declared, actual)
+                or not self._retains_local_evidence(declared, actual, projected_refs)
             ):
                 source_kind = {
                     ComponentType.PROMPT_TEMPLATE: "instruction files",
@@ -301,11 +350,6 @@ class CompletenessValidator:
                     f"Missing or mismatched local component from {source_kind}: {actual.bom_ref}",
                 )
         for extra in supplied.values():
-            if (
-                isinstance(extra, AgentComponent)
-                and extra.properties.get("identity_source") == "repository-path"
-            ):
-                continue
             # Supplementary runtime observations have their own provenance. Missing
             # repository subjects cannot be explained by an unrelated observation.
             local_path = extra.source_path is not None and "://" not in extra.source_path
@@ -321,7 +365,9 @@ class CompletenessValidator:
         return report
 
     @staticmethod
-    def _retains_local_evidence(supplied: AnyComponent, local: AnyComponent) -> bool:
+    def _retains_local_evidence(
+        supplied: AnyComponent, local: AnyComponent, projected_refs: set[str]
+    ) -> bool:
         """Compare the fields populated by the collector, independently of supplier claims."""
         if local.properties.get("collection_mode") == "imported-unverified-report":
             return True  # _discovery_mismatches checks the entire source projection.
@@ -331,6 +377,17 @@ class CompletenessValidator:
             "claims",
             "properties",
         }
+        if isinstance(local, AgentComponent) and isinstance(supplied, AgentComponent):
+            # The assembler appends associations to default lists in place. Those
+            # lists do not appear in model_fields_set and are unordered references.
+            for name in AgentComponent.model_fields:
+                if name.endswith("_refs"):
+                    supplied_refs = (
+                        ref for ref in getattr(supplied, name) if ref in projected_refs
+                    )
+                    if Counter(getattr(local, name)) != Counter(supplied_refs):
+                        return False
+                    fields.discard(name)
         if (
             isinstance(supplied, ToolComponent)
             and supplied.assurance_level == AssuranceLevel.OBSERVED

@@ -79,7 +79,9 @@ coverage and provenance.
 ## Import and policy gates
 
 The native importer compares reported totals and supplied per-kind and
-per-surface counts with the final findings array. A contradictory summary is an
+per-surface counts with the final findings array. When the producer supplies
+aggregate error counts and incomplete-reason counts, the importer also checks
+them against the connector records. A contradictory summary is an
 invalid report, including in report-only mode. Individual connector counts can
 precede filtering or deduplication and can legitimately differ from the final
 array.

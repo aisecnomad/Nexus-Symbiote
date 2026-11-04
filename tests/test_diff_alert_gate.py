@@ -119,3 +119,66 @@ def test_in_place_change_fails_the_drift_gate(tmp_path, change):
     assert result.exit_code == 1, result.output
     alerts = json.loads(result.stdout)["security_alerts"]
     assert any(re.search(rf"'{re.escape(component)}'", alert["alert"]) for alert in alerts), alerts
+
+
+@pytest.mark.parametrize(
+    ("relationship", "remove", "severity"),
+    [
+        ("delegates-to", False, "high"),
+        ("uses-guardrail", True, "high"),
+        ("depends-on", True, "medium"),
+    ],
+)
+def test_relationship_only_changes_fail_the_ci_gate(tmp_path, relationship, remove, severity):
+    from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
+    from nexus_symbiote.core.models import AgentComponent, GuardrailComponent
+
+    target = (
+        GuardrailComponent(bom_ref="guard:approval", name="approval")
+        if relationship == "uses-guardrail"
+        else AgentComponent(bom_ref="agent:privileged", name="privileged")
+    )
+    bom = AIBOM(components=[AgentComponent(bom_ref="agent:front", name="front"), target])
+    before, after = tmp_path / "before.json", tmp_path / "after.json"
+    bom.save(after if remove else before)
+    bom.add_dependency(
+        DependencyEdge(
+            source_ref="agent:front",
+            target_ref=target.bom_ref,
+            relationship=relationship,
+        )
+    )
+    bom.save(before if remove else after)
+    result = CliRunner().invoke(
+        main, ["diff", str(before), str(after), "--json-output", "--fail-on-alert"]
+    )
+    assert result.exit_code == 1, result.output
+    alerts = json.loads(result.stdout)["security_alerts"]
+    assert len(alerts) == 1 and alerts[0]["severity"] == severity
+    assert relationship in alerts[0]["alert"]
+
+
+@pytest.mark.parametrize("remove", [False, True])
+def test_changed_edge_multiplicity_fails_the_gate(tmp_path, remove):
+    from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
+    from nexus_symbiote.core.models import AgentComponent
+
+    bom = AIBOM(
+        components=[AgentComponent(bom_ref=name, name=name) for name in ("front", "remote")]
+    )
+    edge = DependencyEdge(source_ref="front", target_ref="remote", relationship="delegates-to")
+    bom.add_dependency(edge)
+    before, after = tmp_path / "one.json", tmp_path / "two.json"
+    bom.save(before)
+    bom.add_dependency(edge)
+    bom.save(after)
+    if remove:
+        before, after = after, before
+    result = CliRunner().invoke(
+        main, ["diff", str(before), str(after), "--json-output", "--fail-on-alert"]
+    )
+    assert result.exit_code == 1, result.output
+    report = json.loads(result.stdout)
+    assert report["total_changes"] == 1
+    assert len(report["dependencies_removed" if remove else "dependencies_added"]) == 1
+    assert report["security_alerts"][0]["severity"] == "high"

@@ -4,6 +4,7 @@ Discovers MCP server configurations from:
   - .mcp.json (project-level MCP config)
   - claude_desktop_config.json
   - mcp.json
+  - .codex/config.toml (declared project settings)
   - .cursor/mcp.json
   - package.json (mcp-related dependencies)
 
@@ -49,12 +50,15 @@ from nexus_symbiote.core.models import (
 from nexus_symbiote.scanners.base import Scanner, ScanResult, sanitized_origin
 from nexus_symbiote.utils.secrets import REDACTED, redact_descriptor, redact_text
 
+CODEX_CONFIG = ".codex/config.toml"
+
 MCP_CONFIG_FILES = [
     ".mcp.json",
     "mcp.json",
     "claude_desktop_config.json",
     ".cursor/mcp.json",
     ".claude/mcp.json",
+    CODEX_CONFIG,
 ]
 
 _NPM_NAME = r"(?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*"
@@ -154,7 +158,12 @@ class MCPScanner(Scanner):
         with self._collection(project_root, result) as files:
             for config_name in MCP_CONFIG_FILES:
                 config_path = files.root / config_name
-                data = files.read_json(config_name, missing_ok=True)
+                codex = config_name == CODEX_CONFIG
+                data = (
+                    self._read_mapping(config_path, result)
+                    if codex
+                    else files.read_json(config_name, missing_ok=True)
+                )
                 if data is None:
                     continue
                 found_any = True
@@ -162,13 +171,21 @@ class MCPScanner(Scanner):
                 if not isinstance(data, dict):
                     result.scan_failures.append(f"{config_name}: expected a configuration object")
                     continue
-                servers = data.get("mcpServers", data.get("servers", {}))
+                if codex and "mcp_servers" not in data:
+                    continue
+                servers = (
+                    data["mcp_servers"]
+                    if codex
+                    else data.get("mcpServers", data.get("servers", {}))
+                )
                 if not isinstance(servers, dict) or len(servers) > 1000:
                     result.scan_failures.append(f"{config_name}: invalid or oversized server map")
                     continue
                 server_refs: list[str] = []
                 for server_name, server_config in sorted(servers.items()):
-                    if not isinstance(server_config, dict) or not self._valid_server(server_config):
+                    if not isinstance(server_config, dict) or not self._valid_server(
+                        server_config, codex=codex
+                    ):
                         result.scan_failures.append(f"{config_name}: invalid server configuration")
                         continue
                     try:
@@ -206,7 +223,23 @@ class MCPScanner(Scanner):
 
         return result
 
-    def _valid_server(self, config: dict[str, Any]) -> bool:
+    def _valid_server(self, config: dict[str, Any], *, codex: bool = False) -> bool:
+        tools = config.get("tools", {} if codex else [])
+        if codex:
+            # Codex tools entries are approval overrides, never served descriptions.
+            if (
+                bool(config.get("url")) == bool(config.get("command"))
+                or not isinstance(config.get("enabled", True), bool)
+                or not isinstance(tools, dict)
+            ):
+                return False
+            headers = config.get("http_headers", {})
+            if not isinstance(headers, dict) or not all(
+                isinstance(v, str) for v in headers.values()
+            ):
+                return False
+        elif not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools):
+            return False
         return (
             isinstance(config.get("command", ""), str)
             and isinstance(config.get("args", []), list)
@@ -214,9 +247,7 @@ class MCPScanner(Scanner):
             and isinstance(config.get("env", {}), dict)
             and all(isinstance(value, str) for value in config.get("env", {}).values())
             and all(isinstance(config.get(key, ""), str) for key in ("url", "endpoint"))
-            and isinstance(config.get("tools", []), list)
-            and len(config.get("tools", [])) <= 1000
-            and all(isinstance(tool, dict) for tool in config.get("tools", []))
+            and len(tools) <= 1000
         )
 
     def _parse_server(
@@ -237,6 +268,8 @@ class MCPScanner(Scanner):
         if self._files is None:
             raise RuntimeError("_parse_server called outside a _collection context")
         config_scope = config_path.relative_to(self._files.root).as_posix()
+        if config_scope == CODEX_CONFIG:
+            secrets.extend(value for value in config.get("http_headers", {}).values() if value)
         server_ref = (
             "mcp-server:" + hash_canonical({"config": config_scope, "name": name}).split(":", 1)[1]
         )
@@ -346,6 +379,11 @@ class MCPScanner(Scanner):
             risks=risks,
             properties={
                 "collection_mode": "static-config",
+                **(
+                    {"declared_enabled": config.get("enabled", True)}
+                    if config_scope == CODEX_CONFIG
+                    else {}
+                ),
                 "launch_arguments_redacted": bool(args),
                 "endpoint_credentials_omitted": bool(endpoint_url),
                 "static_config_hash": source_config_hash,
@@ -577,6 +615,7 @@ class MCPScanner(Scanner):
             ".claude/mcp.json": "claude-code",
             "claude_desktop_config.json": "claude-desktop",
             ".cursor/mcp.json": "cursor",
+            CODEX_CONFIG: "codex",
         }.get(config_name)
 
     def _scan_code_mcp_clients(self, root: Path, result: ScanResult) -> None:
