@@ -7,7 +7,7 @@ Baseline: `main` at `c31d1ef` (after #115). Continues the [2026-11-02 review](cl
 - **Pull requests #74–#116.** For each merged pull request, the lines its merge added were compared with current `main`, excluding the changelog and lock files. Any pull request missing more than a fifth of its added lines was reviewed by hand. Pull requests closed without merging were checked for a superseding change.
 - **Branches.** Every branch and every `refs/pull/*/head` was mirrored. A branch is *preserved* when each of its commits is reachable from `main` or from a pull-request ref, which GitHub keeps after a branch is deleted.
 - **Unmerged work.** The unique commits on the remaining branches were read, and any finding they record was reproduced on `main`.
-- **Merge state.** Some pull requests were squash-merged through GitHub's web flow with edited subjects that omit the pull-request number, such as `d852727` for #103 and #110. Such a commit is attributed to its pull request by its GitHub committer and by tree equality with the pull-request head, not by its subject.
+- **Merge state.** Some pull requests were squash-merged through GitHub's web flow with edited subjects that omit the pull-request number, such as `d852727`, whose tree equals the head of #102. Such a commit is attributed to its pull request by its GitHub committer and by tree equality with the pull-request head, not by its subject.
 
 These are evidence of what reached `main`, not re-certifications of historical heads.
 
