@@ -319,6 +319,20 @@ _PYTHON_SOURCE_OPTIONS = frozenset(
         "--pip-args",
     }
 )
+_PACKAGE_LAUNCHERS = frozenset({"npx", "bunx", "uvx", "pipx", "docker"})
+_WINDOWS_EXECUTABLE_SUFFIXES = frozenset({"exe", "cmd", "bat", "ps1"})
+
+
+def _launcher(command: str) -> tuple[str, bool]:
+    """Return the command's file name for classification and whether a path selected it.
+
+    A directory, drive or Windows executable suffix does not change which launcher
+    runs, so it must not hide the package reference from the pinning checks.
+    """
+    parts = re.split(r"[\\/:]", command)
+    stem, dot, suffix = parts[-1].rpartition(".")
+    name = stem if dot and suffix.lower() in _WINDOWS_EXECUTABLE_SUFFIXES else parts[-1]
+    return name.lower(), len(parts) > 1
 
 
 class MCPScanner(Scanner):
@@ -596,9 +610,15 @@ class MCPScanner(Scanner):
             {"profile": STATIC_CONFIG_HASH_PROFILE, "structure": structure}
         )
 
-        package_ref = self._extract_package_ref(command, args)
-        launcher_package = self._launcher_package(command, package_ref) if package_ref else None
-        if launcher_package and command in {"uvx", "pipx"}:
+        launcher, path_qualified = _launcher(command)
+        package_ref = self._extract_package_ref(launcher, args)
+        # An explicit path can name any executable, so it never identifies a registry package.
+        launcher_package = (
+            self._launcher_package(launcher, package_ref)
+            if package_ref and not path_qualified
+            else None
+        )
+        if launcher_package and launcher in {"uvx", "pipx"}:
             if any(arg.split("=", 1)[0] in _PYTHON_SOURCE_OPTIONS for arg in args):
                 launcher_package = None
         if launcher_package:
@@ -611,9 +631,9 @@ class MCPScanner(Scanner):
         version_pinned: bool | None = None
         version = None
         if package_ref:
-            if command in {"uvx", "pipx"}:
+            if launcher in {"uvx", "pipx"}:
                 version = extract_version_pin(package_ref, ecosystem="python")
-            elif command == "docker":
+            elif launcher == "docker":
                 version = extract_version_pin(package_ref, ecosystem="oci")
             else:
                 version = extract_version_pin(package_ref, ecosystem="npm")
@@ -672,6 +692,11 @@ class MCPScanner(Scanner):
                 "endpoint_credentials_omitted": bool(endpoint_url),
                 "static_config_hash": source_config_hash,
                 "static_config_hash_profile": STATIC_CONFIG_HASH_PROFILE,
+                **(
+                    {"launcher": launcher, "launcher_path_qualified": path_qualified}
+                    if launcher in _PACKAGE_LAUNCHERS and launcher != command
+                    else {}
+                ),
             },
         )
 
