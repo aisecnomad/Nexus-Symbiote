@@ -137,14 +137,18 @@ server or approval policy; only a merged value that Codex would refuse is a
 collection failure. The IDE record keeps each layer's own sandbox mode, approval
 policy and reviewer, `default_permissions`, `[permissions]` profiles and
 `[sandbox_workspace_write]` settings. As in Codex, a layer's `default_permissions`
-takes precedence over its `sandbox_mode`. Full access by any route, including a
-profile that extends `:danger-full-access`, and writable paths outside the
-project are high-severity findings. Codex writes to the target of a symlinked
+takes precedence over its `sandbox_mode`. Full access by any route and writable
+paths outside the project are high-severity findings. Codex refuses a profile
+that extends a built-in other than `:read-only` or `:workspace`, such as
+`:danger-full-access`, so such a profile is a collection failure. Codex writes to the target of a symlinked
 writable root. The collection fails on a symlink anywhere in the project except
 inside the directories it never enters (`node_modules`, `.git`, `__pycache__`,
 `venv` and `.venv`), so a writable or workspace root through one of those leaves
 coverage incomplete. Sandbox network access, and workspace writes with every
-approval prompt disabled, are medium-severity findings. A Codex MCP server
+approval prompt disabled, are medium-severity findings. Codex loads project
+layers only for trusted projects and gives them `:workspace` writes when no layer
+selects a sandbox, so disabling every prompt without a sandbox selection is the
+same finding. A Codex MCP server
 declared in a nested layer is recorded with the layers it merges. Server records
 keep tool approval modes, tool allow and deny lists, OAuth scopes, the stdio
 working directory and the names of forwarded environment variables (`env_vars`,

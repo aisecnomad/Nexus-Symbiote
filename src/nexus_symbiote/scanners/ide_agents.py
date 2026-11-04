@@ -37,6 +37,8 @@ CODEX_BUILT_IN_PROFILES = {
     ":danger-full-access": "danger-full-access",
 }
 _CODEX_SANDBOX_MODES = frozenset(CODEX_BUILT_IN_PROFILES.values())
+# Codex refuses a profile that extends any other built-in, such as :danger-full-access.
+_CODEX_EXTENSIBLE_PARENTS = frozenset({":read-only", ":workspace"})
 _CODEX_PROFILE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
 _CODEX_PROFILE_KEYS = frozenset(
     {"description", "extends", "filesystem", "network", "workspace_roots"}
@@ -128,7 +130,7 @@ def _resolve_profile(
     base: str | None = None
     grants: dict[str, Any] = {}
     while name not in memo:
-        if name in CODEX_BUILT_IN_PROFILES:
+        if name in _CODEX_EXTENSIBLE_PARENTS:
             base = name
             break
         if name in seen or name not in catalog:
@@ -217,7 +219,9 @@ def _codex_scope_mode(
     """Select the permission syntax as Codex does: the last layer declaring one wins,
     and within a layer `default_permissions` takes precedence over `sandbox_mode`."""
     mode = None
-    writes = False
+    # Project layers load only for trusted projects, where Codex defaults to :workspace;
+    # user config and Windows without its sandbox are not observed.
+    writes = True
     for _, _, values in chain:
         if "sandbox_mode" in values:
             mode = values["sandbox_mode"]
@@ -643,7 +647,7 @@ class IDEAgentScanner(Scanner):
                 profiles = values.get("permission_profiles", {})
                 for name in list(profiles):
                     try:
-                        base, grants = _resolve_profile(name, catalog, memo, budget)
+                        _, grants = _resolve_profile(name, catalog, memo, budget)
                     except ValueError:
                         result.scan_failures.append(
                             f"{label}: invalid permission profile declaration"
@@ -651,14 +655,8 @@ class IDEAgentScanner(Scanner):
                         del profiles[name]
                         continue
                     places |= _profile_writes(grants, directory, budget)[1]
-                    findings.update(
-                        finding
-                        for finding, present in (
-                            (_FULL_ACCESS, base == ":danger-full-access"),
-                            (_NETWORK, grants.get("network_enabled") is True),
-                        )
-                        if present
-                    )
+                    if grants.get("network_enabled") is True:
+                        findings.add(_NETWORK)
                 if not profiles:
                     values.pop("permission_profiles", None)
                 # An override that broke a profile was removed above; resolve the rest.

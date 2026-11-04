@@ -87,15 +87,16 @@ def test_each_directory_scope_selects_its_own_syntax(tmp_path: Path) -> None:
         'default_permissions = "ci"\n[permissions.ci]\nextends = ":danger-full-access"\n',
         'default_permissions = "ci"\n[permissions.ci]\nextends = "base"\n'
         '[permissions.base]\nextends = ":danger-full-access"\n',
-        # A declared profile is selectable at run time even when this layer selects another.
+        # Codex refuses a declared profile even when this layer selects another.
         'default_permissions = ":read-only"\n[permissions.ci]\nextends = ":danger-full-access"\n',
     ],
 )
-def test_profiles_extending_full_access_are_high_risk(tmp_path: Path, body: str) -> None:
+def test_profiles_extending_full_access_are_invalid(tmp_path: Path, body: str) -> None:
+    # Codex extends only :read-only and :workspace and refuses any other built-in parent.
     write_layer(tmp_path, body)
     result = IDEAgentScanner().scan(tmp_path)
-    assert (RiskSeverity.HIGH, FULL_ACCESS) in findings(codex(result))
-    assert not result.scan_failures
+    assert ".codex/config.toml: invalid permission profile declaration" in result.scan_failures
+    assert (RiskSeverity.HIGH, FULL_ACCESS) not in findings(codex(result))
 
 
 def test_custom_profile_records_interpreted_grants(tmp_path: Path) -> None:
@@ -275,6 +276,26 @@ def test_workspace_write_settings_are_recorded(tmp_path: Path) -> None:
 def test_workspace_write_without_prompts_is_medium_risk(tmp_path: Path) -> None:
     write_layer(tmp_path, 'sandbox_mode = "workspace-write"\napproval_policy = "never"\n')
     assert findings(codex(IDEAgentScanner().scan(tmp_path))) == {(RiskSeverity.MEDIUM, UNPROMPTED)}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'approval_policy = "never"\n',
+        "[approval_policy.granular]\nsandbox_approval = false\nrules = false\n"
+        "mcp_elicitations = false\n",
+    ],
+)
+def test_disabling_prompts_without_a_sandbox_selection_is_unprompted(
+    tmp_path: Path, body: str
+) -> None:
+    # Codex loads project layers only for trusted projects, where it defaults to :workspace.
+    write_layer(tmp_path, body)
+    result = IDEAgentScanner().scan(tmp_path)
+    agent = codex(result)
+    assert agent.permission_mode is None
+    assert findings(agent) == {(RiskSeverity.MEDIUM, UNPROMPTED)}
+    assert not result.scan_failures
 
 
 def test_granular_policy_rejecting_every_prompt_is_unprompted(tmp_path: Path) -> None:

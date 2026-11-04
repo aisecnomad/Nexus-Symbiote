@@ -113,13 +113,13 @@ def test_long_permission_profile_chain_resolves_quickly(tmp_path: Path) -> None:
     write_layer(
         tmp_path,
         f'default_permissions = "p{count - 1}"\n'
-        '[permissions.p0]\nextends = ":danger-full-access"\n'
+        '[permissions.p0]\nextends = ":workspace"\n'
         + "".join(f'[permissions.p{i}]\nextends = "p{i - 1}"\n' for i in range(1, count)),
     )
     result = bounded_scan(IDEAgentScanner(), tmp_path)
     assert not result.scan_failures
     agent = next(c for c in result.components if isinstance(c, IDEAgentComponent))
     assert agent.permission_mode == f"profile:p{count - 1}"
-    assert {(risk.severity, risk.detail) for risk in agent.risks} == {
-        (RiskSeverity.HIGH, FULL_ACCESS)
+    assert (RiskSeverity.HIGH, FULL_ACCESS) not in {
+        (risk.severity, risk.detail) for risk in agent.risks
     }
