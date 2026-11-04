@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import secrets
 
@@ -15,6 +17,7 @@ from nexus_symbiote.core.hashing import (
     SOURCE_BINDING_KEY_ENV,
     SourceBindingKeyError,
     bind_source_values,
+    canonical_json,
 )
 from nexus_symbiote.diff.differ import AIBOMDiffer
 from nexus_symbiote.scanners.a2a import A2AScanner, has_a2a_source_binding
@@ -348,16 +351,36 @@ WEAK_KEYS = [
     "acme-agents-binding-key-2026-prod",
     "nexus-symbiote-binding-key-2026!",
     "drift-fixture-operator-key-at-least-32-characters",
+    # Passphrases in the base64url alphabet, and base64url itself: only hexadecimal is accepted.
+    "Acme-Agents-Binding-Key-2026-Production-Primary",
+    "CorrectHorseBatteryStapleCorrectHorseBatteryStaple",
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq",
+    base64.urlsafe_b64encode(bytes.fromhex(OTHER_KEY)).decode().rstrip("="),
     "k" * 40,
-    "a" * 64,
-    "0123456789abcdef" * 4,
-    "00" * 16 + "ff" * 16,
     "A" * 43,
-    "abcdef0123456789abcdef0123456789abcdef0123456789",
-    "98cac034c72c5e5a7cf015128779ae4e39b178899dca2a89d79745cb4a7379e",
     "+/" + "Qm9vazEyMzQ1Njc4OTBhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5eg==",
     KEY + "\n",
     "\udcff" * 64,
+    "98cac034c72c5e5a7cf015128779ae4e39b178899dca2a89d79745cb4a7379e",
+    # Hexadecimal, but shorter than 32 bytes or evidently not random. Each rule has entries
+    # that no other rule rejects, at its boundary where it has one: 31 bytes, 19 distinct
+    # byte values, encoded text, an 8-byte constant-step run and a repeated 8-byte block.
+    KEY[:62],
+    "abcdef0123456789abcdef0123456789abcdef0123456789",
+    "a" * 64,
+    "0123456789abcdef" * 4,
+    "00" * 16 + "ff" * 16,
+    "b6fde3bff78ea4b6d8fbbfda91e3affaa2daa6b7aeaefbebaee3a4d8e3aaa691",
+    b"acme agents binding key 2026 production!".hex(),
+    "Schl\u00fcssel f\u00fcr die Bindung, Gr\u00fc\u00dfe aus M\u00fcnchen!".encode().hex(),
+    b"binding key for the production pipeline 2026\n".hex(),
+    bytes(range(32)).hex(),
+    bytes(range(255, 223, -1)).hex(),
+    "ffcac32df564ce9ea1a45ed20c9b2ab948d766f59455a68818f107f195f13b42",
+    "00112233445566778899aabbccddeeff" * 2,
+    bytes(range(16)).hex() * 2,
+    "12a1fc06b3fcc3df637e06eb719edf143537afde470284be" * 2,
+    "cd88980e745ee919280dac9202175b656a39f2f80e745ee919280dac6221476d",
 ]
 
 
@@ -377,15 +400,63 @@ def test_binding_key_must_be_random_key_material(monkeypatch, key):
         lambda: KEY.upper(),
         lambda: secrets.token_hex(32),
         lambda: secrets.token_hex(48),
-        lambda: secrets.token_urlsafe(32),
-        lambda: base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(),
+        # Just inside each rule's boundary: 20 byte values, a 7-byte run, a 7-byte repeat.
+        lambda: "b283c8d0908ba39b8ea8bfd0a8adbfcb829bcd89c8b2c8ee9aa3a3aabfa88d89",
+        lambda: "ef82dbb0128585152761fbf321416181a1c1e116c251e8ba8d1de41929173c5e",
+        lambda: "3db07c6765e5c88e30c8a18cc26a4b60faff20f26765e5c88e30c8ba1f77154b",
     ],
-    ids=["constant", "uppercase", "token_hex", "long_hex", "token_urlsafe", "padded_base64url"],
+    ids=["constant", "uppercase", "token_hex", "long_hex", "values20", "run7", "repeat7"],
 )
 def test_random_binding_keys_are_accepted(monkeypatch, generate):
     monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, generate())
     mac, key_id = bind_source_values({"kind": "client"}, profile="test")
     assert mac.startswith("hmac-sha256:") and len(key_id) == 32
+
+
+def test_key_is_the_encoded_bytes_regardless_of_hexadecimal_case(monkeypatch):
+    bindings = []
+    for key in (KEY, KEY.upper()):
+        monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, key)
+        bindings.append(bind_source_values({"kind": "client"}, profile="test"))
+    assert bindings[0] == bindings[1]
+
+
+def test_exported_values_need_a_slow_key_derivation_per_guess(monkeypatch):
+    """The key id and a binding over a public card are known-input oracles for the key.
+
+    No format check recognizes a hash of a passphrase, so each offline guess must cost
+    PBKDF2-HMAC-SHA256 with 600,000 iterations instead of a single HMAC.
+    """
+    key = hashlib.sha256(b"password").hexdigest()
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, key)
+    config = {"kind": "client"}
+    mac, key_id = bind_source_values(config, profile="test")
+    label = b"nexus-symbiote/source-binding-key-id"
+    for fast in (bytes.fromhex(key), key.encode()):
+        assert key_id != hmac.new(fast, label, "sha256").hexdigest()[:32]
+    stretched = hashlib.pbkdf2_hmac(
+        "sha256", bytes.fromhex(key), b"nexus-symbiote/source-binding-key/v1", 600_000
+    )
+    assert key_id == hmac.new(stretched, label, "sha256").hexdigest()[:32]
+    message = canonical_json({"profile": "test", "configuration": config}).encode()
+    assert mac == "hmac-sha256:" + hmac.new(stretched, message, "sha256").hexdigest()
+
+
+def test_key_derivation_runs_once_per_key_in_a_process(monkeypatch):
+    derivations = []
+    derive = hashlib.pbkdf2_hmac
+
+    def counted(*args, **kwargs):
+        derivations.append(None)
+        return derive(*args, **kwargs)
+
+    monkeypatch.setattr(hashlib, "pbkdf2_hmac", counted)
+    first, second = secrets.token_hex(32), secrets.token_hex(32)
+    for key in (first, second, first):
+        monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, key)
+        for index in range(3):
+            bind_source_values({"kind": "client", "index": index}, profile="test")
+    assert len(derivations) == 2
 
 
 @pytest.mark.parametrize(

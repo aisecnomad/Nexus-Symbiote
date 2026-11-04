@@ -6,10 +6,10 @@ hashing of tool definitions, prompt templates, and other mutable artifacts.
 
 from __future__ import annotations
 
-import base64
-import binascii
+import functools
 import hashlib
 import hmac
+import itertools
 import json
 import os
 import re
@@ -32,8 +32,14 @@ def canonical_json(data: Any) -> str:
 
 
 SOURCE_BINDING_KEY_ENV = "NEXUS_SYMBIOTE_SOURCE_BINDING_KEY"
-_HEX_KEY = re.compile(r"(?:[0-9a-fA-F]{2}){32,}")
-_BASE64URL_KEY = re.compile(r"[A-Za-z0-9_-]{43,}={0,2}")
+_HEX_KEY = re.compile(r"(?:[0-9a-fA-F]{2})+")
+# Every BOM exports the key identifier, and a binding over a public card is computed from
+# known input, so each lets anyone holding a BOM test key guesses offline. Stretching the
+# key makes every guess cost this derivation instead of one HMAC; a guessable key stays
+# guessable, only slower.
+_KEY_DERIVATION_SALT = b"nexus-symbiote/source-binding-key/v1"
+_KEY_DERIVATION_ITERATIONS = 600_000
+_KEY_ID_LABEL = b"nexus-symbiote/source-binding-key-id"
 
 
 class SourceBindingKeyError(ValueError):
@@ -44,35 +50,52 @@ class SourceBindingValueError(ValueError):
     """A declaration contains values that RFC 8785 cannot canonicalize for binding."""
 
 
-def source_binding_key() -> bytes | None:
-    """Return the operator binding key, or ``None`` when values are not bound.
+def _evidently_not_random(material: bytes) -> bool:
+    """Return whether key bytes are too short, low-diversity, textual or patterned.
 
-    Every BOM exports a key identifier, and a binding over a public declaration is
-    also known input, so either confirms guesses for a passphrase offline. Only
-    encoded random key material is accepted.
+    Passing proves nothing about entropy: the hash of a passphrase passes. Together the
+    rules reject fewer than one random 32-byte key in a billion.
+    """
+    if len(material) < 32 or len(set(material)) < 20:
+        return True
+    try:
+        text = material.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    else:
+        if all(char.isprintable() or char.isspace() for char in text):
+            return True  # encoded text, such as a passphrase
+    blocks = [material[index : index + 8] for index in range(len(material) - 7)]
+    steps = [(after - before) % 256 for before, after in itertools.pairwise(material)]
+    # A repeated 8-byte block, or 8 bytes that change by a constant step like a counter.
+    return len(set(blocks)) < len(blocks) or any(
+        len(set(steps[index : index + 7])) == 1 for index in range(len(steps) - 6)
+    )
+
+
+def source_binding_key() -> bytes | None:
+    """Return the decoded operator key, or ``None`` when values are not bound.
+
+    Only hexadecimal keys of at least 32 bytes are accepted, so a passphrase cannot be
+    used as typed. The format check rejects encoded text and evident patterns but cannot
+    recognize every non-random key, such as a hash of a passphrase.
     """
     key = os.environ.get(SOURCE_BINDING_KEY_ENV, "")
     if not key:
         return None
-    material = b""
-    if _HEX_KEY.fullmatch(key):
-        material = bytes.fromhex(key)
-    elif (
-        _BASE64URL_KEY.fullmatch(key)
-        and any(char.isupper() for char in key)
-        and any(char.islower() for char in key)
-    ):
-        try:
-            material = base64.b64decode(key + "=" * (-len(key) % 4), b"-_", validate=True)
-        except binascii.Error:
-            material = b""
-    # A random 32-byte key repeats few byte values; patterns and repetitions repeat many.
-    if len(material) < 32 or len(set(material)) < 16:
+    material = bytes.fromhex(key) if _HEX_KEY.fullmatch(key) else b""
+    if _evidently_not_random(material):
         raise SourceBindingKeyError(
             f"{SOURCE_BINDING_KEY_ENV} must be random key material: at least 64 hexadecimal "
-            "characters, or base64url encoding at least 32 random bytes; never a passphrase"
+            "characters from a random generator; never a passphrase, text or a pattern"
         )
-    return key.encode("utf-8")
+    return material
+
+
+@functools.lru_cache(maxsize=8)
+def _stretched_key(material: bytes) -> bytes:
+    """Derive the binding key once per process and key with PBKDF2-HMAC-SHA256."""
+    return hashlib.pbkdf2_hmac("sha256", material, _KEY_DERIVATION_SALT, _KEY_DERIVATION_ITERATIONS)
 
 
 def bind_source_values(config: dict[str, Any], *, profile: str) -> tuple[str, str] | None:
@@ -84,8 +107,9 @@ def bind_source_values(config: dict[str, Any], *, profile: str) -> tuple[str, st
         message = canonical_json({"profile": profile, "configuration": config})
     except (TypeError, ValueError, RecursionError):
         raise SourceBindingValueError("declaration cannot be canonicalized for binding") from None
-    mac = hmac.new(material, message.encode("utf-8"), "sha256").hexdigest()
-    key_id = hmac.new(material, b"nexus-symbiote/source-binding-key-id", "sha256").hexdigest()
+    key = _stretched_key(material)
+    mac = hmac.new(key, message.encode("utf-8"), "sha256").hexdigest()
+    key_id = hmac.new(key, _KEY_ID_LABEL, "sha256").hexdigest()
     return "hmac-sha256:" + mac, key_id[:32]
 
 
