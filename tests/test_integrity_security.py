@@ -481,3 +481,50 @@ def test_local_tool_mismatch_fails_even_when_supplier_rehashes(tmp_path):
     assert report.tool_descriptors_self_consistent == 1
     assert report.hashes_verified == 0
     assert any(i.category == "hash_mismatch" for i in report.issues)
+
+
+def test_redacted_descriptor_is_not_counted_as_internally_consistent():
+    # Only the displayed view can be recomputed; the original digest stays unchecked.
+    tool = ToolComponent(
+        bom_ref="tool:redacted",
+        name="redacted",
+        description_text="[REDACTED]",
+        redacted_definition_hash=hash_tool_definition("redacted", "[REDACTED]"),
+        definition_hash="sha256:" + "0" * 64,
+        definition_hash_version=TOOL_DEFINITION_HASH_VERSION,
+    )
+    report = IntegrityValidator().validate(AIBOM(components=[tool]))
+    assert report.status == "unknown"
+    assert report.tool_descriptors_self_consistent == 0
+    assert report.hashes_verified == 0
+    (issue,) = report.issues
+    assert issue.category == "descriptor_source_unavailable"
+    assert issue.severity == "unknown"
+    assert issue.detail == (
+        "Redacted representation matches; original descriptor requires matching source evidence"
+    )
+
+
+def test_validate_prints_no_workflow_command_from_a_supplied_bom_ref(tmp_path):
+    from click.testing import CliRunner
+
+    from nexus_symbiote.cli import main
+
+    ref = "tool:x\n::error::forged\r::warning::forged\u2028::notice::forged\x85##[error]forged"
+    tool = ToolComponent(
+        bom_ref=ref,
+        name="x",
+        description_text="d",
+        definition_hash=hash_tool_definition("x", "d"),
+        definition_hash_version=TOOL_DEFINITION_HASH_VERSION,
+    )
+    path = tmp_path / "supplied.aibom.json"
+    AIBOM(components=[tool]).save(path)
+    result = CliRunner().invoke(main, ["validate", "--no-project-policy", str(path)])
+    assert result.exit_code == 1, result.output
+    lines = result.output.splitlines()
+    assert any(line.startswith("  UNKNOWN [tool:x") for line in lines), result.output
+    # The runner trims leading whitespace before "::" and finds "##[" anywhere.
+    for line in lines:
+        assert not line.lstrip().startswith("::"), line
+        assert "##[" not in line, line

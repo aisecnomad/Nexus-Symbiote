@@ -245,7 +245,9 @@ class IntegrityValidator:
             raw_hash = f"{algorithm}:{expected}"
             if recomputed != (comp.redacted_definition_hash or raw_hash):
                 raise ValueError("Tool definition differs from its declared digest")
-            report.tool_descriptors_self_consistent += 1
+            # A redacted descriptor recomputes only its displayed view, not the original.
+            if comp.redacted_definition_hash is None:
+                report.tool_descriptors_self_consistent += 1
             if comp.bom_ref in local_tools:
                 local = local_tools[comp.bom_ref]
                 if (
@@ -260,7 +262,9 @@ class IntegrityValidator:
                     IntegrityIssue(
                         comp.bom_ref,
                         "descriptor_source_unavailable",
-                        "Descriptor is internally consistent but has no matching local configuration evidence",
+                        "Descriptor is internally consistent but has no matching local configuration evidence"
+                        if comp.redacted_definition_hash is None
+                        else "Redacted representation matches; original descriptor requires matching source evidence",
                         "unknown",
                     )
                 )

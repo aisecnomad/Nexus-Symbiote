@@ -246,9 +246,20 @@ nexus-symbiote summary [OPTIONS] AIBOM_PATH
 Validate an AIBOM for completeness and integrity.
 
 Tool descriptor self-consistency is reported separately from a matching local
-configuration. Without source corroboration the integrity verdict is `UNKNOWN`
-and the gate exits nonzero. Local matching alone does not authenticate the source
-or a live endpoint.
+configuration. A descriptor counts as internally consistent only when its full
+digest can be recomputed from the BOM; a redacted descriptor's original digest
+cannot, so it is not counted. A tool without a matching local configuration
+under `--project` leaves the integrity verdict at best `UNKNOWN`, and with the
+built-in policy the gate exits nonzero. Local matching alone does not authenticate
+the source or a live endpoint.
+
+Unless `--no-project-policy` is given, the command reads `.nexus-symbiote.yaml` (or
+`.yml`) from the `--project` root, or without `--project` from the BOM's directory,
+or else from the nearest ancestor directory that has one. That policy can skip the
+integrity and completeness checks (`validate.require_integrity: false`,
+`validate.require_completeness: false`), and the command can then exit 0 without
+any corroboration. Pass `--no-project-policy` when the BOM, its directory or the
+checkout is untrusted.
 
 ```text
 nexus-symbiote validate [OPTIONS] AIBOM_PATH
