@@ -159,16 +159,17 @@ an authentication finding.
 
 The collector interprets legacy `authentication.schemes`, the A2A 0.3
 [`security` alternatives](https://a2a-protocol.org/v0.3.0/specification/#55-agentcard-object-structure)
-and A2A v1 `securityRequirements`, on the card and on each skill. An empty list
-or an empty alternative permits anonymous use and does not establish required
-authentication, and so does a legacy scheme named `none`, `public`, `anonymous`,
-`noauth`, `unauthenticated` or the empty string. A card can declare several of
-these forms for different clients, and a skill's requirements can relax the
-card's: if any declared form, on the card or on any skill, permits anonymous use,
-authentication is not required. A card that declares no card-level form does not
-require authentication. Skill-level requirements of either version are recorded
-in `skill_security_requirements`, keyed by skill identifier, so a skill that
-declares requirements needs a unique `id`.
+and A2A v1 `securityRequirements`. An empty list or an empty alternative permits
+anonymous use and does not establish required authentication, and so does a
+legacy scheme named `none`, `public`, `anonymous`, `noauth`, `unauthenticated` or
+the empty string. A card can declare several of these forms for different
+clients: if any card-level form permits anonymous use, authentication is not
+required. A card that declares no card-level form does not require
+authentication. Skill-level requirements of either version add requirements for
+that skill; the card-level requirement applies to every request, so they never
+relax it. They are recorded in `skill_security_requirements`, keyed by skill
+identifier, so a skill that declares requirements needs a unique `id`, and an
+unsupported skill-level form is recorded as unknown coverage.
 
 An unsupported form leaves the requirement unknown coverage: an A2A 0.3 or v1
 requirement that names a scheme missing from `securitySchemes`, or a scheme

@@ -155,9 +155,9 @@ def _legacy_authentication(value: Any) -> bool | None:
 
 
 def _authentication_required(
-    data: dict[str, Any], v1_requirements: Requirements | None, skills: list[bool | None]
+    data: dict[str, Any], v1_requirements: Requirements | None
 ) -> bool | None:
-    """Combine every declared requirement form; any form permitting anonymous use wins."""
+    """Combine the card-level requirement forms; any form permitting anonymous use wins."""
     declared: list[bool | None] = []
     if data.get("security") is not None:
         alternatives = _v03_requirements(data["security"])
@@ -170,10 +170,11 @@ def _authentication_required(
         declared.append(_requirement_semantics(v1_requirements, data.get("securitySchemes")))
     if data.get("authentication") is not None:
         declared.append(_legacy_authentication(data["authentication"]))
-    # A client may use any declared form and any skill can relax the card's forms, so one
-    # anonymous form makes authentication optional; an unsupported form leaves the
-    # requirement unknown. A card that declares no card-level form requires nothing.
-    combined = [*(declared or [False]), *skills]
+    # A client may use any declared form, so one anonymous form makes authentication
+    # optional; an unsupported form leaves the requirement unknown. A card that declares
+    # no card-level form requires nothing. Skill-level forms only add requirements for a
+    # skill: the card-level requirement applies to every request (A2A 0.3 section 4.4).
+    combined = declared or [False]
     if False in combined:
         return False
     return None if None in combined else True
@@ -482,6 +483,12 @@ class A2AScanner(Scanner):
             result.surfaces_excluded.append(
                 f"{relative}: A2A authentication requirement semantics are unknown"
             )
+        if isinstance(component, A2AServerComponent) and component.properties.get(
+            "skill_security_unknown"
+        ):
+            result.surfaces_excluded.append(
+                f"{relative}: A2A skill security requirement semantics are unknown"
+            )
         if (
             isinstance(component, A2AClientComponent)
             and UNRECOGNIZED_AUTHENTICATION in component.authentication_methods
@@ -534,12 +541,13 @@ class A2AScanner(Scanner):
         if not isinstance(declared_skills, list) or len(declared_skills) > 1000:
             raise ValueError("invalid skills")
         skills = []
-        skill_semantics: list[bool | None] = []
+        unknown_skills: list[str] = []
         for skill in declared_skills:
             if isinstance(skill, dict):
                 skill = _proto_fields(skill, "securityRequirements")
                 semantics, requirements = _skill_security(skill, data.get("securitySchemes"))
-                skill_semantics.extend(semantics)
+                if None in semantics:
+                    unknown_skills.append(redact_text(str(skill.get("id", "unknown"))))
                 if requirements is not None:
                     skill_id = skill.get("id")
                     if not isinstance(skill_id, str) or not skill_id:
@@ -559,7 +567,9 @@ class A2AScanner(Scanner):
         if data.get("securityRequirements") is not None:
             requirements = _v1_requirements(data["securityRequirements"])
             properties["security_requirements"] = _canonical(_redacted(requirements))
-        auth_required = _authentication_required(data, requirements, skill_semantics)
+        auth_required = _authentication_required(data, requirements)
+        if unknown_skills:
+            properties["skill_security_unknown"] = sorted(set(unknown_skills))
         risks: list[RiskAssessment] = []
         transport = [_transport_security(origin) for origin in origins]
         if False in transport:

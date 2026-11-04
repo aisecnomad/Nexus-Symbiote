@@ -413,24 +413,24 @@ def test_legacy_and_v0_3_authentication_semantics(tmp_path, extra, expected):
 
 
 @pytest.mark.parametrize(
-    "skill, expected, recorded",
+    "skill, unknown_skill, recorded",
     [
         ({"security": [{}]}, False, [{}]),
         ({"security": []}, False, []),
-        ({"security": [{"bearer": ["admin", "admin"]}]}, True, [{"bearer": ["admin"]}]),
+        ({"security": [{"bearer": ["admin", "admin"]}]}, False, [{"bearer": ["admin"]}]),
         ({"security": [{"bearer": []}, {}]}, False, [{"bearer": []}, {}]),
-        ({"security": [{"undeclared": []}]}, None, [{"undeclared": []}]),
-        ({"security": {"bearer": []}}, None, None),
-        ({"security": None}, True, None),
+        ({"security": [{"undeclared": []}]}, True, [{"undeclared": []}]),
+        ({"security": {"bearer": []}}, True, None),
+        ({"security": None}, False, None),
         ({"securityRequirements": [{"schemes": {}}]}, False, [{}]),
         ({"securityRequirements": []}, False, []),
-        ({"securityRequirements": None}, True, None),
+        ({"securityRequirements": None}, False, None),
         (
             {
                 "security": [{"bearer": []}],
                 "securityRequirements": [{"schemes": {"bearer": {}}}],
             },
-            True,
+            False,
             [{"bearer": []}],
         ),
         (
@@ -440,9 +440,10 @@ def test_legacy_and_v0_3_authentication_semantics(tmp_path, extra, expected):
         ),
     ],
 )
-def test_skill_requirements_decide_whether_authentication_is_universal(
-    tmp_path, skill, expected, recorded
+def test_skill_requirements_never_relax_the_card_level_requirement(
+    tmp_path, skill, unknown_skill, recorded
 ):
+    # The card-level requirement applies to every request; skill-level forms add to it.
     card = {
         **LEGACY,
         "security": [{"bearer": []}],
@@ -453,8 +454,9 @@ def test_skill_requirements_decide_whether_authentication_is_universal(
         ],
     }
     server, unknown = _server(tmp_path, card)
-    assert server.authentication_required is expected
-    assert unknown == (expected is None)
+    assert server.authentication_required is True
+    assert unknown == unknown_skill
+    assert bool(server.properties.get("skill_security_unknown")) == unknown_skill
     if recorded is None:
         assert "skill_security_requirements" not in server.properties
     else:
@@ -550,8 +552,9 @@ def test_v1_skill_requirements_are_checked_against_security_schemes(tmp_path, sc
         {"id": "plan", "name": "plan", "securityRequirements": [{"schemes": schemes}]}
     ]
     server, unknown = _server(tmp_path, card)
-    assert server.authentication_required is expected
+    assert server.authentication_required is True
     assert unknown == (expected is None)
+    assert bool(server.properties.get("skill_security_unknown")) == (expected is None)
     assert list(server.properties["skill_security_requirements"]["plan"][0]) == list(schemes)
 
 
