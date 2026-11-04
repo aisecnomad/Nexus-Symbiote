@@ -20,7 +20,12 @@ from packaging.utils import canonicalize_name
 from nexus_symbiote.core.enums import AssuranceLevel, RiskSeverity, TrustTier
 from nexus_symbiote.core.hashing import extract_version_pin, hash_bytes, parse_json_strict
 from nexus_symbiote.core.models import ClaimEvidence, RegistryEntryComponent, RiskAssessment
-from nexus_symbiote.scanners.base import Scanner, ScanResult, sanitized_origin
+from nexus_symbiote.scanners.base import (
+    Scanner,
+    ScanResult,
+    sanitized_origin,
+    toml_exceeds_limits,
+)
 from nexus_symbiote.utils.secrets import redact_text
 
 AI_PACKAGE_PATTERNS = [
@@ -296,9 +301,12 @@ class RegistryScanner(Scanner):
         content = self._read(path, result)
         if content is None:
             return components
+        if toml_exceeds_limits(content):
+            result.scan_failures.append("pyproject.toml: TOML size or structure limit exceeded")
+            return components
         try:
             data = tomllib.loads(content)
-        except (tomllib.TOMLDecodeError, RecursionError):
+        except (ValueError, RecursionError):
             result.scan_failures.append("pyproject.toml: invalid TOML")
             return components
         declarations: list[str] = []

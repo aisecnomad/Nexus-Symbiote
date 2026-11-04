@@ -237,6 +237,25 @@ class TestRegistryScanner:
         result = scanner.scan(tmp_path)
         assert any(c.name == "transformers" for c in result.components)
 
+    def test_unparsable_pyproject_toml_keeps_other_manifests(self, tmp_path):
+        # tomllib raises a plain ValueError for an integer beyond Python's digit limit.
+        (tmp_path / "requirements.txt").write_text("transformers==4.40.0\n")
+        (tmp_path / "pyproject.toml").write_text("x = " + "1" * 5000 + "\n")
+        result = RegistryScanner().scan(tmp_path)
+        assert "pyproject.toml: invalid TOML" in result.scan_failures
+        assert any(c.name == "transformers" for c in result.components)
+
+    def test_pyproject_toml_over_structure_limit_is_not_parsed(self, tmp_path, monkeypatch):
+        from nexus_symbiote.scanners import registry as registry_module
+
+        def refuse(_: str) -> dict[str, object]:
+            raise AssertionError("parsed a TOML file over the structure limit")
+
+        monkeypatch.setattr(registry_module.tomllib, "loads", refuse)
+        (tmp_path / "pyproject.toml").write_text("a." * 1000 + "a = 1\n")
+        result = RegistryScanner().scan(tmp_path)
+        assert result.scan_failures == ["pyproject.toml: TOML size or structure limit exceeded"]
+
     def test_scan_pinned_pip_no_risk(self, tmp_path):
         (tmp_path / "requirements.txt").write_text("transformers==4.40.0\n")
         scanner = RegistryScanner()

@@ -164,7 +164,8 @@ folder, so one without `config.toml` still identifies Codex. With the operator
 key, the values of these settings are bound, so an edit to them fails the drift
 gate; settings that RFC 8785 cannot canonicalize are a collection failure. Codex TOML
 larger than 256 KiB, nested more than 32 levels or with more than 16 unquoted
-dots on one line is recorded as a collection failure without being parsed.
+dots on one line is recorded as a collection failure without being parsed. The
+registry collector applies the same limits to `pyproject.toml`.
 Redacting each Codex MCP server's recorded names against its secret values, and
 resolving and checking permission profiles, are bounded over the collection
 (4 million name-by-secret checks and 2 million grant entries); past either
