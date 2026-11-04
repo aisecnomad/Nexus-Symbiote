@@ -176,6 +176,9 @@ def test_workspace_writes_without_escalation_prompts_are_a_finding(tmp_path: Pat
         '[mcp_servers.CANARY_SECRET]\nurl = "https://example.test"\nbearer_token_env_var = [1]',
         '[mcp_servers.CANARY_SECRET]\nurl = "https://example.test"\nscopes = "CANARY_SECRET"',
         '[mcp_servers.CANARY_SECRET]\nurl = "https://example.test"\nscopes = [1]',
+        '[mcp_servers.CANARY_SECRET]\ncommand = "npx"\ntools.x.output_token_limit = 0',
+        '[mcp_servers.CANARY_SECRET]\ncommand = "npx"\ntools.x.output_token_limit = "100"',
+        '[mcp_servers.CANARY_SECRET]\ncommand = "npx"\nenv_vars = [{ name = "A", CANARY_SECRET = 1 }]',
     ],
 )
 def test_malformed_codex_server_fields_are_incomplete(tmp_path: Path, body: str) -> None:
@@ -195,6 +198,7 @@ def test_codex_header_values_never_reach_the_bom(tmp_path: Path) -> None:
 url = "https://example.test/mcp"
 http_headers = { "X-Api-Key" = "hdrcanary8472915" }
 enabled_tools = ["hdrcanary8472915"]
+env_vars = ["hdrcanary8472915", { name = "hdrcanary8472915", source = "remote" }]
 env_http_headers = { "hdrcanary8472915" = "hdrcanary8472915" }
 bearer_token_env_var = "hdrcanary8472915"
 scopes = ["hdrcanary8472915"]
@@ -417,6 +421,10 @@ def test_approval_change_beside_a_similar_name_fails_the_drift_gate(
         "x = { " + "a." * 1000 + "a = 1 }\n",
         "x = " + "[" * 5000 + "]" * 5000 + "\n",
         'sandbox_mode = "read-only"\n' + "# padding\n" * 30_000,
+        # Escapes decide where a string ends; a lexer out of step with tomllib would read
+        # the dotted key as string content and pass it.
+        '"\\\\".' + "a." * 1000 + "a = 1\n",
+        'x = """\\"""abc"""\n' + "a." * 1000 + 'a = 1\ny = """\n"""\n',
     ],
 )
 def test_costly_toml_is_refused_before_parsing(
@@ -457,6 +465,16 @@ notes = \"\"\"
 command = "npx"
 args = ["{dotted}@1.2.3", '''{dotted}''']
 """,
+    )
+    for scanner in (MCPScanner, IDEAgentScanner):
+        assert not scanner().scan(tmp_path).scan_failures
+
+
+def test_dotted_keys_are_counted_per_line_after_a_multiline_string(tmp_path: Path) -> None:
+    # Each key has 9 parts; only counting across the multi-line string reaches the limit.
+    write_config(
+        tmp_path,
+        "t = { " + "a." * 9 + 'a = """\nx\n""", ' + "b." * 9 + "b = 1 }\n",
     )
     for scanner in (MCPScanner, IDEAgentScanner):
         assert not scanner().scan(tmp_path).scan_failures
