@@ -242,6 +242,10 @@ def test_pinned_image_after_environment_option_has_no_finding(tmp_path):
         ("npx", ["-p", "a@1.0.0", "-p", "b@latest", "srv"]),
         ("uvx", []),
         ("docker", ["run", "--platform", "linux/amd64", "registry.test/team/server:1.2.3"]),
+        ("docker", ["--debug", "run", "registry.test/team/server:latest"]),
+        ("docker", ["-H", "tcp://registry.test", "run", "-i", "registry.test/team/server"]),
+        ("docker", ["container", "run", "registry.test/team/server:latest"]),
+        ("docker", ["--context", "registry.test", "container", "run", "registry.test/x"]),
     ],
 )
 def test_undetermined_package_reference_is_a_finding(tmp_path, command, args):
@@ -252,3 +256,19 @@ def test_undetermined_package_reference_is_a_finding(tmp_path, command, args):
     assert [risk.severity.value for risk in pinning] == ["high"]
     assert "could not be determined" in pinning[0].detail
     assert "registry.test" not in server.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["compose", "up"],
+        ["pull", "registry.test/team/server:latest"],
+        ["--debug", "compose", "run", "server"],
+        ["-H", "tcp://registry.test", "version"],
+        [],
+    ],
+)
+def test_docker_command_that_starts_no_container_has_no_finding(tmp_path, args):
+    server = scan_server(tmp_path, "docker", args)
+    assert server.launcher_package is None
+    assert [risk for risk in server.risks if risk.category == "version_pinning"] == []

@@ -324,6 +324,7 @@ _PYTHON_SOURCE_OPTIONS = frozenset(
     }
 )
 _PACKAGE_LAUNCHERS = frozenset({"npx", "bunx", "uvx", "pipx", "docker"})
+
 _DOCKER_RUN_FLAGS = frozenset({"--rm", "-i", "-t", "-it", "-d", "--detach", "--init"})
 # Skipped without reading their values, which can hold credentials such as -e TOKEN=...
 _DOCKER_RUN_VALUE_OPTIONS = frozenset(
@@ -346,6 +347,17 @@ _DOCKER_RUN_VALUE_OPTIONS = frozenset(
     }
 )
 _WINDOWS_EXECUTABLE_SUFFIXES = frozenset({"exe", "cmd", "bat", "ps1"})
+
+
+def _docker_may_run_container(args: list[str]) -> bool:
+    # Global options and their values precede the subcommand, and their values are not
+    # distinguishable from subcommands here, so any `run` after an option counts.
+    if "run" not in args:
+        return False
+    before = args[: args.index("run")]
+    if "compose" in before:
+        return False
+    return not before or before[-1] == "container" or before[0].startswith("-")
 
 
 def _launcher(command: str) -> tuple[str, bool]:
@@ -725,7 +737,7 @@ class MCPScanner(Scanner):
         elif (
             package_ref is None
             and launcher in _PACKAGE_LAUNCHERS
-            and (launcher != "docker" or args[:1] == ["run"])
+            and (launcher != "docker" or _docker_may_run_container(args))
         ):
             risks.append(
                 RiskAssessment(
