@@ -289,6 +289,11 @@ def scan(
     selected = scanners or tuple(policy.scan.scanners)
     if signature_policies and "model" not in selected:
         raise click.BadParameter("--signature-policy requires the model scanner")
+    if signature_policies and policy.scan.failure_mode == "report-only" and not report_only:
+        raise click.BadParameter(
+            "--signature-policy requires a failing gate, but project policy selects "
+            "report-only; pass --report-only to inspect or --no-project-policy to gate"
+        )
     unknown = set(selected) - set(all_scanners)
     if unknown:
         raise click.BadParameter(

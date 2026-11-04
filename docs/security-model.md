@@ -39,8 +39,12 @@ and labels the result `supplied-bom`. For an operator-configured signature
 check, supply the trusted signer policy when validating the project. Each entry
 must match a collected model and verify under the specified identity and issuer.
 An unsupported model, an excluded model or an invalid signature fails the gate,
-even if other files have valid hashes. Use `scan --report-only` to retain the
-partial inventory and its failures for inspection.
+even if other files have valid hashes. A project policy cannot weaken a supplied
+signer policy: `scan` rejects one that deselects the model scanner, or that
+selects `failure_mode: report-only` unless you also pass `--report-only`, and
+`validate` rejects one that disables integrity validation. `scan` writes the
+inventory and its recorded failures whether or not the gate passes;
+`--report-only` returns exit status 0 instead of 1 so you can inspect them.
 
 A mediated action needs a trusted approver, snapshot binding, authenticated workload and endpoint, action/resource constraints, validity, current revocation state, rollback protection, and any action-specific approval. One-use approval must bind to the action and arguments it authorizes. Adapter checks cannot govern tools invoked through an unmediated route; deployments need their own network, identity, and sandbox controls to make mediation complete.
 

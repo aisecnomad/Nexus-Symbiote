@@ -238,6 +238,35 @@ def test_failed_signature_on_valid_safetensors_blocks_scan_and_risk(policy_input
     assert any(failure in reason for reason in assessment["gate_reasons"])
 
 
+@pytest.mark.parametrize("exclude", [False, True])
+def test_project_report_only_mode_cannot_neutralize_an_explicit_policy(
+    policy_inputs, tmp_path, exclude
+):
+    project, policy, record = policy_inputs
+    (project / "model.bin").unlink()
+    write_safetensors(project / "model.safetensors")
+    write_records(policy, [{**record, "artifact_path": "model.safetensors"}])
+    excluded = "  exclude_paths: [model.safetensors]\n" if exclude else ""
+    (project / ".nexus-symbiote.yaml").write_text("scan:\n  failure_mode: report-only\n" + excluded)
+    runner = CliRunner()
+    output = tmp_path / "bom.json"
+    scan = ["scan", str(project), "--signature-policy", str(policy), "-o", str(output)]
+    result = runner.invoke(main, scan)
+    assert result.exit_code == 2, result.output
+    assert "--report-only" in result.output and not output.exists()
+    failed = "model.safetensors: explicit signature policy verification failed"
+    unmatched = "Signature policy artifact #1 did not match a collected model"
+    # Only the operator selects inspection mode for an explicit signer policy.
+    assert runner.invoke(main, [*scan, "--report-only"]).exit_code == 0
+    coverage = AIBOM.load(output).metadata.completeness
+    assert coverage is not None and (unmatched if exclude else failed) in coverage.scan_failures
+    output.unlink()
+    # Without report-only the gate fails, and the inventory still records why.
+    assert runner.invoke(main, [*scan, "--no-project-policy"]).exit_code == 1
+    coverage = AIBOM.load(output).metadata.completeness
+    assert coverage is not None and failed in coverage.scan_failures
+
+
 def test_explicit_policy_cannot_be_silently_disabled(policy_inputs, tmp_path):
     project, policy, _ = policy_inputs
     runner = CliRunner()
