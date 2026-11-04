@@ -575,6 +575,16 @@ GOOD_YAML = (
 GOOD_JSON = '{"name": "good", "url": "https://agent.example/a2a", "authMethods": ["bearer"]}'
 
 
+def _parser_accepts_nesting(depth):
+    # Python 3.11's JSON parser refuses nesting that 3.12 and later parse; such a file
+    # then fails as a whole, before any declaration in it is canonicalized.
+    try:
+        json.loads("[" * depth + "]" * depth)
+    except RecursionError:
+        return False
+    return True
+
+
 @pytest.mark.parametrize(
     ("relative", "content"),
     [
@@ -608,6 +618,10 @@ def test_values_outside_i_json_fail_only_their_declaration(
     monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
     (tmp_path / relative).write_text(content)
     result = A2AScanner().scan(tmp_path)
+    if "[" * 1200 in content and not _parser_accepts_nesting(1200):
+        assert result.scan_failures == [f"{tmp_path / relative}: invalid JSON or duplicate keys"]
+        assert result.components == []
+        return
     assert result.scan_failures == [
         f"{relative}: A2A declaration cannot be canonicalized for binding"
     ]
@@ -658,9 +672,12 @@ def test_deeply_nested_card_is_a_per_file_failure(tmp_path, monkeypatch):
     client = {"name": "remote", "url": "https://agent.example/a2a", "authMethods": ["bearer"]}
     _clients(tmp_path / "a2a.json", clients=[client])
     result = A2AScanner().scan(tmp_path)
-    assert result.scan_failures == [
+    expected = (
         "agent.json: A2A declaration cannot be canonicalized for binding"
-    ]
+        if _parser_accepts_nesting(1500)
+        else f"{tmp_path / 'agent.json'}: invalid JSON or duplicate keys"
+    )
+    assert result.scan_failures == [expected]
     assert {component.name for component in result.components} == {"reviewed-agent", "remote"}
 
 
