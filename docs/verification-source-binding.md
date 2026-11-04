@@ -148,14 +148,18 @@ Client configurations (`a2a.json`, `a2a.yaml`, `a2a.yml`, `a2a_config.json`) may
 list entries under `clients`, `remoteAgents` or both. Every entry in either list
 is collected and bound separately. Any other top-level field with a value is
 recorded as unknown coverage, because the collector cannot tell how it changes
-the clients. A client exports only recognized authentication scheme identifiers,
-compared without regard to case, spaces, hyphens or underscores: `bearer`,
-`basic`, `digest`, `apiKey`, `oauth2`, `openIdConnect` (`oidc`), `mutualTLS`
-(`mtls`), and the anonymous forms `none`, `public`, `anonymous`, `noauth`,
-`unauthenticated` and the empty string. Any other value, such as a token, is
-exported as `[unrecognized]` and recorded as unknown coverage; the value itself
-stays inside the keyed input. A missing, anonymous or unrecognized method raises
-an authentication finding.
+the clients. An entry names its agent with `name` or `agentName` and its endpoint
+with `agentCardUrl`, `url` or `endpoint`; a `null` field counts as absent. A
+client may use any of these URLs, so each one is checked: a URL that is not
+`https://` raises a high transport finding, and the origin of the first one is
+exported as `agent_card_url`. A client exports only recognized authentication
+scheme identifiers, compared without regard to case, spaces, hyphens or
+underscores: `bearer`, `basic`, `digest`, `apiKey`, `oauth2`, `openIdConnect`
+(`oidc`), `mutualTLS` (`mtls`), and the anonymous forms `none`, `public`,
+`anonymous`, `noauth`, `unauthenticated` and the empty string. Any other value,
+such as a token, is exported as `[unrecognized]` and recorded as unknown
+coverage; the value itself stays inside the keyed input. A missing, anonymous or
+unrecognized method raises an authentication finding.
 
 The collector interprets legacy `authentication.schemes`, the A2A 0.3
 [`security` alternatives](https://a2a-protocol.org/v0.3.0/specification/#55-agentcard-object-structure)
@@ -195,8 +199,9 @@ raises a medium transport finding. Otherwise only an `https://` URL, or a
 `grpcs://` URL on a gRPC binding, counts as TLS; any other URL raises a high
 transport finding. An explicit `grpc://` URL conventionally means plaintext, and
 an HTTP binding such as `JSONRPC` or `HTTP+JSON` needs an `https://` URL.
-Interface URLs containing whitespace or control characters fail collection,
-because URL parsing would silently drop them and record a different host.
+Interface and client URLs containing whitespace or control characters fail
+collection of their card or client entry, because URL parsing would silently drop
+them and record a different host.
 
 `tests/test_a2a_source_binding.py` exercises the CLI gates, same-origin path and
 authentication changes, both client lists, client authentication export,

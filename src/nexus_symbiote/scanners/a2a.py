@@ -30,6 +30,7 @@ AGENT_CARD_FILES = [
 ]
 A2A_CONFIG_FILES = ["a2a.json", "a2a.yaml", "a2a.yml", "a2a_config.json"]
 A2A_CLIENT_LISTS = ("clients", "remoteAgents")
+A2A_CLIENT_URL_FIELDS = ("agentCardUrl", "url", "endpoint")
 A2A_SOURCE_BINDING_PROFILE = "nexus-symbiote/a2a-static-values/v1"
 A2A_SOURCE_BINDING_FIELDS = (
     "a2a_source_binding",
@@ -241,11 +242,16 @@ def _grpc_authority(address: str) -> str:
     return f"grpc://{host}:{port}"
 
 
-def _interface(url: str, binding: str, field: str) -> dict[str, str]:
-    """Return the exported origin and binding of an interface URL."""
+def _printable_url(url: str) -> str:
     # urlsplit silently drops tabs and line breaks, which would record another host.
     if any(char.isspace() or not char.isprintable() for char in url):
-        raise ValueError("invalid A2A interface URL")
+        raise ValueError("invalid A2A URL")
+    return url
+
+
+def _interface(url: str, binding: str, field: str) -> dict[str, str]:
+    """Return the exported origin and binding of an interface URL."""
+    url = _printable_url(url)
     if binding.strip().upper() == "GRPC" and "://" not in url:
         # The address does not say whether the channel uses TLS. Unlike an explicit
         # grpc:// URL, which declares plaintext, it is exported as undeclared.
@@ -622,14 +628,22 @@ class A2AScanner(Scanner):
     def _parse_a2a_client(
         self, config: dict[str, Any], config_path: Path, binding: dict[str, Any]
     ) -> A2AClientComponent:
-        name = config.get("name", config.get("agentName", "unnamed-client"))
-        card_url = config.get("agentCardUrl", config.get("url", config.get("endpoint")))
-        if not isinstance(name, str) or (card_url is not None and not isinstance(card_url, str)):
+        # A null field counts as absent, so it cannot hide an alternative field.
+        name = next(
+            (config[field] for field in ("name", "agentName") if config.get(field) is not None),
+            "unnamed-client",
+        )
+        declared = [
+            config[field] for field in A2A_CLIENT_URL_FIELDS if config.get(field) is not None
+        ]
+        if not isinstance(name, str) or not all(isinstance(url, str) for url in declared):
             raise ValueError("invalid client identity")
+        # A client configuration may use any of these URLs, so each one is checked.
+        urls = [_printable_url(url) for url in declared if url]
         name = redact_text(name)
         auth_methods = _client_authentication(config)
         risks = []
-        if card_url and not card_url.lower().startswith("https://"):
+        if any(not url.lower().startswith("https://") for url in urls):
             risks.append(
                 RiskAssessment(
                     severity=RiskSeverity.HIGH,
@@ -654,7 +668,7 @@ class A2AScanner(Scanner):
         return A2AClientComponent(
             bom_ref=f"a2a-client:{name}",
             name=name,
-            agent_card_url=sanitized_origin(card_url) if card_url else None,
+            agent_card_url=sanitized_origin(urls[0]) if urls else None,
             authentication_methods=auth_methods,
             source_path=str(config_path),
             trust_tier=TrustTier.UNKNOWN,

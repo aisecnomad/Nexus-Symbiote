@@ -166,6 +166,64 @@ def test_remote_agents_beside_clients_deny_drift_and_project_risk(tmp_path, monk
     assert risk.exit_code == 1, risk.output
 
 
+PLAINTEXT = "http://attacker.example/rpc"
+
+
+@pytest.mark.parametrize(
+    ("declared", "exported"),
+    [
+        ({"agentCardUrl": None, "url": PLAINTEXT}, "http://attacker.example"),
+        ({"url": None, "endpoint": PLAINTEXT}, "http://attacker.example"),
+        ({"agentCardUrl": "", "endpoint": PLAINTEXT}, "http://attacker.example"),
+        (
+            {"agentCardUrl": "https://trusted.example/card", "url": PLAINTEXT},
+            "https://trusted.example",
+        ),
+        ({"url": "https://trusted.example/a2a", "endpoint": PLAINTEXT}, "https://trusted.example"),
+    ],
+)
+def test_every_declared_client_url_is_checked(tmp_path, monkeypatch, declared, exported):
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
+    client = {"name": "remote", "authMethods": ["bearer"], **declared}
+    _clients(tmp_path / "a2a.json", clients=[client])
+    result = A2AScanner().scan(tmp_path)
+    assert not result.scan_failures and not result.surfaces_excluded
+    (component,) = result.components
+    assert component.agent_card_url == exported
+    transport = [risk.severity for risk in component.risks if risk.category == "transport_security"]
+    assert transport == ["high"]
+
+
+@pytest.mark.parametrize(
+    ("declared", "name"),
+    [({"name": None, "agentName": "billing"}, "billing"), ({"name": None}, "unnamed-client")],
+)
+def test_a_null_client_name_counts_as_absent(tmp_path, declared, name):
+    client = {"url": "https://billing.example/a2a", "authMethods": ["bearer"], **declared}
+    _clients(tmp_path / "a2a.json", clients=[client])
+    result = A2AScanner().scan(tmp_path)
+    assert not result.scan_failures
+    assert [component.name for component in result.components] == [name]
+
+
+@pytest.mark.parametrize("field", ["agentCardUrl", "url", "endpoint"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://trusted.exa\nmple.attacker.net/x",
+        "https://trusted.exa\tmple.attacker.net/x",
+        "https://trusted.exa\rmple.attacker.net/x",
+        "https://trusted.example .evil.net/x",
+    ],
+)
+def test_client_urls_with_whitespace_or_control_characters_are_rejected(tmp_path, field, url):
+    client = {"name": "remote", "url": "https://trusted.example/a2a", field: url}
+    _clients(tmp_path / "a2a.json", clients=[{**client, "authMethods": ["bearer"]}])
+    result = A2AScanner().scan(tmp_path)
+    assert result.scan_failures == ["a2a.json: invalid A2A client field types"]
+    assert not result.components
+
+
 def test_empty_client_list_does_not_shadow_remote_agents(tmp_path, monkeypatch):
     monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
     billing = {
