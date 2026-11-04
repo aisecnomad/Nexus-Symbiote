@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import stat
 import tomllib
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
@@ -90,6 +91,53 @@ def _toml_multiline_end(text: str, position: int, quote: str) -> int:
             extra += 1
         return end + 2 + extra
     return -1
+
+
+# At most this many files are read for one documented name, such as CLAUDE.md.
+MAX_CASE_VARIANTS = 8
+# HFS+ ignores these code points when it compares names (see git's core.protectHFS).
+_HFS_IGNORED = dict.fromkeys(
+    [0x200C, 0x200D, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x206A, 0x2070), 0xFEFF]
+)
+
+
+def folded_name(path: str) -> str:
+    """Fold a name so spellings that default macOS and Windows file systems treat as one match."""
+    return path.translate(_HFS_IGNORED).upper().casefold()
+
+
+def case_variants(files: ConfinedCollection, name: str, failures: list[str]) -> list[str]:
+    """Paths that a case-insensitive file system opens as a documented name; exact name first.
+
+    Agents open fixed names by path join, so the default macOS and Windows file systems
+    open .MCP.json as .mcp.json. A case-sensitive file system can hold several such
+    files; all are returned, up to MAX_CASE_VARIANTS, because which one an agent reads
+    there depends on where it runs.
+    """
+    *directories, leaf = name.split("/")
+    parents = [""]
+    for part in directories:
+        parents = [
+            f"{parent}{entry}/"
+            for parent in parents
+            for entry, kind in sorted(files.list_entries(parent or ".").items())
+            # A symlinked directory is listed so that reading it fails closed.
+            if kind in (stat.S_IFDIR, stat.S_IFLNK) and folded_name(entry) == folded_name(part)
+        ]
+    matches = sorted(
+        (
+            f"{parent}{entry}"
+            for parent in parents
+            for entry, kind in files.list_entries(parent or ".").items()
+            if kind != stat.S_IFDIR and folded_name(entry) == folded_name(leaf)
+        ),
+        key=lambda path: (path != name, path),
+    )
+    if len(matches) > MAX_CASE_VARIANTS:
+        failures.append(
+            f"{name}: more than {MAX_CASE_VARIANTS} files open as {name}; the rest not read"
+        )
+    return matches[:MAX_CASE_VARIANTS]
 
 
 def read_regular_text(path: Path, *, max_bytes: int = MAX_CONFIG_BYTES) -> str:

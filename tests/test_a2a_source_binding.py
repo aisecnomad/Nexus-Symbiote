@@ -846,3 +846,41 @@ def test_project_reconciliation_fails_closed_on_unencodable_local_text(tmp_path,
     )
     assert run.exception is None or isinstance(run.exception, SystemExit), repr(run.exception)
     assert run.exit_code == 1
+
+
+def _too_deep_for(marker):
+    from nexus_symbiote.scanners import a2a
+
+    real = a2a.bind_source_values
+
+    def bind(config, *, profile):
+        # Canonicalization recurses; nesting the JSON parser accepts can exhaust the stack.
+        if marker in json.dumps(config):
+            raise RecursionError
+        return real(config, profile=profile)
+
+    return bind
+
+
+def test_a_card_too_deep_to_bind_fails_alone(tmp_path, monkeypatch):
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
+    monkeypatch.setattr("nexus_symbiote.scanners.a2a.bind_source_values", _too_deep_for("deep"))
+    (tmp_path / ".well-known").mkdir()
+    (tmp_path / ".well-known" / "agent.json").write_text(json.dumps(_card()))
+    (tmp_path / "agent.json").write_text(json.dumps({**_card(), "name": "deep"}))
+    result = A2AScanner().scan(tmp_path)
+    assert result.scan_failures == ["agent.json: invalid A2A card field types"]
+    assert [c.name for c in result.components] == ["reviewed-agent"]
+
+
+def test_a_client_too_deep_to_bind_fails_alone(tmp_path, monkeypatch):
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
+    monkeypatch.setattr("nexus_symbiote.scanners.a2a.bind_source_values", _too_deep_for("deep"))
+    clients = [
+        {"name": "remote", "url": "https://agent.example"},
+        {"name": "deep", "url": "https://agent.example"},
+    ]
+    (tmp_path / "a2a.json").write_text(json.dumps({"clients": clients}))
+    result = A2AScanner().scan(tmp_path)
+    assert result.scan_failures == ["a2a.json: invalid A2A client field types"]
+    assert [c.name for c in result.components] == ["remote"]

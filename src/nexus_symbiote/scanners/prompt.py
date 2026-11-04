@@ -8,7 +8,7 @@ from pathlib import Path
 from nexus_symbiote.core.enums import RiskSeverity, TrustTier
 from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.models import PromptComponent, RiskAssessment, SkillPackageComponent
-from nexus_symbiote.scanners.base import Scanner, ScanResult
+from nexus_symbiote.scanners.base import Scanner, ScanResult, case_variants
 
 INVISIBLE_CHARS: dict[str, str] = {
     "​": "ZERO WIDTH SPACE",
@@ -117,6 +117,9 @@ INSTRUCTION_FILES: dict[str, str] = {
 }
 
 SKILL_DIRECTORIES = [".claude/skills", ".claude/commands", "skills"]
+# Claude Code opens these by name, which a case-insensitive file system resolves to a
+# name such as claude.md.
+OPENED_BY_NAME = {"CLAUDE.md", ".claude/CLAUDE.md"}
 
 
 class PromptScanner(Scanner):
@@ -126,7 +129,16 @@ class PromptScanner(Scanner):
         result = ScanResult(scanner_name=self.name)
 
         with self._collection(project_root, result) as files:
-            for rel_path, prompt_type in INSTRUCTION_FILES.items():
+            instructions = [
+                (relative, prompt_type)
+                for name, prompt_type in INSTRUCTION_FILES.items()
+                for relative in (
+                    case_variants(files, name, result.scan_failures)
+                    if name in OPENED_BY_NAME
+                    else [name]
+                )
+            ]
+            for rel_path, prompt_type in instructions:
                 content = files.read_bytes(rel_path, missing_ok=True)
                 if content is None:
                     continue

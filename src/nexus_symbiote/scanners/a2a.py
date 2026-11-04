@@ -407,6 +407,7 @@ class A2AScanner(Scanner):
                 if data is None:
                     continue
                 result.surfaces_scanned.append(str(path))
+                # The keyed binding recurses, so nesting too deep for it fails only this card.
                 try:
                     binding = self._source_binding(data, "agent-card", result)
                     component = self._parse_agent_card(data, relative, path, binding)

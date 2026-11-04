@@ -13,9 +13,17 @@ Discovers configurations for IDE-integrated AI coding agents:
 
 from __future__ import annotations
 
+import io
+import ipaddress
+import json
+import os
 import re
+import shlex
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
+
+from rfc8785 import CanonicalizationError
 
 from nexus_symbiote.core.enums import RiskSeverity, TrustTier
 from nexus_symbiote.core.hashing import (
@@ -23,9 +31,10 @@ from nexus_symbiote.core.hashing import (
     SourceBindingKeyError,
     SourceBindingValueError,
     bind_source_values,
+    canonical_json,
 )
 from nexus_symbiote.core.models import IDEAgentComponent, RiskAssessment, VerifiedExtensionComponent
-from nexus_symbiote.scanners.base import Scanner, ScanResult
+from nexus_symbiote.scanners.base import Scanner, ScanResult, folded_name
 from nexus_symbiote.scanners.mcp import (
     CODEX_CONFIG,
     codex_applies,
@@ -34,7 +43,7 @@ from nexus_symbiote.scanners.mcp import (
     is_codex_config,
     merge_codex,
 )
-from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES, ConfinedCollection
 from nexus_symbiote.utils.secrets import redact_text
 
 CODEX_BUILT_IN_PROFILES = {
@@ -531,6 +540,426 @@ IDE_AGENT_CONFIGS: dict[str, dict[str, Any]] = {
     },
 }
 
+# Hook types that act without the model. Claude Code reads an HTTP response or MCP tool
+# result like command output, so either can also allow, block or rewrite a tool call.
+CLAUDE_HOOK_RISKS: dict[str, tuple[RiskSeverity, str, str]] = {
+    "command": (RiskSeverity.HIGH, "agent-hook-command", "runs hook command '{command_basename}'"),
+    "http": (RiskSeverity.HIGH, "agent-hook-http", "sends hook event data to '{url_origin}'"),
+    "mcp_tool": (
+        RiskSeverity.MEDIUM,
+        "agent-hook-mcp-tool",
+        "sends hook event data to tool '{mcp_tool}' of MCP server '{mcp_server}'",
+    ),
+}
+CLAUDE_HOOK_BINDING_PROFILE = "nexus-symbiote/claude-code-hooks/v2"
+# Settings that turn hooks off, or bound the URLs HTTP hooks reach and the environment
+# variables their headers may carry. A project false overrides a user true.
+CLAUDE_HOOK_SETTINGS = ("disableAllHooks", "allowedHttpHookUrls", "httpHookAllowedEnvVars")
+# Settings whose shell command line Claude Code runs, like a hook, without asking: helpers
+# are strings, and the others are objects with a command.
+CLAUDE_SETTINGS_HELPERS = (
+    "apiKeyHelper",
+    "awsAuthRefresh",
+    "awsCredentialExport",
+    "gcpAuthRefresh",
+    "otelHeadersHelper",
+)
+CLAUDE_SETTINGS_COMMAND_OBJECTS = ("statusLine", "fileSuggestion", "subagentStatusLine")
+CLAUDE_SETTINGS_FILES = (".claude/settings.json", ".claude/settings.local.json")
+UNPARSED_NAME = "[unparsed]"
+_HOOK_EVENT = re.compile(r"[A-Za-z][A-Za-z0-9]{0,63}")
+_SAFE_NAME = re.compile(r"[\w.+-][\w.+:-]{0,127}", re.ASCII)
+_ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+# An RFC 9110 token.
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}")
+# Documented values of handler fields that decide how a hook runs.
+_HANDLER_CHOICES = {"shell": ("bash", "powershell"), "onFailure": ("continue", "block")}
+# shlex grows each token one character at a time, which is quadratic in its length.
+# The executable comes first, so only a bounded prefix is lexed.
+_COMMAND_LEX_LIMIT = 4096
+# Every hook record repeats its matcher, and every settings file read is merged with the
+# earlier ones, so these bound the inventory and the work that a repository can demand.
+_MATCHER_LIMIT = 512
+_MAX_HOOK_DECLARATIONS = 1000
+# Header and environment variable names are up to 128 characters, so without these bounds
+# two 4 MiB settings files produced a BOM larger than any command would load.
+_MAX_NAMES = 64
+_MAX_HOOK_NAMES = 2048
+_MAX_CLAUDE_SETTINGS_FILES = 8
+# Printable ASCII without spaces or backslashes after an http(s) scheme and two slashes.
+_PLAIN_HTTP_URL = re.compile(r"(?i:https?)://[!-\[\]-~]+")
+_URL_HOST = re.compile(r"[a-z0-9_.-]+")
+
+
+_CLAUDE_SETTINGS_LAYERS = {
+    folded_name(name): index for index, name in enumerate(CLAUDE_SETTINGS_FILES)
+}
+
+
+def _claude_settings_paths(available: set[str]) -> list[str]:
+    """Files Claude Code may open as project, then local, settings; exact names first.
+
+    Claude Code joins fixed names, so a case-insensitive file system also opens
+    .Claude/Settings.json for .claude/settings.json.
+    """
+    matches = []
+    for path in available:
+        layer = _CLAUDE_SETTINGS_LAYERS.get(folded_name(path)) if path.count("/") == 1 else None
+        if layer is not None:
+            matches.append((layer, path != CLAUDE_SETTINGS_FILES[layer], path))
+    return [path for *_, path in sorted(matches)]
+
+
+def _claude_marker_variant(marker: str, available: set[str]) -> tuple[str, str] | None:
+    """A marker's name as a case-insensitive file system opens it, and a file proving it.
+
+    For the marker .claude/commands this may be .Claude/Commands and a file beneath it.
+    """
+    depth, target = marker.count("/") + 1, folded_name(marker)
+    for path in sorted(available):
+        name = "/".join(path.split("/")[:depth])
+        if folded_name(name) == target:
+            return name, path
+    return None
+
+
+def _safe_name(value: str) -> str:
+    return redact_text(value) if _SAFE_NAME.fullmatch(value) else UNPARSED_NAME
+
+
+def _exportable_matcher(matcher: str) -> bool:
+    """Whether a matcher can be exported as written.
+
+    Lone surrogates break UTF-8 exports, and control or format characters can disguise a
+    matcher. Tool names and the patterns that match them are printable ASCII.
+    """
+    return len(matcher) <= _MATCHER_LIMIT and matcher.isascii() and matcher.isprintable()
+
+
+def _http_origin(url: str) -> str | None:
+    """A plain http(s) URL's origin, or None where URL parsers may disagree on the host.
+
+    Claude Code posts HTTP hooks from Node, whose WHATWG parser reads a backslash as a path
+    separator and accepts "https:host" without slashes; urlsplit does neither. So
+    https://attacker.example\\@hooks.example posts to attacker.example, not hooks.example.
+    """
+    if not _PLAIN_HTTP_URL.fullmatch(url):
+        return None
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+        host = parsed.hostname or ""
+        # Python before 3.11.4 accepts any bracketed host, such as [hooks.example].
+        if "[" in parsed.netloc:
+            host = f"[{ipaddress.IPv6Address(host)}]"
+        elif not _URL_HOST.fullmatch(host):
+            return None
+    except ValueError:
+        return None
+    return f"{parsed.scheme}://{host}" + ("" if port is None else f":{port}")
+
+
+def _order_free(hooks: Any) -> Any:
+    """Matching hooks run in parallel, so bind matcher groups and handlers in canonical order."""
+    if not isinstance(hooks, dict):
+        return hooks
+    ordered: dict[str, Any] = {}
+    for event, groups in hooks.items():
+        if isinstance(groups, list):
+            groups = sorted(
+                (
+                    {**group, "hooks": sorted(group["hooks"], key=canonical_json)}
+                    if isinstance(group, dict) and isinstance(group.get("hooks"), list)
+                    else group
+                    for group in groups
+                ),
+                key=canonical_json,
+            )
+        ordered[event] = groups
+    return ordered
+
+
+def _within_budget(budget: list[int], relative: str, result: ScanResult) -> bool:
+    """Count one hook declaration; past the limit, record one failure and stop."""
+    budget[0] -= 1
+    if budget[0] == -1:
+        result.scan_failures.append(
+            f"{relative}: more than {_MAX_HOOK_DECLARATIONS} hook declarations; "
+            "the rest not inventoried"
+        )
+    return budget[0] >= 0
+
+
+def _command_basename(command: str, *, exec_form: bool) -> str:
+    """The executable's file name. Assignments, directories and arguments are never kept.
+
+    A backslash in a leading assignment, where a POSIX shell could escape the space that
+    ends the value, gives UNPARSED_NAME.
+    """
+    token = command
+    if not exec_form:
+        head = io.StringIO(command[:_COMMAND_LEX_LIMIT])
+        lexer = shlex.shlex(head, posix=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        # A backslash is literal in PowerShell and Windows paths. As a POSIX escape it would
+        # join directory names into the executable name, such as C:Usersalicehook.exe.
+        lexer.escape = ""
+        token = ""
+        try:
+            for word in lexer:
+                # "&" is the PowerShell call operator; assignments only set the environment.
+                if word != "&" and not _ENV_ASSIGNMENT.match(word):
+                    token = word
+                    break
+                # Up to the first backslash, this lexer splits words as a POSIX shell does.
+                # In API_KEY=sk\ live ./hook.sh the shell escapes the space, so the word
+                # after the assignment is part of its value, not the executable.
+                if "\\" in word:
+                    return UNPARSED_NAME
+        except ValueError:
+            # Splitting unbalanced quotes on whitespace could export part of a quoted secret.
+            return UNPARSED_NAME
+        if len(command) > _COMMAND_LEX_LIMIT and head.tell() >= _COMMAND_LEX_LIMIT:
+            return UNPARSED_NAME
+    return _safe_name(token.replace("\\", "/").rsplit("/", 1)[-1])
+
+
+def _hook_target(handler: Any) -> dict[str, str] | None:
+    """A documented hook handler's type and secret-free target, or None if unrecognized."""
+    if not isinstance(handler, dict):
+        return None
+    kind = handler.get("type")
+    if not isinstance(kind, str):
+        return None
+    if kind == "command":
+        command, args = handler.get("command"), handler.get("args")
+        if not isinstance(command, str) or not command.strip():
+            return None
+        if args is not None and not (
+            isinstance(args, list) and all(isinstance(arg, str) for arg in args)
+        ):
+            return None
+        basename = _command_basename(command, exec_form=args is not None)
+        return {"type": kind, "command_basename": basename}
+    if kind == "http":
+        url = handler.get("url")
+        if not isinstance(url, str):
+            return None
+        return {"type": kind, "url_origin": _http_origin(url) or UNPARSED_NAME}
+    if kind == "mcp_tool":
+        server, tool = handler.get("server"), handler.get("tool")
+        if not isinstance(server, str) or not isinstance(tool, str):
+            return None
+        return {"type": kind, "mcp_server": _safe_name(server), "mcp_tool": _safe_name(tool)}
+    if kind in {"prompt", "agent"} and isinstance(handler.get("prompt"), str):
+        return {"type": kind}
+    return None
+
+
+def _names(
+    value: Any,
+    pattern: re.Pattern[str],
+    subject: str,
+    result: ScanResult,
+    budget: list[int] | None = None,
+) -> list[str] | str:
+    """Sorted unique names from a list of names matching pattern, within the bounds.
+
+    Anything else is recorded as UNPARSED_NAME with a failure naming the subject. A budget
+    is shared by every name list it is passed to and spent by those recorded.
+    """
+    if not (
+        isinstance(value, list)
+        and all(isinstance(item, str) and pattern.fullmatch(item) for item in value)
+    ):
+        reason = "is not a documented value"
+    elif len(names := sorted(set(value))) > _MAX_NAMES:
+        reason = f"lists more than {_MAX_NAMES} names"
+    elif budget is not None and len(names) > budget[0]:
+        reason = f"would pass {_MAX_HOOK_NAMES} names across hook handlers"
+    else:
+        if budget is not None:
+            budget[0] -= len(names)
+        return names
+    result.scan_failures.append(f"{subject} {reason}; recorded as {UNPARSED_NAME}")
+    return UNPARSED_NAME
+
+
+def _handler_options(
+    handler: dict[str, Any], relative: str, event: str, result: ScanResult, names: list[int]
+) -> dict[str, Any]:
+    """Declared fields that decide when, how and with what access a hook runs.
+
+    Only names and documented values are kept; header values can hold credentials.
+    """
+    options: dict[str, Any] = {}
+
+    def unparsed(field: str) -> str:
+        result.scan_failures.append(
+            f"{relative}: hooks.{event} handler {field} is not a documented value; "
+            f"recorded as {UNPARSED_NAME}"
+        )
+        return UNPARSED_NAME
+
+    if "if" in handler:
+        condition = handler["if"]
+        options["if"] = (
+            redact_text(condition)
+            if isinstance(condition, str) and _exportable_matcher(condition)
+            else unparsed("if")
+        )
+    for field, allowed in _HANDLER_CHOICES.items():
+        if field in handler:
+            options[field] = handler[field] if handler[field] in allowed else unparsed(field)
+    for field in ("async", "asyncRewake"):
+        if field in handler:
+            options[field] = handler[field] if isinstance(handler[field], bool) else unparsed(field)
+    if "timeout" in handler:
+        timeout = handler["timeout"]
+        valid = isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+        # Also excludes NaN and infinities, which have no JSON form.
+        options["timeout"] = timeout if valid and 0 < timeout <= 2**53 else unparsed("timeout")
+    if handler["type"] == "command" and handler.get("args") is not None:
+        # With args, the command runs without a shell.
+        options["exec_form"] = True
+    if handler["type"] == "http":
+        subject = f"{relative}: hooks.{event} handler"
+        if "allowedEnvVars" in handler:
+            options["allowedEnvVars"] = _names(
+                handler["allowedEnvVars"], _ENV_NAME, f"{subject} allowedEnvVars", result, names
+            )
+        if "headers" in handler:
+            headers = handler["headers"]
+            options["header_names"] = _names(
+                list(headers) if isinstance(headers, dict) else None,
+                _HEADER_NAME,
+                f"{subject} header names",
+                result,
+                names,
+            )
+    return options
+
+
+def _hook_settings_record(
+    relative: str, declared: dict[str, Any], result: ScanResult
+) -> dict[str, Any]:
+    """A settings file's hook switch and allowlists; URL patterns are only counted."""
+    record: dict[str, Any] = {"settings_file": relative}
+
+    def unparsed(field: str) -> str:
+        result.scan_failures.append(
+            f"{relative}: {field} is not a documented value; recorded as {UNPARSED_NAME}"
+        )
+        return UNPARSED_NAME
+
+    if "disableAllHooks" in declared:
+        disabled = declared["disableAllHooks"]
+        record["disableAllHooks"] = (
+            disabled if isinstance(disabled, bool) else unparsed("disableAllHooks")
+        )
+    if "allowedHttpHookUrls" in declared:
+        patterns = declared["allowedHttpHookUrls"]
+        record["allowedHttpHookUrls_count"] = (
+            len(patterns)
+            if isinstance(patterns, list) and all(isinstance(item, str) for item in patterns)
+            else unparsed("allowedHttpHookUrls")
+        )
+    if "httpHookAllowedEnvVars" in declared:
+        record["httpHookAllowedEnvVars"] = _names(
+            declared["httpHookAllowedEnvVars"],
+            _ENV_NAME,
+            f"{relative}: httpHookAllowedEnvVars",
+            result,
+        )
+    return record
+
+
+def _setting_command_records(
+    relative: str, declared: dict[str, Any], result: ScanResult
+) -> list[dict[str, Any]]:
+    """The executable name of each settings command a file declares."""
+    records = []
+    for setting in (*CLAUDE_SETTINGS_HELPERS, *CLAUDE_SETTINGS_COMMAND_OBJECTS):
+        if setting not in declared:
+            continue
+        value = declared[setting]
+        if setting in CLAUDE_SETTINGS_COMMAND_OBJECTS:
+            value = value.get("command") if isinstance(value, dict) else None
+        if isinstance(value, str) and value.strip():
+            basename = _command_basename(value, exec_form=False)
+        else:
+            result.scan_failures.append(
+                f"{relative}: {setting} is not a documented command; recorded as {UNPARSED_NAME}"
+            )
+            basename = UNPARSED_NAME
+        records.append(
+            {"settings_file": relative, "setting": setting, "command_basename": basename}
+        )
+    return records
+
+
+def _claude_hook_records(
+    relative: str, hooks: Any, result: ScanResult, budget: list[int], names: list[int]
+) -> list[dict[str, Any]]:
+    """Every handler under event -> matcher groups -> hooks; other shapes are failures."""
+    if not isinstance(hooks, dict):
+        result.scan_failures.append(f"{relative}: hooks is not an object; not inventoried")
+        return []
+    records: list[dict[str, Any]] = []
+    for event, groups in hooks.items():
+        if not _within_budget(budget, relative, result):
+            return records
+        if not _HOOK_EVENT.fullmatch(event):
+            result.scan_failures.append(f"{relative}: unrecognized hook event; not inventoried")
+            continue
+        if not isinstance(groups, list):
+            result.scan_failures.append(f"{relative}: hooks.{event} is not a list; not inventoried")
+            continue
+        for group in groups:
+            if not _within_budget(budget, relative, result):
+                return records
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            matcher = group.get("matcher") if isinstance(group, dict) else None
+            if not isinstance(handlers, list) or not (matcher is None or isinstance(matcher, str)):
+                result.scan_failures.append(
+                    f"{relative}: unrecognized hooks.{event} matcher group; not inventoried"
+                )
+                continue
+            if matcher is not None and not _exportable_matcher(matcher):
+                result.scan_failures.append(
+                    f"{relative}: hooks.{event} matcher is not printable ASCII of at most "
+                    f"{_MATCHER_LIMIT} characters; recorded as {UNPARSED_NAME}"
+                )
+                matcher = UNPARSED_NAME
+            for handler in handlers:
+                if not _within_budget(budget, relative, result):
+                    return records
+                target = _hook_target(handler)
+                if target is None:
+                    result.scan_failures.append(
+                        f"{relative}: unrecognized hooks.{event} handler; not inventoried"
+                    )
+                    continue
+                if target.get("url_origin") == UNPARSED_NAME:
+                    # The destination is what an HTTP hook finding reports, so unlike an
+                    # unparsed command name, an unparsed URL leaves coverage unknown.
+                    result.scan_failures.append(
+                        f"{relative}: hooks.{event} HTTP hook URL is not a plain http(s) URL "
+                        f"with an ASCII host; recorded as {UNPARSED_NAME}"
+                    )
+                records.append(
+                    {
+                        "settings_file": relative,
+                        "event": event,
+                        "matcher": None if matcher is None else redact_text(matcher),
+                        **target,
+                        **_handler_options(handler, relative, event, result, names),
+                    }
+                )
+    return records
+
 
 class IDEAgentScanner(Scanner):
     name = "ide_agents"
@@ -559,9 +988,18 @@ class IDEAgentScanner(Scanner):
                             None,
                         )
                     )
+                    name = marker
+                    if (
+                        evidence is None
+                        and ide_type == "claude-code"
+                        and marker not in CLAUDE_SETTINGS_FILES
+                    ):
+                        name, evidence = _claude_marker_variant(marker, available) or (marker, None)
                     if evidence and files.read_bytes(evidence) is not None:
-                        found.append(marker)
+                        found.append(name)
                         result.surfaces_scanned.append(str(files.root / evidence))
+                if ide_type == "claude-code":
+                    self._claude_settings_variants(files, available, found, result)
                 if not found:
                     continue
                 settings = self._read_ide_settings(files.root, ide_type, result, available) or {}
@@ -591,8 +1029,16 @@ class IDEAgentScanner(Scanner):
                             ),
                         )
                     )
+                hook_properties = (
+                    self._claude_code_hooks(
+                        settings.get("hooks"), settings.get("hook_settings"), result, risks
+                    )
+                    if ide_type == "claude-code"
+                    else {}
+                )
                 layered = (
-                    ide_type == "claude-code" and {"CLAUDE.md", ".claude/CLAUDE.md"}.issubset(found)
+                    ide_type == "claude-code"
+                    and {"claude.md", ".claude/claude.md"} <= {folded_name(f) for f in found}
                 ) or (ide_type == "cursor" and {".cursorrules", ".cursor/rules"}.issubset(found))
                 if layered:
                     risks.append(
@@ -638,6 +1084,7 @@ class IDEAgentScanner(Scanner):
                                     "by the host or version."
                                 ),
                             ],
+                            **hook_properties,
                         },
                     )
                 )
@@ -650,7 +1097,6 @@ class IDEAgentScanner(Scanner):
         self, root: Path, ide_type: str, result: ScanResult, available: set[str]
     ) -> dict[str, Any] | None:
         settings_paths = {
-            "claude-code": [".claude/settings.json", ".claude/settings.local.json"],
             "cursor": [".cursor/settings.json"],
             "windsurf": [".windsurf/settings.json"],
             "cline": [".cline/settings.json"],
@@ -660,10 +1106,36 @@ class IDEAgentScanner(Scanner):
         # Keep declared allowances from every collected Claude settings layer.
         # This summary does not resolve effective permissions across trust,
         # user/managed policy, ask/deny rules, flags or product versions.
-        for relative in settings_paths.get(ide_type, []):
+        relatives = (
+            _claude_settings_paths(available)[:_MAX_CLAUDE_SETTINGS_FILES]
+            if ide_type == "claude-code"
+            else settings_paths.get(ide_type, [])
+        )
+        for relative in relatives:
             if relative in available:
                 data = self._read_mapping(root / relative, result)
                 if data is not None:
+                    if ide_type == "claude-code" and "hooks" in data:
+                        # Claude Code runs the hooks of every settings layer; none overrides.
+                        merged["hooks"] = {**merged.get("hooks", {}), relative: data.pop("hooks")}
+                    declared = (
+                        {
+                            key: data.pop(key)
+                            for key in (
+                                *CLAUDE_HOOK_SETTINGS,
+                                *CLAUDE_SETTINGS_HELPERS,
+                                *CLAUDE_SETTINGS_COMMAND_OBJECTS,
+                            )
+                            if key in data
+                        }
+                        if ide_type == "claude-code"
+                        else {}
+                    )
+                    if declared:
+                        merged["hook_settings"] = {
+                            **merged.get("hook_settings", {}),
+                            relative: declared,
+                        }
                     if ide_type == "claude-code" and "permissions" in data:
                         permissions = data["permissions"]
                         if not isinstance(permissions, dict):
@@ -875,6 +1347,139 @@ class IDEAgentScanner(Scanner):
             value in allowed
             for value in ("Bash", "Edit", "Write", "Bash(*)", "Edit(*)", "Write(*)", "*")
         )
+
+    @staticmethod
+    def _claude_settings_variants(
+        files: ConfinedCollection, available: set[str], found: list[str], result: ScanResult
+    ) -> None:
+        """Add Claude settings files whose names differ from the markers only in case."""
+        paths = _claude_settings_paths(available)
+        if len(paths) > _MAX_CLAUDE_SETTINGS_FILES:
+            result.scan_failures.append(
+                f"claude-code: more than {_MAX_CLAUDE_SETTINGS_FILES} files open as Claude Code "
+                "settings; the rest not read"
+            )
+        for evidence in paths[:_MAX_CLAUDE_SETTINGS_FILES]:
+            if evidence in CLAUDE_SETTINGS_FILES or evidence in found:
+                continue
+            if files.read_bytes(evidence) is not None:
+                found.append(evidence)
+                result.surfaces_scanned.append(str(files.root / evidence))
+
+    @staticmethod
+    def _claude_code_hooks(
+        sources: Any, hook_settings: Any, result: ScanResult, risks: list[RiskAssessment]
+    ) -> dict[str, Any]:
+        """Record each settings file's hooks and settings commands, and flag those that run.
+
+        hook_settings holds each file's hook switches, allowlists and settings commands.
+        """
+        sources, hook_settings = sources or {}, hook_settings or {}
+        if not sources and not hook_settings:
+            return {}
+        budget, names = [_MAX_HOOK_DECLARATIONS], [_MAX_HOOK_NAMES]
+        failures = len(result.scan_failures)
+        records = sorted(
+            (
+                record
+                for relative, hooks in sources.items()
+                for record in _claude_hook_records(relative, hooks, result, budget, names)
+            ),
+            key=lambda record: json.dumps(list(record.values())),
+        )
+        if not records and not hook_settings and len(result.scan_failures) == failures:
+            # Nothing runs, so keep the inventory that predates hook collection.
+            return {}
+        commands = sorted(
+            (
+                record
+                for relative, declared in hook_settings.items()
+                for record in _setting_command_records(relative, declared, result)
+            ),
+            key=lambda record: json.dumps(list(record.values())),
+        )
+        for command in commands:
+            risks.append(
+                RiskAssessment(
+                    severity=RiskSeverity.HIGH,
+                    category="agent-settings-command",
+                    detail=(
+                        f"IDE agent 'claude-code' runs settings command "
+                        f"'{command['command_basename']}' from {command['setting']} "
+                        "without per-call approval."
+                    ),
+                    recommendation=(
+                        "Review the command. Claude Code runs settings helper commands "
+                        "automatically, and -p and SDK sessions never ask for workspace trust."
+                    ),
+                )
+            )
+        for record in records:
+            if record["type"] not in CLAUDE_HOOK_RISKS:
+                continue
+            severity, category, action = CLAUDE_HOOK_RISKS[record["type"]]
+            risks.append(
+                RiskAssessment(
+                    severity=severity,
+                    category=category,
+                    detail=(
+                        f"IDE agent 'claude-code' {action.format(**record)} on "
+                        f"{record['event']} without per-call approval."
+                    ),
+                    recommendation=(
+                        "Review the hook and its target. Claude Code runs project hooks "
+                        "automatically, and -p and SDK sessions never ask for workspace trust."
+                    ),
+                )
+            )
+        # Arguments, header values and inputs can hold credentials, so only an operator-keyed
+        # binding may cover them; an unkeyed digest would let secrets be guessed offline.
+        # Ordering canonicalizes values, which can fail, so order only what a key will bind.
+        order = _order_free if os.environ.get(SOURCE_BINDING_KEY_ENV) else (lambda hooks: hooks)
+        try:
+            binding = bind_source_values(
+                {
+                    relative: {
+                        **({"hooks": order(sources[relative])} if relative in sources else {}),
+                        **hook_settings.get(relative, {}),
+                    }
+                    for relative in {**sources, **hook_settings}
+                },
+                profile=CLAUDE_HOOK_BINDING_PROFILE,
+            )
+        except SourceBindingKeyError:
+            result.scan_failures.append(
+                f"{SOURCE_BINDING_KEY_ENV} is not valid random key material; "
+                "Claude Code hooks were not bound"
+            )
+            binding = None
+        except (CanonicalizationError, SourceBindingValueError, UnicodeEncodeError, RecursionError):
+            # Lone surrogates, numbers outside I-JSON and deep nesting have no RFC 8785 form;
+            # rfc8785 sorts keys by UTF-16, which raises UnicodeEncodeError on a surrogate key.
+            result.scan_failures.append(
+                "claude-code: hook values have no canonical JSON form; not bound"
+            )
+            binding = None
+        return {
+            # Reconciliation accepts properties a fresh scan lacks, so all are always
+            # present: removing disableAllHooks must change a value, not drop a key.
+            "declared_hooks": records,
+            "declared_hook_settings": [
+                _hook_settings_record(relative, declared, result)
+                for relative, declared in hook_settings.items()
+                if not declared.keys().isdisjoint(CLAUDE_HOOK_SETTINGS)
+            ],
+            "declared_setting_commands": commands,
+            **(
+                {
+                    "hook_value_binding": binding[0],
+                    "hook_value_binding_key_id": binding[1],
+                    "hook_value_binding_profile": CLAUDE_HOOK_BINDING_PROFILE,
+                }
+                if binding
+                else {}
+            ),
+        }
 
     def _scan_extensions(self, root: Path, result: ScanResult, available: set[str]) -> None:
         relative = ".vscode/extensions.json"

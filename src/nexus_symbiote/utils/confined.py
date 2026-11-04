@@ -428,6 +428,43 @@ class ConfinedCollection:
         finally:
             os.close(fd)
 
+    def list_entries(self, directory: str | Path = ".") -> dict[str, int]:
+        """One directory's entry names and file types (stat.S_IFMT), never following symlinks.
+
+        A missing directory has no entries; one that is a symlink, unreadable or over
+        the entry limit is a failure. This does not spend the walk's entry budget.
+        """
+        try:
+            relative = self._relative(directory)
+        except CollectionError:
+            self._fail(directory, "directory is outside collection root")
+            return {}
+        if self.excluded(relative) or self._root_fd is None:
+            return {}
+        entries: dict[str, int] = {}
+        fd = os.dup(self._root_fd)
+        try:
+            for part in relative.parts:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+            with os.scandir(fd) as stream:
+                for entry in stream:
+                    if len(entries) >= self.max_entries:
+                        self._fail(relative, "directory entry limit exceeded")
+                        return {}
+                    if not self.excluded(relative / entry.name):
+                        mode = entry.stat(follow_symlinks=False).st_mode
+                        entries[entry.name] = stat.S_IFMT(mode)
+        except FileNotFoundError:
+            return {}
+        except OSError:
+            self._fail(relative, "directory unavailable or contains a symlink")
+            return {}
+        finally:
+            os.close(fd)
+        return entries
+
     def _walk(
         self, directory_fd: int, relative: Path, depth: int, budget: list[int]
     ) -> Iterator[Path]:

@@ -52,7 +52,7 @@ from nexus_symbiote.core.models import (
     ToolComponent,
 )
 from nexus_symbiote.core.textsafety import HiddenKind, hidden_character_kinds
-from nexus_symbiote.scanners.base import Scanner, ScanResult, sanitized_origin
+from nexus_symbiote.scanners.base import Scanner, ScanResult, case_variants, sanitized_origin
 from nexus_symbiote.utils.secrets import REDACTED, redact_descriptor, redact_text
 
 CODEX_CONFIG = ".codex/config.toml"
@@ -246,6 +246,9 @@ MCP_CONFIG_FILES = [
     ".claude/mcp.json",
     CODEX_CONFIG,
 ]
+# Claude Code opens .mcp.json by name, which a case-insensitive file system resolves
+# to a name such as .MCP.json.
+_OPENED_BY_NAME = {".mcp.json"}
 
 _NPM_NAME = r"(?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*"
 _OCI_REPOSITORY = (
@@ -391,20 +394,29 @@ class MCPScanner(Scanner):
             codex_tables: list[tuple[str, PurePosixPath, dict[str, Any]]] = []
             codex_work = 0
             json_work = 0
-            for config_name in [*MCP_CONFIG_FILES, *nested]:
-                config_path = files.root / config_name
+            configs = [
+                (config_name, relative)
+                for config_name in [*MCP_CONFIG_FILES, *nested]
+                for relative in (
+                    case_variants(files, config_name, result.scan_failures)
+                    if config_name in _OPENED_BY_NAME
+                    else [config_name]
+                )
+            ]
+            for config_name, relative in configs:
+                config_path = files.root / relative
                 codex = is_codex_config(config_name)
                 data = (
                     self._read_mapping(config_path, result)
                     if codex
-                    else files.read_json(config_name, missing_ok=True)
+                    else files.read_json(relative, missing_ok=True)
                 )
                 if data is None:
                     continue
                 found_any = True
                 result.surfaces_scanned.append(str(config_path))
                 if not isinstance(data, dict):
-                    result.scan_failures.append(f"{config_name}: expected a configuration object")
+                    result.scan_failures.append(f"{relative}: expected a configuration object")
                     continue
                 if codex and "mcp_servers" not in data:
                     continue
@@ -414,7 +426,7 @@ class MCPScanner(Scanner):
                     else data.get("mcpServers", data.get("servers", {}))
                 )
                 if not isinstance(servers, dict) or len(servers) > 1000:
-                    result.scan_failures.append(f"{config_name}: invalid or oversized server map")
+                    result.scan_failures.append(f"{relative}: invalid or oversized server map")
                     continue
                 inherited: list[tuple[str, dict[str, Any]]] = []
                 if codex:
@@ -439,7 +451,7 @@ class MCPScanner(Scanner):
                     if not isinstance(server_config, dict) or not self._valid_server(
                         server_config, codex=codex
                     ):
-                        result.scan_failures.append(f"{config_name}: invalid server configuration")
+                        result.scan_failures.append(f"{relative}: invalid server configuration")
                         continue
                     if codex:
                         codex_work += _codex_redaction_work(server_name, server_config)
