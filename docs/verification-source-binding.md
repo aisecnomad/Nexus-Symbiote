@@ -12,9 +12,9 @@ arguments, environment variables, fields and tools, and changed endpoint origins
 
 Values are bound only when the operator sets `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` to
 [random key material](#the-operator-binding-key) during collection and validation.
-Records then also carry `static_value_binding`, an HMAC-SHA256 under that key over
-the original server object (profile `nexus-symbiote/mcp-static-values/v1`), and a
-key identifier. This detects a different package with the same version, changed
+Records then also carry `static_value_binding`, an HMAC-SHA256 under a key
+[derived from that key](#the-operator-binding-key) over the original server object
+(profile `nexus-symbiote/mcp-static-values/v1`), and a key identifier. This detects a different package with the same version, changed
 arguments, environment values, endpoint paths and opaque launchers. The key never
 enters the BOM; without it, the binding cannot be used to test guesses for a
 secret. Keep the key in the CI secret store, use the same key for a baseline and
@@ -38,23 +38,36 @@ not substitute for the static configuration evidence.
 ## The operator binding key
 
 MCP and A2A collection read the same key from `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`.
-It must be random key material: at least 64 hexadecimal characters, or base64url
-(`A`-`Z`, `a`-`z`, `0`-`9`, `-` and `_`, optionally padded with `=`) that decodes
-to at least 32 bytes. Generate it; never use a passphrase:
+It must be random key material written as hexadecimal, two digits per byte: at
+least 64 digits for 32 or more bytes. Generate it; never compose one or use a
+passphrase:
 
 ```sh
 python -c 'import secrets; print(secrets.token_hex(32))'
 ```
 
-`openssl rand -hex 32` works as well. Every BOM carries the key identifier, and a
-binding over a public agent card is computed from known input, so either one lets
-anyone holding the BOM test guesses for the key offline. A recovered key would
-then confirm guesses for secrets inside the bound declarations and forge
-bindings. Collection therefore rejects shorter keys, other encodings (including
-standard base64 with `+` or `/`), surrounding whitespace or line breaks, base64url
-keys without both upper- and lower-case letters, and keys whose decoded bytes
-repeat few values. The check cannot tell a random-looking passphrase from random
-bytes, so generate the key rather than composing one.
+`openssl rand -hex 32` works as well. Letter case does not matter: the key is the
+bytes that the hexadecimal digits encode.
+
+Every BOM carries the key identifier, and a binding over a public agent card is
+computed from known input, so either one lets anyone holding the BOM test guesses
+for the key offline. A recovered key would then confirm guesses for secrets inside
+the bound declarations and forge bindings. Two measures make guessing harder, and
+neither makes a guessable key safe:
+
+- Collection rejects keys that are not hexadecimal, including base64, base64url and
+  passphrases typed as text; fewer than 64 hexadecimal digits or an odd number of
+  them; and surrounding whitespace or line breaks. It also rejects decoded bytes that are
+  evidently not random: UTF-8 text, such as a hex-encoded passphrase; fewer than 20
+  distinct byte values; a repeated 8-byte block; or 8 bytes that change by a
+  constant step, like a counter. Together these rules reject fewer than one random
+  32-byte key in a billion. They cannot recognize every non-random key: the
+  SHA-256 hash of a passphrase, for example, passes.
+- Bindings and the key identifier use a key derived from the operator key with
+  PBKDF2-HMAC-SHA256 and 600,000 iterations, computed once per process. Each
+  offline guess therefore costs that derivation instead of a single HMAC, which
+  slows a search but still confirms a passphrase from a short list of likely
+  candidates.
 
 An invalid key fails collection with a message that names the variable and never
 contains the key. The A2A collector reports it once and keeps the unbound
@@ -66,7 +79,9 @@ NEXUS_SYMBIOTE_SOURCE_BINDING_KEY is not valid random key material; A2A declarat
 
 The MCP collector records each affected server as an invalid tool definition.
 Moving from an older key to a new one changes every binding: recollect the
-baseline and its candidates with the new key.
+baseline and its candidates with the new key. Earlier builds used the key without
+deriving one from it, so their snapshots carry a different key identifier and
+need recollection as well.
 
 ## Upgrade existing snapshots
 
@@ -99,7 +114,8 @@ across an independently sampled population of agent deployments.
 ## A2A cards and clients
 
 Static A2A cards and client entries bind their entire original declaration using
-RFC 8785 and HMAC-SHA256 under `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`. The profile is
+RFC 8785 and HMAC-SHA256 under the key derived from
+`NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`. The profile is
 `nexus-symbiote/a2a-static-values/v1`; the HMAC input includes the declaration kind
 (`agent-card` or `client`). Endpoints continue to expose only their origin.
 Credentials and other authentication values, endpoint paths, queries, fragments,
@@ -154,22 +170,24 @@ require authentication. Skill-level requirements of either version are recorded
 in `skill_security_requirements`, keyed by skill identifier, so a skill that
 declares requirements needs a unique `id`.
 
-An unsupported form leaves the requirement unknown coverage: an A2A 0.3
+An unsupported form leaves the requirement unknown coverage: an A2A 0.3 or v1
 requirement that names a scheme missing from `securitySchemes`, or a scheme
 whose definition is not one of `apiKey`, `http` with a non-anonymous scheme,
 `oauth2`, `openIdConnect` or `mutualTLS` (in the 0.3 `type` form or the v1
 ProtoJSON form); a legacy `authentication` value that is not a mapping, has other
 fields but no scheme list, or lists something other than strings; and a
 `security` value of any other shape. Such cards stay in the inventory. A `null`
-field counts as absent. A2A v1 requirements are not yet checked against
-`securitySchemes`. This collector is not a complete A2A protocol conformance
+field counts as absent. This collector is not a complete A2A protocol conformance
 validator.
 
 The origins and transports of a card's A2A 0.3 `url` (with `preferredTransport`)
 and `additionalInterfaces` are recorded in `legacy_interfaces`, also when the card
 declares v1 `supportedInterfaces`, because 0.3 clients still route on them. They
 are part of the HTTPS check, and a change raises a high-severity drift alert, like
-a change to `supported_interfaces`. A gRPC interface may use the `host:port` address form that
+a change to `supported_interfaces`. a2a-python 0.3 also accepts and routes on the
+field names `additional_interfaces` and `preferred_transport`, so either spelling
+is read, as for the ProtoJSON spellings of v1 fields; a card that uses both
+spellings of one field fails collection. A gRPC interface may use the `host:port` address form that
 A2A v1 specifies. It is exported as `grpc://host:port` with its TLS use unknown,
 which raises a medium transport finding; `grpcs://` and `https://` addresses
 count as TLS. Interface URLs containing whitespace or control characters fail
@@ -178,7 +196,8 @@ host.
 
 `tests/test_a2a_source_binding.py` exercises the CLI gates, same-origin path and
 authentication changes, both client lists, client authentication export,
-canonicalization, redaction, key requirements, loss and rotation, and legacy
-snapshots. These cases are also required against the installed release wheel.
-`tests/test_a2a_v1_cards.py` covers v1 and legacy interfaces and the
-authentication requirement forms.
+canonicalization, redaction, key requirements and stretching, loss and rotation,
+and legacy snapshots. These cases are also required against the installed release
+wheel. `tests/test_a2a_v1_cards.py` covers v1 and legacy interfaces in both
+spellings and the authentication requirement forms, including v1 requirements
+checked against `securitySchemes`.

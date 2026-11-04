@@ -4,8 +4,8 @@ branding:
   icon: shield
   color: blue
 # Operator binding key. The collector reads NEXUS_SYMBIOTE_SOURCE_BINDING_KEY from the
-# environment; it is not an input. Generate a random key once, never a passphrase,
-# for example with
+# environment; it is not an input. Generate a random key of at least 64 hexadecimal
+# characters once, never a passphrase, for example with
 #   python -c 'import secrets; print(secrets.token_hex(32))'
 # store it as a repository secret, and pass it to this Action as step-level env:
 #   - uses: Hunzee-VC/Nexus-Symbiote@<reviewed-40-character-commit-sha>

@@ -63,7 +63,7 @@ approval.
 | Variable | Effect |
 |---|---|
 | `NEXUS_SYMBIOTE_MODE` | `offline` or `live`; selects the mode when no mode flag is given. |
-| `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` | Operator key for the keyed MCP and A2A source bindings, read whenever a project is collected: `scan`, `baseline`, and `validate` or `risk` with `--project`. It must be random key material, at least 64 hexadecimal characters or base64url encoding at least 32 bytes, for example the output of `python -c 'import secrets; print(secrets.token_hex(32))'`, never a passphrase. An invalid key fails collection. Without a key, A2A declarations are partial coverage and the default gates fail. `diff` does not read it: compare snapshots collected with the same key. See [the operator binding key](verification-source-binding.md#the-operator-binding-key). |
+| `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` | Operator key for the keyed MCP and A2A source bindings, read whenever a project is collected: `scan`, `baseline`, and `validate` or `risk` with `--project`. It must be random key material written as at least 64 hexadecimal characters, for example the output of `python -c 'import secrets; print(secrets.token_hex(32))'`, never a passphrase. An invalid key fails collection. Without a key, A2A declarations are partial coverage and the default gates fail. `diff` does not read it: compare snapshots collected with the same key. See [the operator binding key](verification-source-binding.md#the-operator-binding-key). |
 
 ## Command details
 
