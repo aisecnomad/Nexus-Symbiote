@@ -238,24 +238,28 @@ def _grpc_authority(address: str) -> str:
         host = f"[{ipaddress.IPv6Address(host)}]"
     elif len(host) > 253 or not _HOSTNAME.fullmatch(host):
         raise ValueError("invalid gRPC host")
-    # The address does not say whether the channel uses TLS; grpc:// marks it unknown.
     return f"grpc://{host}:{port}"
 
 
-def _interface_origin(url: str, binding: str) -> str:
+def _interface(url: str, binding: str, field: str) -> dict[str, str]:
+    """Return the exported origin and binding of an interface URL."""
     # urlsplit silently drops tabs and line breaks, which would record another host.
     if any(char.isspace() or not char.isprintable() for char in url):
         raise ValueError("invalid A2A interface URL")
     if binding.strip().upper() == "GRPC" and "://" not in url:
-        return _grpc_authority(url)
-    return sanitized_origin(url)
+        # The address does not say whether the channel uses TLS. Unlike an explicit
+        # grpc:// URL, which declares plaintext, it is exported as undeclared.
+        return {"origin": _grpc_authority(url), field: redact_text(binding), "tls": "undeclared"}
+    return {"origin": sanitized_origin(url), field: redact_text(binding)}
 
 
-def _transport_security(origin: str) -> bool | None:
-    scheme = origin.partition("://")[0]
-    if scheme in {"https", "grpcs"}:
-        return True
-    return None if scheme == "grpc" else False
+def _transport_security(interface: dict[str, str]) -> bool | None:
+    if interface.get("tls") == "undeclared":
+        return None
+    scheme = interface["origin"].partition("://")[0]
+    binding = interface.get("protocol_binding", interface.get("transport", ""))
+    # grpcs:// is the gRPC convention for TLS. An HTTP binding needs an https:// URL.
+    return scheme == "https" or (scheme == "grpcs" and binding.strip().upper() == "GRPC")
 
 
 def _interfaces(value: Any) -> list[dict[str, str]]:
@@ -277,18 +281,12 @@ def _interfaces(value: Any) -> list[dict[str, str]]:
             r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", version
         ):
             raise ValueError("invalid A2A interface protocol version")
-        origin = _interface_origin(url, binding)
-        if origin == "[redacted]":
+        interface = _interface(url, binding, "protocol_binding")
+        if interface["origin"] == "[redacted]":
             raise ValueError("invalid A2A interface origin")
         # Paths, userinfo, queries, fragments and opaque tenant routing values
         # can contain credentials. Compare only the exported origins and bindings.
-        interfaces.append(
-            {
-                "origin": origin,
-                "protocol_binding": redact_text(binding),
-                "protocol_version": version,
-            }
-        )
+        interfaces.append({**interface, "protocol_version": version})
     return interfaces
 
 
@@ -310,9 +308,7 @@ def _legacy_interfaces(data: dict[str, Any], endpoint: str | None) -> list[dict[
         url, transport = item.get("url"), item.get("transport")
         if not isinstance(url, str) or not isinstance(transport, str) or not transport.strip():
             raise ValueError("invalid A2A interface URL or transport")
-        interfaces.append(
-            {"origin": _interface_origin(url, transport), "transport": redact_text(transport)}
-        )
+        interfaces.append(_interface(url, transport, "transport"))
     return interfaces
 
 
@@ -527,13 +523,13 @@ class A2AScanner(Scanner):
         # A2A 0.3 clients route on url and additionalInterfaces even when a card also
         # declares v1 supportedInterfaces, so their origins stay recorded and checked.
         legacy = _legacy_interfaces(data, endpoint)
-        origins = [item["origin"] for item in legacy]
-        endpoint_url = origins[0] if endpoint else None
+        declared = list(legacy)
+        endpoint_url = legacy[0]["origin"] if endpoint else None
         if "supportedInterfaces" in data:
             interfaces = _interfaces(data["supportedInterfaces"])
             properties["supported_interfaces"] = interfaces
             endpoint_url = interfaces[0]["origin"]
-            origins = [*(item["origin"] for item in interfaces), *origins]
+            declared = [*interfaces, *declared]
             protocols = list(dict.fromkeys(item["protocol_binding"] for item in interfaces))
         if legacy:
             properties["legacy_interfaces"] = legacy
@@ -571,7 +567,7 @@ class A2AScanner(Scanner):
         if unknown_skills:
             properties["skill_security_unknown"] = sorted(set(unknown_skills))
         risks: list[RiskAssessment] = []
-        transport = [_transport_security(origin) for origin in origins]
+        transport = [_transport_security(interface) for interface in declared]
         if False in transport:
             risks.append(
                 RiskAssessment(

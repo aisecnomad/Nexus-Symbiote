@@ -188,12 +188,15 @@ are part of the HTTPS check, and a change raises a high-severity drift alert, li
 a change to `supported_interfaces`. a2a-python 0.3 also accepts and routes on the
 field names `additional_interfaces` and `preferred_transport`, so either spelling
 is read, as for the ProtoJSON spellings of v1 fields; a card that uses both
-spellings of one field fails collection. A gRPC interface may use the `host:port` address form that
-A2A v1 specifies. It is exported as `grpc://host:port` with its TLS use unknown,
-which raises a medium transport finding; `grpcs://` and `https://` addresses
-count as TLS. Interface URLs containing whitespace or control characters fail
-collection, because URL parsing would silently drop them and record a different
-host.
+spellings of one field fails collection. A gRPC interface may use the `host:port`
+address form that A2A v1 specifies. The address does not say whether the channel
+uses TLS, so it is exported as `grpc://host:port` with `"tls": "undeclared"` and
+raises a medium transport finding. Otherwise only an `https://` URL, or a
+`grpcs://` URL on a gRPC binding, counts as TLS; any other URL raises a high
+transport finding. An explicit `grpc://` URL conventionally means plaintext, and
+an HTTP binding such as `JSONRPC` or `HTTP+JSON` needs an `https://` URL.
+Interface URLs containing whitespace or control characters fail collection,
+because URL parsing would silently drop them and record a different host.
 
 `tests/test_a2a_source_binding.py` exercises the CLI gates, same-origin path and
 authentication changes, both client lists, client authentication export,

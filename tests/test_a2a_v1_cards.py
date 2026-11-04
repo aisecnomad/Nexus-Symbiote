@@ -137,6 +137,28 @@ def test_legacy_additional_interfaces_are_checked_without_v1_interfaces(tmp_path
     assert _transport_risks(server) == ["high"]
 
 
+@pytest.mark.parametrize(
+    "interface, risks",
+    [
+        ({"url": "grpcs://agent.example/x", "transport": "JSONRPC"}, ["high"]),
+        ({"url": "grpc://agent.example/x", "transport": "HTTP+JSON"}, ["high"]),
+        ({"url": "grpcs://agent.example:443", "transport": "GRPC"}, []),
+        ({"url": "grpc://agent.example:443", "transport": "GRPC"}, ["high"]),
+        ({"url": "agent.example:443", "transport": "GRPC"}, ["medium"]),
+    ],
+)
+def test_legacy_interfaces_get_the_same_tls_classification(tmp_path, interface, risks):
+    card = {
+        "name": "legacy",
+        "url": "https://agent.example/a2a",
+        "additionalInterfaces": [interface],
+        "authentication": {"schemes": ["bearer"]},
+        "skills": [{"id": "s", "name": "s"}],
+    }
+    server, _ = _server(tmp_path, card)
+    assert _transport_risks(server) == risks
+
+
 def test_legacy_endpoint_repoint_is_a_high_alert_even_with_unchanged_bindings(
     tmp_path, monkeypatch
 ):
@@ -157,6 +179,7 @@ def test_legacy_endpoint_repoint_is_a_high_alert_even_with_unchanged_bindings(
         ("GRPC.Example.com:50051", "grpc://grpc.example.com:50051", ["medium"]),
         ("[2001:db8::1]:443", "grpc://[2001:db8::1]:443", ["medium"]),
         ("grpcs://grpc.example.com:443", "grpcs://grpc.example.com:443", []),
+        ("grpc://grpc.example.com:443", "grpc://grpc.example.com:443", ["high"]),
         ("https://grpc.example.com/a2a", "https://grpc.example.com", []),
         ("http://grpc.example.com/a2a", "http://grpc.example.com", ["high"]),
     ],
@@ -167,6 +190,31 @@ def test_grpc_interfaces_accept_the_specified_host_port_form(tmp_path, url, orig
     server, _ = _server(tmp_path, card)
     assert server.properties["supported_interfaces"][1]["origin"] == origin
     assert _transport_risks(server) == risks
+
+
+def test_an_explicit_grpc_url_is_exported_apart_from_the_address_form(tmp_path):
+    """grpc:// conventionally means plaintext; only the host:port form leaves TLS undeclared."""
+    recorded = []
+    for url in ("grpc://grpc.example.com:443", "grpc.example.com:443"):
+        card = _card()
+        card["supportedInterfaces"][1]["url"] = url
+        server, _ = _server(tmp_path, card)
+        recorded.append(server.properties["supported_interfaces"][1])
+    interface = {
+        "origin": "grpc://grpc.example.com:443",
+        "protocol_binding": "GRPC",
+        "protocol_version": "1.0",
+    }
+    assert recorded == [interface, {**interface, "tls": "undeclared"}]
+
+
+@pytest.mark.parametrize("binding", ["JSONRPC", "HTTP+JSON"])
+@pytest.mark.parametrize("url", ["grpcs://agent.example/a2a", "grpc://agent.example/a2a"])
+def test_http_bindings_count_only_https_as_tls(tmp_path, binding, url):
+    card = _card()
+    card["supportedInterfaces"][0].update(url=url, protocolBinding=binding)
+    server, _ = _server(tmp_path, card)
+    assert _transport_risks(server) == ["high"]
 
 
 @pytest.mark.parametrize(
