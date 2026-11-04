@@ -26,6 +26,7 @@
 - [ ] Workflow and repository hygiene checks pass (`make workflow-check hygiene`)
 - [ ] Documentation updated (if applicable)
 - [ ] CHANGELOG.md updated under Unreleased
+- [ ] Behavior- or security-changing: open for at least 24 hours, and the full diff re-read after `Verified CI` passed (see CONTRIBUTING.md)
 
 ### Security-sensitive changes
 
