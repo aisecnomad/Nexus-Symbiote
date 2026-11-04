@@ -18,7 +18,7 @@ import ast
 import ipaddress
 import re
 from collections.abc import Iterable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -57,6 +57,8 @@ CODEX_CONFIG = ".codex/config.toml"
 # and its working directory, so each one in the tree is a configuration layer.
 MAX_CODEX_LAYERS = 16
 _CODEX_APPROVAL_MODES = frozenset({"auto", "prompt", "writes", "approve"})
+# Launchers named in clear; any other command is a local path or name that may be private.
+_SHOWN_COMMANDS = frozenset({"npx", "bunx", "uvx", "pipx", "docker", "node", "python", "python3"})
 
 
 def is_codex_config(path: str) -> bool:
@@ -73,8 +75,34 @@ def codex_config_layers(paths: Iterable[str], result: ScanResult) -> list[str]:
     return layers[:MAX_CODEX_LAYERS]
 
 
+def codex_scope(layer: str) -> PurePosixPath:
+    """The project directory a Codex layer applies to, with every directory below it."""
+    return PurePosixPath(layer).parent.parent
+
+
+def codex_applies(layer_scope: PurePosixPath, directory: PurePosixPath) -> bool:
+    """Whether Codex loads a layer for a session in `directory`; siblings never merge."""
+    return layer_scope == directory or layer_scope in directory.parents
+
+
+def merge_codex(earlier: Any, later: Any) -> Any:
+    """Merge a later Codex layer's value over an earlier one, table by table.
+
+    Codex merges its project layers this way and validates only the merged
+    configuration, so a layer may override a single field of a table above it.
+    A value of any other type replaces what came before.
+    """
+    if not (isinstance(earlier, dict) and isinstance(later, dict)):
+        return later
+    merged = dict(earlier)
+    for key, value in later.items():
+        merged[key] = merge_codex(merged[key], value) if key in merged else value
+    return merged
+
+
 def _codex_server_policy(config: dict[str, Any], secrets: list[str]) -> dict[str, Any]:
-    """Tool approval and host-environment forwarding; names only, never values."""
+    """Tool approval, forwarded host-environment names, OAuth scopes, the working
+    directory and the header helper's shape. Secret values never appear."""
     policy: dict[str, Any] = {}
     modes = {
         redact_text(name, secrets): entry["approval_mode"]
@@ -98,6 +126,28 @@ def _codex_server_policy(config: dict[str, Any], secrets: list[str]) -> dict[str
         policy["env_vars"] = [
             {"name": name, "source": source} for name, source in sorted(forwarded)
         ]
+    if "env_http_headers" in config:
+        headers = {
+            (redact_text(header, secrets), redact_text(variable, secrets))
+            for header, variable in config["env_http_headers"].items()
+        }
+        policy["env_http_headers"] = [
+            {"header": header, "env_var": variable} for header, variable in sorted(headers)
+        ]
+    if "bearer_token_env_var" in config:
+        policy["bearer_token_env_var"] = redact_text(config["bearer_token_env_var"], secrets)
+    if "scopes" in config:
+        policy["scopes"] = sorted({redact_text(scope, secrets) for scope in config["scopes"]})
+    if "cwd" in config:
+        policy["cwd"] = redact_text(config["cwd"], secrets)
+    if "http_headers_helper" in config:
+        # A local shell command line, which may carry an inline credential. Like a
+        # stdio command, only a known launcher is named; the keyed binding covers the rest.
+        words = config["http_headers_helper"].split()
+        policy["http_headers_helper"] = {
+            "command": words[0] if words[0] in _SHOWN_COMMANDS else "[redacted-command]",
+            "argument_count": len(words) - 1,
+        }
     return policy
 
 
@@ -202,6 +252,8 @@ class MCPScanner(Scanner):
             sources = [] if config_only else list(files.iter_files())
             layers = codex_config_layers((path.as_posix() for path in sources), result)
             nested = [layer for layer in layers if layer != CODEX_CONFIG]
+            # Server tables of the Codex layers read so far, ancestors first.
+            codex_tables: list[tuple[str, PurePosixPath, dict[str, Any]]] = []
             for config_name in [*MCP_CONFIG_FILES, *nested]:
                 config_path = files.root / config_name
                 codex = is_codex_config(config_name)
@@ -227,8 +279,26 @@ class MCPScanner(Scanner):
                 if not isinstance(servers, dict) or len(servers) > 1000:
                     result.scan_failures.append(f"{config_name}: invalid or oversized server map")
                     continue
+                inherited: list[tuple[str, dict[str, Any]]] = []
+                if codex:
+                    scope = codex_scope(config_name)
+                    inherited = [
+                        (label, table)
+                        for label, layer_scope, table in codex_tables
+                        if codex_applies(layer_scope, scope)
+                    ]
+                    codex_tables.append((config_name, scope, servers))
                 server_refs: list[str] = []
-                for server_name, server_config in sorted(servers.items()):
+                for server_name, declared in sorted(servers.items()):
+                    # A layer may override single fields of a server declared above it.
+                    contributions = [
+                        (label, table[server_name])
+                        for label, table in inherited
+                        if server_name in table
+                    ]
+                    server_config: Any = None
+                    for _, value in [*contributions, (config_name, declared)]:
+                        server_config = merge_codex(server_config, value)
                     if not isinstance(server_config, dict) or not self._valid_server(
                         server_config, codex=codex
                     ):
@@ -236,7 +306,10 @@ class MCPScanner(Scanner):
                         continue
                     try:
                         mcp_comp, tool_comps = self._parse_server(
-                            server_name, server_config, config_path
+                            server_name,
+                            server_config,
+                            config_path,
+                            inherited_from=[label for label, _ in contributions],
                         )
                     except (TypeError, ValueError, RecursionError):
                         result.scan_failures.append(f"{config_name}: invalid tool definition")
@@ -311,6 +384,22 @@ class MCPScanner(Scanner):
                 for item in forwarded
             ):
                 return False
+            env_headers = config.get("env_http_headers", {})
+            scopes = config.get("scopes", [])
+            helper = config.get("http_headers_helper", "helper")
+            if (
+                not isinstance(env_headers, dict)
+                or not all(isinstance(name, str) for name in env_headers.values())
+                or not isinstance(scopes, list)
+                or not all(isinstance(scope, str) for scope in scopes)
+                or not all(
+                    isinstance(config.get(k, ""), str) for k in ("bearer_token_env_var", "cwd")
+                )
+                # Codex refuses a blank helper command.
+                or not isinstance(helper, str)
+                or not helper.strip()
+            ):
+                return False
         elif not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools):
             return False
         return (
@@ -328,6 +417,8 @@ class MCPScanner(Scanner):
         name: str,
         config: dict[str, Any],
         config_path: Path,
+        *,
+        inherited_from: list[str] | None = None,
     ) -> tuple[MCPServerComponent, list[ToolComponent]]:
         command = config.get("command", "")
         args = config.get("args", [])
@@ -352,9 +443,7 @@ class MCPScanner(Scanner):
             redact_text(sanitized_origin(endpoint_url), secrets) if endpoint_url else None
         )
         shown_command = (
-            command
-            if command in {"npx", "bunx", "uvx", "pipx", "docker", "node", "python", "python3"}
-            else ("[redacted-command]" if command else None)
+            command if command in _SHOWN_COMMANDS else ("[redacted-command]" if command else None)
         )
         tool_names = sorted(
             redact_text(str(tool.get("name", "")), secrets)
@@ -362,6 +451,12 @@ class MCPScanner(Scanner):
             if isinstance(tool, dict)
         )
         codex_policy = _codex_server_policy(config, secrets) if codex else {}
+        codex_properties: dict[str, Any] = (
+            {"declared_enabled": config.get("enabled", True), **codex_policy} if codex else {}
+        )
+        if codex and inherited_from:
+            # The recorded server is the merge of these layers, ancestors first.
+            codex_properties["codex_merged_layers"] = [*inherited_from, config_scope]
         structure = {
             "fields": sorted(config),
             "command": shown_command,
@@ -440,11 +535,7 @@ class MCPScanner(Scanner):
             version=version,
             transport=transport,
             launcher_package=launcher_package,
-            command=(
-                command
-                if command in {"npx", "bunx", "uvx", "pipx", "docker", "node", "python", "python3"}
-                else ("[redacted-command]" if command else None)
-            ),
+            command=shown_command,
             args=[REDACTED for _ in args],
             env=dict.fromkeys(env, "***"),
             endpoint_url=safe_endpoint,
@@ -454,11 +545,7 @@ class MCPScanner(Scanner):
             risks=risks,
             properties={
                 "collection_mode": "static-config",
-                **(
-                    {"declared_enabled": config.get("enabled", True), **codex_policy}
-                    if codex
-                    else {}
-                ),
+                **codex_properties,
                 "launch_arguments_redacted": bool(args),
                 "endpoint_credentials_omitted": bool(endpoint_url),
                 "static_config_hash": source_config_hash,

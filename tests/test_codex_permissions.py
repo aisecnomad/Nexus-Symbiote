@@ -155,6 +155,106 @@ def test_writable_roots_outside_the_workspace_are_high_risk(tmp_path: Path, root
     assert findings(agent) == {(RiskSeverity.HIGH, OUTSIDE)}
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        '[permissions.p.filesystem]\n":workspace_roots" = { "~/.ssh" = "write" }\n',
+        '[permissions.p.filesystem]\n":workspace_roots" = { "../.." = "write" }\n',
+        '[permissions.p.filesystem]\n":project_roots" = { "/etc" = "write" }\n',
+        '[permissions.p.workspace_roots]\n"/" = true\n',
+        '[permissions.p.workspace_roots]\n"../shared" = true\n',
+    ],
+)
+def test_profile_paths_leaving_the_workspace_are_high_risk(tmp_path: Path, body: str) -> None:
+    write_layer(tmp_path, body)
+    result = IDEAgentScanner().scan(tmp_path)
+    assert findings(codex(result)) == {(RiskSeverity.HIGH, OUTSIDE)}
+    assert not result.scan_failures and not result.surfaces_excluded
+
+
+def test_profile_workspace_roots_resolve_from_their_layer(tmp_path: Path) -> None:
+    write_layer(tmp_path, '[permissions.p]\nextends = ":workspace"\n')
+    write_layer(tmp_path, '[permissions.p.workspace_roots]\n"../.." = true\n', "a/b")
+    result = IDEAgentScanner().scan(tmp_path)
+    # ../.. from a/b is the project root.
+    assert not codex(result).risks and not result.scan_failures
+    write_layer(tmp_path, '[permissions.p.workspace_roots]\n"../../.." = true\n', "a/b")
+    assert findings(codex(IDEAgentScanner().scan(tmp_path))) == {(RiskSeverity.HIGH, OUTSIDE)}
+
+
+EXCLUDED_ROOT = "a/.codex/config.toml: Codex writable or workspace root passes through an excluded directory; coverage is unknown"
+
+
+@pytest.mark.parametrize("target", ["symlink", "directory"])
+@pytest.mark.parametrize(
+    ("body", "excluded"),
+    [
+        (
+            'sandbox_mode = "workspace-write"\n[sandbox_workspace_write]\n'
+            'writable_roots = ["../node_modules/.cache"]\n',
+            "a/node_modules/.cache",
+        ),
+        (
+            'sandbox_mode = "workspace-write"\n[sandbox_workspace_write]\n'
+            'writable_roots = ["../../.venv/lib/../.."]\n',
+            ".venv/lib",
+        ),
+        # A case-insensitive filesystem resolves this to the node_modules directory.
+        (
+            '[permissions.p.filesystem]\n":workspace_roots" = { "NODE_MODULES/x" = "write" }\n',
+            "a/node_modules/x",
+        ),
+        ('[permissions.p.workspace_roots]\n".git/hooks" = true\n', "a/.git/hooks"),
+    ],
+)
+def test_roots_through_excluded_directories_leave_coverage_unknown(
+    tmp_path: Path, body: str, excluded: str, target: str
+) -> None:
+    # The confined walk never enters dependency caches or Git internals, so it cannot
+    # see a symlink there. Codex binds a symlinked root's target, which may be "/".
+    write_layer(tmp_path, body, "a")
+    location = tmp_path / excluded
+    location.parent.mkdir(parents=True, exist_ok=True)
+    if target == "symlink":
+        location.symlink_to("/")
+    else:
+        location.mkdir()
+    result = IDEAgentScanner().scan(tmp_path)
+    assert result.surfaces_excluded == [EXCLUDED_ROOT]
+    assert not result.scan_failures
+
+
+def test_symlinked_root_elsewhere_fails_collection(tmp_path: Path) -> None:
+    write_layer(
+        tmp_path,
+        'sandbox_mode = "workspace-write"\n[sandbox_workspace_write]\n'
+        'writable_roots = ["../build/.cache"]\n',
+    )
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build/.cache").symlink_to("/")
+    result = IDEAgentScanner().scan(tmp_path)
+    assert "build/.cache: symlink excluded" in result.scan_failures
+    assert not result.surfaces_excluded
+
+
+def test_cli_does_not_pass_a_root_through_an_excluded_directory(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    write_layer(
+        root,
+        'sandbox_mode = "workspace-write"\n[sandbox_workspace_write]\n'
+        'writable_roots = ["../node_modules/.cache"]\n',
+    )
+    (root / "node_modules").mkdir()
+    (root / "node_modules/.cache").symlink_to("/")
+    (root / "AGENTS.md").write_text("Be careful.")
+    output = tmp_path / "bom.json"
+    run = CliRunner().invoke(main, ["scan", str(root), "--no-project-policy", "-o", str(output)])
+    assert run.exit_code == 1, run.output
+    completeness = json.loads(output.read_text())["metadata"]["completeness"]
+    assert completeness["scanner_status"]["ide_agents"] == "partial"
+    assert any("excluded directory" in item for item in completeness["surfaces_excluded"])
+
+
 def test_workspace_write_settings_are_recorded(tmp_path: Path) -> None:
     write_layer(
         tmp_path,

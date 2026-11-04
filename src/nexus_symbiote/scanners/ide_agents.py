@@ -20,7 +20,15 @@ from typing import Any
 from nexus_symbiote.core.enums import RiskSeverity, TrustTier
 from nexus_symbiote.core.models import IDEAgentComponent, RiskAssessment, VerifiedExtensionComponent
 from nexus_symbiote.scanners.base import Scanner, ScanResult
-from nexus_symbiote.scanners.mcp import CODEX_CONFIG, codex_config_layers, is_codex_config
+from nexus_symbiote.scanners.mcp import (
+    CODEX_CONFIG,
+    codex_applies,
+    codex_config_layers,
+    codex_scope,
+    is_codex_config,
+    merge_codex,
+)
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES
 from nexus_symbiote.utils.secrets import redact_text
 
 CODEX_BUILT_IN_PROFILES = {
@@ -38,6 +46,9 @@ _CODEX_WORKSPACE_PATHS = frozenset({":workspace_roots", ":project_roots"})
 _CODEX_TEMPORARY_PATHS = frozenset({":tmpdir", ":slash_tmp"})
 _CODEX_SPECIAL_PATHS = _CODEX_WORKSPACE_PATHS | _CODEX_TEMPORARY_PATHS | {":root", ":minimal"}
 _CODEX_WORKSPACE_WRITE_KEYS = ("network_access", "exclude_tmpdir_env_var", "exclude_slash_tmp")
+_CODEX_APPROVAL_POLICIES = frozenset({"on-request", "on-failure", "untrusted", "never"})
+_CODEX_GRANULAR_REQUIRED = frozenset({"sandbox_approval", "rules", "mcp_elicitations"})
+_CODEX_GRANULAR_KEYS = _CODEX_GRANULAR_REQUIRED | {"request_permissions", "skill_approval"}
 # auto_review instructs the automatic approver and hooks can answer permission
 # requests. Neither is interpreted, so declaring one leaves coverage unknown.
 _CODEX_UNINTERPRETED = ("auto_review", "hooks")
@@ -49,33 +60,33 @@ _UNPROMPTED = (
     RiskSeverity.MEDIUM,
     "Codex declares workspace writes with no interactive escalation prompts.",
 )
+_UNOBSERVED_ROOT = (
+    "Codex writable or workspace root passes through an excluded directory; coverage is unknown"
+)
 
 
-def _outside_workspace(path: str, base: PurePosixPath) -> bool:
-    """Lexically resolve a declared path; host-absolute and home paths are outside."""
+def _resolve_root(path: str, base: PurePosixPath) -> str | None:
+    """Lexically resolve a declared root against a project directory.
+
+    Returns "outside" for host-absolute and home paths and for paths that leave
+    the project, and "unobserved" for a path through a directory the collection
+    never enters. Codex binds the target of a symlinked root, and the confined walk
+    fails on a symlink anywhere else in the project, so only those can hide one.
+    """
     if not path or _HOST_PATH.match(path):
-        return True
+        return "outside"
     parts = list(base.parts)
+    unobserved = False
     for part in re.split(r"[/\\]", path):
         if part == "..":
             if not parts:
-                return True
+                return "outside"
             parts.pop()
         elif part not in {"", "."}:
             parts.append(part)
-    return False
-
-
-def _merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
-    """Merge a later Codex layer over an earlier one, table by table."""
-    merged = dict(base)
-    for key, value in overlay.items():
-        earlier = merged.get(key)
-        if isinstance(value, dict) and isinstance(earlier, dict):
-            merged[key] = _merge(earlier, value)
-        else:
-            merged[key] = value
-    return merged
+            # Case-insensitive filesystems resolve NODE_MODULES to node_modules.
+            unobserved |= part.lower() in DEFAULT_EXCLUDES
+    return "unobserved" if unobserved else None
 
 
 def _resolve_profile(name: str, catalog: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
@@ -91,13 +102,14 @@ def _resolve_profile(name: str, catalog: dict[str, Any]) -> tuple[str | None, di
         name = parent
     merged: dict[str, Any] = {}
     for item in reversed(chain):
-        merged = _merge(merged, {k: v for k, v in catalog[item].items() if k != "extends"})
+        merged = merge_codex(merged, {k: v for k, v in catalog[item].items() if k != "extends"})
     return (name if name in CODEX_BUILT_IN_PROFILES else None), merged
 
 
-def _profile_writes(grants: dict[str, Any], directory: PurePosixPath) -> tuple[bool, bool]:
-    """Report whether profile grants allow any writes, and any outside the workspace."""
-    writes = outside = False
+def _profile_writes(grants: dict[str, Any], directory: PurePosixPath) -> tuple[bool, set[str]]:
+    """Report whether profile grants allow any writes, and how their roots resolve."""
+    writes = False
+    places: set[str | None] = set()
     for path, access in grants.get("filesystem", {}).items():
         if path == "glob_scan_max_depth":
             continue
@@ -106,32 +118,52 @@ def _profile_writes(grants: dict[str, Any], directory: PurePosixPath) -> tuple[b
                 continue
             writes = True
             if path in _CODEX_WORKSPACE_PATHS:
-                outside |= subpath != "." and _outside_workspace(subpath, PurePosixPath())
-            else:
-                outside |= path not in _CODEX_TEMPORARY_PATHS
-    roots = grants.get("workspace_roots", {})
-    outside |= any(on and _outside_workspace(root, directory) for root, on in roots.items())
-    return writes, outside
+                if subpath != ".":
+                    places.add(_resolve_root(subpath, PurePosixPath()))
+            elif path not in _CODEX_TEMPORARY_PATHS:
+                places.add("outside")
+    for root, on in grants.get("workspace_roots", {}).items():
+        if on:
+            places.add(_resolve_root(root, directory))
+    return writes, {place for place in places if place is not None}
 
 
 def _codex_catalog(chain: list[tuple[str, PurePosixPath, dict[str, Any]]]) -> dict[str, Any]:
     catalog: dict[str, Any] = {}
     for _, _, values in chain:
-        catalog = _merge(catalog, values.get("permission_profiles", {}))
+        catalog = merge_codex(catalog, values.get("permission_profiles", {}))
     return catalog
+
+
+def _codex_approval(chain: list[tuple[str, PurePosixPath, dict[str, Any]]]) -> Any:
+    """The approval policy Codex merges for a directory, or None when none is declared."""
+    approval: Any = None
+    for _, _, values in chain:
+        if "approval_policy" in values:
+            approval = merge_codex(approval, values["approval_policy"])
+    return approval
+
+
+def _valid_approval(approval: Any) -> bool:
+    """Whether Codex accepts a merged policy; each layer's values were checked already."""
+    if not isinstance(approval, dict):
+        return True
+    return (
+        approval.keys() == {"granular"} and approval["granular"].keys() >= _CODEX_GRANULAR_REQUIRED
+    )
 
 
 def _codex_scope_mode(
     chain: list[tuple[str, PurePosixPath, dict[str, Any]]],
     catalog: dict[str, Any],
+    approval: Any,
     findings: set[tuple[RiskSeverity, str]],
 ) -> str | None:
     """Select the permission syntax as Codex does: the last layer declaring one wins,
     and within a layer `default_permissions` takes precedence over `sandbox_mode`."""
-    mode = approval = None
+    mode = None
     writes = False
     for _, _, values in chain:
-        approval = values.get("approval_policy", approval)
         if "sandbox_mode" in values:
             mode = values["sandbox_mode"]
             writes = mode == "workspace-write"
@@ -162,24 +194,18 @@ def _codex_declarations(label: str, data: dict[str, Any], result: ScanResult) ->
             result.scan_failures.append(f"{label}: invalid declared sandbox mode")
     approval = data.get("approval_policy")
     if approval is not None:
-        if isinstance(approval, str) and approval in {
-            "on-request",
-            "on-failure",
-            "untrusted",
-            "never",
-        }:
+        if isinstance(approval, str) and approval in _CODEX_APPROVAL_POLICIES:
             values["approval_policy"] = approval
-        elif isinstance(approval, dict) and set(approval) == {"granular"}:
-            granular = approval["granular"]
-            required = {"sandbox_approval", "rules", "mcp_elicitations"}
+        elif isinstance(approval, dict) and approval.keys() <= {"granular"}:
+            granular = approval.get("granular", {})
+            # A layer may set only some prompts over an inherited table, so the
+            # required prompts are checked on each directory's merged policy.
             if (
                 isinstance(granular, dict)
-                and required
-                <= granular.keys()
-                <= required | {"request_permissions", "skill_approval"}
+                and granular.keys() <= _CODEX_GRANULAR_KEYS
                 and all(isinstance(value, bool) for value in granular.values())
             ):
-                values["approval_policy"] = {"granular": dict(granular)}
+                values["approval_policy"] = {key: dict(granular) for key in approval}
             else:
                 result.scan_failures.append(f"{label}: invalid granular approval policy")
         else:
@@ -546,16 +572,14 @@ class IDEAgentScanner(Scanner):
             if "mcp_servers" in data:
                 mcp_configs.append(label)
             values = _codex_declarations(label, data, result)
-            declared.append((label, PurePosixPath(label).parent.parent, values))
+            declared.append((label, codex_scope(label), values))
         findings: set[tuple[RiskSeverity, str]] = set()
         root_mode: str | None = None
         for index, (label, directory, values) in enumerate(declared):
-            chain = [
-                layer
-                for layer in declared[: index + 1]
-                if layer[1] == directory or layer[1] in directory.parents
-            ]
+            chain = [layer for layer in declared[: index + 1] if codex_applies(layer[1], directory)]
             catalog = _codex_catalog(chain)
+            # How each declared writable or workspace root resolves: see _resolve_root.
+            places: set[str | None] = set()
             profiles = values.get("permission_profiles", {})
             for name in list(profiles):
                 try:
@@ -564,12 +588,11 @@ class IDEAgentScanner(Scanner):
                     result.scan_failures.append(f"{label}: invalid permission profile declaration")
                     del profiles[name]
                     continue
-                outside = _profile_writes(grants, directory)[1]
+                places |= _profile_writes(grants, directory)[1]
                 findings.update(
                     finding
                     for finding, present in (
                         (_FULL_ACCESS, base == ":danger-full-access"),
-                        (_OUTSIDE, outside),
                         (_NETWORK, grants.get("network_enabled") is True),
                     )
                     if present
@@ -586,11 +609,17 @@ class IDEAgentScanner(Scanner):
                     result.scan_failures.append(f"{label}: unsupported declared permission profile")
                     del values["default_permissions"]
             workspace = values.get("sandbox_workspace_write", {})
-            if any(
-                _outside_workspace(path, directory / ".codex")
+            # Codex resolves a layer's relative writable roots against its .codex folder.
+            places.update(
+                _resolve_root(path, directory / ".codex")
                 for path in workspace.get("writable_roots", [])
-            ):
+            )
+            if "outside" in places:
                 findings.add(_OUTSIDE)
+            if "unobserved" in places:
+                message = f"{label}: {_UNOBSERVED_ROOT}"
+                if message not in result.surfaces_excluded:
+                    result.surfaces_excluded.append(message)
             if workspace.get("network_access") is True:
                 findings.add(_NETWORK)
             if "danger-full-access" in {
@@ -598,7 +627,14 @@ class IDEAgentScanner(Scanner):
                 CODEX_BUILT_IN_PROFILES.get(values.get("default_permissions", "")),
             }:
                 findings.add(_FULL_ACCESS)
-            mode = _codex_scope_mode(chain, catalog, findings)
+            approval = _codex_approval(chain)
+            if not _valid_approval(approval):
+                # Codex refuses the merged policy, so no session runs with it here.
+                if "approval_policy" in values:
+                    kind = "invalid granular" if "granular" in approval else "unsupported declared"
+                    result.scan_failures.append(f"{label}: {kind} approval policy")
+                approval = None
+            mode = _codex_scope_mode(chain, catalog, approval, findings)
             if directory == PurePosixPath():
                 root_mode = mode
         for severity, detail in sorted(findings, key=lambda finding: finding[1]):

@@ -117,21 +117,33 @@ Project validation compares static MCP records and configured tool fingerprints 
 Codex loads a `.codex/config.toml` from each directory between the project root
 and its working directory. The collectors read every one in the project, up to
 16 layers (more are a collection failure), and evaluate each directory with the
-layers above it. The IDE record keeps each layer's sandbox mode, approval policy
-and reviewer, `default_permissions`, `[permissions]` profiles and
+layers above it, never with a sibling's. As in Codex, the layers are merged
+table by table, so a package layer may override a single field of a root MCP
+server or approval policy; only a merged value that Codex would refuse is a
+collection failure. The IDE record keeps each layer's own sandbox mode, approval
+policy and reviewer, `default_permissions`, `[permissions]` profiles and
 `[sandbox_workspace_write]` settings. As in Codex, a layer's `default_permissions`
 takes precedence over its `sandbox_mode`. Full access by any route, including a
 profile that extends `:danger-full-access`, and writable paths outside the
-project are high-severity findings. Sandbox network access, and workspace writes
-with every approval prompt disabled, are medium-severity findings. Codex MCP
-server records keep tool approval modes, tool allow and deny lists and the names
-of forwarded environment variables, and the structure binding covers them
-without the operator key. Values the collectors cannot validate are collection
-failures, and settings they do not interpret, such as profile network proxy
-rules, `hooks` and `auto_review`, leave coverage incomplete. Codex TOML larger
-than 256 KiB, nested more than 32 levels or with more than 16 unquoted dots on
-one line is recorded as a collection failure without being parsed. User, managed
-and runtime settings and project trust remain unobserved.
+project are high-severity findings. Codex writes to the target of a symlinked
+writable root. The collection fails on a symlink anywhere in the project except
+inside the directories it never enters (`node_modules`, `.git`, `__pycache__`,
+`venv` and `.venv`), so a writable or workspace root through one of those leaves
+coverage incomplete. Sandbox network access, and workspace writes with every
+approval prompt disabled, are medium-severity findings. A Codex MCP server
+declared in a nested layer is recorded with the layers it merges. Server records
+keep tool approval modes, tool allow and deny lists, OAuth scopes, the stdio
+working directory and the names of forwarded environment variables (`env_vars`,
+`env_http_headers` and `bearer_token_env_var`). An `http_headers_helper` command
+is recorded by its argument count, and by its program only when that is a known
+launcher, as for a stdio command. The structure binding covers all of these
+without the operator key; other values, such as the helper's arguments, are
+bound only by the keyed binding. Values the collectors cannot validate are
+collection failures, and settings they do not interpret, such as profile network
+proxy rules, `hooks` and `auto_review`, leave coverage incomplete. Codex TOML
+larger than 256 KiB, nested more than 32 levels or with more than 16 unquoted
+dots on one line is recorded as a collection failure without being parsed. User,
+managed and runtime settings and project trust remain unobserved.
 
 Integrity validation reports a tool descriptor's internal consistency separately
 from a fresh local configuration match. A matching digest contained only in the
