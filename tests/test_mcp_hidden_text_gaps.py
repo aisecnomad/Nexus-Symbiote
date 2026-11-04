@@ -86,6 +86,10 @@ def test_other_invisible_format_and_control_characters_are_invisible(char):
         "\U0001f600\ufe00\ufe01\ufe02",
         "\U0001f600\U000e0100\U000e0101",
         "\U0001f600" + ZWJ + VS16,
+        "".join(char + chr(0xE0100 + ord(char)) for char in "Readafile."),
+        "a" + VS16,
+        "." + chr(0xFE01),
+        "1" + chr(0xE0100),
     ],
 )
 def test_joiners_and_selectors_outside_normal_emoji_text_are_invisible(text):
@@ -107,6 +111,8 @@ def test_joiners_and_selectors_outside_normal_emoji_text_are_invisible(text):
         "\u1820\u180b",
         "\u0627\u0644\u0645\u0644\u0641 \u6587\u4ef6 \u0444\u0430\u0439\u043b",
         "tab\tline\ncarriage\r\n",
+        "#" + VS16 + chr(0x20E3),
+        "0" + chr(0xFE00),
     ],
 )
 def test_normal_text_emoji_sequences_and_variants_are_not_hidden(text):

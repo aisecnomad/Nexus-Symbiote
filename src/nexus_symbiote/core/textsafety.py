@@ -54,12 +54,13 @@ def _normal_in_context(text: str, index: int) -> bool:
         following = text[index + 1 : index + 2]
         return bool(previous and following) and _pictographic(previous) and _pictographic(following)
     # A selector picks a variant of the character before it. A run of selectors, or
-    # one with nothing to modify, can encode arbitrary bytes.
-    return (
-        bool(previous)
-        and not _CONTEXTUAL.match(previous)
-        and unicodedata.category(previous) not in _NOT_A_BASE
-    )
+    # one with nothing to modify, can encode arbitrary bytes. Of ASCII characters only
+    # keycap bases take one, so a selector after ASCII text can only carry data.
+    if not previous or _CONTEXTUAL.match(previous):
+        return False
+    if previous.isascii():
+        return previous in "0123456789#*" and ord(text[index]) in (0xFE00, 0xFE0E, 0xFE0F)
+    return unicodedata.category(previous) not in _NOT_A_BASE
 
 
 def _hidden_in_text(text: str) -> set[HiddenKind]:
@@ -77,7 +78,7 @@ def hidden_character_kinds(value: object) -> set[HiddenKind]:
     Bidirectional controls and tag characters have their own kinds. Other format,
     control and default-ignorable characters are "invisible", except tab and line
     breaks, a zero-width joiner between emoji, and a single variation selector after
-    a visible character.
+    an emoji, a keycap character or another visible non-ASCII character.
     """
     kinds: set[HiddenKind] = set()
     pending = [value]
