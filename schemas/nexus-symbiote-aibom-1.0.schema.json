@@ -1441,6 +1441,7 @@
       "type": "object"
     },
     "DependencyEdge": {
+      "additionalProperties": false,
       "description": "A typed relationship between two components.",
       "properties": {
         "source_ref": {

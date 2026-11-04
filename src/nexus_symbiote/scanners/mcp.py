@@ -15,9 +15,7 @@ and detects unpinned versions, missing transport security, and rug-pull risk.
 from __future__ import annotations
 
 import ast
-import hmac
 import ipaddress
-import os
 import re
 from pathlib import Path
 from typing import Any
@@ -34,8 +32,11 @@ from nexus_symbiote.core.enums import (
     TrustTier,
 )
 from nexus_symbiote.core.hashing import (
+    SOURCE_BINDING_KEY_ENV as SOURCE_BINDING_KEY_ENV,
+)
+from nexus_symbiote.core.hashing import (
     TOOL_DEFINITION_HASH_VERSION,
-    canonical_json,
+    bind_source_values,
     extract_version_pin,
     hash_canonical,
     hash_tool_definition,
@@ -73,21 +74,10 @@ _OCI_REPOSITORY = (
 # Values are bound by an HMAC under an operator key that never enters the BOM.
 STATIC_CONFIG_HASH_PROFILE = "nexus-symbiote/mcp-static-config/v2"
 STATIC_VALUE_BINDING_PROFILE = "nexus-symbiote/mcp-static-values/v1"
-SOURCE_BINDING_KEY_ENV = "NEXUS_SYMBIOTE_SOURCE_BINDING_KEY"
-_MIN_SOURCE_BINDING_KEY_LENGTH = 32
 
 
 def _value_binding(config: dict[str, Any]) -> tuple[str, str] | None:
-    key = os.environ.get(SOURCE_BINDING_KEY_ENV, "")
-    if not key:
-        return None
-    if len(key) < _MIN_SOURCE_BINDING_KEY_LENGTH:
-        raise ValueError(f"{SOURCE_BINDING_KEY_ENV} must contain at least 32 characters")
-    material = key.encode()
-    message = canonical_json({"profile": STATIC_VALUE_BINDING_PROFILE, "configuration": config})
-    mac = hmac.new(material, message.encode(), "sha256").hexdigest()
-    key_id = hmac.new(material, b"nexus-symbiote/source-binding-key-id", "sha256").hexdigest()
-    return "hmac-sha256:" + mac, key_id[:32]
+    return bind_source_values(config, profile=STATIC_VALUE_BINDING_PROFILE)
 
 
 # Index, registry and find-links options decide where a launcher fetches its package.

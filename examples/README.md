@@ -27,9 +27,14 @@ python -m pip install --no-deps --no-build-isolation .
 ### 1. Inventory the project
 
 ```bash
+export NEXUS_SYMBIOTE_SOURCE_BINDING_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 nexus-symbiote scan examples/demo-agent -o demo.aibom.json
 nexus-symbiote summary demo.aibom.json
 ```
+
+Keep the same binding key for the commands below; do not store it in the agent
+project or share it with the BOM. Without it the A2A declarations remain partial
+coverage and the default scan gate fails. See [source bindings](../docs/verification-source-binding.md).
 
 All eight collectors complete and record 11 components across 9 types. The scan
 passes the default gate (exit 0) with a risk warning: score 33, below the default

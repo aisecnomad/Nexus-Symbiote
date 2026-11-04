@@ -13,6 +13,8 @@ from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.enums import AssuranceLevel, ComponentType, TrustTier
 from nexus_symbiote.core.hashing import canonical_json
 from nexus_symbiote.core.models import (
+    A2AClientComponent,
+    A2AServerComponent,
     AgentComponent,
     AnyComponent,
     ClaimEvidence,
@@ -22,6 +24,11 @@ from nexus_symbiote.core.models import (
     ToolComponent,
 )
 from nexus_symbiote.scanner_catalog import BUILTIN_SCANNER_NAMES
+from nexus_symbiote.scanners.a2a import (
+    A2A_SOURCE_BINDING_FIELDS,
+    A2A_STATIC_MODES,
+    has_a2a_source_binding,
+)
 
 if TYPE_CHECKING:
     from nexus_symbiote.scanners.base import ScanResult
@@ -320,6 +327,20 @@ class CompletenessValidator:
         for actual in expected.components:
             declared = supplied.pop(actual.bom_ref, None)
             if (
+                isinstance(actual, (A2AClientComponent, A2AServerComponent))
+                and actual.properties.get("collection_mode") in A2A_STATIC_MODES
+                and (
+                    not isinstance(declared, (A2AClientComponent, A2AServerComponent))
+                    or not has_a2a_source_binding(declared)
+                    or not has_a2a_source_binding(actual)
+                )
+            ):
+                incomplete(
+                    actual.bom_ref,
+                    "Static A2A source binding is unknown; re-collect with the operator binding key before reconciliation.",
+                    "unknown",
+                )
+            if (
                 isinstance(actual, MCPServerComponent)
                 and actual.properties.get("collection_mode") == "static-config"
                 and isinstance(declared, MCPServerComponent)
@@ -540,6 +561,19 @@ class CompletenessValidator:
             return isinstance(supplied, RegistryEntryComponent) and (
                 supplied.package_url == local.package_url
                 and supplied.registry_type == local.registry_type
+            )
+        if (
+            isinstance(local, (A2AClientComponent, A2AServerComponent))
+            and local.properties.get("collection_mode") in A2A_STATIC_MODES
+        ):
+            return (
+                isinstance(supplied, type(local))
+                and has_a2a_source_binding(supplied)
+                and has_a2a_source_binding(local)
+                and all(
+                    supplied.properties.get(field) == local.properties.get(field)
+                    for field in A2A_SOURCE_BINDING_FIELDS
+                )
             )
         if (
             isinstance(local, MCPServerComponent)

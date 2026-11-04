@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from nexus_symbiote.core.enums import RiskSeverity, TrustTier
-from nexus_symbiote.core.hashing import canonical_json
+from nexus_symbiote.core.hashing import (
+    SOURCE_BINDING_KEY_ENV,
+    bind_source_values,
+    canonical_json,
+)
 from nexus_symbiote.core.models import A2AClientComponent, A2AServerComponent, RiskAssessment
 from nexus_symbiote.scanners.base import Scanner, ScanResult, sanitized_origin
 from nexus_symbiote.utils.secrets import redact_text
@@ -21,6 +25,73 @@ AGENT_CARD_FILES = [
     "a2a/agent.json",
 ]
 A2A_CONFIG_FILES = ["a2a.json", "a2a.yaml", "a2a.yml", "a2a_config.json"]
+A2A_SOURCE_BINDING_PROFILE = "nexus-symbiote/a2a-static-values/v1"
+A2A_SOURCE_BINDING_FIELDS = (
+    "a2a_source_binding",
+    "a2a_source_binding_key_id",
+    "a2a_source_binding_profile",
+)
+A2A_STATIC_MODES = {"static-agent-card", "static-config"}
+
+
+def has_a2a_source_binding(component: A2AClientComponent | A2AServerComponent) -> bool:
+    properties = component.properties
+    return (
+        properties.get("a2a_source_binding_profile") == A2A_SOURCE_BINDING_PROFILE
+        and isinstance(properties.get("a2a_source_binding"), str)
+        and re.fullmatch(r"hmac-sha256:[0-9a-f]{64}", properties["a2a_source_binding"]) is not None
+        and isinstance(properties.get("a2a_source_binding_key_id"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", properties["a2a_source_binding_key_id"]) is not None
+    )
+
+
+def _source_binding(data: dict[str, Any], kind: str) -> dict[str, Any]:
+    binding = bind_source_values(
+        {"kind": kind, "declaration": data}, profile=A2A_SOURCE_BINDING_PROFILE
+    )
+    return {
+        "a2a_source_binding_profile": A2A_SOURCE_BINDING_PROFILE,
+        **(
+            {"a2a_source_binding": binding[0], "a2a_source_binding_key_id": binding[1]}
+            if binding
+            else {}
+        ),
+    }
+
+
+def _authentication_required(
+    data: dict[str, Any], v1_requirements: list[dict[str, list[str]]] | None
+) -> bool | None:
+    """Combine every declared requirement form; any form permitting anonymous use wins."""
+    declared: list[bool | None] = []
+    if "security" in data:
+        requirements = data["security"]
+        if not isinstance(requirements, list) or len(requirements) > 1000:
+            raise ValueError("invalid security requirements")
+        for requirement in requirements:
+            if not isinstance(requirement, dict):
+                raise ValueError("invalid security requirement")
+            for scopes in requirement.values():
+                if not isinstance(scopes, list):
+                    raise ValueError("invalid security scopes")
+                _strings(scopes)
+        # Requirements are OR alternatives; an empty alternative permits anonymous use.
+        declared.append(bool(requirements) and all(bool(item) for item in requirements))
+    if v1_requirements is not None:
+        declared.append(bool(v1_requirements) and all(v1_requirements))
+    authentication = data.get("authentication")
+    if authentication is not None:
+        if not isinstance(authentication, dict):
+            raise ValueError("invalid legacy authentication")
+        if "schemes" in authentication:
+            declared.append(bool(_strings(authentication["schemes"])))
+        else:
+            declared.append(None if authentication else False)
+    # A client may use any declared form, so one anonymous form makes authentication
+    # optional; an unsupported form leaves the requirement unknown.
+    if not declared or False in declared:
+        return False
+    return None if None in declared else True
 
 
 def _strings(value: Any) -> list[str]:
@@ -120,7 +191,9 @@ class A2AScanner(Scanner):
                     continue
                 result.surfaces_scanned.append(str(path))
                 try:
-                    result.components.append(self._parse_agent_card(data, relative, path))
+                    component = self._parse_agent_card(data, relative, path)
+                    result.components.append(component)
+                    self._record_binding_gap(component, relative, result)
                 except (TypeError, ValueError):
                     result.scan_failures.append(f"{relative}: invalid A2A card field types")
             for relative in A2A_CONFIG_FILES:
@@ -137,7 +210,9 @@ class A2AScanner(Scanner):
                     try:
                         if not isinstance(client, dict):
                             raise ValueError("invalid client")
-                        result.components.append(self._parse_a2a_client(client, path))
+                        client_component = self._parse_a2a_client(client, path)
+                        result.components.append(client_component)
+                        self._record_binding_gap(client_component, relative, result)
                     except (TypeError, ValueError):
                         result.scan_failures.append(f"{relative}: invalid A2A client field types")
             self._scan_code_patterns(files.root, result)
@@ -145,9 +220,24 @@ class A2AScanner(Scanner):
             result.surfaces_scanned.append("a2a (no A2A configurations found)")
         return result
 
+    @staticmethod
+    def _record_binding_gap(
+        component: A2AClientComponent | A2AServerComponent, relative: str, result: ScanResult
+    ) -> None:
+        if not has_a2a_source_binding(component):
+            result.surfaces_excluded.append(
+                f"{relative}: A2A declaration values are unbound; configure "
+                f"{SOURCE_BINDING_KEY_ENV} before relying on drift or reconciliation"
+            )
+        if isinstance(component, A2AServerComponent) and component.authentication_required is None:
+            result.surfaces_excluded.append(
+                f"{relative}: A2A authentication requirement semantics are unknown"
+            )
+
     def _parse_agent_card(
         self, data: dict[str, Any], rel_path: str, card_path: Path
     ) -> A2AServerComponent:
+        declaration = data
         data = _proto_fields(data, "supportedInterfaces", "securityRequirements")
         name, version = data.get("name", "unnamed-agent"), data.get("version")
         endpoint = data.get("url") or data.get("endpoint")
@@ -169,9 +259,6 @@ class A2AScanner(Scanner):
             properties["supported_interfaces"] = interfaces
             origins = [item["origin"] for item in interfaces]
             protocols = list(dict.fromkeys(item["protocol_binding"] for item in interfaces))
-        for field in ("authentication", "security"):
-            if data.get(field) is not None and not isinstance(data[field], (dict, list)):
-                raise ValueError("invalid authentication declaration")
         declared_skills = data.get("skills", [])
         if not isinstance(declared_skills, list) or len(declared_skills) > 1000:
             raise ValueError("invalid skills")
@@ -194,12 +281,11 @@ class A2AScanner(Scanner):
             skills.append(redact_text(skill))
         # This records declarations only; neither a card nor this collector proves
         # that an endpoint actually enforces authentication.
-        auth_required = bool(data.get("authentication") or data.get("security"))
+        requirements = None
         if "securityRequirements" in data:
             requirements = _security_requirements(data["securityRequirements"])
             properties["security_requirements"] = requirements
-            # An empty alternative permits anonymous access.
-            auth_required = bool(requirements) and all(requirements)
+        auth_required = _authentication_required(data, requirements)
         risks: list[RiskAssessment] = []
         if any(not origin.startswith("https://") for origin in origins):
             risks.append(
@@ -240,7 +326,7 @@ class A2AScanner(Scanner):
             source_path=str(card_path),
             trust_tier=TrustTier.INTERNAL_UNVERIFIED,
             risks=risks,
-            properties=properties,
+            properties={**properties, **_source_binding(declaration, "agent-card")},
         )
 
     def _parse_a2a_client(self, config: dict[str, Any], config_path: Path) -> A2AClientComponent:
@@ -280,7 +366,11 @@ class A2AScanner(Scanner):
             source_path=str(config_path),
             trust_tier=TrustTier.UNKNOWN,
             risks=risks,
-            properties={"collection_mode": "static-config", "remote_agent_contacted": False},
+            properties={
+                "collection_mode": "static-config",
+                "remote_agent_contacted": False,
+                **_source_binding(config, "client"),
+            },
         )
 
     def _scan_code_patterns(self, root: Path, result: ScanResult) -> None:

@@ -108,6 +108,7 @@ The repository contains a synthetic agent project at
 From a checkout:
 
 ```bash
+export NEXUS_SYMBIOTE_SOURCE_BINDING_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 nexus-symbiote scan examples/demo-agent -o demo.aibom.json
 nexus-symbiote summary demo.aibom.json
 nexus-symbiote import-shadowscan tests/fixtures/shadowscan/code-report-0.1.4.json \

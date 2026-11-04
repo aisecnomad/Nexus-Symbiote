@@ -21,6 +21,8 @@ from nexus_symbiote.core.models import (
 class DependencyEdge(BaseModel):
     """A typed relationship between two components."""
 
+    model_config = ConfigDict(extra="forbid")
+
     source_ref: str
     target_ref: str
     relationship: Literal[

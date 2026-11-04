@@ -46,6 +46,15 @@ A mediated action needs a trusted approver, snapshot binding, authenticated work
 
 For hosted models, an alias is a locator. Provider-reported revisions and behavioral canaries do not establish measured weight identity. Preserve identity assurance and unknowns explicitly. For retrieval and memory, record the source and index versions, effective reader/writer permissions, and derived records requiring invalidation after withdrawal.
 
+Static A2A cards and client declarations require an operator-keyed source binding
+for complete value coverage. The exported origin and authentication Boolean do
+not describe endpoint paths, credentials, scopes or scheme definitions. Their
+canonical source is bound by HMAC without exposing it; the same operator key is
+required for candidates and project reconciliation. Missing keys, legacy or
+incompatible bindings and unknown authentication forms leave coverage unknown.
+Drift checks require review for unbound snapshots even when their public fields
+match. See [source binding and migration](verification-source-binding.md).
+
 ## Known false-positive and false-negative classes
 
 These are current behaviors, not guarantees. Review them before relying on a gate.

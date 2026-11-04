@@ -46,6 +46,27 @@ def test_nested_capability_unknown_semantics_rejected():
         CapabilityDeclaration.model_validate({"unrecognized_approval_bypass": True})
 
 
+def test_dependency_edge_unknown_semantics_rejected_by_schema_model_and_cli(tmp_path):
+    document = AIBOM(components=[AgentComponent(bom_ref="agent:one", name="one")]).to_dict()
+    document["dependencies"] = [
+        {
+            "source_ref": "agent:one",
+            "target_ref": "agent:one",
+            "relationship": "invokes",
+            "required_approval": "human",
+        }
+    ]
+    schema = AIBOM.model_json_schema()
+    assert list(Draft202012Validator(schema).iter_errors(document))
+    with pytest.raises(ValidationError):
+        AIBOM.model_validate(document)
+    path = tmp_path / "bom.json"
+    path.write_text(json.dumps(document))
+    result = CliRunner().invoke(main, ["validate", str(path), "--no-project-policy"])
+    assert result.exit_code == 1
+    assert "not a valid native AIBOM" in result.output
+
+
 def test_loader_rejects_duplicate_keys_and_limits(tmp_path):
     path = tmp_path / "bom.json"
     path.write_text('{"components":[],"components":[]}')

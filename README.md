@@ -143,6 +143,7 @@ Optional extras: `.[sigstore]` for Sigstore verification, `.[cyclonedx]` for Cyc
 From the checkout, inventory the bundled demo agent — nothing is executed and no network is used:
 
 ```bash
+export NEXUS_SYMBIOTE_SOURCE_BINDING_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 nexus-symbiote scan examples/demo-agent -o demo.aibom.json
 nexus-symbiote summary demo.aibom.json
 nexus-symbiote risk demo.aibom.json --no-project-policy
@@ -150,6 +151,8 @@ nexus-symbiote validate demo.aibom.json --project examples/demo-agent --no-proje
 ```
 
 `validate` exits 1 on purpose: completeness passes, but the model's integrity stays unknown because no signer policy was supplied. An inventory can be complete and still not be approvable.
+
+A2A cards and client declarations need the same operator binding key during collection, comparison and project reconciliation. Keep it outside the scanned checkout, preferably in your CI secret store. Without it, collection still records the inventory but marks A2A values as partial coverage and default gates fail. The keyed binding detects changed endpoint paths, credentials and authentication declarations without exporting those values. See [source binding and migration](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/docs/verification-source-binding.md).
 
 ### Scan your own agent
 
@@ -190,6 +193,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: Hunzee-VC/Nexus-Symbiote@<reviewed-40-character-commit-sha>
+        env:
+          NEXUS_SYMBIOTE_SOURCE_BINDING_KEY: ${{ secrets.NEXUS_SYMBIOTE_SOURCE_BINDING_KEY }}
         with:
           scan-path: .
           output-file: agentbom.json

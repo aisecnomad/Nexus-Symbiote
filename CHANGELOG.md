@@ -8,6 +8,9 @@ First alpha of the AgentBOM toolkit under the Hunzee-VC organization. Not yet ta
 
 ### Security
 
+- **Breaking:** Bind static A2A cards and client declarations with an operator-keyed, RFC 8785 HMAC. Without `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`, A2A values remain partial coverage and default gates fail. Drift and project reconciliation reject missing, incompatible or changed bindings, including same-origin endpoint paths, authentication schemes and scopes. Recollect legacy snapshots with the same operator key before reviewing them.
+- Reject unknown fields on native dependency edges instead of silently discarding them; regenerate the native schema and enforce this in built-wheel acceptance.
+- Treat an empty A2A security alternative as anonymous access, and record unsupported authentication semantics as unknown coverage.
 - Check each artifact named in an operator signer policy. An unrelated file with a valid hash can no longer satisfy an unmatched policy entry.
 - Reconcile repository dependency records during project validation and risk scoring. The drift gate now alerts on added delegations, removed controls and changes to other recorded relationships.
 - Read A2A v1 interface preferences and security requirements, and collect project-local Codex TOML declarations for sandbox access, approval policy and MCP servers.

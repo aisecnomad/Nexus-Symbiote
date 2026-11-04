@@ -7,6 +7,7 @@ hashing of tool definitions, prompt templates, and other mutable artifacts.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -26,6 +27,23 @@ def canonical_json(data: Any) -> str:
     Python values fail instead of being coerced into a different JSON value.
     """
     return rfc8785.dumps(data).decode("utf-8")
+
+
+SOURCE_BINDING_KEY_ENV = "NEXUS_SYMBIOTE_SOURCE_BINDING_KEY"
+
+
+def bind_source_values(config: dict[str, Any], *, profile: str) -> tuple[str, str] | None:
+    """Bind private source values without exporting a digest usable to guess secrets."""
+    key = os.environ.get(SOURCE_BINDING_KEY_ENV, "")
+    if not key:
+        return None
+    if len(key) < 32:
+        raise ValueError(f"{SOURCE_BINDING_KEY_ENV} must contain at least 32 characters")
+    material = key.encode("utf-8")
+    message = canonical_json({"profile": profile, "configuration": config})
+    mac = hmac.new(material, message.encode("utf-8"), "sha256").hexdigest()
+    key_id = hmac.new(material, b"nexus-symbiote/source-binding-key-id", "sha256").hexdigest()
+    return "hmac-sha256:" + mac, key_id[:32]
 
 
 def parse_json_strict(text: str | bytes, *, max_bytes: int = 4 * 1024 * 1024) -> Any:

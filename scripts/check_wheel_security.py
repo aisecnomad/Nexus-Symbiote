@@ -32,6 +32,8 @@ CASES = (
     "test_shadowscan_bridge_security.py::test_baseline_rejects_contradictory_shadowscan_diagnostics",
     "test_project_reconciliation.py::test_known_package_url_cannot_be_replaced_with_another_package",
     "test_mcp_source_binding.py::test_changed_launcher_rejects_unchanged_baseline",
+    "test_a2a_source_binding.py",
+    "test_native_contract.py::test_dependency_edge_unknown_semantics_rejected_by_schema_model_and_cli",
     "test_mcp_source_binding.py::test_self_consistent_replacement_descriptor_is_not_source_corroboration",
     "test_scanner_error_redaction.py::test_invalid_model_config_retains_artifact_and_safe_failure_location",
     "test_ide_permission_semantics.py::test_cli_does_not_report_unrestricted_shell_declaration_as_clean",

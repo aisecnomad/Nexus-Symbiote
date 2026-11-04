@@ -14,7 +14,12 @@ from typing import Any
 from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
 from nexus_symbiote.core.enums import TrustTier
 from nexus_symbiote.core.hashing import TOOL_DEFINITION_HASH_VERSION
-from nexus_symbiote.core.models import A2AServerComponent, MCPServerComponent
+from nexus_symbiote.core.models import A2AClientComponent, A2AServerComponent, MCPServerComponent
+from nexus_symbiote.scanners.a2a import (
+    A2A_SOURCE_BINDING_FIELDS,
+    A2A_STATIC_MODES,
+    has_a2a_source_binding,
+)
 
 TRUST_TIER_ORDER = {
     TrustTier.INTERNAL_VERIFIED: 0,
@@ -284,6 +289,28 @@ class AIBOMDiffer:
 
     def _compare_components(self, old: Any, new: Any) -> list[dict[str, str]]:
         modifications: list[dict[str, str]] = []
+
+        if isinstance(old, (A2AClientComponent, A2AServerComponent)) and isinstance(
+            new, (A2AClientComponent, A2AServerComponent)
+        ):
+            if any(c.properties.get("collection_mode") in A2A_STATIC_MODES for c in (old, new)):
+                if not all(has_a2a_source_binding(c) for c in (old, new)):
+                    modifications.append(
+                        {
+                            "detail": "A2A source binding is unknown or incompatible; re-collect and review both snapshots.",
+                            "severity": "high",
+                        }
+                    )
+                elif any(
+                    old.properties.get(key) != new.properties.get(key)
+                    for key in A2A_SOURCE_BINDING_FIELDS
+                ):
+                    modifications.append(
+                        {
+                            "detail": "A2A source binding changed: endpoint, authentication, declaration values or binding key differ. Review before invocation.",
+                            "severity": "high",
+                        }
+                    )
 
         if isinstance(old, MCPServerComponent) and isinstance(new, MCPServerComponent):
             for label, before, after in (

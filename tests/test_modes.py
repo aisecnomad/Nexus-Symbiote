@@ -361,7 +361,10 @@ def test_every_static_command_runs_under_the_offline_guard(tmp_path):
     assert json.loads(verified)["contract_verified"] is True
 
 
-def test_documented_offline_demo_collects_every_surface(tmp_path):
+def test_documented_offline_demo_collects_every_surface(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "NEXUS_SYMBIOTE_SOURCE_BINDING_KEY", "offline-demo-test-key-at-least-32-characters"
+    )
     demo = REPOSITORY / "examples" / "demo-agent"
     if not demo.is_dir():
         pytest.skip("the demo project ships in the repository, not in the wheel")
