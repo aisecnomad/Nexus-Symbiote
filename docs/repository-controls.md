@@ -23,9 +23,10 @@ bypass actor/restrictions on a single-maintainer repository blocks the
 maintainer from merging their own pull requests, because GitHub does not
 count self-approval toward a required review. The interim file still binds
 `Verified CI` to the GitHub Actions app, enforces it for administrators, and
-disables force pushes and branch deletion — `scripts/check_repository_controls.py`
-only checks for those properties plus the enforced status check, not for
-required reviews, so the interim configuration satisfies the same
+disables force pushes and branch deletion. `scripts/check_repository_controls.py`
+checks only the enforced, Actions-bound status check, not required reviews,
+force pushes or deletion, which GitHub's branch metadata does not report without
+administration access; the interim configuration therefore satisfies the same
 publication preflight. Switch to the full configuration once a second
 reviewer can approve changes, rather than leaving the weaker one in place
 indefinitely.
