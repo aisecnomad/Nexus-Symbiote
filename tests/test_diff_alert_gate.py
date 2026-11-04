@@ -161,6 +161,53 @@ def test_relationship_only_changes_fail_the_ci_gate(tmp_path, relationship, remo
     assert relationship in alerts[0]["alert"]
 
 
+HOSTILE_REFS = (
+    "x\n::error title=Approved::drift gate passed",
+    "::error title=Approved::drift gate passed",
+    "ok ##[error]drift gate passed",
+    "x\r::add-mask::secret\u2028::warning::y\x85::notice::z",
+)
+
+
+@pytest.mark.parametrize("remove", [False, True])
+def test_dependency_refs_cannot_forge_workflow_commands(tmp_path, remove):
+    from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
+    from nexus_symbiote.core.models import AgentComponent
+
+    refs = ("front", *HOSTILE_REFS)
+    bom = AIBOM(components=[AgentComponent(bom_ref=ref, name="agent") for ref in refs])
+    before, after = tmp_path / "before.json", tmp_path / "after.json"
+    bom.save(after if remove else before)
+    for ref in HOSTILE_REFS:
+        bom.add_dependency(
+            DependencyEdge(
+                source_ref="front", target_ref=ref, relationship="delegates-to", conditions=ref
+            )
+        )
+        bom.add_dependency(
+            DependencyEdge(source_ref=ref, target_ref="front", relationship="depends-on")
+        )
+    bom.save(before if remove else after)
+    runner = CliRunner()
+    diff = ["diff", str(before), str(after), "--fail-on-alert"]
+    text = runner.invoke(main, diff)
+    data = runner.invoke(main, [*diff, "--json-output"])
+    for result in (text, data):
+        assert result.exit_code == 1, result.output
+        # The runner trims leading whitespace before reading a "::" command, and it
+        # reads the legacy "##[" form anywhere in a line.
+        lines = result.output.splitlines()
+        assert not [line for line in lines if line.lstrip().startswith("::")]
+        assert "##[" not in result.output
+    assert text.output.count("Dependency delegates-to from 'front' to ") == len(HOSTILE_REFS)
+    report = json.loads(data.stdout)
+    changed = report["dependencies_removed" if remove else "dependencies_added"]
+    targets = [*HOSTILE_REFS, *["front"] * len(HOSTILE_REFS)]
+    assert sorted(change["target"] for change in changed) == sorted(targets)
+    assert sorted(c["conditions"] for c in changed if c["conditions"]) == sorted(HOSTILE_REFS)
+    assert len(report["security_alerts"]) == 2 * len(HOSTILE_REFS)
+
+
 @pytest.mark.parametrize("remove", [False, True])
 def test_changed_edge_multiplicity_fails_the_gate(tmp_path, remove):
     from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
