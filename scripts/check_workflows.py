@@ -17,7 +17,15 @@ ALLOWED_EVENTS = frozenset({"push", "pull_request", "schedule", "workflow_dispat
 HOSTED_RUNNER = re.compile(r"(?:ubuntu|windows|macos)-[0-9a-z.-]+")
 # Contexts a pull request author or Action caller controls. A step that copies them
 # into GITHUB_ENV or GITHUB_PATH could set variables or executables for later steps.
-UNTRUSTED_CONTEXT = re.compile(r"\$\{\{[^}]*\b(?:github\.event\.|github\.head_ref|inputs\.)")
+# Expression names are case-insensitive, and a context can be reached through a
+# function argument, an index or the whole object, as in format('{0}', github.event.x),
+# github['event'] or toJSON(github). So match `inputs` in any use, and `github` in any
+# use other than a dotted property besides `event` and `head_ref`.
+UNTRUSTED_CONTEXT = re.compile(
+    r"(?<![\w.-])(?:inputs(?![\w-])"
+    r"|github(?![\w-])(?!\s*\.\s*(?!(?:event|head_ref)(?![\w-]))[a-z_]))",
+    re.IGNORECASE,
+)
 ENVIRONMENT_FILES = re.compile(r"\bGITHUB_(?:ENV|PATH)\b")
 
 
@@ -48,7 +56,25 @@ def _job_errors(path: Path, name: str, job: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _step_errors(path: Path, step: dict[str, Any], scope: str) -> list[str]:
+def _strings(value: object) -> list[str]:
+    if isinstance(value, dict):
+        value = [*value.keys(), *value.values()]
+    if isinstance(value, list):
+        return [text for child in value for text in _strings(child)]
+    return [value] if isinstance(value, str) else []
+
+
+def _untrusted(environments: tuple[object, ...]) -> bool:
+    # Search each whole value that holds an expression rather than each extracted
+    # expression: a `}}` inside a string literal would end an extraction early.
+    return any(
+        "${{" in text and UNTRUSTED_CONTEXT.search(text)
+        for environment in environments
+        for text in _strings(environment)
+    )
+
+
+def _step_errors(path: Path, step: dict[str, Any], scope: tuple[object, ...]) -> list[str]:
     errors = []
     uses = step.get("uses")
     configured = step.get("with")
@@ -61,7 +87,7 @@ def _step_errors(path: Path, step: dict[str, Any], scope: str) -> list[str]:
             errors.append(f"{path}: pass expressions through env, never script source")
     run = step.get("run")
     if isinstance(run, str) and ENVIRONMENT_FILES.search(run):
-        if UNTRUSTED_CONTEXT.search(scope + str(step.get("env", ""))):
+        if _untrusted((*scope, step.get("env"))):
             errors.append(f"{path}: untrusted context must not reach GITHUB_ENV or GITHUB_PATH")
     return errors
 
@@ -76,7 +102,7 @@ def check(path: Path) -> list[str]:
         steps = runs.get("steps") if isinstance(runs, dict) else None
         for step in steps if isinstance(steps, list) else []:
             if isinstance(step, dict):
-                errors.extend(_step_errors(path, step, ""))
+                errors.extend(_step_errors(path, step, ()))
     else:
         if _events(document) - ALLOWED_EVENTS:
             errors.append(
@@ -114,7 +140,7 @@ def check(path: Path) -> list[str]:
                 if not isinstance(needs, list) or set(needs) - jobs.keys():
                     errors.append(f"{path}: {name} references unknown prerequisites")
                 errors.extend(_job_errors(path, name, job))
-                scope = str(document.get("env", "")) + str(job.get("env", ""))
+                scope = (document.get("env"), job.get("env"))
                 for step in job["steps"]:
                     if isinstance(step, dict):
                         errors.extend(_step_errors(path, step, scope))

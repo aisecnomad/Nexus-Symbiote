@@ -356,6 +356,14 @@ CREDENTIALS = "actions/checkout must set persist-credentials: false"
 ENVIRONMENT_FILE = "untrusted context must not reach GITHUB_ENV or GITHUB_PATH"
 
 
+def environment_file_step(value):
+    return (
+        "      - env:\n"
+        f"          VALUE: {value}\n"
+        '        run: echo "VALUE=$VALUE" >> "$GITHUB_ENV"\n'
+    )
+
+
 @pytest.mark.parametrize(
     ("old", "new", "error"),
     [
@@ -394,6 +402,22 @@ ENVIRONMENT_FILE = "untrusted context must not reach GITHUB_ENV or GITHUB_PATH"
             '      - run: echo "$BRANCH" >> "$GITHUB_PATH"\n',
             ENVIRONMENT_FILE,
         ),
+        # A function argument, an index, the whole context or another letter case
+        # reaches the same untrusted values as the dotted property.
+        *[
+            ("      - run: echo safe\n", environment_file_step(value), ENVIRONMENT_FILE)
+            for value in (
+                "${{ format('{0}', github.event.pull_request.title) }}",
+                "${{ github.event['pull_request']['title'] }}",
+                "${{ github['head_ref'] }}",
+                "${{ toJSON(github.event) }}",
+                "${{ toJSON(github) }}",
+                "${{ GitHub.Head_Ref }}",
+                "${{ toJSON(inputs) }}",
+                # The string's `}}` must not end the search before the context.
+                "${{ format('}}{0}', github.event.pull_request.title) }}",
+            )
+        ],
     ],
 )
 def test_workflow_checker_rejects_privileged_unbounded_or_injectable_jobs(
@@ -406,6 +430,24 @@ def test_workflow_checker_rejects_privileged_unbounded_or_injectable_jobs(
     assert old in SAFE_WORKFLOW
     workflow.write_text(SAFE_WORKFLOW.replace(old, new, 1))
     assert checker.check(workflow) == [f"{workflow}: {error}"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "${{ github.event_name }}",
+        "${{ github.sha }}",
+        "${{ format('https://github.com/{0}', github.repository) }}",
+        "${{ steps.github.outputs.inputs }}",
+        "${{ secrets.GITHUB_TOKEN }}",
+    ],
+)
+def test_workflow_checker_accepts_trusted_contexts_in_environment_files(tmp_path, value):
+    checker = workflow_checker()
+    workflow = tmp_path / "workflow.yml"
+    step = environment_file_step(value)
+    workflow.write_text(SAFE_WORKFLOW.replace("      - run: echo safe\n", step, 1))
+    assert checker.check(workflow) == []
 
 
 def test_workflow_checker_rejects_action_inputs_reaching_environment_files(tmp_path):
