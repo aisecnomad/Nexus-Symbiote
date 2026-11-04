@@ -311,10 +311,110 @@ def test_workflow_checker_main_rejects_unsafe_workflows_under_either_extension(
     assert checker.main() == 1
     workflow.write_text(
         "on: pull_request\n"
+        "permissions:\n"
+        "  contents: read\n"
         "jobs:\n"
         "  test:\n"
         "    runs-on: ubuntu-latest\n"
+        "    timeout-minutes: 5\n"
         "    steps:\n"
         "      - run: echo safe\n"
     )
     assert checker.main() == 0
+
+
+def workflow_checker():
+    spec = importlib.util.spec_from_file_location(
+        "workflow_checker_policy", Path(__file__).parents[1] / "scripts" / "check_workflows.py"
+    )
+    assert spec is not None and spec.loader is not None
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    return checker
+
+
+SAFE_WORKFLOW = """\
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: echo safe
+"""
+SCRIPT_ACTION = "actions/github-script@" + "0" * 40
+TRIGGERS = "only push, pull_request, schedule and workflow_dispatch triggers are allowed"
+PERMISSIONS = "top-level permissions must be an explicit read-only mapping"
+TIMEOUT = "test must set a positive integer timeout-minutes"
+RUNNER = "test must run on GitHub-hosted runner labels"
+CREDENTIALS = "actions/checkout must set persist-credentials: false"
+ENVIRONMENT_FILE = "untrusted context must not reach GITHUB_ENV or GITHUB_PATH"
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "error"),
+    [
+        ("on: pull_request", "on: [push, pull_request_target]", TRIGGERS),
+        ("on: pull_request", "on:\n  workflow_run:\n    workflows: [CI]", TRIGGERS),
+        ("on: pull_request", "on: issue_comment", TRIGGERS),
+        ("permissions:\n  contents: read\n", "", PERMISSIONS),
+        ("permissions:\n  contents: read\n", "permissions: write-all\n", PERMISSIONS),
+        ("contents: read", "contents: write", PERMISSIONS),
+        ("    timeout-minutes: 5\n", "", TIMEOUT),
+        ("    timeout-minutes: 5\n", "    timeout-minutes: '${{ inputs.minutes }}'\n", TIMEOUT),
+        ("runs-on: ubuntu-latest", "runs-on: [self-hosted, linux]", RUNNER),
+        # A self-hosted runner can be selected by a custom label alone.
+        ("runs-on: ubuntu-latest", "runs-on: gpu-builder", RUNNER),
+        ("        with:\n          persist-credentials: false\n", "", CREDENTIALS),
+        ("persist-credentials: false", "persist-credentials: true", CREDENTIALS),
+        (
+            "      - run: echo safe\n",
+            f"      - uses: {SCRIPT_ACTION}\n"
+            "        with:\n"
+            "          script: console.log('${{ github.event.issue.title }}')\n",
+            "pass expressions through env, never script source",
+        ),
+        (
+            "      - run: echo safe\n",
+            "      - env:\n"
+            "          TITLE: ${{ github.event.pull_request.title }}\n"
+            '        run: echo "TITLE=$TITLE" >> "$GITHUB_ENV"\n',
+            ENVIRONMENT_FILE,
+        ),
+        (
+            "    steps:\n",
+            "    env:\n"
+            "      BRANCH: ${{ github.head_ref }}\n"
+            "    steps:\n"
+            '      - run: echo "$BRANCH" >> "$GITHUB_PATH"\n',
+            ENVIRONMENT_FILE,
+        ),
+    ],
+)
+def test_workflow_checker_rejects_privileged_unbounded_or_injectable_jobs(
+    tmp_path, old, new, error
+):
+    checker = workflow_checker()
+    workflow = tmp_path / "workflow.yml"
+    workflow.write_text(SAFE_WORKFLOW)
+    assert checker.check(workflow) == []
+    assert old in SAFE_WORKFLOW
+    workflow.write_text(SAFE_WORKFLOW.replace(old, new, 1))
+    assert checker.check(workflow) == [f"{workflow}: {error}"]
+
+
+def test_workflow_checker_rejects_action_inputs_reaching_environment_files(tmp_path):
+    checker = workflow_checker()
+    action = yaml.safe_load((Path(__file__).parents[1] / "action.yml").read_text())
+    path = tmp_path / "action.yml"
+    path.write_text(yaml.safe_dump(action))
+    assert checker.check(path) == []
+    install = next(s for s in action["runs"]["steps"] if "GITHUB_PATH" in s.get("run", ""))
+    install["env"]["SYMBIOTE_VENV_HINT"] = "${{ inputs.scan-path }}"
+    path.write_text(yaml.safe_dump(action))
+    assert checker.check(path) == [f"{path}: {ENVIRONMENT_FILE}"]
