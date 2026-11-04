@@ -1,10 +1,12 @@
-"""Adversarial acceptance cases for incomplete advisory and CodeQL evidence."""
+"""Adversarial acceptance cases for incomplete advisory, CodeQL and test-session evidence."""
 
 from __future__ import annotations
 
 import copy
 import importlib.util
 import json
+import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -200,6 +202,28 @@ def test_scheduled_advisory_audit_repeats_the_ci_audit_outside_publication_evide
         return normalized
 
     assert steps(scheduled["jobs"]["dependency-audit"]) == steps(ci["jobs"]["dependency-audit"])
+
+
+def test_session_guard_refuses_a_package_imported_from_another_checkout(monkeypatch, tmp_path):
+    # A virtual environment shared by several worktrees holds one editable install;
+    # the guard in another worktree's conftest must not accept it as its own source.
+    other = tmp_path / "other-worktree"
+    (other / "src" / "nexus_symbiote").mkdir(parents=True)
+    (other / "src" / "nexus_symbiote" / "__init__.py").write_text("")
+    (other / "tests").mkdir()
+    shutil.copyfile(ROOT / "tests" / "conftest.py", other / "tests" / "conftest.py")
+    spec = importlib.util.spec_from_file_location("other_conftest", other / "tests/conftest.py")
+    assert spec and spec.loader
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    monkeypatch.setattr(guard, "_regular_install", lambda: None)
+    with pytest.raises(pytest.UsageError, match="neither this checkout's"):
+        guard.pytest_sessionstart(None)
+    # A regular install, as when a built wheel is tested, is accepted from any checkout.
+    imported = importlib.util.find_spec("nexus_symbiote")
+    assert imported and imported.origin
+    monkeypatch.setattr(guard, "_regular_install", lambda: os.path.realpath(imported.origin))
+    guard.pytest_sessionstart(None)
 
 
 def test_unreadable_lock_fails_the_dependency_cli_closed(monkeypatch, tmp_path):
