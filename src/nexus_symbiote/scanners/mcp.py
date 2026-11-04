@@ -59,6 +59,11 @@ MAX_CODEX_LAYERS = 16
 _CODEX_APPROVAL_MODES = frozenset({"auto", "prompt", "writes", "approve"})
 # Launchers named in clear; any other command is a local path or name that may be private.
 _SHOWN_COMMANDS = frozenset({"npx", "bunx", "uvx", "pipx", "docker", "node", "python", "python3"})
+# Each recorded name of a Codex server is redacted against every secret value of
+# that server, and a nested layer can merge an ancestor's server in a few bytes.
+# Bound the names-by-secrets product over the collection: about a second of work.
+MAX_CODEX_REDACTION_WORK = 4_000_000
+_CODEX_REDACTION_LIMIT = "Codex configuration: MCP server redaction work limit exceeded"
 
 
 def is_codex_config(path: str) -> bool:
@@ -98,6 +103,15 @@ def merge_codex(earlier: Any, later: Any) -> Any:
     for key, value in later.items():
         merged[key] = merge_codex(merged[key], value) if key in merged else value
     return merged
+
+
+def _codex_redaction_work(config: dict[str, Any]) -> int:
+    """The names a validated Codex server record redacts, times its secret values."""
+    names = 4 + 2 * len(config.get("env_http_headers", {}))
+    for key in ("tools", "enabled_tools", "disabled_tools", "env_vars", "scopes", "args"):
+        names += len(config.get(key, ()))
+    secrets = len(config.get("env", {})) + len(config.get("http_headers", {}))
+    return names * max(secrets, 1)
 
 
 def _codex_server_policy(config: dict[str, Any], secrets: list[str]) -> dict[str, Any]:
@@ -254,6 +268,7 @@ class MCPScanner(Scanner):
             nested = [layer for layer in layers if layer != CODEX_CONFIG]
             # Server tables of the Codex layers read so far, ancestors first.
             codex_tables: list[tuple[str, PurePosixPath, dict[str, Any]]] = []
+            codex_work = 0
             for config_name in [*MCP_CONFIG_FILES, *nested]:
                 config_path = files.root / config_name
                 codex = is_codex_config(config_name)
@@ -304,6 +319,12 @@ class MCPScanner(Scanner):
                     ):
                         result.scan_failures.append(f"{config_name}: invalid server configuration")
                         continue
+                    if codex:
+                        codex_work += _codex_redaction_work(server_config)
+                        if codex_work > MAX_CODEX_REDACTION_WORK:
+                            if _CODEX_REDACTION_LIMIT not in result.scan_failures:
+                                result.scan_failures.append(_CODEX_REDACTION_LIMIT)
+                            continue
                     try:
                         mcp_comp, tool_comps = self._parse_server(
                             server_name,

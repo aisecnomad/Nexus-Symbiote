@@ -63,6 +63,29 @@ _UNPROMPTED = (
 _UNOBSERVED_ROOT = (
     "Codex writable or workspace root passes through an excluded directory; coverage is unknown"
 )
+# Resolving a profile copies the grants it inherits, and checking one iterates them.
+# Each directory resolves an ancestor profile once, but grants that grow along a long
+# `extends` chain, or a large profile selected in every layer, still multiply that
+# work. Bound the grant entries handled over the collection: well under a second.
+MAX_CODEX_PROFILE_WORK = 2_000_000
+_PROFILE_WORK_LIMIT = "Codex configuration: permission profile work limit exceeded"
+
+
+class _ProfileWorkError(Exception):
+    """Permission-profile resolution exceeded the collection's work limit."""
+
+
+def _spend(budget: list[int], work: int) -> None:
+    budget[0] -= work
+    if budget[0] < 0:
+        raise _ProfileWorkError
+
+
+def _copy_cost(earlier: Any, later: Any) -> int:
+    """The entries merge_codex copies when it merges `later` over `earlier`."""
+    if not (isinstance(earlier, dict) and isinstance(later, dict)):
+        return 0
+    return len(earlier) + sum(_copy_cost(earlier[k], v) for k, v in later.items() if k in earlier)
 
 
 def _resolve_root(path: str, base: PurePosixPath) -> str | None:
@@ -89,28 +112,58 @@ def _resolve_root(path: str, base: PurePosixPath) -> str | None:
     return "unobserved" if unobserved else None
 
 
-def _resolve_profile(name: str, catalog: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
-    """Return a custom profile's built-in base and its grants merged along `extends`."""
+_Resolved = tuple[str | None, dict[str, Any]]
+
+
+def _resolve_profile(
+    name: str, catalog: dict[str, Any], memo: dict[str, _Resolved], budget: list[int]
+) -> _Resolved:
+    """Return a custom profile's built-in base and its grants merged along `extends`.
+
+    `memo` holds the profiles already resolved against the same catalog, so each
+    ancestor of a long `extends` chain is merged once.
+    """
     chain: list[str] = []
-    while name not in CODEX_BUILT_IN_PROFILES:
-        if name in chain or name not in catalog:
+    seen: set[str] = set()
+    base: str | None = None
+    grants: dict[str, Any] = {}
+    while name not in memo:
+        if name in CODEX_BUILT_IN_PROFILES:
+            base = name
+            break
+        if name in seen or name not in catalog:
             raise ValueError("undefined or cyclic permission profile")
+        seen.add(name)
         chain.append(name)
         parent = catalog[name].get("extends")
         if parent is None:
             break
         name = parent
-    merged: dict[str, Any] = {}
+    else:
+        base, grants = memo[name]
     for item in reversed(chain):
-        merged = merge_codex(merged, {k: v for k, v in catalog[item].items() if k != "extends"})
-    return (name if name in CODEX_BUILT_IN_PROFILES else None), merged
+        own = {k: v for k, v in catalog[item].items() if k != "extends"}
+        _spend(budget, 1 + _copy_cost(grants, own))
+        grants = merge_codex(grants, own)
+        memo[item] = (base, grants)
+    return base, grants
 
 
-def _profile_writes(grants: dict[str, Any], directory: PurePosixPath) -> tuple[bool, set[str]]:
+def _profile_writes(
+    grants: dict[str, Any], directory: PurePosixPath, budget: list[int]
+) -> tuple[bool, set[str]]:
     """Report whether profile grants allow any writes, and how their roots resolve."""
     writes = False
     places: set[str | None] = set()
-    for path, access in grants.get("filesystem", {}).items():
+    filesystem = grants.get("filesystem", {})
+    roots = grants.get("workspace_roots", {})
+    _spend(
+        budget,
+        1
+        + len(roots)
+        + sum(len(access) if isinstance(access, dict) else 1 for access in filesystem.values()),
+    )
+    for path, access in filesystem.items():
         if path == "glob_scan_max_depth":
             continue
         for subpath, mode in access.items() if isinstance(access, dict) else [(".", access)]:
@@ -156,6 +209,8 @@ def _valid_approval(approval: Any) -> bool:
 def _codex_scope_mode(
     chain: list[tuple[str, PurePosixPath, dict[str, Any]]],
     catalog: dict[str, Any],
+    memo: dict[str, _Resolved],
+    budget: list[int],
     approval: Any,
     findings: set[tuple[RiskSeverity, str]],
 ) -> str | None:
@@ -172,9 +227,9 @@ def _codex_scope_mode(
             mode = CODEX_BUILT_IN_PROFILES[selected]
             writes = selected == ":workspace"
         elif selected is not None:
-            base, grants = _resolve_profile(selected, catalog)
+            base, grants = _resolve_profile(selected, catalog, memo, budget)
             mode = f"profile:{selected}"
-            writes = base == ":workspace" or _profile_writes(grants, PurePosixPath())[0]
+            writes = base == ":workspace" or _profile_writes(grants, PurePosixPath(), budget)[0]
     unprompted = approval == "never" or (
         isinstance(approval, dict) and not any(approval["granular"].values())
     )
@@ -575,68 +630,82 @@ class IDEAgentScanner(Scanner):
             declared.append((label, codex_scope(label), values))
         findings: set[tuple[RiskSeverity, str]] = set()
         root_mode: str | None = None
-        for index, (label, directory, values) in enumerate(declared):
-            chain = [layer for layer in declared[: index + 1] if codex_applies(layer[1], directory)]
-            catalog = _codex_catalog(chain)
-            # How each declared writable or workspace root resolves: see _resolve_root.
-            places: set[str | None] = set()
-            profiles = values.get("permission_profiles", {})
-            for name in list(profiles):
-                try:
-                    base, grants = _resolve_profile(name, catalog)
-                except ValueError:
-                    result.scan_failures.append(f"{label}: invalid permission profile declaration")
-                    del profiles[name]
-                    continue
-                places |= _profile_writes(grants, directory)[1]
-                findings.update(
-                    finding
-                    for finding, present in (
-                        (_FULL_ACCESS, base == ":danger-full-access"),
-                        (_NETWORK, grants.get("network_enabled") is True),
+        budget = [MAX_CODEX_PROFILE_WORK]
+        try:
+            for index, (label, directory, values) in enumerate(declared):
+                chain = [
+                    layer for layer in declared[: index + 1] if codex_applies(layer[1], directory)
+                ]
+                catalog = _codex_catalog(chain)
+                memo: dict[str, _Resolved] = {}
+                # How each declared writable or workspace root resolves: see _resolve_root.
+                places: set[str | None] = set()
+                profiles = values.get("permission_profiles", {})
+                for name in list(profiles):
+                    try:
+                        base, grants = _resolve_profile(name, catalog, memo, budget)
+                    except ValueError:
+                        result.scan_failures.append(
+                            f"{label}: invalid permission profile declaration"
+                        )
+                        del profiles[name]
+                        continue
+                    places |= _profile_writes(grants, directory, budget)[1]
+                    findings.update(
+                        finding
+                        for finding, present in (
+                            (_FULL_ACCESS, base == ":danger-full-access"),
+                            (_NETWORK, grants.get("network_enabled") is True),
+                        )
+                        if present
                     )
-                    if present
+                if not profiles:
+                    values.pop("permission_profiles", None)
+                # An override that broke a profile was removed above; resolve the rest.
+                catalog = _codex_catalog(chain)
+                memo = {}
+                selected = values.get("default_permissions")
+                if selected is not None and selected not in CODEX_BUILT_IN_PROFILES:
+                    try:
+                        _resolve_profile(selected, catalog, memo, budget)
+                    except ValueError:
+                        result.scan_failures.append(
+                            f"{label}: unsupported declared permission profile"
+                        )
+                        del values["default_permissions"]
+                workspace = values.get("sandbox_workspace_write", {})
+                # Codex resolves a layer's relative writable roots against its .codex folder.
+                places.update(
+                    _resolve_root(path, directory / ".codex")
+                    for path in workspace.get("writable_roots", [])
                 )
-            if not profiles:
-                values.pop("permission_profiles", None)
-            # An override that broke a profile was removed above; resolve the rest.
-            catalog = _codex_catalog(chain)
-            selected = values.get("default_permissions")
-            if selected is not None and selected not in CODEX_BUILT_IN_PROFILES:
-                try:
-                    _resolve_profile(selected, catalog)
-                except ValueError:
-                    result.scan_failures.append(f"{label}: unsupported declared permission profile")
-                    del values["default_permissions"]
-            workspace = values.get("sandbox_workspace_write", {})
-            # Codex resolves a layer's relative writable roots against its .codex folder.
-            places.update(
-                _resolve_root(path, directory / ".codex")
-                for path in workspace.get("writable_roots", [])
-            )
-            if "outside" in places:
-                findings.add(_OUTSIDE)
-            if "unobserved" in places:
-                message = f"{label}: {_UNOBSERVED_ROOT}"
-                if message not in result.surfaces_excluded:
-                    result.surfaces_excluded.append(message)
-            if workspace.get("network_access") is True:
-                findings.add(_NETWORK)
-            if "danger-full-access" in {
-                values.get("sandbox_mode"),
-                CODEX_BUILT_IN_PROFILES.get(values.get("default_permissions", "")),
-            }:
-                findings.add(_FULL_ACCESS)
-            approval = _codex_approval(chain)
-            if not _valid_approval(approval):
-                # Codex refuses the merged policy, so no session runs with it here.
-                if "approval_policy" in values:
-                    kind = "invalid granular" if "granular" in approval else "unsupported declared"
-                    result.scan_failures.append(f"{label}: {kind} approval policy")
-                approval = None
-            mode = _codex_scope_mode(chain, catalog, approval, findings)
-            if directory == PurePosixPath():
-                root_mode = mode
+                if "outside" in places:
+                    findings.add(_OUTSIDE)
+                if "unobserved" in places:
+                    message = f"{label}: {_UNOBSERVED_ROOT}"
+                    if message not in result.surfaces_excluded:
+                        result.surfaces_excluded.append(message)
+                if workspace.get("network_access") is True:
+                    findings.add(_NETWORK)
+                if "danger-full-access" in {
+                    values.get("sandbox_mode"),
+                    CODEX_BUILT_IN_PROFILES.get(values.get("default_permissions", "")),
+                }:
+                    findings.add(_FULL_ACCESS)
+                approval = _codex_approval(chain)
+                if not _valid_approval(approval):
+                    # Codex refuses the merged policy, so no session runs with it here.
+                    if "approval_policy" in values:
+                        kind = (
+                            "invalid granular" if "granular" in approval else "unsupported declared"
+                        )
+                        result.scan_failures.append(f"{label}: {kind} approval policy")
+                    approval = None
+                mode = _codex_scope_mode(chain, catalog, memo, budget, approval, findings)
+                if directory == PurePosixPath():
+                    root_mode = mode
+        except _ProfileWorkError:
+            result.scan_failures.append(_PROFILE_WORK_LIMIT)
         for severity, detail in sorted(findings, key=lambda finding: finding[1]):
             risks.append(
                 RiskAssessment(

@@ -142,8 +142,12 @@ bound only by the keyed binding. Values the collectors cannot validate are
 collection failures, and settings they do not interpret, such as profile network
 proxy rules, `hooks` and `auto_review`, leave coverage incomplete. Codex TOML
 larger than 256 KiB, nested more than 32 levels or with more than 16 unquoted
-dots on one line is recorded as a collection failure without being parsed. User,
-managed and runtime settings and project trust remain unobserved.
+dots on one line is recorded as a collection failure without being parsed.
+Redacting each Codex MCP server's recorded names against its secret values, and
+resolving and checking permission profiles, are bounded over the collection
+(4 million name-by-secret checks and 2 million grant entries); past either
+bound the collection fails instead of running for minutes. User, managed and
+runtime settings and project trust remain unobserved.
 
 Integrity validation reports a tool descriptor's internal consistency separately
 from a fresh local configuration match. A matching digest contained only in the
