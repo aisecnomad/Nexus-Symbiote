@@ -802,7 +802,13 @@ def test_unencodable_text_never_crashes_an_export(tmp_path, case, output_format)
     if output_format == "json":
         completeness = AIBOM.load(output).metadata.completeness
         assert completeness is not None
-        assert "a2a: component text cannot be encoded for export" in completeness.scan_failures
+        # A client URL is validated before export, so its entry fails on its own first.
+        expected = (
+            "a2a.json: invalid A2A client field types"
+            if case == "client-url-host"
+            else "a2a: component text cannot be encoded for export"
+        )
+        assert expected in completeness.scan_failures
 
 
 @pytest.mark.parametrize("command", ["validate", "risk"])
