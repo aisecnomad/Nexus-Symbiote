@@ -631,3 +631,103 @@ def test_relative_subjects_still_reconcile_after_moving_or_renaming_a_checkout(t
         checked.exit_code == 0
         and json.loads(checked.stdout)["assessment_basis"] == "project-reconciled"
     )
+
+
+def test_absolute_source_paths_do_not_follow_a_moved_checkout(tmp_path):
+    root = tmp_path / "original" / "agent"
+    root.mkdir(parents=True)
+    (root / "AGENTS.md").write_text("Check scope.")
+    output = tmp_path / "bom.json"
+    runner = CliRunner()
+    assert (
+        runner.invoke(main, ["scan", str(root), "--no-project-policy", "-o", str(output)]).exit_code
+        == 0
+    )
+    prompt = AIBOM.load(output).get_component("prompt:AGENTS.md")
+    assert prompt is not None and Path(prompt.source_path).is_absolute()
+    moved = tmp_path / "relocated" / "agent"
+    moved.parent.mkdir()
+    root.rename(moved)
+    against = [str(output), "--project", str(moved), "--no-project-policy"]
+    validated = runner.invoke(main, ["validate", *against])
+    assert validated.exit_code == 1, validated.output
+    assert "Artifact path escapes the supplied project root" in validated.output
+
+
+def test_the_inferred_root_agent_name_is_not_evidence(tmp_path):
+    project, output, bom = _scanned(tmp_path, {"AGENTS.md": "Review requests."})
+    agent = next(c for c in bom.components if c.component_type.value == "agent")
+    assert agent.properties["identity_source"] == "repository-path"
+    agent.name = "payments-approval-agent"
+    bom.save(output)
+    against = [str(output), "--project", str(project), "--no-project-policy"]
+    assert CliRunner().invoke(main, ["validate", *against]).exit_code == 0
+    _assert_reconciled(project, output)
+
+
+def test_deployment_profiles_keep_their_producer_reported_state(tmp_path):
+    from datetime import UTC, datetime
+
+    from nexus_symbiote.core.evidence import AuthorityClaim, DeploymentProfile, EvidenceRecord
+
+    project, output, bom = _scanned(tmp_path, {"AGENTS.md": "Review requests."})
+    agent = next(c for c in bom.components if c.component_type.value == "agent")
+    now = datetime.now(UTC)
+    evidence = EvidenceRecord(
+        source="iam",
+        collector="exporter",
+        collected_at=now,
+        subject_digest="sha256:" + "0" * 64,
+        verification_status="verified",
+        verifier="verifier",
+        verification_policy="policy",
+        verified_at=now,
+    )
+    claim = AuthorityClaim(
+        kind="effective",
+        state="verified",
+        principal="agent",
+        action="deploy",
+        resource="prod",
+        evidence=[evidence],
+    )
+    agent.deployment_profile = DeploymentProfile(
+        deployment_id="prod", environment="production", authority=[claim]
+    )
+    bom.save(output)
+    against = [str(output), "--project", str(project), "--no-project-policy"]
+    assert CliRunner().invoke(main, ["validate", *against]).exit_code == 0
+    _assert_reconciled(project, output)
+
+
+def test_provides_tool_conditions_are_kept_as_supplied(tmp_path):
+    from nexus_symbiote.core.aibom import DependencyEdge
+    from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolComponent
+
+    project, output, bom = _scanned(tmp_path, {".mcp.json": TWO_SERVERS})
+    local = min(
+        (c for c in bom.components if isinstance(c, MCPServerComponent)), key=lambda c: c.name
+    )
+    served = ClaimEvidence(
+        assurance="observed", scope="served-descriptor", method="operator-pinned-stdio-tools-list"
+    )
+    tool = ToolComponent(
+        bom_ref="tool:observed",
+        name="observed",
+        mcp_server_ref=local.bom_ref,
+        assurance_level="observed",
+        claims={"tool_definition": served},
+    )
+    bom.add_component(tool)
+    local.tool_refs.append(tool.bom_ref)
+    bom.add_dependency(
+        DependencyEdge(
+            source_ref=local.bom_ref,
+            target_ref=tool.bom_ref,
+            relationship="provides-tool",
+            assurance_level="observed",
+            conditions="human approval enforced for every call",
+        )
+    )
+    bom.save(output)
+    _assert_reconciled(project, output)

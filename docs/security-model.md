@@ -42,13 +42,27 @@ provenance and does not verify it, so it can be linked to local subjects only as
 that command links a tool served by a local MCP server: through the tool's
 `mcp_server_ref`, that server's or an agent's `tool_refs`, and a `provides-tool`
 record from that server that claims no more assurance than the tool's own
-claims. Any other reference or dependency record between a local subject and a
-supplementary component fails reconciliation. So does `verified` assurance in a
-supplied component, claim, dependency record or completeness claim, or an
-`internal-verified` or `third-party-signed` trust tier on a supplementary
-component, because no offline check establishes them. Otherwise, fields and
-claims that no collector populates, and relationships among supplementary
-components, are accepted as supplied and not verified.
+claims. That record's `conditions` text is kept as supplied and is not evidence
+of a control; whether to accept only the text that `verify-live --record` writes
+remains a maintainer decision. Any other reference or dependency record between
+a local subject and a supplementary component fails reconciliation. So does
+`verified` assurance in a supplied component, claim, dependency record or
+completeness claim, or an `internal-verified` or `third-party-signed` trust tier
+on a supplementary component, because no offline check establishes them.
+Deployment-profile authority claims and evidence records are the exception: they
+keep their producer-reported state, including `verified`, as supplied and not
+verified; see [deployment-scoped authority claims](deployment-evidence.md).
+Carrying that state is what a profile is for, so whether reconciliation should
+reject it too remains a maintainer decision. Otherwise, fields and claims that no
+collector populates, and relationships among supplementary components, are
+accepted as supplied and not verified.
+
+Without `agent.yaml`, the repository agent's reference and name derive from the
+checkout path, so reconciliation takes both from the supplied BOM and compares
+only the agent's contents and relationships; its name is not evidence. `scan`
+records absolute `source_path` values, so a supplied BOM reconciles with a moved
+or renamed checkout only when those paths are relative to the project root.
+
 Without a project, `risk` scores the supplied claims
 and labels the result `supplied-bom`. For an operator-configured signature
 check, supply the trusted signer policy when validating the project. Each entry
