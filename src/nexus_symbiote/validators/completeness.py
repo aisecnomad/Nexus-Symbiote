@@ -281,12 +281,13 @@ class CompletenessValidator:
                 elif len(roots) == 1 and re.fullmatch(
                     r"agent:repository:[0-9a-f]{24}", roots[0].bom_ref
                 ):
-                    # This ID names a checkout path, not an artifact. Reconcile its
-                    # contents and bindings even when the checkout moved.
+                    # This ID and name derive from the checkout path, not from an
+                    # artifact. Rebind both so only contents and bindings are compared.
                     for edge in expected.dependencies:
                         if edge.source_ref == agent.bom_ref:
                             edge.source_ref = roots[0].bom_ref
                     agent.bom_ref = roots[0].bom_ref
+                    agent.name = roots[0].name
                 elif not roots and not any(
                     edge.source_ref == agent.bom_ref for edge in expected.dependencies
                 ):

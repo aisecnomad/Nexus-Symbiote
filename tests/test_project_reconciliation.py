@@ -359,7 +359,8 @@ def test_supplementary_relationships_cannot_exceed_their_own_observation(
     assert json.loads(result.stdout)["assessment_basis"] == "project-reconciliation-failed"
 
 
-def test_relative_subjects_still_reconcile_after_moving_a_checkout(tmp_path):
+@pytest.mark.parametrize("basename", ["agent", "agent-ci-clone"])
+def test_relative_subjects_still_reconcile_after_moving_or_renaming_a_checkout(tmp_path, basename):
     root = tmp_path / "original" / "agent"
     root.mkdir(parents=True)
     (root / "AGENTS.md").write_text("Check scope.")
@@ -371,11 +372,16 @@ def test_relative_subjects_still_reconcile_after_moving_a_checkout(tmp_path):
     prompt = bom.get_component("prompt:AGENTS.md")
     prompt.source_path = "AGENTS.md"
     bom.save(output)
-    moved = tmp_path / "relocated" / "agent"
+    moved = tmp_path / "relocated" / basename
     moved.parent.mkdir()
     root.rename(moved)
-    risk = ["risk", str(output), "--project", str(moved), "--no-project-policy", "--json-output"]
-    checked = runner.invoke(main, risk)
+    # The inferred root's reference and name both derive from the original path.
+    inferred = next(c for c in bom.components if c.component_type.value == "agent")
+    assert inferred.name == "agent"
+    against = [str(output), "--project", str(moved), "--no-project-policy"]
+    validated = runner.invoke(main, ["validate", *against])
+    assert validated.exit_code == 0, validated.output
+    checked = runner.invoke(main, ["risk", *against, "--json-output"])
     assert (
         checked.exit_code == 0
         and json.loads(checked.stdout)["assessment_basis"] == "project-reconciled"
