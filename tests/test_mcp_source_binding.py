@@ -345,6 +345,28 @@ def test_mcp_redaction_work_is_bounded(tmp_path, monkeypatch):
     assert set(_servers(result)) == {"other"}
 
 
+def test_long_strings_count_toward_mcp_redaction_work(tmp_path, monkeypatch):
+    # Each secret check scans the whole string, so one long description is costly.
+    monkeypatch.delenv(SOURCE_BINDING_KEY_ENV, raising=False)
+    config = {
+        "mcpServers": {
+            "wide": {
+                "command": "node",
+                "args": ["s.js"],
+                "env": {f"k{i}": f"v{i}" for i in range(20_000)},
+                "tools": [{"name": "t", "description": "x" * (1 << 20)}],
+            },
+            "other": {"command": "node", "args": ["s.js"]},
+        }
+    }
+    (tmp_path / ".mcp.json").write_text(json.dumps(config))
+    started = time.monotonic()
+    result = MCPScanner().scan(tmp_path)
+    assert time.monotonic() - started < 5
+    assert result.scan_failures == ["MCP configuration: MCP server redaction work limit exceeded"]
+    assert set(_servers(result)) == {"other"}
+
+
 def test_ordinary_mcp_configuration_is_within_the_redaction_budget(tmp_path, monkeypatch):
     monkeypatch.delenv(SOURCE_BINDING_KEY_ENV, raising=False)
     servers = {

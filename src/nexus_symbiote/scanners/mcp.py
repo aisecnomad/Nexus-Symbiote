@@ -63,8 +63,11 @@ _CODEX_APPROVAL_MODES = frozenset({"auto", "prompt", "writes", "approve"})
 _SHOWN_COMMANDS = frozenset({"npx", "bunx", "uvx", "pipx", "docker", "node", "python", "python3"})
 # Each recorded string of a server is redacted against every secret value of that
 # server, and a nested Codex layer can merge an ancestor's server in a few bytes.
-# Bound the strings-by-secrets product over the collection: about a second of work.
-MAX_CODEX_REDACTION_WORK = 4_000_000
+# Each check scans the whole string, so a string weighs its length plus a fixed cost
+# per check. Bound the weighted strings-by-secrets product over the collection:
+# about a second of work.
+_REDACTION_CHECK_COST = 100
+MAX_CODEX_REDACTION_WORK = 400_000_000
 _CODEX_REDACTION_LIMIT = "Codex configuration: MCP server redaction work limit exceeded"
 _JSON_REDACTION_LIMIT = "MCP configuration: MCP server redaction work limit exceeded"
 _KEY_FAILURE = (
@@ -116,32 +119,47 @@ def merge_codex(earlier: Any, later: Any) -> Any:
     return merged
 
 
-def _codex_redaction_work(config: dict[str, Any]) -> int:
-    """The names a validated Codex server record redacts, times its secret values."""
-    names = 4 + 2 * len(config.get("env_http_headers", {}))
-    for key in ("tools", "enabled_tools", "disabled_tools", "env_vars", "scopes", "args"):
-        names += len(config.get(key, ()))
+def _weight(strings: Iterable[Any]) -> int:
+    """The cost of checking each string against one secret value."""
+    return sum(_REDACTION_CHECK_COST + len(value) for value in strings if isinstance(value, str))
+
+
+def _codex_redaction_work(name: str, config: dict[str, Any]) -> int:
+    """The names a validated Codex server record redacts, weighted by length, times
+    its secret values."""
+    names = [name, *(config.get(k) for k in ("command", "url", "cwd", "bearer_token_env_var"))]
+    names += [config.get("http_headers_helper")]
+    for key in ("tools", "enabled_tools", "disabled_tools", "scopes", "args"):
+        names += list(config.get(key, ()))
+    for item in config.get("env_vars", ()):
+        names += [item] if isinstance(item, str) else [item["name"], item.get("source")]
+    for header, variable in config.get("env_http_headers", {}).items():
+        names += [header, variable]
     secrets = len(config.get("env", {})) + len(config.get("http_headers", {}))
-    return names * max(secrets, 1)
+    return (4 * _REDACTION_CHECK_COST + _weight(names)) * max(secrets, 1)
 
 
-def _json_redaction_work(config: dict[str, Any]) -> int:
-    """The strings a JSON server record redacts, times its distinct secret values.
+def _json_redaction_work(name: str, config: dict[str, Any]) -> int:
+    """The strings a JSON server record redacts, weighted by length, times its
+    distinct secret values.
 
     Without secrets, redaction costs only time linear in the bounded input.
     """
-    strings = 4 + len(config.get("args", []))
+    strings: list[Any] = [name, *(config.get(key) for key in ("command", "url", "endpoint"))]
+    strings += config.get("args", [])
+    work = 4 * _REDACTION_CHECK_COST
     pending: list[Any] = [config.get("tools", [])]
     while pending:
         value = pending.pop()
         if isinstance(value, dict):
-            strings += len(value)
+            work += _weight(value)
             pending.extend(value.values())
         elif isinstance(value, list):
             pending.extend(value)
         elif isinstance(value, str):
-            strings += 1
-    return strings * len({value for value in config.get("env", {}).values() if value})
+            work += _weight((value,))
+    work += _weight(strings)
+    return work * len({value for value in config.get("env", {}).values() if value})
 
 
 def _redacted_names(
@@ -199,9 +217,11 @@ def _codex_server_policy(config: dict[str, Any], secrets: list[str]) -> dict[str
             {"header": header, "env_var": variable} for header, variable in sorted(names.values())
         ]
     if "bearer_token_env_var" in config:
-        policy["bearer_token_env_var"] = redact_text(config["bearer_token_env_var"], secrets)
+        policy["bearer_token_env_var"] = redact_text(
+            config["bearer_token_env_var"], identity_secrets
+        )
     if "cwd" in config:
-        policy["cwd"] = redact_text(config["cwd"], secrets)
+        policy["cwd"] = redact_text(config["cwd"], identity_secrets)
     if "http_headers_helper" in config:
         # A local shell command line, which may carry an inline credential. Like a
         # stdio command, only a known launcher is named; the keyed binding covers the rest.
@@ -369,10 +389,10 @@ class MCPScanner(Scanner):
                         result.scan_failures.append(f"{config_name}: invalid server configuration")
                         continue
                     if codex:
-                        codex_work += _codex_redaction_work(server_config)
+                        codex_work += _codex_redaction_work(server_name, server_config)
                         over, limit = codex_work, _CODEX_REDACTION_LIMIT
                     else:
-                        json_work += _json_redaction_work(server_config)
+                        json_work += _json_redaction_work(server_name, server_config)
                         over, limit = json_work, _JSON_REDACTION_LIMIT
                     if over > MAX_CODEX_REDACTION_WORK:
                         if limit not in result.scan_failures:

@@ -177,8 +177,9 @@ CPU-seconds, and `scan`, `validate --project` and `risk --project` each run both
 Codex collectors.
 Redacting each MCP server's recorded names, strings and tool descriptors against
 its secret values, and resolving and checking permission profiles, are bounded
-over the collection (4 million string-by-secret checks for Codex layers and
-again for JSON configurations, and 2 million grant entries); past either
+over the collection (400 million character-by-secret checks for Codex layers
+and again for JSON configurations, each string weighing its length plus 100,
+and 2 million grant entries); past either
 bound the collection fails instead of running for minutes. User, managed and
 runtime settings and project trust remain unobserved.
 

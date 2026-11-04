@@ -412,6 +412,32 @@ def test_approval_change_beside_a_similar_name_fails_the_drift_gate(
     assert run.exit_code == 1, run.output
 
 
+@pytest.mark.parametrize(
+    "server",
+    [
+        SHORT_ENV + 'cwd = "srv{index}"\n',
+        '[mcp_servers.fs]\nurl = "https://mcp.example.test/mcp"\n'
+        'http_headers = { A = "1", B = "2" }\nbearer_token_env_var = "TOKEN{index}"\n',
+    ],
+    ids=["cwd", "bearer-token-env-var"],
+)
+def test_forwarded_name_change_beside_short_values_fails_the_drift_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server: str
+) -> None:
+    monkeypatch.delenv(SOURCE_BINDING_KEY_ENV, raising=False)
+    root = tmp_path / "project"
+    outputs = []
+    for index in (1, 2):
+        write_config(root, server.replace("{index}", str(index)))
+        output = tmp_path / f"bom{index}.json"
+        CliRunner().invoke(
+            main, ["scan", str(root), "--no-project-policy", "--report-only", "-o", str(output)]
+        )
+        outputs.append(str(output))
+    run = CliRunner().invoke(main, ["diff", *outputs, "--json-output", "--fail-on-alert"])
+    assert run.exit_code == 1, run.output
+
+
 @pytest.mark.parametrize("scanner", [MCPScanner, IDEAgentScanner])
 @pytest.mark.parametrize(
     "body",
