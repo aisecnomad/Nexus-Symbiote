@@ -1,5 +1,6 @@
 """Collect project-local Codex declarations without reading user settings or launching servers."""
 
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -143,3 +144,57 @@ def test_legacy_json_cannot_supply_toml_only_settings(tmp_path: Path) -> None:
     assert agent.permission_mode == "manual"
     assert "sandbox_mode" not in agent.properties
     assert not agent.risks
+
+
+@pytest.mark.parametrize("scanner", [MCPScanner, IDEAgentScanner])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "a." * 1000 + "a = 1\n",
+        "[" + "a." * 1000 + "a]\n",
+        "x = { " + "a." * 1000 + "a = 1 }\n",
+        "x = " + "[" * 5000 + "]" * 5000 + "\n",
+        'sandbox_mode = "read-only"\n' + "# padding\n" * 30_000,
+    ],
+)
+def test_costly_toml_is_refused_before_parsing(
+    tmp_path: Path, scanner: type[MCPScanner] | type[IDEAgentScanner], body: str
+) -> None:
+    write_config(tmp_path, body)
+    result = scanner().scan(tmp_path)
+    assert ".codex/config.toml: TOML size or structure limit exceeded" in result.scan_failures
+
+
+@pytest.mark.parametrize("scanner", [MCPScanner, IDEAgentScanner])
+def test_parser_recursion_is_a_recorded_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scanner: type[MCPScanner] | type[IDEAgentScanner],
+) -> None:
+    write_config(tmp_path, 'sandbox_mode = "danger-full-access"\n')
+
+    def recurse(_: str) -> dict[str, object]:
+        raise RecursionError
+
+    monkeypatch.setattr(tomllib, "loads", recurse)
+    result = scanner().scan(tmp_path)
+    assert ".codex/config.toml: TOML mapping parse failed" in result.scan_failures
+
+
+def test_dots_in_strings_comments_and_quoted_keys_are_not_key_parts(tmp_path: Path) -> None:
+    dotted = ".".join(["part"] * 40)
+    write_config(
+        tmp_path,
+        f"""# {dotted}
+sandbox_mode = "read-only" # {dotted}
+"{dotted}" = '{dotted}'
+notes = \"\"\"
+{dotted}
+\"\"\"
+[mcp_servers.local]
+command = "npx"
+args = ["{dotted}@1.2.3", '''{dotted}''']
+""",
+    )
+    for scanner in (MCPScanner, IDEAgentScanner):
+        assert not scanner().scan(tmp_path).scan_failures

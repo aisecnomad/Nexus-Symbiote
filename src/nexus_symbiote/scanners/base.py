@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
@@ -17,6 +18,78 @@ from nexus_symbiote.utils.confined import ConfinedCollection
 
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
 MAX_MODEL_BYTES = 1024 * 1024 * 1024
+# tomllib is pure Python: its cost grows quadratically with the parts of one
+# dotted key or table header, and every input byte is slow. These bounds keep a
+# hostile agent configuration file to well under a second of parsing.
+MAX_TOML_BYTES = 256 * 1024
+MAX_TOML_LINE_DOTS = 16
+MAX_TOML_NESTING = 32
+_TOML_SIGNIFICANT = re.compile(r"[\n#\"'.\[\]{}]")
+_TOML_BASIC_STRING = re.compile(r'[\n"\\]')
+
+
+def toml_exceeds_limits(text: str) -> bool:
+    """Bound the dotted-key parts and nesting tomllib would process, in linear time.
+
+    Keys never span lines, so the unquoted dots on one line bound the parts of
+    any key on it. A malformed prefix is refused by tomllib before it is reached.
+    """
+    if len(text.encode("utf-8", "surrogatepass")) > MAX_TOML_BYTES:
+        return True
+    dots = depth = 0
+    position = 0
+    while match := _TOML_SIGNIFICANT.search(text, position):
+        char, start = match.group(), match.start()
+        position = start + 1
+        if char == "\n":
+            dots = 0
+        elif char == ".":
+            dots += 1
+            if dots > MAX_TOML_LINE_DOTS:
+                return True
+        elif char in "[{":
+            depth += 1
+            if depth > MAX_TOML_NESTING:
+                return True
+        elif char in "]}":
+            depth = max(depth - 1, 0)
+        else:
+            if char == "#":
+                end = text.find("\n", start)
+            elif text.startswith(char * 3, start):
+                end = _toml_multiline_end(text, start + 3, char)
+            elif char == "'":
+                end = text.find("'", position)
+            else:
+                end = _toml_basic_end(text, position)
+            end = len(text) if end < 0 else end
+            if text.find("\n", start, end) >= 0:
+                dots = 0
+            position = end if char == "#" else end + 1
+    return False
+
+
+def _toml_basic_end(text: str, position: int) -> int:
+    while match := _TOML_BASIC_STRING.search(text, position):
+        if match.group() == "\\":
+            position = match.end() + 1
+            continue
+        return match.start()
+    return -1
+
+
+def _toml_multiline_end(text: str, position: int, quote: str) -> int:
+    while (end := text.find(quote * 3, position)) >= 0:
+        escapes = len(text[position:end]) - len(text[position:end].rstrip("\\"))
+        if quote == '"' and escapes % 2:
+            position = end + 1
+            continue
+        # Like tomllib, take up to two further quotes as string content.
+        extra = 0
+        while extra < 2 and text.startswith(quote, end + 3 + extra):
+            extra += 1
+        return end + 2 + extra
+    return -1
 
 
 def read_regular_text(path: Path, *, max_bytes: int = MAX_CONFIG_BYTES) -> str:
@@ -126,9 +199,16 @@ class Scanner(ABC):
             if text is None:
                 return None
             try:
+                label = path.relative_to(self._files.root).as_posix()
+            except ValueError:
+                label = path.name
+            if toml_exceeds_limits(text):
+                result.scan_failures.append(f"{label}: TOML size or structure limit exceeded")
+                return None
+            try:
                 data = tomllib.loads(text)
             except (ValueError, RecursionError):
-                result.scan_failures.append(f"{path.name}: TOML mapping parse failed")
+                result.scan_failures.append(f"{label}: TOML mapping parse failed")
                 return None
         else:
             text = self._files.read_text(path, missing_ok=missing_ok)
