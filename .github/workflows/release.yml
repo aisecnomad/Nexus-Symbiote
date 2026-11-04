@@ -44,7 +44,10 @@ jobs:
         if: inputs.publish != 'none'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python scripts/check_repository_controls.py --repo "$GITHUB_REPOSITORY" --branch main --sha "$GITHUB_SHA"
+          PUBLISH_ENVIRONMENT: ${{ inputs.publish }}
+        run: >-
+          python scripts/check_repository_controls.py --repo "$GITHUB_REPOSITORY"
+          --branch main --sha "$GITHUB_SHA" --environment "$PUBLISH_ENVIRONMENT"
       # Build first, from an export of the checked-out commit: no file that a
       # later test or evidence step writes into the workspace can reach the sdist.
       - name: Export the checked-out commit for a clean, reproducible build

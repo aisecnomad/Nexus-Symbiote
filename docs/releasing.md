@@ -26,7 +26,12 @@ as described below.
    GitHub Enterprise Cloud. GitHub Actions must also be able to run: check
    *Billing & plans* if jobs end without starting.
 2. **Create two environments**, `testpypi` and `pypi`. Give each required reviewers,
-   enable *Prevent self-review*, and restrict deployments to `main`.
+   enable *Prevent self-review*, and restrict deployments to `main` with a single
+   *Selected branches and tags* rule for the branch `main`. The publication
+   preflight rejects any other deployment rule, including *Protected branches
+   only*. With one maintainer, *Prevent self-review* means a second reviewer
+   approves, or an administrator bypasses the rule; the preflight cannot detect
+   that bypass.
 3. **Create a pending trusted publisher on each index**, right before the first
    upload, because a pending publisher does not reserve the name:
    - PyPI: <https://pypi.org/manage/account/publishing/>
@@ -88,7 +93,10 @@ as described below.
    publication succeeded until the package index and the source revision agree.
 
 A `testpypi` or `pypi` run fails closed if its read-only preflight cannot establish
-the required branch controls and successful CI for the exact source commit.
+the required branch controls and successful CI for the exact source commit, or that
+the environment it is about to deploy to requires a reviewer with self-review
+prevented and allows deployments from `main` alone. A missing environment also
+fails: GitHub would otherwise create it, unprotected, on first use.
 Candidate runs remain available before those controls are configured; an
 inspectable candidate is not publication approval.
 

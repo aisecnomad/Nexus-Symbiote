@@ -56,15 +56,22 @@ enforcement, and verifies that `Verified CI` is required. It also requires the e
 source SHA to match the live branch head, the newest run of `.github/workflows/ci.yml`
 for that SHA to succeed in this repository on the expected branch, and exactly one
 successful `Verified CI`, `CodeQL policy` and `Dependency advisories` jobs in that
-run's latest attempt. An unbound status with the same name cannot satisfy the
-protection preflight. A pending or failed
+run's latest attempt. With `--environment pypi` or `--environment testpypi`, which
+the release workflow passes for the index it is about to publish to, it also
+requires that GitHub environment to exist, to have one required-reviewers rule
+that names a reviewer and prevents self-review, and to allow deployments from
+`main` alone through a single custom branch rule. A package index's trusted
+publisher accepts the release workflow file from any ref, so these environment
+settings, not the workflow's own `if:` conditions, stop a modified copy of the
+workflow on another branch from publishing. An unbound status with the same name
+cannot satisfy the protection preflight. A pending or failed
 newer run cannot be replaced by an older success. Missing or truncated job data,
 an API failure, redirects and an unprotected branch fail closed. The SHA defaults
 to `GITHUB_SHA`; local invocations must supply their reviewed commit explicitly.
 This limited preflight
-does not independently audit approval counts, bypass actors,
-environment configuration or package-index ownership; an administrator must
-review those separately. The preflight checks live state during the build; it
+does not independently audit approval counts, bypass actors (including an
+environment's administrator bypass) or package-index ownership; an administrator
+must review those separately. The preflight checks live state during the build; it
 does not lock GitHub settings or cancel a candidate after later administrative
 changes. Review the exact run and current controls at the environment approval.
 Candidate builds remain available while controls are
@@ -182,5 +189,7 @@ After step 1, a commit can reach `main`, including the maintainer's own, only
 after its `Verified CI` check has passed on a branch that is up to date with
 `main`. In practice that means a pull request. Step 2
 passes only once the newest CI run for the `main` head has succeeded. Configure
-the `pypi` environment's reviewers and main-only deployment restriction, and
-verify them independently, before requesting publication.
+the `testpypi` and `pypi` environments' reviewers and main-only deployment
+restriction as described in [releasing](releasing.md), and confirm them by adding
+`--environment testpypi` and then `--environment pypi` to step 2, before
+requesting publication.

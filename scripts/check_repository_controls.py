@@ -1,6 +1,6 @@
 """Require enforced checks and successful workflow evidence for the published SHA.
 
-Only read repository branch metadata. Administrative configuration is a separate
+Only read repository metadata. Administrative configuration is a separate
 operator action; a checked-in policy file does not protect a GitHub branch.
 """
 
@@ -21,6 +21,10 @@ GITHUB_ACTIONS_APP_ID = 15368
 REQUIRED_CI_JOBS = frozenset({"Verified CI", "CodeQL policy", "Dependency advisories"})
 CI_WORKFLOW = ".github/workflows/ci.yml"
 MAX_RESPONSE_BYTES = 1024 * 1024
+# Each index's trusted publisher accepts this repository's release workflow and its
+# environment from any ref, so the environment's reviewers and branch policy are what
+# stop a modified copy of the workflow on another branch from publishing.
+PUBLICATION_ENVIRONMENTS = frozenset({"pypi", "testpypi"})
 
 
 def evaluate(metadata: Any, required: frozenset[str] = REQUIRED_CHECKS) -> list[str]:
@@ -174,11 +178,67 @@ def evaluate_verification(
     return errors
 
 
+def fetch_environment(repo: str, name: str, token: str) -> tuple[Any, Any]:
+    if name not in PUBLICATION_ENVIRONMENTS:
+        raise ValueError("unsupported publication environment")
+    try:
+        environment = _fetch(repo, f"environments/{name}", token)
+    except HTTPError as error:
+        if error.code != 404:
+            raise
+        # GitHub would create a missing environment, unprotected, on first use.
+        error.close()
+        return None, None
+    policy = environment.get("deployment_branch_policy") if isinstance(environment, dict) else None
+    if isinstance(policy, dict) and policy.get("custom_branch_policies") is True:
+        listed = _fetch(repo, f"environments/{name}/deployment-branch-policies?per_page=100", token)
+        return environment, listed
+    return environment, None
+
+
+def evaluate_environment(environment: Any, policies: Any, *, name: str, branch: str) -> list[str]:
+    """Require a reviewer other than the dispatcher and deployments from the branch alone."""
+    if not isinstance(environment, dict) or environment.get("name") != name:
+        return [f"publication environment {name} is not configured"]
+    rules = environment.get("protection_rules")
+    if not isinstance(rules, list) or any(not isinstance(rule, dict) for rule in rules):
+        return [f"{name} environment protection metadata is malformed"]
+    errors = []
+    reviews = [rule for rule in rules if rule.get("type") == "required_reviewers"]
+    if (
+        len(reviews) != 1
+        or not isinstance(reviews[0].get("reviewers"), list)
+        or not reviews[0]["reviewers"]
+        or reviews[0].get("prevent_self_review") is not True
+    ):
+        errors.append(f"{name} environment must require a reviewer other than the dispatcher")
+    policy = environment.get("deployment_branch_policy")
+    listed = policies.get("branch_policies") if isinstance(policies, dict) else None
+    total = policies.get("total_count") if isinstance(policies, dict) else None
+    if (
+        not isinstance(policy, dict)
+        or policy.get("protected_branches") is not False
+        or policy.get("custom_branch_policies") is not True
+        or not isinstance(listed, list)
+        or type(total) is not int
+        or total != len(listed)
+        # A policy without a type predates tag policies and names a branch.
+        or [
+            (p.get("name"), p.get("type", "branch")) if isinstance(p, dict) else None
+            for p in listed
+        ]
+        != [(branch, "branch")]
+    ):
+        errors.append(f"{name} environment must allow deployments from {branch} alone")
+    return errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--branch", default="main")
     parser.add_argument("--sha", default=os.environ.get("GITHUB_SHA", ""))
+    parser.add_argument("--environment", choices=sorted(PUBLICATION_ENVIRONMENTS))
     args = parser.parse_args()
     try:
         if not _valid_sha(args.sha):
@@ -191,6 +251,13 @@ def main() -> int:
             errors.extend(
                 evaluate_verification(run, jobs, repo=args.repo, branch=args.branch, sha=args.sha)
             )
+        if args.environment is not None:
+            environment, policies = fetch_environment(args.repo, args.environment, token)
+            errors.extend(
+                evaluate_environment(
+                    environment, policies, name=args.environment, branch=args.branch
+                )
+            )
     except (HTTPError, URLError, OSError, ValueError, RecursionError):
         # Do not include response bodies, headers or credential-bearing error text.
         print(
@@ -202,7 +269,11 @@ def main() -> int:
         print("Repository controls: " + error, file=sys.stderr)
     if errors:
         return 1
-    print("Repository controls verified: protected branch and successful CI for the exact source.")
+    scope = f" and the reviewed {args.environment} environment" if args.environment else ""
+    print(
+        "Repository controls verified: protected branch and successful CI for the exact "
+        f"source{scope}."
+    )
     return 0
 
 
