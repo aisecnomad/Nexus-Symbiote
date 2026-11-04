@@ -194,12 +194,57 @@ def test_silent_peer_and_repeated_pagination_are_bounded(tmp_path, monkeypatch):
         inventory(), trusted_launchers=launcher(tmp_path, "import time; time.sleep(30)")
     ).complete
     assert time.monotonic() - start < 3
-    repeated = SERVER.replace("TOOLS", repr([TOOL])).replace(
+    # No tools on the repeated page: a repeated tool would be refused as a duplicate
+    # before the cursor check runs, so the case would pass without exercising it.
+    repeated = SERVER.replace("TOOLS", repr([])).replace(
         'result = {"tools": tools}', 'result = {"tools": tools, "nextCursor":"same"}'
     )
     assert not verify_mcp_servers(
         inventory(), trusted_launchers=launcher(tmp_path, repeated)
     ).complete
+
+
+LISTING = 'result = {"tools": tools}'
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "tools", "reason"),
+    [
+        ("2025-06-18", "2024-11-05", [TOOL], "unsupported MCP protocol version"),
+        ('"capabilities":{"tools":{}}', '"capabilities":{}', [TOOL], "not negotiated"),
+        ('"version":"1"}}', '"version":1}}', [TOOL], "not negotiated"),
+        ('"id": request["id"]', '"id": request["id"] + 1', [TOOL], "unexpected MCP response"),
+        (LISTING, 'result = {"tools": tools, "nextCursor":"same"}', [], "pagination cursor"),
+        (LISTING, 'result = {"tools": tools, "nextCursor":""}', [], "pagination cursor"),
+        (LISTING, 'result = {"tools": tools, "nextCursor":"c" * 257}', [], "pagination cursor"),
+        (LISTING, 'result = {"tools": {"weather": tools}}', [TOOL], "invalid or oversized"),
+        (LISTING, LISTING, [{**TOOL, "name": "weather\nforged"}], "invalid or duplicate"),
+        (LISTING, LISTING, [{**TOOL, "name": "x" * 257}], "invalid or duplicate"),
+    ],
+    ids=[
+        "protocol-version",
+        "tools-capability",
+        "server-info",
+        "response-id",
+        "repeated-cursor",
+        "empty-cursor",
+        "oversized-cursor",
+        "tool-list-type",
+        "unprintable-tool-name",
+        "oversized-tool-name",
+    ],
+)
+def test_handshake_and_listing_violations_fail_for_the_stated_reason(
+    tmp_path, old, new, tools, reason
+):
+    # verify_mcp_servers reports only that verification is incomplete, so check the
+    # launcher's own refusal to show which guard fired.
+    base = SERVER.replace("TOOLS", repr(tools))
+    source = base.replace(old, new)
+    assert old in base and (source != base or old == new)
+    policy = launcher(tmp_path, source)["mcp:weather"]
+    with pytest.raises(ValueError, match=reason):
+        stdio.list_pinned_tools(policy["command"], policy["sha256"])
 
 
 def test_peer_that_never_reads_requests_cannot_block_writes(tmp_path, monkeypatch):
