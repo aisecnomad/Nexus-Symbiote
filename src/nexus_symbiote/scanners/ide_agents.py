@@ -14,14 +14,294 @@ Discovers configurations for IDE-integrated AI coding agents:
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from nexus_symbiote.core.enums import RiskSeverity, TrustTier
 from nexus_symbiote.core.models import IDEAgentComponent, RiskAssessment, VerifiedExtensionComponent
 from nexus_symbiote.scanners.base import Scanner, ScanResult
-from nexus_symbiote.scanners.mcp import CODEX_CONFIG
+from nexus_symbiote.scanners.mcp import CODEX_CONFIG, codex_config_layers, is_codex_config
 from nexus_symbiote.utils.secrets import redact_text
+
+CODEX_BUILT_IN_PROFILES = {
+    ":read-only": "read-only",
+    ":workspace": "workspace-write",
+    ":danger-full-access": "danger-full-access",
+}
+_CODEX_SANDBOX_MODES = frozenset(CODEX_BUILT_IN_PROFILES.values())
+_CODEX_PROFILE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
+_CODEX_PROFILE_KEYS = frozenset(
+    {"description", "extends", "filesystem", "network", "workspace_roots"}
+)
+_CODEX_ACCESS = {"read": "read", "write": "write", "deny": "deny", "none": "deny"}
+_CODEX_WORKSPACE_PATHS = frozenset({":workspace_roots", ":project_roots"})
+_CODEX_TEMPORARY_PATHS = frozenset({":tmpdir", ":slash_tmp"})
+_CODEX_SPECIAL_PATHS = _CODEX_WORKSPACE_PATHS | _CODEX_TEMPORARY_PATHS | {":root", ":minimal"}
+_CODEX_WORKSPACE_WRITE_KEYS = ("network_access", "exclude_tmpdir_env_var", "exclude_slash_tmp")
+# auto_review instructs the automatic approver and hooks can answer permission
+# requests. Neither is interpreted, so declaring one leaves coverage unknown.
+_CODEX_UNINTERPRETED = ("auto_review", "hooks")
+_HOST_PATH = re.compile(r"[/\\~]|[A-Za-z]:")
+_FULL_ACCESS = (RiskSeverity.HIGH, "Codex declares unrestricted filesystem access.")
+_OUTSIDE = (RiskSeverity.HIGH, "Codex declares writable paths outside the workspace.")
+_NETWORK = (RiskSeverity.MEDIUM, "Codex declares sandbox network access.")
+_UNPROMPTED = (
+    RiskSeverity.MEDIUM,
+    "Codex declares workspace writes with no interactive escalation prompts.",
+)
+
+
+def _outside_workspace(path: str, base: PurePosixPath) -> bool:
+    """Lexically resolve a declared path; host-absolute and home paths are outside."""
+    if not path or _HOST_PATH.match(path):
+        return True
+    parts = list(base.parts)
+    for part in re.split(r"[/\\]", path):
+        if part == "..":
+            if not parts:
+                return True
+            parts.pop()
+        elif part not in {"", "."}:
+            parts.append(part)
+    return False
+
+
+def _merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Merge a later Codex layer over an earlier one, table by table."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        earlier = merged.get(key)
+        if isinstance(value, dict) and isinstance(earlier, dict):
+            merged[key] = _merge(earlier, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _resolve_profile(name: str, catalog: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+    """Return a custom profile's built-in base and its grants merged along `extends`."""
+    chain: list[str] = []
+    while name not in CODEX_BUILT_IN_PROFILES:
+        if name in chain or name not in catalog:
+            raise ValueError("undefined or cyclic permission profile")
+        chain.append(name)
+        parent = catalog[name].get("extends")
+        if parent is None:
+            break
+        name = parent
+    merged: dict[str, Any] = {}
+    for item in reversed(chain):
+        merged = _merge(merged, {k: v for k, v in catalog[item].items() if k != "extends"})
+    return (name if name in CODEX_BUILT_IN_PROFILES else None), merged
+
+
+def _profile_writes(grants: dict[str, Any], directory: PurePosixPath) -> tuple[bool, bool]:
+    """Report whether profile grants allow any writes, and any outside the workspace."""
+    writes = outside = False
+    for path, access in grants.get("filesystem", {}).items():
+        if path == "glob_scan_max_depth":
+            continue
+        for subpath, mode in access.items() if isinstance(access, dict) else [(".", access)]:
+            if mode != "write":
+                continue
+            writes = True
+            if path in _CODEX_WORKSPACE_PATHS:
+                outside |= subpath != "." and _outside_workspace(subpath, PurePosixPath())
+            else:
+                outside |= path not in _CODEX_TEMPORARY_PATHS
+    roots = grants.get("workspace_roots", {})
+    outside |= any(on and _outside_workspace(root, directory) for root, on in roots.items())
+    return writes, outside
+
+
+def _codex_catalog(chain: list[tuple[str, PurePosixPath, dict[str, Any]]]) -> dict[str, Any]:
+    catalog: dict[str, Any] = {}
+    for _, _, values in chain:
+        catalog = _merge(catalog, values.get("permission_profiles", {}))
+    return catalog
+
+
+def _codex_scope_mode(
+    chain: list[tuple[str, PurePosixPath, dict[str, Any]]],
+    catalog: dict[str, Any],
+    findings: set[tuple[RiskSeverity, str]],
+) -> str | None:
+    """Select the permission syntax as Codex does: the last layer declaring one wins,
+    and within a layer `default_permissions` takes precedence over `sandbox_mode`."""
+    mode = approval = None
+    writes = False
+    for _, _, values in chain:
+        approval = values.get("approval_policy", approval)
+        if "sandbox_mode" in values:
+            mode = values["sandbox_mode"]
+            writes = mode == "workspace-write"
+        selected = values.get("default_permissions")
+        if selected in CODEX_BUILT_IN_PROFILES:
+            mode = CODEX_BUILT_IN_PROFILES[selected]
+            writes = selected == ":workspace"
+        elif selected is not None:
+            base, grants = _resolve_profile(selected, catalog)
+            mode = f"profile:{selected}"
+            writes = base == ":workspace" or _profile_writes(grants, PurePosixPath())[0]
+    unprompted = approval == "never" or (
+        isinstance(approval, dict) and not any(approval["granular"].values())
+    )
+    if writes and unprompted:
+        findings.add(_UNPROMPTED)
+    return mode
+
+
+def _codex_declarations(label: str, data: dict[str, Any], result: ScanResult) -> dict[str, Any]:
+    """Validate the permission-bearing keys of one Codex layer; unknown is not safe."""
+    values: dict[str, Any] = {}
+    sandbox = data.get("sandbox_mode")
+    if sandbox is not None:
+        if isinstance(sandbox, str) and sandbox in _CODEX_SANDBOX_MODES:
+            values["sandbox_mode"] = sandbox
+        else:
+            result.scan_failures.append(f"{label}: invalid declared sandbox mode")
+    approval = data.get("approval_policy")
+    if approval is not None:
+        if isinstance(approval, str) and approval in {
+            "on-request",
+            "on-failure",
+            "untrusted",
+            "never",
+        }:
+            values["approval_policy"] = approval
+        elif isinstance(approval, dict) and set(approval) == {"granular"}:
+            granular = approval["granular"]
+            required = {"sandbox_approval", "rules", "mcp_elicitations"}
+            if (
+                isinstance(granular, dict)
+                and required
+                <= granular.keys()
+                <= required | {"request_permissions", "skill_approval"}
+                and all(isinstance(value, bool) for value in granular.values())
+            ):
+                values["approval_policy"] = {"granular": dict(granular)}
+            else:
+                result.scan_failures.append(f"{label}: invalid granular approval policy")
+        else:
+            result.scan_failures.append(f"{label}: unsupported declared approval policy")
+    reviewer = data.get("approvals_reviewer")
+    if reviewer is not None:
+        if isinstance(reviewer, str) and reviewer in {
+            "user",
+            "auto_review",
+            "guardian_subagent",
+        }:
+            # guardian_subagent is Codex's legacy alias for auto_review.
+            values["approvals_reviewer"] = "user" if reviewer == "user" else "auto_review"
+        else:
+            result.scan_failures.append(f"{label}: unsupported declared approvals reviewer")
+    selected = data.get("default_permissions")
+    if selected is not None:
+        if isinstance(selected, str) and (
+            selected in CODEX_BUILT_IN_PROFILES or _CODEX_PROFILE_NAME.fullmatch(selected)
+        ):
+            values["default_permissions"] = selected
+        else:
+            result.scan_failures.append(f"{label}: unsupported declared permission profile")
+    if "permissions" in data:
+        profiles = data["permissions"]
+        if not isinstance(profiles, dict):
+            result.scan_failures.append(f"{label}: invalid permission profile declaration")
+        else:
+            values["permission_profiles"] = {}
+            for name, profile in profiles.items():
+                grants = _codex_profile(label, name, profile, result)
+                if grants is None:
+                    result.scan_failures.append(f"{label}: invalid permission profile declaration")
+                else:
+                    values["permission_profiles"][name] = grants
+    if "sandbox_workspace_write" in data:
+        workspace = data["sandbox_workspace_write"]
+        roots = workspace.get("writable_roots", []) if isinstance(workspace, dict) else None
+        if (
+            isinstance(workspace, dict)
+            and workspace.keys() <= {"writable_roots", *_CODEX_WORKSPACE_WRITE_KEYS}
+            and isinstance(roots, list)
+            and all(isinstance(path, str) for path in roots)
+            and all(isinstance(workspace.get(k, False), bool) for k in _CODEX_WORKSPACE_WRITE_KEYS)
+        ):
+            values["sandbox_workspace_write"] = {
+                key: list(value) if key == "writable_roots" else value
+                for key, value in workspace.items()
+            }
+        else:
+            result.scan_failures.append(f"{label}: invalid sandbox_workspace_write declaration")
+    for key in _CODEX_UNINTERPRETED:
+        if key in data:
+            _codex_unknown(label, key, result)
+    return values
+
+
+def _codex_profile(
+    label: str, name: Any, profile: Any, result: ScanResult
+) -> dict[str, Any] | None:
+    """Normalize one [permissions] profile, or None when Codex would reject it."""
+    if (
+        not isinstance(name, str)
+        or not _CODEX_PROFILE_NAME.fullmatch(name)
+        or not isinstance(profile, dict)
+        or not profile.keys() <= _CODEX_PROFILE_KEYS
+        or not isinstance(profile.get("description", ""), str)
+    ):
+        return None
+    grants: dict[str, Any] = {}
+    parent = profile.get("extends")
+    if parent is not None:
+        if not isinstance(parent, str) or not (
+            parent in CODEX_BUILT_IN_PROFILES or _CODEX_PROFILE_NAME.fullmatch(parent)
+        ):
+            return None
+        grants["extends"] = parent
+    filesystem = profile.get("filesystem")
+    if filesystem is not None:
+        if not isinstance(filesystem, dict):
+            return None
+        entries: dict[str, Any] = {}
+        for path, access in filesystem.items():
+            if path == "glob_scan_max_depth":
+                if type(access) is not int or access < 1:
+                    return None
+                entries[path] = access
+                continue
+            if isinstance(access, str) and access in _CODEX_ACCESS:
+                mapped: Any = _CODEX_ACCESS[access]
+            elif isinstance(access, dict) and all(
+                isinstance(mode, str) and mode in _CODEX_ACCESS for mode in access.values()
+            ):
+                mapped = {subpath: _CODEX_ACCESS[mode] for subpath, mode in access.items()}
+            else:
+                return None
+            if path.startswith(":") and path not in _CODEX_SPECIAL_PATHS:
+                _codex_unknown(label, "permission profile path", result)
+                continue
+            entries[path] = mapped
+        grants["filesystem"] = entries
+    network = profile.get("network")
+    if network is not None:
+        if not isinstance(network, dict) or not isinstance(network.get("enabled", False), bool):
+            return None
+        if "enabled" in network:
+            grants["network_enabled"] = network["enabled"]
+        if network.keys() - {"enabled"}:
+            _codex_unknown(label, "permission profile network", result)
+    roots = profile.get("workspace_roots")
+    if roots is not None:
+        if not isinstance(roots, dict) or not all(isinstance(on, bool) for on in roots.values()):
+            return None
+        grants["workspace_roots"] = dict(roots)
+    return grants
+
+
+def _codex_unknown(label: str, setting: str, result: ScanResult) -> None:
+    message = f"{label}: Codex {setting} settings are not interpreted; coverage is unknown"
+    if message not in result.surfaces_excluded:
+        result.surfaces_excluded.append(message)
+
 
 IDE_AGENT_CONFIGS: dict[str, dict[str, Any]] = {
     "claude-code": {
@@ -99,9 +379,12 @@ class IDEAgentScanner(Scanner):
         result = ScanResult(scanner_name=self.name)
         with self._collection(project_root, result) as files:
             available = {path.as_posix() for path in files.iter_files()}
+            nested_codex = [
+                layer for layer in codex_config_layers(available, result) if layer != CODEX_CONFIG
+            ]
             for ide_type, config in IDE_AGENT_CONFIGS.items():
                 found: list[str] = []
-                for marker in config["markers"]:
+                for marker in [*config["markers"], *(nested_codex if ide_type == "codex" else [])]:
                     evidence = (
                         marker
                         if marker in available
@@ -119,9 +402,13 @@ class IDEAgentScanner(Scanner):
                 mode = self._extract_permission_mode(settings, ide_type, result)
                 risks: list[RiskAssessment] = []
                 codex_policy: dict[str, Any] = {}
-                if ide_type == "codex" and CODEX_CONFIG in found:
-                    codex_policy = self._codex_policy(settings, result, risks)
-                    mode = codex_policy.get("sandbox_mode", mode)
+                mcp_configs: list[str] = []
+                layers = [path for path in found if is_codex_config(path)]
+                if ide_type == "codex" and layers:
+                    codex_policy, codex_mode, mcp_configs = self._codex_policy(
+                        files.root, layers, result, risks
+                    )
+                    mode = codex_mode or mode
                 if self._has_broad_permissions(settings, ide_type, result):
                     risks.append(
                         RiskAssessment(
@@ -149,11 +436,6 @@ class IDEAgentScanner(Scanner):
                             recommendation="Document loading order, modification authority and approved digests.",
                         )
                     )
-                mcp_configs = (
-                    [CODEX_CONFIG]
-                    if ide_type == "codex" and CODEX_CONFIG in found and "mcp_servers" in settings
-                    else []
-                )
                 for config_name in config.get("mcp_config", []):
                     if config_name in available:
                         data = self._read_mapping(files.root / config_name, result)
@@ -205,7 +487,7 @@ class IDEAgentScanner(Scanner):
             "cursor": [".cursor/settings.json"],
             "windsurf": [".windsurf/settings.json"],
             "cline": [".cline/settings.json"],
-            "codex": [".codex/config.json", CODEX_CONFIG],
+            "codex": [".codex/config.json"],
         }
         merged: dict[str, Any] = {}
         # Keep declared allowances from every collected Claude settings layer.
@@ -238,77 +520,109 @@ class IDEAgentScanner(Scanner):
                             else:
                                 combined[key] = list(dict.fromkeys([*earlier, *current]))
                         data = {**data, "permissions": combined}
-                    if relative == CODEX_CONFIG:
-                        # The legacy JSON "agent" table is independent of Codex TOML.
-                        # TOML commonly uses "agent"/"agents" for unrelated settings.
-                        for key in ("sandbox_mode", "approval_policy", "mcp_servers"):
-                            if key in data:
-                                merged[key] = data[key]
-                    elif ide_type == "codex":
-                        # Only the legacy agent.permissionMode field comes from JSON.
+                    if ide_type == "codex":
+                        # Only the legacy agent.permissionMode field comes from JSON;
+                        # _codex_policy reads the TOML layers.
                         if "agent" in data:
                             merged["agent"] = data["agent"]
                     else:
                         merged.update(data)
         return merged or None
 
-    @staticmethod
     def _codex_policy(
-        settings: dict[str, Any], result: ScanResult, risks: list[RiskAssessment]
-    ) -> dict[str, Any]:
-        policy: dict[str, Any] = {}
-        sandbox = settings.get("sandbox_mode")
-        if sandbox is not None:
-            if isinstance(sandbox, str) and sandbox in {
-                "read-only",
-                "workspace-write",
-                "danger-full-access",
+        self, root: Path, layers: list[str], result: ScanResult, risks: list[RiskAssessment]
+    ) -> tuple[dict[str, Any], str | None, list[str]]:
+        """Interpret Codex TOML layers; return root declarations, root mode and MCP layers.
+
+        Codex merges every layer from the project root down to its working
+        directory, so each directory scope is evaluated with its ancestors.
+        """
+        declared: list[tuple[str, PurePosixPath, dict[str, Any]]] = []
+        mcp_configs: list[str] = []
+        for label in layers:
+            data = self._read_mapping(root / label, result)
+            if data is None:
+                continue
+            if "mcp_servers" in data:
+                mcp_configs.append(label)
+            values = _codex_declarations(label, data, result)
+            declared.append((label, PurePosixPath(label).parent.parent, values))
+        findings: set[tuple[RiskSeverity, str]] = set()
+        root_mode: str | None = None
+        for index, (label, directory, values) in enumerate(declared):
+            chain = [
+                layer
+                for layer in declared[: index + 1]
+                if layer[1] == directory or layer[1] in directory.parents
+            ]
+            catalog = _codex_catalog(chain)
+            profiles = values.get("permission_profiles", {})
+            for name in list(profiles):
+                try:
+                    base, grants = _resolve_profile(name, catalog)
+                except ValueError:
+                    result.scan_failures.append(f"{label}: invalid permission profile declaration")
+                    del profiles[name]
+                    continue
+                outside = _profile_writes(grants, directory)[1]
+                findings.update(
+                    finding
+                    for finding, present in (
+                        (_FULL_ACCESS, base == ":danger-full-access"),
+                        (_OUTSIDE, outside),
+                        (_NETWORK, grants.get("network_enabled") is True),
+                    )
+                    if present
+                )
+            if not profiles:
+                values.pop("permission_profiles", None)
+            # An override that broke a profile was removed above; resolve the rest.
+            catalog = _codex_catalog(chain)
+            selected = values.get("default_permissions")
+            if selected is not None and selected not in CODEX_BUILT_IN_PROFILES:
+                try:
+                    _resolve_profile(selected, catalog)
+                except ValueError:
+                    result.scan_failures.append(f"{label}: unsupported declared permission profile")
+                    del values["default_permissions"]
+            workspace = values.get("sandbox_workspace_write", {})
+            if any(
+                _outside_workspace(path, directory / ".codex")
+                for path in workspace.get("writable_roots", [])
+            ):
+                findings.add(_OUTSIDE)
+            if workspace.get("network_access") is True:
+                findings.add(_NETWORK)
+            if "danger-full-access" in {
+                values.get("sandbox_mode"),
+                CODEX_BUILT_IN_PROFILES.get(values.get("default_permissions", "")),
             }:
-                policy["sandbox_mode"] = sandbox
-            else:
-                result.scan_failures.append(f"{CODEX_CONFIG}: invalid declared sandbox mode")
-        approval = settings.get("approval_policy")
-        if approval is not None:
-            if isinstance(approval, str) and approval in {
-                "on-request",
-                "on-failure",
-                "untrusted",
-                "never",
-            }:
-                policy["approval_policy"] = approval
-            elif isinstance(approval, dict) and set(approval) == {"granular"}:
-                granular = approval["granular"]
-                required = {"sandbox_approval", "rules", "mcp_elicitations"}
-                if (
-                    isinstance(granular, dict)
-                    and required
-                    <= granular.keys()
-                    <= required | {"request_permissions", "skill_approval"}
-                    and all(isinstance(value, bool) for value in granular.values())
-                ):
-                    policy["approval_policy"] = {"granular": dict(granular)}
-                else:
-                    result.scan_failures.append(f"{CODEX_CONFIG}: invalid granular approval policy")
-            else:
-                result.scan_failures.append(f"{CODEX_CONFIG}: unsupported declared approval policy")
-        if sandbox == "danger-full-access" or (
-            sandbox == "workspace-write" and approval == "never"
-        ):
+                findings.add(_FULL_ACCESS)
+            mode = _codex_scope_mode(chain, catalog, findings)
+            if directory == PurePosixPath():
+                root_mode = mode
+        for severity, detail in sorted(findings, key=lambda finding: finding[1]):
             risks.append(
                 RiskAssessment(
-                    severity=RiskSeverity.HIGH
-                    if sandbox == "danger-full-access"
-                    else RiskSeverity.MEDIUM,
+                    severity=severity,
                     category="permission_scope",
-                    detail=(
-                        "Codex declares unrestricted filesystem access."
-                        if sandbox == "danger-full-access"
-                        else "Codex declares workspace writes with no interactive escalation prompts."
+                    detail=detail,
+                    recommendation=(
+                        "Review project trust and enforce sandbox and approval constraints "
+                        "at the host."
                     ),
-                    recommendation="Review project trust and enforce sandbox and approval constraints at the host.",
                 )
             )
-        return policy
+        properties: dict[str, Any] = {}
+        nested: dict[str, Any] = {}
+        for label, directory, values in declared:
+            if directory == PurePosixPath():
+                properties.update(values)
+            elif values:
+                nested[label] = values
+        if nested:
+            properties["nested_config_layers"] = nested
+        return properties, root_mode, mcp_configs
 
     def _extract_permission_mode(
         self, settings: dict[str, Any], ide_type: str, result: ScanResult

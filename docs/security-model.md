@@ -114,6 +114,25 @@ Verifying the remote endpoint and its enforcement requires separate evidence.
 
 Project validation compares static MCP records and configured tool fingerprints with fresh local evidence. A structure binding detects added or removed arguments, environment variables and tools. With `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` set, a keyed binding also detects same-version package swaps and changed argument, environment and endpoint values, without exporting anything a secret could be guessed from. MCP references include the relative configuration path and declared name. Legacy snapshots without the binding, or with name-only identities, need recollection; see [source reconciliation and migration](verification-source-binding.md). Python source declaration collection has bounded application-file coverage and reports unresolved or dynamic registrations as gaps.
 
+Codex loads a `.codex/config.toml` from each directory between the project root
+and its working directory. The collectors read every one in the project, up to
+16 layers (more are a collection failure), and evaluate each directory with the
+layers above it. The IDE record keeps each layer's sandbox mode, approval policy
+and reviewer, `default_permissions`, `[permissions]` profiles and
+`[sandbox_workspace_write]` settings. As in Codex, a layer's `default_permissions`
+takes precedence over its `sandbox_mode`. Full access by any route, including a
+profile that extends `:danger-full-access`, and writable paths outside the
+project are high-severity findings. Sandbox network access, and workspace writes
+with every approval prompt disabled, are medium-severity findings. Codex MCP
+server records keep tool approval modes, tool allow and deny lists and the names
+of forwarded environment variables, and the structure binding covers them
+without the operator key. Values the collectors cannot validate are collection
+failures, and settings they do not interpret, such as profile network proxy
+rules, `hooks` and `auto_review`, leave coverage incomplete. Codex TOML larger
+than 256 KiB, nested more than 32 levels or with more than 16 unquoted dots on
+one line is recorded as a collection failure without being parsed. User, managed
+and runtime settings and project trust remain unobserved.
+
 Integrity validation reports a tool descriptor's internal consistency separately
 from a fresh local configuration match. A matching digest contained only in the
 supplied BOM is not source evidence and leaves integrity unknown, including when

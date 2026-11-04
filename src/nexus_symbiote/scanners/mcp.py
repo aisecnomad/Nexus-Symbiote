@@ -4,7 +4,7 @@ Discovers MCP server configurations from:
   - .mcp.json (project-level MCP config)
   - claude_desktop_config.json
   - mcp.json
-  - .codex/config.toml (declared project settings)
+  - .codex/config.toml at the project root and in subdirectories (declared settings)
   - .cursor/mcp.json
   - package.json (mcp-related dependencies)
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import ipaddress
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -52,6 +53,57 @@ from nexus_symbiote.scanners.base import Scanner, ScanResult, sanitized_origin
 from nexus_symbiote.utils.secrets import REDACTED, redact_descriptor, redact_text
 
 CODEX_CONFIG = ".codex/config.toml"
+# Codex loads a .codex/config.toml from every directory between the project root
+# and its working directory, so each one in the tree is a configuration layer.
+MAX_CODEX_LAYERS = 16
+_CODEX_APPROVAL_MODES = frozenset({"auto", "prompt", "writes", "approve"})
+
+
+def is_codex_config(path: str) -> bool:
+    return path == CODEX_CONFIG or path.endswith("/" + CODEX_CONFIG)
+
+
+def codex_config_layers(paths: Iterable[str], result: ScanResult) -> list[str]:
+    """Root-relative Codex configuration layers, ancestors before descendants."""
+    layers = sorted(filter(is_codex_config, paths), key=lambda path: (path.count("/"), path))
+    if len(layers) > MAX_CODEX_LAYERS:
+        result.scan_failures.append(
+            f"Codex configuration: {MAX_CODEX_LAYERS}-layer collection limit exceeded"
+        )
+    return layers[:MAX_CODEX_LAYERS]
+
+
+def _codex_server_policy(config: dict[str, Any], secrets: list[str]) -> dict[str, Any]:
+    """Tool approval and host-environment forwarding; names only, never values."""
+    policy: dict[str, Any] = {}
+    modes = {
+        redact_text(name, secrets): entry["approval_mode"]
+        for name, entry in config.get("tools", {}).items()
+        if "approval_mode" in entry
+    }
+    if modes:
+        policy["tool_approval_modes"] = dict(sorted(modes.items()))
+    if "default_tools_approval_mode" in config:
+        policy["default_tools_approval_mode"] = config["default_tools_approval_mode"]
+    for key in ("enabled_tools", "disabled_tools"):
+        if key in config:
+            policy[key] = sorted({redact_text(name, secrets) for name in config[key]})
+    if "env_vars" in config:
+        forwarded = {
+            (redact_text(item, secrets), "local")
+            if isinstance(item, str)
+            else (redact_text(item["name"], secrets), item.get("source", "local"))
+            for item in config["env_vars"]
+        }
+        policy["env_vars"] = [
+            {"name": name, "source": source} for name, source in sorted(forwarded)
+        ]
+    return policy
+
+
+def _member(value: Any, allowed: frozenset[str]) -> bool:
+    return isinstance(value, str) and value in allowed
+
 
 MCP_CONFIG_FILES = [
     ".mcp.json",
@@ -146,9 +198,13 @@ class MCPScanner(Scanner):
         clients: dict[str, MCPClientComponent] = {}
 
         with self._collection(project_root, result) as files:
-            for config_name in MCP_CONFIG_FILES:
+            # One walk: every walk of a collection draws on the same entry budget.
+            sources = [] if config_only else list(files.iter_files())
+            layers = codex_config_layers((path.as_posix() for path in sources), result)
+            nested = [layer for layer in layers if layer != CODEX_CONFIG]
+            for config_name in [*MCP_CONFIG_FILES, *nested]:
                 config_path = files.root / config_name
-                codex = config_name == CODEX_CONFIG
+                codex = is_codex_config(config_name)
                 data = (
                     self._read_mapping(config_path, result)
                     if codex
@@ -206,7 +262,7 @@ class MCPScanner(Scanner):
                     client.properties["config_paths"].append(str(config_path))
             result.components.extend(clients.values())
             if not config_only:
-                self._scan_code_mcp_clients(files.root, result)
+                self._scan_code_mcp_clients(files.root, result, sources)
 
         if not found_any and not result.scan_failures and not result.surfaces_excluded:
             result.surfaces_scanned.append("mcp-config (no config files found)")
@@ -226,6 +282,33 @@ class MCPScanner(Scanner):
             headers = config.get("http_headers", {})
             if not isinstance(headers, dict) or not all(
                 isinstance(v, str) for v in headers.values()
+            ):
+                return False
+            if not all(
+                isinstance(entry, dict)
+                and entry.keys() <= {"approval_mode", "output_token_limit"}
+                and _member(entry.get("approval_mode", "auto"), _CODEX_APPROVAL_MODES)
+                and type(entry.get("output_token_limit", 1)) is int
+                and entry.get("output_token_limit", 1) > 0
+                for entry in tools.values()
+            ) or not _member(
+                config.get("default_tools_approval_mode", "auto"), _CODEX_APPROVAL_MODES
+            ):
+                return False
+            for key in ("enabled_tools", "disabled_tools"):
+                names = config.get(key, [])
+                if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                    return False
+            forwarded = config.get("env_vars", [])
+            if not isinstance(forwarded, list) or not all(
+                isinstance(item, str)
+                or (
+                    isinstance(item, dict)
+                    and item.keys() <= {"name", "source"}
+                    and isinstance(item.get("name"), str)
+                    and _member(item.get("source", "local"), frozenset({"local", "remote"}))
+                )
+                for item in forwarded
             ):
                 return False
         elif not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools):
@@ -258,7 +341,8 @@ class MCPScanner(Scanner):
         if self._files is None:
             raise RuntimeError("_parse_server called outside a _collection context")
         config_scope = config_path.relative_to(self._files.root).as_posix()
-        if config_scope == CODEX_CONFIG:
+        codex = is_codex_config(config_scope)
+        if codex:
             secrets.extend(value for value in config.get("http_headers", {}).values() if value)
         server_ref = (
             "mcp-server:" + hash_canonical({"config": config_scope, "name": name}).split(":", 1)[1]
@@ -277,20 +361,21 @@ class MCPScanner(Scanner):
             for tool in config.get("tools", [])
             if isinstance(tool, dict)
         )
+        codex_policy = _codex_server_policy(config, secrets) if codex else {}
+        structure = {
+            "fields": sorted(config),
+            "command": shown_command,
+            "transport": transport,
+            "endpoint": safe_endpoint,
+            "argument_count": len(args),
+            "environment_names": sorted(env),
+            "tool_names": tool_names,
+            "package_sources": _package_sources(args, secrets),
+        }
+        if codex:
+            structure["codex_tool_policy"] = codex_policy
         source_config_hash = hash_canonical(
-            {
-                "profile": STATIC_CONFIG_HASH_PROFILE,
-                "structure": {
-                    "fields": sorted(config),
-                    "command": shown_command,
-                    "transport": transport,
-                    "endpoint": safe_endpoint,
-                    "argument_count": len(args),
-                    "environment_names": sorted(env),
-                    "tool_names": tool_names,
-                    "package_sources": _package_sources(args, secrets),
-                },
-            }
+            {"profile": STATIC_CONFIG_HASH_PROFILE, "structure": structure}
         )
         value_binding = _value_binding(config)
 
@@ -370,8 +455,8 @@ class MCPScanner(Scanner):
             properties={
                 "collection_mode": "static-config",
                 **(
-                    {"declared_enabled": config.get("enabled", True)}
-                    if config_scope == CODEX_CONFIG
+                    {"declared_enabled": config.get("enabled", True), **codex_policy}
+                    if codex
                     else {}
                 ),
                 "launch_arguments_redacted": bool(args),
@@ -600,18 +685,18 @@ class MCPScanner(Scanner):
 
     @staticmethod
     def _detect_host_from_config(config_name: str) -> str | None:
+        if is_codex_config(config_name):
+            return "codex"
         return {
             ".mcp.json": "claude-code",
             ".claude/mcp.json": "claude-code",
             "claude_desktop_config.json": "claude-desktop",
             ".cursor/mcp.json": "cursor",
-            CODEX_CONFIG: "codex",
         }.get(config_name)
 
-    def _scan_code_mcp_clients(self, root: Path, result: ScanResult) -> None:
+    def _scan_code_mcp_clients(self, root: Path, result: ScanResult, sources: list[Path]) -> None:
         if self._files is None:
             raise RuntimeError("_scan_code_mcp_clients called outside a _collection context")
-        sources = list(self._files.iter_files())
         from nexus_symbiote.scanners.python_tools import collect_python_tools
         from nexus_symbiote.scanners.ts_tools import collect_typescript
 

@@ -65,13 +65,13 @@ Eight built-in collectors read declared configuration and artifacts from the pro
 
 | Collector | Reads | Records |
 | --- | --- | --- |
-| `mcp` | MCP config files (`.mcp.json`, `.claude/mcp.json`, `.cursor/mcp.json`, `claude_desktop_config.json`) and server source | Clients, servers, launchers, pinned versions, transports, endpoints, tool fingerprints |
+| `mcp` | MCP config files (`.mcp.json`, `.claude/mcp.json`, `.cursor/mcp.json`, `claude_desktop_config.json`, `mcp_servers` in each `.codex/config.toml`) and server source | Clients, servers, launchers, pinned versions, transports, endpoints, tool fingerprints, Codex tool approval and environment forwarding |
 | `model` | `.safetensors`, `.gguf`, `.ggml`, `.onnx`, Keras (`.h5`, `.hdf5`, `.keras`), `saved_model.pb` and pickle-family files (including `.ckpt`, `.pdparams`, `.dill` and compressed dumps), with their config | SHA-256 hashes, serialization safety, SafeTensors structure, signature status |
 | `prompt` | `CLAUDE.md`, `AGENTS.md`, `CODEX.md`, Copilot/Codex instructions, skill and command files | Instruction and skill digests, hidden-character findings |
 | `rag` | `rag_config.*`, `retrieval_config.json`, `vector_store_config.json` | Declared retrieval sources and controls |
 | `registry` | `package.json`, lockfiles, `requirements*.txt`, `pyproject.toml`, Dockerfiles | AI package identities, pins, lockfile integrity; container images and digests |
 | `a2a` | `.well-known/agent-card.json`, legacy agent cards, A2A client config | Preferred interface, advertised transports and endpoint origins, declared authentication |
-| `ide_agents` | Settings for Claude Code, Cursor, Codex (including `.codex/config.toml`), Windsurf, Cline, Copilot and others | Agent configuration, declared permissions and approval settings |
+| `ide_agents` | Settings for Claude Code, Cursor, Codex (each `.codex/config.toml` in the project), Windsurf, Cline, Copilot and others | Agent configuration, declared permissions (for Codex, sandbox modes, permission profiles and writable roots) and approval settings |
 | `shadowscan` | [Nexus-ShadowScan](https://github.com/Hunzee-VC/Nexus-ShadowScan) reports | Imported discovery claims, kept separate from local evidence |
 
 ### What it checks

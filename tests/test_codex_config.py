@@ -1,5 +1,6 @@
 """Collect project-local Codex declarations without reading user settings or launching servers."""
 
+import json
 import tomllib
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from click.testing import CliRunner
 
 from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import AIBOM
+from nexus_symbiote.core.hashing import SOURCE_BINDING_KEY_ENV
 from nexus_symbiote.core.models import IDEAgentComponent, MCPClientComponent, MCPServerComponent
 from nexus_symbiote.scanners.ide_agents import IDEAgentScanner
 from nexus_symbiote.scanners.mcp import MCPScanner
@@ -144,6 +146,134 @@ def test_legacy_json_cannot_supply_toml_only_settings(tmp_path: Path) -> None:
     assert agent.permission_mode == "manual"
     assert "sandbox_mode" not in agent.properties
     assert not agent.risks
+
+
+def test_workspace_writes_without_escalation_prompts_are_a_finding(tmp_path: Path) -> None:
+    write_config(tmp_path, 'sandbox_mode = "workspace-write"\napproval_policy = "never"\n')
+    agent = next(
+        c for c in IDEAgentScanner().scan(tmp_path).components if isinstance(c, IDEAgentComponent)
+    )
+    assert [(r.severity.value, r.category) for r in agent.risks] == [("medium", "permission_scope")]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '[mcp_servers.CANARY_SECRET]\nurl = "https://example.test"\nhttp_headers = { A = 1 }',
+        '[mcp_servers.CANARY_SECRET]\ncommand = "npx"\ntools = { x = "approve" }',
+        '[mcp_servers.CANARY_SECRET]\ncommand = "npx"\ntools.x.approval_mode = "CANARY_SECRET"',
+        '[mcp_servers.CANARY_SECRET]\ncommand = "npx"\ntools.x.CANARY_SECRET = 1',
+        '[mcp_servers.CANARY_SECRET]\ncommand = "npx"\ndefault_tools_approval_mode = "always"',
+        '[mcp_servers.CANARY_SECRET]\ncommand = "npx"\nenabled_tools = "CANARY_SECRET"',
+        '[mcp_servers.CANARY_SECRET]\ncommand = "npx"\ndisabled_tools = [1]',
+        '[mcp_servers.CANARY_SECRET]\ncommand = "npx"\nenv_vars = [1]',
+        '[mcp_servers.CANARY_SECRET]\ncommand = "npx"\nenv_vars = [{ name = "A", source = "x" }]',
+    ],
+)
+def test_malformed_codex_server_fields_are_incomplete(tmp_path: Path, body: str) -> None:
+    write_config(tmp_path, body)
+    result = MCPScanner().scan(tmp_path)
+    # Validation rejects the shape before any field is used.
+    assert result.scan_failures == [".codex/config.toml: invalid server configuration"]
+    assert not any(isinstance(c, MCPServerComponent) for c in result.components)
+    assert "CANARY_SECRET" not in repr(result)
+
+
+def test_codex_header_values_never_reach_the_bom(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    write_config(
+        root,
+        """[mcp_servers.hdrcanary8472915]
+url = "https://example.test/mcp"
+http_headers = { "X-Api-Key" = "hdrcanary8472915" }
+enabled_tools = ["hdrcanary8472915"]
+[mcp_servers.hdrcanary8472915.tools.hdrcanary8472915]
+approval_mode = "approve"
+""",
+    )
+    path = tmp_path / "bom.json"
+    run = CliRunner().invoke(
+        main, ["scan", str(root), "--no-project-policy", "--report-only", "-o", str(path)]
+    )
+    assert run.exit_code == 0, run.output
+    assert "hdrcanary8472915" not in path.read_text()
+    server = next(c for c in AIBOM.load(path).components if isinstance(c, MCPServerComponent))
+    assert server.properties["tool_approval_modes"] == {"***": "approve"}
+
+
+def test_codex_server_approval_and_forwarding_are_recorded(tmp_path: Path) -> None:
+    write_config(
+        tmp_path,
+        """[mcp_servers.fs]
+command = "npx"
+args = ["-y", "fs-server@1.2.3"]
+default_tools_approval_mode = "prompt"
+enabled_tools = ["read_file", "delete_file"]
+disabled_tools = ["exec"]
+env = { API_TOKEN = "CANARY_ENV_VALUE" }
+env_vars = ["HOME", { name = "GITHUB_TOKEN", source = "remote" }]
+[mcp_servers.fs.tools.delete_file]
+approval_mode = "approve"
+[mcp_servers.fs.tools.read_file]
+output_token_limit = 4000
+""",
+    )
+    result = MCPScanner().scan(tmp_path)
+    assert not result.scan_failures
+    server = next(c for c in result.components if isinstance(c, MCPServerComponent))
+    assert server.properties["tool_approval_modes"] == {"delete_file": "approve"}
+    assert server.properties["default_tools_approval_mode"] == "prompt"
+    assert server.properties["enabled_tools"] == ["delete_file", "read_file"]
+    assert server.properties["disabled_tools"] == ["exec"]
+    assert server.properties["env_vars"] == [
+        {"name": "GITHUB_TOKEN", "source": "remote"},
+        {"name": "HOME", "source": "local"},
+    ]
+    assert "CANARY_ENV_VALUE" not in repr(result)
+
+
+SERVER = '[mcp_servers.fs]\ncommand = "npx"\nargs = ["-y", "fs-server@1.2.3"]\n'
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (
+            '[mcp_servers.fs.tools.delete_file]\napproval_mode = "prompt"\n',
+            '[mcp_servers.fs.tools.delete_file]\napproval_mode = "approve"\n',
+        ),
+        ('default_tools_approval_mode = "prompt"\n', 'default_tools_approval_mode = "approve"\n'),
+        ('disabled_tools = ["delete_file", "exec"]\n', "disabled_tools = []\n"),
+        ('enabled_tools = ["read_file"]\n', 'enabled_tools = ["read_file", "exec"]\n'),
+        ('env_vars = ["HOME"]\n', 'env_vars = ["AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"]\n'),
+        ('env_vars = ["HOME"]\n', 'env_vars = [{ name = "HOME", source = "remote" }]\n'),
+    ],
+)
+def test_codex_server_policy_edits_fail_the_drift_gate_without_the_binding_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, before: str, after: str
+) -> None:
+    monkeypatch.delenv(SOURCE_BINDING_KEY_ENV, raising=False)
+    root = tmp_path / "project"
+    outputs = []
+    for index, body in enumerate((before, after)):
+        write_config(root, SERVER + body)
+        output = tmp_path / f"bom{index}.json"
+        CliRunner().invoke(
+            main, ["scan", str(root), "--no-project-policy", "--report-only", "-o", str(output)]
+        )
+        outputs.append(str(output))
+    run = CliRunner().invoke(main, ["diff", *outputs, "--json-output", "--fail-on-alert"])
+    assert run.exit_code == 1, run.output
+    assert json.loads(run.stdout)["total_changes"] > 0
+    # Reconciliation and the critical drift alert compare the structure binding.
+    before_server, after_server = (
+        next(c for c in AIBOM.load(Path(o)).components if isinstance(c, MCPServerComponent))
+        for o in outputs
+    )
+    assert (
+        before_server.properties["static_config_hash"]
+        != after_server.properties["static_config_hash"]
+    )
 
 
 @pytest.mark.parametrize("scanner", [MCPScanner, IDEAgentScanner])
