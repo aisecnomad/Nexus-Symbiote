@@ -132,6 +132,11 @@ class TestCycloneDXGenerator:
 
 
 class TestCycloneDXSchemaFormats:
+    """These formats are checked where the cyclonedx extra is installed, as in CI.
+
+    A core install leaves their checkers out; see test_format_checker_dependencies.
+    """
+
     def test_export_rejects_a_timestamp_outside_rfc3339(self):
         bom = _sample_aibom()
         # Python allows UTC offsets with seconds; RFC 3339 date-time does not.

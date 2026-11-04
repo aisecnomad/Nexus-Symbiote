@@ -69,15 +69,18 @@ approval. Independently authenticate the exact received bytes and the producer's
 policy before relying on the result. See [security model](security-model.md) and
 [ShadowScan integration](shadowscan-integration.md) for source verification.
 
-Schema validation, when exporting and in `verify-export`, includes the `format`
-assertions of the pinned CycloneDX schema: `date-time`, `date`, `idn-email`,
-`iri-reference` and `uri`. A malformed timestamp or IRI therefore fails the
-export or the check. The `date-time`, `iri-reference` and `uri` checkers come
-from the core `jsonschema[format-nongpl]` dependency, which the Action's locked
-environment also installs. jsonschema skips a `format` whose checker is not
-installed instead of failing, so install the package with its dependencies or
-from the provided locks. The SPDX 3.0.1 schema has no `format` assertions; it
-constrains timestamps with patterns.
+Schema validation, when exporting and in `verify-export`, checks a `format`
+assertion of the pinned CycloneDX schema only if jsonschema has a checker for it,
+and skips it otherwise. `date` and `idn-email` are always checked. `date-time`,
+`iri-reference` and `uri` are checked only where jsonschema's optional format
+checkers are installed, as with the `cyclonedx` or `all` extra, through
+cyclonedx-python-lib, and in CI. The core dependencies, and therefore the Action's
+locked environment, leave these checkers out on purpose. The `iri-reference`
+checker, rfc3987-syntax, takes CPU time and memory in proportion to the length of
+each IRI: several seconds and a few hundred megabytes for one IRI of 16,000
+characters. With the `cyclonedx` or `all` extra, run `verify-export` on exports
+from untrusted senders only under CPU and memory limits. The SPDX 3.0.1 schema has
+no `format` assertions; it constrains timestamps with patterns.
 
 ### Verification limits
 
