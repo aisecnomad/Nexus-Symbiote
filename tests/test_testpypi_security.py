@@ -89,3 +89,15 @@ def test_evidence_is_derived_only_from_the_uploaded_distribution_bytes():
     )
     assert staged < upload < recheck
     assert runs[recheck].index("distributions.sha256") < runs[recheck].index("evidence.py prepare")
+
+
+def test_wheel_gate_runs_codex_regressions_that_fail_on_a_stale_wheel():
+    # The full-access CLI case alone also passes on code without the Codex protections.
+    source = (ROOT / "scripts" / "check_wheel_security.py").read_text()
+    for node in (
+        "test_codex_permissions.py::test_cli_reports_profile_full_access_as_unsafe",
+        "test_codex_permissions.py::test_permission_changes_fail_the_drift_gate_without_the_binding_key",
+        "test_codex_config.py::test_codex_server_policy_edits_fail_the_drift_gate_without_the_binding_key",
+        "test_codex_layers.py::test_partial_overrides_pass_the_scan_gate",
+    ):
+        assert f'"{node}"' in source
