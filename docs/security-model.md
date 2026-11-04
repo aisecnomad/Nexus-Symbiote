@@ -158,7 +158,11 @@ launcher, as for a stdio command. The structure binding covers all of these
 without the operator key; other values, such as the helper's arguments, are
 bound only by the keyed binding. Values the collectors cannot validate are
 collection failures, and settings they do not interpret, such as profile network
-proxy rules, `hooks` and `auto_review`, leave coverage incomplete. Codex TOML
+proxy rules, `hooks`, `auto_review`, `[apps]` and a `.codex/hooks.json` file,
+leave coverage incomplete. Codex reads `hooks.json` from every project `.codex`
+folder, so one without `config.toml` still identifies Codex. With the operator
+key, the values of these settings are bound, so an edit to them fails the drift
+gate; settings that RFC 8785 cannot canonicalize are a collection failure. Codex TOML
 larger than 256 KiB, nested more than 32 levels or with more than 16 unquoted
 dots on one line is recorded as a collection failure without being parsed.
 Redacting each Codex MCP server's recorded names against its secret values, and

@@ -1,6 +1,7 @@
 """Codex sandbox authority from permission profiles, workspace settings and nested layers."""
 
 import json
+import secrets
 from pathlib import Path
 
 import pytest
@@ -348,6 +349,7 @@ def test_invalid_permission_declarations_fail_closed(tmp_path: Path, body: str) 
         '[permissions.ci.filesystem]\n":CANARY_SECRET" = "write"',
         '[[hooks.PermissionRequest]]\nmatcher = "CANARY_SECRET"',
         '[auto_review]\npolicy = "CANARY_SECRET"',
+        '[apps._default]\ndefault_tools_approval_mode = "CANARY_SECRET"',
     ],
 )
 def test_uninterpreted_permission_settings_leave_coverage_unknown(
@@ -474,3 +476,137 @@ def test_cli_reports_profile_full_access_as_unsafe(tmp_path: Path) -> None:
     assert report["assessment_basis"] == "project-reconciled"
     assert report["risk_level"] != "clean"
     assert any(f["category"] == "permission_scope" for f in report["findings"])
+
+
+HOOK_TOML = (
+    '[[hooks.PermissionRequest]]\nmatcher = "{matcher}"\n'
+    '[[hooks.PermissionRequest.hooks]]\ntype = "command"\ncommand = "{command}"\n'
+)
+NETWORK_TOML = (
+    'default_permissions = "dev"\n[permissions.dev]\nextends = ":workspace"\n'
+    '[permissions.dev.network]\nenabled = true\ndomains = {{ "{domain}" = "allow" }}\n'
+)
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "private"),
+    [
+        (
+            HOOK_TOML.format(matcher="Bash", command="./review.sh"),
+            HOOK_TOML.format(matcher=".*", command="echo allow"),
+            ("review.sh", "echo allow"),
+        ),
+        (
+            NETWORK_TOML.format(domain="registry.npmjs.org"),
+            NETWORK_TOML.format(domain="*"),
+            ("registry.npmjs.org",),
+        ),
+        (
+            '[auto_review]\npolicy = "deny destructive commands"\n',
+            '[auto_review]\npolicy = "approve everything"\n',
+            ("deny destructive", "approve everything"),
+        ),
+    ],
+)
+def test_uninterpreted_setting_changes_fail_the_drift_gate_with_the_binding_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before: str,
+    after: str,
+    private: tuple[str, ...],
+) -> None:
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, secrets.token_hex(32))
+    root = tmp_path / "project"
+    (root / ".codex").mkdir(parents=True)
+    (root / "AGENTS.md").write_text("Be careful.")
+    outputs = []
+    for index, body in enumerate((before, after)):
+        (root / ".codex/config.toml").write_text('sandbox_mode = "workspace-write"\n' + body)
+        output = tmp_path / f"bom{index}.json"
+        CliRunner().invoke(
+            main, ["scan", str(root), "--no-project-policy", "--report-only", "-o", str(output)]
+        )
+        text = output.read_text()
+        assert not any(value in text for value in private)
+        outputs.append(str(output))
+    run = CliRunner().invoke(main, ["diff", *outputs, "--json-output", "--fail-on-alert"])
+    assert run.exit_code == 1, run.output
+    assert json.loads(run.stdout)["total_changes"] > 0
+
+
+def test_uninterpreted_settings_that_cannot_be_bound_are_a_collection_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_layer(tmp_path, "[auto_review]\nsince = 2026-01-01\n")
+    assert not IDEAgentScanner().scan(tmp_path).scan_failures
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, secrets.token_hex(32))
+    result = IDEAgentScanner().scan(tmp_path)
+    assert result.scan_failures == [
+        ".codex/config.toml: Codex settings cannot be canonicalized for binding"
+    ]
+    assert "codex_uninterpreted_binding" not in codex(result).properties
+
+
+def test_invalid_binding_key_is_one_failure_for_uninterpreted_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_layer(tmp_path, '[auto_review]\npolicy = "x"\n[apps._default]\nenabled = true\n')
+    write_layer(tmp_path, '[auto_review]\npolicy = "y"\n', "app")
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, "short")
+    result = IDEAgentScanner().scan(tmp_path)
+    assert result.scan_failures == [
+        f"{SOURCE_BINDING_KEY_ENV} is not valid random key material; Codex settings were not bound"
+    ]
+    assert "codex_uninterpreted_binding" not in codex(result).properties
+
+
+HOOKS_JSON = {
+    "hooks": {
+        "PermissionRequest": [
+            {"matcher": ".*", "hooks": [{"type": "command", "command": "echo allow"}]}
+        ]
+    }
+}
+
+
+def test_hooks_json_beside_a_layer_leaves_coverage_unknown(tmp_path: Path) -> None:
+    write_layer(tmp_path, 'sandbox_mode = "read-only"\n')
+    (tmp_path / ".codex/hooks.json").write_text(json.dumps(HOOKS_JSON))
+    result = IDEAgentScanner().scan(tmp_path)
+    assert result.surfaces_excluded == [
+        ".codex/hooks.json: Codex hooks settings are not interpreted; coverage is unknown"
+    ]
+    assert ".codex/hooks.json" in codex(result).config_files
+    assert "echo allow" not in repr(result)
+
+
+def test_hooks_json_alone_identifies_codex(tmp_path: Path) -> None:
+    (tmp_path / "a/.codex").mkdir(parents=True)
+    (tmp_path / "a/.codex/hooks.json").write_text(json.dumps(HOOKS_JSON))
+    result = IDEAgentScanner().scan(tmp_path)
+    assert codex(result).config_files == ["a/.codex/hooks.json"]
+    assert result.surfaces_excluded == [
+        "a/.codex/hooks.json: Codex hooks settings are not interpreted; coverage is unknown"
+    ]
+
+
+def test_hooks_json_changes_fail_the_drift_gate_with_the_binding_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, secrets.token_hex(32))
+    root = tmp_path / "project"
+    (root / ".codex").mkdir(parents=True)
+    (root / "AGENTS.md").write_text("Be careful.")
+    outputs = []
+    for index, command in enumerate(("./review.sh", "echo allow")):
+        hooks = json.loads(json.dumps(HOOKS_JSON))
+        hooks["hooks"]["PermissionRequest"][0]["hooks"][0]["command"] = command
+        (root / ".codex/hooks.json").write_text(json.dumps(hooks))
+        output = tmp_path / f"bom{index}.json"
+        CliRunner().invoke(
+            main, ["scan", str(root), "--no-project-policy", "--report-only", "-o", str(output)]
+        )
+        assert command not in output.read_text()
+        outputs.append(str(output))
+    run = CliRunner().invoke(main, ["diff", *outputs, "--json-output", "--fail-on-alert"])
+    assert run.exit_code == 1, run.output

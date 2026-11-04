@@ -18,6 +18,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from nexus_symbiote.core.enums import RiskSeverity, TrustTier
+from nexus_symbiote.core.hashing import (
+    SOURCE_BINDING_KEY_ENV,
+    SourceBindingKeyError,
+    SourceBindingValueError,
+    bind_source_values,
+)
 from nexus_symbiote.core.models import IDEAgentComponent, RiskAssessment, VerifiedExtensionComponent
 from nexus_symbiote.scanners.base import Scanner, ScanResult
 from nexus_symbiote.scanners.mcp import (
@@ -51,9 +57,15 @@ _CODEX_WORKSPACE_WRITE_KEYS = ("network_access", "exclude_tmpdir_env_var", "excl
 _CODEX_APPROVAL_POLICIES = frozenset({"on-request", "on-failure", "untrusted", "never"})
 _CODEX_GRANULAR_REQUIRED = frozenset({"sandbox_approval", "rules", "mcp_elicitations"})
 _CODEX_GRANULAR_KEYS = _CODEX_GRANULAR_REQUIRED | {"request_permissions", "skill_approval"}
-# auto_review instructs the automatic approver and hooks can answer permission
-# requests. Neither is interpreted, so declaring one leaves coverage unknown.
-_CODEX_UNINTERPRETED = ("auto_review", "hooks")
+# auto_review instructs the automatic approver, hooks can answer permission requests
+# and apps set connector tool approval. None is interpreted, so declaring one leaves
+# coverage unknown; with the operator key their values are bound.
+_CODEX_UNINTERPRETED = ("apps", "auto_review", "hooks")
+CODEX_HOOKS = ".codex/hooks.json"
+CODEX_UNINTERPRETED_BINDING_PROFILE = "nexus-symbiote/codex-uninterpreted/v1"
+_KEY_FAILURE = (
+    f"{SOURCE_BINDING_KEY_ENV} is not valid random key material; Codex settings were not bound"
+)
 _HOST_PATH = re.compile(r"[/\\~]|[A-Za-z]:")
 _FULL_ACCESS = (RiskSeverity.HIGH, "Codex declares unrestricted filesystem access.")
 _OUTSIDE = (RiskSeverity.HIGH, "Codex declares writable paths outside the workspace.")
@@ -382,6 +394,69 @@ def _codex_profile(
     return grants
 
 
+def _codex_uninterpreted(data: dict[str, Any]) -> dict[str, Any]:
+    """The raw values of the settings in one layer that the collector does not interpret.
+
+    They may hold credentials, such as a proxy URL, so they are only ever bound by HMAC.
+    """
+    subtrees = {key: data[key] for key in _CODEX_UNINTERPRETED if key in data}
+    profiles = data.get("permissions")
+    for name, profile in profiles.items() if isinstance(profiles, dict) else []:
+        if not isinstance(profile, dict):
+            continue
+        own: dict[str, Any] = {}
+        network = profile.get("network")
+        if isinstance(network, dict) and network.keys() - {"enabled"}:
+            own["network"] = {k: v for k, v in network.items() if k != "enabled"}
+        filesystem = profile.get("filesystem")
+        if isinstance(filesystem, dict):
+            special = {
+                path: access
+                for path, access in filesystem.items()
+                if path.startswith(":") and path not in _CODEX_SPECIAL_PATHS
+            }
+            if special:
+                own["filesystem"] = special
+        if own:
+            subtrees.setdefault("permissions", {})[name] = own
+    return subtrees
+
+
+def _codex_uninterpreted_binding(
+    uninterpreted: dict[str, dict[str, Any]], result: ScanResult
+) -> dict[str, Any]:
+    """Bind uninterpreted settings so that edits to them fail the drift gate."""
+    bound: dict[str, Any] = {}
+    try:
+        for label, subtrees in uninterpreted.items():
+            try:
+                bind_source_values(
+                    {"layers": {label: subtrees}}, profile=CODEX_UNINTERPRETED_BINDING_PROFILE
+                )
+            except SourceBindingValueError:
+                result.scan_failures.append(
+                    f"{label}: Codex settings cannot be canonicalized for binding"
+                )
+                continue
+            bound[label] = subtrees
+        binding = (
+            bind_source_values({"layers": bound}, profile=CODEX_UNINTERPRETED_BINDING_PROFILE)
+            if bound
+            else None
+        )
+    except SourceBindingKeyError:
+        if _KEY_FAILURE not in result.scan_failures:
+            result.scan_failures.append(_KEY_FAILURE)
+        return {}
+    if binding is None:
+        return {}
+    return {
+        "codex_uninterpreted_binding": binding[0],
+        "codex_uninterpreted_binding_key_id": binding[1],
+        "codex_uninterpreted_binding_profile": CODEX_UNINTERPRETED_BINDING_PROFILE,
+    }
+
+
 def _codex_unknown(label: str, setting: str, result: ScanResult) -> None:
     message = f"{label}: Codex {setting} settings are not interpreted; coverage is unknown"
     if message not in result.surfaces_excluded:
@@ -467,6 +542,12 @@ class IDEAgentScanner(Scanner):
             nested_codex = [
                 layer for layer in codex_config_layers(available, result) if layer != CODEX_CONFIG
             ]
+            # Codex reads hooks.json from every project .codex folder, even without config.toml.
+            nested_codex += sorted(
+                path
+                for path in available
+                if path == CODEX_HOOKS or path.endswith("/" + CODEX_HOOKS)
+            )
             for ide_type, config in IDE_AGENT_CONFIGS.items():
                 found: list[str] = []
                 for marker in [*config["markers"], *(nested_codex if ide_type == "codex" else [])]:
@@ -489,9 +570,10 @@ class IDEAgentScanner(Scanner):
                 codex_policy: dict[str, Any] = {}
                 mcp_configs: list[str] = []
                 layers = [path for path in found if is_codex_config(path)]
-                if ide_type == "codex" and layers:
+                hooks = [path for path in found if path.endswith(CODEX_HOOKS)]
+                if ide_type == "codex" and (layers or hooks):
                     codex_policy, codex_mode, mcp_configs = self._codex_policy(
-                        files.root, layers, result, risks
+                        files.root, layers, hooks, result, risks
                     )
                     mode = codex_mode or mode
                 if self._has_broad_permissions(settings, ide_type, result):
@@ -615,7 +697,12 @@ class IDEAgentScanner(Scanner):
         return merged or None
 
     def _codex_policy(
-        self, root: Path, layers: list[str], result: ScanResult, risks: list[RiskAssessment]
+        self,
+        root: Path,
+        layers: list[str],
+        hooks: list[str],
+        result: ScanResult,
+        risks: list[RiskAssessment],
     ) -> tuple[dict[str, Any], str | None, list[str]]:
         """Interpret Codex TOML layers; return root declarations, root mode and MCP layers.
 
@@ -624,6 +711,7 @@ class IDEAgentScanner(Scanner):
         """
         declared: list[tuple[str, PurePosixPath, dict[str, Any]]] = []
         mcp_configs: list[str] = []
+        uninterpreted: dict[str, dict[str, Any]] = {}
         for label in layers:
             data = self._read_mapping(root / label, result)
             if data is None:
@@ -632,6 +720,13 @@ class IDEAgentScanner(Scanner):
                 mcp_configs.append(label)
             values = _codex_declarations(label, data, result)
             declared.append((label, codex_scope(label), values))
+            if subtrees := _codex_uninterpreted(data):
+                uninterpreted[label] = subtrees
+        for label in hooks:
+            _codex_unknown(label, "hooks", result)
+            hook_data = self._read_mapping(root / label, result)
+            if hook_data is not None:
+                uninterpreted[label] = hook_data
         findings: set[tuple[RiskSeverity, str]] = set()
         root_mode: str | None = None
         budget = [MAX_CODEX_PROFILE_WORK]
@@ -725,6 +820,7 @@ class IDEAgentScanner(Scanner):
                 nested[label] = values
         if nested:
             properties["nested_config_layers"] = nested
+        properties.update(_codex_uninterpreted_binding(uninterpreted, result))
         return properties, root_mode, mcp_configs
 
     def _extract_permission_mode(
