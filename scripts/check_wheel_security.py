@@ -38,6 +38,12 @@ CASES = (
     "test_runtime_authorization.py::test_revocation_during_final_authentication_denies_pending_invocation",
     "test_export_conformance.py::test_spdx_aggregation_keeps_revisions_and_references_distinct",
     "test_projection_integrity.py",
+    "test_model_format_coverage.py",
+    "test_cli_terminal_safety.py::test_risk_reconciliation_reasons_never_start_an_output_line",
+    "test_cli_terminal_safety.py::test_policy_and_inventory_errors_cannot_forge_output_lines",
+    "test_cli_terminal_safety.py::test_literal_text_renders_no_emoji_or_invisible_characters",
+    "test_cli_terminal_safety.py::test_one_line_replaces_every_line_boundary_and_undecodable_name",
+    "test_cli_terminal_safety.py::test_legacy_workflow_commands_are_inert_in_text_and_json_output",
 )
 
 
