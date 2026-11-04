@@ -566,9 +566,16 @@ class A2AScanner(Scanner):
         # This records declarations only; neither a card nor this collector proves
         # that an endpoint actually enforces authentication.
         requirements = None
+        recorded: Requirements | None = None
+        if data.get("security") is not None:
+            alternatives = _v03_requirements(data["security"])
+            if alternatives is not None:
+                recorded = _redacted(alternatives)
         if data.get("securityRequirements") is not None:
             requirements = _v1_requirements(data["securityRequirements"])
-            properties["security_requirements"] = _canonical(_redacted(requirements))
+            recorded = [*(recorded or []), *_redacted(requirements)]
+        if recorded is not None:
+            properties["security_requirements"] = _canonical(recorded)
         auth_required = _authentication_required(data, requirements)
         if unknown_skills:
             properties["skill_security_unknown"] = sorted(set(unknown_skills))

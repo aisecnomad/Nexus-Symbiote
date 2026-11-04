@@ -461,6 +461,42 @@ def test_legacy_and_v0_3_authentication_semantics(tmp_path, extra, expected):
 
 
 @pytest.mark.parametrize(
+    "extra, recorded",
+    [
+        ({"security": [{"bearer": ["write", "read"]}]}, [{"bearer": ["read", "write"]}]),
+        ({"security": [{}, {"bearer": []}]}, [{"bearer": []}, {}]),
+        (
+            {
+                "security": [{"bearer": ["read"]}],
+                "securityRequirements": [{"schemes": {"oauth2": {"list": ["write"]}}}],
+            },
+            [{"bearer": ["read"]}, {"oauth2": ["write"]}],
+        ),
+        ({"security": {"bearer": []}}, None),
+        ({"security": None}, None),
+    ],
+)
+def test_card_level_requirements_of_both_versions_are_exported(tmp_path, extra, recorded):
+    card = {**LEGACY, "securitySchemes": {**BEARER, **OAUTH2}, **extra}
+    server, _ = _server(tmp_path, card)
+    assert server.properties.get("security_requirements") == recorded
+
+
+def test_card_level_v0_3_scope_change_is_a_high_alert_even_with_unchanged_bindings(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
+    card = {**LEGACY, "security": [{"bearer": ["read"]}], "securitySchemes": BEARER}
+    old, _ = _server(tmp_path, card)
+    new = old.model_copy(deep=True)
+    new.properties["security_requirements"][0]["bearer"] = ["admin"]
+    report = AIBOMDiffer().diff(AIBOM(components=[old]), AIBOM(components=[new]))
+    (change,) = report.components_modified
+    assert change.details == ["properties changed."]
+    assert change.severity == "high"
+
+
+@pytest.mark.parametrize(
     "skill, unknown_skill, recorded",
     [
         ({"security": [{}]}, False, [{}]),

@@ -169,11 +169,13 @@ legacy scheme named `none`, `public`, `anonymous`, `noauth`, `unauthenticated` o
 the empty string. A card can declare several of these forms for different
 clients: if any card-level form permits anonymous use, authentication is not
 required. A card that declares no card-level form does not require
-authentication. Skill-level requirements of either version add requirements for
-that skill; the card-level requirement applies to every request, so they never
-relax it. They are recorded in `skill_security_requirements`, keyed by skill
-identifier, so a skill that declares requirements needs a unique `id`, and an
-unsupported skill-level form is recorded as unknown coverage.
+authentication. Card-level requirements of both versions are recorded together
+in `security_requirements`. Skill-level requirements of either version add
+requirements for that skill; the card-level requirement applies to every
+request, so they never relax it. They are recorded in
+`skill_security_requirements`, keyed by skill identifier, so a skill that
+declares requirements needs a unique `id`, and an unsupported skill-level form is
+recorded as unknown coverage.
 
 An unsupported form leaves the requirement unknown coverage: an A2A 0.3 or v1
 requirement that names a scheme missing from `securitySchemes`, or a scheme
