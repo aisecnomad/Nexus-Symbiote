@@ -238,9 +238,8 @@ class CycloneDXGenerator(Generator):
                 result["version"] = package.version
         if comp.hashes:
             result["hashes"] = [
-                {"alg": normalize_hash(alg, val)[0], "content": normalize_hash(alg, val)[1]}
-                for alg, val in comp.hashes.items()
-                if val
+                {"alg": name, "content": digest}
+                for name, digest in (normalize_hash(alg, val) for alg, val in comp.hashes.items())
             ]
 
         props = self._extension_properties(comp)

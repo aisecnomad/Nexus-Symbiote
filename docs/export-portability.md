@@ -49,7 +49,11 @@ these differences are tolerated:
 A row with only a `ref` declares that the component has no dependencies. For a
 component whose conditional `depends-on` edge was withheld from the standard
 graph, the row contradicts the inventory, and verification fails. A round trip
-through such an SDK therefore fails for those inventories.
+through such an SDK therefore fails for those inventories. The standard graph
+carries only `depends-on` edges, so such a row is accepted for a component whose
+other relationships, such as `uses-model` or `invokes`, appear only in the typed
+extension; a consumer that reads only the standard graph sees that component as
+dependency-free.
 
 Any other difference fails verification, including standard data that
 contradicts nothing, such as an added `vulnerabilities` array. Exports written by
@@ -80,7 +84,7 @@ therefore refuses a larger export before comparing or validating it:
 | CycloneDX components | 2,000 |
 | CycloneDX dependency rows | 2,000 |
 | SPDX `@graph` entries | 1,000 |
-| Embedded inventory | 2,000 components and 10,000 dependency edges |
+| Embedded inventory | 16 MiB, 32 levels of nesting and 1,000,000 values; 2,000 components and 10,000 dependency edges |
 
 `CycloneDXGenerator.recover` and `SPDXGenerator.recover` apply the same limits,
 except the file limit, and raise `VerificationLimitError`, a `ValueError`. Larger
@@ -94,10 +98,11 @@ senders automatically, allow for these durations in the command's timeout, and
 treat a timeout as a failed verification.
 
 If the export cannot be verified, the command exits 1 with one of three fixed
-messages that never quote the input:
+messages that never quote the input. A path that does not exist or names a
+directory is a usage error instead: the command exits 2 and names the path.
 
 | Message | Cause |
 | --- | --- |
 | `Cannot read the export: ...` | Not a regular UTF-8 file of at most 16 MiB, or a symbolic link in its path |
-| `Export exceeds the verification limits and was not verified` | A limit in the table above |
+| `Export exceeds the verification limits and was not verified` | A limit in the table above, or nesting too deep to parse |
 | `Export or embedded native inventory failed verification` | Any other failure, including a malformed or conflicting document |

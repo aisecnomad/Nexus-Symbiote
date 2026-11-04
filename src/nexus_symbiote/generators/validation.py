@@ -26,14 +26,14 @@ MAX_RECEIVED_VALUES = 1_000_000
 MAX_RECEIVED_COMPONENTS = 2_000
 MAX_RECEIVED_SPDX_ELEMENTS = 1_000
 MAX_RECEIVED_RELATIONSHIPS = 10_000
+MAX_EMBEDDED_BYTES = 16 * 1024 * 1024
 
 
 class VerificationLimitError(ValueError):
     """A received export is larger than verification accepts."""
 
 
-def require_received_limits(document: Any, fmt: str) -> None:
-    """Refuse an oversized received export before any costly or recursive check."""
+def _require_nesting_limits(document: Any) -> None:
     pending: list[tuple[Any, int]] = [(document, 1)]
     remaining = MAX_RECEIVED_VALUES
     while pending:
@@ -44,6 +44,11 @@ def require_received_limits(document: Any, fmt: str) -> None:
                 raise VerificationLimitError("export exceeds the verification limits")
             children = value.values() if isinstance(value, dict) else value
             pending.extend((child, depth + 1) for child in children)
+
+
+def require_received_limits(document: Any, fmt: str) -> None:
+    """Refuse an oversized received export before any costly or recursive check."""
+    _require_nesting_limits(document)
     if not isinstance(document, dict):
         raise ValueError("export must be a JSON object")
     if fmt == "spdx":
@@ -55,6 +60,22 @@ def require_received_limits(document: Any, fmt: str) -> None:
         ]
     if any(isinstance(items, list) and len(items) > limit for items, limit in collections):
         raise VerificationLimitError("export exceeds the verification limits")
+
+
+def parse_embedded_inventory(text: str) -> Any:
+    """Parse an embedded native document within the nesting and value limits.
+
+    The document is a string inside the received export, so the export's own
+    limits do not bound it; JSON parsing and RFC 8785 canonicalization recurse.
+    """
+    from nexus_symbiote.core.hashing import parse_json_strict
+
+    if len(text.encode("utf-8", "surrogatepass")) > MAX_EMBEDDED_BYTES:
+        raise VerificationLimitError("embedded inventory exceeds the verification limits")
+    try:
+        return parse_json_strict(text, max_bytes=MAX_EMBEDDED_BYTES, check=_require_nesting_limits)
+    except RecursionError:
+        raise VerificationLimitError("embedded inventory exceeds the verification limits") from None
 
 
 def require_inventory_limits(bom: AIBOM) -> None:

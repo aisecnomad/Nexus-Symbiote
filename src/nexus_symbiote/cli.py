@@ -568,7 +568,10 @@ def verify_export(export_path: str, export_format: str) -> None:
     from nexus_symbiote.core.hashing import parse_json_strict
     from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
     from nexus_symbiote.generators.spdx import SPDXGenerator
-    from nexus_symbiote.generators.validation import VerificationLimitError
+    from nexus_symbiote.generators.validation import (
+        VerificationLimitError,
+        require_received_limits,
+    )
     from nexus_symbiote.scanners.base import read_regular_text
 
     limit = 16 * 1024 * 1024
@@ -582,12 +585,14 @@ def verify_export(export_path: str, export_format: str) -> None:
     # Any exception raised by hostile input is a verification failure. Its text can
     # quote the input, so only these fixed messages are printed.
     try:
-        document = parse_json_strict(text, max_bytes=limit)
-        if not isinstance(document, dict):
-            raise ValueError("export must be an object")
+        document = parse_json_strict(
+            text,
+            max_bytes=limit,
+            check=lambda value: require_received_limits(value, export_format),
+        )
         generator = CycloneDXGenerator if export_format == "cyclonedx" else SPDXGenerator
         generator.recover(document)
-    except VerificationLimitError as exc:
+    except (VerificationLimitError, RecursionError) as exc:
         raise click.ClickException(
             "Export exceeds the verification limits and was not verified"
         ) from exc

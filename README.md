@@ -82,6 +82,7 @@ Eight built-in collectors read declared configuration and artifacts from the pro
 | `risk` | What are the findings, and does the score or worst severity cross your gate? |
 | `diff` | What changed since the reviewed snapshot? Is any change security-relevant? |
 | `verify-artifact`, `verify-discovery` | Do these bytes match a trusted digest, Sigstore identity or ShadowScan report? |
+| `verify-export` | Does a received CycloneDX or SPDX export still equal the projection of its embedded inventory? |
 | `blast-radius` | Which agents and components are associated with a compromised component? |
 | `runtime keygen/sign/verify` | Are signed snapshots, approvals and trust statements valid for a gateway? |
 | `discover-mcp`, `verify-live`, `advisories` | What does a running server actually serve? Do exact versions have known advisories? *(live mode)* |
@@ -100,8 +101,8 @@ The [CLI reference](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/docs/c
 
 Standard exports embed the native inventory in a digest-bound extension. Keep that extension to recover full semantics.
 After interchange, use `nexus-symbiote verify-export --format cyclonedx received.json`
-(or `--format spdx`) to detect missing or conflicting extension data. The check
-does not authenticate the producer. See the [portability matrix](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/docs/export-portability.md).
+(or `--format spdx`) to check that the received export equals the projection of its
+embedded inventory. The check does not authenticate the producer. See the [portability matrix](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/docs/export-portability.md).
 
 ### See it on the demo agent
 

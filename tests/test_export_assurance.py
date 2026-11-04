@@ -535,3 +535,118 @@ def test_cyclonedx_validation_rejects_duplicates_in_any_member_order(collection)
     first = document[collection][0]
     document[collection].append(dict(reversed(first.items())))
     assert validate_cyclonedx(document) == [f"{collection}: array has non-unique elements"]
+
+
+def _set_native_text(document, fmt, text):
+    """Replace the embedded native document string without parsing it."""
+    if fmt == "cyclonedx":
+        properties, name, value = document["metadata"]["properties"], "name", "value"
+    else:
+        node = next(n for n in document["@graph"] if n["type"] == "SpdxDocument")
+        properties = node["extension"][0]["extension_cdxProperty"]
+        name, value = "extension_cdxPropName", "extension_cdxPropValue"
+    next(p for p in properties if p[name] == "nexus-symbiote:document")[value] = text
+
+
+@pytest.mark.parametrize("fmt,generator", FORMATS)
+def test_recover_rejects_a_conflicting_export_before_schema_validation(monkeypatch, fmt, generator):
+    from nexus_symbiote.generators import validation
+
+    document = generator().generate(_small_bom())
+    _replace_native(document, fmt, lambda native: native["components"][0].update(name="b"))
+    validated = []
+    monkeypatch.setattr(validation, "_schema_errors", lambda *args: validated.append(args) or [])
+    with pytest.raises(ValueError, match="projection conflicts with the embedded native"):
+        generator.recover(document)
+    assert validated == []
+
+
+def test_verify_export_prints_only_the_fixed_message_for_unexpected_errors(tmp_path, monkeypatch):
+    path = tmp_path / "export.json"
+    path.write_text(json.dumps(CycloneDXGenerator().generate(_small_bom())))
+
+    def crash(cls, document, **kwargs):
+        raise KeyError("::error::quoted input ##[warning]text")
+
+    monkeypatch.setattr(CycloneDXGenerator, "recover", classmethod(crash))
+    _assert_clean_failure(_verify(path, "cyclonedx"))
+
+
+@pytest.mark.parametrize("fmt,generator", FORMATS)
+def test_recover_refuses_an_embedded_inventory_with_too_many_edges(fmt, generator):
+    from nexus_symbiote.generators.validation import (
+        MAX_RECEIVED_COMPONENTS,
+        MAX_RECEIVED_RELATIONSHIPS,
+        VerificationLimitError,
+    )
+
+    nodes = 101
+    assert nodes * (nodes - 1) > MAX_RECEIVED_RELATIONSHIPS
+    assert nodes < MAX_RECEIVED_COMPONENTS
+    components = [
+        {"bom_ref": f"agent:{i}", "name": "x", "component_type": "agent"} for i in range(nodes)
+    ]
+    edges = [
+        {"source_ref": f"agent:{i}", "target_ref": f"agent:{j}", "relationship": "depends-on"}
+        for i in range(nodes)
+        for j in range(nodes)
+        if i != j
+    ]
+
+    def grow(native):
+        native["components"].extend(components)
+        native["dependencies"] = edges
+
+    document = generator().generate(_small_bom())
+    _replace_native(document, fmt, grow)
+    with pytest.raises(VerificationLimitError):
+        generator.recover(document)
+
+
+@pytest.mark.parametrize("fmt,generator", FORMATS)
+@pytest.mark.parametrize("depth", [33, 100_000])
+def test_recover_refuses_a_deeply_nested_embedded_inventory(fmt, generator, depth):
+    from nexus_symbiote.generators.validation import MAX_RECEIVED_DEPTH, VerificationLimitError
+
+    assert depth > MAX_RECEIVED_DEPTH
+    document = generator().generate(_small_bom())
+    _set_native_text(document, fmt, "[" * depth + "]" * depth)
+    with pytest.raises(VerificationLimitError):
+        generator.recover(document)
+
+
+def test_recover_rejects_duplicate_keys_in_the_embedded_inventory():
+    # The last duplicate wins in plain JSON parsing, so this text keeps the digest.
+    document = CycloneDXGenerator().generate(_small_bom())
+    properties = document["metadata"]["properties"]
+    native = next(p for p in properties if p["name"] == "nexus-symbiote:document")["value"]
+    _set_native_text(document, "cyclonedx", '{"components": [], ' + native[1:])
+    with pytest.raises(ValueError, match="Duplicate JSON object key"):
+        CycloneDXGenerator.recover(document)
+
+
+def test_verify_export_reports_nesting_beyond_the_parser_as_a_limit(tmp_path):
+    path = tmp_path / "deep.json"
+    path.write_text("[" * 100_000 + "]" * 100_000)
+    _assert_clean_failure(_verify(path, "cyclonedx"), OVERSIZED)
+
+
+def test_verify_export_checks_limits_before_canonicalizing(tmp_path, monkeypatch):
+    from nexus_symbiote.core import hashing
+    from nexus_symbiote.generators.validation import MAX_RECEIVED_VALUES
+
+    def refuse(value):
+        raise AssertionError("an oversized export was canonicalized")
+
+    monkeypatch.setattr(hashing, "canonical_json", refuse)
+    path = tmp_path / "values.json"
+    path.write_text(json.dumps({"@graph": [0.1] * (MAX_RECEIVED_VALUES + 1)}))
+    _assert_clean_failure(_verify(path, "spdx"), OVERSIZED)
+
+
+@pytest.mark.parametrize("fmt,generator", FORMATS)
+@pytest.mark.parametrize("algorithm", ["sha256", "blake2b"])
+def test_exports_reject_an_empty_digest(fmt, generator, algorithm):
+    bom = AIBOM(components=[AgentComponent(bom_ref="agent:a", name="a", hashes={algorithm: ""})])
+    with pytest.raises(ValueError, match="digest|algorithm"):
+        generator().generate(bom)

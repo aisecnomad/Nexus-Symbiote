@@ -29,7 +29,7 @@ selects the mode; without either, the mode is offline. See
 | [`scan`](#scan) | offline | Inventory a project and write an AgentBOM (native JSON, CycloneDX, SPDX or SARIF) |
 | [`import-shadowscan`](#import-shadowscan) | offline | Convert a Nexus ShadowScan report into an AgentBOM of imported claims |
 | [`validate`](#validate) | offline | Check an AgentBOM's completeness and integrity, optionally against the project |
-| [`verify-export`](#verify-export) | offline | Check a portable export retains its matching native inventory |
+| [`verify-export`](#verify-export) | offline | Check that a received export equals the projection of its embedded inventory |
 | [`risk`](#risk) | offline | Score findings and apply the risk gate |
 | [`diff`](#diff) | offline | Compare two AgentBOMs and report security-relevant drift |
 | [`summary`](#summary) | offline | Print component and risk counts |
@@ -327,7 +327,8 @@ nexus-symbiote verify-export [OPTIONS] EXPORT_PATH
 If the export cannot be verified, the command exits 1 with one of three fixed
 messages that never quote the input: the file could not be read, the export
 exceeds the [verification limits](export-portability.md#verification-limits), or
-verification failed. The file must be a regular UTF-8 file of at most 16 MiB,
+verification failed. A path that does not exist or names a directory is a usage
+error, which exits 2. The file must be a regular UTF-8 file of at most 16 MiB,
 opened without following a symbolic link in any part of its absolute path; a
 relative path starts at the physical working directory. On macOS, for example,
 pass `/private/tmp/...` rather than `/tmp/...`.

@@ -14,6 +14,7 @@ import json
 import os
 import re
 import stat
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, BinaryIO, Literal
 
@@ -113,8 +114,17 @@ def bind_source_values(config: dict[str, Any], *, profile: str) -> tuple[str, st
     return "hmac-sha256:" + mac, key_id[:32]
 
 
-def parse_json_strict(text: str | bytes, *, max_bytes: int = 4 * 1024 * 1024) -> Any:
-    """Parse bounded I-JSON, rejecting duplicate keys and invalid numbers."""
+def parse_json_strict(
+    text: str | bytes,
+    *,
+    max_bytes: int = 4 * 1024 * 1024,
+    check: Callable[[Any], None] | None = None,
+) -> Any:
+    """Parse bounded I-JSON, rejecting duplicate keys and invalid numbers.
+
+    ``check`` runs on the parsed value before the slower I-JSON check, so a caller
+    can refuse a value that is too large for it without paying for that check.
+    """
     if len(text if isinstance(text, bytes) else text.encode("utf-8")) > max_bytes:
         raise ValueError("JSON exceeds the configured byte limit")
 
@@ -130,6 +140,8 @@ def parse_json_strict(text: str | bytes, *, max_bytes: int = 4 * 1024 * 1024) ->
         raise ValueError(f"Nonfinite JSON number: {value}")
 
     result = json.loads(text, object_pairs_hook=object_pairs, parse_constant=reject_constant)
+    if check is not None:
+        check(result)
     canonical_json(result)
     return result
 

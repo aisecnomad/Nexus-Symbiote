@@ -218,7 +218,9 @@ def recover_document(properties: list[dict[str, str]]) -> AIBOM:
         raise ValueError("duplicate native document property names")
     if required.difference(props):
         raise ValueError("missing native document properties")
-    document = json.loads(props["nexus-symbiote:document"])
+    from nexus_symbiote.generators.validation import parse_embedded_inventory
+
+    document = parse_embedded_inventory(props["nexus-symbiote:document"])
     if props["nexus-symbiote:documentDigest"] != content_digest(document):
         raise ValueError("embedded native document digest mismatch")
     return AIBOM.model_validate(document)
