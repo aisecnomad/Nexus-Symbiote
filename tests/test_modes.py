@@ -361,11 +361,12 @@ def test_every_static_command_runs_under_the_offline_guard(tmp_path):
     assert json.loads(verified)["contract_verified"] is True
 
 
+# A random operator key in the format the walkthrough generates with token_hex(32).
+DEMO_BINDING_KEY = "de61cc580f37acf0bae7d6f264f846bf257b698be498660944892cb2f7fe1fc3"
+
+
 def test_documented_offline_demo_collects_every_surface(tmp_path, monkeypatch):
-    monkeypatch.setenv(
-        "NEXUS_SYMBIOTE_SOURCE_BINDING_KEY",
-        "27ac76f7408dd6bd3f7da261e2121d13ff74ca2c484986570dcb86d9592c0199",
-    )
+    monkeypatch.setenv("NEXUS_SYMBIOTE_SOURCE_BINDING_KEY", DEMO_BINDING_KEY)
     demo = REPOSITORY / "examples" / "demo-agent"
     if not demo.is_dir():
         pytest.skip("the demo project ships in the repository, not in the wheel")
@@ -388,6 +389,30 @@ def test_documented_offline_demo_collects_every_surface(tmp_path, monkeypatch):
         "a2a-server",
         "ide-agent",
     } <= types
+
+
+def test_demo_results_match_the_published_walkthrough(tmp_path, monkeypatch):
+    # README.md ("See it on the demo agent") and examples/README.md quote these
+    # results; update both documents together with this test. The A2A card needs
+    # the operator binding key, or the scan's default gate fails.
+    monkeypatch.setenv("NEXUS_SYMBIOTE_SOURCE_BINDING_KEY", DEMO_BINDING_KEY)
+    demo = REPOSITORY / "examples" / "demo-agent"
+    if not demo.is_dir():
+        pytest.skip("the demo project ships in the repository, not in the wheel")
+    output = tmp_path / "demo.aibom.json"
+    runner = CliRunner()
+    scanned = runner.invoke(main, ["scan", str(demo), "-o", str(output)], env=UNSET)
+    assert scanned.exit_code == 0, scanned.output
+    components = json.loads(output.read_text())["components"]
+    assert len(components) == 11
+    assert len({component["component_type"] for component in components}) == 9
+    risk = runner.invoke(
+        main, ["risk", str(output), "--no-project-policy", "--json-output"], env=UNSET
+    )
+    assert risk.exit_code == 0, risk.output
+    report = json.loads(risk.stdout)
+    assert report["overall_score"] == 33
+    assert {k: v for k, v in report["severity_counts"].items() if v} == {"high": 3, "medium": 3}
 
 
 def test_sigstore_offline_verifier_needs_no_network_or_process(tmp_path, monkeypatch):
