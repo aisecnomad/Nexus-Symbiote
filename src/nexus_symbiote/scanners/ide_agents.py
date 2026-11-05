@@ -772,10 +772,16 @@ def _marker_variant(marker: str, available: set[str]) -> tuple[str, str] | None:
 
 
 def _settings_variants(name: str, available: set[str], result: ScanResult) -> list[str]:
-    """Files a case-insensitive file system opens as a settings file; exact name first."""
+    """Files the agent may open as a settings file.
+
+    A case-sensitive host opens only the exact name, and a case-insensitive file system
+    cannot hold a variant beside it, so an exact file is read alone.
+    """
+    if name in available:
+        return [name]
     target = folded_name(name)
     paths = sorted(
-        (path != name, path)
+        path
         for path in available
         if path.count("/") == name.count("/") and folded_name(path) == target
     )
@@ -783,7 +789,7 @@ def _settings_variants(name: str, available: set[str], result: ScanResult) -> li
         result.scan_failures.append(
             f"{name}: more than {MAX_CASE_VARIANTS} files open as {name}; the rest not read"
         )
-    return [path for _, path in paths[:MAX_CASE_VARIANTS]]
+    return paths[:MAX_CASE_VARIANTS]
 
 
 def _safe_name(value: str) -> str:
@@ -1218,7 +1224,9 @@ class IDEAgentScanner(Scanner):
                     self._claude_settings_variants(files, available, found, result)
                 if not found:
                     continue
-                settings = self._read_ide_settings(files.root, ide_type, result, available) or {}
+                settings = (
+                    self._read_ide_settings(files.root, ide_type, result, available, found) or {}
+                )
                 mode = self._extract_permission_mode(settings, ide_type, result)
                 risks: list[RiskAssessment] = []
                 codex_policy: dict[str, Any] = {}
@@ -1313,7 +1321,12 @@ class IDEAgentScanner(Scanner):
         return result
 
     def _read_ide_settings(
-        self, root: Path, ide_type: str, result: ScanResult, available: set[str]
+        self,
+        root: Path,
+        ide_type: str,
+        result: ScanResult,
+        available: set[str],
+        found: list[str],
     ) -> dict[str, Any] | None:
         settings_paths = {
             "cursor": [".cursor/settings.json"],
@@ -1325,19 +1338,30 @@ class IDEAgentScanner(Scanner):
         # Keep declared allowances from every collected Claude settings layer.
         # This summary does not resolve effective permissions across trust,
         # user/managed policy, ask/deny rules, flags or product versions.
+        variants = {
+            name: _settings_variants(name, available, result)
+            for name in settings_paths.get(ide_type, [])
+        }
         relatives = (
             _claude_settings_paths(available)[:_MAX_CLAUDE_SETTINGS_FILES]
             if ide_type == "claude-code"
-            else [
-                path
-                for name in settings_paths.get(ide_type, [])
-                for path in _settings_variants(name, available, result)
-            ]
+            else [path for paths in variants.values() for path in paths]
         )
+        # Only one of several case variants can exist on the agent's file system, so
+        # variants that disagree leave the declaration unknown instead of last-wins.
+        agents: dict[str, str] = {}
         for relative in relatives:
             if relative in available:
                 data = self._read_mapping(root / relative, result)
                 if data is not None:
+                    if ide_type != "claude-code":
+                        if relative not in found:
+                            found.append(relative)
+                            result.surfaces_scanned.append(str(root / relative))
+                        if "agent" in data:
+                            agents[relative] = json.dumps(
+                                data["agent"], sort_keys=True, default=str
+                            )
                     if ide_type == "claude-code" and "hooks" in data:
                         # Claude Code runs the hooks of every settings layer; none overrides.
                         merged["hooks"] = {**merged.get("hooks", {}), relative: data.pop("hooks")}
@@ -1390,6 +1414,14 @@ class IDEAgentScanner(Scanner):
                             merged["agent"] = data["agent"]
                     else:
                         merged.update(data)
+        for name, paths in variants.items():
+            agent_values = {agents[path] for path in paths if path in agents}
+            if len(agent_values) > 1:
+                merged.pop("agent", None)
+                result.scan_failures.append(
+                    f"{name}: {', '.join(path for path in paths if path in agents)} declare "
+                    "different agent settings; permission mode not recorded"
+                )
         return merged or None
 
     def _codex_policy(

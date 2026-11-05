@@ -393,3 +393,94 @@ def test_exact_ide_marker_names_scan_as_before(tmp_path: Path) -> None:
         "copilot": [".github/copilot-instructions.md"],
     }
     assert agents["cursor"].permission_mode == "plan"
+
+
+@pytest.mark.parametrize(
+    ("ide", "name", "variant", "mode"),
+    [
+        ("cursor", ".cursor/settings.json", ".cursor/Settings.json", "bypassPermissions"),
+        ("windsurf", ".windsurf/settings.json", ".windsurf/Settings.json", "bypassPermissions"),
+        ("cline", ".cline/settings.json", ".Cline/settings.json", "bypassPermissions"),
+        ("codex", ".codex/config.json", ".codex/Config.json", "full-access"),
+    ],
+)
+def test_a_variant_settings_file_does_not_override_the_exact_one(
+    tmp_path: Path, ide: str, name: str, variant: str, mode: str
+) -> None:
+    if not case_sensitive(tmp_path):
+        pytest.skip("needs a case-sensitive file system")
+    write(tmp_path, name, json.dumps({"agent": {"permissionMode": mode}}))
+    write(tmp_path, variant, json.dumps({"agent": {"permissionMode": "default"}}))
+    result = IDEAgentScanner().scan(tmp_path)
+    assert not result.scan_failures
+    (agent,) = (
+        c for c in result.components if isinstance(c, IDEAgentComponent) and c.ide_type == ide
+    )
+    assert agent.permission_mode == mode
+    assert agent.config_files == [name]
+
+
+def test_conflicting_variant_settings_files_leave_the_mode_unrecorded(tmp_path: Path) -> None:
+    if not case_sensitive(tmp_path):
+        pytest.skip("needs a case-sensitive file system")
+    write(tmp_path, ".cursor/SETTINGS.json", json.dumps({"agent": {"permissionMode": "plan"}}))
+    write(
+        tmp_path,
+        ".cursor/Settings.json",
+        json.dumps({"agent": {"permissionMode": "bypassPermissions"}}),
+    )
+    result = IDEAgentScanner().scan(tmp_path)
+    assert result.scan_failures == [
+        ".cursor/settings.json: .cursor/SETTINGS.json, .cursor/Settings.json declare "
+        "different agent settings; permission mode not recorded"
+    ]
+    (agent,) = result.components
+    assert agent.permission_mode is None
+    assert agent.config_files == [".cursor/SETTINGS.json", ".cursor/Settings.json"]
+    assert sorted(result.surfaces_scanned) == sorted(
+        str(tmp_path / name) for name in agent.config_files
+    )
+
+
+def test_agreeing_variant_settings_files_are_all_listed(tmp_path: Path) -> None:
+    if not case_sensitive(tmp_path):
+        pytest.skip("needs a case-sensitive file system")
+    for name in [".windsurf/SETTINGS.json", ".Windsurf/settings.json"]:
+        write(tmp_path, name, json.dumps({"agent": {"permissionMode": "plan"}}))
+    result = IDEAgentScanner().scan(tmp_path)
+    assert not result.scan_failures
+    (agent,) = result.components
+    assert agent.permission_mode == "plan"
+    assert agent.config_files == [".Windsurf/settings.json", ".windsurf/SETTINGS.json"]
+
+
+def test_variant_settings_files_are_bounded(tmp_path: Path) -> None:
+    if not case_sensitive(tmp_path):
+        pytest.skip("needs a case-sensitive file system")
+    names = [
+        ".cursor/" + "".join(c.upper() if mask >> i & 1 else c for i, c in enumerate("settings"))
+        for mask in range(1, 10)
+    ]
+    for name in names:
+        write(tmp_path, name + ".json", json.dumps({"agent": {"permissionMode": "plan"}}))
+    result = IDEAgentScanner().scan(tmp_path)
+    assert result.scan_failures == [
+        ".cursor/settings.json: more than 8 files open as .cursor/settings.json; the rest not read"
+    ]
+    (agent,) = result.components
+    assert agent.config_files == sorted(name + ".json" for name in names)[:8]
+    assert agent.permission_mode == "plan"
+
+
+def test_an_exact_settings_file_beside_many_variants_is_read_alone(tmp_path: Path) -> None:
+    if not case_sensitive(tmp_path):
+        pytest.skip("needs a case-sensitive file system")
+    write(tmp_path, ".cursor/settings.json", json.dumps({"agent": {"permissionMode": "plan"}}))
+    for mask in range(1, 10):
+        name = "".join(c.upper() if mask >> i & 1 else c for i, c in enumerate("settings"))
+        write(tmp_path, f".cursor/{name}.json", json.dumps({"agent": {"permissionMode": "auto"}}))
+    result = IDEAgentScanner().scan(tmp_path)
+    assert not result.scan_failures
+    (agent,) = result.components
+    assert agent.config_files == [".cursor/settings.json"]
+    assert agent.permission_mode == "plan"
