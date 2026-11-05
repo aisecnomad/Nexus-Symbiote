@@ -298,3 +298,98 @@ def test_a_directory_under_the_mcp_config_name_is_reported(tmp_path: Path, name:
     (tmp_path / name).mkdir()
     result = MCPScanner().scan(tmp_path)
     assert result.scan_failures == [f"{name}: {REFUSED}"]
+
+
+@pytest.mark.parametrize(
+    "name,ide_type,marker",
+    [
+        (".github/Copilot-Instructions.md", "copilot", ".github/Copilot-Instructions.md"),
+        (".GitHub/copilot-instructions.md", "copilot", ".GitHub/copilot-instructions.md"),
+        (".github/copilot-instructions.md‌", "copilot", ".github/copilot-instructions.md‌"),
+        (".github/Copilot-Extensions.json", "copilot", ".github/Copilot-Extensions.json"),
+        (".CursorRules", "cursor", ".CursorRules"),
+        (".Cursor/Rules/style.mdc", "cursor", ".Cursor/Rules"),
+        ("Codex.md", "codex", "Codex.md"),
+        (".Codex/Instructions.md", "codex", ".Codex/Instructions.md"),
+        (".WindsurfRules", "windsurf", ".WindsurfRules"),
+        (".Clinerules", "cline", ".Clinerules"),
+        (".Antigravity/config.json", "antigravity", ".Antigravity/config.json"),
+        (".XAI/settings.json", "xai", ".XAI/settings.json"),
+    ],
+)
+def test_case_variant_markers_identify_other_ide_agents(
+    tmp_path: Path, name: str, ide_type: str, marker: str
+) -> None:
+    write(tmp_path, name, "notes\n")
+    result = IDEAgentScanner().scan(tmp_path)
+    assert not result.scan_failures
+    (agent,) = (c for c in result.components if isinstance(c, IDEAgentComponent))
+    assert agent.ide_type == ide_type
+    assert agent.config_files == [marker]
+
+
+def test_a_case_variant_instruction_file_gets_both_its_prompt_and_its_ide_agent(
+    tmp_path: Path,
+) -> None:
+    write(tmp_path, ".github/Copilot-Instructions.md", "Review every change.\n")
+    prompts = PromptScanner().scan(tmp_path).components
+    agents = IDEAgentScanner().scan(tmp_path).components
+    assert [c.bom_ref for c in prompts] == ["prompt:.github/Copilot-Instructions.md"]
+    assert [c.bom_ref for c in agents] == ["ide-agent:copilot"]
+
+
+@pytest.mark.parametrize("name", ["codex.md", "CODEX.md", "Codex.md", "codex.MD"])
+def test_a_codex_instruction_file_is_listed_once(tmp_path: Path, name: str) -> None:
+    write(tmp_path, name, "notes\n")
+    result = IDEAgentScanner().scan(tmp_path)
+    (agent,) = result.components
+    assert agent.config_files == [name]
+    assert result.surfaces_scanned == [str(tmp_path / name)]
+
+
+def test_both_exact_codex_spellings_keep_their_ide_agent_order(tmp_path: Path) -> None:
+    if not case_sensitive(tmp_path):
+        pytest.skip("needs a case-sensitive file system")
+    write(tmp_path, "CODEX.md", "b\n")
+    write(tmp_path, "codex.md", "a\n")
+    (agent,) = IDEAgentScanner().scan(tmp_path).components
+    assert agent.config_files == ["codex.md", "CODEX.md"]
+
+
+def test_case_variant_cursor_instruction_layers_are_reported(tmp_path: Path) -> None:
+    write(tmp_path, ".CursorRules", "a\n")
+    write(tmp_path, ".cursor/rules/style.mdc", "b\n")
+    (agent,) = IDEAgentScanner().scan(tmp_path).components
+    assert agent.config_files == [".CursorRules", ".cursor/rules"]
+    assert any(risk.category == "instruction_layering" for risk in agent.risks)
+
+
+@pytest.mark.parametrize("name", [".Cursor/settings.json", ".cursor/Settings.JSON"])
+def test_case_variant_ide_settings_are_read(tmp_path: Path, name: str) -> None:
+    write(tmp_path, name, json.dumps({"agent": {"permissionMode": "bypassPermissions"}}))
+    result = IDEAgentScanner().scan(tmp_path)
+    assert not result.scan_failures
+    (agent,) = result.components
+    assert agent.config_files == [name]
+    assert agent.permission_mode == "bypassPermissions"
+
+
+def test_exact_ide_marker_names_scan_as_before(tmp_path: Path) -> None:
+    for name in [
+        ".github/copilot-instructions.md",
+        ".cursorrules",
+        ".cursor/rules/style.mdc",
+        "codex.md",
+        ".codex/instructions.md",
+        ".windsurfrules",
+    ]:
+        write(tmp_path, name, "notes\n")
+    write(tmp_path, ".cursor/settings.json", json.dumps({"agent": {"permissionMode": "plan"}}))
+    agents = {c.ide_type: c for c in IDEAgentScanner().scan(tmp_path).components}
+    assert {name: agent.config_files for name, agent in agents.items()} == {
+        "codex": ["codex.md", ".codex/instructions.md"],
+        "cursor": [".cursorrules", ".cursor/rules", ".cursor/settings.json"],
+        "windsurf": [".windsurfrules"],
+        "copilot": [".github/copilot-instructions.md"],
+    }
+    assert agents["cursor"].permission_mode == "plan"

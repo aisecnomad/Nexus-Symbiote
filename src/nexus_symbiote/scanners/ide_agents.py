@@ -34,7 +34,7 @@ from nexus_symbiote.core.hashing import (
     canonical_json,
 )
 from nexus_symbiote.core.models import IDEAgentComponent, RiskAssessment, VerifiedExtensionComponent
-from nexus_symbiote.scanners.base import Scanner, ScanResult, folded_name
+from nexus_symbiote.scanners.base import MAX_CASE_VARIANTS, Scanner, ScanResult, folded_name
 from nexus_symbiote.scanners.mcp import (
     CODEX_CONFIG,
     codex_applies,
@@ -757,10 +757,11 @@ def _claude_settings_paths(available: set[str]) -> list[str]:
     return [path for *_, path in sorted(matches)]
 
 
-def _claude_marker_variant(marker: str, available: set[str]) -> tuple[str, str] | None:
+def _marker_variant(marker: str, available: set[str]) -> tuple[str, str] | None:
     """A marker's name as a case-insensitive file system opens it, and a file proving it.
 
-    For the marker .claude/commands this may be .Claude/Commands and a file beneath it.
+    For the marker .claude/commands this may be .Claude/Commands and a file beneath it,
+    and for .github/copilot-instructions.md, .GitHub/Copilot-Instructions.md.
     """
     depth, target = marker.count("/") + 1, folded_name(marker)
     for path in sorted(available):
@@ -768,6 +769,21 @@ def _claude_marker_variant(marker: str, available: set[str]) -> tuple[str, str] 
         if folded_name(name) == target:
             return name, path
     return None
+
+
+def _settings_variants(name: str, available: set[str], result: ScanResult) -> list[str]:
+    """Files a case-insensitive file system opens as a settings file; exact name first."""
+    target = folded_name(name)
+    paths = sorted(
+        (path != name, path)
+        for path in available
+        if path.count("/") == name.count("/") and folded_name(path) == target
+    )
+    if len(paths) > MAX_CASE_VARIANTS:
+        result.scan_failures.append(
+            f"{name}: more than {MAX_CASE_VARIANTS} files open as {name}; the rest not read"
+        )
+    return [path for _, path in paths[:MAX_CASE_VARIANTS]]
 
 
 def _safe_name(value: str) -> str:
@@ -1185,12 +1201,16 @@ class IDEAgentScanner(Scanner):
                         )
                     )
                     name = marker
+                    # Codex configuration layers stay case-sensitive, as codex_config_layers is.
                     if (
                         evidence is None
-                        and ide_type == "claude-code"
                         and marker not in CLAUDE_SETTINGS_FILES
+                        and not is_codex_config(marker)
                     ):
-                        name, evidence = _claude_marker_variant(marker, available) or (marker, None)
+                        name, evidence = _marker_variant(marker, available) or (marker, None)
+                    # codex.md and CODEX.md both fold to one name.
+                    if name in found:
+                        continue
                     if evidence and files.read_bytes(evidence) is not None:
                         found.append(name)
                         result.surfaces_scanned.append(str(files.root / evidence))
@@ -1235,7 +1255,10 @@ class IDEAgentScanner(Scanner):
                 layered = (
                     ide_type == "claude-code"
                     and {"claude.md", ".claude/claude.md"} <= {folded_name(f) for f in found}
-                ) or (ide_type == "cursor" and {".cursorrules", ".cursor/rules"}.issubset(found))
+                ) or (
+                    ide_type == "cursor"
+                    and {".cursorrules", ".cursor/rules"} <= {folded_name(f) for f in found}
+                )
                 if layered:
                     risks.append(
                         RiskAssessment(
@@ -1305,7 +1328,11 @@ class IDEAgentScanner(Scanner):
         relatives = (
             _claude_settings_paths(available)[:_MAX_CLAUDE_SETTINGS_FILES]
             if ide_type == "claude-code"
-            else settings_paths.get(ide_type, [])
+            else [
+                path
+                for name in settings_paths.get(ide_type, [])
+                for path in _settings_variants(name, available, result)
+            ]
         )
         for relative in relatives:
             if relative in available:
