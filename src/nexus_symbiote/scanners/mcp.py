@@ -418,6 +418,112 @@ _LAUNCHER_WORD = re.compile(
 _WORD_SPLITTERS = re.compile(r"[\\'\"^`\[\]]")
 
 
+# Recorded as the launcher of a command whose program expansion chooses at run time.
+_COMPUTED_LAUNCHER = "[computed]"
+_UNDETERMINED_LAUNCHERS = _PACKAGE_LAUNCHERS | {_COMPUTED_LAUNCHER}
+
+
+class _CommandSyntax(NamedTuple):
+    separators: str
+    quotes: str
+    escape: str
+    # Words that another command word follows, such as `exec` in `exec $TOOL`.
+    prefixes: frozenset[str]
+    # Expansion that can change the file name of a command word.
+    computed: re.Pattern[str]
+
+
+_COMMAND_SYNTAX = {
+    "posix": _CommandSyntax(
+        ";&|()\n",
+        "'\"",
+        "\\",
+        frozenset({"!", "{", "}", "if", "then", "else", "elif", "do", "while", "until", "exec"})
+        | _PREFIX_PROGRAMS,
+        re.compile(r"\$\(|`|[$*?}][^/]*$|\[[^/]*\][^/]*$"),
+    ),
+    "cmd": _CommandSyntax(
+        "&|()\n", '"', "^", frozenset({"call"}), re.compile(r"([%!])[^%!\\/]+\1[^\\/]*$")
+    ),
+    # A parenthesized expression is one word, so `& (Get-Command x).Source` is computed.
+    "powershell": _CommandSyntax(
+        ";&|{}\n", "'\"", "`", frozenset({"."}), re.compile(r"\$\(|^\(|\$[^\\/]*$")
+    ),
+}
+# Expansion an MCP client applies to a configured program, as in ${NPX} or ${env:NPX},
+# or that a shell applies when the client starts the program through one.
+_CONFIG_COMPUTED = re.compile(r"\$\(|`|\$[^\\/]*$|%[^%\\/]+%[^\\/]*$")
+_POWERSHELL_ASSIGNMENT = re.compile(r"\$[\w:{}]+[-+*/%?]{0,2}=.*", re.DOTALL)
+
+
+def _computed_name(word: str) -> bool:
+    """Whether a configured program name is chosen by expansion when the server starts."""
+    return _CONFIG_COMPUTED.search(word) is not None
+
+
+def _command_tokens(line: str, syntax: _CommandSyntax) -> list[str | None]:
+    """Unexpanded words, split at unquoted whitespace, with None at each command separator.
+
+    Characters that a quote keeps from expanding are replaced, so `'$TOOL'` is literal.
+    """
+    tokens: list[str | None] = []
+    word: list[str] = []
+    quote = ""
+    escaped = False
+    for char in line:
+        if (quote == "'" and char in "$`*?[](){}") or (quote == '"' and char in "*?[]"):
+            word.append("_")
+            continue
+        if escaped:
+            escaped = False
+        elif char == syntax.escape and (not quote or (quote == '"' and char != "^")):
+            escaped = True
+        elif quote:
+            quote = "" if char == quote else quote
+        elif char in syntax.quotes:
+            quote = char
+        elif char in syntax.separators or char.isspace():
+            if word:
+                tokens.append("".join(word))
+                word = []
+            if char in syntax.separators:
+                tokens.append(None)
+            continue
+        word.append(char)
+    if word:
+        tokens.append("".join(word))
+    return tokens
+
+
+def _computed_command(line: str, language: str) -> bool:
+    """Whether expansion at run time chooses a program that a command line runs.
+
+    A command word is computed when expansion can change its file name: `$TOOL`,
+    `/opt/$TOOL` and `"$(which x)"` are, but `$HOME/bin/server` is not.
+    """
+    syntax = _COMMAND_SYNTAX[language]
+    tokens = _command_tokens(line, syntax)
+    expect = True
+    for index, token in enumerate(tokens):
+        if token is None:
+            expect = True
+            continue
+        if not expect:
+            continue
+        if language == "cmd":
+            token = token.removeprefix("@")
+        if token in syntax.prefixes or (language == "posix" and _ASSIGNMENT.fullmatch(token)):
+            continue
+        following = tokens[index + 1] if index + 1 < len(tokens) else None
+        assignment = token if "=" in token else f"{token}{following or ''}"
+        expect = False
+        if language == "powershell" and _POWERSHELL_ASSIGNMENT.fullmatch(assignment):
+            continue
+        if syntax.computed.search(token):
+            return True
+    return False
+
+
 class _UnreadableWrapperError(Exception):
     """The wrapped command line cannot be read with confidence."""
 
@@ -645,15 +751,34 @@ def _runs_launcher(args: list[str]) -> bool:
     return False
 
 
+_LANGUAGES = {"cmd": "cmd", "powershell": "powershell", "pwsh": "powershell"}
+
+
+def _computed_launch(path_qualified: bool, wrapper: str, words: list[str]) -> _Launch:
+    return _Launch(
+        _COMPUTED_LAUNCHER,
+        path_qualified,
+        [],
+        wrapper,
+        undetermined=True,
+        wrapped_words=tuple(words),
+    )
+
+
 def _resolve_launch(command: str, args: list[str]) -> _Launch:
     """Classify the launcher a shell, cmd, PowerShell or env wrapper starts.
 
     A wrapped line that cannot be read with confidence but names a package launcher
-    is undetermined, so it cannot pass the pinning checks unseen.
+    is undetermined, so it cannot pass the pinning checks unseen. So is a program that
+    expansion chooses, as in `$TOOL pkg`, because it may be any launcher.
     """
     name, path_qualified = _launcher(command)
     if name in _PACKAGE_LAUNCHERS:
         return _Launch(name, path_qualified, args)
+    if _computed_name(command):
+        return _Launch(_COMPUTED_LAUNCHER, path_qualified, [], undetermined=True)
+    if name in _PREFIX_PROGRAMS and args and _computed_name(args[0]):
+        return _Launch(_COMPUTED_LAUNCHER, path_qualified, [], name, undetermined=True)
     if name not in _WRAPPERS:
         if not _runs_launcher(args):
             return _Launch(name, path_qualified, args)
@@ -686,6 +811,9 @@ def _resolve_launch(command: str, args: list[str]) -> _Launch:
             words = words[1:]
         if not words:
             return _Launch(wrapper, False, [])
+        # Only env passes configured words on unread; a client may have left ${NAME} in them.
+        if _computed_name(words[0]):
+            return _computed_launch(path_qualified, wrapper, words)
         name, qualified = _launcher(words[0])
         path_qualified = path_qualified or qualified
         args, text = words[1:], " ".join(words)
@@ -698,6 +826,8 @@ def _resolve_launch(command: str, args: list[str]) -> _Launch:
             return _Launch(wrapper, False, [])
     found = _LAUNCHER_WORD.search(text) or _LAUNCHER_WORD.search(_WORD_SPLITTERS.sub("", text))
     if found is None:
+        if _computed_command(text, _LANGUAGES.get(name, "posix")):
+            return _computed_launch(path_qualified, wrapper, text.split())
         return _Launch(wrapper, False, [])
     return _Launch(
         found[1].lower(),
@@ -1086,20 +1216,25 @@ class MCPScanner(Scanner):
             )
         elif (
             package_ref is None
-            and launcher in _PACKAGE_LAUNCHERS
+            and launcher in _UNDETERMINED_LAUNCHERS
             and (
                 launch.undetermined
                 or launcher != "docker"
                 or _docker_may_run_container(launch_args)
             )
         ):
+            started = (
+                "a program chosen at run time, which may be a package launcher whose package"
+                if launcher == _COMPUTED_LAUNCHER
+                else "a package launcher whose package"
+            )
             risks.append(
                 RiskAssessment(
                     severity=RiskSeverity.HIGH,
                     category="version_pinning",
                     detail=(
-                        f"MCP server '{name}' starts a package launcher whose package could "
-                        "not be determined, so its pinning is unknown (arguments omitted)."
+                        f"MCP server '{name}' starts {started} could not be determined, "
+                        "so its pinning is unknown (arguments omitted)."
                     ),
                     recommendation=(
                         "Name the package before any other launcher option, pinned to an "
@@ -1155,7 +1290,7 @@ class MCPScanner(Scanner):
                         "launcher_path_qualified": path_qualified,
                         **({"launcher_wrapper": launch.wrapper} if launch.wrapper else {}),
                     }
-                    if launcher in _PACKAGE_LAUNCHERS and launcher != command
+                    if launcher in _UNDETERMINED_LAUNCHERS and launcher != command
                     else {}
                 ),
             },

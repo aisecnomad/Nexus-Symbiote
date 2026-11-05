@@ -443,3 +443,95 @@ def test_unknown_program_before_launcher_is_not_exported(tmp_path):
     assert "could not be determined" in pinning(server)[0]
     assert server.properties["launcher_wrapper"] == "[redacted-command]"
     assert "private-dir" not in server.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "command,args",
+    [
+        ("sh", ["-c", "$TOOL some-mcp-server@latest"]),
+        ("sh", ["-c", "${RUNNER} x"]),
+        ("sh", ["-c", '"$(command -v runner)" some-mcp-server']),
+        ("sh", ["-c", "`cat tool.txt` some-mcp-server"]),
+        ("sh", ["-c", "${TOOL:-/opt/bin/runner} some-mcp-server"]),
+        ("bash", ["-lc", "cd /srv && $TOOL some-mcp-server"]),
+        ("bash", ["-c", "FOO=1 exec $TOOL some-mcp-server"]),
+        ("sh", ["-c", "nohup $TOOL some-mcp-server"]),
+        ("sh", ["-c", "/opt/bin/$TOOL some-mcp-server"]),
+        ("sh", ["-c", "run* some-mcp-server"]),
+        ("sh", ["-c", "x=$(cat tool.txt); $x some-mcp-server"]),
+        ("cmd", ["/c", "%LAUNCHER% some-mcp-server"]),
+        ("cmd", ["/c", "@%LAUNCHER%", "some-mcp-server"]),
+        ("cmd", ["/v:on", "/c", "!LAUNCHER! some-mcp-server"]),
+        ("pwsh", ["-c", "$env:LAUNCHER some-mcp-server"]),
+        ("pwsh", ["-c", "& $tool some-mcp-server"]),
+        ("pwsh", ["-c", "& (Get-Command runner).Source some-mcp-server"]),
+        ("powershell", ["-EncodedCommand", encoded("$env:LAUNCHER some-mcp-server")]),
+        ("env", ["${TOOL}", "some-mcp-server"]),
+        ("env", ["-S", "$TOOL some-mcp-server"]),
+    ],
+)
+def test_computed_command_in_wrapped_line_is_an_undetermined_finding(tmp_path, command, args):
+    server = scan_server(tmp_path, command, args)
+    assert server.version_pinned is None
+    assert server.launcher_package is None
+    details = pinning(server)
+    assert len(details) == 1
+    assert "could not be determined" in details[0]
+    assert server.properties["launcher"] == "[computed]"
+    assert server.properties["launcher_wrapper"] == command
+    dump = server.model_dump_json()
+    assert "some-mcp-server" not in dump
+    assert "LAUNCHER" not in dump
+    assert "TOOL" not in dump
+
+
+@pytest.mark.parametrize(
+    "command,args,wrapper",
+    [
+        ("$NPX", ["some-mcp-server"], None),
+        ("${NPX}", ["some-mcp-server"], None),
+        ("${env:NPX}", ["some-mcp-server"], None),
+        ("%NPX%", ["some-mcp-server"], None),
+        ("/opt/${TOOL}", ["some-mcp-server"], None),
+        ("nohup", ["${TOOL}", "some-mcp-server"], "nohup"),
+    ],
+)
+def test_computed_configured_command_is_an_undetermined_finding(tmp_path, command, args, wrapper):
+    server = scan_server(tmp_path, command, args)
+    details = pinning(server)
+    assert len(details) == 1
+    assert "could not be determined" in details[0]
+    assert server.launcher_package is None
+    assert server.properties["launcher"] == "[computed]"
+    assert server.properties.get("launcher_wrapper") == wrapper
+    assert "NPX" not in server.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "command,args",
+    [
+        ("sh", ["-c", "node server.js --port $PORT"]),
+        ("sh", ["-c", "$HOME/bin/my-server --port 3000"]),
+        ("sh", ["-c", '"$HOME/.local/bin/my-server"']),
+        ("sh", ["-c", 'exec node "$@"']),
+        ("bash", ["-c", 'cd "$DIR" && node server.js']),
+        ("bash", ["-c", "PORT=$((BASE + 1)) node server.js"]),
+        ("sh", ["-c", 'echo "$(date)" > /tmp/started; node server.js']),
+        ("sh", ["-c", "{ node server.js; } 2>&1"]),
+        ("sh", ["-c", "'$TOOL' --port 3000"]),
+        ("sh", ["-c", "for f in *.js; do node $f; done"]),
+        ("cmd", ["/c", '"%ProgramFiles%\\nodejs\\node.exe" server.js']),
+        ("cmd", ["/c", "node server.js --port %PORT%"]),
+        ("pwsh", ["-c", "$port = 3000; node server.js --port $port"]),
+        ("pwsh", ["-c", "$env:PORT = '3000'; node server.js"]),
+        ("pwsh", ["-c", '& "$env:ProgramFiles\\nodejs\\node.exe" server.js']),
+        ("${HOME}/bin/my-server", ["--port", "3000"]),
+        ("node", ["${HOME}/server.js"]),
+        ("env", ["PORT=${PORT}", "node", "server.js"]),
+        ("nohup", ["node", "${HOME}/server.js"]),
+    ],
+)
+def test_literal_command_with_expanded_arguments_has_no_finding(tmp_path, command, args):
+    server = scan_server(tmp_path, command, args)
+    assert pinning(server) == []
+    assert "launcher" not in server.properties
