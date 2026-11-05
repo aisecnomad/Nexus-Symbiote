@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -42,6 +43,17 @@ MINIMUM_COMPONENT_TYPES = {
     ComponentType.TOOL,
     ComponentType.PROMPT_TEMPLATE,
 }
+
+
+def _binding_equal(supplied: object, local: object) -> bool:
+    """Compare binding tags without an early exit at the first differing byte.
+
+    Only string pairs take the constant-time path: ``hmac.compare_digest`` raises on
+    ``None``, non-string or non-ASCII values, and a hostile inventory can hold any of them.
+    """
+    if isinstance(supplied, str) and isinstance(local, str):
+        return hmac.compare_digest(supplied.encode("utf-8"), local.encode("utf-8"))
+    return supplied == local
 
 
 @dataclass
@@ -512,7 +524,7 @@ class CompletenessValidator:
                     local.version_pinned,
                 )
                 and all(
-                    supplied.properties.get(field) == local.properties.get(field)
+                    _binding_equal(supplied.properties.get(field), local.properties.get(field))
                     for field in (
                         "static_config_hash",
                         "static_config_hash_profile",

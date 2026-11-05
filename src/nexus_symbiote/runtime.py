@@ -21,7 +21,7 @@ import rfc8785
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from nexus_symbiote.runtime_validation import (
     MAX_ARGUMENT_BYTES,
@@ -286,8 +286,26 @@ def verify_contract(
         if statement["subject"] != subject:
             raise AuthorizationError("subject digest mismatch")
         return contract, accepted
+    except ValidationError as exc:
+        # Field names only: the text would otherwise echo issuer-authored values to
+        # whoever reads the library error, which the CLI already avoids.
+        raise AuthorizationError(_validation_message(exc)) from exc
     except (ValueError, TypeError, KeyError) as exc:
         raise AuthorizationError(str(exc)) from exc
+
+
+def _validation_message(exc: ValidationError) -> str:
+    known = {
+        name
+        for model in (ApprovedSnapshot, ActionApproval, TrustStatus, HostedModelAttestation)
+        for name in model.model_fields
+    }
+    invalid = set()
+    for error in exc.errors(include_input=False, include_context=False, include_url=False):
+        location = error["loc"]
+        head = location[0] if location else None
+        invalid.add(head if isinstance(head, str) and head in known else "unsupported field")
+    return "contract validation failed; review fields: " + ", ".join(sorted(invalid))
 
 
 def _validate_threshold(threshold: int) -> None:
@@ -341,6 +359,10 @@ class StateStore:
             }:
                 connection.execute("ALTER TABLE heads ADD COLUMN revoked_signers TEXT")
             connection.execute("CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY)")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS tenant_nonces "
+                "(tenant TEXT NOT NULL, nonce TEXT NOT NULL, PRIMARY KEY (tenant, nonce))"
+            )
         path.chmod(0o600)
 
     @contextmanager
@@ -397,6 +419,7 @@ class StateStore:
         heads: tuple[tuple[str, int, str], ...],
         nonce: str | None = None,
         *,
+        tenant: str | None = None,
         check_time: Callable[[], None] | None = None,
     ) -> None:
         with self._transaction() as db:
@@ -418,8 +441,19 @@ class StateStore:
                     (scope, serial, value),
                 )
             if nonce is not None:
+                # Rows consumed before nonces were tenant-scoped stay consumed for every
+                # tenant, so an upgrade can never resurrect a used nonce.
+                legacy = db.execute("SELECT 1 FROM nonces WHERE nonce=?", (nonce,)).fetchone()
                 try:
-                    db.execute("INSERT INTO nonces(nonce) VALUES (?)", (nonce,))
+                    if legacy is not None:
+                        raise sqlite3.IntegrityError("legacy nonce")
+                    if tenant is None:
+                        db.execute("INSERT INTO nonces(nonce) VALUES (?)", (nonce,))
+                    else:
+                        db.execute(
+                            "INSERT INTO tenant_nonces(tenant, nonce) VALUES (?, ?)",
+                            (tenant, nonce),
+                        )
                 except sqlite3.IntegrityError as exc:
                     raise AuthorizationError("approval nonce has already been used") from exc
             if check_time is not None:
@@ -612,6 +646,7 @@ class ReferenceGateway(Generic[T]):
                 trust_head,
             ),
             nonce,
+            tenant=context.tenant,
             check_time=check_time,
         )
         return self.execute(call)

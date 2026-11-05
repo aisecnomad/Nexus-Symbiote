@@ -17,6 +17,7 @@ from nexus_symbiote.runtime import (
     ApprovedSnapshot,
     AuthorizationError,
     Envelope,
+    EnvelopeSignature,
     ExecutionContext,
     ReferenceGateway,
     ServedTool,
@@ -24,6 +25,8 @@ from nexus_symbiote.runtime import (
     ToolCall,
     ToolGrant,
     TrustStatus,
+    _pae,
+    canonical_bytes,
     digest,
     key_id,
     sign_contract,
@@ -81,7 +84,7 @@ def fixture(tmp_path: Path, *, serial: int = 1):
         snapshot_digest=digest(snapshot.model_dump(mode="json")),
         context_digest=digest(context.model_dump(mode="json")),
         request_digest=digest(call.model_dump(mode="json")),
-        nonce="unique-operation-000001",
+        nonce="c3f1b0a7d9e24f6b8a1c5d7e9f0b2a4c",
         actor="approver",
         not_before=NOW - timedelta(seconds=1),
         not_after=NOW + timedelta(minutes=1),
@@ -500,3 +503,41 @@ def test_approval_actor_must_match_authorized_key(tmp_path):
 def test_noncanonical_input_rejected(raw):
     with pytest.raises(AuthorizationError):
         strict_json(raw)
+
+
+def test_nonces_are_scoped_by_tenant_and_legacy_rows_stay_consumed(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite")
+    store.record((), "shared-nonce", tenant="acme")
+    store.record((), "shared-nonce", tenant="globex")
+    with pytest.raises(AuthorizationError, match="already been used"):
+        store.record((), "shared-nonce", tenant="acme")
+    with sqlite3.connect(tmp_path / "state.sqlite") as db:
+        db.execute("INSERT INTO nonces VALUES ('legacy-consumed-nonce')")
+    for tenant in ("acme", "globex", None):
+        with pytest.raises(AuthorizationError, match="already been used"):
+            store.record((), "legacy-consumed-nonce", tenant=tenant)
+
+
+def test_library_validation_errors_name_fields_without_values(tmp_path):
+    values = fixture(tmp_path)
+    key = values[6]
+    envelope = sign_contract(values[3], "snapshot", (key,))
+    ring = {key_id(key.public_key()): key.public_key()}
+    statement = json.loads(base64.b64decode(envelope.payload))
+    statement["predicate"]["not_before"] = "2026-10-31T23:59:59"
+    statement["predicate"]["unexpected_key"] = "SECRET-VALUE-0001"
+    payload = canonical_bytes(statement)
+    altered = Envelope(
+        payload=base64.b64encode(payload).decode(),
+        signatures=(
+            EnvelopeSignature(
+                key_id=key_id(key.public_key()),
+                signature=base64.b64encode(key.sign(_pae(payload))).decode(),
+            ),
+        ),
+    )
+    with pytest.raises(AuthorizationError) as excinfo:
+        verify_contract(altered, "snapshot", ring)
+    message = str(excinfo.value)
+    assert "SECRET-VALUE-0001" not in message and "23:59:59" not in message
+    assert "not_before" in message and "unsupported field" in message

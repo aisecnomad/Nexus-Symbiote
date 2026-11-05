@@ -28,6 +28,8 @@ Four signed contracts have distinct predicate types and schemas:
 | Action approval | Bind an authorized approver key to one snapshot, execution context, exact request and single-use nonce | 5 minutes |
 | Hosted model attestation | Bind a trusted provider statement to endpoint, requested alias and resolved revision | 24 hours |
 
+Approval nonces are single-use within a tenant; draw each one from a cryptographically secure generator with at least 128 bits of entropy (for example `secrets.token_hex(16)`), never from a counter.
+
 Signatures authenticate the claims of authorized issuers. They do not prove
 human presence, model safety, complete discovery, or the truth of a provider's
 statement. The operator owns the signer-to-role and approver-key-to-actor maps.

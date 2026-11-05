@@ -262,3 +262,14 @@ def test_unkeyed_binding_ignores_index_credentials(tmp_path, monkeypatch):
     second = server("Winter2025x")
     assert first.properties["static_config_hash"] == second.properties["static_config_hash"]
     assert "Summer2024!" not in first.model_dump_json()
+
+
+def test_binding_tags_compare_in_constant_time_and_tolerate_hostile_values():
+    from nexus_symbiote.validators.completeness import _binding_equal
+
+    assert _binding_equal("abc", "abc")
+    assert not _binding_equal("abc", "abd")
+    assert not _binding_equal("tag", None)
+    assert _binding_equal(None, None)
+    assert not _binding_equal("t\u00e9", "te")
+    assert not _binding_equal(["x"], "x")
