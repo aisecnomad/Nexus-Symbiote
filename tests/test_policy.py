@@ -118,3 +118,32 @@ def test_invalid_settings_fail_closed(tmp_path, text):
     (tmp_path / ".nexus-symbiote.yaml").write_text(text)
     with pytest.raises(PolicyError):
         load_policy(tmp_path)
+
+
+def test_weakened_settings_names_only_relaxations():
+    from nexus_symbiote.policy import Policy, weakened_settings
+
+    assert weakened_settings(Policy()) == []
+    relaxed = Policy.model_validate(
+        {
+            "validate": {"require_integrity": False},
+            "risk": {
+                "fail_on_severity": "none",
+                "fail_threshold": 90.0,
+                "ignore_categories": ["x"],
+            },
+            "scan": {"failure_mode": "report-only", "scanners": ["mcp"]},
+        }
+    )
+    assert weakened_settings(relaxed) == [
+        "validate.require_integrity=false",
+        "risk.fail_on_severity=none",
+        "risk.fail_threshold=90",
+        "risk.ignore_categories=x",
+        "scan.failure_mode=report-only",
+        "scan.scanners=mcp",
+    ]
+    stricter = Policy.model_validate(
+        {"risk": {"fail_on_severity": "high", "fail_threshold": 10.0, "warn_threshold": 5.0}}
+    )
+    assert weakened_settings(stricter) == []

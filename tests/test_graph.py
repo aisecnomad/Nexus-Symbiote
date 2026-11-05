@@ -450,3 +450,26 @@ def test_project_policy_applies_through_project_and_is_named_otherwise(tmp_path)
     )
     assert named.exit_code == 1
     assert json.loads(named.stdout)["gate_reasons"] == ["finding at or above high"]
+
+
+def test_policy_source_and_relaxations_are_visible(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("Keep receipts.")
+    out = tmp_path / "bom.json"
+    runner = CliRunner()
+    assert (
+        runner.invoke(main, ["scan", str(project), "-o", str(out), "--no-project-policy"]).exit_code
+        == 0
+    )
+    (project / ".nexus-symbiote.yaml").write_text("risk: {fail_on_severity: none}\n")
+    unnamed = runner.invoke(main, ["risk", str(out), "--json-output"])
+    assert json.loads(unnamed.stdout)["policy_source"] == "built-in"
+    relaxed = runner.invoke(main, ["risk", str(out), "--project", str(project), "--json-output"])
+    payload = json.loads(relaxed.stdout)
+    assert payload["policy_source"].startswith("project:")
+    assert payload["policy_weakened"] == ["risk.fail_on_severity=none"]
+    human = runner.invoke(main, ["risk", str(out), "--project", str(project)])
+    assert "weakens the built-in gates: risk.fail_on_severity=none" in human.output
+    shown = runner.invoke(main, ["validate", str(out), "--project", str(project)])
+    assert "Policy: project:" in shown.output
