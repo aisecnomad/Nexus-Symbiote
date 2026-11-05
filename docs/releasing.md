@@ -172,7 +172,10 @@ replace the candidate.
 hash-checked binaries from `requirements-action.lock`, then collects the SBOM and
 benchmark evidence. `project.cdx.json` is a static inventory of the checked-out
 project, not a guarantee of complete runtime or build dependency coverage.
-`installed-distributions.json` records that locked environment. `source-revision.json`
+`installed-distributions.json` records that locked environment and
+`environment.cdx.json` is the same record as a CycloneDX 1.7 SBOM of the installed
+distributions, validated against the vendored schema; it describes what pip
+reports, not file authenticity. `source-revision.json`
 requires the actual clean checkout to match the workflow's exact `GITHUB_SHA` and
 records the repository, ref and run identity. `SHA256SUMS` covers that source
 record, the release distributions and evidence files. The workflow bundles all

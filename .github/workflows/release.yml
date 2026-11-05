@@ -106,6 +106,8 @@ jobs:
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/release-smoke/bin/python" -m nexus_symbiote --version
           "$RUNNER_TEMP/release-smoke/bin/python" -m nexus_symbiote scan "$GITHUB_WORKSPACE" --report-only -f cyclonedx -o "$GITHUB_WORKSPACE/evidence/project.cdx.json"
+      - name: Write the CycloneDX SBOM of the locked wheel runtime
+        run: python scripts/environment_sbom.py evidence/installed-distributions.json --out evidence/environment.cdx.json
       - name: Package the installed wheel's inventory benchmark
         run: |
           # Evidence below is derived from dist/; fail closed unless it still holds

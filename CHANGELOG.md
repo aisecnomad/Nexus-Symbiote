@@ -56,6 +56,7 @@ First alpha of the AgentBOM toolkit under the Hunzee-VC organization. Not yet ta
 
 ### Delivery
 
+- Add `environment.cdx.json`, a CycloneDX 1.7 SBOM of the locked wheel runtime, to the attested release evidence.
 - Declare the distribution license as `MIT AND Apache-2.0` and ship the vendored CycloneDX and SPDX schema license and notice as license files, so SBOM consumers record the bundled Apache-2.0 resources. The project's own code stays MIT. Raise the `pyyaml` floor to 6.0.1, the first release with CPython 3.12 wheels.
 - Organize the README around why, what and how: the agent supply-chain problem and the risks Nexus SymBiote records, what each collector reads and each command checks and produces, the demo agent's verified results, and how to install, scan, gate drift in CI, and configure the GitHub Action, pre-commit hooks and policy. Result limits and export semantics stay in the security model's "What results do and do not establish" section. Links and the banner use absolute URLs, so the README renders the same on PyPI as on GitHub.
 - Add a documentation hub, `docs/README.md`, that organizes every guide by why, what and how, and a schema guide, `schemas/README.md`, covering validation and byte-exact regeneration from the models. Validate the published schema example against both the schema and the runtime model in the test suite.
