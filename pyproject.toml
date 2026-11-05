@@ -7,7 +7,12 @@ name = "nexus-symbiote"
 version = "0.1.0"
 description = "Agent Bill of Materials (AgentBOM) — generate, validate, and manage AIBOMs for production AI agent systems"
 readme = "README.md"
-license = "MIT"
+license = "MIT AND Apache-2.0"
+license-files = [
+    "LICENSE",
+    "src/nexus_symbiote/generators/schemas/vendor/LICENSE-APACHE-2.0.txt",
+    "src/nexus_symbiote/generators/schemas/vendor/NOTICE.txt",
+]
 requires-python = ">=3.11"
 authors = [
     { name = "Emmanuel Dahunsi", email = "immanueldahunsi@gmail.com" },
@@ -46,7 +51,7 @@ dependencies = [
     "pydantic>=2.5,<3",
     "rich>=13.0,<16",
     "rfc8785>=0.1.4,<1",
-    "pyyaml>=6.0,<7",
+    "pyyaml>=6.0.1,<7",
     "jsonschema>=4.23,<5",
     "referencing>=0.35,<1",
     "cryptography>=50,<51",
@@ -63,13 +68,13 @@ sigstore = [
     "tuf>=7,<8",
 ]
 yaml = [
-    "pyyaml>=6.0,<7",
+    "pyyaml>=6.0.1,<7",
 ]
 all = [
     "cyclonedx-python-lib[json-validation]>=11.12,<12",
     "sigstore>=4.4,<5",
     "tuf>=7,<8",
-    "pyyaml>=6.0,<7",
+    "pyyaml>=6.0.1,<7",
 ]
 dev = [
     "pytest>=9.0.3,<10",

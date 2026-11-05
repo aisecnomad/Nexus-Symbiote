@@ -271,4 +271,4 @@ If you use Nexus SymBiote in research or tooling, cite it with the metadata in [
 
 ## License
 
-[MIT](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/LICENSE). Copyright (c) 2026 Emmanuel Dahunsi (AISecNomad).
+[MIT](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/LICENSE). Copyright (c) 2026 Emmanuel Dahunsi (AISecNomad). The vendored CycloneDX and SPDX schemas under `src/nexus_symbiote/generators/schemas/vendor/` are Apache-2.0 and ship with their [license](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/src/nexus_symbiote/generators/schemas/vendor/LICENSE-APACHE-2.0.txt) and [notice](https://github.com/Hunzee-VC/Nexus-Symbiote/blob/main/src/nexus_symbiote/generators/schemas/vendor/NOTICE.txt), so the distribution's license expression is `MIT AND Apache-2.0`.

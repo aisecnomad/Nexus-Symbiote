@@ -48,10 +48,16 @@ as described below.
 1. Choose the version. `pyproject.toml` and `src/nexus_symbiote/__init__.py` must
    agree; `scripts/check_repository_hygiene.py` fails CI otherwise. Move the
    changelog's *Unreleased* entries under the new version.
-2. Dispatch with `publish=none`. Inspect the run's wheel, source distribution, SBOM,
-   exact source record, installed-distribution inventory, dependency advisory
-   report, checksums and build/evidence attestations. Test the wheel in an isolated
-   environment outside the checkout.
+2. Freeze `main`: after the release pull request merges, merge nothing else until
+   the `pypi` run is approved. `workflow_dispatch --ref main` builds whatever `main`
+   is at dispatch time and the preflight requires that exact head, so a Dependabot
+   merge between runs would silently change the published bytes from the
+   rehearsed ones. The build is reproducible for one commit, so the `SHA256SUMS` of
+   the candidate, TestPyPI and PyPI runs must list identical distribution digests.
+   Dispatch with `publish=none`. Inspect the run's wheel, source distribution,
+   environment SBOM, exact source record, installed-distribution inventory,
+   dependency advisory report, checksums and build/evidence attestations. Test the
+   wheel in an isolated environment outside the checkout.
 3. Dispatch with `publish=testpypi` and approve the `testpypi` environment. Fetch
    only this project from TestPyPI, check it against the run's `SHA256SUMS`, then
    install it with dependencies from PyPI alone. Anyone can register project names
@@ -69,23 +75,54 @@ as described below.
    nexus-symbiote --version
    ```
 
-   An index never accepts the same file name twice, so a second rehearsal of the
-   same version needs a new version number, for example a release candidate such
-   as `0.1.0rc2`.
+   Confirm the PEP 740 provenance the index itself publishes: the file page must
+   show a verified provenance entry naming this repository and `release.yml`, or run
+   `pypi-attestations verify pypi --repository https://github.com/Hunzee-VC/Nexus-Symbiote <file URL>`
+   in a throwaway environment. Open the rendered project page and check the
+   headings, the banner and the alpha note.
+
+   An index never accepts the same file name twice, so a second rehearsal after a
+   fix needs a new version number. A pre-release such as `0.1.0rc2` is not a valid
+   successor: it sorts before `0.1.0` and would not satisfy `nexus-symbiote==0.1.0`.
+   Bump to the next patch version, rehearse it, and publish that version.
 4. Dispatch with `publish=pypi` and approve the `pypi` environment. Review the
    artifacts of this exact run at the approval gate.
 5. Verify the published files against this run's checksums and provenance. Constrain
    the signer, ref, commit and runner, not only the repository:
 
    ```bash
+   gh auth login
    gh attestation verify <file> --repo Hunzee-VC/Nexus-Symbiote \
      --signer-workflow Hunzee-VC/Nexus-Symbiote/.github/workflows/release.yml \
      --source-ref refs/heads/main --source-digest <release commit SHA> \
      --deny-self-hosted-runners
    ```
 
-   Create a matching signed tag `v<version>` and release notes. Do not claim
-   publication succeeded until the package index and the source revision agree.
+   Create a matching signed tag `v<version>` and release notes, and attach the run's
+   `SHA256SUMS`, `release-evidence.tar.gz` and attestation bundles to the release so
+   offline verification with `gh attestation verify --bundle` stays possible. Do not
+   claim publication succeeded until the package index and the source revision agree.
+
+## Rollback and incidents
+
+- A file name can never be reused on either index. A fix is always a new version;
+  the next patch version is the successor of a bad release.
+- Yanking: a project owner yanks a release on the index with a reason. A yanked
+  version still installs for anyone who pins it exactly, so yank only together with
+  a published fix and a changelog entry naming the defect. Yank rather than merely
+  supersede when the published bytes are wrong or vulnerable.
+- Partial upload: if one of the two files uploads and the other fails, a plain
+  re-run fails with "File already exists". Confirm the uploaded file's digest
+  against that run's `SHA256SUMS`, then re-run the publish once from the same commit
+  with `skip-existing: true` set on the publish step for that retry only.
+- Burned TestPyPI version: PyPI can still take the version, but the published bytes
+  would not be the rehearsed ones. Prefer bumping and rehearsing again.
+- Name rejected at upload time: the publish job fails before any file lands. Choose a
+  new name only after checking both indexes, and update `pyproject.toml`, the trusted
+  publishers and the environments' URLs together.
+- Security defect after publication: open a GitHub Security Advisory, publish the
+  fixed version first, then yank the affected one and reference the advisory in the
+  release notes and the changelog.
 
 A `testpypi` or `pypi` run fails closed if its read-only preflight cannot establish
 the required branch controls and successful CI for the exact source commit.
