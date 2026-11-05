@@ -120,7 +120,9 @@ def case_variants(
     open .MCP.json as .mcp.json, and .Claude/Skills as .claude/skills. A case-sensitive
     file system can hold several such paths; all are returned, up to MAX_CASE_VARIANTS
     at each level, because which one an agent reads there depends on where it runs.
-    With `directory`, the name is a directory. `listings` shares directory listings
+    With `directory`, the name is a directory; otherwise entries of every kind are returned,
+    so that a directory or symlink under a file name is read and refused. `listings` shares
+    directory listings
     between calls, so that each directory is listed at most once.
     """
     listings = {} if listings is None else listings
@@ -150,7 +152,8 @@ def case_variants(
             f"{parent}{entry}"
             for parent in parents
             for entry, kind in entries(parent).items()
-            if (kind in (stat.S_IFDIR, stat.S_IFLNK) if directory else kind != stat.S_IFDIR)
+            # Every kind is kept for a file name, so a directory there fails its read.
+            if (not directory or kind in (stat.S_IFDIR, stat.S_IFLNK))
             and folded_name(entry) == folded_name(leaf)
         ],
         name,

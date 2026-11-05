@@ -9,7 +9,7 @@ from nexus_symbiote.core.enums import RiskSeverity, TrustTier
 from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.models import PromptComponent, RiskAssessment, SkillPackageComponent
 from nexus_symbiote.core.textsafety import hidden_character_kinds
-from nexus_symbiote.scanners.base import Scanner, ScanResult, case_variants
+from nexus_symbiote.scanners.base import Scanner, ScanResult, case_variants, folded_name
 from nexus_symbiote.utils.confined import ConfinedCollection
 
 INVISIBLE_CHARS: dict[str, str] = {
@@ -140,8 +140,9 @@ def _documented_paths(
 
     Agents join fixed names such as CLAUDE.md or .claude/skills, which the default macOS
     and Windows file systems resolve to claude.md or .Claude/Skills. When no listing
-    shows the name, it is read itself, so a directory that cannot be listed, or a
-    directory under a documented file name, is still reported.
+    shows the name, it is read itself, so a parent that cannot be listed or is not a
+    directory is still reported. A directory under a documented file name, in any case,
+    is listed and its read refused.
     """
     return case_variants(files, name, failures, directory=directory, listings=listings) or [name]
 
@@ -179,7 +180,8 @@ class PromptScanner(Scanner):
                     files, skill_dir, result.scan_failures, listings, directory=True
                 )
                 for path in (path for d in directories for path in files.iter_files(d)):
-                    if path.name.startswith(".") or path.suffix.lower() not in (
+                    # HFS+ opens SKILL.md\u200c as SKILL.md, so the suffix is compared folded.
+                    if path.name.startswith(".") or Path(folded_name(path.name)).suffix not in (
                         ".md",
                         ".txt",
                         ".yaml",
