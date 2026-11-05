@@ -15,11 +15,14 @@ and detects unpinned versions, missing transport security, and rug-pull risk.
 from __future__ import annotations
 
 import ast
+import base64
+import binascii
 import ipaddress
 import re
+import shlex
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
 from packaging.requirements import InvalidRequirement, Requirement
@@ -372,6 +375,266 @@ def _launcher(command: str) -> tuple[str, bool]:
     return name.lower(), len(parts) > 1
 
 
+_POSIX_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "ash"})
+_WRAPPERS = _POSIX_SHELLS | {"cmd", "powershell", "pwsh", "env"}
+# Bounds on reading a wrapped command line, which is a whole program in a shell's syntax.
+_MAX_WRAPPED_LINE = 4096
+_MAX_WRAPPER_DEPTH = 4
+_SHELL_LONG_FLAGS = frozenset(
+    {"--login", "--noprofile", "--norc", "--posix", "--noediting", "--restricted", "--verbose"}
+)
+# Expansion, quoting the tokenizer does not model, globbing and command separators.
+_POSIX_UNREADABLE = frozenset("\n\r\x00$`\\{}*?[]")
+_POSIX_OPERATOR = frozenset("();<>|&")
+_CMD_UNREADABLE = frozenset("\n\r\x00&|<>^%!(),;")
+_POWERSHELL_UNREADABLE = frozenset("\n\r\x00;|&$`(){}<>,#%[]")
+_POWERSHELL_FLAGS = frozenset(
+    {"noprofile", "nop", "noninteractive", "noni", "nologo", "nol", "noexit", "noe"}
+    | {"mta", "sta", "login", "l"}
+)
+_POWERSHELL_VALUE_OPTIONS = frozenset(
+    {"executionpolicy", "ep", "ex", "windowstyle", "w", "win", "inputformat", "inp", "if"}
+    | {"outputformat", "of", "o", "configurationname", "config", "workingdirectory", "wd"}
+    | {"settingsfile", "settings"}
+)
+_ENV_LONG_FLAGS = frozenset({"--ignore-environment", "--null", "--debug"})
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
+_LAUNCHER_WORD = re.compile(
+    r"(?<![\w.@-])(npx|bunx|uvx|pipx|docker)(?:\.(?:exe|cmd|bat|ps1))?(?![\w.-])", re.IGNORECASE
+)
+
+
+class _UnreadableWrapperError(Exception):
+    """The wrapped command line cannot be read with confidence."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__("unreadable wrapped command")
+        self.text = text
+
+
+def _posix_words(line: str) -> list[str]:
+    if len(line) > _MAX_WRAPPED_LINE or not _POSIX_UNREADABLE.isdisjoint(line):
+        raise _UnreadableWrapperError(line)
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        words = list(lexer)
+    except ValueError:
+        raise _UnreadableWrapperError(line) from None
+    if any(word and set(word) <= _POSIX_OPERATOR for word in words):
+        raise _UnreadableWrapperError(line)
+    return words
+
+
+def _quoted_words(line: str, unreadable: frozenset[str], quotes: str) -> list[str]:
+    """Split on whitespace, accepting a quote only around a whole word without spaces.
+
+    A leading @ makes PowerShell splat a variable, so it is unreadable there too.
+    """
+    if len(line) > _MAX_WRAPPED_LINE or not unreadable.isdisjoint(line):
+        raise _UnreadableWrapperError(line)
+    words = []
+    for word in line.split():
+        if word[0] in quotes and len(word) > 1 and word[-1] == word[0]:
+            word = word[1:-1]
+        if any(quote in word for quote in quotes) or (quotes != '"' and word.startswith("@")):
+            raise _UnreadableWrapperError(line)
+        words.append(word)
+    return words
+
+
+def _shell_command(args: list[str]) -> list[str] | None:
+    command = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"-", "--"}:
+            index += 1
+            break
+        if arg.startswith("--"):
+            if arg in {"--rcfile", "--init-file"}:
+                index += 2
+            elif arg in _SHELL_LONG_FLAGS:
+                index += 1
+            else:
+                raise _UnreadableWrapperError(" ".join(args))
+            continue
+        if arg[:1] not in {"-", "+"}:
+            break
+        letters = arg[1:]
+        if not (letters.isascii() and letters.isalpha()):
+            raise _UnreadableWrapperError(" ".join(args))
+        command = command or (arg[0] == "-" and "c" in letters)
+        index += 1 + sum(letter in "oO" for letter in letters)
+    if not command:
+        return None
+    if index >= len(args):
+        raise _UnreadableWrapperError(" ".join(args))
+    # Later arguments become $0, $1 and so on, which the line can only use by expansion.
+    return _posix_words(args[index])
+
+
+def _cmd_command(args: list[str]) -> list[str] | None:
+    for index, arg in enumerate(args):
+        option = arg.lower()
+        if option[:2] in {"/c", "/k"}:
+            line = " ".join([arg[2:], *args[index + 1 :]]).lstrip()
+            # A leading @ only turns off echoing of the command.
+            return _quoted_words(line.removeprefix("@"), _CMD_UNREADABLE, '"')
+        if not re.fullmatch(r"/(?:[adqsu]|[efv]:(?:on|off)|t:[0-9a-f]{1,2})", option):
+            raise _UnreadableWrapperError(" ".join(args))
+    return None
+
+
+def _powershell_command(wrapper: str, args: list[str]) -> list[str] | None:
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if not arg.startswith("-"):
+            # Windows PowerShell runs a bare first argument as a command, pwsh as a script.
+            if wrapper == "powershell":
+                return _quoted_words(" ".join(args[index:]), _POWERSHELL_UNREADABLE, "'\"")
+            return None
+        option, colon, _ = arg.lstrip("-").lower().partition(":")
+        if option == "c" or (len(option) >= 3 and "command".startswith(option)):
+            line = " ".join(args[index + 1 :])
+            if line == "-":
+                return None
+            return _quoted_words(line, _POWERSHELL_UNREADABLE, "'\"")
+        if option in {"e", "ec"} or (len(option) >= 2 and "encodedcommand".startswith(option)):
+            value = args[index + 1] if index + 1 < len(args) else ""
+            if len(value) > 4 * _MAX_WRAPPED_LINE:
+                raise _UnreadableWrapperError(value)
+            try:
+                line = base64.b64decode(value, validate=True).decode("utf-16-le")
+            except (binascii.Error, UnicodeDecodeError):
+                raise _UnreadableWrapperError(value) from None
+            return _quoted_words(line, _POWERSHELL_UNREADABLE, "'\"")
+        if option and "file".startswith(option):
+            return None
+        if option in _POWERSHELL_FLAGS:
+            index += 1
+        elif option in _POWERSHELL_VALUE_OPTIONS:
+            index += 1 if colon else 2
+        else:
+            raise _UnreadableWrapperError(" ".join(args))
+    return None
+
+
+def _env_command(args: list[str]) -> list[str] | None:
+    split = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        split_value: str | None = None
+        if arg == "--":
+            break
+        if arg == "-":
+            continue
+        if arg.startswith("--"):
+            name, equals, attached = arg.partition("=")
+            if name in _ENV_LONG_FLAGS and not equals:
+                continue
+            if name not in {"--unset", "--chdir", "--split-string"}:
+                raise _UnreadableWrapperError(" ".join(args))
+            if not equals:
+                if index >= len(args):
+                    raise _UnreadableWrapperError(" ".join(args))
+                attached, index = args[index], index + 1
+            if name != "--split-string":
+                continue
+            split_value = attached
+        elif arg.startswith("-"):
+            letters = arg[1:]
+            for position, letter in enumerate(letters):
+                if letter in "i0v":
+                    continue
+                if letter not in "uCS":
+                    raise _UnreadableWrapperError(" ".join(args))
+                attached = letters[position + 1 :]
+                if not attached:
+                    if index >= len(args):
+                        raise _UnreadableWrapperError(" ".join(args))
+                    attached, index = args[index], index + 1
+                if letter == "S":
+                    split_value = attached
+                break
+            if split_value is None:
+                continue
+        elif "=" in arg:
+            continue
+        else:
+            index -= 1
+            break
+        if split:
+            raise _UnreadableWrapperError(" ".join(args))
+        # env -S splits its string into arguments and goes on reading options from them.
+        split = True
+        args, index = [*_posix_words(split_value), *args[index:]], 0
+    return args[index:] or None
+
+
+def _wrapped_words(wrapper: str, args: list[str]) -> list[str] | None:
+    """Return the command a wrapper runs, or None when it runs no command line."""
+    if wrapper in _POSIX_SHELLS:
+        return _shell_command(args)
+    if wrapper == "cmd":
+        return _cmd_command(args)
+    if wrapper in {"powershell", "pwsh"}:
+        return _powershell_command(wrapper, args)
+    return _env_command(args)
+
+
+class _Launch(NamedTuple):
+    launcher: str
+    path_qualified: bool
+    args: list[str]
+    wrapper: str | None = None
+    undetermined: bool = False
+
+
+def _resolve_launch(command: str, args: list[str]) -> _Launch:
+    """Classify the launcher a shell, cmd, PowerShell or env wrapper starts.
+
+    A wrapped line that cannot be read with confidence but names a package launcher
+    is undetermined, so it cannot pass the pinning checks unseen.
+    """
+    name, path_qualified = _launcher(command)
+    if name not in _WRAPPERS:
+        return _Launch(name, path_qualified, args)
+    wrapper, text = name, " ".join(args)
+    for _ in range(_MAX_WRAPPER_DEPTH):
+        try:
+            words = _wrapped_words(name, args)
+        except _UnreadableWrapperError as error:
+            text = error.text
+            break
+        if words is None:
+            return _Launch(wrapper, False, [])
+        while words and _ASSIGNMENT.fullmatch(words[0]):
+            words = words[1:]
+        if words[:1] == ["exec"] and len(words) > 1 and not words[1].startswith("-"):
+            words = words[1:]
+        if not words:
+            return _Launch(wrapper, False, [])
+        name, qualified = _launcher(words[0])
+        path_qualified = path_qualified or qualified
+        args, text = words[1:], " ".join(words)
+        if name in _PACKAGE_LAUNCHERS:
+            return _Launch(name, path_qualified, args, wrapper)
+        if name not in _WRAPPERS:
+            # A launcher after another program, as in `nohup npx`, is not classified.
+            if any(_launcher(arg)[0] in _PACKAGE_LAUNCHERS for arg in args):
+                break
+            return _Launch(wrapper, False, [])
+    found = _LAUNCHER_WORD.search(text)
+    if found is None:
+        return _Launch(wrapper, False, [])
+    return _Launch(found[1].lower(), path_qualified, [], wrapper, undetermined=True)
+
+
 # Same categories and severities as the instruction-file checks in scanners/prompt.py.
 _HIDDEN_TEXT_FINDINGS: dict[HiddenKind, tuple[RiskSeverity, str, str]] = {
     "bidi": (
@@ -694,8 +957,11 @@ class MCPScanner(Scanner):
             {"profile": STATIC_CONFIG_HASH_PROFILE, "structure": structure}
         )
 
-        launcher, path_qualified = _launcher(command)
-        package_ref = self._extract_package_ref(launcher, args)
+        launch = _resolve_launch(command, args)
+        launcher, path_qualified, launch_args = launch.launcher, launch.path_qualified, launch.args
+        package_ref = (
+            None if launch.undetermined else self._extract_package_ref(launcher, launch_args)
+        )
         # An explicit path can name any executable, so it never identifies a registry package.
         launcher_package = (
             self._launcher_package(launcher, package_ref)
@@ -703,7 +969,7 @@ class MCPScanner(Scanner):
             else None
         )
         if launcher_package and launcher in {"uvx", "pipx"}:
-            if any(arg.split("=", 1)[0] in _PYTHON_SOURCE_OPTIONS for arg in args):
+            if any(arg.split("=", 1)[0] in _PYTHON_SOURCE_OPTIONS for arg in launch_args):
                 launcher_package = None
         if launcher_package:
             package_name = launcher_package.split(":", 1)[1]
@@ -737,7 +1003,11 @@ class MCPScanner(Scanner):
         elif (
             package_ref is None
             and launcher in _PACKAGE_LAUNCHERS
-            and (launcher != "docker" or _docker_may_run_container(args))
+            and (
+                launch.undetermined
+                or launcher != "docker"
+                or _docker_may_run_container(launch_args)
+            )
         ):
             risks.append(
                 RiskAssessment(
@@ -796,7 +1066,11 @@ class MCPScanner(Scanner):
                 "static_config_hash": source_config_hash,
                 "static_config_hash_profile": STATIC_CONFIG_HASH_PROFILE,
                 **(
-                    {"launcher": launcher, "launcher_path_qualified": path_qualified}
+                    {
+                        "launcher": launcher,
+                        "launcher_path_qualified": path_qualified,
+                        **({"launcher_wrapper": launch.wrapper} if launch.wrapper else {}),
+                    }
                     if launcher in _PACKAGE_LAUNCHERS and launcher != command
                     else {}
                 ),
