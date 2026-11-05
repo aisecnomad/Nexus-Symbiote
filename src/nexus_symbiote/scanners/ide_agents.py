@@ -568,7 +568,99 @@ CLAUDE_SETTINGS_COMMAND_OBJECTS = ("statusLine", "fileSuggestion", "subagentStat
 CLAUDE_SETTINGS_FILES = (".claude/settings.json", ".claude/settings.local.json")
 # Hook and settings records of a Claude Code agent. A fresh scan omits them when no settings
 # file declares anything they cover, so reconciliation must treat a missing one as a change.
-CLAUDE_SETTINGS_RECORDS = ("declared_hooks", "declared_hook_settings", "declared_setting_commands")
+CLAUDE_SETTINGS_RECORDS = (
+    "declared_hooks",
+    "declared_hook_settings",
+    "declared_setting_commands",
+    "declared_settings_env",
+)
+# Claude Code writes settings env into its own environment, which every Bash command, hook,
+# settings command and stdio MCP server it starts inherits.
+CLAUDE_SETTINGS_ENV = "env"
+# Variables that load code into, or choose, what those processes run: dynamic loaders,
+# interpreter options and search paths, shell startup files, the shell itself, PATH, and git's
+# ssh, askpass, pager and config commands.
+_EXEC_ENV = frozenset(
+    {
+        "BASH_ENV",
+        "ENV",
+        "PATH",
+        "SHELL",
+        "PROMPT_COMMAND",
+        "ZDOTDIR",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONHOME",
+        "PYTHONUSERBASE",
+        "PERL5OPT",
+        "PERL5LIB",
+        "PERLLIB",
+        "RUBYOPT",
+        "RUBYLIB",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "DOTNET_STARTUP_HOOKS",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_EXEC_PATH",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_PAGER",
+        "GIT_EDITOR",
+        "GIT_PROXY_COMMAND",
+        "GIT_TEMPLATE_DIR",
+        "CLAUDE_CODE_SHELL",
+        "CLAUDE_CODE_SHELL_PREFIX",
+        "CLAUDE_CODE_GIT_BASH_PATH",
+        "CLAUDE_ENV_FILE",
+    }
+)
+_EXEC_ENV_PREFIXES = ("LD_", "DYLD_", "GIT_CONFIG")
+# Variables that choose where Claude Code sends the conversation and with which credentials,
+# headers, proxy or certificate trust.
+_ENDPOINT_ENV = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "ANTHROPIC_FOUNDRY_API_KEY",
+        "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+        "ANTHROPIC_FOUNDRY_RESOURCE",
+        "ANTHROPIC_AWS_API_KEY",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_MANTLE",
+        "CLAUDE_CODE_EXTRA_BODY",
+        "CLAUDE_CODE_CERT_STORE",
+        "CLAUDE_CODE_CLIENT_CERT",
+        "CLAUDE_CODE_CLIENT_KEY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+        "NODE_TLS_REJECT_UNAUTHORIZED",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    }
+)
+_ENDPOINT_ENV_PATTERN = re.compile(r"ANTHROPIC_\w*BASE_URL|CLAUDE_CODE_SKIP_\w*AUTH")
+# Both are high: an endpoint or proxy receives every prompt, file and tool result in the
+# conversation and writes the replies that become tool calls, as an HTTP hook would see them.
+_ENV_FINDINGS = {
+    "agent-settings-env-exec": "can inject code into or redirect the commands it runs",
+    "agent-settings-env-endpoint": (
+        "can redirect its model endpoint, credentials, network proxy or TLS trust"
+    ),
+}
+_MAX_ENV_FINDING_NAMES = 8
 UNPARSED_NAME = "[unparsed]"
 _HOOK_EVENT = re.compile(r"[A-Za-z][A-Za-z0-9]{0,63}")
 _SAFE_NAME = re.compile(r"[\w.+-][\w.+:-]{0,127}", re.ASCII)
@@ -879,6 +971,51 @@ def _hook_settings_record(
     return record
 
 
+def _env_category(name: str) -> str | None:
+    """The finding a settings env variable raises, if any; Windows ignores name case."""
+    upper = name.upper()
+    if upper in _EXEC_ENV or upper.startswith(_EXEC_ENV_PREFIXES):
+        return "agent-settings-env-exec"
+    if upper in _ENDPOINT_ENV or _ENDPOINT_ENV_PATTERN.fullmatch(upper):
+        return "agent-settings-env-endpoint"
+    return None
+
+
+def _settings_env_record(
+    relative: str, env: Any, result: ScanResult, risks: list[RiskAssessment]
+) -> dict[str, Any]:
+    """A settings file's env variable names, never values, and findings for risky names.
+
+    Names Claude Code may still apply count even when the record is unparsed.
+    """
+    valid = isinstance(env, dict) and all(isinstance(value, str) for value in env.values())
+    names = _names(list(env) if valid else None, _ENV_NAME, f"{relative}: env", result)
+    flagged: dict[str, list[str]] = {}
+    if isinstance(env, dict):
+        for name in env:
+            if _ENV_NAME.fullmatch(name) and (category := _env_category(name)):
+                flagged.setdefault(category, []).append(name)
+    for category, action in _ENV_FINDINGS.items():
+        if not (matched := sorted(flagged.get(category, []))):
+            continue
+        shown = ", ".join(matched[:_MAX_ENV_FINDING_NAMES])
+        if len(matched) > _MAX_ENV_FINDING_NAMES:
+            shown += f" and {len(matched) - _MAX_ENV_FINDING_NAMES} more"
+        risks.append(
+            RiskAssessment(
+                severity=RiskSeverity.HIGH,
+                category=category,
+                detail=f"IDE agent 'claude-code' settings env sets {shown}, which {action}.",
+                recommendation=(
+                    "Review the variables and their values. Claude Code applies settings env "
+                    "to every session and the commands it starts, and -p and SDK sessions "
+                    "never ask for workspace trust."
+                ),
+            )
+        )
+    return {"settings_file": relative, "names": names}
+
+
 def _setting_command_records(
     relative: str, declared: dict[str, Any], result: ScanResult
 ) -> list[dict[str, Any]]:
@@ -1128,6 +1265,7 @@ class IDEAgentScanner(Scanner):
                                 *CLAUDE_HOOK_SETTINGS,
                                 *CLAUDE_SETTINGS_HELPERS,
                                 *CLAUDE_SETTINGS_COMMAND_OBJECTS,
+                                CLAUDE_SETTINGS_ENV,
                             )
                             if key in data
                         }
@@ -1373,9 +1511,9 @@ class IDEAgentScanner(Scanner):
     def _claude_code_hooks(
         sources: Any, hook_settings: Any, result: ScanResult, risks: list[RiskAssessment]
     ) -> dict[str, Any]:
-        """Record each settings file's hooks and settings commands, and flag those that run.
+        """Record each settings file's hooks, settings commands and env, and flag those that run.
 
-        hook_settings holds each file's hook switches, allowlists and settings commands.
+        hook_settings holds each file's hook switches, allowlists, settings commands and env.
         """
         sources, hook_settings = sources or {}, hook_settings or {}
         if not sources and not hook_settings:
@@ -1401,6 +1539,11 @@ class IDEAgentScanner(Scanner):
             ),
             key=lambda record: json.dumps(list(record.values())),
         )
+        env = [
+            _settings_env_record(relative, declared[CLAUDE_SETTINGS_ENV], result, risks)
+            for relative, declared in hook_settings.items()
+            if CLAUDE_SETTINGS_ENV in declared
+        ]
         for command in commands:
             risks.append(
                 RiskAssessment(
@@ -1471,6 +1614,8 @@ class IDEAgentScanner(Scanner):
                 if not declared.keys().isdisjoint(CLAUDE_HOOK_SETTINGS)
             ],
             "declared_setting_commands": commands,
+            # Only when declared, so baselines from before env was collected still reconcile.
+            **({"declared_settings_env": env} if env else {}),
             **(
                 {
                     "hook_value_binding": binding[0],
