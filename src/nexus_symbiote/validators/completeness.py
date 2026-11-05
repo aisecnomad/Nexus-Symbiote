@@ -18,6 +18,7 @@ from nexus_symbiote.core.models import (
     AgentComponent,
     AnyComponent,
     ClaimEvidence,
+    IDEAgentComponent,
     MCPServerComponent,
     ModelComponent,
     RegistryEntryComponent,
@@ -30,6 +31,7 @@ from nexus_symbiote.scanners.a2a import (
     has_a2a_source_binding,
 )
 from nexus_symbiote.scanners.base import exportable
+from nexus_symbiote.scanners.ide_agents import CLAUDE_SETTINGS_RECORDS
 
 if TYPE_CHECKING:
     from nexus_symbiote.scanners.base import ScanResult
@@ -596,6 +598,13 @@ class CompletenessValidator:
             or canonical_json(supplied.properties[key]) != canonical_json(value)
             for key, value in local.properties.items()
         ):
+            return False
+        if isinstance(local, IDEAgentComponent) and any(
+            key in supplied.properties and key not in local.properties
+            for key in CLAUDE_SETTINGS_RECORDS
+        ):
+            # Other properties a fresh scan lacks may come from separate observations, but
+            # these are omitted only when the settings declaring them are gone.
             return False
         for name, evidence in local.claims.items():
             if evidence.method == "not-collected":

@@ -566,6 +566,9 @@ CLAUDE_SETTINGS_HELPERS = (
 )
 CLAUDE_SETTINGS_COMMAND_OBJECTS = ("statusLine", "fileSuggestion", "subagentStatusLine")
 CLAUDE_SETTINGS_FILES = (".claude/settings.json", ".claude/settings.local.json")
+# Hook and settings records of a Claude Code agent. A fresh scan omits them when no settings
+# file declares anything they cover, so reconciliation must treat a missing one as a change.
+CLAUDE_SETTINGS_RECORDS = ("declared_hooks", "declared_hook_settings", "declared_setting_commands")
 UNPARSED_NAME = "[unparsed]"
 _HOOK_EVENT = re.compile(r"[A-Za-z][A-Za-z0-9]{0,63}")
 _SAFE_NAME = re.compile(r"[\w.+-][\w.+:-]{0,127}", re.ASCII)
@@ -1461,8 +1464,6 @@ class IDEAgentScanner(Scanner):
             )
             binding = None
         return {
-            # Reconciliation accepts properties a fresh scan lacks, so all are always
-            # present: removing disableAllHooks must change a value, not drop a key.
             "declared_hooks": records,
             "declared_hook_settings": [
                 _hook_settings_record(relative, declared, result)
