@@ -375,8 +375,16 @@ def _launcher(command: str) -> tuple[str, bool]:
     return name.lower(), len(parts) > 1
 
 
-_POSIX_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "ash"})
+_POSIX_SHELLS = frozenset(
+    {"sh", "bash", "dash", "zsh", "ksh", "ash", "mksh", "oksh", "loksh", "yash", "posh"}
+    | {"fish", "csh", "tcsh"}
+)
 _WRAPPERS = _POSIX_SHELLS | {"cmd", "powershell", "pwsh", "env"}
+# Programs that run the command in their arguments; their own options are not modeled.
+_PREFIX_PROGRAMS = frozenset(
+    {"nohup", "nice", "timeout", "time", "command", "setsid", "stdbuf", "busybox", "sudo"}
+    | {"doas", "ionice", "chrt", "taskset", "xargs", "caffeinate", "unbuffer", "chronic"}
+)
 # Bounds on reading a wrapped command line, which is a whole program in a shell's syntax.
 _MAX_WRAPPED_LINE = 4096
 _MAX_WRAPPER_DEPTH = 4
@@ -388,6 +396,8 @@ _POSIX_UNREADABLE = frozenset("\n\r\x00$`\\{}*?[]")
 _POSIX_OPERATOR = frozenset("();<>|&")
 _CMD_UNREADABLE = frozenset("\n\r\x00&|<>^%!(),;")
 _POWERSHELL_UNREADABLE = frozenset("\n\r\x00;|&$`(){}<>,#%[]")
+# PowerShell reads an option after '/' or any of these dashes, and one more of the same dash.
+_POWERSHELL_DASHES = "-\u2013\u2014\u2015"
 _POWERSHELL_FLAGS = frozenset(
     {"noprofile", "nop", "noninteractive", "noni", "nologo", "nol", "noexit", "noe"}
     | {"mta", "sta", "login", "l"}
@@ -400,8 +410,12 @@ _POWERSHELL_VALUE_OPTIONS = frozenset(
 _ENV_LONG_FLAGS = frozenset({"--ignore-environment", "--null", "--debug"})
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
 _LAUNCHER_WORD = re.compile(
-    r"(?<![\w.@-])(npx|bunx|uvx|pipx|docker)(?:\.(?:exe|cmd|bat|ps1))?(?![\w.-])", re.IGNORECASE
+    r"(?<![\w.@-])(npx|bunx|uvx|pipx|docker)(?:\.(?:exe|cmd|bat|ps1))?(?![\w.\\/-])",
+    re.IGNORECASE,
 )
+# Quote, escape and bracket characters a shell removes or matches inside a word, as in
+# `n\px`, `n"p"x`, `n^px`, `n`px` or `np[x]`.
+_WORD_SPLITTERS = re.compile(r"[\\'\"^`\[\]]")
 
 
 class _UnreadableWrapperError(Exception):
@@ -436,9 +450,12 @@ def _quoted_words(line: str, unreadable: frozenset[str], quotes: str) -> list[st
         raise _UnreadableWrapperError(line)
     words = []
     for word in line.split():
-        if word[0] in quotes and len(word) > 1 and word[-1] == word[0]:
+        quoted = word[0] in quotes and len(word) > 1 and word[-1] == word[0]
+        if quoted:
             word = word[1:-1]
-        if any(quote in word for quote in quotes) or (quotes != '"' and word.startswith("@")):
+        if any(quote in word for quote in quotes) or (
+            not quoted and quotes != '"' and word.startswith("@")
+        ):
             raise _UnreadableWrapperError(line)
         words.append(word)
     return words
@@ -487,16 +504,40 @@ def _cmd_command(args: list[str]) -> list[str] | None:
     return None
 
 
+def _powershell_option(arg: str) -> str | None:
+    """Return a PowerShell option's name, read as PowerShell's command-line parser does."""
+    arg = arg.strip()
+    if not arg or (arg[0] != "/" and arg[0] not in _POWERSHELL_DASHES):
+        return None
+    name = arg[1:]
+    if arg[0] != "/" and name[:1] == arg[0]:
+        name = name[1:]
+    return name.lower()
+
+
+def _encoded_command(value: str) -> str:
+    # .NET Convert.FromBase64String skips these whitespace characters.
+    value = re.sub(r"[ \t\r\n]", "", value)
+    try:
+        return base64.b64decode(value, validate=True).decode("utf-16-le")
+    except (binascii.Error, UnicodeDecodeError):
+        # Search what a lenient decoder reads, never the opaque base64 itself.
+        value = re.sub(r"[^A-Za-z0-9+/]", "", value)
+        data = base64.b64decode(value[: len(value) // 4 * 4])
+        raise _UnreadableWrapperError(data.decode("utf-16-le", errors="replace")) from None
+
+
 def _powershell_command(wrapper: str, args: list[str]) -> list[str] | None:
     index = 0
     while index < len(args):
         arg = args[index]
-        if not arg.startswith("-"):
+        switch = _powershell_option(arg)
+        if switch is None:
             # Windows PowerShell runs a bare first argument as a command, pwsh as a script.
             if wrapper == "powershell":
                 return _quoted_words(" ".join(args[index:]), _POWERSHELL_UNREADABLE, "'\"")
             return None
-        option, colon, _ = arg.lstrip("-").lower().partition(":")
+        option, colon, _ = switch.partition(":")
         if option == "c" or (len(option) >= 3 and "command".startswith(option)):
             line = " ".join(args[index + 1 :])
             if line == "-":
@@ -504,13 +545,7 @@ def _powershell_command(wrapper: str, args: list[str]) -> list[str] | None:
             return _quoted_words(line, _POWERSHELL_UNREADABLE, "'\"")
         if option in {"e", "ec"} or (len(option) >= 2 and "encodedcommand".startswith(option)):
             value = args[index + 1] if index + 1 < len(args) else ""
-            if len(value) > 4 * _MAX_WRAPPED_LINE:
-                raise _UnreadableWrapperError(value)
-            try:
-                line = base64.b64decode(value, validate=True).decode("utf-16-le")
-            except (binascii.Error, UnicodeDecodeError):
-                raise _UnreadableWrapperError(value) from None
-            return _quoted_words(line, _POWERSHELL_UNREADABLE, "'\"")
+            return _quoted_words(_encoded_command(value), _POWERSHELL_UNREADABLE, "'\"")
         if option and "file".startswith(option):
             return None
         if option in _POWERSHELL_FLAGS:
@@ -593,6 +628,21 @@ class _Launch(NamedTuple):
     args: list[str]
     wrapper: str | None = None
     undetermined: bool = False
+    # Words of a wrapped line, which the outer arguments hide, read for package sources.
+    wrapped_words: tuple[str, ...] = ()
+
+
+def _runs_launcher(args: list[str]) -> bool:
+    """Whether another program's arguments may start a package launcher, as in `nohup npx`."""
+    names_launcher = _LAUNCHER_WORD.search(" ".join(args)) is not None
+    for index, arg in enumerate(args):
+        name = _launcher(arg)[0]
+        if name == "docker":
+            # An option value such as `--runtime docker` starts no container.
+            return _docker_may_run_container(args[index + 1 :])
+        if name in _PACKAGE_LAUNCHERS or (name in _WRAPPERS and names_launcher):
+            return True
+    return False
 
 
 def _resolve_launch(command: str, args: list[str]) -> _Launch:
@@ -602,8 +652,16 @@ def _resolve_launch(command: str, args: list[str]) -> _Launch:
     is undetermined, so it cannot pass the pinning checks unseen.
     """
     name, path_qualified = _launcher(command)
-    if name not in _WRAPPERS:
+    if name in _PACKAGE_LAUNCHERS:
         return _Launch(name, path_qualified, args)
+    if name not in _WRAPPERS:
+        if not _runs_launcher(args):
+            return _Launch(name, path_qualified, args)
+        found = _LAUNCHER_WORD.search(" ".join(args))
+        if found is None:
+            return _Launch(name, path_qualified, args)
+        shown = name if name in _PREFIX_PROGRAMS else "[redacted-command]"
+        return _Launch(found[1].lower(), path_qualified, [], shown, undetermined=True)
     wrapper, text = name, " ".join(args)
     for _ in range(_MAX_WRAPPER_DEPTH):
         try:
@@ -613,9 +671,18 @@ def _resolve_launch(command: str, args: list[str]) -> _Launch:
             break
         if words is None:
             return _Launch(wrapper, False, [])
-        while words and _ASSIGNMENT.fullmatch(words[0]):
-            words = words[1:]
-        if words[:1] == ["exec"] and len(words) > 1 and not words[1].startswith("-"):
+        if name in _POSIX_SHELLS or name == "env":
+            # cmd and PowerShell run a first word with '=' in it as a program.
+            start = next(
+                (i for i, word in enumerate(words) if not _ASSIGNMENT.fullmatch(word)), len(words)
+            )
+            words = words[start:]
+        if (
+            name in _POSIX_SHELLS
+            and words[:1] == ["exec"]
+            and len(words) > 1
+            and not words[1].startswith("-")
+        ):
             words = words[1:]
         if not words:
             return _Launch(wrapper, False, [])
@@ -623,16 +690,23 @@ def _resolve_launch(command: str, args: list[str]) -> _Launch:
         path_qualified = path_qualified or qualified
         args, text = words[1:], " ".join(words)
         if name in _PACKAGE_LAUNCHERS:
-            return _Launch(name, path_qualified, args, wrapper)
+            return _Launch(name, path_qualified, args, wrapper, wrapped_words=tuple(args))
         if name not in _WRAPPERS:
             # A launcher after another program, as in `nohup npx`, is not classified.
-            if any(_launcher(arg)[0] in _PACKAGE_LAUNCHERS for arg in args):
+            if _runs_launcher(args):
                 break
             return _Launch(wrapper, False, [])
-    found = _LAUNCHER_WORD.search(text)
+    found = _LAUNCHER_WORD.search(text) or _LAUNCHER_WORD.search(_WORD_SPLITTERS.sub("", text))
     if found is None:
         return _Launch(wrapper, False, [])
-    return _Launch(found[1].lower(), path_qualified, [], wrapper, undetermined=True)
+    return _Launch(
+        found[1].lower(),
+        path_qualified,
+        [],
+        wrapper,
+        undetermined=True,
+        wrapped_words=tuple(text.split()),
+    )
 
 
 # Same categories and severities as the instruction-file checks in scanners/prompt.py.
@@ -941,6 +1015,17 @@ class MCPScanner(Scanner):
         if codex and inherited_from:
             # The recorded server is the merge of these layers, ancestors first.
             codex_properties["codex_merged_layers"] = [*inherited_from, config_scope]
+        launch = _resolve_launch(command, args)
+        package_sources = _package_sources(args, secrets)
+        # A registry option inside a wrapped line is hidden in one opaque outer argument.
+        package_sources = sorted(
+            package_sources
+            + [
+                source
+                for source in _package_sources(list(launch.wrapped_words), secrets)
+                if source not in package_sources
+            ]
+        )
         structure = {
             "fields": sorted(config),
             "command": shown_command,
@@ -949,7 +1034,7 @@ class MCPScanner(Scanner):
             "argument_count": len(args),
             "environment_names": sorted(env),
             "tool_names": tool_names,
-            "package_sources": _package_sources(args, secrets),
+            "package_sources": package_sources,
         }
         if codex:
             structure["codex_tool_policy"] = codex_policy
@@ -957,7 +1042,6 @@ class MCPScanner(Scanner):
             {"profile": STATIC_CONFIG_HASH_PROFILE, "structure": structure}
         )
 
-        launch = _resolve_launch(command, args)
         launcher, path_qualified, launch_args = launch.launcher, launch.path_qualified, launch.args
         package_ref = (
             None if launch.undetermined else self._extract_package_ref(launcher, launch_args)

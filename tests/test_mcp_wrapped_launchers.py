@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -275,3 +276,170 @@ def test_secret_in_package_position_withholds_identity(tmp_path):
     server = scan_server(tmp_path, "sh", ["-c", f"npx {secret}"], env={"TOKEN": secret})
     assert server.launcher_package is None
     assert secret not in server.model_dump_json()
+
+
+def test_many_env_assignments_after_double_dash_resolve_in_linear_time():
+    from nexus_symbiote.scanners.mcp import _resolve_launch
+
+    started = time.perf_counter()
+    launch = _resolve_launch("env", ["--", *["A=1"] * 200_000, "npx", "some-mcp-server"])
+    # Quadratic stripping took about 30 seconds here; linear stripping takes well under one.
+    assert time.perf_counter() - started < 10
+    assert launch.launcher == "npx"
+    assert launch.args == ["some-mcp-server"]
+
+
+@pytest.mark.parametrize(
+    "command,args",
+    [
+        ("pwsh", ["/c", "npx -y some-mcp-server@latest"]),
+        ("pwsh", ["/Command", "npx -y some-mcp-server@latest"]),
+        ("pwsh", ["\u2013c", "npx -y some-mcp-server@latest"]),
+        ("pwsh", ["\u2014Command", "npx -y some-mcp-server@latest"]),
+        ("pwsh", ["\u2015\u2015command", "npx -y some-mcp-server@latest"]),
+        ("pwsh", ["-NoProfile", "/c", "npx -y some-mcp-server@latest"]),
+        ("pwsh.exe", ["/c", "npx -y some-mcp-server@latest"]),
+        ("powershell", ["/NoProfile", "/Command", "npx -y some-mcp-server@latest"]),
+        ("pwsh", ["/EncodedCommand", encoded("npx -y some-mcp-server@latest")]),
+        ("bash", ["--rcfile", "rc", "-c", "npx some-mcp-server@latest"]),
+    ],
+)
+def test_wrapper_option_spellings_are_read(tmp_path, command, args):
+    server = scan_server(tmp_path, command, args)
+    assert server.version_pinned is False
+    assert any("unpinned package reference" in detail for detail in pinning(server))
+    assert server.launcher_package == "npm:some-mcp-server"
+    assert server.properties["launcher_wrapper"] in {"pwsh", "powershell", "bash"}
+
+
+ENCODED = encoded("npx -y some-mcp-server@latest")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ENCODED[:8] + " " + ENCODED[8:],
+        ENCODED[:8] + "\r\n" + ENCODED[8:] + "\t",
+    ],
+)
+def test_encoded_command_ignores_whitespace_like_dotnet(tmp_path, value):
+    server = scan_server(tmp_path, "pwsh", ["-EncodedCommand", value])
+    assert server.launcher_package == "npm:some-mcp-server"
+    assert any("unpinned package reference" in detail for detail in pinning(server))
+
+
+@pytest.mark.parametrize(
+    "command,args",
+    [
+        ("pwsh", ["-EncodedCommand", encoded("npx -y some-mcp-server@latest" + " " * 6200)]),
+        ("pwsh", ["-EncodedCommand", encoded(" " * 9000 + "npx -y some-mcp-server@1.2.3")]),
+        ("pwsh", ["-EncodedCommand", ENCODED[:-4] + "!!" + ENCODED[-4:]]),
+        ("sh", ["-c", "n\\px -y some-mcp-server@latest"]),
+        ("sh", ["-c", 'n"p"x -y some-mcp-server@latest; true']),
+        ("sh", ["-c", "np[x] -y some-mcp-server@latest"]),
+        ("cmd", ["/c", "n^px -y some-mcp-server@latest"]),
+        ("powershell", ["-c", "n`px -y some-mcp-server@latest"]),
+        ("sh", ["-c", "nohup sh -c 'npx -y some-mcp-server@latest'"]),
+        ("bash", ["-c", "timeout 3600 bash -c 'npx some-mcp-server@latest'"]),
+        ("cmd", ["/c", "installer=x", "npx", "-y", "some-mcp-server@1.2.3"]),
+        ("pwsh", ["-c", "helper=x npx some-mcp-server@1.2.3"]),
+        ("pwsh", ["-c", "npx some-mcp-server@1.2.3 @splat"]),
+        ("env", ["-S", "A=1", "-S", "npx some-mcp-server@latest"]),
+        ("nohup", ["npx", "-y", "some-mcp-server@latest"]),
+        ("busybox", ["sh", "-c", "npx -y some-mcp-server@latest"]),
+        ("timeout", ["3600", "npx", "some-mcp-server@1.2.3"]),
+        ("dotenv", ["--", "npx", "some-mcp-server@1.2.3"]),
+    ],
+)
+def test_obscured_wrapped_launcher_is_an_undetermined_finding(tmp_path, command, args):
+    server = scan_server(tmp_path, command, args)
+    assert server.version_pinned is None
+    assert server.launcher_package is None
+    details = pinning(server)
+    assert len(details) == 1
+    assert "could not be determined" in details[0]
+    assert server.properties["launcher"] == "npx"
+    assert server.properties["launcher_wrapper"]
+
+
+@pytest.mark.parametrize(
+    "command,args",
+    [
+        ("fish", ["-c", "npx -y some-mcp-server@latest"]),
+        ("mksh", ["-c", "npx -y some-mcp-server@latest"]),
+        ("yash", ["-c", "npx -y some-mcp-server@latest"]),
+    ],
+)
+def test_more_posix_shells_are_wrappers(tmp_path, command, args):
+    server = scan_server(tmp_path, command, args)
+    assert server.launcher_package == "npm:some-mcp-server"
+    assert any("unpinned package reference" in detail for detail in pinning(server))
+    assert server.properties["launcher_wrapper"] == command
+
+
+SCOPED = "@modelcontextprotocol/server-filesystem@1.2.3"
+
+
+@pytest.mark.parametrize(
+    "command,args",
+    [
+        ("pwsh", ["-Command", f"npx -y '{SCOPED}' C:\\data"]),
+        ("powershell", ["-Command", "npx", "-y", f'"{SCOPED}"']),
+    ],
+)
+def test_quoted_scoped_package_under_powershell_is_pinned(tmp_path, command, args):
+    server = scan_server(tmp_path, command, args)
+    assert server.version_pinned is True
+    assert server.version == "1.2.3"
+    assert server.launcher_package == "npm:@modelcontextprotocol/server-filesystem"
+    assert pinning(server) == []
+
+
+@pytest.mark.parametrize(
+    "command,args",
+    [
+        ("bash", ["-lc", "python -m my_server --runtime docker"]),
+        ("sh", ["-c", "node /opt/docker"]),
+        ("sh", ["-c", "node /srv/docker/server.js > /tmp/mcp.log"]),
+        ("python", ["-m", "my_server", "--runtime", "docker"]),
+        ("pwsh", ["-File", "npx.ps1"]),
+        ("pwsh", ["npx", "some-mcp-server@latest"]),
+        ("bash", ["--rcfile", "npx", "-c", "node s.js"]),
+    ],
+)
+def test_launcher_name_outside_command_position_has_no_finding(tmp_path, command, args):
+    server = scan_server(tmp_path, command, args)
+    assert pinning(server) == []
+    assert "launcher" not in server.properties
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "uvx --from pkg==1.0 --index-url {} tool",
+        "uvx --from pkg==1.0 --index-url {} tool; true",
+    ],
+)
+def test_wrapped_package_source_is_bound_by_static_config_hash(tmp_path, line):
+    def static_hash(url: str) -> str:
+        server = scan_server(tmp_path, "sh", ["-c", line.format(url)])
+        return str(server.properties["static_config_hash"])
+
+    assert static_hash("https://pypi.org/simple") != static_hash("https://evil.example/simple")
+
+
+def test_direct_launcher_static_config_hash_is_unchanged(tmp_path):
+    server = scan_server(
+        tmp_path, "uvx", ["--from", "pkg==1.0", "--index-url", "https://pypi.org/simple", "tool"]
+    )
+    assert server.properties["static_config_hash"] == DIRECT_UVX_HASH
+
+
+DIRECT_UVX_HASH = "sha256:44f413734097e44466f14476b0780df5cc51c60ac86b4e255139db2a0e854bb7"
+
+
+def test_unknown_program_before_launcher_is_not_exported(tmp_path):
+    server = scan_server(tmp_path, "/opt/private-dir/runner", ["npx", "some-mcp-server@1.2.3"])
+    assert "could not be determined" in pinning(server)[0]
+    assert server.properties["launcher_wrapper"] == "[redacted-command]"
+    assert "private-dir" not in server.model_dump_json()
