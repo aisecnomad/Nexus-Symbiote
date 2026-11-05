@@ -106,38 +106,66 @@ def folded_name(path: str) -> str:
     return path.translate(_HFS_IGNORED).upper().casefold()
 
 
-def case_variants(files: ConfinedCollection, name: str, failures: list[str]) -> list[str]:
+def case_variants(
+    files: ConfinedCollection,
+    name: str,
+    failures: list[str],
+    *,
+    directory: bool = False,
+    listings: dict[str, dict[str, int]] | None = None,
+) -> list[str]:
     """Paths that a case-insensitive file system opens as a documented name; exact name first.
 
     Agents open fixed names by path join, so the default macOS and Windows file systems
-    open .MCP.json as .mcp.json. A case-sensitive file system can hold several such
-    files; all are returned, up to MAX_CASE_VARIANTS, because which one an agent reads
-    there depends on where it runs.
+    open .MCP.json as .mcp.json, and .Claude/Skills as .claude/skills. A case-sensitive
+    file system can hold several such paths; all are returned, up to MAX_CASE_VARIANTS
+    at each level, because which one an agent reads there depends on where it runs.
+    With `directory`, the name is a directory. `listings` shares directory listings
+    between calls, so that each directory is listed at most once.
     """
+    listings = {} if listings is None else listings
+
+    def entries(parent: str) -> dict[str, int]:
+        if parent not in listings:
+            listings[parent] = files.list_entries(parent or ".")
+        return listings[parent]
+
     *directories, leaf = name.split("/")
     parents = [""]
-    for part in directories:
-        parents = [
-            f"{parent}{entry}/"
-            for parent in parents
-            for entry, kind in sorted(files.list_entries(parent or ".").items())
-            # A symlinked directory is listed so that reading it fails closed.
-            if kind in (stat.S_IFDIR, stat.S_IFLNK) and folded_name(entry) == folded_name(part)
-        ]
-    matches = sorted(
-        (
+    for depth, part in enumerate(directories, 1):
+        parents = _first_variants(
+            [
+                f"{parent}{entry}/"
+                for parent in parents
+                for entry, kind in entries(parent).items()
+                # A symlinked directory is listed so that reading it fails closed.
+                if kind in (stat.S_IFDIR, stat.S_IFLNK) and folded_name(entry) == folded_name(part)
+            ],
+            "/".join(directories[:depth]) + "/",
+            "directories",
+            failures,
+        )
+    return _first_variants(
+        [
             f"{parent}{entry}"
             for parent in parents
-            for entry, kind in files.list_entries(parent or ".").items()
-            if kind != stat.S_IFDIR and folded_name(entry) == folded_name(leaf)
-        ),
-        key=lambda path: (path != name, path),
+            for entry, kind in entries(parent).items()
+            if (kind in (stat.S_IFDIR, stat.S_IFLNK) if directory else kind != stat.S_IFDIR)
+            and folded_name(entry) == folded_name(leaf)
+        ],
+        name,
+        "directories" if directory else "files",
+        failures,
     )
-    if len(matches) > MAX_CASE_VARIANTS:
-        failures.append(
-            f"{name}: more than {MAX_CASE_VARIANTS} files open as {name}; the rest not read"
-        )
-    return matches[:MAX_CASE_VARIANTS]
+
+
+def _first_variants(paths: list[str], name: str, kind: str, failures: list[str]) -> list[str]:
+    paths.sort(key=lambda path: (path != name, path))
+    message = f"{name}: more than {MAX_CASE_VARIANTS} {kind} open as {name}; the rest not read"
+    # Documented names share directories such as .claude/, so one bound can be hit repeatedly.
+    if len(paths) > MAX_CASE_VARIANTS and message not in failures:
+        failures.append(message)
+    return paths[:MAX_CASE_VARIANTS]
 
 
 def read_regular_text(path: Path, *, max_bytes: int = MAX_CONFIG_BYTES) -> str:

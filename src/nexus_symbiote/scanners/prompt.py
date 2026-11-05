@@ -10,6 +10,7 @@ from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.models import PromptComponent, RiskAssessment, SkillPackageComponent
 from nexus_symbiote.core.textsafety import hidden_character_kinds
 from nexus_symbiote.scanners.base import Scanner, ScanResult, case_variants
+from nexus_symbiote.utils.confined import ConfinedCollection
 
 INVISIBLE_CHARS: dict[str, str] = {
     "​": "ZERO WIDTH SPACE",
@@ -125,9 +126,24 @@ INSTRUCTION_FILES: dict[str, str] = {
 }
 
 SKILL_DIRECTORIES = [".claude/skills", ".claude/commands", "skills"]
-# Claude Code opens these by name, which a case-insensitive file system resolves to a
-# name such as claude.md.
-OPENED_BY_NAME = {"CLAUDE.md", ".claude/CLAUDE.md"}
+
+
+def _documented_paths(
+    files: ConfinedCollection,
+    name: str,
+    failures: list[str],
+    listings: dict[str, dict[str, int]],
+    *,
+    directory: bool = False,
+) -> list[str]:
+    """Paths that agents open as a documented name on case-insensitive file systems.
+
+    Agents join fixed names such as CLAUDE.md or .claude/skills, which the default macOS
+    and Windows file systems resolve to claude.md or .Claude/Skills. When no listing
+    shows the name, it is read itself, so a directory that cannot be listed, or a
+    directory under a documented file name, is still reported.
+    """
+    return case_variants(files, name, failures, directory=directory, listings=listings) or [name]
 
 
 class PromptScanner(Scanner):
@@ -137,16 +153,13 @@ class PromptScanner(Scanner):
         result = ScanResult(scanner_name=self.name)
 
         with self._collection(project_root, result) as files:
-            instructions = [
-                (relative, prompt_type)
-                for name, prompt_type in INSTRUCTION_FILES.items()
-                for relative in (
-                    case_variants(files, name, result.scan_failures)
-                    if name in OPENED_BY_NAME
-                    else [name]
-                )
-            ]
-            for rel_path, prompt_type in instructions:
+            listings: dict[str, dict[str, int]] = {}
+            instructions: dict[str, str] = {}
+            for name, prompt_type in INSTRUCTION_FILES.items():
+                # CODEX.md and codex.md fold to the same paths; each file is read once.
+                for relative in _documented_paths(files, name, result.scan_failures, listings):
+                    instructions.setdefault(relative, prompt_type)
+            for rel_path, prompt_type in instructions.items():
                 content = files.read_bytes(rel_path, missing_ok=True)
                 if content is None:
                     continue
@@ -162,7 +175,10 @@ class PromptScanner(Scanner):
 
             for skill_dir in SKILL_DIRECTORIES:
                 found = False
-                for path in files.iter_files(skill_dir):
+                directories = _documented_paths(
+                    files, skill_dir, result.scan_failures, listings, directory=True
+                )
+                for path in (path for d in directories for path in files.iter_files(d)):
                     if path.name.startswith(".") or path.suffix.lower() not in (
                         ".md",
                         ".txt",
