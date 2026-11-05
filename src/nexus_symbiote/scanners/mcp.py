@@ -429,8 +429,6 @@ class _CommandSyntax(NamedTuple):
     escape: str
     # Words that another command word follows, such as `exec` in `exec $TOOL`.
     prefixes: frozenset[str]
-    # Expansion that can change the file name of a command word.
-    computed: re.Pattern[str]
 
 
 _COMMAND_SYNTAX = {
@@ -438,39 +436,80 @@ _COMMAND_SYNTAX = {
         ";&|()\n",
         "'\"",
         "\\",
-        frozenset({"!", "{", "}", "if", "then", "else", "elif", "do", "while", "until", "exec"})
+        frozenset({"!", "{", "}", "if", "then", "else", "elif", "do", "while", "until"})
+        | {"exec", "builtin", "coproc", "env"}
         | _PREFIX_PROGRAMS,
-        re.compile(r"\$\(|`|[$*?}][^/]*$|\[[^/]*\][^/]*$"),
     ),
-    "cmd": _CommandSyntax(
-        "&|()\n", '"', "^", frozenset({"call"}), re.compile(r"([%!])[^%!\\/]+\1[^\\/]*$")
-    ),
-    # A parenthesized expression is one word, so `& (Get-Command x).Source` is computed.
-    "powershell": _CommandSyntax(
-        ";&|{}\n", "'\"", "`", frozenset({"."}), re.compile(r"\$\(|^\(|\$[^\\/]*$")
-    ),
+    "cmd": _CommandSyntax("&|()\n", '"', "^", frozenset({"call"})),
+    "powershell": _CommandSyntax(";&|{}\n", "'\"", "`", frozenset({"."})),
 }
 # Expansion an MCP client applies to a configured program, as in ${NPX} or ${env:NPX},
-# or that a shell applies when the client starts the program through one.
-_CONFIG_COMPUTED = re.compile(r"\$\(|`|\$[^\\/]*$|%[^%\\/]+%[^\\/]*$")
-_POWERSHELL_ASSIGNMENT = re.compile(r"\$[\w:{}]+[-+*/%?]{0,2}=.*", re.DOTALL)
+# or that a shell it starts the program through applies, as in %NPX%.
+_CMD_EXPANSION = re.compile(r"%[^%!]+%|![^%!]+!")
+_PERCENT_EXPANSION = re.compile(r"%[^%]+%")
+_CMD_FOR_VARIABLE = re.compile(r"%%?(?:~[A-Za-z$:]*)?[A-Za-z]")
+_POWERSHELL_ASSIGNMENT = re.compile(r"\$[\w:{}]+(?:\.\w+|\[[^\]]*\])*[-+*/%?]{0,2}=.*", re.DOTALL)
+# A redirection operator, which may stand before the command word and takes the next word
+# as its target when nothing follows it.
+_REDIRECTION = re.compile(r"[0-9]*(?:<<<|<<-?|<>|<&|>&|>>|>\||&>>?|<|>)")
+# Prefix programs whose first operand is a value, such as the duration of `timeout 30`.
+_VALUE_PREFIX_PROGRAMS = frozenset({"timeout", "taskset", "chrt"})
+_POSIX_OPTION_VALUES = {"exec": frozenset({"-a"}), "env": frozenset({"-u", "-C"})}
+_CMD_IF_OPERATORS = frozenset({"==", "equ", "neq", "lss", "leq", "gtr", "geq"})
+_START_PROCESS = frozenset({"start-process", "saps", "start"})
+_START_PROCESS_SWITCHES = frozenset(
+    {"-nonewwindow", "-wait", "-passthru", "-usenewenvironment", "-loaduserprofile", "-lup"}
+    | {"-whatif", "-confirm"}
+)
+
+
+def _last_segment(word: str, separators: str) -> str:
+    for separator in separators:
+        word = word.rpartition(separator)[2]
+    return word
 
 
 def _computed_name(word: str) -> bool:
-    """Whether a configured program name is chosen by expansion when the server starts."""
-    return _CONFIG_COMPUTED.search(word) is not None
+    """Whether a configured program name is chosen by expansion when the server starts.
+
+    Each test is linear in the word's length, which a configuration file controls.
+    """
+    if "$(" in word or "`" in word:
+        return True
+    segment = _last_segment(word, "\\/")
+    return "$" in segment or _PERCENT_EXPANSION.search(segment) is not None
+
+
+def _computed_word(word: str, language: str) -> bool:
+    """Whether expansion can change the file name of a command word."""
+    if language == "cmd":
+        segment = _last_segment(word, "\\/")
+        return (
+            _CMD_EXPANSION.search(segment) is not None
+            or _CMD_FOR_VARIABLE.fullmatch(word) is not None
+        )
+    if language == "powershell":
+        return "$(" in word or word.startswith("(") or "$" in _last_segment(word, "\\/")
+    if "$(" in word or "`" in word:
+        return True
+    segment = _last_segment(word, "/")
+    if any(char in segment for char in "$*?}"):
+        return True
+    bracket = segment.find("[")
+    return bracket >= 0 and "]" in segment[bracket + 1 :]
 
 
 def _command_tokens(line: str, syntax: _CommandSyntax) -> list[str | None]:
     """Unexpanded words, split at unquoted whitespace, with None at each command separator.
 
     Characters that a quote keeps from expanding are replaced, so `'$TOOL'` is literal.
+    The `&` of a redirection such as `2>&1` or `&>` does not separate commands.
     """
     tokens: list[str | None] = []
     word: list[str] = []
     quote = ""
     escaped = False
-    for char in line:
+    for index, char in enumerate(line):
         if (quote == "'" and char in "$`*?[](){}") or (quote == '"' and char in "*?[]"):
             word.append("_")
             continue
@@ -482,6 +521,10 @@ def _command_tokens(line: str, syntax: _CommandSyntax) -> list[str | None]:
             quote = "" if char == quote else quote
         elif char in syntax.quotes:
             quote = char
+        elif (char in "&|" and word and word[-1] in "<>") or (
+            char == "&" and line[index + 1 : index + 2] == ">" and syntax.escape == "\\"
+        ):
+            pass
         elif char in syntax.separators or char.isspace():
             if word:
                 tokens.append("".join(word))
@@ -495,33 +538,223 @@ def _command_tokens(line: str, syntax: _CommandSyntax) -> list[str | None]:
     return tokens
 
 
-def _computed_command(line: str, language: str) -> bool:
-    """Whether expansion at run time chooses a program that a command line runs.
+def _token_at(tokens: list[str | None], index: int) -> str | None:
+    return tokens[index] if index < len(tokens) else None
 
-    A command word is computed when expansion can change its file name: `$TOOL`,
-    `/opt/$TOOL` and `"$(which x)"` are, but `$HOME/bin/server` is not.
-    """
-    syntax = _COMMAND_SYNTAX[language]
-    tokens = _command_tokens(line, syntax)
+
+def _arguments(tokens: list[str | None], start: int) -> list[str]:
+    """The words of one command from `start` to the next separator."""
+    words: list[str] = []
+    for token in tokens[start:]:
+        if token is None:
+            break
+        words.append(token)
+    return words
+
+
+def _unquoted(word: str) -> str:
+    if len(word) > 1 and word[0] == word[-1] and word[0] in "'\"":
+        return word[1:-1]
+    return word
+
+
+def _skip_redirection(tokens: list[str | None], index: int, token: str) -> int | None:
+    """The index after a redirection and its target, or None when `token` is not one."""
+    found = _REDIRECTION.match(token)
+    if found is None:
+        return None
+    if found.end() == len(token) and index + 1 < len(tokens) and tokens[index + 1] is not None:
+        return index + 2
+    return index + 1
+
+
+def _posix_computed(tokens: list[str | None], depth: int) -> bool:
+    index, expect = 0, True
+    while index < len(tokens):
+        word = tokens[index]
+        if word is None:
+            index, expect = index + 1, True
+            continue
+        if not expect:
+            index += 1
+            continue
+        after = _skip_redirection(tokens, index, word)
+        if after is not None:
+            index = after
+            continue
+        index += 1
+        following = _token_at(tokens, index)
+        if word == "function":
+            index += 1
+            continue
+        if word in _POSIX_OPTION_VALUES:
+            while following is not None and following.startswith("-"):
+                index += 2 if following in _POSIX_OPTION_VALUES[word] else 1
+                following = _token_at(tokens, index)
+            continue
+        if word in _VALUE_PREFIX_PROGRAMS and following and not following.startswith("-"):
+            index += 1
+            continue
+        if word == "coproc" and following and _token_at(tokens, index + 1) == "{":
+            index += 1
+            continue
+        if word in _COMMAND_SYNTAX["posix"].prefixes or _ASSIGNMENT.fullmatch(word):
+            continue
+        expect = False
+        args = _arguments(tokens, index)
+        if word == "eval":
+            if any("$" in arg or "`" in arg for arg in args):
+                return True
+            continue
+        if word in {".", "source"}:
+            if args and _computed_word(args[0], "posix"):
+                return True
+            continue
+        if _launcher(word)[0] in _POSIX_SHELLS and depth < _MAX_WRAPPER_DEPTH:
+            line = _shell_command_operand(args)
+            if line is not None and _computed_command(_unquoted(line), "posix", depth + 1):
+                return True
+            continue
+        if _computed_word(word, "posix"):
+            return True
+    return False
+
+
+def _shell_command_operand(args: list[str]) -> str | None:
+    """The command line operand of a nested POSIX shell's -c option, if any."""
+    for position, arg in enumerate(args):
+        if not arg.startswith("-") or arg.startswith("--"):
+            return None
+        if "c" in arg[1:]:
+            return next((word for word in args[position + 1 :] if word != "--"), None)
+    return None
+
+
+def _cmd_if_command(tokens: list[str | None], index: int) -> int:
+    """The index of the command after an `if` condition that starts at `index`."""
+    while (_token_at(tokens, index) or "").lower() in {"/i", "not"}:
+        index += 1
+    first = (_token_at(tokens, index) or "").lower()
+    operator = (_token_at(tokens, index + 1) or "").lower()
+    if first in {"defined", "exist", "errorlevel", "cmdextversion"}:
+        return index + 2
+    if "==" in first and not first.endswith("=="):
+        return index + 1
+    if operator in _CMD_IF_OPERATORS:
+        return index + 3
+    if first.endswith("==") or operator.startswith("=="):
+        return index + 2
+    return index + 1
+
+
+def _cmd_start_program(tokens: list[str | None], index: int) -> int:
+    """The index of the program `start` runs, after its options and a quoted title."""
+    titled = False
+    while (word := _token_at(tokens, index)) is not None:
+        if word.startswith('"') and not titled:
+            index, titled = index + 1, True
+        elif word.startswith("/"):
+            index += 2 if word.lower() in {"/d", "/affinity", "/node"} else 1
+        else:
+            break
+    return index
+
+
+def _cmd_computed(tokens: list[str | None]) -> bool:
+    index, expect = 0, True
+    while index < len(tokens):
+        token = tokens[index]
+        if token is None:
+            index, expect = index + 1, True
+            continue
+        if not expect:
+            index += 1
+            continue
+        token = token.removeprefix("@")
+        after = _skip_redirection(tokens, index, token)
+        if after is not None:
+            index = after
+            continue
+        index += 1
+        word = token.lower()
+        if word in _COMMAND_SYNTAX["cmd"].prefixes:
+            continue
+        if word == "if":
+            index = _cmd_if_command(tokens, index)
+            continue
+        if word == "for":
+            while index < len(tokens) and (tokens[index] or "").lower() != "do":
+                index += 1
+            index += 1
+            continue
+        if word == "start":
+            index = _cmd_start_program(tokens, index)
+            continue
+        expect = False
+        if _computed_word(token, "cmd"):
+            return True
+    return False
+
+
+def _start_process_program(args: list[str]) -> str | None:
+    """The program that PowerShell's Start-Process runs, named or first positional."""
+    position = 0
+    while position < len(args):
+        arg = args[position]
+        if not arg.startswith("-"):
+            return arg
+        name, colon, value = arg.lower().partition(":")
+        if name[1:] and any(full.startswith(name[1:]) for full in ("filepath", "pspath", "path")):
+            if colon:
+                return value
+            return args[position + 1] if position + 1 < len(args) else None
+        position += 1 if colon or name in _START_PROCESS_SWITCHES else 2
+    return None
+
+
+def _powershell_computed(tokens: list[str | None]) -> bool:
     expect = True
     for index, token in enumerate(tokens):
         if token is None:
             expect = True
             continue
-        if not expect:
-            continue
-        if language == "cmd":
-            token = token.removeprefix("@")
-        if token in syntax.prefixes or (language == "posix" and _ASSIGNMENT.fullmatch(token)):
+        if not expect or token in _COMMAND_SYNTAX["powershell"].prefixes:
             continue
         following = tokens[index + 1] if index + 1 < len(tokens) else None
         assignment = token if "=" in token else f"{token}{following or ''}"
         expect = False
-        if language == "powershell" and _POWERSHELL_ASSIGNMENT.fullmatch(assignment):
+        if _POWERSHELL_ASSIGNMENT.fullmatch(assignment):
             continue
-        if syntax.computed.search(token):
+        args = _arguments(tokens, index + 1)
+        word = token.lower()
+        if word in {"iex", "invoke-expression"}:
+            if any("$" in arg or arg.startswith("(") for arg in args):
+                return True
+            continue
+        if word in _START_PROCESS:
+            program = _start_process_program(args)
+            if program is not None and _computed_word(program, "powershell"):
+                return True
+            continue
+        if _computed_word(token, "powershell"):
             return True
     return False
+
+
+def _computed_command(line: str, language: str, depth: int = 0) -> bool:
+    """Whether expansion at run time chooses a program that a command line runs.
+
+    A command word is computed when expansion can change its file name: `$TOOL`,
+    `/opt/$TOOL` and `"$(which x)"` are, but `$HOME/bin/server` is not. So is the
+    program that `eval`, `.`, a nested shell's -c, Invoke-Expression or Start-Process
+    runs when expansion chooses it.
+    """
+    tokens = _command_tokens(line, _COMMAND_SYNTAX[language])
+    if language == "cmd":
+        return _cmd_computed(tokens)
+    if language == "powershell":
+        return _powershell_computed(tokens)
+    return _posix_computed(tokens, depth)
 
 
 class _UnreadableWrapperError(Exception):
@@ -777,7 +1010,8 @@ def _resolve_launch(command: str, args: list[str]) -> _Launch:
         return _Launch(name, path_qualified, args)
     if _computed_name(command):
         return _Launch(_COMPUTED_LAUNCHER, path_qualified, [], undetermined=True)
-    if name in _PREFIX_PROGRAMS and args and _computed_name(args[0]):
+    operand = 1 if name in _VALUE_PREFIX_PROGRAMS and args[1:2] and args[0][:1] != "-" else 0
+    if name in _PREFIX_PROGRAMS and args and _computed_name(args[operand]):
         return _Launch(_COMPUTED_LAUNCHER, path_qualified, [], name, undetermined=True)
     if name not in _WRAPPERS:
         if not _runs_launcher(args):

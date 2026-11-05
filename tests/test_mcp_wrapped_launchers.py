@@ -468,6 +468,43 @@ def test_unknown_program_before_launcher_is_not_exported(tmp_path):
         ("powershell", ["-EncodedCommand", encoded("$env:LAUNCHER some-mcp-server")]),
         ("env", ["${TOOL}", "some-mcp-server"]),
         ("env", ["-S", "$TOOL some-mcp-server"]),
+        ("sh", ["-c", "</dev/null $TOOL some-mcp-server"]),
+        ("sh", ["-c", "2>/tmp/err $TOOL some-mcp-server"]),
+        ("sh", ["-c", "> /tmp/log $TOOL some-mcp-server"]),
+        ("sh", ["-c", 'eval "$TOOL some-mcp-server"']),
+        ("sh", ["-c", "eval $LAUNCH"]),
+        ("sh", ["-c", "env $TOOL some-mcp-server"]),
+        ("sh", ["-c", "env -i PATH=$PATH $TOOL some-mcp-server"]),
+        ("sh", ["-c", "env -u HOME $TOOL some-mcp-server"]),
+        ("sh", ["-c", "exec -a name $TOOL some-mcp-server"]),
+        ("sh", ["-c", "exec >>$LOG 2>&1; $TOOL some-mcp-server"]),
+        ("bash", ["-c", "builtin exec $TOOL some-mcp-server"]),
+        ("bash", ["-c", "coproc $TOOL some-mcp-server"]),
+        ("bash", ["-c", "coproc srv { $TOOL some-mcp-server; }"]),
+        ("bash", ["-c", "function f { $TOOL some-mcp-server; }; f"]),
+        ("sh", ["-c", 'sh -c "$LAUNCH"']),
+        ("sh", ["-c", "bash -ec $LAUNCH"]),
+        ("bash", ["-c", '. "$ENV_SCRIPT"']),
+        ("bash", ["-c", "source $ENV_SCRIPT"]),
+        ("sh", ["-c", 'timeout "$SECS" $TOOL some-mcp-server']),
+        ("cmd", ["/c", 'start "" %LAUNCHER% some-mcp-server']),
+        ("cmd", ["/c", 'start /b /wait "" %LAUNCHER% some-mcp-server']),
+        ("cmd", ["/c", "start /d C:\\srv %LAUNCHER% some-mcp-server"]),
+        ("cmd", ["/c", "if 1==1 %LAUNCHER% some-mcp-server"]),
+        ("cmd", ["/c", "if /i not %A% == b %LAUNCHER% some-mcp-server"]),
+        ("cmd", ["/c", "if defined LAUNCHER %LAUNCHER% some-mcp-server"]),
+        ("cmd", ["/c", "if exist x.txt (%LAUNCHER% some-mcp-server)"]),
+        ("cmd", ["/c", "for /f %i in ('where runner') do %i some-mcp-server"]),
+        ("cmd", ["/c", "for %%T in (a) do @%%~fT some-mcp-server"]),
+        ("cmd", ["/c", ">nul %LAUNCHER% some-mcp-server"]),
+        ("pwsh", ["-c", 'iex "$env:LAUNCHER some-mcp-server"']),
+        ("pwsh", ["-c", "Invoke-Expression $env:LAUNCHER"]),
+        ("pwsh", ["-c", "Invoke-Expression (Get-Content launch.txt)"]),
+        ("pwsh", ["-c", "Start-Process $env:LAUNCHER -ArgumentList some-mcp-server"]),
+        ("pwsh", ["-c", "Start-Process -FilePath $env:LAUNCHER some-mcp-server"]),
+        ("pwsh", ["-c", "Start-Process -NoNewWindow -Wait $env:LAUNCHER"]),
+        ("pwsh", ["-c", "saps -WorkingDirectory C:\\srv -f:$env:LAUNCHER"]),
+        ("pwsh", ["-c", "$PSStyle.OutputRendering = 'PlainText'; & $env:LAUNCHER x"]),
     ],
 )
 def test_computed_command_in_wrapped_line_is_an_undetermined_finding(tmp_path, command, args):
@@ -494,6 +531,7 @@ def test_computed_command_in_wrapped_line_is_an_undetermined_finding(tmp_path, c
         ("%NPX%", ["some-mcp-server"], None),
         ("/opt/${TOOL}", ["some-mcp-server"], None),
         ("nohup", ["${TOOL}", "some-mcp-server"], "nohup"),
+        ("timeout", ["30", "${TOOL}", "some-mcp-server"], "timeout"),
     ],
 )
 def test_computed_configured_command_is_an_undetermined_finding(tmp_path, command, args, wrapper):
@@ -529,9 +567,59 @@ def test_computed_configured_command_is_an_undetermined_finding(tmp_path, comman
         ("node", ["${HOME}/server.js"]),
         ("env", ["PORT=${PORT}", "node", "server.js"]),
         ("nohup", ["node", "${HOME}/server.js"]),
+        ("sh", ["-c", "exec >>$LOG 2>&1; node server.js"]),
+        ("sh", ["-c", 'exec 2>"$LOGFILE"; exec node server.js']),
+        ("sh", ["-c", 'exec 2>>"$LOG"; node server.js']),
+        ("sh", ["-c", ">$LOG node server.js"]),
+        ("sh", ["-c", "node server.js 2>>$LOG"]),
+        ("bash", ["-c", "node server.js &>$LOG"]),
+        ("sh", ["-c", 'timeout "$TIMEOUT" node server.js']),
+        ("sh", ["-c", "taskset $MASK node server.js"]),
+        ("timeout", ["${TIMEOUT}", "node", "server.js"]),
+        ("chrt", ["${PRIO}", "node", "server.js"]),
+        ("bash", ["-c", '. "$HOME/.nvm/nvm.sh"; nvm use 20; node server.js']),
+        ("sh", ["-c", 'sh -c "node $DIR/server.js"']),
+        ("sh", ["-c", "env PORT=$PORT node server.js"]),
+        ("cmd", ["/c", "if defined PORT node server.js --port %PORT%"]),
+        ("cmd", ["/c", "for %i in (%FILES%) do node %~fi"]),
+        ("cmd", ["/c", 'start "%TITLE%" node server.js']),
+        ("pwsh", ["-c", "$PSStyle.OutputRendering = 'PlainText'; node server.js"]),
+        ("pwsh", ["-c", "$PSDefaultParameterValues['*:Encoding'] = 'utf8'; node server.js"]),
+        (
+            "powershell",
+            [
+                "-Command",
+                "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+                "$host.UI.RawUI.WindowTitle = 'mcp'; node server.js",
+            ],
+        ),
+        ("pwsh", ["-c", "Start-Process -FilePath node -ArgumentList $env:ARGS"]),
+        ("pwsh", ["-c", "iex 'Write-Output ready'; node server.js"]),
     ],
 )
 def test_literal_command_with_expanded_arguments_has_no_finding(tmp_path, command, args):
     server = scan_server(tmp_path, command, args)
     assert pinning(server) == []
     assert "launcher" not in server.properties
+
+
+@pytest.mark.parametrize(
+    "command,args",
+    [
+        ("sh", ["-c", "$" * 200_000 + "/"]),
+        ("sh", ["-c", "exec " + "$" * 200_000 + "/"]),
+        ("cmd", ["/c", "%a" * 100_000 + "\\"]),
+        ("cmd", ["/c", "!a" * 100_000 + "\\"]),
+        ("pwsh", ["-c", "$" * 200_000 + "\\"]),
+        ("$" * 200_000 + "/", []),
+        ("%a" * 100_000 + "/", []),
+        ("nohup", ["$" * 200_000 + "/"]),
+        ("sh", ["-c", "env -i " * 100_000 + "node"]),
+        ("cmd", ["/c", "if not " * 100_000 + "node"]),
+        ("cmd", ["/c", "start /b " * 100_000 + "node"]),
+    ],
+)
+def test_long_computed_word_is_classified_in_linear_time(tmp_path, command, args):
+    started = time.monotonic()
+    scan_server(tmp_path, command, args)
+    assert time.monotonic() - started < 3
