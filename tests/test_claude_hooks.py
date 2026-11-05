@@ -1509,6 +1509,46 @@ def test_settings_env_names_are_recorded_without_values(tmp_path: Path) -> None:
         ("NO_PROXY", ENDPOINT),
         ("NODE_EXTRA_CA_CERTS", ENDPOINT),
         ("NODE_TLS_REJECT_UNAUTHORIZED", ENDPOINT),
+        # Config roots and helper commands that the processes Claude Code starts read.
+        ("HOME", EXEC),
+        ("XDG_CONFIG_HOME", EXEC),
+        ("GIT_DIR", EXEC),
+        ("GIT_COMMON_DIR", EXEC),
+        ("GIT_WORK_TREE", EXEC),
+        ("GIT_SEQUENCE_EDITOR", EXEC),
+        ("PAGER", EXEC),
+        ("EDITOR", EXEC),
+        ("VISUAL", EXEC),
+        ("LESSOPEN", EXEC),
+        ("MANPAGER", EXEC),
+        ("AWS_CONFIG_FILE", EXEC),
+        ("KUBECONFIG", EXEC),
+        ("DOCKER_CONFIG", EXEC),
+        ("GCONV_PATH", EXEC),
+        ("PYTHONWARNINGS", EXEC),
+        ("PERL5DB", EXEC),
+        ("SHELLOPTS", EXEC),
+        ("NPM_CONFIG_SCRIPT_SHELL", EXEC),
+        ("npm_config_userconfig", EXEC),
+        ("PIP_INDEX_URL", EXEC),
+        # Telemetry export, sign-in and provider credentials, and TLS trust of child tools.
+        ("CLAUDE_CODE_ENABLE_TELEMETRY", ENDPOINT),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", ENDPOINT),
+        ("OTEL_EXPORTER_OTLP_LOGS_HEADERS", ENDPOINT),
+        ("OTEL_LOGS_EXPORTER", ENDPOINT),
+        ("OTEL_LOG_USER_PROMPTS", ENDPOINT),
+        ("OTEL_LOG_TOOL_DETAILS", ENDPOINT),
+        ("BETA_TRACING_ENDPOINT", ENDPOINT),
+        ("AWS_ENDPOINT_URL", ENDPOINT),
+        ("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", ENDPOINT),
+        ("AWS_ACCESS_KEY_ID", ENDPOINT),
+        ("AWS_PROFILE", ENDPOINT),
+        ("AWS_SHARED_CREDENTIALS_FILE", ENDPOINT),
+        ("CLAUDE_CODE_OAUTH_TOKEN", ENDPOINT),
+        ("GOOGLE_APPLICATION_CREDENTIALS", ENDPOINT),
+        ("REQUESTS_CA_BUNDLE", ENDPOINT),
+        ("CURL_CA_BUNDLE", ENDPOINT),
+        ("GIT_SSL_NO_VERIFY", ENDPOINT),
     ],
 )
 def test_settings_env_that_redirects_execution_or_the_endpoint_is_high(
@@ -1533,6 +1573,22 @@ def test_other_settings_env_names_are_recorded_without_a_finding(tmp_path: Path,
         {"settings_file": ".claude/settings.json", "names": [name]}
     ]
     assert not env_findings(agent)
+
+
+def test_settings_env_bash_function_import_is_an_exec_finding(tmp_path: Path) -> None:
+    # Bash imports BASH_FUNC_<name>%% as a function that replaces that command.
+    write_raw_settings(
+        tmp_path, json.dumps({"env": {f"BASH_FUNC_{CANARY}%%": "() { :; }", "DEBUG": "1"}})
+    )
+    result = IDEAgentScanner().scan(tmp_path)
+    agent = claude_agent(result)
+    assert agent.properties["declared_settings_env"] == [
+        {"settings_file": ".claude/settings.json", "names": "[unparsed]"}
+    ]
+    ((severity, found, detail),) = env_findings(agent)
+    assert (severity, found) == (RiskSeverity.HIGH, EXEC)
+    assert "sets BASH_FUNC_*," in detail
+    assert CANARY not in repr(result)
 
 
 def test_cli_does_not_score_a_settings_env_repository_clean(tmp_path: Path) -> None:

@@ -578,10 +578,37 @@ CLAUDE_SETTINGS_RECORDS = (
 # settings command and stdio MCP server it starts inherits.
 CLAUDE_SETTINGS_ENV = "env"
 # Variables that load code into, or choose, what those processes run: dynamic loaders,
-# interpreter options and search paths, shell startup files, the shell itself, PATH, and git's
-# ssh, askpass, pager and config commands.
+# interpreter options and search paths, shell startup files, the shell itself, PATH, git's
+# ssh, askpass, pager and config commands, and the config roots and helper commands from which
+# git, editors, pagers, cloud CLIs and package managers run commands. A denylist cannot be
+# complete; other names are recorded and their changes are drift.
 _EXEC_ENV = frozenset(
     {
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PS4",
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_SEQUENCE_EDITOR",
+        "EDITOR",
+        "VISUAL",
+        "PAGER",
+        "MANPAGER",
+        "LESSOPEN",
+        "LESSCLOSE",
+        "BROWSER",
+        "GCONV_PATH",
+        "PYTHONWARNINGS",
+        "PYTHONBREAKPOINT",
+        "PERL5DB",
+        "AWS_CONFIG_FILE",
+        "KUBECONFIG",
+        "DOCKER_CONFIG",
+        "RUSTC_WRAPPER",
+        "CARGO_HOME",
         "BASH_ENV",
         "ENV",
         "PATH",
@@ -619,11 +646,31 @@ _EXEC_ENV = frozenset(
         "CLAUDE_ENV_FILE",
     }
 )
-_EXEC_ENV_PREFIXES = ("LD_", "DYLD_", "GIT_CONFIG")
-# Variables that choose where Claude Code sends the conversation and with which credentials,
-# headers, proxy or certificate trust.
+# Bash imports BASH_FUNC_<name>%% as a function that replaces the command <name>.
+_EXEC_ENV_PREFIXES = ("LD_", "DYLD_", "GIT_CONFIG", "NPM_CONFIG_", "PIP_", "BASH_FUNC_")
+# Variables that choose where Claude Code sends the conversation, or exports it as telemetry,
+# and with which credentials, headers, proxy or certificate trust, including those of the
+# cloud CLIs and tools it starts.
 _ENDPOINT_ENV = frozenset(
     {
+        "CLAUDE_CODE_ENABLE_TELEMETRY",
+        "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+        "ENABLE_ENHANCED_TELEMETRY_BETA",
+        "ENABLE_BETA_TRACING_DETAILED",
+        "BETA_TRACING_ENDPOINT",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CA_BUNDLE",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "GIT_SSL_CAINFO",
+        "GIT_SSL_NO_VERIFY",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_CUSTOM_HEADERS",
@@ -651,13 +698,17 @@ _ENDPOINT_ENV = frozenset(
         "SSL_CERT_DIR",
     }
 )
-_ENDPOINT_ENV_PATTERN = re.compile(r"ANTHROPIC_\w*BASE_URL|CLAUDE_CODE_SKIP_\w*AUTH")
+_ENDPOINT_ENV_PATTERN = re.compile(
+    r"ANTHROPIC_\w*BASE_URL|CLAUDE_CODE_SKIP_\w*AUTH|AWS_ENDPOINT_URL\w*"
+    r"|OTEL_LOG_\w+|OTEL_\w*EXPORTER\w*"
+)
 # Both are high: an endpoint or proxy receives every prompt, file and tool result in the
 # conversation and writes the replies that become tool calls, as an HTTP hook would see them.
 _ENV_FINDINGS = {
     "agent-settings-env-exec": "can inject code into or redirect the commands it runs",
     "agent-settings-env-endpoint": (
-        "can redirect its model endpoint, credentials, network proxy or TLS trust"
+        "can redirect its model endpoint, credentials, network proxy or TLS trust, "
+        "or export the conversation as telemetry"
     ),
 }
 _MAX_ENV_FINDING_NAMES = 8
@@ -993,10 +1044,15 @@ def _settings_env_record(
     flagged: dict[str, list[str]] = {}
     if isinstance(env, dict):
         for name in env:
-            if _ENV_NAME.fullmatch(name) and (category := _env_category(name)):
+            if not isinstance(name, str):
+                continue
+            if name.upper().startswith("BASH_FUNC_"):
+                # The name holds the replaced command and %%, which are not shown.
+                flagged.setdefault("agent-settings-env-exec", []).append("BASH_FUNC_*")
+            elif _ENV_NAME.fullmatch(name) and (category := _env_category(name)):
                 flagged.setdefault(category, []).append(name)
     for category, action in _ENV_FINDINGS.items():
-        if not (matched := sorted(flagged.get(category, []))):
+        if not (matched := sorted(set(flagged.get(category, [])))):
             continue
         shown = ", ".join(matched[:_MAX_ENV_FINDING_NAMES])
         if len(matched) > _MAX_ENV_FINDING_NAMES:
