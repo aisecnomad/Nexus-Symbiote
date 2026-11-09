@@ -18,8 +18,22 @@ from nexus_symbiote.core.hashing import (
 
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 MAX_SIGNED_ARTIFACT_BYTES = 5 * 1024 * 1024 * 1024
+MAX_DISCOVERY_STATEMENT_BYTES = 64 * 1024
 # A fixed message, so callers can report it instead of a generic signature failure.
 SIGSTORE_MISSING = "sigstore package not installed; install nexus-symbiote[sigstore]"
+
+
+@dataclass(frozen=True)
+class DiscoveryContextPolicy:
+    """Operator-supplied expectations for a signed discovery statement."""
+
+    statement_path: Path
+    bundle_path: Path
+    repository: str
+    revision: str
+    scope: str
+    producer_version: str
+    max_age_seconds: int
 
 
 @dataclass(frozen=True)
@@ -34,6 +48,7 @@ class SigstoreArtifactPolicy:
     bundle_path: Path
     expected_identity: str
     expected_issuer: str
+    discovery_context: DiscoveryContextPolicy | None = None
 
     def __post_init__(self) -> None:
         if not self.expected_identity.strip() or not self.expected_issuer.strip():

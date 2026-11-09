@@ -362,17 +362,26 @@ def test_every_static_command_runs_under_the_offline_guard(tmp_path):
     assert json.loads(verified)["contract_verified"] is True
 
 
-def test_documented_offline_demo_collects_every_surface(tmp_path):
+def test_documented_offline_demo_reports_partial_settings_coverage(tmp_path):
     demo = REPOSITORY / "examples" / "demo-agent"
     if not demo.is_dir():
         pytest.skip("the demo project ships in the repository, not in the wheel")
     output = tmp_path / "demo.aibom.json"
     result = CliRunner().invoke(main, ["scan", str(demo), "-o", str(output)], env=UNSET)
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 1, result.output
     bom = json.loads(output.read_text())
     completeness = bom["metadata"]["completeness"]
     assert completeness["scan_failures"] == []
-    assert set(completeness["scanner_status"].values()) == {"complete"}
+    assert completeness["scanner_status"]["ide_agents"] == "partial"
+    assert all(
+        status == "complete"
+        for scanner, status in completeness["scanner_status"].items()
+        if scanner != "ide_agents"
+    )
+    assert any(
+        ".claude/settings.json" in gap and "partially inventoried" in gap
+        for gap in completeness["surfaces_excluded"]
+    )
     types = {c["component_type"] for c in bom["components"]}
     assert {
         "agent",

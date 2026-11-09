@@ -28,8 +28,10 @@ _IGNORED = {"dist", "build", "__tests__", "tests", "test"}
 MAX_SOURCE_FILES = 50
 MAX_SOURCE_BYTES = 262_144
 MAX_AST_NODES = 20_000
+MAX_AST_DEPTH = 128
 MAX_REGISTRATIONS = 1_000
 MAX_PARSE_SECONDS = 0.25
+MAX_ANALYSIS_SECONDS = 2.0
 
 
 def _value(node: Node | None) -> str:
@@ -37,15 +39,17 @@ def _value(node: Node | None) -> str:
 
 
 def _nodes(root: Node) -> Iterator[Node]:
-    pending = [root]
+    pending = [(root, 0)]
     count = 0
     while pending:
-        node = pending.pop()
+        node, depth = pending.pop()
         count += 1
         if count > MAX_AST_NODES:
             raise ValueError("TypeScript AST node limit exceeded")
+        if depth > MAX_AST_DEPTH:
+            raise ValueError("TypeScript AST depth limit exceeded")
         yield node
-        pending.extend(reversed(node.named_children))
+        pending.extend((child, depth + 1) for child in reversed(node.named_children))
 
 
 _FUNCTIONS = {
@@ -75,7 +79,7 @@ def _pattern_names(node: Node | None) -> list[str]:
     ]
 
 
-def _bindings(nodes: Sequence[Node], root: Node) -> dict[tuple[int, str], object]:
+def _bindings(nodes: Sequence[Node], root: Node, deadline: float) -> dict[tuple[int, str], object]:
     bindings: dict[tuple[int, str], object] = {}
 
     def bind(scope: Node | None, name: str, value: object) -> None:
@@ -84,6 +88,8 @@ def _bindings(nodes: Sequence[Node], root: Node) -> dict[tuple[int, str], object
             bindings[key] = "ambiguous" if key in bindings else value
 
     for node in nodes:
+        if time.monotonic() >= deadline:
+            raise ValueError("TypeScript AST analysis deadline exceeded")
         if node.type == "import_statement" and node.parent == root:
             sdk = _value(node.child_by_field_name("source"))[1:-1] in _MODULES and not any(
                 child.type == "type" for child in node.children
@@ -155,6 +161,21 @@ def collect_typescript(
     files: ConfinedCollection, result: ScanResult, sources: Sequence[Path]
 ) -> None:
     """Use the scanner's existing pinned root, exclusions and shared I/O budgets."""
+    for path in sources:
+        unsupported = path.suffix in {".js", ".mjs", ".cjs", ".mts", ".cts"} or (
+            path.suffix == ".ts"
+            and (
+                bool(_IGNORED.intersection(path.parts))
+                or path.name.endswith((".d.ts", ".spec.ts", ".test.ts"))
+            )
+        )
+        if not unsupported:
+            continue
+        content = files.read_bytes(path)
+        if content is not None and b"@modelcontextprotocol/" in content and b"McpServer" in content:
+            result.surfaces_excluded.append(
+                f"{path}: unsupported MCP server source form or location"
+            )
     paths = [
         path
         for path in sources
@@ -202,15 +223,27 @@ def _collect_source(content: bytes, path: Path, result: ScanResult) -> None:
     root = tree.root_node
     if root.has_error:
         raise ValueError("invalid TypeScript syntax")
+    deadline = time.monotonic() + MAX_ANALYSIS_SECONDS
     nodes = list(_nodes(root))
-    bindings = _bindings(nodes, root)
+    bindings = _bindings(nodes, root, deadline)
     if "sdk" not in bindings.values():
+        # A server-like source that names the SDK but uses a namespace or
+        # otherwise unsupported binding must not silently appear covered.
+        if b"McpServer" in content:
+            result.surfaces_excluded.append(f"{path}: unsupported TypeScript MCP server binding")
         return
     servers: dict[int, tuple[MCPServerComponent, int]] = {}
     for node in nodes:
+        if time.monotonic() >= deadline:
+            raise ValueError("TypeScript AST analysis deadline exceeded")
         if node.type != "new_expression":
             continue
-        constructor = _value(node.child_by_field_name("constructor"))
+        constructor_node = node.child_by_field_name("constructor")
+        # Only a lexical SDK identifier can resolve to the supported import.
+        # Serializing a nested constructor for every new-expression is quadratic.
+        if constructor_node is None or constructor_node.type != "identifier":
+            continue
+        constructor = _value(constructor_node)
         if _lookup(bindings, constructor, node) != "sdk":
             continue
         variable = node.parent
@@ -258,6 +291,8 @@ def _collect_source(content: bytes, path: Path, result: ScanResult) -> None:
     components: list[MCPServerComponent | ToolComponent] = [s for s, _ in servers.values()]
     registrations = 0
     for node in nodes:
+        if time.monotonic() >= deadline:
+            raise ValueError("TypeScript AST analysis deadline exceeded")
         if node.type != "call_expression":
             continue
         member = node.child_by_field_name("function")

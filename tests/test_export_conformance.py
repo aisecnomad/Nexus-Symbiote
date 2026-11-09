@@ -188,6 +188,51 @@ def test_cdx_independent_consumer_round_trip():
     assert native_document(CycloneDXGenerator.recover(output)) == native_document(original)
 
 
+def test_cdx_partial_coverage_through_independent_consumer():
+    """A reader cannot silently weaken incomplete coverage and still recover the BOM."""
+    from cyclonedx.model.bom import Bom
+    from cyclonedx.output.json import JsonV1Dot7
+
+    from nexus_symbiote.core.models import CompletenessClaim
+
+    original = fixture_bom()
+    original.metadata.completeness = CompletenessClaim(scope="partial")
+    document = CycloneDXGenerator().generate(original)
+    assert document["compositions"] == [{"aggregate": "incomplete"}]
+    consumed = Bom.from_json(document)
+    assert consumed is not None
+    output = json.loads(JsonV1Dot7(consumed).output_as_string())
+    assert validate_cyclonedx(output) == []
+    if output.get("compositions") == document["compositions"]:
+        assert native_document(CycloneDXGenerator.recover(output)) == native_document(original)
+    else:
+        with pytest.raises(ValueError, match="projection conflicts"):
+            CycloneDXGenerator.recover(output)
+
+
+def test_spdx_partial_coverage_through_independent_consumer():
+    from spdx_python_model.bindings import v3_0_1 as spdx
+
+    from nexus_symbiote.core.models import CompletenessClaim
+
+    original = fixture_bom()
+    original.metadata.completeness = CompletenessClaim(scope="partial")
+    document = SPDXGenerator().generate(original)
+    objects = spdx.SHACLObjectSet()
+    spdx.JSONLDDeserializer().read(io.BytesIO(json.dumps(document).encode()), objects)
+    output = io.BytesIO()
+    spdx.JSONLDSerializer().write(objects, output)
+    consumed = json.loads(output.getvalue())
+    assert validate_spdx(consumed) == []
+    assert native_document(SPDXGenerator.recover(consumed)) == native_document(original)
+    edges = [
+        n
+        for n in consumed["@graph"]
+        if n.get("type") == "Relationship" and n.get("relationshipType") == "usesTool"
+    ]
+    assert edges and all(edge.get("completeness") == "incomplete" for edge in edges)
+
+
 @pytest.mark.parametrize("generator", [CycloneDXGenerator, SPDXGenerator])
 def test_invalid_hash_and_reference_fail_closed(generator):
     bom = fixture_bom()

@@ -206,12 +206,71 @@ BOM are never trusted for this check. A passing check authenticates the
 report's producer, not the truth of its findings, and imported components keep
 declared assurance. Install the Sigstore extra for this mode.
 
-The check binds the report to its producer, not to this repository, commit or
-time. Anyone who can write to the checkout can substitute an older report, or
-another repository's report, signed by the same identity, for example one from
-before a shadow agent appeared, and regenerate the BOM from it. Give each
-repository's discovery workflow its own signer identity, and bind freshness or
-the commit separately where you need that.
+Without `discovery_context`, this check authenticates the producer only. An old
+report or another repository's report signed by that identity can be substituted.
+A policy that names the report requires its evidence to be present in the BOM,
+even when the project's completeness gate is disabled.
+
+### Bind the report to an expected subject and age
+
+An operator can add the complete `discovery_context` object to the report's
+signature policy entry. The signature policy must remain outside the checkout;
+expected values must be supplied by a trusted deployment or CI system, not read
+from the untrusted report or the code being gated.
+
+```json
+{"version": 1, "artifacts": [{
+  "artifact_path": ".shadowscan/report.json",
+  "bundle_path": ".shadowscan/report.json.sigstore",
+  "expected_identity": "https://github.com/acme/infra/.github/workflows/discovery.yml@refs/heads/main",
+  "expected_issuer": "https://token.actions.githubusercontent.com",
+  "discovery_context": {
+    "statement_path": ".shadowscan/statement.json",
+    "bundle_path": ".shadowscan/statement.json.sigstore",
+    "repository": "acme/agent",
+    "revision": "0123456789012345678901234567890123456789",
+    "scope": "code:repository",
+    "producer_version": "0.1.4",
+    "max_age_seconds": 3600
+  }
+}]}
+```
+
+The trusted discovery producer signs the exact report and also signs this
+strict JSON statement with the same expected identity and issuer. For example:
+
+```json
+{"version": 1,
+ "report_sha256": "sha256:<64 lowercase hexadecimal digits of the exact report bytes>",
+ "repository": "acme/agent",
+ "revision": "0123456789012345678901234567890123456789",
+ "scope": "code:repository",
+ "producer_version": "0.1.4",
+ "produced_at": "2026-11-09T08:00:00Z"}
+```
+
+Replace the digest and timestamp with values measured by the trusted producer;
+the example is not a valid statement. A producer with the Sigstore CLI and its
+OIDC identity can create the two bundles using `python -m sigstore sign --bundle
+.shadowscan/report.json.sigstore .shadowscan/report.json` and `python -m sigstore
+sign --bundle .shadowscan/statement.json.sigstore .shadowscan/statement.json`.
+Place the generated files at the policy paths. The operator sets the expected
+full lowercase 40- or 64-hex revision, exact repository, scope and producer
+version, and an integer maximum age from 1 to 604800 seconds. The statement's
+`produced_at` must be a UTC `Z` timestamp; future timestamps and statements
+older than the maximum age fail. Unknown, duplicate, missing or malformed
+statement fields fail closed. The statement path and its bundle must be bounded,
+regular files beneath the project root. Both the report and the exact statement
+bytes are verified before the statement's claims are used. The context object
+cannot be attached to an unrelated artifact or an unselected report.
+
+This is a signed producer assertion, not proof that the producer actually scanned
+the claimed subject or collected all findings. Protect the producer workflow,
+clock, credentials and policy distribution. A signed report can still be replayed
+within the permitted age; a trusted signer could also issue a fresh statement for
+an old report. Enforce a trusted run identifier or stateful nonce externally if
+your deployment requires single-use or immediate replay prevention. Binding does
+not prove the safety of a discovered component.
 
 ### Verify the native import and its producer
 

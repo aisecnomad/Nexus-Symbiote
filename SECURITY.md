@@ -32,6 +32,32 @@ A signature proves that authorized key material signed particular bytes under th
 
 Agent inventories can expose infrastructure, permissions, endpoints, and instruction fingerprints. Restrict access to exported evidence and review its contents before sharing it. Keep raw credentials out of BOMs, logs, and issue reports.
 
+## Coverage changes after 0.1.0
+
+When found within the scanned scope, nested instruction files, GitHub and
+Cursor instruction directories, Claude subagent definitions, unsupported skill
+package files, partially inventoried IDE settings and unsupported MCP config or
+server forms produce coverage gaps. Default-excluded directories nested under
+skill or command packages also produce gaps. A default gate fails with these
+gaps; `--report-only` permits inspection of the partial inventory. Static source
+hints are conservative and cannot identify every possible agent declaration,
+and paths outside the collection scope remain unobserved. A passing gate still
+does not establish global completeness.
+
+## Discovery binding and resource limits after 0.1.0
+
+An operator signature policy can require a separately signed discovery context
+that binds the report digest to the expected repository, revision, scope, producer
+version and maximum age; see [the integration guide](docs/shadowscan-integration.md).
+The context is an authenticated producer claim, not proof of collection accuracy.
+The producer can sign misleading claims, and a report can be replayed within the
+allowed age. Without this context, the 0.1.0 replay limitation below still applies.
+
+TypeScript source analysis now limits AST depth and per-file analysis time, and
+the JavaScript comment hint uses a linear scan. Limits fail collection rather
+than establish complete coverage. These are not a whole-job CPU or wall-clock
+budget: use an external timeout and resource limits for untrusted inputs.
+
 ## Known limitations in 0.1.0
 
 The pre-publication review of 0.1.0 confirmed these gaps. When a scan meets one of the detection gaps below, it still reports complete coverage, and neither `validate`, `risk` nor `diff --fail-on-alert` can flag what the inventory does not record, so review changes to those files by other means until a later release covers them.

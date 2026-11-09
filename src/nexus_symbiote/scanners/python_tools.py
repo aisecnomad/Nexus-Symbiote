@@ -99,13 +99,27 @@ def _report_import_scope(
         for stmt in imports
     ):
         result.surfaces_excluded.append(f"{path}: low-level MCP server tool list uncollected")
-    modules = {module for module, _ in _FACTORIES}
+    if any(
+        stmt.module is not None
+        and (stmt.module == "mcp.server" or stmt.module.startswith("mcp.server."))
+        and any(
+            (stmt.module, alias.name) not in _FACTORIES
+            and alias.name in {"FastMCP", "MCPServer", "Server"}
+            for alias in stmt.names
+        )
+        for stmt in imports
+    ):
+        result.surfaces_excluded.append(f"{path}: unsupported Python MCP server import")
     qualified_import = any(
-        isinstance(node, ast.Import) and any(a.name in modules for a in node.names)
+        isinstance(node, ast.Import)
+        and any(a.name == "mcp.server" or a.name.startswith("mcp.server.") for a in node.names)
         for node in nodes
     )
     if qualified_import or any(
-        stmt.module in modules and any(a.name == "*" for a in stmt.names) for stmt in imports
+        stmt.module is not None
+        and (stmt.module == "mcp.server" or stmt.module.startswith("mcp.server."))
+        and any(a.name == "*" for a in stmt.names)
+        for stmt in imports
     ):
         result.surfaces_excluded.append(f"{path}: unresolved Python MCP factory import")
 

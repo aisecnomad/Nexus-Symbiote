@@ -73,6 +73,43 @@ SOURCE_BINDING_KEY_ENV = "NEXUS_SYMBIOTE_SOURCE_BINDING_KEY"
 _MIN_SOURCE_BINDING_KEY_LENGTH = 32
 
 
+def _strip_js_comments(content: str) -> str:
+    """Remove block and whole-line comments in linear time for the SDK hint.
+
+    This intentionally retains the pre-existing conservative lexical hint, not a
+    JavaScript parser. An unterminated block is retained as before. Once no
+    closing delimiter exists, later block openers cannot close either.
+    """
+    chunks: list[str] = []
+    cursor = 0
+    segment = 0
+    can_close_block = True
+    size = len(content)
+    while cursor < size:
+        if can_close_block and content.startswith("/*", cursor):
+            end = content.find("*/", cursor + 2)
+            if end == -1:
+                can_close_block = False
+            else:
+                chunks.append(content[segment:cursor])
+                cursor = end + 2
+                segment = cursor
+                continue
+        if cursor == 0 or content[cursor - 1] == "\n":
+            end = cursor
+            while end < size and content[end] != "\n" and content[end].isspace():
+                end += 1
+            if content.startswith("//", end):
+                chunks.append(content[segment:cursor])
+                newline = content.find("\n", end + 2)
+                cursor = size if newline == -1 else newline
+                segment = cursor
+                continue
+        cursor += 1
+    chunks.append(content[segment:])
+    return "".join(chunks)
+
+
 def _value_binding(config: dict[str, Any]) -> tuple[str, str] | None:
     key = os.environ.get(SOURCE_BINDING_KEY_ENV, "")
     if not key:
@@ -152,6 +189,11 @@ class MCPScanner(Scanner):
         clients: dict[str, MCPClientComponent] = {}
 
         with self._collection(project_root, result) as files:
+            for unsupported in (".vscode/mcp.json", ".windsurf/mcp.json", ".cline/mcp.json"):
+                if files.read_bytes(unsupported, missing_ok=True) is not None:
+                    result.surfaces_excluded.append(
+                        f"{unsupported}: MCP configuration not inventoried"
+                    )
             for config_name in MCP_CONFIG_FILES:
                 config_path = files.root / config_name
                 data = files.read_json(config_name, missing_ok=True)
@@ -587,6 +629,16 @@ class MCPScanner(Scanner):
         from nexus_symbiote.scanners.ts_tools import collect_typescript
 
         collect_typescript(self._files, result, sources)
+        for path in sources:
+            if path.suffix != ".py" or not {"tests", "test", "dist", "build"}.intersection(
+                path.parts
+            ):
+                continue
+            source_bytes = self._files.read_bytes(path)
+            if source_bytes is not None and b"mcp.server" in source_bytes:
+                result.surfaces_excluded.append(
+                    f"{path}: Python MCP server source in unsupported location"
+                )
         detected: list[str] = []
         for suffix in (".py", ".ts", ".js"):
             paths = [
@@ -638,7 +690,7 @@ class MCPScanner(Scanner):
                 else:
                     # A bounded syntax hint, never a claim that an SDK is installed
                     # or deployed. Strip comments and require the SDK import path.
-                    content = re.sub(r"/\*.*?\*/|(?m:^\s*//[^\n]*$)", "", content, flags=re.S)
+                    content = _strip_js_comments(content)
                     found = bool(
                         re.search(
                             r"(?:\bfrom\s*[\"']@modelcontextprotocol/sdk(?:/[^\"']*)?[\"']|"

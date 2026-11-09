@@ -126,6 +126,26 @@ class PromptScanner(Scanner):
         result = ScanResult(scanner_name=self.name)
 
         with self._collection(project_root, result) as files:
+            # A successful fixed-path read cannot establish that instructions in
+            # other supported client locations are absent. Report them as gaps
+            # until their loading and precedence semantics are implemented.
+            for path in files.iter_files():
+                relative = path.as_posix()
+                unsupported_instruction = (
+                    path.name in {"AGENTS.md", "CLAUDE.md"} and relative not in INSTRUCTION_FILES
+                ) or any(
+                    relative.startswith(prefix + "/")
+                    for prefix in (
+                        ".github/instructions",
+                        ".github/prompts",
+                        ".cursor/rules",
+                        ".claude/agents",
+                    )
+                )
+                if unsupported_instruction:
+                    result.surfaces_excluded.append(
+                        f"{relative}: unsupported agent instruction or subagent definition"
+                    )
             for rel_path, prompt_type in INSTRUCTION_FILES.items():
                 content = files.read_bytes(rel_path, missing_ok=True)
                 if content is None:
@@ -150,6 +170,9 @@ class PromptScanner(Scanner):
                         ".yml",
                         ".json",
                     ):
+                        result.surfaces_excluded.append(
+                            f"{path}: unsupported skill or command package file"
+                        )
                         continue
                     content = files.read_bytes(path)
                     if content is None:

@@ -12,6 +12,7 @@ policy neither verifies a signature nor authorizes artifact execution.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import urlsplit
@@ -20,13 +21,26 @@ from nexus_symbiote.core.hashing import open_regular_file, parse_json_strict
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.crypto import (
     MAX_BUNDLE_BYTES,
+    MAX_DISCOVERY_STATEMENT_BYTES,
     MAX_SIGNED_ARTIFACT_BYTES,
+    DiscoveryContextPolicy,
     SigstoreArtifactPolicy,
 )
 
 MAX_POLICY_BYTES = 4 * 1024 * 1024
 MAX_POLICY_ARTIFACTS = 1000
 _FIELDS = frozenset({"artifact_path", "bundle_path", "expected_identity", "expected_issuer"})
+_CONTEXT_FIELDS = frozenset(
+    {
+        "statement_path",
+        "bundle_path",
+        "repository",
+        "revision",
+        "scope",
+        "producer_version",
+        "max_age_seconds",
+    }
+)
 
 
 class SignaturePolicyError(ValueError):
@@ -87,12 +101,16 @@ def load_signature_policies(policy_path: Path, project_root: Path) -> list[Sigst
         raise SignaturePolicyError("Signature policy requires a bounded nonempty artifacts list")
     policies: list[SigstoreArtifactPolicy] = []
     seen: set[Path] = set()
+    seen_identities: set[tuple[int, int]] = set()
     failures: list[str] = []
     with ConfinedCollection(project_root, failures) as files:
         for record in records:
-            if not isinstance(record, dict) or set(record) != _FIELDS:
+            if not isinstance(record, dict) or set(record) not in (
+                _FIELDS,
+                _FIELDS | {"discovery_context"},
+            ):
                 raise SignaturePolicyError(
-                    "Each artifact requires exactly the four signature policy fields"
+                    "Each artifact requires the four signature policy fields and optional discovery_context"
                 )
             artifact = _relative_path(_required_string(record, "artifact_path"))
             bundle = _relative_path(_required_string(record, "bundle_path"))
@@ -116,6 +134,31 @@ def load_signature_policies(policy_path: Path, project_root: Path) -> list[Sigst
             if artifact in seen:
                 raise SignaturePolicyError("Duplicate artifact in signature policy")
             seen.add(artifact)
+            context = None
+            if "discovery_context" in record:
+                item = record["discovery_context"]
+                if not isinstance(item, dict) or set(item) != _CONTEXT_FIELDS:
+                    raise SignaturePolicyError("Discovery context requires all expected fields")
+                age = item["max_age_seconds"]
+                if type(age) is not int or not 1 <= age <= 604800:
+                    raise SignaturePolicyError(
+                        "Discovery context max_age_seconds must be 1 to 604800"
+                    )
+                statement = _relative_path(_required_string(item, "statement_path"))
+                statement_bundle = _relative_path(_required_string(item, "bundle_path"))
+                context = DiscoveryContextPolicy(
+                    files.root / statement,
+                    files.root / statement_bundle,
+                    _required_string(item, "repository"),
+                    _required_string(item, "revision"),
+                    _required_string(item, "scope"),
+                    _required_string(item, "producer_version"),
+                    age,
+                )
+                if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", context.revision):
+                    raise SignaturePolicyError(
+                        "Discovery revision must be a full lowercase commit digest"
+                    )
             try:
                 # Open only to validate root containment, file kind and bounds.
                 # Artifact bytes and signature authenticity are checked later.
@@ -123,12 +166,34 @@ def load_signature_policies(policy_path: Path, project_root: Path) -> list[Sigst
                     pass
                 with files.open_regular(bundle, max_bytes=MAX_BUNDLE_BYTES):
                     pass
+                if context is not None:
+                    with files.open_regular(statement, max_bytes=MAX_DISCOVERY_STATEMENT_BYTES):
+                        pass
+                    with files.open_regular(statement_bundle, max_bytes=MAX_BUNDLE_BYTES):
+                        pass
             except (OSError, ValueError):
                 raise SignaturePolicyError(
                     "Policy artifact or bundle is unavailable beneath the project root"
                 ) from None
+            artifact_id = files.path_identity(artifact)
+            if artifact_id is None or artifact_id in seen_identities:
+                raise SignaturePolicyError("Duplicate or unavailable signature policy artifact")
+            seen_identities.add(artifact_id)
+            if context is not None:
+                from nexus_symbiote.scanners.shadowscan import REPORT_PATHS
+
+                report_ids = [files.path_identity(path) for path in REPORT_PATHS]
+                first_report_id = next(
+                    (identity for identity in report_ids if identity is not None), None
+                )
+                if artifact_id != first_report_id:
+                    raise SignaturePolicyError(
+                        "Discovery context must name the report selected by the ShadowScan collector"
+                    )
             policies.append(
-                SigstoreArtifactPolicy(files.root / artifact, files.root / bundle, identity, issuer)
+                SigstoreArtifactPolicy(
+                    files.root / artifact, files.root / bundle, identity, issuer, context
+                )
             )
     if failures:
         raise SignaturePolicyError("Signature policy references could not be safely inspected")

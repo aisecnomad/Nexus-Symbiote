@@ -99,8 +99,10 @@ def test_cli_does_not_report_unrestricted_shell_declaration_as_clean(tmp_path: P
     result = CliRunner().invoke(
         main, ["scan", str(tmp_path), "--no-project-policy", "-o", str(output)]
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     bom = AIBOM.load(output)
+    assert bom.metadata.completeness is not None
+    assert any("partially inventoried" in s for s in bom.metadata.completeness.surfaces_excluded)
     report = RiskScorer().score(bom)
     assert report.risk_level != "clean"
     assert any(f.category == "permission_scope" for f in report.findings)

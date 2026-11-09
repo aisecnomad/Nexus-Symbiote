@@ -27,13 +27,14 @@ python -m pip install --no-deps --no-build-isolation .
 ### 1. Inventory the project
 
 ```bash
-nexus-symbiote scan examples/demo-agent -o demo.aibom.json
+nexus-symbiote scan examples/demo-agent --report-only -o demo.aibom.json
 nexus-symbiote summary demo.aibom.json
 ```
 
-All eight collectors complete and record 11 components across 9 types. The scan
-passes the default gate (exit 0) with a risk warning: score 33, below the default
-fail threshold of 50, from three high and three medium findings:
+The scan records 11 components across 9 types. Its IDE collector reports partial
+coverage because the Claude settings are not fully inventoried. A default scan
+therefore exits 1; `--report-only` retains the inventory for inspection and is
+not a production approval gate. The findings include:
 
 | Severity | Component | Finding |
 |---|---|---|
@@ -50,19 +51,18 @@ nexus-symbiote risk demo.aibom.json --no-project-policy
 nexus-symbiote validate demo.aibom.json --project examples/demo-agent --no-project-policy
 ```
 
-`risk` passes the default gate. `validate` exits 1. Completeness passes, but
-integrity is unknown: no operator signer policy was supplied, so the model's
+`risk` scores the supplied inventory. `validate` exits 1 because the IDE
+settings coverage is partial, and integrity is unknown: no operator signer policy was supplied, so the model's
 signature cannot be verified, and unknown evidence never passes. It also warns
 that the `memory` package is unpinned and that the remote `tickets` endpoint's
-identity is unverified. That is the intended teaching point: an inventory can be
-complete and still not be approvable.
+identity is unverified.
 
 ### 3. Export standard formats
 
 ```bash
-nexus-symbiote scan examples/demo-agent -f cyclonedx -o demo.cdx.json
-nexus-symbiote scan examples/demo-agent -f spdx -o demo.spdx.json
-nexus-symbiote scan examples/demo-agent -f sarif -o demo.sarif
+nexus-symbiote scan examples/demo-agent --report-only -f cyclonedx -o demo.cdx.json
+nexus-symbiote scan examples/demo-agent --report-only -f spdx -o demo.spdx.json
+nexus-symbiote scan examples/demo-agent --report-only -f sarif -o demo.sarif
 ```
 
 ### 4. Catch drift
@@ -73,11 +73,11 @@ at a different host.
 
 ```bash
 cp -r examples/demo-agent /tmp/demo-agent
-nexus-symbiote scan /tmp/demo-agent -o before.json
+nexus-symbiote scan /tmp/demo-agent --report-only -o before.json
 sed -i.bak -e 's/server-filesystem@2025.8.21/server-filesystem@latest/' \
   -e 's#https://mcp.example.com/mcp#https://mcp.attacker.example/mcp#' \
   /tmp/demo-agent/.mcp.json
-nexus-symbiote scan /tmp/demo-agent -o after.json
+nexus-symbiote scan /tmp/demo-agent --report-only -o after.json
 nexus-symbiote diff before.json after.json --fail-on-alert
 ```
 

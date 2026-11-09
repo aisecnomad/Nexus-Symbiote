@@ -2,6 +2,19 @@
 
 Notable changes to Nexus SymBiote, newest release first. Within a release, security changes come first, and changes that need action from users are marked **Breaking**.
 
+## Unreleased
+
+### Security
+
+- **Breaking:** scans now report partial coverage when they encounter selected uncollected instruction, skill, IDE settings or MCP source and configuration surfaces. The default gate can therefore fail for projects that previously passed. Use `--report-only` to inspect the partial inventory and review the identified surfaces separately.
+- Operator signature policies can require a signed ShadowScan discovery context binding the report digest to the expected repository, revision, collection scope, producer version and maximum age. Signed producer claims do not prove collection accuracy or prevent replay within the allowed age.
+- Bound TypeScript AST depth and per-file analysis time and replace the JavaScript comment hint's quadratic pattern. Use an external timeout and resource limits for the whole scan.
+
+### Assurance
+
+- Document standard export semantics and information loss and exercise partial-coverage exports through independent SDK consumers.
+- Add an offline evaluator and protocol for externally selected and adjudicated holdout corpora. No independent field accuracy result is claimed.
+
 ## [0.1.0] - 2026-11-07
 
 First alpha of the AgentBOM toolkit under the Hunzee-VC organization. Its known detection gaps, including Claude Code settings beyond the permission mode and blanket grants, skill scripts and subagents, are listed under [known limitations](SECURITY.md#known-limitations-in-010); `diff --fail-on-alert` cannot alert on them.

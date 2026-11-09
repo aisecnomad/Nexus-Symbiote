@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "upstream": {
     "repository": "modelcontextprotocol/servers",
     "commit": "194cc86e3ae6400958555bd4116849d822d69263",
@@ -78,10 +78,11 @@
     {
       "id": "registration-decoys",
       "inventory_scope": "source",
-      "coverage_rationale": "Unresolved receiver and dynamic name are intentional; absent labels remain unknown.",
+      "coverage_rationale": "Unresolved receiver and dynamic name are intentional; the test-directory server is outside the collected scope. Absent labels remain unknown.",
       "expected_mcp_exclusions": [
         "src/server.ts:6 (unresolved MCP registration receiver)",
-        "src/server.ts:7 (unresolved MCP tool name)"
+        "src/server.ts:7 (unresolved MCP tool name)",
+        "tests/server.ts: unsupported MCP server source form or location"
       ],
       "files": {
         "src/server.ts": "import { McpServer as S } from \"@modelcontextprotocol/server\";\nconst service = new S({});\nservice.registerTool(\"active_tool\", {}, () => {});\n// service.registerTool(\"in_comment\", {}, fn);\nconst help = `service.registerTool(\"in_string\", {}, fn)`;\nunrelated.registerTool(\"wrong_receiver\", {}, fn);\nservice.registerTool(nameFromRuntime, {}, fn);\n",

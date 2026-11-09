@@ -2,7 +2,7 @@
 
 From a Nexus SymBiote development install run `python benchmarks/inventory/run_inventory.py`. The command prints per-case predictions, missed and unexpected tool names, control outcomes and counts. It returns nonzero on any mismatch. Run offline. Cases extract declared tools without executing repository code.
 
-The source fixtures in `fixtures/upstream` are unmodified and accompanied by their licenses. Corpus v3 samples three public implementations. The manifest pins the upstream revisions and blobs, and the runner checks each source file's SHA-256 before collection.
+The source fixtures in `fixtures/upstream` are unmodified and accompanied by their licenses. Corpus v4 samples three public implementations. The manifest pins the upstream revisions and blobs, and the runner checks each source file's SHA-256 before collection. Version 4 records the newly surfaced test-directory exclusion in the registration-decoys case; its files and tool labels are unchanged.
 
 | Upstream source | Expected tools | Explicit decoys | Label evidence |
 | --- | ---: | ---: | --- |
@@ -14,7 +14,7 @@ The MarkItDown fixture exercises a separately maintained application beyond the 
 
 Tool confusion counts include only explicit expected tools and explicit decoys. A predicted name outside both label sets is reported separately as `unexpected_unlabeled` and fails the case pending review; it is not silently added to the false-positive denominator. The report totals these names under `unlabeled_predictions`. Labels must be unique and disjoint. No assertion that an unlabeled name is a true negative or a false positive is implied. Collection failures or relevant MCP exclusions make unobserved positive and negative labels unknown and exclude them from scored denominators. Per-collector status and relevant exclusions remain visible.
 
-Source-scoped cases explicitly assess source declarations; the routine absence of an MCP config is outside that scope. Other exclusions make collection incomplete. The registration-decoys case intentionally contains two ambiguous registrations; the manifest records those exact expected exclusions and their rationale. The case can pass as a control when those omissions are reported exactly, but its missing labels remain unknown. An additional unexpected exclusion fails the case. A passing regression control therefore does not mean all labels were scored or that collection was complete.
+Source-scoped cases explicitly assess source declarations; the routine absence of an MCP config is outside that scope. Other exclusions make collection incomplete. The registration-decoys case intentionally contains two ambiguous registrations and a server in the uncollected test directory; the manifest records those exact expected exclusions and their rationale. The case can pass as a control when those omissions are reported exactly, but its missing labels remain unknown. An additional unexpected exclusion fails the case. A passing regression control therefore does not mean all labels were scored or that collection was complete.
 
 Each case and the aggregate report include `tool_counts` and/or `label_bounds`.
 The recall interval treats every unobserved positive label first as missed, then
@@ -28,11 +28,10 @@ are case-label occurrences: repeated names across cases are not distinct real
 deployments. The release statement signs the new results along with existing
 corpus and scanner materials.
 
-The manifest's `version` identifies the corpus and labels, not the result wire
-format; it is unchanged because the cases and labels are unchanged. The additional
-result fields are additive. Consumers that reject unknown JSON fields must update
-their parser. New result bytes require a new evidence statement and signature;
-previously signed results remain verifiable using their original statement.
+The manifest's `version` identifies the corpus and expected coverage, not the
+result wire format. New result bytes require a new evidence statement and
+signature; previously signed results remain verifiable using their original
+statement.
 
 ## Independent effectiveness evaluation
 
@@ -94,3 +93,8 @@ For a retained copy of the attestation, download `inventory-benchmark-attestatio
 from that run and supply its file to `gh attestation verify` with `--bundle`.
 Compare the candidate wheel against `wheel.sha256` before using the results for
 that distribution. The counts describe the versioned public fixtures.
+
+For scoring an externally selected and adjudicated holdout, see the separate
+[held-out evaluation protocol](heldout-evaluation.md). Its evaluator checks
+fixture and artifact hashes and preserves unknown labels; it does not supply an
+independent corpus or establish that a given evaluation is representative.

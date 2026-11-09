@@ -97,6 +97,22 @@ class IDEAgentScanner(Scanner):
         result = ScanResult(scanner_name=self.name)
         with self._collection(project_root, result) as files:
             available = {path.as_posix() for path in files.iter_files()}
+            # These files have executable and authorization settings that this
+            # collector does not bind. A mode-only observation is not complete.
+            for path in sorted(
+                available.intersection(
+                    {
+                        ".claude/settings.json",
+                        ".claude/settings.local.json",
+                        ".cursor/settings.json",
+                        ".windsurf/settings.json",
+                        ".cline/settings.json",
+                        ".codex/config.json",
+                        ".codex/config.toml",
+                    }
+                )
+            ):
+                result.surfaces_excluded.append(f"{path}: IDE settings only partially inventoried")
             for ide_type, config in IDE_AGENT_CONFIGS.items():
                 found: list[str] = []
                 for marker in config["markers"]:

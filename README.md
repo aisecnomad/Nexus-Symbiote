@@ -102,7 +102,7 @@ Standard exports embed the native inventory in a digest-bound extension. Keep th
 
 ### See it on the demo agent
 
-The bundled [demo agent](https://github.com/Hunzee-VC/Nexus-Symbiote/tree/main/examples/demo-agent) is a small synthetic support assistant. Scanning it records 11 components across 9 types and six findings (risk score 33, below the default fail threshold of 50):
+The bundled [demo agent](https://github.com/Hunzee-VC/Nexus-Symbiote/tree/main/examples/demo-agent) is a small synthetic support assistant. Scanning it records 11 components across 9 types, including the following findings:
 
 | Severity | Component | Finding |
 | --- | --- | --- |
@@ -167,13 +167,13 @@ Optional extras: `.[sigstore]` for Sigstore verification; `.[cyclonedx]` install
 From the checkout, inventory the bundled demo agent — nothing is executed and no network is used:
 
 ```bash
-nexus-symbiote scan examples/demo-agent -o demo.aibom.json
+nexus-symbiote scan examples/demo-agent --report-only -o demo.aibom.json
 nexus-symbiote summary demo.aibom.json
 nexus-symbiote risk demo.aibom.json --no-project-policy
 nexus-symbiote validate demo.aibom.json --project examples/demo-agent --no-project-policy
 ```
 
-`validate` exits 1 on purpose: completeness passes, but the model's integrity stays unknown because no signer policy was supplied. An inventory can be complete and still not be approvable.
+The demo scan uses `--report-only` to retain an incomplete inventory for inspection. Its Claude settings are only partially inventoried, so the default scan gate and `validate` fail. The model's integrity also stays unknown because no signer policy was supplied. Report-only mode is not a production approval gate.
 
 ### Scan your own agent
 
@@ -265,7 +265,7 @@ Every command is offline by default. Only `discover-mcp`, `advisories` and `veri
 
 1. **Collect.** Each collector reads its surfaces through confined, size-bounded file reads and returns components, findings and coverage status.
 2. **Assemble.** Results merge into one AgentBOM. Every claim keeps its assurance level: declared, observed or verified.
-3. **Gate.** `validate` checks completeness and integrity; `risk` scores findings against your policy. Gaps the collectors report fail closed; surfaces they do not support are not reported.
+3. **Gate.** `validate` checks completeness and integrity; `risk` scores findings against your policy. Detected unsupported instruction, skill, IDE and MCP surfaces are reported as coverage gaps. Other unsupported surfaces may remain undetected, so completeness is only a claim within the documented collection profile.
 4. **Compare.** `diff` compares two snapshots semantically and rates each change.
 5. **Export.** Standard formats are generated from the same collection, so every export describes the same evidence.
 

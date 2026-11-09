@@ -663,10 +663,12 @@ def discovery_producer_problems(
     the importer's confined reader, its digest must equal the recorded one, and the
     operator policy entry for that report path must verify over those bytes.
     """
-    from nexus_symbiote.scanners.shadowscan import ShadowScanImporter
+    from nexus_symbiote.scanners.shadowscan import REPORT_PATHS, ShadowScanImporter
     from nexus_symbiote.utils.crypto import SIGSTORE_MISSING, verify_sigstore_bundle
 
     if not _carries_discovery(bom):
+        if _report_policy(root, signature_policies, REPORT_PATHS) is not None:
+            return ["Required ShadowScan discovery evidence is absent from the BOM."]
         return []
     claim = bom.metadata.completeness
     recorded = claim.source_report_digest if claim is not None else None
@@ -702,4 +704,8 @@ def discovery_producer_problems(
         and hmac.compare_digest(str(verified.details.get("artifact_digest", "")), recorded)
     ):
         problems.append("ShadowScan report signature or signer policy verification failed.")
+    else:
+        from nexus_symbiote.discovery_context import discovery_context_problems
+
+        problems.extend(discovery_context_problems(root, policy, recorded))
     return problems

@@ -488,17 +488,27 @@ def test_cli_runs_record_the_scope_each_case_needs(scans):
 
 
 @pytest.mark.parametrize("scan", ["full", "init-policy", "every-scanner"])
-def test_full_static_scan_is_public_unknown_and_never_complete(scans, scan):
+def test_full_static_demo_reports_incomplete_for_partial_ide_settings(scans, scan):
     cdx = standard_only(scans[scan]["cyclonedx"], "cyclonedx")
     spdx_view = standard_only(scans[scan]["spdx"], "spdx")
-    assert cdx.get("compositions") == [{"aggregate": "unknown"}]
-    assert {e.get("completeness") for e in _edges(spdx_view)} == {"noAssertion"}
-    assert _spdx_document(spdx_view).get("comment", "").startswith("Collection coverage is unknown")
+    assert cdx.get("compositions") == [{"aggregate": "incomplete"}]
+    assert {e.get("completeness") for e in _edges(spdx_view)} == {"incomplete"}
+    assert (
+        _spdx_document(spdx_view).get("comment", "").startswith("Collection coverage is incomplete")
+    )
     _cyclonedx_strict(cdx)
     _spdx_round_trip(spdx_view)
     document = scans[scan]["cyclonedx"]
-    # An SDK that drops the composition removes no assertion; a complete claim conflicts.
-    assert CycloneDXGenerator.recover({k: v for k, v in document.items() if k != "compositions"})
+    claim = CycloneDXGenerator.recover(document).metadata.completeness
+    assert claim is not None
+    assert claim.scanner_status["ide_agents"] == "partial"
+    assert any(
+        ".claude/settings.json: IDE settings only partially inventoried" in item
+        for item in claim.surfaces_excluded
+    )
+    # Dropping an incomplete warning is a downgrade and recovery rejects it.
+    with pytest.raises(ValueError, match="projection conflicts"):
+        CycloneDXGenerator.recover({k: v for k, v in document.items() if k != "compositions"})
     with pytest.raises(ValueError, match="projection conflicts"):
         CycloneDXGenerator.recover({**document, "compositions": [{"aggregate": "complete"}]})
 

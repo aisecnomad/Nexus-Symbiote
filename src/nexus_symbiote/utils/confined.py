@@ -185,6 +185,16 @@ class ConfinedCollection:
         # the documented static scope. The BOM records these patterns. Any
         # further omission within that scope is a blocking coverage gap.
         if any(part in DEFAULT_EXCLUDES for part in relative.parts):
+            # General dependency caches are outside the static scope, but a
+            # skill package can itself contain executable content with such a
+            # name. Skipping it must not make that package appear complete.
+            parts = relative.parts
+            for prefix in ((".claude", "skills"), (".claude", "commands"), ("skills",)):
+                if parts[: len(prefix)] == prefix and len(parts) > len(prefix):
+                    message = f"{relative}: default exclusion inside agent skill package"
+                    if message not in self.exclusions:
+                        self.exclusions.append(message)
+                    break
             return True
         denied = any(absolute == value or value in absolute.parents for value in self._excluded)
         if denied:
