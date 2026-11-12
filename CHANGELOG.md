@@ -2,6 +2,12 @@
 
 Notable changes to Nexus SymBiote, newest release first. Within a release, security changes come first, and changes that need action from users are marked **Breaking**.
 
+## [Unreleased]
+
+### Security
+
+- Preserve HTTP body framing during live MCP discovery: decode chunked SSE through the HTTP response parser, enforce Content-Length boundaries, and reject negative or oversized chunk lengths before buffered reads. JSON and SSE failures remain bounded and use fixed diagnostics.
+
 ## [0.1.0] - 2026-11-04
 
 First alpha of the AgentBOM toolkit under the Hunzee-VC organization.

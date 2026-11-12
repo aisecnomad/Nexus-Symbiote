@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import socket
 import ssl
+import sys
 import time
 
 import pytest
@@ -148,6 +149,9 @@ class Reply:
     def read(self, size):
         return self.body[:size]
 
+    def readline(self, size):
+        return self.fp.readline(size)
+
     def close(self):
         self.fp.close()
 
@@ -258,3 +262,87 @@ def test_pinned_https_context_requires_tls12_and_verified_hostnames():
     assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.check_hostname is True
+
+
+def framed_sse_reply(wire):
+    adapter = live._DeadlineSocket(FakeSocket(wire), time.monotonic() + 1)
+    response = live._PinnedHTTPSConnection.response_class(adapter)
+    response.begin()
+    return response
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 4096])
+def test_sse_decodes_http_chunks_and_stops_before_stream_end(monkeypatch, chunk_size):
+    body = b'data: {"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n\n'
+    chunks = [body[i : i + chunk_size] for i in range(0, len(body), chunk_size)]
+    wire = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n"
+        + b"".join(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n" for chunk in chunks)
+    )
+    transport, calls, _ = transport_fixture(monkeypatch, [framed_sse_reply(wire)])
+    reply = transport.request(
+        "https://fixture.example/mcp", b'{"id":2}', {}, timeout=1, max_bytes=len(body)
+    )
+    assert reply.body == body
+    assert calls[0].closed
+
+
+@pytest.mark.parametrize("length", [0, 10])
+def test_sse_does_not_accept_result_beyond_content_length(monkeypatch, length):
+    body = b'data: {"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n\n'
+    wire = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        + f"Content-Length: {length}\r\n\r\n".encode()
+        + body
+    )
+    transport, calls, _ = transport_fixture(monkeypatch, [framed_sse_reply(wire)])
+    with pytest.raises(live.DiscoveryError, match="without matching response"):
+        transport.request("https://fixture.example/mcp", b'{"id":2}', {}, timeout=1, max_bytes=200)
+    assert calls[0].closed
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_sse_decoded_body_keeps_byte_budget(monkeypatch, chunked):
+    body = b'data: {"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n\n'
+    framing = b"Transfer-Encoding: chunked\r\n" if chunked else b""
+    payload = f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n" if chunked else body
+    wire = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" + framing + b"\r\n" + payload
+    transport, calls, _ = transport_fixture(monkeypatch, [framed_sse_reply(wire)])
+    with pytest.raises(live.DiscoveryError, match="byte or line limit"):
+        transport.request(
+            "https://fixture.example/mcp", b'{"id":2}', {}, timeout=1, max_bytes=len(body) - 1
+        )
+    assert calls[0].closed
+
+
+@pytest.mark.parametrize("chunk_size", [b"-1", f"{sys.maxsize + 1:x}".encode()])
+@pytest.mark.parametrize("media_type", [b"application/json", b"text/event-stream"])
+def test_malformed_chunk_size_fails_without_draining_body(monkeypatch, chunk_size, media_type):
+    wire = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: "
+        + media_type
+        + b"\r\nTransfer-Encoding: chunked\r\n\r\n"
+        + chunk_size
+        + b'\r\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n\n'
+        + b"x" * 1_000_000
+    )
+    raw, secured = FakeSocket(), FakeSocket(wire)
+    context = ssl.create_default_context()
+    monkeypatch.setattr(ssl, "create_default_context", lambda: context)
+    monkeypatch.setattr(context, "wrap_socket", lambda stream, *, server_hostname: secured)
+    monkeypatch.setattr(socket, "socket", lambda *a, **kw: raw)
+    monkeypatch.setattr(live, "_resolve_public", lambda *a: (socket.AF_INET, "93.184.216.34"))
+    result = live.discover_tools(
+        "https://fixture.example/mcp",
+        allowed_origins=["https://fixture.example"],
+        limits=live.DiscoveryLimits(max_response_bytes=100),
+    )
+    # Header parsing may prefetch one buffer, but an invalid size must never
+    # reach HTTPResponse's read(-1) or an oversized BufferedReader.peek().
+    assert secured.incoming.tell() <= io.DEFAULT_BUFFER_SIZE
+    assert not result.complete
+    assert result.failures == [
+        "Live MCP discovery refused or incomplete; check endpoint policy, protocol and configured limits."
+    ]
+    assert secured.closed
