@@ -6,6 +6,7 @@ Notable changes to Nexus SymBiote, newest release first. Within a release, secur
 
 ### Security
 
+- Interpret A2A security requirements as OR alternatives. Anonymous alternatives now produce an authentication finding and authentication-removal drift; malformed declarations become collection gaps. Use legacy authentication schemes only when security is absent. Recollect A2A snapshots to obtain the corrected declaration semantics.
 - Preserve HTTP body framing during live MCP discovery: decode chunked SSE through the HTTP response parser, enforce Content-Length boundaries, and reject negative or oversized chunk lengths before buffered reads. JSON and SSE failures remain bounded and use fixed diagnostics.
 
 ## [0.1.0] - 2026-11-04
