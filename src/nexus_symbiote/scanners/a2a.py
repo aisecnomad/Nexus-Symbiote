@@ -33,6 +33,41 @@ def _strings(value: Any) -> list[str]:
     return [redact_text(item) for item in value]
 
 
+def _authentication_required(data: dict[str, Any]) -> bool:
+    if "security" in data:
+        requirements = data["security"]
+        if not isinstance(requirements, list) or len(requirements) > 1000:
+            raise ValueError("invalid security requirements")
+        for requirement in requirements:
+            if not isinstance(requirement, dict) or len(requirement) > 1000:
+                raise ValueError("invalid security requirement")
+            for name, scopes in requirement.items():
+                if (
+                    not isinstance(name, str)
+                    or not name.strip()
+                    or not isinstance(scopes, list)
+                    or len(scopes) > 1000
+                    or not all(isinstance(scope, str) and scope.strip() for scope in scopes)
+                ):
+                    raise ValueError("invalid security scheme requirement")
+        # A2A's OpenAPI requirements are OR alternatives. An empty object allows
+        # an anonymous request, even when other alternatives require credentials.
+        return bool(requirements) and all(requirements)
+    authentication = data.get("authentication")
+    if authentication is None:
+        return False
+    if not isinstance(authentication, dict):
+        raise ValueError("invalid legacy authentication declaration")
+    schemes = authentication.get("schemes")
+    if (
+        not isinstance(schemes, list)
+        or len(schemes) > 1000
+        or not all(isinstance(scheme, str) and scheme.strip() for scheme in schemes)
+    ):
+        raise ValueError("invalid legacy authentication schemes")
+    return bool(schemes)
+
+
 class A2AScanner(Scanner):
     name = "a2a"
 
@@ -84,9 +119,7 @@ class A2AScanner(Scanner):
             raise ValueError("invalid card identity")
         name = redact_text(name)
         protocols = _strings(data.get("protocols", []))
-        for field in ("authentication", "security"):
-            if data.get(field) is not None and not isinstance(data[field], (dict, list)):
-                raise ValueError("invalid authentication declaration")
+        auth_required = _authentication_required(data)
         declared_skills = data.get("skills", [])
         if not isinstance(declared_skills, list) or len(declared_skills) > 1000:
             raise ValueError("invalid skills")
@@ -99,7 +132,6 @@ class A2AScanner(Scanner):
             skills.append(redact_text(skill))
         # This records declarations only; neither a card nor this collector proves
         # that an endpoint actually enforces authentication.
-        auth_required = bool(data.get("authentication") or data.get("security"))
         risks: list[RiskAssessment] = []
         if endpoint and not endpoint.lower().startswith("https://"):
             risks.append(
@@ -115,7 +147,7 @@ class A2AScanner(Scanner):
                 RiskAssessment(
                     severity=RiskSeverity.MEDIUM,
                     category="authentication",
-                    detail=f"A2A agent '{name}' has no nonempty authentication requirement declared.",
+                    detail=f"A2A agent '{name}' does not declare authentication as required for every alternative.",
                     recommendation="Declare and independently verify endpoint authentication requirements.",
                 )
             )

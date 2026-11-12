@@ -71,6 +71,15 @@ For trusted local projects, standalone `scan` loads project policy from the scan
 | Impact analysis | Potential graph reachability through recorded relationships, not proof that an exploit executed |
 | GitHub Action | One collected inventory, caller-owned gates and optional SARIF upload; disabled or skipped gates are visible policy choices |
 
+A2A card authentication is a declaration only. The collector interprets the
+`security` requirement list as OpenAPI alternatives: an empty list or any empty
+requirement object (`{}`) permits anonymous access and produces an authentication
+finding. Each nonempty requirement must contain named schemes with string-list
+scopes; malformed declarations are collection gaps. When `security` is absent,
+the legacy `authentication.schemes` string list is used. A present `security`
+field takes precedence over the legacy declaration. This does not validate the
+referenced scheme definitions or prove that the endpoint enforces them.
+
 Project validation compares static MCP records and configured tool fingerprints with fresh local evidence. A structure binding detects added or removed arguments, environment variables and tools. With `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` set, a keyed binding also detects same-version package swaps and changed argument, environment and endpoint values, without exporting anything a secret could be guessed from. MCP references include the relative configuration path and declared name. Legacy snapshots without the binding, or with name-only identities, need recollection; see [source reconciliation and migration](verification-source-binding.md). Python source declaration collection has bounded application-file coverage and reports unresolved or dynamic registrations as gaps.
 
 CycloneDX 1.7 and SPDX 3.0.1 exports use supported standard structures and a digest-bound native extension. Consumers must retain that extension to recover full native semantics and inspect the selected-field loss report. A digest detects changes; it does not authenticate the producer. SPDX identities are scoped to each inventory revision. SARIF contains reviewable findings rather than an admission decision, and standalone ShadowScan imports do not support SARIF. VEX output marks findings `in_triage` and does not assert exploitability. Schema validity alone establishes neither semantic equivalence nor complete collection.
