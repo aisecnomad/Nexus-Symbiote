@@ -54,7 +54,10 @@ class HostedModelIdentity(Contract):
             and self.identity_assurance == "provider-attested"
             and self._verified_digest == digest(self.model_dump(mode="json"))
             and self._verified_until is not None
-            and timestamp < self._verified_until
+            # Verification binds the observation inside the signed validity window.
+            # Cached evidence cannot establish an identity before that observation,
+            # including when the clock moves backwards after verification.
+            and self.observed_at <= timestamp < self._verified_until
         )
 
     def verify_attestation(
