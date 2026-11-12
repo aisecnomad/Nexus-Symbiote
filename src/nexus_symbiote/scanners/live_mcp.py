@@ -22,6 +22,7 @@ import json
 import queue
 import socket
 import ssl
+import sys
 import threading
 import time
 import uuid
@@ -277,7 +278,21 @@ class _DeadlineSocket:
             self.stream.close()
 
 
+class _BoundedHTTPResponse(http.client.HTTPResponse):
+    """Keep malformed chunk sizes out of the stdlib's buffered read calls."""
+
+    def _read_next_chunk_size(self) -> int:
+        # This stdlib hook is not exposed by typeshed. Keep its framing parser,
+        # then reject sizes that mean an unbounded read or overflow peek().
+        size = cast(int, super()._read_next_chunk_size())  # type: ignore[misc]
+        if not 0 <= size <= sys.maxsize:
+            raise http.client.HTTPException("HTTP chunk size refused")
+        return size
+
+
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    response_class = _BoundedHTTPResponse
+
     def __init__(self, host: str, port: int, family: int, address: str, timeout: float) -> None:
         context = ssl.create_default_context()
         # Explicit: a system OpenSSL policy must not lower the floor below TLS 1.2.
@@ -375,7 +390,8 @@ class PinnedHTTPTransport:
         while len(payload) <= maximum:
             if response.fp is None:
                 break
-            line = response.fp.readline(min(65_537, maximum + 1 - len(payload)))
+            # Keep HTTP chunk framing and Content-Length enforcement in HTTPResponse.
+            line = response.readline(min(65_537, maximum + 1 - len(payload)))
             if not line:
                 break
             payload.extend(line)
