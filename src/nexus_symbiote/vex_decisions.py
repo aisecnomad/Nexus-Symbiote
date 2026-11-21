@@ -44,8 +44,9 @@ MAX_DECISIONS = 5_000
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 MAX_KEY_BYTES = 64 * 1024
 # Format characters that ordinary text needs: ZWNJ and ZWJ (Persian, Indic scripts, emoji
-# sequences), variation selectors (emoji presentation) and the soft hyphen. Output
-# neutralization replaces them; every other character UNSAFE_TEXT matches is refused.
+# sequences), the variation selectors U+FE00-FE0F and U+E0100-E01EF (emoji presentation,
+# ideographic variants) and the soft hyphen. Output neutralization replaces them; every other
+# character UNSAFE_TEXT matches, Mongolian free variation selectors included, is refused.
 _ORDINARY_FORMAT_CHARACTERS = re.compile(r"[\xad\u200c\u200d\ufe00-\ufe0f\U000e0100-\U000e01ef]")
 
 VEXState = Literal["not_affected", "exploitable", "resolved", "false_positive", "in_triage"]

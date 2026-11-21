@@ -650,6 +650,47 @@ def test_vex_decisions_refuse_yaml_aliases_and_repeated_keys(tmp_path, text, mes
     assert load_vex_decisions(path).entries[0].owner == "o"
 
 
+def test_vex_decisions_bound_yaml_nodes(tmp_path, monkeypatch):
+    from nexus_symbiote import vex_decisions
+
+    budgets = []
+    parse = vex_decisions.parse_yaml_mapping
+
+    def recording(text, **kwargs):
+        budgets.append(kwargs.get("max_nodes"))
+        return parse(text, **kwargs)
+
+    monkeypatch.setattr(vex_decisions, "parse_yaml_mapping", recording)
+    path = tmp_path / "decisions.yaml"
+    path.write_text(_ACCEPTED_DECISION, encoding="utf-8")
+    load_vex_decisions(path)
+    assert budgets == [100_000]
+
+
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        ("decisions.yaml", b"version: 1\ndecisions: [\n  token-5f3a9c: : [\n"),
+        ("decisions.json", b'{"version": 1, "decisions": [token-5f3a9c]}'),
+        ("decisions.yaml", b"version: 1\ndecisions: []\n# token-5f3a9c \xff\n"),
+    ],
+    ids=["yaml-syntax", "json-syntax", "invalid-utf8"],
+)
+def test_vex_decisions_syntax_errors_never_quote_the_file(tmp_path, name, content):
+    path = tmp_path / name
+    path.write_bytes(content)
+    with pytest.raises(VEXDecisionError) as refused:
+        load_vex_decisions(path)
+    assert str(refused.value) == "Invalid VEX decisions syntax or complexity"
+
+
+def test_vex_decision_with_a_null_deployment_id_loads_unscoped(tmp_path):
+    path = tmp_path / "decisions.yaml"
+    path.write_text(_ACCEPTED_DECISION + "    deployment_id: null\n", encoding="utf-8")
+    (entry,) = load_vex_decisions(path).entries
+    assert entry.deployment_id is None
+
+
 def test_vex_decisions_report_invalid_utf8_as_a_decision_error(tmp_path):
     path = tmp_path / "decisions.yaml"
     path.write_bytes(b"version: 1\ndecisions: []\n# \xff\xfe\n")
@@ -756,6 +797,11 @@ def test_vex_loads_decisions_below_a_trusted_traverse_only_ancestor(tmp_path, mo
         "tag\U000e0041\U000e007f",
         "joiner\u2060",
         "bom\ufeff",
+        "mark\u200e",
+        "mark\u200f",
+        "arabic\u061cmark",
+        "grapheme\u034fjoiner",
+        "mongolian\u180bselector",
     ],
     ids=[
         "bidi-override",
@@ -769,6 +815,11 @@ def test_vex_loads_decisions_below_a_trusted_traverse_only_ancestor(tmp_path, mo
         "tag-characters",
         "word-joiner",
         "byte-order-mark",
+        "left-to-right-mark",
+        "right-to-left-mark",
+        "arabic-letter-mark",
+        "combining-grapheme-joiner",
+        "mongolian-free-variation-selector",
     ],
 )
 def test_vex_decision_text_refuses_c1_bidi_and_invisible_characters(text):
