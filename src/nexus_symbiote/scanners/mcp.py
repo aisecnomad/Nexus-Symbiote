@@ -3630,7 +3630,6 @@ class MCPScanner(Scanner):
             view.binding.extend([f"{path}:{key}", value] for key, value in binding)
             for key, value in file.settings:
                 label = f"{path}:{_setting_name(key, launched)}"
-                view.names.append(label)
                 kind = _file_setting(path, family, key, value, launched)
                 if kind == "identity":
                     if path == ".npmrc":
@@ -3645,8 +3644,12 @@ class MCPScanner(Scanner):
                     view.sources.append((label, value))
                 elif kind == "unresolved":
                     view.unresolved.append(label)
-            if path in {"uv.toml", "pyproject.toml", ".env.yarn", "deno.json", "deno.jsonc"}:
-                continue
+            registry_packages = (
+                []
+                if path in {"uv.toml", "pyproject.toml", ".env.yarn", "deno.json", "deno.jsonc"}
+                else packages
+            )
+            selected_keys: set[str] = set()
             default = "npmRegistryServer" if path == ".yarnrc.yml" else "registry"
             scope_label, scope = (
                 environment_scope or (f"{path}:scope", settings.get("scope", ""))
@@ -3656,7 +3659,7 @@ class MCPScanner(Scanner):
             if expands(scope) and not any(npm_scope_registry(key) for key in settings):
                 # Whatever scope the environment names, no setting here is its registry.
                 scope = ""
-            for package in packages:
+            for package in registry_packages:
                 name = package.name or ""
                 chosen = npm_registry_settings(settings, name, default, scope)
                 if launch.launcher not in {"npx", "npm exec"}:
@@ -3664,6 +3667,7 @@ class MCPScanner(Scanner):
                     # launcher other than npm's both settings count.
                     chosen += npm_registry_settings(settings, name, default)
                 for selected in dict.fromkeys(chosen):
+                    selected_keys.add(selected)
                     view.sources.append(
                         (scope_label, scope)
                         if selected == "scope"
@@ -3672,6 +3676,10 @@ class MCPScanner(Scanner):
                             settings[selected],
                         )
                     )
+            view.names.extend(
+                f"{path}:{_setting_name(key, launched, selected=key in selected_keys)}"
+                for key, _value in file.settings
+            )
         return view
 
     @staticmethod

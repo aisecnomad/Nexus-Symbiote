@@ -105,6 +105,9 @@ _INLINE_SOURCES = ("data:", "http:", "https:")
 # Rarely used interpreters: inline code flags anywhere before the script file, alone, at
 # the end of a cluster, or with the code attached after a run of options that take none.
 _INLINE_FLAGS = {
+    "lua": re.compile(r"-e.*", re.S),
+    "rscript": re.compile(r"-e"),
+    "osascript": re.compile(r"-e"),
     "ruby": re.compile(r"-[a-zA-Z]*e|-[acdlnpsSvwyhUW0-9]*e.+", re.S),
     "perl": re.compile(r"-[a-zA-Z]*[eE]|-[acdfgnpsStTuUvwWXhl0-9]*[eE].+", re.S),
     "php": re.compile(
@@ -114,6 +117,9 @@ _INLINE_FLAGS = {
 # Their options that take the next word as a value when none is attached (ruby --help,
 # perl -h, php --help); the value is never the script.
 _INLINE_VALUES = {
+    "lua": _set("-l"),
+    "rscript": frozenset(),
+    "osascript": _set("-l -s"),
     "ruby": _set(
         "-I -r -C -E --encoding --external-encoding --internal-encoding --enable --disable"
         " --dump --parser --backtrace-limit --crash-report"
@@ -128,7 +134,7 @@ _SCRIPT_SUFFIX = re.compile(r"(?:-cli)?\.[cm]?js$|\.py$")
 # Python options that end a short-option cluster: inline code, a module, or a value.
 _PYTHON_SPECIAL = re.compile("[cmWX]")
 # Windows' windowed interpreters (pythonw, pyw) and free-threaded builds (python3.13t).
-_PYTHON_NAME = re.compile(r"(?:python|pypy)w?[0-9.]*t?w?|pyw?")
+_PYTHON_NAME = re.compile(r"(?:python|pypy)w?[0-9.]*t?w?(?:d|-dbg)?|pyw?")
 # Standard library modules that run their arguments as Python code.
 _PYTHON_CODE_MODULES = frozenset({"timeit"})
 # TypeScript and transpiling Node runners accept node's inline code options.
@@ -1019,7 +1025,7 @@ _FISH_LONG = {
     "version": ("v", False),
 }
 _INTERPRETERS = frozenset(
-    {"cmd", "powershell", "pwsh", "wsl", "env", "exec", "nohup", "java", "ruby", "perl", "php"}
+    {"cmd", "powershell", "pwsh", "wsl", "env", "exec", "nohup", "java", *_INLINE_FLAGS}
 )
 _INJECTORS = frozenset({"op", "doppler", "infisical", "dotenvx", "aws-vault", "with-secrets"})
 # Injectors that add variables the inventory cannot read (files, secret stores).
@@ -2425,6 +2431,9 @@ def _unwrap_powershell(rest: list[str], launch: Launch) -> list[str] | None:
         launch.mark("inline_shell_code")
         launch.fail("PowerShell command is not a simple command")
         return None
+    if words and words[0].casefold() in {"iex", "invoke-expression"}:
+        launch.fail(_inline("powershell", launch))
+        return None
     launch.wrappers.append("powershell -Command")
     return words
 
@@ -3141,9 +3150,13 @@ def _host_source(spec: str, *, mount: bool) -> str | None:
             for key, _, value in [option.partition("=")]
         }
         binds = {"bind", "rbind"} & set(driver.get("o", "").lower().split(","))
-        if kind != "volume" or not binds:
+        device = driver.get("device", "")
+        local_device = fields.get(
+            "volume-driver", "local"
+        ).lower() == "local" and device.startswith("/")
+        if kind != "volume" or not (binds or local_device):
             return None
-        return driver.get("device") or None
+        return device or None
     # A client variable such as ${env:HOME} holds a colon of its own.
     end = _volume_source_end(spec)
     if end < 0:
