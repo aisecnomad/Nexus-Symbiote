@@ -47,6 +47,7 @@ MAX_NESTED_CDX_DEPTH: Final[int] = 32
 MAX_MANIFEST_YAML_BYTES: Final[int] = 512 * 1024
 MAX_CONFLICT_SAMPLES: Final[int] = 8
 MAX_CONFLICT_SUMMARY: Final[int] = 200
+MAX_IDENTITY_BINDINGS: Final[int] = 6
 _SUPPORTED_CDX_SPECS: Final[frozenset[str]] = frozenset(["1.4", "1.5", "1.6", "1.7"])
 _SUPPORTED_SPDX2_VERSIONS: Final[frozenset[str]] = frozenset(("SPDX-2.2", "SPDX-2.3"))
 _SHA256_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{64}", re.ASCII)
@@ -104,6 +105,7 @@ class SBOMImportSummary:
 @dataclass
 class _IdentityBucket:
     versions: dict[str, str] = field(default_factory=dict)
+    incomparable_versions: dict[str, str] = field(default_factory=dict)
     digests: dict[str, str] = field(default_factory=dict)
     extra_version_conflicts: int = 0
     extra_digest_conflicts: int = 0
@@ -186,7 +188,11 @@ def _spec_to_pep440(spec: str) -> str | None:
             return f">={maj}.{min_i}.{pat_i},<{hi}"
         if maj > 0:
             return f">={maj}.{min_i}.{pat_i},<{maj + 1}.0.0"
-        return f">=0.{min_i}.{pat_i},<0.{min_i + 1}.0" if min_i > 0 else f"==0.0.{pat_i}"
+        if m.group(3) is None:
+            return ">=0.0.0,<1.0.0"
+        if min_i > 0 or m.group(4) is None:
+            return f">=0.{min_i}.{pat_i},<0.{min_i + 1}.0"
+        return f"==0.0.{pat_i}"
     if re.fullmatch(r"(?:==)?v?\d+(?:\.(?:\d+|[*xX]))+", s) and any(w in s for w in "*xX"):
         return "==" + re.sub(r"[xX]", "*", s.removeprefix("==").lstrip("v"))
     return s if any(c in s for c in "><~!*,") else None
@@ -208,6 +214,32 @@ def _versions_conflict(peer_ver: str | None, cand_ver: str | None) -> bool:
             except (InvalidSpecifier, InvalidVersion):
                 pass
     return True
+
+
+def _nested_version_unresolved(component: AnyComponent) -> bool:
+    """Whether a nested declaration has no comparable exact version or range."""
+    if (
+        not isinstance(component, RegistryEntryComponent)
+        or not component.properties.get("manifest_path")
+        or component.properties.get("pinning_state") != "manifest-only"
+        or not component.version
+    ):
+        return False
+    version = component.version
+    if component.registry_type == "conda":
+        return True
+    if component.registry_type == "cargo":
+        return re.fullmatch(r"=[0-9]+\.[0-9]+\.[0-9]+", version) is None
+    if component.registry_type != "npm" or _reg._npm_exact(version):
+        return False
+    specifier = _spec_to_pep440(version)
+    if specifier is None:
+        return True
+    try:
+        SpecifierSet(specifier)
+    except InvalidSpecifier:
+        return True
+    return False
 
 
 def _record_bucket_item(
@@ -407,19 +439,33 @@ def _identity_tokens(
     values = [
         f"name:{e}:{_norm_pkg(name) if e == 'pypi' else name.strip().casefold()}" for e in scopes
     ]
+    if eco in {"pypi", "any"}:
+        # Ecosystem-free records can name a PyPI package with its original separators.
+        values.extend(f"pypi-name:{e}:{_norm_pkg(name)}" for e in scopes if e in {"*", "any"})
     if purl:
         try:
             package = PackageURL.from_string(purl)
+        except ValueError:
+            # Keep the legacy lexical comparison for PURLs the parser cannot read.
+            stem = purl.partition("@")[0].partition("?")[0].partition("#")[0].lower()
+            identity, qualified = stem, False
+        else:
             identity = PackageURL(
                 type=package.type,
                 namespace=package.namespace,
                 name=package.name,
                 qualifiers=package.qualifiers,
                 subpath=package.subpath,
-            )
-            values.append("purl:" + identity.to_string())
-        except ValueError:
-            pass
+            ).to_string()
+            stem = PackageURL(
+                type=package.type, namespace=package.namespace, name=package.name
+            ).to_string()
+            qualified = bool(package.qualifiers or package.subpath)
+        values.append("purl:" + identity)
+        # Compare a qualified package with an unspecified one, while keeping distinct
+        # explicitly qualified packages separate.
+        suffix = "qualified" if qualified != lookup else "unspecified"
+        values.append(f"purl-{suffix}:{stem}")
     return [_identity_binding(key, v) for v in values]
 
 
@@ -497,7 +543,7 @@ def import_foreign_sbom(
     matches: dict[tuple[str, frozenset[str]], tuple[str | None, bool]] = {}
 
     buckets: dict[str, _IdentityBucket] = {}
-    context = _identity_binding(key, "context")
+    context = _identity_binding(key, "context-v2")
     incomplete_identity = False
     for existing in bom.components:
         purl = existing.package_url if isinstance(existing, RegistryEntryComponent) else None
@@ -509,7 +555,7 @@ def import_foreign_sbom(
             if (
                 existing.properties.get("identity_context") == context
                 and isinstance(stored, list)
-                and 1 <= len(stored) <= 3
+                and 1 <= len(stored) <= MAX_IDENTITY_BINDINGS
                 and all(isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) for v in stored)
             ):
                 keys_for_existing = stored
@@ -518,11 +564,13 @@ def import_foreign_sbom(
                 # that a differently spelled name or versionless PURL did not match.
                 incomplete_identity = True
                 keys_for_existing = ["legacy:" + existing.name]
+        version_unresolved = _nested_version_unresolved(existing)
         for k in dict.fromkeys(keys_for_existing):
             b = buckets.setdefault(k, _IdentityBucket())
             if existing.version:
+                versions = b.incomparable_versions if version_unresolved else b.versions
                 _record_bucket_item(
-                    b.versions, existing.version, existing.bom_ref, "extra_version_conflicts", b
+                    versions, existing.version, existing.bom_ref, "extra_version_conflicts", b
                 )
             sha = existing.hashes.get("sha256") or existing.properties.get("declared_sha256")
             if isinstance(sha, str) and sha:
@@ -608,9 +656,15 @@ def import_foreign_sbom(
         conflict_msgs: list[str] = []
         seen_peer: set[tuple[str, str]] = set()
         overflow = 0
+        unresolved_versions = False
         for k in cand_keys:
             bucket = buckets.setdefault(k, _IdentityBucket())
             if clean_ver:
+                if any(
+                    _versions_conflict(version, clean_ver)
+                    for version in bucket.incomparable_versions
+                ):
+                    unresolved_versions = True
                 for p_ver, p_ref in bucket.versions.items():
                     if (p_ref, "ver") not in seen_peer and _versions_conflict(p_ver, clean_ver):
                         seen_peer.add((p_ref, "ver"))
@@ -658,13 +712,13 @@ def import_foreign_sbom(
                             )
                         )
 
-        elif overflow or incomplete_identity:
+        elif overflow or incomplete_identity or unresolved_versions:
             summary.unresolved_conflict_count += 1
             risks.append(
                 RiskAssessment(
                     severity=RiskSeverity.MEDIUM,
                     category="source_conflict_unresolved",
-                    detail="Prior package identities or the complete set of versions and digests cannot be reconciled.",
+                    detail="Prior package identities, manifest ranges or the complete set of versions and digests cannot be reconciled.",
                     recommendation="Reconcile the complete supplier and repository component records.",
                 )
             )
@@ -703,7 +757,7 @@ def import_foreign_sbom(
             "name_hash_mode": hash_mode,
             "pinning_state": "pinned-version" if exact_ver else "unpinned",
         }
-        if sha256_val:
+        if sha256_val and not shareable:
             props["declared_sha256"] = sha256_val
         if bound_target is not None:
             props["declared_digest_local_match"] = bound_target
@@ -846,7 +900,11 @@ def _direct_toml_lock(
     raw = files.read_text(prefix + filename, missing_ok=True)
     if raw is None:
         return {}
-    doc = load_toml(raw)
+    try:
+        doc = load_toml(raw)
+    except (ValueError, PolicyError, RecursionError):
+        files._fail(prefix + filename, "invalid nested lockfile")
+        return {}
     packages = doc.get("package")
     if not isinstance(packages, list) or not all(isinstance(p, dict) for p in packages):
         return {}
@@ -895,16 +953,26 @@ def _direct_toml_lock(
 
 
 def _cargo_lock_agrees(spec: str | None, version: str) -> bool:
-    # Cargo's bare version is a caret constraint. Only model stable full triples.
+    # Cargo's bare version is a caret constraint, including abbreviated versions.
     if (
         not spec
-        or not re.fullmatch(r"[=^~]?[0-9]+\.[0-9]+\.[0-9]+", spec)
+        or not re.fullmatch(r"[=^~]?[0-9]+(?:\.[0-9]+){0,2}", spec)
         or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version)
     ):
         return False
     if spec.startswith("="):
         return spec[1:] == version
     return not _versions_conflict(spec if spec[0] in "^~" else "^" + spec, version)
+
+
+def _npm_lock_agrees(spec: str, version: str) -> bool:
+    # A bare major or major.minor is a range in npm, and excludes prereleases.
+    if re.fullmatch(r"v?[0-9]+(?:\.[0-9]+)?", spec):
+        expected = spec.removeprefix("v") + "."
+        return re.fullmatch(
+            r"v?[0-9]+\.[0-9]+\.[0-9]+", version
+        ) is not None and version.removeprefix("v").startswith(expected)
+    return not _versions_conflict(spec, version)
 
 
 def _join_continued_lines(text: str) -> list[str]:
@@ -967,7 +1035,8 @@ def _parse_nested_manifest(
                 files._fail(rel_posix, "invalid nested npm lockfile")
                 npm_locks = {}
             declared: dict[str, list[tuple[str, str]]] = {}
-            for section in ("dependencies", "devDependencies", "optionalDependencies"):
+            # npm loads root dependency edges in this order. A later section wins.
+            for section in ("dependencies", "optionalDependencies", "devDependencies"):
                 deps = parsed.get(section)
                 if isinstance(deps, dict):
                     for pkg_name, spec in deps.items():
@@ -978,7 +1047,7 @@ def _parse_nested_manifest(
                         ):
                             declared.setdefault(pkg_name, []).append((section, spec.strip()))
             for pkg_name, specs in declared.items():
-                spec = dict(specs).get("optionalDependencies", specs[0][1])
+                spec = specs[-1][1]
                 record = npm_locks.get("node_modules/" + pkg_name)
                 version = record.get("version") if isinstance(record, dict) else None
                 if (
@@ -990,10 +1059,10 @@ def _parse_nested_manifest(
                     and isinstance(version, str)
                     and len(version) <= 128
                     and _reg._npm_exact(version)
-                    and not _versions_conflict(spec, version)
+                    and _npm_lock_agrees(spec, version)
                 ):
                     found.append((pkg_name, version, "npm", "locked", {}))
-                elif all(item == spec for _, item in specs) and is_exact_version(spec):
+                elif all(item == spec for _, item in specs) and _reg._npm_exact(spec):
                     found.append((pkg_name, spec, "npm", "pinned-version", {}))
                 else:
                     found.append((pkg_name, spec, "npm", "manifest-only", {}))
@@ -1095,7 +1164,7 @@ def _parse_nested_manifest(
         in_require = False
         for line in text.splitlines():
             parts = line.split("//", 1)[0].strip().split()
-            if parts == ["require", "("]:
+            if parts in (["require", "("], ["require("]):
                 in_require = True
                 continue
             if parts == [")"]:
