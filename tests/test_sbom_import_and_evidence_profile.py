@@ -925,6 +925,7 @@ def test_evidence_profile_reuses_one_artifact_budget_and_derives_model_risk(tmp_
         source_path=artifact.name,
         hashes={"sha256": digest},
         assurance_level=AssuranceLevel.OBSERVED,
+        trust_remote_code=True,
     )
     duplicate = model.model_copy(update={"bom_ref": "model:b"})
     risky = ModelComponent(bom_ref="model:c", name="remote", trust_remote_code=True)
@@ -937,8 +938,10 @@ def test_evidence_profile_reuses_one_artifact_budget_and_derives_model_risk(tmp_
     first, second, third = report["components"]
     assert report["policy_loaded"] is True
     assert report["policy_verified"] is False
+    assert first["evidence"]["digest_bound"] is True
     assert first["evidence"]["digest_pinned_under_policy"] is True
     assert first["evidence"]["signed_under_policy"] is False
+    assert first["highest_finding_severity"] == "critical"
     assert second["evidence"]["digest_bound"] is False
     assert second["evidence"]["digest_recorded"] is True
     assert third["finding_count"] == 1

@@ -140,6 +140,8 @@ def build_evidence_profile(
             ),
         }
         risks = effective_component_risks(comp)
+        observed = report.model_behavior_risks.get(comp.bom_ref, {}) if report else {}
+        additional = set(observed.values()).difference(r.category for r in risks)
         hi = (
             max(risks, key=lambda r: _SEVERITY_RANK.get(r.severity, 0)).severity.value
             if risks
@@ -152,10 +154,15 @@ def build_evidence_profile(
             "assurance_level": comp.assurance_level.value,
             "evidence": ev,
             "inventory_claims": claims,
-            "finding_count": len(risks),
-            "highest_finding_severity": hi,
+            "finding_count": len(risks) + len(additional),
+            "highest_finding_severity": RiskSeverity.CRITICAL.value if observed else hi,
             "missing_evidence": [k for k, v in ev.items() if not v],
         }
+        if observed:
+            entry["integrity_findings"] = [
+                {"category": category, "severity": RiskSeverity.CRITICAL.value}
+                for category in sorted(observed)
+            ]
         if isinstance(comp, m.ModelComponent) and comp.signing_status:
             entry["declared_signing_status"] = neutralize(comp.signing_status)
         entries.append(entry)
