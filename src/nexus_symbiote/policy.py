@@ -27,6 +27,24 @@ MAX_POLICY_LIST_ITEMS = 256
 MAX_POLICY_SUPPRESSIONS = 1000
 MAX_POLICY_ENTRY_CHARS = 1024
 _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_CI_ENVIRONMENT_VARIABLES = (
+    "CI",
+    "GITHUB_ACTIONS",
+    "GITLAB_CI",
+    "CIRCLECI",
+    "TF_BUILD",
+    "JENKINS_URL",
+    "BUILDKITE",
+    "DRONE",
+    "TRAVIS",
+)
+
+
+def running_in_ci() -> bool:
+    """Whether a recognized environment variable indicates a CI runner."""
+    return any(
+        os.environ.get(name) not in (None, "", "0", "false") for name in _CI_ENVIRONMENT_VARIABLES
+    )
 
 
 class PolicyError(ValueError):
@@ -305,6 +323,11 @@ def weakened_settings(policy: Policy) -> list[str]:
     if policy.output.default_format != base.output.default_format:
         weaker.append(f"output.default_format={policy.output.default_format}")
     return weaker
+
+
+def gate_weakenings(weaker: list[str]) -> list[str]:
+    """Relaxations that can change whether a check passes."""
+    return [entry for entry in weaker if not entry.startswith("output.")]
 
 
 def read_sexagesimal_integers_as_text(loader: type[Any]) -> None:
