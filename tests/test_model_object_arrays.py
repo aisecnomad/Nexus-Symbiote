@@ -341,6 +341,66 @@ def test_a_decoy_directory_does_not_hide_what_zipfile_lists(
     assert {r: found[r].serialization_safety for r in relatives} == dict.fromkeys(relatives, UNSAFE)
 
 
+def _zip64_extensible_decoy(
+    decoy: tuple[bytes, bytes], real: tuple[bytes, bytes], padding: int
+) -> bytes:
+    """The locator stores the offset of a ZIP64 record naming the real directory, whose
+    size counts ``padding``, a decoy directory and a decoy record as extensible data.
+    zipfile from Python 3.13 reads the record at the locator's offset; a reader that takes
+    the record right before the locator lists only the decoy."""
+    first = _local(*decoy)
+    real_local = _local(*real)
+    real_cd = _central(*decoy, 0) + _central(*real, len(first))
+    directory_at = len(first) + len(real_local)
+    record_at = directory_at + len(real_cd)
+    decoy_cd = _central(*decoy, 0)
+    decoy_at = record_at + 56 + padding
+    extensible = padding + len(decoy_cd) + 56
+    record = struct.pack(
+        "<IQHHIIQQQQ", 0x06064B50, 44 + extensible, 45, 45, 0, 0, 2, 2, len(real_cd), directory_at
+    )
+    decoy_record = struct.pack(
+        "<IQHHIIQQQQ", 0x06064B50, 44, 45, 45, 0, 0, 1, 1, len(decoy_cd), decoy_at
+    )
+    locator = struct.pack("<IIQI", 0x07064B50, 0, record_at, 1)
+    end = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0)
+    head = first + real_local + real_cd + record
+    return head + b"\0" * padding + decoy_cd + decoy_record + locator + end
+
+
+_INERT_PICKLE = pickle.dumps({"weights": [1, 2, 3]}, protocol=2)
+
+
+@pytest.mark.parametrize("large", [False, True], ids=["record-in-tail", "record-before-tail"])
+@pytest.mark.parametrize("pickled", [False, True], ids=["array", "pickle"])
+def test_a_zip64_record_before_the_retained_tail_is_not_hidden_by_a_decoy(
+    tmp_path: Path, large: bool, pickled: bool
+) -> None:
+    # Audit P1-H2: a locator offset before the retained tail was dropped, and the decoy
+    # record before the locator listed only a harmless member, so an object array was not
+    # inventoried and a .pt fell from critical to high. What that record lists is unread.
+    decoy = (b"archive/version", b"3\n") if pickled else (b"numbers.npy", _npy("'<f8'"))
+    real = (b"archive/data.pkl", _INERT_PICKLE) if pickled else (b"objects.npy", _npy("'|O'"))
+    padding = 2 * model._ZIP_TAIL_BYTES if large else 4096
+    archive = _zip64_extensible_decoy(decoy, real, padding)
+    with zipfile.ZipFile(io.BytesIO(archive)) as opened:
+        assert opened.namelist() == [decoy[0].decode(), real[0].decode()]
+    expected = (
+        (SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD)
+        if large
+        else (UNSAFE, ZIP_PICKLE_MEMBER if pickled else ZIP_OBJECT_ARRAY)
+    )
+    (tmp_path / "models").mkdir()
+    relatives = ["models/archive", "arrays.npz", "model.pt"]
+    for relative in relatives:
+        (tmp_path / relative).write_bytes(archive)
+    assert inspect_model_format(tmp_path / "models/archive") == expected
+    found = {c.source_path: c for c in ModelScanner().scan(tmp_path).components}
+    assert set(relatives) <= set(found)
+    assert found["model.pt"].serialization_safety == UNSAFE
+    assert found["models/archive"].properties["format_inspection"] in expected
+
+
 def _overlong_name(archive: bytes, extra: int) -> bytes:
     """The last directory entry's name length set past the directory by ``extra`` bytes.
 

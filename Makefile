@@ -86,8 +86,8 @@ security-regressions: ## Run the committed security regression contracts
 	PYTHONPATH=src python scripts/check_security_regressions.py --out security-regressions.json
 
 .PHONY: precision
-precision: ## Run the precision and drift-regression gate against recorded class floors
-	PYTHONPATH=src python scripts/check_precision_gate.py --out precision-gate.json
+precision: ## Run the drift-regression gate and the class recall floors on a fresh benchmark scan
+	PYTHONPATH=src python scripts/check_precision_gate.py --fresh --out precision-gate.json
 
 .PHONY: fuzz-smoke
 fuzz-smoke: ## Exercise bounded parser readers against the deterministic fuzz corpus
