@@ -1483,7 +1483,10 @@ is a failure; everything below is neither a gap nor a failure.
   it is not decoded there. YAML or TOML past those bounds, and a file that does not
   parse, have every backslash escape, line continuation and YAML `''` decoded by
   pattern, in literal strings and comments too, which can only add findings; a match
-  there is located at its byte offset in the file.
+  there is located at its byte offset in the file. Decoded Markdown front matter
+  uses YAML and starts with at least three dashes, with optional leading whitespace.
+  Tagged fences, TOML fences, and blocks without a closing delimiter receive the raw
+  text checks only.
 - **Hidden markup is reported as hidden markup.** When the `prompt` collector rates
   a Markdown file's hidden markup high, the rules skip the text of each HTML comment,
   closed processing instruction and `#` reference definition in it, which

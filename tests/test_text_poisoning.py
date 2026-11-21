@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -27,15 +28,19 @@ from nexus_symbiote.core.models import (
 from nexus_symbiote.generators.sarif import SARIFGenerator
 from nexus_symbiote.generators.vex import VEXGenerator
 from nexus_symbiote.text_poisoning import (
+    _FENCE_OPEN_RE,
     CATEGORY_INSTRUCTION_INJECTION,
     CATEGORY_TOOL_POISONING,
     RULE_PACK_VERSION,
+    _decoded_source,
+    _mask_hidden_markdown_markup,
     apply_text_poisoning_rules,
     check_sidenote_tool_schema,
     extract_json_text_entries,
     normalize_for_lexical_scan,
     scan_text_block,
 )
+from nexus_symbiote.utils.markdown import _OPENING_FENCE
 from tests.support import scaling_ratio
 
 
@@ -1604,6 +1609,30 @@ def test_a_closed_comment_outside_code_is_still_masked(tmp_path: Path) -> None:
     )
     apply_text_poisoning_rules(AIBOM(components=[prompt]), tmp_path)
     assert prompt.risks == [hidden]
+
+
+@pytest.mark.parametrize("pattern", [_FENCE_OPEN_RE, _OPENING_FENCE])
+def test_fence_opening_check_scales_linearly(pattern: re.Pattern[str]) -> None:
+    def match(scale: int) -> None:
+        line = "`" * (400 * scale) + "sample" * (400 * scale) + "`"
+        assert pattern.match(line) is None
+
+    ratio = scaling_ratio(match)
+    assert ratio < 9.0, f"expected linear fence matching, got {ratio:.2f}"
+
+
+@pytest.mark.parametrize("comment", ["<!-->", "<!--->"])
+def test_short_html_comments_do_not_mask_trailing_text(comment: str) -> None:
+    body = " Visible text.\n"
+    assert _mask_hidden_markdown_markup(comment + body) == " " * len(comment) + body
+
+
+@pytest.mark.parametrize(("leading", "fence"), [("\n ", "---"), ("", "----")])
+def test_yaml_front_matter_accepts_leading_space_and_wider_fences(leading: str, fence: str) -> None:
+    text = f'{leading}{fence}\ndescription: "\\u0041 sample"\n{fence}\n'
+    tree, span = _decoded_source("SKILL.md", text)
+    assert tree == {"description": "A sample"}
+    assert span is None
 
 
 def test_masking_code_and_decoding_escapes_scale_linearly(tmp_path: Path) -> None:

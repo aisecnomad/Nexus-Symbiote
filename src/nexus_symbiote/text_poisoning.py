@@ -121,7 +121,10 @@ _APOSTROPHES = {"‘": "'", "’": "'"}
 # as well as the raw text.
 _DECODED_FORMATS = {".jsonc": "JSON", ".yaml": "YAML", ".yml": "YAML", ".toml": "TOML"}
 _MARKDOWN_SUFFIXES = frozenset({".md", ".mdc", ".markdown"})
-_FRONT_MATTER_RE = re.compile(r"\ufeff?---[ \t]*\r?\n(.*?)^(?:---|\.\.\.)[ \t]*\r?$", re.S | re.M)
+_FRONT_MATTER_RE = re.compile(
+    r"\ufeff?(?>(?:[ \t]*\r?\n)*)[ \t]*-{3,}[ \t]*\r?\n(.*?)^(?:-{3,}|\.\.\.)[ \t]*\r?$",
+    re.S | re.M,
+)
 # The bounds the prompt collector parses YAML and TOML within: the parsers are pure Python,
 # and PyYAML's cost grows with flow nesting. Past them, escapes are decoded by pattern.
 _MAX_PARSED_CHARS = 65_536
@@ -151,7 +154,7 @@ _NAMED_ESCAPES = {
 _BLANK_LINE_RE = re.compile(r"\n[ \t]*\r?\n")
 # Fences and code spans as generously as any reader finds them, inside quotes and list
 # items too: a "<!--" taken for code is not masked, which can only add findings.
-_FENCE_OPEN_RE = re.compile(r"^[ \t>*+\-.)0-9]*?(`{3,}(?![^\n]*`)|~{3,})", re.M)
+_FENCE_OPEN_RE = re.compile(r"^[ \t>*+\-.)0-9]*?((?>`{3,})(?![^\n]*`)|~{3,})", re.M)
 _FENCE_CLOSE_RE = re.compile(r"^[ \t>]*(`{3,}|~{3,})[ \t]*\r?$", re.M)
 _BACKTICK_RUN_RE = re.compile(r"`+")
 
@@ -1020,7 +1023,8 @@ def _mask_hidden_markdown_markup(text: str) -> str:
     for open_tok, close_tok in (("<!--", "-->"), ("<?", "?>")):
         pos = 0
         while (start := text.find(open_tok, pos)) != -1:
-            end = text.find(close_tok, start + len(open_tok), start + 4096)
+            # Short HTML comments can close with a delimiter overlapping the opener.
+            end = text.find(close_tok, start + 2, start + 4096)
             if in_code(start) or (end == -1 and open_tok == "<?"):
                 # Code is shown as written, and only a closed processing instruction is
                 # hidden from rendered views.
