@@ -31,8 +31,8 @@ def test_a_known_hit_is_reported_alongside_a_feed_error(tmp_path: Path, source: 
     assert "no introduced event" in report.errors[0]
 
 
-@pytest.mark.parametrize("raw_type", ["git", "gıt"])
-def test_only_the_osv_git_enum_is_skipped(tmp_path: Path, raw_type: str) -> None:
+@pytest.mark.parametrize("raw_type", ["gıt", "ſemver", "ecoſystem"])
+def test_unicode_lookalikes_are_unsupported(tmp_path: Path, raw_type: str) -> None:
     bad = {"type": raw_type, "events": [{"introduced": "0"}]}
     path = tmp_path / "feed.json"
     path.write_text(json.dumps([_transformers_record(ranges=[bad])]))
@@ -40,3 +40,14 @@ def test_only_the_osv_git_enum_is_skipped(tmp_path: Path, raw_type: str) -> None
     assert not report.complete
     assert len(report.errors) == 1
     assert "range type is not supported" in report.errors[0]
+
+
+@pytest.mark.parametrize("raw_type", ["ecosystem", "Ecosystem", "semver", "sEmVeR", "git", "Git"])
+def test_ascii_case_preserves_the_range_semantics(tmp_path: Path, raw_type: str) -> None:
+    affected = {"type": raw_type, "events": [{"introduced": "0"}, {"fixed": "5.0"}]}
+    path = tmp_path / "feed.json"
+    path.write_text(json.dumps([_transformers_record(ranges=[affected])]))
+    report, _ = match_offline_advisories(_bom_with_package(), db_path=path)
+    assert report.complete
+    expected = [] if raw_type.lower() == "git" else [["5.0"]]
+    assert [a["fixed_versions"] for a in report.advisories] == expected

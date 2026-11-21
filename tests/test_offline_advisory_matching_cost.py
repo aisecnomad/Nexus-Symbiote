@@ -33,9 +33,6 @@ from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.models import RegistryEntryComponent
 from tests.support import scaling_ratio
 
-_SUPPORTED_RANGE_TYPES = frozenset({"ECOSYSTEM", "SEMVER"})
-_UNMATCHED_RANGE_TYPES = frozenset({"GIT"})
-
 # #296 rates the feed's age against the caller's clock. These tests date every record
 # now, so a feed-age error never stands in for the matching behaviour under test.
 NOW = datetime.now(UTC)
@@ -69,12 +66,15 @@ def _reference_range_matches(
     below any limit is in range), or past a parsable bound of an interval with none unparsable.
     """
     raw_type = rng.get("type")
-    if isinstance(raw_type, str) and raw_type in _UNMATCHED_RANGE_TYPES:
-        return False, [], []
-    if raw_type is not None and (
-        not isinstance(raw_type, str) or raw_type not in _SUPPORTED_RANGE_TYPES
-    ):
-        raise ValueError("OSV range type is not supported")
+    if raw_type is not None:
+        if isinstance(raw_type, str) and raw_type.isascii() and raw_type.lower() == "git":
+            return False, [], []
+        if (
+            not isinstance(raw_type, str)
+            or not raw_type.isascii()
+            or raw_type.lower() not in {"ecosystem", "semver"}
+        ):
+            raise ValueError("OSV range type is not supported")
     events = rng.get("events")
     if not isinstance(events, list):
         raise ValueError("OSV range events are not a list")

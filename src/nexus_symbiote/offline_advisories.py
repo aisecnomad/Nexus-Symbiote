@@ -400,7 +400,8 @@ def _read_range(rng: dict[str, Any]) -> _Range | None:
     """
     raw_type = rng.get("type")
     if raw_type is not None:
-        kind_of_range = raw_type if isinstance(raw_type, str) else ""
+        # Older feeds use mixed case. Unicode lookalikes are distinct range types.
+        kind_of_range = raw_type.upper() if isinstance(raw_type, str) and raw_type.isascii() else ""
         if kind_of_range in _UNMATCHED_RANGE_TYPES:
             return None
         if kind_of_range not in _SUPPORTED_RANGE_TYPES:
