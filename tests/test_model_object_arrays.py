@@ -401,6 +401,131 @@ def test_a_zip64_record_before_the_retained_tail_is_not_hidden_by_a_decoy(
     assert found["models/archive"].properties["format_inspection"] in expected
 
 
+def _zip64_in_first_name(real: tuple[bytes, bytes]) -> bytes:
+    """A small archive whose first local header's name holds the real member, its
+    directory, a ZIP64 record and the locator, followed by a classic end record naming an
+    empty directory. zipfile and miniz read the locator just before the end record."""
+    member = _local(*real)
+    directory_at = 30 + len(member)
+    directory = _central(*real, 30)
+    record_at = directory_at + len(directory)
+    record = struct.pack(
+        "<IQHHIIQQQQ", 0x06064B50, 44, 45, 45, 0, 0, 1, 1, len(directory), directory_at
+    )
+    locator = struct.pack("<IIQI", 0x07064B50, 0, record_at, 1)
+    name = member + directory + record + locator
+    first = struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0, 0, 0, 0, 0, 0, 0, len(name), 0)
+    return first + name + _end(0, 0, 30 + len(name))
+
+
+@pytest.mark.parametrize("pickled", [False, True], ids=["array", "pickle"])
+def test_a_zip64_locator_inside_the_first_header_is_read(tmp_path: Path, pickled: bool) -> None:
+    # The first local header and its name were read before the directory search and not
+    # kept, so a locator there was never seen: the decoy end record listed nothing, an
+    # object array in a 375-byte .npz was not inventoried, and a .pt fell to high.
+    real = (b"archive/data.pkl", _INERT_PICKLE) if pickled else (b"objects.npy", _npy("'|O'"))
+    archive = _zip64_in_first_name(real)
+    with zipfile.ZipFile(io.BytesIO(archive)) as opened:
+        assert opened.namelist() == [real[0].decode()]
+        assert opened.read(real[0].decode()) == real[1]
+    expected = (UNSAFE, ZIP_PICKLE_MEMBER if pickled else ZIP_OBJECT_ARRAY)
+    (tmp_path / "models").mkdir()
+    relatives = ["models/archive", "arrays.npz", "archive.dat", "model.pt"]
+    for relative in relatives:
+        (tmp_path / relative).write_bytes(archive)
+        assert inspect_model_format(tmp_path / relative) == expected, relative
+    found = {c.source_path: c for c in ModelScanner().scan(tmp_path).components}
+    assert {r: found[r].serialization_safety for r in relatives} == dict.fromkeys(relatives, UNSAFE)
+
+
+def test_a_locator_outside_the_held_bytes_is_unread() -> None:
+    # The same archive searched without its first bytes: a locator that would lie before
+    # what is held is not decided, whatever the end record names.
+    archive = _zip64_in_first_name((b"objects.npy", _npy("'|O'")))
+    stream = io.BytesIO(archive)
+    stream.seek(len(archive) - 22)
+    assert model._zip_directory(stream, len(archive) - 22, len(archive)) is None
+
+
+def _zip64_record_after_locator(decoy: tuple[bytes, bytes], real: tuple[bytes, bytes]) -> bytes:
+    """The classic end record names a decoy directory; the locator stores the offset of a
+    ZIP64 record kept in the end record's comment, after the locator, naming the real
+    directory. zipfile refuses the archive; miniz reads the record there."""
+    first = _local(*decoy)
+    real_local = _local(*real)
+    real_cd = _central(*decoy, 0) + _central(*real, len(first))
+    real_at = len(first) + len(real_local)
+    decoy_cd = _central(*decoy, 0)
+    decoy_at = real_at + len(real_cd)
+    end_at = decoy_at + len(decoy_cd) + 20
+    record = struct.pack("<IQHHIIQQQQ", 0x06064B50, 44, 45, 45, 0, 0, 2, 2, len(real_cd), real_at)
+    locator = struct.pack("<IIQI", 0x07064B50, 0, end_at + 22, 1)
+    end = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 1, 1, len(decoy_cd), decoy_at, len(record))
+    return first + real_local + real_cd + decoy_cd + locator + end + record
+
+
+@pytest.mark.parametrize("pickled", [False, True], ids=["array", "pickle"])
+def test_a_zip64_record_after_the_locator_is_read_as_miniz_reads_it(
+    tmp_path: Path, pickled: bool
+) -> None:
+    # A record at the locator's offset was taken only before the locator, so this one was
+    # dropped and the decoy listed only archive/version; torch.load's miniz unpickles
+    # data.pkl from the directory the record names.
+    decoy = (b"archive/version", b"3\n") if pickled else (b"numbers.npy", _npy("'<f8'"))
+    real = (b"archive/data.pkl", _INERT_PICKLE) if pickled else (b"objects.npy", _npy("'|O'"))
+    archive = _zip64_record_after_locator(decoy, real)
+    with pytest.raises(zipfile.BadZipFile):
+        zipfile.ZipFile(io.BytesIO(archive))
+    expected = (UNSAFE, ZIP_PICKLE_MEMBER if pickled else ZIP_OBJECT_ARRAY)
+    (tmp_path / "models").mkdir()
+    relatives = ["models/archive", "archive.dat", "model.pt"]
+    for relative in relatives:
+        (tmp_path / relative).write_bytes(archive)
+        assert inspect_model_format(tmp_path / relative) == expected, relative
+    found = {c.source_path: c for c in ModelScanner().scan(tmp_path).components}
+    assert {r: found[r].serialization_safety for r in relatives} == dict.fromkeys(relatives, UNSAFE)
+
+
+def _directory_past_its_end_record(real: tuple[bytes, bytes]) -> bytes:
+    """The classic record stores the real directory's offset with a size that runs past
+    the end record into its comment. zipfile reads the directory of that size ending at
+    the end record, a decoy entry whose comment absorbs the real entries; miniz reads the
+    stored offset, bounded only by the archive's size."""
+    version = (b"archive/version", b"3\n")
+    head = _local(*version) + _local(*real)
+    real_cd = _central(*version, 0) + _central(*real, len(_local(*version)))
+    probe_size = len(_central(*version, 0))
+    stored = len(head) + probe_size
+    size = probe_size + len(real_cd)
+    decoy = _central(*version, probe_size, comment=real_cd)
+    assert len(decoy) == size
+    end = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 2, 2, size, stored, probe_size)
+    return head + decoy[:probe_size] + real_cd + end + b"\0" * probe_size
+
+
+@pytest.mark.parametrize("pickled", [False, True], ids=["array", "pickle"])
+def test_a_directory_that_runs_past_its_end_record_is_unread(tmp_path: Path, pickled: bool) -> None:
+    # Only zipfile's decoy reading was kept, so the archive was rated as listing no
+    # pickle; no writer produces this layout, and the stored reading miniz takes lists
+    # the real member, so what the archive holds is not decided.
+    real = (b"archive/data.pkl", _INERT_PICKLE) if pickled else (b"objects.npy", _npy("'|O'"))
+    archive = _directory_past_its_end_record(real)
+    with zipfile.ZipFile(io.BytesIO(archive)) as opened:
+        assert opened.namelist() == ["archive/version"]
+    (tmp_path / "models").mkdir()
+    relatives = ["models/archive", "archive.dat"]
+    for relative in relatives:
+        (tmp_path / relative).write_bytes(archive)
+        assert inspect_model_format(tmp_path / relative) == (
+            SerializationSafety.UNKNOWN,
+            ZIP_DIRECTORY_UNREAD,
+        ), relative
+    found = {c.source_path: c for c in ModelScanner().scan(tmp_path).components}
+    assert {r: found[r].properties["format_inspection"] for r in relatives} == dict.fromkeys(
+        relatives, ZIP_DIRECTORY_UNREAD
+    )
+
+
 def _overlong_name(archive: bytes, extra: int) -> bytes:
     """The last directory entry's name length set past the directory by ``extra`` bytes.
 

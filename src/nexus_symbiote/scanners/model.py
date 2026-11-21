@@ -566,17 +566,19 @@ def _zip_directory(
     the difference. When a ZIP64 locator precedes the end record, ``zipfile`` reads a
     ZIP64 record whatever the classic record holds: the one at the locator's offset,
     taking the bytes up to the locator as extensible data, and only when no record
-    starts there the one right before the locator. Every reading that lists members is
-    returned, with the offset its directory starts at, its members' offsets as that
-    reader moves them.
+    starts there the one right before the locator. miniz, which ``torch.load`` uses,
+    reads the record at the locator's offset wherever it lies in the archive, also after
+    the locator. Every reading that lists members is returned, with the offset its
+    directory starts at, its members' offsets as that reader moves them.
 
     The rest of the stream is read in bounded chunks, keeping only the tail that can
     hold the directory within ``MAX_ZIP_DIRECTORY_BYTES``, the end-of-central-directory
     record with its comment and the ZIP64 records. ``read`` holds the bytes that end at
-    ``consumed``, already read from the stream. ``None`` when no directory can be
-    read, when any directory that lies within the archive is beyond that bound, as it
-    may list what the others do not, when a ZIP64 locator stores an offset before that
-    tail, or when the stream ends before ``size``.
+    ``consumed``, already read from the stream; from offset 0, a small archive is held
+    whole. ``None`` when no directory can be read, when any directory that lies within
+    the archive is beyond that bound or runs past its end record, as it may list what
+    the others do not, when a ZIP64 locator stores an offset before that tail or the
+    locator itself would lie before it, or when the stream ends before ``size``.
     """
     tail: deque[bytes] = deque([read])
     held = len(read)
@@ -599,6 +601,9 @@ def _zip_directory(
         end_record = data.rfind(b"PK\x05\x06", max(0, len(data) - 22 - 65_535))
     if end_record < 0 or end_record + 22 > len(data):
         return None
+    if start > 0 and end_record < 76:
+        # The locator and the ZIP64 record before it would lie in bytes not held.
+        return None
     # (where the directory ends, its size, its stored offset) for each record a reader takes
     records = [(end_record, _little(data, end_record + 12, 4), _little(data, end_record + 16, 4))]
     locator = end_record - 20
@@ -609,9 +614,11 @@ def _zip_directory(
             # tail does not hold it, so what zipfile lists is not decided.
             return None
         for record in sorted({locator - 56, stored}):
+            # miniz, which torch.load uses, reads the record at the stored offset anywhere
+            # in the archive, also after the locator, where zipfile refuses the archive.
             if (
                 record >= 0
-                and record + 56 <= locator
+                and record + 56 <= len(data)
                 and data[record : record + 4] == b"PK\x06\x06"
             ):
                 records.append(
@@ -630,15 +637,19 @@ def _zip_directory(
                 continue
             members = _directory_members(data, begin - start, directory_size, directory_end)
             if members is None and (
-                0 <= begin <= start + directory_end - directory_size
-                and (
-                    begin < start
-                    or directory_size > MAX_ZIP_DIRECTORY_BYTES
-                    or data[begin - start : begin - start + 4] == b"PK\x01\x02"
+                (
+                    0 <= begin <= start + directory_end - directory_size
+                    and (
+                        begin < start
+                        or directory_size > MAX_ZIP_DIRECTORY_BYTES
+                        or data[begin - start : begin - start + 4] == b"PK\x01\x02"
+                    )
                 )
+                or start + directory_end - directory_size < begin <= size - directory_size
             ):
                 # A directory past the bound, or one that starts but cannot be read,
-                # may list what a decoy the other reading takes does not.
+                # may list what a decoy the other reading takes does not. One that runs
+                # past its end record no writer produces, and miniz still reads it.
                 return None
             if members is not None:
                 shift = begin - directory_offset
@@ -987,21 +998,21 @@ def _recognized_code_container(
     # archive does; zipfile reads the archive whose end record ends the file.
     if prefix[:4] not in (b"PK\x03\x04", b"PK\x05\x06"):
         return _recognized_pickle(stream, prefix, size, by_content=by_content)
-    consumed = len(prefix)
-    # An end record at offset 0 is all an empty archive holds, so the prefix is kept.
-    kept = prefix if prefix[:4] == b"PK\x05\x06" else b""
+    # Every byte read so far is kept for the directory search. In a small archive the
+    # first local header and its name can hold the ZIP64 locator or record, and zipfile
+    # and miniz read them there; an end record at offset 0 is all an empty archive holds.
+    kept = prefix
     if prefix[:4] == b"PK\x03\x04":
         header = prefix + stream.read(22)
-        consumed = len(header)
         first = b""
         if len(header) == 30:
             name_length = int.from_bytes(header[26:28], "little")
             if 0 < name_length <= 4096:
                 first = stream.read(name_length)
-                consumed += len(first)
+        kept = header + first
         if _pickle_member(first):
             return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_PICKLE_MEMBER
-    readings = _zip_directory(stream, consumed, size, kept)
+    readings = _zip_directory(stream, len(kept), size, kept)
     if readings is None:
         return SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD
     if any(_pickle_member(member.name) for members, _ in readings for member in members):
