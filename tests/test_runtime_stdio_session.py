@@ -8,9 +8,11 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import BoundedSemaphore
 
 import pytest
 
+from nexus_symbiote import runtime, runtime_validation
 from nexus_symbiote.live import session as live_session
 from nexus_symbiote.live.pinned_process import isolation_off
 from nexus_symbiote.live.session import (
@@ -19,8 +21,13 @@ from nexus_symbiote.live.session import (
     PinnedStdioSession,
     invoke_pinned_stdio,
 )
-from nexus_symbiote.runtime import AuthorizationError, digest, sign_contract
-from nexus_symbiote.runtime_validation import MAX_ARGUMENT_BYTES, ValidationBudgetError
+from nexus_symbiote.runtime import AuthorizationError, digest, sign_contract, tool_definition_digest
+from nexus_symbiote.runtime_validation import (
+    MAX_ARGUMENT_BYTES,
+    MAX_JSON_DEPTH,
+    MAX_JSON_NODES,
+    ValidationBudgetError,
+)
 from tests.support import STDIO_HELLO, launcher_log, misbehaving_launcher
 from tests.test_runtime_authorization import DEFINITION, fixture
 
@@ -86,9 +93,12 @@ for line in sys.stdin:
     return path, "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(), log
 
 
-def signed_inputs(values, pin):
+def signed_inputs(values, pin, *, output_schema=None):
     gateway, call, bom, snapshot, status, approval, release, human, trust, executed = values
     grant = snapshot.tools[0].model_copy(update={"endpoint_identity": "stdio+launcher:" + pin})
+    if output_schema is not None:
+        definition_digest = tool_definition_digest({**DEFINITION, "outputSchema": output_schema})
+        grant = grant.model_copy(update={"definition_digest": definition_digest})
     snapshot = snapshot.model_copy(update={"tools": (grant,)})
     approval = approval.model_copy(
         update={"snapshot_digest": digest(snapshot.model_dump(mode="json"))}
@@ -540,6 +550,69 @@ def test_a_launcher_over_the_byte_budget_is_denied_before_it_is_read_or_run(tmp_
         pass
 
 
+def test_unsupported_approved_output_schema_is_denied_before_call(tmp_path):
+    schema = {"$schema": "https://example.invalid/output-dialect", "type": "object"}
+    values = fixture(tmp_path)
+    path, pin, log = launcher(tmp_path, output_schema=schema)
+    kwargs = signed_inputs(values, pin, output_schema=schema)
+    decisions = []
+    values[0].on_decision = decisions.append
+    with pytest.raises(AuthorizationError) as denied:
+        invoke_pinned_stdio(values[0], values[1], command=str(path), sha256=pin, **kwargs)
+    assert denied.value.reason == "schema-invalid"
+    assert [decision.reason for decision in decisions] == ["schema-invalid"]
+    assert [record[0] for record in launcher_log(log)] == ["tools/list"]
+
+
+def test_output_capacity_refusal_leaves_approval_available(tmp_path, monkeypatch):
+    schema = {"type": "object", "required": ["count"]}
+    result = {"structuredContent": {"count": 1}}
+    values = fixture(tmp_path)
+    path, pin, log = launcher(tmp_path, output_schema=schema, tool_result=result)
+    kwargs = signed_inputs(values, pin, output_schema=schema)
+    slots = BoundedSemaphore(1)
+    monkeypatch.setattr(runtime_validation, "_WORKER_SLOTS", slots)
+    validate_arguments = runtime._validate_arguments
+
+    def occupy_remaining_capacity(schema, arguments):
+        validate_arguments(schema, arguments)
+        assert slots.acquire(blocking=False)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime, "_validate_arguments", occupy_remaining_capacity)
+        with pytest.raises(AuthorizationError) as denied:
+            invoke_pinned_stdio(values[0], values[1], command=str(path), sha256=pin, **kwargs)
+        assert denied.value.reason == "validation-capacity"
+    assert [record[0] for record in launcher_log(log)] == ["tools/list"]
+
+    slots.release()
+    assert (
+        invoke_pinned_stdio(values[0], values[1], command=str(path), sha256=pin, **kwargs) == result
+    )
+    assert [record[0] for record in launcher_log(log)] == ["tools/list", "tools/list", "tools/call"]
+    assert slots.acquire(blocking=False)
+    slots.release()
+
+
+def nested_value(depth: int):
+    value = []
+    for _ in range(1, depth):
+        value = [value]
+    return value
+
+
+def test_output_schema_copy_respects_the_descriptor_budget(tmp_path):
+    schema = {"type": "object", "examples": nested_value(MAX_JSON_DEPTH + 1)}
+    path, pin, log = launcher(tmp_path, output_schema=schema)
+    with (
+        PinnedStdioSession(command=str(path), sha256=pin, server_id="server:mail") as session,
+        pytest.raises(AuthorizationError) as denied,
+    ):
+        session.describe("server:mail", "send")
+    assert denied.value.reason == "descriptor-too-large"
+    assert [record[0] for record in launcher_log(log)] == ["tools/list"]
+
+
 @pytest.mark.parametrize(
     ("result", "accepted", "validation_reason"),
     [
@@ -548,6 +621,26 @@ def test_a_launcher_over_the_byte_budget_is_denied_before_it_is_read_or_run(tmp_
         ({"content": []}, False, None),
         ({"isError": True, "content": []}, True, None),
         ({"isError": "true", "content": []}, False, None),
+        (
+            {"structuredContent": {"count": 1, "values": [0] * (MAX_JSON_NODES - 3)}},
+            True,
+            None,
+        ),
+        (
+            {"structuredContent": {"count": 1, "values": [0] * (MAX_JSON_NODES - 2)}},
+            False,
+            "json-budget-exceeded",
+        ),
+        (
+            {"structuredContent": {"count": 1, "nested": nested_value(MAX_JSON_DEPTH)}},
+            True,
+            None,
+        ),
+        (
+            {"structuredContent": {"count": 1, "nested": nested_value(MAX_JSON_DEPTH + 1)}},
+            False,
+            "json-budget-exceeded",
+        ),
         (
             {"structuredContent": {"count": 1, "text": "a" * MAX_ARGUMENT_BYTES}},
             False,

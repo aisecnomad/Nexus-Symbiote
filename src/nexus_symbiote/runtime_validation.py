@@ -16,6 +16,8 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 MAX_SCHEMA_BYTES = 256 * 1024
@@ -163,14 +165,34 @@ def validate_arguments(schema: Any, arguments: dict[str, Any]) -> None:
     reason code; crashes and malformed replies share one. No approval nonce is
     consumed here.
     """
+    if not isinstance(arguments, dict):
+        raise ValidationBudgetError("tool arguments must be an object")
+    wire = _validation_request(schema, arguments)
+    with _validation_slot():
+        _validate(wire)
+
+
+@contextmanager
+def prepare_output_validation(schema: Any) -> Iterator[Callable[[dict[str, Any]], None]]:
+    """Check schema support and reserve capacity through the tool response."""
+    preflight = _validation_request(schema, None)
+
+    def validate(result: dict[str, Any]) -> None:
+        _validate(_validation_request(schema, result))
+
+    with _validation_slot():
+        _validate(preflight)
+        yield validate
+
+
+def _validation_request(schema: Any, instance: dict[str, Any] | None) -> bytes:
     if not isinstance(schema, dict):
-        raise ValidationBudgetError(
-            "served tool requires an object input schema", reason="schema-invalid"
-        )
+        raise ValidationBudgetError("served tool schema must be an object", reason="schema-invalid")
     check_json_budget(schema, maximum=MAX_SCHEMA_BYTES)
-    check_json_budget(arguments, maximum=MAX_ARGUMENT_BYTES)
+    if instance is not None:
+        check_json_budget(instance, maximum=MAX_ARGUMENT_BYTES)
     wire = json.dumps(
-        {"schema": schema, "arguments": arguments},
+        {"schema": schema, "arguments": instance},
         ensure_ascii=True,
         separators=(",", ":"),
         allow_nan=False,
@@ -179,14 +201,23 @@ def validate_arguments(schema: Any, arguments: dict[str, Any]) -> None:
         raise ValidationBudgetError(
             "validation request exceeds byte budget", reason="json-budget-exceeded"
         )
+    return wire
+
+
+@contextmanager
+def _validation_slot() -> Iterator[None]:
     if not _WORKER_SLOTS.acquire(blocking=False):
         raise ValidationBudgetError(
             "validation worker capacity unavailable", reason="validation-capacity"
         )
     try:
-        result = _run_worker(wire)
+        yield
     finally:
         _WORKER_SLOTS.release()
+
+
+def _validate(wire: bytes) -> None:
+    result = _run_worker(wire)
     if result == _VALID:
         return
     if result == _INVALID:
@@ -910,7 +941,9 @@ def _unsupported_vocabulary(node: dict[str, Any], dialect: str, *, is_root: bool
     return False
 
 
-def _ignores_a_keyword(schema: dict[str, Any], dialect: str, validator: Any) -> bool:
+def _ignores_a_keyword(
+    schema: dict[str, Any], dialect: str, validator: Any, *, check_patterns: bool = False
+) -> bool:
     """Whether evaluation would skip a constraint that whoever approves the schema reads.
 
     That is a keyword the declared dialect does not define or jsonschema does not
@@ -935,6 +968,7 @@ def _ignores_a_keyword(schema: dict[str, Any], dialect: str, validator: Any) -> 
     pending: list[Any] = [schema]
     seen: set[int] = set()
     nodes: list[dict[str, Any]] = []
+    regex = _EcmaRegex() if check_patterns else None
     while pending:
         node = pending.pop()
         if not isinstance(node, dict) or id(node) in seen:
@@ -953,6 +987,11 @@ def _ignores_a_keyword(schema: dict[str, Any], dialect: str, validator: Any) -> 
             return True
         if node is not schema and _redeclares(node, dialect, identifier):
             return True
+        if regex is not None:
+            if isinstance(node.get("pattern"), str):
+                regex.compile(node["pattern"])
+            for pattern in node.get("patternProperties", {}):
+                regex.compile(pattern)
         for keyword, value in node.items():
             if keyword in _SUBSCHEMA_MAPS and isinstance(value, dict):
                 pending.extend(value.values())
@@ -1057,9 +1096,11 @@ def _evaluate(dialects: dict[str, Any], schema: dict[str, Any], arguments: Any) 
         return _SCHEMA
     try:
         validator.check_schema(schema)
-        if _ignores_a_keyword(schema, dialect, validator):
+        preflight = arguments is None
+        if _ignores_a_keyword(schema, dialect, validator, check_patterns=preflight):
             return _SCHEMA
-        validator(schema, registry=Registry()).validate(arguments)
+        if not preflight:
+            validator(schema, registry=Registry()).validate(arguments)
     except SchemaValidationError:
         return _INVALID
     except (SchemaError, Unresolvable, re.error):
@@ -1102,10 +1143,13 @@ def _worker() -> int:
         if not isinstance(request, dict) or set(request) != {"schema", "arguments"}:
             return 1
         schema, arguments = request["schema"], request["arguments"]
-        if not isinstance(schema, dict) or not isinstance(arguments, dict):
+        if not isinstance(schema, dict) or (
+            arguments is not None and not isinstance(arguments, dict)
+        ):
             return 1
         check_json_budget(schema, maximum=MAX_SCHEMA_BYTES)
-        check_json_budget(arguments, maximum=MAX_ARGUMENT_BYTES)
+        if arguments is not None:
+            check_json_budget(arguments, maximum=MAX_ARGUMENT_BYTES)
         sys.stdout.buffer.write(_evaluate(dialects, schema, arguments))
         return 0
     except Exception:
