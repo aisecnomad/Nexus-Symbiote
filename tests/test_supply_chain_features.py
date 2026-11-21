@@ -248,7 +248,7 @@ def test_verify_live_refuses_host_credentials(tmp_path, monkeypatch):
     project = tmp_path / "project"
     project.mkdir()
     source.write_text(AIBOM().to_json())
-    policy = tmp_path / "launch.json"
+    policy = project / "launch.json"
     policy.write_text("{}")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "not-a-real-secret")
     monkeypatch.setenv("NEXUS_SYMBIOTE_SOURCE_BINDING_KEY", "k" * 32)
@@ -262,11 +262,13 @@ def test_verify_live_refuses_host_credentials(tmp_path, monkeypatch):
         str(policy),
     ]
     refused = CliRunner().invoke(main, args)
-    assert refused.exit_code != 0
+    assert refused.exit_code == 2
     assert "AWS_SECRET_ACCESS_KEY" in refused.output
     assert "not-a-real-secret" not in refused.output
     assert "--allow-host-credentials" in refused.output
     allowed = CliRunner().invoke(main, [*args, "--allow-host-credentials"])
+    assert allowed.exit_code == 2
+    assert "launch policy must be provisioned outside the untrusted project" in allowed.output
     assert "AWS_SECRET_ACCESS_KEY" not in allowed.output
     assert "not-a-real-secret" not in allowed.output
 
