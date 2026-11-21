@@ -1006,6 +1006,24 @@ _INVENTORY_REFUSALS: dict[str, Any] = {
     "endpoint-malformed": lambda b: setattr(
         _approved_server(b), "endpoint_url", "https://[mcp.example.com/mcp"
     ),
+    "endpoint-path-case": lambda b: setattr(
+        _approved_server(b), "endpoint_url", "https://mcp.example.com/MCP"
+    ),
+    "endpoint-trailing-slash": lambda b: setattr(
+        _approved_server(b), "endpoint_url", "https://mcp.example.com/mcp/"
+    ),
+    "endpoint-double-slash": lambda b: setattr(
+        _approved_server(b), "endpoint_url", "https://mcp.example.com/mcp//"
+    ),
+    "endpoint-empty-query": lambda b: setattr(
+        _approved_server(b), "endpoint_url", "https://mcp.example.com/mcp?"
+    ),
+    "endpoint-root-empty-query": lambda b: setattr(
+        _approved_server(b), "endpoint_url", "https://mcp.example.com/?"
+    ),
+    "endpoint-encoded-path": lambda b: setattr(
+        _approved_server(b), "endpoint_url", "https://mcp.example.com/%6Dcp"
+    ),
 }
 _EVIDENCE_REFUSALS: dict[str, Any] = {
     "server-assurance": lambda s, t: setattr(s, "assurance_level", "declared"),
@@ -1105,6 +1123,18 @@ def test_an_inventory_endpoint_with_dot_segments_binds_no_evidence(path):
     # string (made before discover-mcp refused them) does not show what they reach.
     approved, evidence, _server, _tool = _remote_case("https://mcp.example.com" + path)
     _approved_server(approved).endpoint_url = "https://mcp.example.com" + path
+    assert _remote_reason(approved, evidence) == ("failed", "invalid-transport-evidence", False)
+
+
+def test_an_encoded_slash_is_compared_as_sent():
+    # %2F separates no segment for a client, so the observed path is the raw one.
+    approved, evidence, _server, _tool = _remote_case("https://mcp.example.com/a%2F..%2Fmcp")
+    _approved_server(approved).endpoint_url = "https://mcp.example.com/a%2F..%2Fmcp"
+    report = verify_mcp_servers(
+        approved, transport_evidence=[evidence], require_full_url_binding=True
+    )
+    assert report.all_servers_verified
+    _approved_server(approved).endpoint_url = "https://mcp.example.com/a/../mcp"
     assert _remote_reason(approved, evidence) == ("failed", "invalid-transport-evidence", False)
 
 

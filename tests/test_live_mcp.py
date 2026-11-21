@@ -844,6 +844,15 @@ def test_endpoint_encoding_and_authority_checks_fail_before_any_request(endpoint
     assert result.endpoint == "[invalid-endpoint]"
 
 
+@pytest.mark.parametrize(
+    "path", ["/a%2F..%2Fmcp", "/x/.%2Fmcp", "/.well-known/mcp", "/v1.0/mcp", "/..hidden/mcp"]
+)
+def test_a_path_without_a_dot_segment_is_observed_as_written(path):
+    from nexus_symbiote.scanners.live_mcp import _endpoint
+
+    assert _endpoint("https://fixture.example" + path)[3] == path
+
+
 def test_an_allowed_origin_that_fails_the_same_checks_is_refused():
     transport = FixtureTransport([SENTINEL])
     result = discover_tools(

@@ -339,7 +339,7 @@ def _endpoint(value: str, *, origin_only: bool = False) -> tuple[str, str, int, 
         raise
     except ValueError as exc:
         raise DiscoveryError("invalid endpoint") from exc
-    if any(part in (".", "..") for part in unquote(parsed.path).split("/")):
+    if any(unquote(part) in (".", "..") for part in parsed.path.split("/")):
         raise DiscoveryError("endpoint dot segments refused")
     if host.endswith(".") or not 1 <= port <= 65535:
         raise DiscoveryError("invalid endpoint authority")

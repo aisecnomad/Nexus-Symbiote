@@ -392,10 +392,10 @@ def _named_endpoint_hash(url: str | None) -> str | None:
     if not isinstance(url, str):
         return None
     try:
-        parts = urlsplit(url)
-        if parts.path in ("", "/") and not parts.query:
+        bare = url.split("#", 1)[0]
+        if urlsplit(bare).path in ("", "/") and "?" not in bare:
             return None
-        origin, _, _, path = _endpoint(url.split("#", 1)[0])
+        origin, _, _, path = _endpoint(bare)
     except ValueError:
         return ""
     return hash_canonical({"observed_endpoint": origin + path})
