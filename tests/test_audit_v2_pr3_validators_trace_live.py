@@ -309,6 +309,7 @@ def _write_stdio_server(
     return str(script), digest
 
 
+@pytest.mark.usefixtures("nonisolated_pinned_fixtures")
 @pytest.mark.skipif(os.name != "posix", reason="POSIX stdio launcher verification")
 def test_live_verify_rejects_post_redaction_tool_name_collision(tmp_path: Path) -> None:
     tools = [
@@ -367,6 +368,7 @@ def test_live_verify_rejects_post_redaction_tool_name_collision(tmp_path: Path) 
         record_candidate(bom, synth)
 
 
+@pytest.mark.usefixtures("nonisolated_pinned_fixtures")
 @pytest.mark.skipif(os.name != "posix", reason="POSIX stdio launcher verification")
 def test_live_verify_round_trips_redacted_tool_name_with_unprofiled_extension(
     tmp_path: Path,
@@ -449,6 +451,7 @@ def test_discover_mcp_rejects_symlink_and_hardlink_raw_descriptor_aliases(
     assert "--raw-descriptors must name a different file than --output" in res_hard.output
 
 
+@pytest.mark.usefixtures("nonisolated_pinned_fixtures")
 def test_observe_pinned_suppresses_wait_timeout_during_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
