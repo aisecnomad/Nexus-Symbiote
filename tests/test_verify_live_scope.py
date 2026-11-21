@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -718,6 +719,11 @@ def test_require_transport_evidence_and_recorded_remote_observations(tmp_path, m
         ],
     )
     obs_bom = observation_inventory(obs, server_ref="mcp:tickets")
+    observed_tool = next(comp for comp in obs_bom.components if isinstance(comp, ToolComponent))
+    observed_definition = observed_tool.claims["tool_definition"]
+    # A tool can be observed at a different time from its server declaration.
+    tool_observed_at = "2026-11-18T12:00:03+00:00"
+    observed_definition.observed_at = datetime.fromisoformat(tool_observed_at)
     obs_path = tmp_path / "tickets-observed.json"
     obs_bom.save(obs_path)
 
@@ -814,6 +820,34 @@ def test_require_transport_evidence_and_recorded_remote_observations(tmp_path, m
     assert verified_doc["verification_scope"] == "all-servers"
     assert verified_doc["servers_skipped"] == 0
     assert "transport_evidence_sha256" in verified_doc["inputs"]
+
+    recorded, _, _ = invoke(
+        tmp_path,
+        bom,
+        policy,
+        "--require-transport-evidence",
+        "--transport-evidence",
+        str(obs_path),
+        "--transport-evidence-attestation",
+        str(att_path),
+        "--trusted-key",
+        str(pub_path),
+        "--record",
+    )
+    assert recorded.exit_code == 0, recorded.output
+    candidate = AIBOM.from_document(json.loads(recorded.stdout))
+    remote_tool = candidate.get_component("tool:open_ticket")
+    assert isinstance(remote_tool, ToolComponent)
+    claim = remote_tool.claims["tool_definition"]
+    assert claim.method == "https-mcp-tools-list"
+    assert claim.collector == "live-mcp"
+    assert claim.observed_at is not None and claim.observed_at.isoformat() == tool_observed_at
+    assert claim.evidence_refs == [f"sha256:{hashlib.sha256(att_path.read_bytes()).hexdigest()}"]
+    stdio_tool = candidate.get_component("tool:weather")
+    assert isinstance(stdio_tool, ToolComponent)
+    stdio_claim = stdio_tool.claims["tool_definition"]
+    assert stdio_claim.method == "operator-pinned-stdio-tools-list"
+    assert stdio_claim.evidence_refs == []
 
     # Forged static-scan BOM signed as transport evidence must be rejected by _verify_remote_evidence.
     static_bom = AIBOM(

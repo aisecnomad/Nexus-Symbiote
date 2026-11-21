@@ -10,6 +10,7 @@ import functools
 import json
 import os
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -19,7 +20,7 @@ from nexus_symbiote import attestation
 from nexus_symbiote.attestation import MAX_SUBJECT_BYTES
 from nexus_symbiote.core.aibom import AIBOM, NativeFormatError
 from nexus_symbiote.core.enums import AssuranceLevel, SerializationSafety
-from nexus_symbiote.core.hashing import normalize_digest
+from nexus_symbiote.core.hashing import hash_bytes, normalize_digest
 from nexus_symbiote.core.inventory_digests import inventory_digests
 from nexus_symbiote.core.models import MCPServerComponent, ModelComponent, ToolComponent
 from nexus_symbiote.graph import validate_graph
@@ -153,7 +154,7 @@ def verify_file_attestation(
             _read_role("subject file", functools.partial(_read, subject_path, MAX_SUBJECT_BYTES)),
         )
     try:
-        return attestation.verify_attestation(
+        verified = attestation.verify_attestation(
             attestation.parse_envelope(raw_env),
             data,
             trusted_keys=ring,
@@ -163,6 +164,7 @@ def verify_file_attestation(
         )
     except attestation.AttestationError as exc:
         raise click.ClickException(f"{failure_prefix}: {exc} ({exc.reason})") from None
+    return replace(verified, envelope_digest=hash_bytes(raw_env))
 
 
 def corroborate_against_project(
