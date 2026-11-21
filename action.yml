@@ -116,9 +116,10 @@ inputs:
   accept-default-excludes:
     description: >-
       Comma-separated built-in names whose occupied paths are accepted and recorded.
-      Defaults to .git for actions/checkout. 'false' accepts none, and 'true' accepts
-      all built-in names. Other occupied default exclusions remain coverage gaps
-    default: ".git"
+      Defaults to root:.git for the checkout's root Git metadata. Explicit .git also
+      accepts regular nested Git metadata files. 'false' accepts none, and 'true'
+      accepts all built-in names. Other occupied default exclusions remain coverage gaps
+    default: "root:.git"
   limits:
     description: >-
       Raised collection limits as NAME=VALUE pairs separated by commas, passed to the CLI as

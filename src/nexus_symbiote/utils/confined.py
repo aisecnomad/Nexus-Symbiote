@@ -33,6 +33,8 @@ MAX_DEPTH = limits.DEFAULTS.depth
 MAX_TOTAL_BYTES = limits.DEFAULTS.total_bytes
 MAX_HASH_BYTES = limits.DEFAULTS.model_bytes
 DEFAULT_EXCLUDES = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv"})
+ROOT_GIT_METADATA = "root:.git"
+DEFAULT_EXCLUDE_ACCEPTANCE = DEFAULT_EXCLUDES | {ROOT_GIT_METADATA}
 DEFAULT_EXCLUDE_REASON = "default collection exclude; not collected"
 AGENT_DEFAULT_EXCLUDE_REASON = (
     "default-excluded name inside an agent configuration directory; not collected"
@@ -788,15 +790,18 @@ class ConfinedCollection:
         finally:
             os.close(child_fd)
 
-    def _is_root_git_metadata(self, directory_fd: int, child: Path) -> bool:
-        """Recognize the checkout's Git marker without resolving a gitdir or a HEAD ref."""
-        if child.parts != (".git",):
+    def _is_git_metadata(self, directory_fd: int, child: Path) -> bool:
+        """Recognize Git metadata without resolving a gitdir or a HEAD ref."""
+        root = child.parts == (".git",)
+        if child.name != ".git" or (not root and ".git" not in self._accepted_default_names):
             return False
         metadata_fd = None
         try:
             entry = self._stat_exact_no_follow(directory_fd, ".git")
             is_directory = stat.S_ISDIR(entry.st_mode)
             if is_directory:
+                if not root:
+                    return False
                 metadata_fd = self._open_dir_part(directory_fd, ".git")
                 parent, name = metadata_fd, "HEAD"
             elif stat.S_ISREG(entry.st_mode):
@@ -1329,13 +1334,14 @@ class ConfinedCollection:
                     ):
                         in_agent_config = _under_agent_configuration_directory(child)
                         canonical = fold_name(name)
+                        accepted = canonical in self._accepted_default_names or (
+                            canonical == ".git"
+                            and ROOT_GIT_METADATA in self._accepted_default_names
+                        )
                         if (
                             not in_agent_config
-                            and canonical in self._accepted_default_names
-                            and (
-                                canonical != ".git"
-                                or self._is_root_git_metadata(directory_fd, child)
-                            )
+                            and accepted
+                            and (canonical != ".git" or self._is_git_metadata(directory_fd, child))
                         ):
                             self.accepted_default_names.add(canonical)
                             if self._accepted_default_exclusions is not None:

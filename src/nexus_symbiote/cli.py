@@ -49,7 +49,7 @@ from nexus_symbiote.sbom_cli import register_sbom_commands
 from nexus_symbiote.supply_chain_cli import STAGED_INVENTORY, register_supply_chain_commands
 from nexus_symbiote.text_poisoning import apply_text_poisoning_rules
 from nexus_symbiote.trace_cli import register_trace_commands
-from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDE_ACCEPTANCE, DEFAULT_EXCLUDES
 from nexus_symbiote.utils.files import write_output_file
 from nexus_symbiote.utils.terminal import (
     echo_line,
@@ -993,7 +993,7 @@ def _render_aibom(
 )
 @click.option(
     "--accept-default-exclude",
-    type=click.Choice(sorted(DEFAULT_EXCLUDES)),
+    type=click.Choice(sorted(DEFAULT_EXCLUDE_ACCEPTANCE)),
     multiple=True,
     help="Accept one default exclusion while retaining the path in the inventory. Repeat as needed.",
 )
@@ -1794,7 +1794,7 @@ def verify_discovery(
 )
 @click.option(
     "--accept-default-exclude",
-    type=click.Choice(sorted(DEFAULT_EXCLUDES)),
+    type=click.Choice(sorted(DEFAULT_EXCLUDE_ACCEPTANCE)),
     multiple=True,
     help="Accept one default exclusion while retaining the path in the inventory. Repeat as needed.",
 )
@@ -2052,7 +2052,7 @@ def validate(
 )
 @click.option(
     "--accept-default-exclude",
-    type=click.Choice(sorted(DEFAULT_EXCLUDES)),
+    type=click.Choice(sorted(DEFAULT_EXCLUDE_ACCEPTANCE)),
     multiple=True,
     help="Accept one default exclusion while retaining the path in the inventory. Repeat as needed.",
 )

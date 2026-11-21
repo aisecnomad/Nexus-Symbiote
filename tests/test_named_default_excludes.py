@@ -38,7 +38,7 @@ def test_action_scans_checkout_metadata_without_accepting_dependencies(tmp_path:
 
     assert run_action.run(config, command=command) == 0
     assert {args[0] for args in calls} == {"scan", "validate", "risk"}
-    assert all("--accept-default-exclude=.git" in args for args in calls)
+    assert all("--accept-default-exclude=root:.git" in args for args in calls)
     inventory = project / "agentbom.json"
     claim = json.loads(inventory.read_text())["metadata"]["completeness"]
     assert ".git" in claim["exclusions"]
@@ -110,7 +110,7 @@ def test_action_input_and_cli_reject_unknown_names(tmp_path: Path) -> None:
         == 2
     )
     action = yaml.safe_load((Path(__file__).parents[1] / "action.yml").read_text())
-    assert action["inputs"]["accept-default-excludes"]["default"] == ".git"
+    assert action["inputs"]["accept-default-excludes"]["default"] == "root:.git"
     assert any(
         step.get("env", {}).get("SYMBIOTE_ACCEPT_DEFAULT_EXCLUDES")
         == "${{ inputs.accept-default-excludes }}"

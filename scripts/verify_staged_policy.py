@@ -49,7 +49,7 @@ from nexus_symbiote.runtime_cli import (
     _read,
     _working_trees,
 )
-from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDE_ACCEPTANCE, ROOT_GIT_METADATA
 from nexus_symbiote.utils.terminal import safe_line
 from nexus_symbiote.validators.completeness import (
     CompletenessValidator,
@@ -220,11 +220,11 @@ def run_staged_gate(
     trusted_keys: tuple[Path, ...] = (),
     allow_unsigned: bool = False,
     max_age_days: int = DEFAULT_MAX_AGE_DAYS,
-    accept_default_excludes: tuple[str, ...] = (".git",),
+    accept_default_excludes: tuple[str, ...] = (ROOT_GIT_METADATA,),
 ) -> tuple[int, str]:
     """Verify operator policy placement/attestation in-place and run repository gates."""
     try:
-        if any(name not in DEFAULT_EXCLUDES for name in accept_default_excludes):
+        if any(name not in DEFAULT_EXCLUDE_ACCEPTANCE for name in accept_default_excludes):
             raise click.UsageError("unknown built-in exclusion")
         if not project_dir.is_dir():
             raise click.UsageError("--project must name an existing directory")
@@ -411,8 +411,8 @@ def _parser() -> argparse.ArgumentParser:
         "--accept-default-exclude",
         dest="accept_default_excludes",
         action="append",
-        choices=sorted(DEFAULT_EXCLUDES),
-        help="Accept this occupied built-in exclusion (repeatable, default: .git)",
+        choices=sorted(DEFAULT_EXCLUDE_ACCEPTANCE),
+        help="Accept this built-in exclusion (repeatable, default: root:.git)",
     )
     exclusions.add_argument(
         "--no-accept-default-excludes",
@@ -470,7 +470,7 @@ def main(argv: list[str] | None = None) -> int:
         trusted_keys=tuple(args.operator_policy_key),
         allow_unsigned=args.allow_unsigned_operator_policy,
         max_age_days=args.operator_policy_max_age_days,
-        accept_default_excludes=(".git",)
+        accept_default_excludes=(ROOT_GIT_METADATA,)
         if args.accept_default_excludes is None
         else tuple(args.accept_default_excludes),
     )

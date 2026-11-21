@@ -15,7 +15,7 @@ import click
 from nexus_symbiote import modes
 from nexus_symbiote.core.aibom import AIBOM, NativeFormatError
 from nexus_symbiote.live_cli import review_notice
-from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDE_ACCEPTANCE
 from nexus_symbiote.utils.files import create_staging_file
 from nexus_symbiote.utils.terminal import (
     echo_line,
@@ -347,7 +347,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
     )
     @click.option(
         "--accept-default-exclude",
-        type=click.Choice(sorted(DEFAULT_EXCLUDES)),
+        type=click.Choice(sorted(DEFAULT_EXCLUDE_ACCEPTANCE)),
         multiple=True,
         help="Accept one default exclusion while retaining the path in the inventory. Repeat as needed.",
     )

@@ -177,13 +177,13 @@ def _require_sigstore() -> None:
 
 
 def _default_exclusions(raw: str) -> bool | tuple[str, ...]:
-    from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES
+    from nexus_symbiote.utils.confined import DEFAULT_EXCLUDE_ACCEPTANCE
 
     value = raw.strip().lower()
     if value in {"true", "false"}:
         return value == "true"
     names = tuple(dict.fromkeys(part.strip() for part in value.split(",") if part.strip()))
-    if not set(names) <= DEFAULT_EXCLUDES:
+    if not set(names) <= DEFAULT_EXCLUDE_ACCEPTANCE:
         raise InputError("accept-default-excludes must name only built-in exclusions")
     return names
 
