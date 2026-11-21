@@ -1216,6 +1216,8 @@ kept.
 
 Analyze an inventory offline for lethal trifectas, chained toxic flows, and tool shadowing. A trifecta is high when applicable human-approval declarations cover every egress in its scope. It stays critical if any egress lacks coverage. The high finding reports that enforcement is unverified. Use `--fail-on-finding` to gate on it. The Python API can explicitly assume those declarations when modeling a proposed design.
 
+An unrelated read-only authorization leaves egress approval unchanged when it names a relative resource scope such as `kb/*`. The recognized actions are `read`, `query`, `list`, `search`, and `get`. The action match ignores case and surrounding whitespace. An unscoped authorization, a global wildcard, or a URL scope can still affect egress approval.
+
 ```text
 nexus-symbiote trifecta [OPTIONS] AIBOM_PATH
 ```
