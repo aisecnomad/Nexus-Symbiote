@@ -21,6 +21,12 @@ An optional [`agent.yaml` manifest](agent-manifest.md) at the project root names
 
 ## MCP servers declared in source
 
+The collector treats a standard-library logger name such as
+`logging.getLogger("mcp.server.demo")` as a logging label when it can establish
+that `logging` is used only for attribute reads. Passing the module as a value,
+including a default such as `def configure(mod=logging)`, produces a coverage gap
+for that call. Other server and tool declarations in the file are still inventoried.
+
 The `mcp` collector names a server it finds in Python, TypeScript or JavaScript
 source by the name its constructor declares as a string literal, the name clients
 see: the first argument or `name=` of `FastMCP("analytics-mcp")` or `MCPServer`,
