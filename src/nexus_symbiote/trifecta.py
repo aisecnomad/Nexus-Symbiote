@@ -595,6 +595,13 @@ def _has_explicit_approval_gate(component: AnyComponent, now: datetime) -> bool:
     if _is_explicitly_ungated(component):
         return False
 
+    records = [
+        r
+        for r in (getattr(component, "authorizations", None) or ())
+        if isinstance(r, AuthorizationRecord)
+    ]
+    if any(r.approval_required is not True or not _unexpired(r, now) for r in records):
+        return False
     decl = getattr(component, "capabilities", None)
     if (
         isinstance(decl, CapabilityDeclaration)
@@ -602,12 +609,9 @@ def _has_explicit_approval_gate(component: AnyComponent, now: datetime) -> bool:
     ):
         return True
 
-    declared = getattr(component, "authorizations", None) or ()
-    records = [r for r in declared if isinstance(r, AuthorizationRecord)]
-    return (
-        bool(records)
-        and all(r.approval_required is True and _unexpired(r, now) for r in records)
-        and any(r.action in _GATING_ACTIONS and r.resource_scope in (None, "*") for r in records)
+    return any(
+        r.action in _GATING_ACTIONS and r.resource_scope in (None, "*") and not r.conditions
+        for r in records
     )
 
 
@@ -819,8 +823,6 @@ def _own_reach(sig: _ComponentSignals) -> _Reach:
         tags.extend(("egress", "sink") if chained else ("egress",))
         if not sig.explicitly_gated:
             tags.extend(("egress_open", "sink_open") if chained else ("egress_open",))
-        if sig.explicitly_ungated:
-            tags.extend(("egress_forced", "sink_forced") if chained else ("egress_forced",))
     if isinstance(comp, IDEAgentComponent) and sig.explicitly_ungated:
         tags.append("ungated_ide")
     if isinstance(comp, (MCPServerComponent, ToolComponent)):
@@ -837,6 +839,15 @@ def _merge(into: _Reach, other: _Reach) -> None:
             into[tag] = tuple(sorted({*have, *refs})[:EVIDENCE_LIMIT])
 
 
+def _uncovered_paths(reach: _Reach) -> _Reach:
+    """The open egress reached without a directly governing approval declaration."""
+    return {
+        path: reach[tag]
+        for tag, path in (("egress_open", "path_egress"), ("sink_open", "path_sink"))
+        if tag in reach
+    }
+
+
 def _summarize(refs: Iterable[str], own: dict[str, _Reach]) -> _Reach:
     lists: dict[str, list[str]] = {}
     for ref in sorted(refs):
@@ -844,7 +855,9 @@ def _summarize(refs: Iterable[str], own: dict[str, _Reach]) -> _Reach:
             found = lists.setdefault(tag, [])
             if len(found) < EVIDENCE_LIMIT:
                 found.append(ref)
-    return {tag: tuple(found) for tag, found in lists.items()}
+    reach = {tag: tuple(found) for tag, found in lists.items()}
+    # Inventory-wide, implicit workspace and unbound pools have no binding owner.
+    return {**reach, **_uncovered_paths(reach)}
 
 
 def _scopes(
@@ -875,13 +888,17 @@ def _scopes(
         return [("inventory:root", False, _summarize(by_ref, own))] if by_ref else []
 
     adj: dict[str, list[str]] = {ref: [] for ref in by_ref}
+    declared_bindings: set[tuple[str, str]] = set()
     for dep in bom.dependencies:
         if dep.source_ref in by_ref and dep.target_ref in by_ref:
             adj[dep.source_ref].append(dep.target_ref)
+            if dep.relationship in {"invokes", "configured-with"}:
+                declared_bindings.add((dep.source_ref, dep.target_ref))
 
     clients_by_host: dict[str, list[MCPClientComponent]] = {}
     for comp in bom.components:
         if isinstance(comp, AgentComponent):
+            declared_bindings.update((comp.bom_ref, ref) for ref in comp.tool_refs)
             for ref in (
                 *comp.tool_refs,
                 *comp.data_refs,
@@ -892,6 +909,7 @@ def _scopes(
                 if ref in by_ref:
                     adj[comp.bom_ref].append(ref)
         elif isinstance(comp, IDEAgentComponent):
+            declared_bindings.update((comp.bom_ref, ref) for ref in comp.mcp_server_refs)
             for ref in (*comp.mcp_server_refs, *comp.prompt_refs):
                 if ref in by_ref:
                     adj[comp.bom_ref].append(ref)
@@ -928,10 +946,28 @@ def _scopes(
     # Condensed DAG edges between SCCs, plus agent-to-agent parent tracking.
     dag_adj: dict[int, list[int]] = {i: [] for i in range(len(sccs))}
     agent_parents: dict[int, set[int]] = {scc_id: set() for scc_id in scc_agents}
+    open_targets = {
+        ref: _uncovered_paths(tags) for ref, tags in own.items() if "egress_open" in tags
+    }
+    path_exposure: list[_Reach] = [{} for _ in sccs]
     for u, targets in adj.items():
         su = scc_of[u]
         seen_t: set[int] = set()
+        governing_agent = u in agent_refs and signals[u].explicitly_gated
+        if u in agent_refs and u in open_targets:
+            _merge(path_exposure[su], open_targets[u])
         for v in targets:
+            if v in open_targets:
+                # A parent's declaration can govern a direct tool binding. A sub-agent,
+                # indirect dependency or second unapproved route remains independent.
+                covered_binding = (
+                    governing_agent
+                    and (u, v) in declared_bindings
+                    and isinstance(by_ref[v], (ToolComponent, MCPServerComponent))
+                    and not signals[v].explicitly_ungated
+                )
+                if not covered_binding:
+                    _merge(path_exposure[su], open_targets[v])
             sv = scc_of[v]
             if sv != su and sv not in seen_t:
                 seen_t.add(sv)
@@ -966,7 +1002,7 @@ def _scopes(
     # Tarjan numbers a strongly connected component after everything it reaches.
     reach: list[_Reach] = []
     for scc_id, scc_members in enumerate(sccs):
-        merged: _Reach = {}
+        merged = path_exposure[scc_id]
         for ref in scc_members:
             _merge(merged, own[ref])
         for child in dag_adj[scc_id]:
@@ -1104,6 +1140,7 @@ def _scope_findings(
                     sig.locator,
                     comp.assurance_level,
                     assume_declared_approvals
+                    and tag not in {"path_egress", "path_sink"}
                     and (gated_owner or sig.explicitly_gated)
                     and not sig.explicitly_ungated,
                 )
@@ -1113,7 +1150,7 @@ def _scope_findings(
     findings: list[FlowFinding] = []
     untrusted = items("untrusted")
     private = items("private")
-    open_egress = items("egress_forced" if gated_owner else "egress_open")
+    open_egress = items("path_egress")
     egress = open_egress
     if not egress and not assume_declared_approvals:
         egress = items("egress")
@@ -1152,9 +1189,7 @@ def _scope_findings(
     # Item 24: Chained toxic flow across two distinct components where neither alone
     # is EXFIL_CAPABLE (linear time without materializing Cartesian pairs).
     chained_sources = items("source")
-    sink_tag = "sink"
-    if assume_declared_approvals:
-        sink_tag = "sink_forced" if gated_owner else "sink_open"
+    sink_tag = "path_sink" if assume_declared_approvals else "sink"
     chained_sinks = items(sink_tag)
     source_refs = {src.component_ref for src in chained_sources}
     sink_refs = {snk.component_ref for snk in chained_sinks}
@@ -1176,7 +1211,14 @@ def _scope_findings(
                     f"Scope '{scope_ref}' enables a chained toxic flow across "
                     f"{'at least ' if capped else ''}{len(pair_refs)} distinct components "
                     f"({', '.join(pair_refs)}) where "
-                    "private data from one component can leave through a sink with unverified approval enforcement."
+                    "private data from one component can leave through "
+                    + (
+                        "an ungated sink."
+                        if any(
+                            signals[sink.component_ref].explicitly_ungated for sink in active_sinks
+                        )
+                        else "a sink with unverified approval enforcement."
+                    )
                 ),
                 component_refs=pair_refs,
                 evidence=(

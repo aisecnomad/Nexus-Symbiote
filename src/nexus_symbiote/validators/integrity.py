@@ -80,6 +80,11 @@ _IMPORTED_EVIDENCE_GAPS = frozenset(
 """Unknown-evidence categories that a bound imported claim reports without blocking."""
 _BLOCKING = {"critical", "error"}
 _SEVERITY_RANK = {"critical": 0, "error": 0, "unknown": 1, "warning": 2, "info": 3}
+# These critical findings describe model use independently of a verified byte identity.
+_MODEL_BEHAVIOR_RISKS = {
+    "unsafe_format": "serialization_format",
+    "trust_remote_code": "code_execution",
+}
 
 
 @dataclass
@@ -111,6 +116,8 @@ class IntegrityReport:
     issues_omitted: int = 0
     omitted_severities: set[str] = field(default_factory=set)
     model_policy_evidence: dict[str, ModelPolicyEvidence] = field(default_factory=dict)
+    # Integrity category to inventory risk category, retained before display truncation.
+    model_behavior_risks: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @property
     def status(self) -> Literal["pass", "fail", "unknown"]:
@@ -378,10 +385,15 @@ class IntegrityValidator:
                     )
             self._check_file_hash(comp, project_root, report)
             # Matching artifact bytes and safe model behavior are separate facts.
-            if any(
-                issue.category not in {"unsafe_format", "trust_remote_code"}
-                for issue in report.issues[first_issue:]
-            ):
+            component_issues = report.issues[first_issue:]
+            behavior = {
+                issue.category: _MODEL_BEHAVIOR_RISKS[issue.category]
+                for issue in component_issues
+                if issue.category in _MODEL_BEHAVIOR_RISKS
+            }
+            if behavior:
+                report.model_behavior_risks[comp.bom_ref] = behavior
+            if any(issue.category not in _MODEL_BEHAVIOR_RISKS for issue in component_issues):
                 report.model_policy_evidence.pop(comp.bom_ref, None)
             if comp.bom_ref in bound_imports and is_imported(comp):
                 for issue in report.issues[first_issue:]:
