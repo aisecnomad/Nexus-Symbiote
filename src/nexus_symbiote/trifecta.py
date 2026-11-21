@@ -27,6 +27,7 @@ import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import islice
 from typing import Any
 
 from nexus_symbiote.core.aibom import AIBOM
@@ -583,36 +584,37 @@ def _is_explicitly_ungated(component: AnyComponent) -> bool:
     return False
 
 
-def _has_explicit_approval_gate(component: AnyComponent, now: datetime) -> bool:
-    """Check whether typed approval declarations cover the component.
-
-    Untrusted ad-hoc properties (such as ``properties.requires_approval`` or
-    ``properties.effective_authorization_verified``) are ignored, and so is an IDE
-    starting mode: no collector verifies the approval a host enforces. Authorization
-    records gate only when every one requires approval and is unexpired, and one of
-    them covers every action or all egress on an unrestricted resource.
-    """
+def _approval_state(
+    component: AnyComponent, now: datetime, assume_declared_approvals: bool
+) -> tuple[bool, bool]:
+    """Return (declared gate, explicit opt-out) for the selected approval policy."""
     if _is_explicitly_ungated(component):
-        return False
-
-    records = [
-        r
-        for r in (getattr(component, "authorizations", None) or ())
-        if isinstance(r, AuthorizationRecord)
-    ]
-    if any(r.approval_required is not True or not _unexpired(r, now) for r in records):
-        return False
+        return False, True
     decl = getattr(component, "capabilities", None)
-    if (
+    required = (
         isinstance(decl, CapabilityDeclaration)
         and decl.human_in_the_loop is HumanInTheLoop.REQUIRED
-    ):
-        return True
-
-    return any(
-        r.action in _GATING_ACTIONS and r.resource_scope in (None, "*") and not r.conditions
+    )
+    # The explicit modeling API historically gives a required declaration precedence.
+    if assume_declared_approvals and required:
+        return True, False
+    records = [
+        r
+        for r in getattr(component, "authorizations", ()) or ()
+        if isinstance(r, AuthorizationRecord)
+    ]
+    for record in records:
+        if not assume_declared_approvals and record.action == "read":
+            continue
+        if record.approval_required is not True or not _unexpired(record, now):
+            return False, not assume_declared_approvals
+    broad = any(
+        r.action in _GATING_ACTIONS
+        and r.resource_scope in (None, "*")
+        and (assume_declared_approvals or not r.conditions)
         for r in records
     )
+    return required or broad, False
 
 
 def _unexpired(record: AuthorizationRecord, now: datetime) -> bool:
@@ -823,6 +825,8 @@ def _own_reach(sig: _ComponentSignals) -> _Reach:
         tags.extend(("egress", "sink") if chained else ("egress",))
         if not sig.explicitly_gated:
             tags.extend(("egress_open", "sink_open") if chained else ("egress_open",))
+        if sig.explicitly_ungated:
+            tags.extend(("egress_forced", "sink_forced") if chained else ("egress_forced",))
     if isinstance(comp, IDEAgentComponent) and sig.explicitly_ungated:
         tags.append("ungated_ide")
     if isinstance(comp, (MCPServerComponent, ToolComponent)):
@@ -839,12 +843,11 @@ def _merge(into: _Reach, other: _Reach) -> None:
             into[tag] = tuple(sorted({*have, *refs})[:EVIDENCE_LIMIT])
 
 
-def _uncovered_paths(reach: _Reach) -> _Reach:
+def _uncovered_paths(reach: _Reach, *, all_egress: bool = False) -> _Reach:
     """The open egress reached without a directly governing approval declaration."""
+    suffix = "" if all_egress else "_open"
     return {
-        path: reach[tag]
-        for tag, path in (("egress_open", "path_egress"), ("sink_open", "path_sink"))
-        if tag in reach
+        "path_" + leg: reach[leg + suffix] for leg in ("egress", "sink") if leg + suffix in reach
     }
 
 
@@ -889,16 +892,41 @@ def _scopes(
 
     adj: dict[str, list[str]] = {ref: [] for ref in by_ref}
     declared_bindings: set[tuple[str, str]] = set()
+    # Inventory containment is evidence of visibility. It does not introduce a
+    # second caller for a tool already directly bound by the governing agent.
+    contained: dict[str, set[str]] = {}
+    independent: set[tuple[str, str]] = set()
+
+    def containment(source: str, target: str) -> None:
+        contained.setdefault(source, set()).add(target)
+
     for dep in bom.dependencies:
         if dep.source_ref in by_ref and dep.target_ref in by_ref:
             adj[dep.source_ref].append(dep.target_ref)
-            if dep.relationship in {"invokes", "configured-with"}:
+            if (
+                dep.relationship == "provides-tool"
+                and isinstance(by_ref[dep.source_ref], MCPServerComponent)
+                and isinstance(by_ref[dep.target_ref], ToolComponent)
+            ):
+                containment(dep.source_ref, dep.target_ref)
+            elif dep.relationship in {"invokes", "configured-with"}:
                 declared_bindings.add((dep.source_ref, dep.target_ref))
+            else:
+                independent.add((dep.source_ref, dep.target_ref))
 
     clients_by_host: dict[str, list[MCPClientComponent]] = {}
     for comp in bom.components:
         if isinstance(comp, AgentComponent):
             declared_bindings.update((comp.bom_ref, ref) for ref in comp.tool_refs)
+            independent.update(
+                (comp.bom_ref, ref)
+                for ref in (
+                    *comp.data_refs,
+                    *comp.memory_refs,
+                    *comp.skill_refs,
+                    *comp.sub_agent_refs,
+                )
+            )
             for ref in (
                 *comp.tool_refs,
                 *comp.data_refs,
@@ -919,8 +947,12 @@ def _scopes(
             for ref in comp.server_refs:
                 if ref in by_ref:
                     adj[comp.bom_ref].append(ref)
+                    if isinstance(by_ref[ref], MCPServerComponent):
+                        containment(comp.bom_ref, ref)
         elif isinstance(comp, ToolComponent) and comp.mcp_server_ref in by_ref:
             adj[comp.mcp_server_ref].append(comp.bom_ref)
+            if isinstance(by_ref[comp.mcp_server_ref], MCPServerComponent):
+                containment(comp.mcp_server_ref, comp.bom_ref)
 
     for comp in agents:
         if isinstance(comp, IDEAgentComponent) and not comp.mcp_server_refs and comp.ide_type:
@@ -950,24 +982,83 @@ def _scopes(
         ref: _uncovered_paths(tags) for ref, tags in own.items() if "egress_open" in tags
     }
     path_exposure: list[_Reach] = [{} for _ in sccs]
+    # A client lists servers, and a server lists tools. Those two typed layers
+    # preserve the incoming caller. An invocation or other dependency starts an
+    # independent route, even alongside a containment edge between the same refs.
+    open_members: dict[str, dict[str, list[str]]] = {}
+    for container, members in contained.items():
+        open_members[container] = {
+            tag: [v for v in sorted(members) if tag in open_targets.get(v, {})]
+            for tag in ("path_egress", "path_sink")
+        }
+    # Cache the ordinary uncovered sample. The common case of shared, unbound
+    # catalogs costs one scan, regardless of how many agents reference a client.
+    nested = {
+        ref: sorted(v for v in values if v in contained)
+        for ref, values in contained.items()
+        if isinstance(by_ref[ref], MCPClientComponent)
+    }
+    ordinary: dict[str, _Reach] = {}
+    for ref in sorted(contained, key=lambda r: isinstance(by_ref[r], MCPClientComponent)):
+        gaps = {
+            tag: tuple(values[:EVIDENCE_LIMIT])
+            for tag, values in open_members[ref].items()
+            if values
+        }
+        for server in nested.get(ref, ()):
+            _merge(gaps, ordinary[server])
+        ordinary[ref] = gaps
+
+    def containment_gaps(
+        owner: str, target: str, binding: bool, visited: set[tuple[str, bool]]
+    ) -> _Reach:
+        sample = ordinary[target]
+        if not binding or all(
+            (owner, ref) not in declared_bindings or signals[ref].explicitly_ungated
+            for refs in sample.values()
+            for ref in refs
+        ):
+            return sample
+        gaps: _Reach = {}
+        for container in (target, *nested.get(target, ())):
+            if (container, binding) in visited:
+                continue
+            visited.add((container, binding))
+            for tag, elements in open_members[container].items():
+                unbound = (
+                    ref
+                    for ref in elements
+                    if (owner, ref) not in declared_bindings or signals[ref].explicitly_ungated
+                )
+                remaining = tuple(islice(unbound, EVIDENCE_LIMIT))
+                if remaining:
+                    _merge(gaps, {tag: remaining})
+        return gaps
+
     for u, targets in adj.items():
         su = scc_of[u]
         seen_t: set[int] = set()
         governing_agent = u in agent_refs and signals[u].explicitly_gated
-        if u in agent_refs and u in open_targets:
+        visited_containers: set[tuple[str, bool]] = set()
+        if u in agent_refs and u in open_targets and not assume_declared_approvals:
             _merge(path_exposure[su], open_targets[u])
         for v in targets:
-            if v in open_targets:
-                # A parent's declaration can govern a direct tool binding. A sub-agent,
-                # indirect dependency or second unapproved route remains independent.
-                covered_binding = (
-                    governing_agent
-                    and (u, v) in declared_bindings
+            edge = (u, v)
+            passive_only = (
+                v in contained.get(u, ())
+                and edge not in independent
+                and edge not in declared_bindings
+            )
+            if not assume_declared_approvals and not passive_only:
+                binding = governing_agent and edge in declared_bindings and edge not in independent
+                if v in open_targets and not (
+                    binding
                     and isinstance(by_ref[v], (ToolComponent, MCPServerComponent))
                     and not signals[v].explicitly_ungated
-                )
-                if not covered_binding:
+                ):
                     _merge(path_exposure[su], open_targets[v])
+                if v in contained:
+                    _merge(path_exposure[su], containment_gaps(u, v, binding, visited_containers))
             sv = scc_of[v]
             if sv != su and sv not in seen_t:
                 seen_t.add(sv)
@@ -1007,6 +1098,8 @@ def _scopes(
             _merge(merged, own[ref])
         for child in dag_adj[scc_id]:
             _merge(merged, reach[child])
+        if not assume_declared_approvals and scc_id in scc_agents and not scc_gated[scc_id]:
+            _merge(merged, _uncovered_paths(merged, all_egress=True))
         reach.append(merged)
 
     covered = set(scc_agents)
@@ -1041,14 +1134,18 @@ def _scopes(
             _merge(scope, workspace)
         if scope_legs & scope.keys():
             _merge(scope, pool)
+        if not assume_declared_approvals and not scc_gated[scc_id]:
+            _merge(scope, _uncovered_paths(scope, all_egress=True))
         result.append((scc_agents[scc_id][0].bom_ref, scc_gated[scc_id], scope))
     if unbound:
         result.append(("inventory:unscoped", False, pool))
     return result
 
 
-def _evidence_entry(leg: str, item: LegEvidence) -> dict[str, Any]:
-    return {
+def _evidence_entry(
+    leg: str, item: LegEvidence, *, egress_approval_declared: bool | None = None
+) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
         "leg": leg,
         "component_ref": item.component_ref,
         "component_name": item.component_name,
@@ -1057,6 +1154,10 @@ def _evidence_entry(leg: str, item: LegEvidence) -> dict[str, Any]:
         "assurance": item.assurance.value,
         "gated": item.gated,
     }
+    if egress_approval_declared is not None:
+        evidence["egress_approval_declared"] = egress_approval_declared
+        evidence["approval_enforcement_verified"] = False
+    return evidence
 
 
 def _detect_shadowing(bom: AIBOM) -> tuple[list[FlowFinding], set[str]]:
@@ -1150,7 +1251,11 @@ def _scope_findings(
     findings: list[FlowFinding] = []
     untrusted = items("untrusted")
     private = items("private")
-    open_egress = items("path_egress")
+    open_egress = (
+        items("egress_forced" if gated_owner else "egress_open")
+        if assume_declared_approvals
+        else items("path_egress")
+    )
     egress = open_egress
     if not egress and not assume_declared_approvals:
         egress = items("egress")
@@ -1176,7 +1281,16 @@ def _scope_findings(
                 evidence=(
                     *(_evidence_entry("untrusted_input", i) for i in untrusted),
                     *(_evidence_entry("private_data", i) for i in private),
-                    *(_evidence_entry("egress", i) for i in egress),
+                    *(
+                        _evidence_entry(
+                            "egress",
+                            i,
+                            egress_approval_declared=None
+                            if assume_declared_approvals
+                            else not open_egress,
+                        )
+                        for i in egress
+                    ),
                 ),
                 recommendation=(
                     "Break at least one leg of the trifecta or enforce an explicit "
@@ -1189,7 +1303,9 @@ def _scope_findings(
     # Item 24: Chained toxic flow across two distinct components where neither alone
     # is EXFIL_CAPABLE (linear time without materializing Cartesian pairs).
     chained_sources = items("source")
-    sink_tag = "path_sink" if assume_declared_approvals else "sink"
+    sink_tag = (
+        ("sink_forced" if gated_owner else "sink_open") if assume_declared_approvals else "sink"
+    )
     chained_sinks = items(sink_tag)
     source_refs = {src.component_ref for src in chained_sources}
     sink_refs = {snk.component_ref for snk in chained_sinks}
@@ -1214,8 +1330,10 @@ def _scope_findings(
                     "private data from one component can leave through "
                     + (
                         "an ungated sink."
-                        if any(
-                            signals[sink.component_ref].explicitly_ungated for sink in active_sinks
+                        if not assume_declared_approvals
+                        and any(
+                            len(source_refs) > 1 or ref not in source_refs
+                            for ref in reach.get("path_sink", ())
                         )
                         else "a sink with unverified approval enforcement."
                     )
@@ -1247,6 +1365,7 @@ def analyze_trifecta(
     signals: dict[str, _ComponentSignals] = {}
     for comp in bom.components:
         rc = classify(comp)
+        gated, ungated = _approval_state(comp, moment, assume_declared_approvals)
         signals[comp.bom_ref] = _ComponentSignals(
             component=comp,
             risk_classification=rc,
@@ -1254,8 +1373,8 @@ def analyze_trifecta(
             untrusted_basis=_untrusted_input_basis(comp, rc),
             private_basis=_private_data_basis(comp, rc),
             egress_basis=_egress_basis(comp, rc),
-            explicitly_gated=_has_explicit_approval_gate(comp, moment),
-            explicitly_ungated=_is_explicitly_ungated(comp),
+            explicitly_gated=gated,
+            explicitly_ungated=ungated,
         )
 
     scopes = _scopes(bom, signals, assume_declared_approvals)

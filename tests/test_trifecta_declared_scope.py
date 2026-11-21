@@ -72,6 +72,8 @@ def test_individually_gated_egress_keeps_its_own_coverage(tmp_path, unbound):
     outbound.capabilities.human_in_the_loop = HumanInTheLoop.REQUIRED
     parent = _gated_owner([reader.bom_ref, private.bom_ref])
     idle = AgentComponent(bom_ref="agent:worker", name="worker")
+    if not unbound:
+        idle.capabilities = CapabilityDeclaration(human_in_the_loop=HumanInTheLoop.REQUIRED)
     parent.sub_agent_refs.append(idle.bom_ref)
     if not unbound:
         idle.tool_refs.append(outbound.bom_ref)
