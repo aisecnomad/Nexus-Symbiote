@@ -289,6 +289,48 @@ decisions:
         load_vex_decisions(dup_file)
 
 
+@pytest.mark.parametrize(
+    ("deployment", "state", "status"),
+    [
+        ("production", "not_affected", "active"),
+        ("staging", "in_triage", "scope-mismatch"),
+        (None, "in_triage", "scope-mismatch"),
+    ],
+)
+def test_vex_cli_scopes_suppression_to_deployment_and_exact_file_bytes(
+    tmp_path, deployment, state, status
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    inventory = project / "inventory.json"
+    # A valid noncanonical serialization distinguishes the file digest from a reserialization.
+    raw = _three_component_bom().to_native_json().encode() + b"\n\n"
+    inventory.write_bytes(raw)
+    ref = "tool:never-loaded"
+    fid = finding_id(ref, "unpinned_tool", "Tool definition is unpinned")
+    decision = {
+        "id": fid,
+        "component_ref": ref,
+        "inventory_sha256": hash_bytes(raw),
+        "deployment_id": "production",
+        "state": "not_affected",
+        "justification": "protected_at_runtime",
+        "detail": "Production policy blocks this tool",
+        "owner": "security",
+        "expires_at": "2099-01-01T00:00:00Z",
+    }
+    decisions = tmp_path / "decisions.yaml"
+    decisions.write_text(json.dumps({"version": 1, "decisions": [decision]}), encoding="utf-8")
+    args = ["vex", str(inventory), "--decisions", str(decisions), "--project-root", str(project)]
+    if deployment is not None:
+        args.extend(["--deployment-id", deployment])
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == 0, result.output
+    entry = next(v for v in json.loads(result.output)["vulnerabilities"] if v["id"] == fid)
+    assert entry["analysis"]["state"] == state
+    assert {"name": "nexus-symbiote:vexDecisionStatus", "value": status} in entry["properties"]
+
+
 def test_vex_confinement_refuses_in_repo_without_project_root_symlinks_and_hardlinks(
     tmp_path, monkeypatch
 ):
