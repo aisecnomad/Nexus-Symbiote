@@ -27,6 +27,7 @@ from nexus_symbiote.core.models import (
 )
 from nexus_symbiote.policy import PolicyError, parse_yaml_mapping
 from nexus_symbiote.scanners.credential_files import credential_gap, credential_shaped
+from nexus_symbiote.scanners.mcp_launch import package_runner_operands
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.jsonc import strip_jsonc
 from nexus_symbiote.utils.secrets import redact_text
@@ -203,7 +204,9 @@ def _normalize_rel_candidate(token: str, *, allow_any_file: bool = False) -> str
 
 
 def _extract_local_script_target(
-    tokens: list[str], project_paths: frozenset[str] = frozenset()
+    tokens: list[str],
+    project_paths: frozenset[str] = frozenset(),
+    files: ConfinedCollection | None = None,
 ) -> str | None:
     if not tokens:
         return None
@@ -212,26 +215,52 @@ def _extract_local_script_target(
     direct = _normalize_rel_candidate(first)
     if direct is not None and base not in RUNTIME_LAUNCHERS:
         return direct
-    if base in RUNTIME_LAUNCHERS:
-        for arg in tokens[1:]:
-            if arg in {"-c", "-e", "-m"}:
+    if base not in RUNTIME_LAUNCHERS:
+        return None
+    args = tokens[1:]
+    package_program = ""
+    if base in PACKAGE_RUNNERS:
+        operands = package_runner_operands(base, args)
+        if operands is None:
+            if files is not None:
+                files.failures.append(
+                    f"{base}: unrecognized package-runner options for script binding"
+                )
+            return None
+        if not operands:
+            return None
+        package, *args = operands
+        # An unqualified name in the package position is resolved by the runner.
+        # A same-named checkout file cannot substitute for that package.
+        if (
+            package.startswith("./")
+            or _PROJECT_DIR_RE.match(package)
+            or (
+                not package.startswith("@") and "/" in package and package.endswith(SCRIPT_SUFFIXES)
+            )
+        ):
+            return _normalize_rel_candidate(package)
+        if base == "npx" and (
+            package == "@modelcontextprotocol/server-filesystem"
+            or package.startswith("@modelcontextprotocol/server-filesystem@")
+        ):
+            return None  # This server's positional operands are filesystem roots.
+        package_program = package.rsplit("/", 1)[-1].partition("@")[0]
+    for arg in args:
+        if arg in {"-c", "-e", "-m"}:
+            return None
+        candidate = _normalize_rel_candidate(arg, allow_any_file=True)
+        if candidate is None or candidate == ".":
+            continue
+        path = posixpath.normpath(candidate)
+        if _normalize_rel_candidate(arg) is None and path not in project_paths:
+            continue
+        if base in PACKAGE_RUNNERS and files is not None and files.is_directory(path):
+            if package_program in RUNTIME_LAUNCHERS or package_program == "ts-node":
+                files.failures.append(f"{path}: directory entry point is unresolved")
                 return None
-            if base in PACKAGE_RUNNERS:
-                # A bare operand may be a package locator. Bind it if the confined
-                # project listing identifies a file, even without a script suffix.
-                local = _normalize_rel_candidate(arg, allow_any_file=True)
-                if local is not None and (path := posixpath.normpath(local)) in project_paths:
-                    return path
-                if not (
-                    arg.startswith("./")
-                    or _PROJECT_DIR_RE.match(arg)
-                    or arg.endswith(SCRIPT_SUFFIXES)
-                ):
-                    continue
-            if not arg.startswith(("-", "@")):
-                cand = _normalize_rel_candidate(arg)
-                if cand is not None:
-                    return cand
+            continue
+        return path
     return None
 
 
@@ -464,16 +493,17 @@ def _bind_script_target(
 
 def _iter_hook_commands(doc: dict[str, Any]) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
-    for event_name, entries in _as_dict(doc.get("hooks")).items():
+    for raw_event, entries in _as_dict(doc.get("hooks")).items():
+        event_name = _clean(raw_event)
         for entry in _as_list(entries):
             if isinstance(entry, str):
-                out.append((str(event_name), entry))
+                out.append((event_name, entry))
             elif isinstance(entry, dict):
                 if isinstance(entry.get("command"), str):
-                    out.append((str(event_name), entry["command"]))
+                    out.append((event_name, entry["command"]))
                 for sub in _as_list(entry.get("hooks")):
                     if isinstance(sub, dict) and isinstance(sub.get("command"), str):
-                        out.append((str(event_name), sub["command"]))
+                        out.append((event_name, sub["command"]))
     return out
 
 
@@ -492,7 +522,7 @@ def _inspect_hooks_and_preambles(
                     command_digest=_sha256_hex(cmd_str.encode()),
                 )
             )
-            target = _extract_local_script_target(_tokenize_command(cmd_str), project_paths)
+            target = _extract_local_script_target(_tokenize_command(cmd_str), project_paths, files)
             if target is not None:
                 rec = _bind_script_target(
                     files,
@@ -535,7 +565,7 @@ def _inspect_hooks_and_preambles(
                 skill_path,
                 skill_ref,
             )
-            target = _extract_local_script_target(_tokenize_command(cmd_body), project_paths)
+            target = _extract_local_script_target(_tokenize_command(cmd_body), project_paths, files)
             if target is not None:
                 _bind_script_target(
                     files,
@@ -696,7 +726,7 @@ def _inspect_mcp_launchers_and_bridges(
                 )
                 continue
 
-            target = _extract_local_script_target(tokens, project_paths)
+            target = _extract_local_script_target(tokens, project_paths, files)
             props = {"registry_origin": reg_origin} if reg_origin else {}
             if target is not None:
                 rec = _bind_script_target(
@@ -1350,30 +1380,15 @@ def diff_control_plane_audits(
     return alerts
 
 
-def audit_project_control_plane(
+def _collect_control_plane(
     project_root: Path,
-    *,
-    claims_path: Path | None = None,
-    baseline_root: Path | None = None,
-    live_versions: dict[str, str] | None = None,
-    trace_reported_refs: frozenset[str] = frozenset(),
-    live_observed_refs: frozenset[str] = frozenset(),
-) -> ControlPlaneAuditSummary:
-    """Run confined control-plane audit across hook targets, bridges, steering, CI, and identities."""
-    summary = ControlPlaneAuditSummary()
+    summary: ControlPlaneAuditSummary,
+    claims: dict[str, Any] | None,
+    live_versions: dict[str, str],
+) -> None:
     decl_sources: list[tuple[str, dict[str, Any], AssuranceLevel]] = []
-    if claims_path is not None:
-        try:
-            with open_regular_file(claims_path) as stream:
-                raw_claims = stream.read(4_194_304).decode("utf-8", errors="replace")
-            parsed = parse_json_strict(raw_claims)
-            if isinstance(parsed, dict):
-                decl_sources.append(("shadowscan:claims", parsed, AssuranceLevel.DECLARED))
-            else:
-                summary.gaps.append(f"{claims_path.name}: claims file is not a JSON object")
-        except (OSError, ValueError, RecursionError):
-            summary.gaps.append(f"{claims_path.name}: invalid JSON")
-
+    if claims is not None:
+        decl_sources.append(("shadowscan:claims", claims, AssuranceLevel.DECLARED))
     with ConfinedCollection(project_root, summary.gaps) as files:
         all_paths = sorted(p.as_posix() for p in files.iter_files())
         project_paths = frozenset(all_paths)
@@ -1386,15 +1401,40 @@ def audit_project_control_plane(
                     except (PolicyError, ValueError, RecursionError):
                         summary.gaps.append(f"{decl_path}: invalid YAML")
         _inspect_hooks_and_preambles(files, all_paths, project_paths, summary)
-        _inspect_mcp_launchers_and_bridges(
-            files, all_paths, project_paths, summary, live_versions or {}
-        )
+        _inspect_mcp_launchers_and_bridges(files, all_paths, project_paths, summary, live_versions)
         _inspect_steering_surfaces(files, all_paths, summary)
         _inspect_workflows_and_claims(files, all_paths, summary, decl_sources)
         _inspect_identities_and_authority(summary, decl_sources)
 
+
+def audit_project_control_plane(
+    project_root: Path,
+    *,
+    claims_path: Path | None = None,
+    baseline_root: Path | None = None,
+    live_versions: dict[str, str] | None = None,
+    trace_reported_refs: frozenset[str] = frozenset(),
+    live_observed_refs: frozenset[str] = frozenset(),
+) -> ControlPlaneAuditSummary:
+    """Run confined control-plane audit across hook targets, bridges, steering, CI, and identities."""
+    summary = ControlPlaneAuditSummary()
+    claims: dict[str, Any] | None = None
+    if claims_path is not None:
+        try:
+            with open_regular_file(claims_path) as stream:
+                raw_claims = stream.read(4_194_304).decode("utf-8", errors="replace")
+            parsed = parse_json_strict(raw_claims)
+            if isinstance(parsed, dict):
+                claims = parsed
+            else:
+                summary.gaps.append(f"{claims_path.name}: claims file is not a JSON object")
+        except (OSError, ValueError, RecursionError):
+            summary.gaps.append(f"{claims_path.name}: invalid JSON")
+
+    _collect_control_plane(project_root, summary, claims, live_versions or {})
     if baseline_root is not None:
-        base_summary = audit_project_control_plane(baseline_root)
+        base_summary = ControlPlaneAuditSummary()
+        _collect_control_plane(baseline_root, base_summary, claims, {})
         # An unreadable baseline hides what changed, so its gaps fail the gate too.
         summary.gaps.extend(f"baseline: {gap}" for gap in base_summary.gaps)
         summary.reach_alerts = diff_control_plane_audits(

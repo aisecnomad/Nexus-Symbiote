@@ -2504,6 +2504,20 @@ def _npx(name: str, rest: list[str], launch: Launch) -> None:
     _npm_exec(parsed.options, parsed.remain, launch)
 
 
+def package_runner_operands(name: str, args: list[str]) -> list[str] | None:
+    """Return the execution operands after npx/uvx options, or None for unknown syntax."""
+    if name == "npx":
+        argv = _npx_argv(args)
+        parsed = _nopt(["exec", *argv]) if argv is not None else None
+        if parsed is None or parsed.failure is not None:
+            return None
+        return parsed.remain[1:]
+    if name == "uvx":
+        scanned = _scan(args, _UV_TOOL_RUN)
+        return args[scanned[1] :] if scanned is not None else None
+    raise ValueError("expected npx or uvx")
+
+
 def _subcommand(
     rest: list[str], table: _Options, launch: Launch
 ) -> tuple[str, list[str], list[tuple[str, str | None]]] | None:
