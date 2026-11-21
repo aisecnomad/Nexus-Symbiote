@@ -12,6 +12,7 @@ Trace outcomes are observations only. ``NEXUS-`` identifiers match no public dat
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from datetime import datetime
@@ -31,6 +32,7 @@ from nexus_symbiote.generators.sarif import SEVERITY_ORDER, plain_text
 from nexus_symbiote.generators.validation import require_valid
 from nexus_symbiote.vex_decisions import (
     ExecutionEvidence,
+    LoadedAdvisoryReport,
     LoadedVEXDecisions,
     resolve_reference_time,
 )
@@ -41,6 +43,14 @@ _SERIAL = re.compile(
 )
 _CDX_SEVERITIES = frozenset({"critical", "high", "medium", "low", "info", "none", "unknown"})
 _SUPPRESSING_STATES = frozenset({"not_affected", "resolved", "false_positive"})
+
+
+def _joined(values: list[Any], field: str) -> str:
+    """Comma-join identifiers, refusing one that holds the delimiter and would read as two."""
+    items = [value for value in values if isinstance(value, str)]
+    if any("," in item for item in items):
+        raise ValueError(f"Advisory {field} entries must not contain ','")
+    return ",".join(items)
 
 
 def finding_id(component_ref: str, category: str, detail: str) -> str:
@@ -64,10 +74,12 @@ def _resolve_analysis(
     expired_warnings: list[str],
     inventory_sha256: str | None,
     deployment_id: str | None,
+    advisory_complete: bool = True,
 ) -> dict[str, Any]:
     analysis: dict[str, Any] = {"state": "in_triage", "detail": default_detail}
     decision = decisions.lookup(vuln_id, component_ref) if decisions is not None else None
     if decision is not None:
+        owner = plain_text(decision.owner)
         if (
             decision.expires_at is not None
             and ref_time is not None
@@ -75,16 +87,17 @@ def _resolve_analysis(
         ):
             warning = (
                 f"Expired operator VEX decision for {vuln_id} "
-                f"(owner={decision.owner}, expired_at={decision.expires_at.isoformat()}); "
+                f"(owner={owner}, expired_at={decision.expires_at.isoformat()}); "
                 "reverted to in_triage."
             )
             expired_warnings.append(warning)
             analysis["detail"] = f"{warning} {default_detail}"
             props["nexus-symbiote:vexDecisionStatus"] = "expired-reverted"
-            props["nexus-symbiote:vexDecisionOwner"] = decision.owner
+            props["nexus-symbiote:vexDecisionOwner"] = owner
             props["nexus-symbiote:vexDecisionExpiredAt"] = decision.expires_at.isoformat()
         elif decision.state in _SUPPRESSING_STATES and (
-            decision.component_ref != component_ref
+            not advisory_complete
+            or decision.component_ref != component_ref
             or decision.inventory_sha256 is None
             or decision.inventory_sha256 != inventory_sha256
             or decision.deployment_id is None
@@ -98,9 +111,9 @@ def _resolve_analysis(
             analysis["state"] = decision.state
             if decision.justification is not None:
                 analysis["justification"] = decision.justification
-            analysis["detail"] = f"{plain_text(decision.detail)} (owner: {decision.owner})"
+            analysis["detail"] = f"{plain_text(decision.detail)} (owner: {owner})"
             props["nexus-symbiote:vexDecisionStatus"] = "active"
-            props["nexus-symbiote:vexDecisionOwner"] = decision.owner
+            props["nexus-symbiote:vexDecisionOwner"] = owner
             if decision.expires_at is not None:
                 props["nexus-symbiote:vexDecisionExpiresAt"] = decision.expires_at.isoformat()
     elif execution_evidence is not None:
@@ -144,13 +157,19 @@ class VEXGenerator(Generator):
         decisions: LoadedVEXDecisions | None = None,
         execution_evidence: ExecutionEvidence | None = None,
         advisories: list[dict[str, Any]] | None = None,
+        advisory_report: LoadedAdvisoryReport | None = None,
         reference_time: datetime | None = None,
         inventory_sha256: str | None = None,
         deployment_id: str | None = None,
     ) -> None:
         self._decisions = decisions
         self._execution_evidence = execution_evidence
-        self._advisories = advisories or []
+        if advisory_report is not None and advisories is not None:
+            raise ValueError("Supply one advisory source")
+        self._advisory_report = advisory_report
+        self._advisories = (
+            advisory_report.advisories if advisory_report is not None else advisories or []
+        )
         self._reference_time = reference_time
         self._inventory_sha256 = inventory_sha256
         self._deployment_id = deployment_id
@@ -272,18 +291,24 @@ class VEXGenerator(Generator):
                 ),
             }
             if isinstance(adv.get("aliases"), list) and adv["aliases"]:
-                props["nexus-symbiote:aliases"] = ",".join(
-                    str(a) for a in adv["aliases"] if isinstance(a, str)
-                )
-            in_kev = bool(adv.get("in_kev"))
+                props["nexus-symbiote:aliases"] = _joined(adv["aliases"], "aliases")
+            in_kev = adv.get("in_kev")
+            if in_kev is None:
+                in_kev = False
+            elif not isinstance(in_kev, bool):
+                # The string "false" is truthy: a coerced flag would invert KEV handling.
+                raise ValueError("Advisory in_kev must be a JSON boolean")
             if in_kev:
                 props["nexus-symbiote:inKev"] = "true"
                 if isinstance(adv.get("kev_sources"), list) and adv["kev_sources"]:
-                    props["nexus-symbiote:kevSources"] = ",".join(
-                        str(s) for s in adv["kev_sources"] if isinstance(s, str)
-                    )
-            if isinstance(adv.get("epss_score"), (int, float)):
-                props["nexus-symbiote:epssScore"] = f"{float(adv['epss_score']):.6f}"
+                    props["nexus-symbiote:kevSources"] = _joined(adv["kev_sources"], "kev_sources")
+            epss = adv.get("epss_score")
+            if epss is not None:
+                if isinstance(epss, bool) or not isinstance(epss, (int, float)):
+                    raise ValueError("Advisory epss_score must be a JSON number")
+                if not math.isfinite(epss):
+                    raise ValueError("Advisory epss_score must be finite")
+                props["nexus-symbiote:epssScore"] = f"{float(epss):.6f}"
             if adv.get("range_undecidable") is True:
                 props["nexus-symbiote:rangeUndecidable"] = "true"
             summary = plain_text(
@@ -301,6 +326,8 @@ class VEXGenerator(Generator):
                 expired_warnings=expired_warnings,
                 inventory_sha256=decision_subject,
                 deployment_id=self._deployment_id,
+                advisory_complete=self._advisory_report is None
+                or self._advisory_report.coverage == "complete",
             )
             vulnerabilities.append(
                 {
@@ -320,6 +347,24 @@ class VEXGenerator(Generator):
             )
 
         meta_props: list[dict[str, str]] = []
+        if self._inventory_sha256:
+            meta_props.append(
+                {"name": "nexus-symbiote:inventorySha256", "value": self._inventory_sha256}
+            )
+        if self._deployment_id:
+            meta_props.append({"name": "nexus-symbiote:deployment", "value": self._deployment_id})
+        if (report := self._advisory_report) is not None:
+            for name, report_value in (
+                ("ReportSha256", report.sha256),
+                ("Coverage", report.coverage),
+                ("Checked", report.checked),
+                ("Skipped", report.skipped),
+                ("Excluded", report.excluded),
+                ("Errors", report.errors),
+            ):
+                meta_props.append(
+                    {"name": "nexus-symbiote:advisory" + name, "value": str(report_value)}
+                )
         if omitted:
             meta_props.append({"name": OMITTED_IMPORTED_FINDINGS, "value": str(omitted)})
         if self._decisions is not None:
@@ -331,6 +376,20 @@ class VEXGenerator(Generator):
                 {"name": "nexus-symbiote:expiredVexDecisions", "value": str(len(expired_warnings))}
             )
         if self._execution_evidence is not None:
+            evidence = self._execution_evidence
+            meta_props.append(
+                {
+                    "name": "nexus-symbiote:traceAuthentication",
+                    "value": "attested" if evidence.attested else "unsigned",
+                }
+            )
+            if evidence.attestation_sha256:
+                meta_props.append(
+                    {
+                        "name": "nexus-symbiote:traceAttestationSha256",
+                        "value": evidence.attestation_sha256,
+                    }
+                )
             meta_props.append(
                 {
                     "name": "nexus-symbiote:traceEvidenceSha256",
@@ -342,8 +401,6 @@ class VEXGenerator(Generator):
             "bomFormat": "CycloneDX",
             "specVersion": "1.7",
             "version": bom.metadata.version,
-            "serialNumber": "urn:uuid:"
-            + str(uuid.uuid5(NAMESPACE, "nexus-symbiote-vex:" + serial)),
             "metadata": {
                 "tools": {
                     "components": [
@@ -372,5 +429,8 @@ class VEXGenerator(Generator):
                     "comment": "The inventory whose findings this document lists",
                 }
             ]
+        document["serialNumber"] = "urn:uuid:" + str(
+            uuid.uuid5(NAMESPACE, "nexus-symbiote/vex-content/v2:" + content_digest(document))
+        )
         require_valid(document, "cyclonedx")
         return document

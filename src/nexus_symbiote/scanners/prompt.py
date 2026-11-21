@@ -1029,11 +1029,13 @@ def _found_by_name(path: str, prompt_type: str | None, directory: object = None)
     if prompt_type == "imported-instruction":
         return False
     parts = PurePosixPath(path).parts
+    if not parts:
+        return False  # A supplied record without a path names no file.
     if path in INSTRUCTION_FILES or (len(parts) > 1 and parts[-1] in NESTED_INSTRUCTION_NAMES):
         return True
     if prompt_type == PROMPT_TEMPLATE_TYPE and _prompt_named(parts[-1]):
         return True
-    if directory in INSTRUCTION_DIRECTORIES and "." not in parts[-1]:
+    if isinstance(directory, str) and directory in INSTRUCTION_DIRECTORIES and "." not in parts[-1]:
         return True
     return "." not in parts[-1] and any(
         parts[: len(directory)] == directory and len(parts) > len(directory)
