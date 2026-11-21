@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import gc
 import importlib.util
+import os
 import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -203,3 +205,44 @@ def launcher_log(log: Path) -> list[list[object]]:
     if not log.exists():
         return []
     return [json.loads(line) for line in log.read_text().splitlines()]
+
+
+# Layouts in which someone other than the caller or root could replace a trust anchor.
+REPLACEABLE_ANCHOR_LAYOUTS = (
+    "group-writable file",
+    "group-writable parent",
+    "world-writable grandparent",
+    "foreign-owned grandparent",
+)
+
+
+def trust_anchor_in_layout(
+    base: Path, layout: str, name: str, data: bytes, monkeypatch: Any
+) -> Path:
+    """Write ``base/anchors/dir/name`` so the file or a directory above it fits ``layout``.
+
+    ``"sticky grandparent"`` is the accepted control: a world-writable sticky directory,
+    such as ``/tmp``, owned by the caller. A foreign owner is shown through ``os.lstat``
+    so the case runs without root.
+    """
+    grandparent = base / "anchors"
+    parent = grandparent / "dir"
+    parent.mkdir(parents=True)
+    path = parent / name
+    path.write_bytes(data)
+    path.chmod(0o664 if layout == "group-writable file" else 0o600)
+    parent.chmod(0o775 if layout == "group-writable parent" else 0o700)
+    modes = {"world-writable grandparent": 0o777, "sticky grandparent": 0o1777}
+    grandparent.chmod(modes.get(layout, 0o700))
+    if layout == "foreign-owned grandparent":
+        host_lstat = os.lstat
+        target = os.fspath(grandparent.absolute())
+
+        def lstat(entry: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            info = host_lstat(entry, *args, **kwargs)
+            if os.fspath(entry) == target:
+                return os.stat_result((*info[:4], 4242, *info[5:10]))
+            return info
+
+        monkeypatch.setattr(os, "lstat", lstat)
+    return path

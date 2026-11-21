@@ -43,6 +43,7 @@ from nexus_symbiote.runtime import (
     validation_fields,
     verify_contract,
 )
+from nexus_symbiote.utils.crypto import _trust_anchor_error
 from nexus_symbiote.utils.files import _parent, _relative
 from nexus_symbiote.utils.terminal import json_text
 
@@ -104,14 +105,19 @@ def _safe_error(exc: BaseException, operation: str) -> str:
     )
 
 
-def _read(path: Path, maximum: int = MAX_INPUT_BYTES, *, owner_only: str = "") -> bytes:
+def _read(
+    path: Path, maximum: int = MAX_INPUT_BYTES, *, owner_only: str = "", trust_anchor: str = ""
+) -> bytes:
     """Read a bounded regular file.
 
     With ``owner_only``, refuse a file that the effective user does not own or that its
-    group or others can access.
+    group or others can access. With ``trust_anchor``, refuse a file that someone other
+    than the effective user or root could replace.
     """
     with open_regular_file(path) as stream:
         info = os.fstat(stream.fileno())
+        if trust_anchor and (reason := _trust_anchor_error(path, info)) is not None:
+            raise _KeyFileError(f"{trust_anchor} {reason}")
         if owner_only and os.name == "posix":
             if stat.S_IMODE(info.st_mode) & 0o077:
                 raise _KeyFileError(f"{owner_only} must not be accessible to group or others")
@@ -294,7 +300,9 @@ def _load_private(path: Path, passphrase: bytes | None) -> Ed25519PrivateKey:
 
 def _load_public(path: Path) -> Ed25519PublicKey:
     try:
-        public = serialization.load_pem_public_key(_read(path, MAX_KEY_BYTES))
+        public = serialization.load_pem_public_key(
+            _read(path, MAX_KEY_BYTES, trust_anchor="public key file")
+        )
     except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
         raise _KeyFileError("public key could not be loaded") from exc
     if not isinstance(public, Ed25519PublicKey):

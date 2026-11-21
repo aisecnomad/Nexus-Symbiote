@@ -29,6 +29,7 @@ from nexus_symbiote.runtime import (
     tool_definition_digest,
 )
 from nexus_symbiote.runtime_cli import register_runtime_commands
+from tests.support import REPLACEABLE_ANCHOR_LAYOUTS, trust_anchor_in_layout
 
 
 def test_cli_sign_verify_and_wrong_purpose(tmp_path):
@@ -888,3 +889,26 @@ def test_register_refuses_a_ring_key_in_the_working_tree_of_its_inputs(tmp_path,
     assert alone.exit_code == 2 and MISPLACED in alone.output
     registered = run("register", snapshot, *rest, *ring_args(outside))
     assert registered.exit_code == 0, registered.output
+
+
+@pytest.mark.parametrize(
+    "layout", [*REPLACEABLE_ANCHOR_LAYOUTS, "world-writable file", "sticky grandparent"]
+)
+def test_runtime_public_key_that_another_user_could_replace_is_refused(
+    tmp_path, monkeypatch, layout
+):
+    from nexus_symbiote import runtime_cli
+
+    pem = (
+        Ed25519PrivateKey.generate()
+        .public_key()
+        .public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    )
+    key = trust_anchor_in_layout(tmp_path, layout, "trusted.pub", pem, monkeypatch)
+    if layout == "world-writable file":
+        key.chmod(0o666)
+    if layout == "sticky grandparent":
+        assert len(runtime_cli._ring((key,))) == 1
+        return
+    with pytest.raises(runtime_cli._KeyFileError, match="group- or world-writable"):
+        runtime_cli._ring((key,))

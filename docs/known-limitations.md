@@ -1852,9 +1852,11 @@ is a failure; everything below is neither a gap nor a failure.
 - **The trusted-key placement check is a heuristic.** It refuses a key inside a git
   working tree that holds the subject, the envelope or the current directory, also
   under another name for that tree directory, and a key file with other hard links.
-  It does not authenticate a key, check its owner or permissions, recognize a
-  checkout without a `.git` entry, or follow a key copied or mounted out of the
-  checkout, such as one reached through `docker run -v "$PWD/keys:/keys"`.
+  It does not authenticate a key, recognize a checkout without a `.git` entry
+  unless that checkout is the project an operator policy is checked against, or
+  follow a key copied or mounted out of the checkout, such as one reached through
+  `docker run -v "$PWD/keys:/keys"`. The owner and mode checks on the key and the
+  directories above it say only that no other user can replace it.
 - **Verification and use are separate reads.** Run `verify-attestation` and `diff`
   where the change under review cannot write between the two.
 - **The verifying build must read the inventory's format.** An attestation of a
@@ -2194,8 +2196,10 @@ is a failure; everything below is neither a gap nor a failure.
 - **The runtime key placement check is a heuristic.** `runtime verify` and
   `runtime register` refuse a public key inside a git working tree that holds an input
   file or the current directory, and a key file with other hard links, as
-  `verify-attestation` does. The check does not authenticate a key or check its owner,
-  and a key copied or mounted out of the checkout is accepted; a registrar given such a
+  `verify-attestation` does, and a key file that another user could replace, by the
+  [trusted keys](inventory-attestation.md#trusted-keys) ownership rule. The check does
+  not authenticate a key, and a key copied or mounted out of the checkout is accepted;
+  a registrar given such a
   key can still record an attacker's serial, which only deleting rows undoes. Python
   callers of `ReferenceGateway` pass key objects and get no placement check. The
   hard-link rule does not look at where the other names are, so a key in a store that

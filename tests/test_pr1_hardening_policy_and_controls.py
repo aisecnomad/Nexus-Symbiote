@@ -41,6 +41,7 @@ from nexus_symbiote.operator_policy import (
 from nexus_symbiote.policy import Policy, RiskPolicy, ScanPolicy, Suppression, ValidatePolicy
 from nexus_symbiote.runtime import key_id
 from nexus_symbiote.validators.risk import RiskScorer
+from tests.support import REPLACEABLE_ANCHOR_LAYOUTS, trust_anchor_in_layout
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -156,6 +157,65 @@ def test_operator_policy_key_and_attestation_pairing_fails_closed(tmp_path):
     fake_env.write_text("{}", encoding="utf-8")
     with pytest.raises(OperatorPolicyError, match="requires at least one --operator-policy-key"):
         load_operator_policy(pol_path, project, envelope_path=fake_env)
+
+
+@pytest.mark.parametrize("layout", REPLACEABLE_ANCHOR_LAYOUTS)
+def test_operator_policy_refuses_a_file_another_user_could_replace(tmp_path, monkeypatch, layout):
+    project = tmp_path / "checkout"
+    project.mkdir()
+    policy = trust_anchor_in_layout(tmp_path, layout, "op.yaml", b"version: '1.0'\n", monkeypatch)
+    with pytest.raises(OperatorPolicyError, match="group- or world-writable"):
+        load_operator_policy(policy, project, allow_unsigned=True)
+
+
+def test_operator_policy_accepts_a_sticky_directory_like_tmp(tmp_path, monkeypatch):
+    project = tmp_path / "checkout"
+    project.mkdir()
+    policy = trust_anchor_in_layout(
+        tmp_path, "sticky grandparent", "op.yaml", b"version: '1.0'\n", monkeypatch
+    )
+    assert load_operator_policy(policy, project, allow_unsigned=True).digest.startswith("sha256:")
+
+
+@pytest.mark.parametrize(("git", "cwd_is_project"), [(False, False), (False, True), (True, False)])
+def test_operator_policy_key_inside_the_scanned_project_is_refused(
+    tmp_path, monkeypatch, git, cwd_is_project
+):
+    project = tmp_path / "checkout"
+    (project / "keys").mkdir(parents=True)
+    if git:
+        (project / ".git").mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(project if cwd_is_project else elsewhere)
+    op_dir = tmp_path / "operator"
+    op_dir.mkdir()
+    policy = op_dir / "policy.yaml"
+    policy.write_text("version: '1.0'\n", encoding="utf-8")
+    envelope = op_dir / "policy.dsse.json"
+    envelope.write_text("{}", encoding="utf-8")
+    _, pub_path, _ = _write_keypair(op_dir)
+    planted = project / "keys" / "op.pub"
+    planted.write_bytes(pub_path.read_bytes())
+    planted.chmod(0o600)
+    with pytest.raises(OperatorPolicyError, match="that holds PROJECT"):
+        load_operator_policy(policy, project, envelope_path=envelope, trusted_keys=(planted,))
+
+
+def test_a_project_policy_may_narrow_operator_exclusions_to_none():
+    operator = Policy.model_validate({"scan": {"exclude_paths": ["vendor/**"]}})
+    narrowed, clamped = narrow_policy(
+        operator, Policy.model_validate({"scan": {"exclude_paths": []}})
+    )
+    assert narrowed.scan.exclude_paths == [] and clamped == []
+    narrowed, clamped = narrow_policy(
+        operator, Policy.model_validate({"scan": {"exclude_paths": ["other/**"]}})
+    )
+    assert narrowed.scan.exclude_paths == []
+    assert clamped == ["scan.exclude_paths (refused extra project exclusions)"]
+    # A project policy that does not set the list keeps the operator's exclusions.
+    narrowed, _ = narrow_policy(operator, Policy.model_validate({"risk": {"fail_threshold": 10}}))
+    assert narrowed.scan.exclude_paths == ["vendor/**"]
 
 
 def test_signed_operator_policy_clamps_checkout_weakening_and_records_provenance_in_sarif_and_json(

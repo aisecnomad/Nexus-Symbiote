@@ -329,12 +329,10 @@ def _trusted_ancestor_uids(uid: int) -> set[int]:
     return allowed
 
 
-def _ancestor_error(directory: Path, *, dir_what: str, remedy: str) -> str | None:
-    """Reject non-sticky world-writable or foreign non-root ancestors above an unpinned root."""
-    uid = _current_uid()
-    trusted_uids = _trusted_ancestor_uids(uid) if uid is not None else set()
-    abs_dir = Path(os.path.abspath(directory))
-    parts = list(abs_dir.parts)
+def _absolute_through_root_links(path: Path) -> Path:
+    """``path`` made absolute, with macOS's standard ``/var``-style root links resolved."""
+    absolute = Path(os.path.abspath(path))
+    parts = list(absolute.parts)
     if (
         sys.platform == "darwin"
         and len(parts) > 1
@@ -344,7 +342,15 @@ def _ancestor_error(directory: Path, *, dir_what: str, remedy: str) -> str | Non
         link_path = f"/{parts[1]}"
         with contextlib.suppress(OSError):
             if os.path.islink(link_path) and os.readlink(link_path) == f"private/{parts[1]}":
-                abs_dir = Path("/", "private", *parts[1:])
+                absolute = Path("/", "private", *parts[1:])
+    return absolute
+
+
+def _ancestor_error(directory: Path, *, dir_what: str, remedy: str) -> str | None:
+    """Reject non-sticky world-writable or foreign non-root ancestors above an unpinned root."""
+    uid = _current_uid()
+    trusted_uids = _trusted_ancestor_uids(uid) if uid is not None else set()
+    abs_dir = _absolute_through_root_links(directory)
     for ancestor in abs_dir.parents:
         try:
             info = os.lstat(ancestor)
@@ -356,6 +362,42 @@ def _ancestor_error(directory: Path, *, dir_what: str, remedy: str) -> str | Non
             return f"{dir_what} {ancestor} is not owned by the current user"
         if (info.st_mode & 0o002) and not (info.st_mode & stat.S_ISVTX):
             return f"{dir_what} {ancestor} is world-writable without sticky protection; {remedy}"
+    return None
+
+
+def _trust_anchor_error(path: Path, info: os.stat_result) -> str | None:
+    """Why someone other than the caller or root could replace a trust anchor, or ``None``.
+
+    ``info`` is the ``fstat`` of the anchor as opened without following symlinks, so the
+    file judged is the file read. Whoever can write a directory above the anchor can
+    rename the directory below it away and put another anchor in its place, so every
+    ancestor up to the file system root must be a real directory owned by the caller or
+    root that its group and others cannot write unless it is sticky. Ancestors are
+    checked after the open: replacing one needs write access to the directory above it,
+    which this walk then refuses. The reason is fixed text that never names the path.
+    """
+    uid = _current_uid()
+    if uid is None:
+        return None
+    trusted_uids = _trusted_ancestor_uids(uid)
+    if info.st_uid not in trusted_uids:
+        return "must be owned by the current user or root"
+    if info.st_mode & 0o022:
+        return "must not be group- or world-writable"
+    for ancestor in _absolute_through_root_links(path).parents:
+        try:
+            entry = os.lstat(ancestor)
+        except OSError:
+            return "must lie in directories that can be inspected"
+        if (
+            not stat.S_ISDIR(entry.st_mode)
+            or entry.st_uid not in trusted_uids
+            or (entry.st_mode & 0o022 and not entry.st_mode & stat.S_ISVTX)
+        ):
+            return (
+                "must lie in directories, up to the file system root, that are owned by "
+                "the current user or root and are not group- or world-writable unless sticky"
+            )
     return None
 
 

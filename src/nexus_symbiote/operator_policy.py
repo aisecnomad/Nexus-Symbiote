@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from xml.sax.saxutils import escape as xml_escape
 
-from nexus_symbiote.core.hashing import open_directory_nofollow, open_regular_file
+from nexus_symbiote.core.hashing import open_regular_file
 from nexus_symbiote.policy import (
     MAX_POLICY_YAML_NODES,
     Policy,
@@ -67,16 +67,11 @@ def _read_confined_operator_policy(policy_path: Path, root: Path | None) -> tupl
     if any(resolved_policy.is_relative_to(directory) for directory in untrusted):
         raise OperatorPolicyError(inside_msg)
 
-    from nexus_symbiote.utils.crypto import _trusted_ancestor_uids
+    from nexus_symbiote.utils.crypto import _trust_anchor_error, _trusted_ancestor_uids
 
     uid = getattr(os, "geteuid", lambda: None)()
     trusted_uids = _trusted_ancestor_uids(uid) if uid is not None else set()
     try:
-        parent_fd = open_directory_nofollow(policy_path.parent)
-        try:
-            parent_info = os.fstat(parent_fd)
-        finally:
-            os.close(parent_fd)
         with open_regular_file(policy_path) as stream:
             info = os.fstat(stream.fileno())
             if info.st_size > MAX_OPERATOR_POLICY_BYTES:
@@ -85,14 +80,12 @@ def _read_confined_operator_policy(policy_path: Path, root: Path | None) -> tupl
                 raise OperatorPolicyError("Operator policy must not have other hard links")
             if uid is not None and info.st_uid not in trusted_uids:
                 raise OperatorPolicyError("Operator policy must be owned by the current user")
-            parent_world_writable = bool(parent_info.st_mode & 0o002) and not (
-                bool(parent_info.st_mode & stat.S_ISVTX)
-                and (uid is None or parent_info.st_uid in trusted_uids)
-            )
-            if (info.st_mode & 0o002) or parent_world_writable:
+            if info.st_mode & 0o002:
                 raise OperatorPolicyError(
                     "Operator policy and its directory must not be world-writable"
                 )
+            if (reason := _trust_anchor_error(policy_path, info)) is not None:
+                raise OperatorPolicyError(f"Operator policy {reason}")
             raw = stream.read(MAX_OPERATOR_POLICY_BYTES + 1)
             if len(raw) > MAX_OPERATOR_POLICY_BYTES:
                 raise OperatorPolicyError("Operator policy exceeds the 1 MiB byte limit")
@@ -146,9 +139,9 @@ def _verify_policy_attestation(
     try:
         _check_key_placement(
             trusted_keys,
-            (policy_path, envelope_path),
+            (policy_path, envelope_path, *(() if root is None else (root,))),
             option="--operator-policy-key",
-            holders="OPERATOR_POLICY, ENVELOPE",
+            holders="PROJECT, OPERATOR_POLICY, ENVELOPE",
         )
         ring: dict[str, Ed25519PublicKey] = {}
         for key_path in trusted_keys:
@@ -294,9 +287,14 @@ def narrow_policy(operator: Policy, project: Policy | None) -> tuple[Policy, lis
     extra_excludes = [p for p in project.scan.exclude_paths if p not in op_excludes]
     if extra_excludes:
         clamped.append("scan.exclude_paths (refused extra project exclusions)")
-    effective_excludes = [
-        p for p in operator.scan.exclude_paths if p in set(project.scan.exclude_paths)
-    ] or list(operator.scan.exclude_paths)
+    # Excluding fewer paths only widens collection, so a project may narrow to none; one
+    # that does not set the list keeps the operator's.
+    if "exclude_paths" in project.scan.model_fields_set:
+        effective_excludes = [
+            p for p in operator.scan.exclude_paths if p in set(project.scan.exclude_paths)
+        ]
+    else:
+        effective_excludes = list(operator.scan.exclude_paths)
 
     if operator.scan.failure_mode == "error" and project.scan.failure_mode == "report-only":
         clamped.append("scan.failure_mode=error (clamped project report-only)")
@@ -415,12 +413,20 @@ def _gate_reasons(document: dict[str, Any]) -> list[str]:
             if isinstance(issues, list) and issues:
                 for issue in issues[:10]:
                     if isinstance(issue, dict):
-                        detail = issue.get("detail") or issue.get("message") or str(issue)
+                        detail = (
+                            issue.get("description")
+                            or issue.get("detail")
+                            or issue.get("message")
+                            or str(issue)
+                        )
                         reasons.append(f"{section_name}: {detail}")
                     else:
                         reasons.append(f"{section_name}: {issue}")
             else:
                 reasons.append(f"{section_name}: {section.get('status')}")
+    producer = document.get("discovery_producer")
+    if isinstance(producer, dict) and isinstance(producer.get("problems"), list):
+        reasons.extend(f"discovery_producer: {problem}" for problem in producer["problems"][:10])
     if document.get("unsigned_discovery"):
         reasons.append(str(document["unsigned_discovery"]))
     alerts = document.get("security_alerts")

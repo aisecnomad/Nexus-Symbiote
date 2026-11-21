@@ -619,6 +619,33 @@ def _resolve_report_format(json_output: bool, report_format: str | None) -> str:
     return "json" if json_output else (report_format or "text")
 
 
+def _refuse_step_summary_input(step_summary: Path) -> None:
+    """Refuse a step summary that is a file this command also reads, such as its inventory.
+
+    Appending Markdown to an input would corrupt it in place. Compared by identity, so a
+    hard link or a case variant of the input is refused too.
+    """
+    ctx = click.get_current_context(silent=True)
+    if ctx is None or not step_summary.exists():
+        return
+    named: list[object] = []
+    for param in ctx.command.params:
+        if param.name == "step_summary" or not isinstance(param.type, click.Path):
+            continue
+        value = ctx.params.get(param.name or "")
+        named.extend(value if isinstance(value, tuple | list) else [value])
+    try:
+        same = any(
+            os.path.exists(source) and os.path.samefile(step_summary, source)
+            for source in named
+            if isinstance(source, str | os.PathLike)
+        )
+    except OSError as exc:
+        raise output_failure(exc) from exc
+    if same:
+        raise click.UsageError("--step-summary must not name a file this command reads")
+
+
 def _emit_gate_report(
     gate_name: str,
     report_format: str,
@@ -635,6 +662,7 @@ def _emit_gate_report(
     )
 
     if step_summary is not None:
+        _refuse_step_summary_input(step_summary)
         append_step_summary(step_summary, render_gate_markdown(gate_name, document))
     if report_format == "json":
         click.echo(json_text(json.dumps(document, indent=2)))

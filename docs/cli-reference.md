@@ -206,8 +206,13 @@ in the BOM is not trusted.
 written by the operator, never by the checkout. The CLI refuses a policy inside the
 scanned project or inside any Git working tree that encloses it, including a
 submodule's superproject, also under another name for any of these directories, or
-one with other hard links. The Action checks its input only against
-`GITHUB_WORKSPACE`: it refuses a path inside the workspace, one that passes through a
+one with other hard links. On POSIX systems it also refuses a policy that another user
+could replace: one not owned by you or root, one its group or others can write, or one
+under a directory, up to the file system root, that is owned by another user or that
+its group or others can write without the sticky bit. An `--operator-policy` file and
+its `--operator-policy-key` files follow the same rule, and a key inside the scanned
+project is refused whether or not the project is a git working tree. The Action
+checks its input only against `GITHUB_WORKSPACE`: it refuses a path inside the workspace, one that passes through a
 symlink, or a hard link. It then copies the policy into a private directory under
 `RUNNER_TEMP`, or under the system temporary directory when `RUNNER_TEMP` is unset,
 and passes that copy to the CLI, which applies the rules above to the copy; a

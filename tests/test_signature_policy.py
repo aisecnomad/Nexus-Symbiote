@@ -7,6 +7,7 @@ import json
 import pytest
 
 from nexus_symbiote.signature_policy import SignaturePolicyError, load_signature_policies
+from tests.support import REPLACEABLE_ANCHOR_LAYOUTS, trust_anchor_in_layout
 
 
 @pytest.fixture
@@ -237,3 +238,18 @@ def test_version_2_supports_openssf_model_signing_dsse_and_rekor_witnesses(polic
         )
         with pytest.raises(SignaturePolicyError, match=match):
             load_signature_policies(policy, project)
+
+
+@pytest.mark.parametrize("layout", [*REPLACEABLE_ANCHOR_LAYOUTS, "sticky grandparent"])
+def test_policy_that_another_user_could_replace_is_refused(
+    policy_inputs, tmp_path, monkeypatch, layout
+):
+    project, policy, _record = policy_inputs
+    placed = trust_anchor_in_layout(
+        tmp_path, layout, "signers.json", policy.read_bytes(), monkeypatch
+    )
+    if layout == "sticky grandparent":
+        assert len(load_signature_policies(placed, project)) == 1
+        return
+    with pytest.raises(SignaturePolicyError, match="group- or world-writable"):
+        load_signature_policies(placed, project)
