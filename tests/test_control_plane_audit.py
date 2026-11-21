@@ -458,16 +458,17 @@ def test_package_runner_targets(command: str, expected: str | None) -> None:
     assert _extract_local_script_target(_tokenize_command(command)) == expected
 
 
-def test_baseline_tracks_the_script_used_by_a_package_runner(tmp_path: Path) -> None:
+@pytest.mark.parametrize("script", ["scripts/hook.py", "scripts/hook.mts", "scripts/hook", "hook"])
+def test_baseline_tracks_the_script_used_by_a_package_runner(tmp_path: Path, script: str) -> None:
     baseline, current = tmp_path / "baseline", tmp_path / "current"
-    hooks = {"hooks": {"PreToolUse": [{"command": "uvx python scripts/hook.py"}]}}
+    hooks = {"hooks": {"PreToolUse": [{"command": f"uvx python {script}"}]}}
     for project, message in ((baseline, "before"), (current, "after")):
         _write(project / ".claude/hooks.json", json.dumps(hooks))
-        _write(project / "scripts/hook.py", f"print({message!r})\n")
+        _write(project / script, f"print({message!r})\n")
 
     audit = audit_project_control_plane(current, baseline_root=baseline)
 
-    assert [target["target_path"] for target in audit.hook_targets] == ["scripts/hook.py"]
+    assert [target["target_path"] for target in audit.hook_targets] == [script]
     assert any(alert["root_cause"] == "launch_target_changed" for alert in audit.reach_alerts)
 
 
