@@ -5,7 +5,8 @@ agent cards, and the instruction, skill, tool and configuration files that the
 selected collectors recorded as component sources. It reads no other file. Every
 rule is a bounded lexical scan, so the pass is O(N) in the scanned text. Default-
 ignorable code points are removed and the rest is NFKC-normalized before matching,
-with a map back to UTF-8 byte offsets. Findings are appended to the owning existing
+with a map back to UTF-8 byte offsets. JSON, JSONC, YAML and TOML sources and Markdown
+front matter are also read as the strings they decode to. Findings are appended to the owning existing
 components; matched payload text and secret values are never written into them.
 """
 
@@ -17,9 +18,10 @@ import re
 import sys
 import tokenize
 import unicodedata
+from bisect import bisect_right
 from collections import deque
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -36,10 +38,12 @@ from nexus_symbiote.core.models import (
     SkillPackageComponent,
     ToolComponent,
 )
+from nexus_symbiote.scanners.base import YAML_TOKEN_LIMIT
 from nexus_symbiote.scanners.prompt import HIDDEN_CHARACTERS
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.jsonc import strip_jsonc
 from nexus_symbiote.utils.terminal import neutralize
+from nexus_symbiote.utils.toml import loads as toml_loads
 
 RULE_PACK_VERSION = "1.0.0"
 
@@ -112,6 +116,47 @@ _SIDE_CHANNEL_PARAM_NAMES = frozenset(
 )
 # Typographic apostrophes fold to ASCII so that "Don’t tell" reads as "Don't tell".
 _APOSTROPHES = {"‘": "'", "’": "'"}
+# A host passes a model the strings these formats, and the YAML front matter of a Markdown
+# file, decode to, where an escape such as \u0049 spells "I"; the rules read those strings
+# as well as the raw text.
+_DECODED_FORMATS = {".jsonc": "JSON", ".yaml": "YAML", ".yml": "YAML", ".toml": "TOML"}
+_MARKDOWN_SUFFIXES = frozenset({".md", ".mdc", ".markdown"})
+_FRONT_MATTER_RE = re.compile(
+    r"\ufeff?(?>(?:[ \t]*\r?\n)*)[ \t]*-{3,}[ \t]*\r?\n(.*?)^(?:-{3,}|\.\.\.)[ \t]*\r?$",
+    re.S | re.M,
+)
+# The bounds the prompt collector parses YAML and TOML within: the parsers are pure Python,
+# and PyYAML's cost grows with flow nesting. Past them, escapes are decoded by pattern.
+_MAX_PARSED_CHARS = 65_536
+_MAX_YAML_FLOW_DEPTH = 64
+_FLOW_BRACKETS_RE = re.compile(r"[\[\]{}]")
+# Every escape a JSON, YAML or TOML string can hold, a line continuation and YAML's ''.
+# Decoding them anywhere, inside a literal string or a comment too, only adds findings.
+_ESCAPE_RE = re.compile(
+    r"\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|[ \t]*\r?\n\s*|(.))|''", re.S
+)
+_NAMED_ESCAPES = {
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+    "b": "\b",
+    "f": "\f",
+    "v": "\v",
+    "a": "\a",
+    "0": "\0",
+    "e": "\x1b",
+    "L": "\u2028",
+    "P": "\u2029",
+    "N": "\x85",
+    "_": "\xa0",
+}
+# A comment opener left open hides nothing past the paragraph it opens in.
+_BLANK_LINE_RE = re.compile(r"\n[ \t]*\r?\n")
+# Fences and code spans as generously as any reader finds them, inside quotes and list
+# items too: a "<!--" taken for code is not masked, which can only add findings.
+_FENCE_OPEN_RE = re.compile(r"^[ \t>*+\-.)0-9]*?((?>`{3,})(?![^\n]*`)|~{3,})", re.M)
+_FENCE_CLOSE_RE = re.compile(r"^[ \t>]*(`{3,}|~{3,})[ \t]*\r?$", re.M)
+_BACKTICK_RUN_RE = re.compile(r"`+")
 
 _DIRECTIVE_TAG_OPEN_RE = re.compile(
     r"<((?:important|system|instructions?|hidden|secret|override)[\w-]{0,40})\b[^>]{0,120}>",
@@ -473,7 +518,8 @@ def scan_text_block(
     # 2. TP-CMT-001: HTML comments carrying override, exfil, or secret-read directives
     search_pos = 0
     while (cmt_start := normalized.find("<!--", search_pos)) != -1:
-        cmt_end = normalized.find("-->", cmt_start + 4, cmt_start + 4 + _MAX_COMMENT_BODY_CHARS)
+        # A short empty comment shares its opening hyphens with the closing delimiter.
+        cmt_end = normalized.find("-->", cmt_start + 2, cmt_start + 4 + _MAX_COMMENT_BODY_CHARS)
         stop = (
             cmt_end + 3
             if cmt_end != -1
@@ -577,9 +623,10 @@ def _pointer_segment(key: str | tuple[str, int]) -> str:
 
 
 def _json_strings_with_owners(
-    data: object, names: Iterable[str]
+    data: object, names: Iterable[str], *, keys: bool = False
 ) -> Iterator[tuple[str, str, _Owner]]:
-    """``(JSON pointer, string, owner)`` for every nonblank string, in O(size).
+    """``(JSON pointer, string, owner)`` for every nonblank string, and with ``keys``
+    every nonblank key at the pointer of its value, in O(size).
 
     The owner is the innermost enclosing object whose ``name`` names a component in
     ``names``; failing that, the innermost one stored under a key that does (as in
@@ -602,6 +649,9 @@ def _json_strings_with_owners(
                 by_name = (label, node)
             for key, val in node.items():
                 child = pointer if long else f"{pointer}/{_pointer_segment(key)}"
+                text = key[0] if isinstance(key, tuple) else key
+                if keys and isinstance(text, str) and text.strip():
+                    yield child, text, by_name or by_key
                 inner = (key, val) if key in known and isinstance(val, dict) else by_key
                 queue.append((child, val, by_name, inner))
         elif isinstance(node, list):
@@ -635,6 +685,154 @@ def _parse_json_leniently(text: str) -> object:
             if candidate is None:
                 raise
     raise AssertionError("unreachable")
+
+
+def _joined_surrogates(text: str) -> str:
+    # A UTF-16 reader joins the halves of a pair that YAML spells as two escapes.
+    if not any("\ud800" <= ch <= "\udfff" for ch in text):
+        return text
+    return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
+
+
+def _yaml_tree(text: str) -> object:
+    """The documents of ``text`` as dicts, lists and strings, built from at most
+    ``YAML_TOKEN_LIMIT`` parser events in O(N). An alias is not expanded, a duplicate
+    key is kept as ``_keep_duplicates`` keeps it, and a key that is not a string is
+    kept with its value under a key no string can spell."""
+    import yaml
+
+    documents: list[object] = []
+    stack: list[tuple[bool, bool, list[object]]] = []
+    flows = 0
+    for count, event in enumerate(yaml.parse(text, Loader=yaml.SafeLoader), start=1):
+        if count > YAML_TOKEN_LIMIT:
+            raise ValueError("too many YAML events")
+        node: object
+        if isinstance(event, yaml.CollectionStartEvent):
+            flow = bool(event.flow_style)
+            flows += flow
+            if flows > _MAX_YAML_FLOW_DEPTH:
+                raise ValueError("YAML nested too deep")
+            stack.append((isinstance(event, yaml.MappingStartEvent), flow, []))
+            continue
+        if isinstance(event, yaml.CollectionEndEvent):
+            is_mapping, flow, children = stack.pop()
+            flows -= flow
+            node = children
+            if is_mapping:
+                mapping: dict[str | tuple[object, int], object] = {}
+                seen: dict[str, int] = {}
+                for index in range(0, len(children) - 1, 2):
+                    key, value = children[index], children[index + 1]
+                    if isinstance(key, str):
+                        n = seen[key] = seen.get(key, 0) + 1
+                        mapping[key if n == 1 else (key, n)] = value
+                    else:
+                        mapping[(None, index)] = [key, value]
+                node = mapping
+        elif isinstance(event, yaml.ScalarEvent):
+            node = _joined_surrogates(event.value)
+        elif isinstance(event, yaml.AliasEvent):
+            node = None
+        else:
+            continue
+        (stack[-1][2] if stack else documents).append(node)
+    return documents[0] if len(documents) == 1 else documents
+
+
+def _flow_depth(text: str) -> int:
+    # Counts brackets in strings and comments too: a cheap first bound on PyYAML's work.
+    depth = deepest = 0
+    for match in _FLOW_BRACKETS_RE.finditer(text):
+        depth = depth + 1 if match.group() in "[{" else max(depth - 1, 0)
+        deepest = max(deepest, depth)
+    return deepest
+
+
+def _decoded_source(rel_path: str, text: str) -> tuple[object, tuple[int, int] | None]:
+    """What a host decodes a JSONC, YAML or TOML source, or a Markdown file's YAML front
+    matter, to: ``(tree, None)`` when it parses within the bounds, ``(None, span)`` for
+    the part of ``text`` to decode by pattern when it does not, and ``(None, None)``
+    when it holds no escape.
+    """
+    suffix = PurePosixPath(rel_path).suffix.lower()
+    kind = _DECODED_FORMATS.get(suffix)
+    span = (0, len(text))
+    if kind is None:
+        front = _FRONT_MATTER_RE.match(text) if suffix in _MARKDOWN_SUFFIXES else None
+        if front is None:
+            return None, None
+        kind, span = "YAML", front.span(1)
+    body = text[span[0] : span[1]]
+    if "\\" not in body and (kind != "YAML" or "''" not in body):
+        return None, None
+    import yaml
+
+    try:
+        if kind == "JSON":
+            return _parse_json_leniently(body), None
+        if len(body) <= _MAX_PARSED_CHARS:
+            if kind == "TOML":
+                return toml_loads(body), None
+            if _flow_depth(body) <= _MAX_YAML_FLOW_DEPTH:
+                return _yaml_tree(body), None
+    except (ValueError, RecursionError, yaml.YAMLError):
+        # Malformed input still needs the same escape inspection as input over a parse limit.
+        return None, span
+    return None, span
+
+
+def _escape_decoded(text: str, start: int, end: int) -> tuple[str, list[int]]:
+    """``text[start:end]`` with every escape decoded and each surrogate pair joined, and
+    for each character of the result the index in ``text`` it came from."""
+    chars: list[str] = []
+    origins: list[int] = []
+    pos = start
+    for match in _ESCAPE_RE.finditer(text, start, end):
+        chars.extend(text[pos : match.start()])
+        origins.extend(range(pos, match.start()))
+        pos = match.end()
+        digits = match.group(1) or match.group(2) or match.group(3)
+        if digits is not None:
+            code = int(digits, 16)
+            decoded = chr(code) if code <= sys.maxunicode else match.group()
+        elif match.group() == "''":
+            decoded = "'"
+        elif match.group(4) is None:
+            decoded = ""
+        else:
+            decoded = _NAMED_ESCAPES.get(match.group(4), match.group(4))
+        for ch in decoded:
+            if "\udc00" <= ch <= "\udfff" and chars and "\ud800" <= chars[-1] <= "\udbff":
+                chars[-1] = _joined_surrogates(chars[-1] + ch)
+            else:
+                chars.append(ch)
+                origins.append(match.start())
+    chars.extend(text[pos:end])
+    origins.extend(range(pos, end))
+    return "".join(chars), origins
+
+
+def _escape_decoded_hits(
+    text: str, span: tuple[int, int], rel_path: str, is_tool_surface: bool
+) -> list[TextPoisoningHit]:
+    """Hits in ``text[span]`` with its escapes decoded, at their byte offsets in ``text``."""
+    decoded, origins = _escape_decoded(text, *span)
+    hits = scan_text_block(decoded, surface=rel_path, is_tool_surface=is_tool_surface)
+    if not hits:
+        return []
+    origin_at: dict[int, int] = {}
+    byte_pos = 0
+    for ch, origin in zip(decoded, origins, strict=True):
+        origin_at[byte_pos] = origin
+        byte_pos += _utf8_width(ch)
+    return [
+        replace(
+            hit,
+            byte_offset=len(text[: origin_at[hit.byte_offset]].encode("utf-8", "surrogatepass")),
+        )
+        for hit in hits
+    ]
 
 
 def _collect_schema_property_names(schema: dict[str, Any] | None) -> set[str]:
@@ -764,6 +962,51 @@ _MD_COMMENT_LINE_RE = re.compile(
 )
 
 
+def _code_spans(text: str, start: int, end: int) -> Iterator[tuple[int, int]]:
+    """Code spans of ``text[start:end]``: backtick runs paired with the next run of the
+    same length in their paragraph, in O(N)."""
+    paragraphs: list[list[tuple[int, int]]] = [[]]
+    blanks = _BLANK_LINE_RE.finditer(text, start, end)
+    blank = next(blanks, None)
+    for run in _BACKTICK_RUN_RE.finditer(text, start, end):
+        while blank is not None and blank.end() <= run.start():
+            paragraphs.append([])
+            blank = next(blanks, None)
+        paragraphs[-1].append(run.span())
+    for runs in paragraphs:
+        later: dict[int, deque[int]] = {}
+        for index, (run_start, run_end) in enumerate(runs):
+            later.setdefault(run_end - run_start, deque()).append(index)
+        index = 0
+        while index < len(runs):
+            same = later[runs[index][1] - runs[index][0]]
+            while same and same[0] <= index:
+                same.popleft()
+            if same:
+                yield runs[index][0], runs[same[0]][1]
+                index = same.popleft()
+            index += 1
+
+
+def _code_regions(text: str) -> list[tuple[int, int]]:
+    """Sorted ``(start, end)`` spans of ``text`` that a Markdown reader may show as code:
+    fenced blocks, an unclosed one running to the end, and code spans, in O(N)."""
+    regions: list[tuple[int, int]] = []
+    pos = 0
+    while (fence := _FENCE_OPEN_RE.search(text, pos)) is not None:
+        regions.extend(_code_spans(text, pos, fence.start()))
+        marker = fence.group(1)
+        pos = len(text)
+        for close in _FENCE_CLOSE_RE.finditer(text, fence.end()):
+            run = close.group(1)
+            if run[0] == marker[0] and len(run) >= len(marker):
+                pos = close.end()
+                break
+        regions.append((fence.start(), pos))
+    regions.extend(_code_spans(text, pos, len(text)))
+    return regions
+
+
 def _mask_hidden_markdown_markup(text: str) -> str:
     """Blank hidden HTML/PI/reference comments, keeping every UTF-8 byte offset.
 
@@ -771,19 +1014,33 @@ def _mask_hidden_markdown_markup(text: str) -> str:
     measured in the masked text are offsets in the file.
     """
     masked = bytearray(len(text))
+    code = _code_regions(text)
+    code_starts = [region[0] for region in code]
+
+    def in_code(index: int) -> bool:
+        at = bisect_right(code_starts, index) - 1
+        return at >= 0 and index < code[at][1]
+
     for open_tok, close_tok in (("<!--", "-->"), ("<?", "?>")):
         pos = 0
         while (start := text.find(open_tok, pos)) != -1:
-            end = text.find(close_tok, start + len(open_tok), start + 4096)
-            if end == -1 and open_tok == "<?":
-                # Only a closed processing instruction is hidden from rendered views.
+            # Short HTML comments can close with a delimiter overlapping the opener.
+            end = text.find(close_tok, start + 2, start + 4096)
+            if in_code(start) or (end == -1 and open_tok == "<?"):
+                # Code is shown as written, and only a closed processing instruction is
+                # hidden from rendered views.
                 pos = start + len(open_tok)
                 continue
-            stop = end + len(close_tok) if end != -1 else min(len(text), start + 4096)
+            if end != -1:
+                stop = end + len(close_tok)
+            else:
+                blank = _BLANK_LINE_RE.search(text, start, start + 4096)
+                stop = blank.start() if blank is not None else min(len(text), start + 4096)
             masked[start:stop] = b"\x01" * (stop - start)
             pos = stop
     for match in _MD_COMMENT_LINE_RE.finditer(text):
-        masked[match.start() : match.end()] = b"\x01" * (match.end() - match.start())
+        if not in_code(match.start()):
+            masked[match.start() : match.end()] = b"\x01" * (match.end() - match.start())
     return "".join(
         " " * _utf8_width(ch) if flag else ch for ch, flag in zip(text, masked, strict=True)
     )
@@ -951,7 +1208,7 @@ def _scan_text_source(
     scan_input = raw_text
     if (
         not is_tool_ctx
-        and suffix in {".md", ".mdc", ".markdown"}
+        and suffix in _MARKDOWN_SUFFIXES
         and any(
             r.category == "hidden_markup" and r.severity == RiskSeverity.HIGH
             for comp in comps
@@ -960,12 +1217,37 @@ def _scan_text_source(
     ):
         scan_input = _mask_hidden_markdown_markup(raw_text)
     hits = scan_text_block(scan_input, surface=rel_path, is_tool_surface=is_tool_ctx)
+    tree, span = _decoded_source(rel_path, raw_text)
+    if span is not None:
+        located = {(h.rule_id, h.byte_offset) for h in hits}
+        hits += [
+            h
+            for h in _escape_decoded_hits(raw_text, span, rel_path, is_tool_ctx)
+            if (h.rule_id, h.byte_offset) not in located
+        ]
     raw_bytes = raw_text.encode("utf-8") if hits else b""
     by_target: dict[str, tuple[ComponentWithRisks, list[TextPoisoningHit]]] = {}
     for h in hits:
         chosen = _attribute_source_component(raw_text, raw_bytes, h.byte_offset, comps, root_agent)
         if chosen is not None:
             by_target.setdefault(chosen.bom_ref, (chosen, []))[1].append(h)
+    if tree is not None:
+        # A decoded string is reported at its pointer, as in a JSON source, unless the raw
+        # text already gave its owner the same rule.
+        found = {(ref, h.rule_id) for ref, (_, group) in by_target.items() for h in group}
+        by_name: dict[str, ComponentWithRisks] = {}
+        for comp in sorted(comps, key=_priority_key):
+            by_name.setdefault(comp.name, comp)
+        fallback = _fallback_component(comps, root_agent)
+        for pointer, value, owner in _json_strings_with_owners(tree, by_name, keys=True):
+            target = by_name[owner[0]] if owner is not None else fallback
+            if target is None:
+                continue
+            for h in scan_text_block(
+                value, surface=rel_path, is_tool_surface=is_tool_ctx, where=pointer or "$"
+            ):
+                if (target.bom_ref, h.rule_id) not in found:
+                    by_target.setdefault(target.bom_ref, (target, []))[1].append(h)
     return list(by_target.values())
 
 
