@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from itertools import islice
+from heapq import merge as merge_sorted
+from itertools import groupby, islice
 from typing import Any
 
 from nexus_symbiote.core.aibom import AIBOM
@@ -383,6 +384,8 @@ _IDE_GRANT_LEGS: dict[str, frozenset[str]] = {
 }
 # An approval record gates its component only when it covers every action or all egress.
 _GATING_ACTIONS = frozenset({"*", "egress"})
+_READ_ACTIONS = frozenset({"read", "query", "list", "search", "get"})
+_RELATIVE_RESOURCE_SCOPE = re.compile(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_.?*-]+)+")
 _UNGATED_CLAUDE_MODES = frozenset({"bypassPermissions", "acceptEdits"})
 _UNGATED_CODEX_POLICIES = frozenset({"never"})
 _UNCONFINED_CODEX_SANDBOXES = frozenset({"danger-full-access", "full-access"})
@@ -604,7 +607,7 @@ def _approval_state(
         if isinstance(r, AuthorizationRecord)
     ]
     for record in records:
-        if not assume_declared_approvals and record.action == "read":
+        if not assume_declared_approvals and _independent_read(record):
             continue
         if record.approval_required is not True or not _unexpired(record, now):
             return False, not assume_declared_approvals
@@ -615,6 +618,17 @@ def _approval_state(
         for r in records
     )
     return required or broad, False
+
+
+def _independent_read(record: AuthorizationRecord) -> bool:
+    """Recognize read-only records with a relative, explicitly named resource scope."""
+    scope = record.resource_scope
+    return (
+        record.action.strip().casefold() in _READ_ACTIONS
+        and scope is not None
+        and _RELATIVE_RESOURCE_SCOPE.fullmatch(scope) is not None
+        and not {".", ".."}.intersection(scope.split("/"))
+    )
 
 
 def _unexpired(record: AuthorizationRecord, now: datetime) -> bool:
@@ -1009,37 +1023,47 @@ def _scopes(
             _merge(gaps, ordinary[server])
         ordinary[ref] = gaps
 
-    def containment_gaps(
-        owner: str, target: str, binding: bool, visited: set[tuple[str, bool]]
-    ) -> _Reach:
+    # Owners who cover part of the ordinary sample may need later members. Share
+    # those ordered candidates across owners and expand only as far as requested.
+    expanded: dict[tuple[str, str], tuple[list[str], Iterator[str]]] = {}
+
+    def containment_candidates(target: str, tag: str) -> Iterator[str]:
+        key = (target, tag)
+        if key not in expanded:
+            sources = [open_members[target][tag]]
+            sources.extend(open_members[server][tag] for server in nested.get(target, ()))
+            expanded[key] = ([], (ref for ref, _ in groupby(merge_sorted(*sources))))
+        known, pending = expanded[key]
+        yield from known
+        for ref in pending:
+            known.append(ref)
+            yield ref
+
+    def containment_gaps(owner: str, target: str, binding: bool) -> _Reach:
         sample = ordinary[target]
-        if not binding or all(
-            (owner, ref) not in declared_bindings or signals[ref].explicitly_ungated
-            for refs in sample.values()
-            for ref in refs
-        ):
+        if not binding:
             return sample
+
+        def uncovered(ref: str) -> bool:
+            return (owner, ref) not in declared_bindings or signals[ref].explicitly_ungated
+
         gaps: _Reach = {}
-        for container in (target, *nested.get(target, ())):
-            if (container, binding) in visited:
-                continue
-            visited.add((container, binding))
-            for tag, elements in open_members[container].items():
-                unbound = (
-                    ref
-                    for ref in elements
-                    if (owner, ref) not in declared_bindings or signals[ref].explicitly_ungated
+        for tag, refs in sample.items():
+            if all(map(uncovered, refs)):
+                gaps[tag] = refs
+            else:
+                remaining = tuple(
+                    islice(filter(uncovered, containment_candidates(target, tag)), EVIDENCE_LIMIT)
                 )
-                remaining = tuple(islice(unbound, EVIDENCE_LIMIT))
                 if remaining:
-                    _merge(gaps, {tag: remaining})
+                    gaps[tag] = remaining
         return gaps
 
     for u, targets in adj.items():
         su = scc_of[u]
         seen_t: set[int] = set()
         governing_agent = u in agent_refs and signals[u].explicitly_gated
-        visited_containers: set[tuple[str, bool]] = set()
+        visited_containers: set[str] = set()
         if u in agent_refs and u in open_targets and not assume_declared_approvals:
             _merge(path_exposure[su], open_targets[u])
         for v in targets:
@@ -1057,8 +1081,9 @@ def _scopes(
                     and not signals[v].explicitly_ungated
                 ):
                     _merge(path_exposure[su], open_targets[v])
-                if v in contained:
-                    _merge(path_exposure[su], containment_gaps(u, v, binding, visited_containers))
+                if v in contained and v not in visited_containers:
+                    visited_containers.add(v)
+                    _merge(path_exposure[su], containment_gaps(u, v, binding))
             sv = scc_of[v]
             if sv != su and sv not in seen_t:
                 seen_t.add(sv)

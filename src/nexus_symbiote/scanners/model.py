@@ -1702,7 +1702,6 @@ def _read_model_configs(
     tree: ModelTree,
     model_dir: Path,
     read: Callable[[ConfinedCollection, Path], bytes | None],
-    credential_file: Callable[[ConfinedCollection, Path], bool],
 ) -> tuple[list[tuple[Path, dict[str, Any]]], list[tuple[Path, str]]]:
     """Read this directory's model configs under the caller's shared byte budget."""
     configs: list[tuple[Path, dict[str, Any]]] = []
@@ -1711,8 +1710,6 @@ def _read_model_configs(
         path = model_dir / name
         if path not in tree.paths:
             _report_variants(files, path)
-            continue
-        if credential_file(files, path):
             continue
         raw = read(files, path)
         if raw is None:
@@ -1802,13 +1799,11 @@ class ModelPackages:
                 weights.append((companion, self._hash(files, companion)))
             weight_reads_complete = not failures
             if directory not in self._loading_configs:
-                before = len(failures)
-                configs, _ = _read_model_configs(
-                    files, tree, directory, self._read, self._credential_config
-                )
+                before = files.failures_recorded
+                configs, _ = _read_model_configs(files, tree, directory, self._read_loading_config)
                 self._loading_configs[directory] = (
                     _remote_code_setting(configs),
-                    len(failures) == before,
+                    files.failures_recorded == before,
                 )
         remote_code, config_complete = self._loading_configs[directory]
         self.covered.update(weight for weight, _ in weights)
@@ -1830,13 +1825,13 @@ class ModelPackages:
         self._packages[path] = package
         return package
 
-    @staticmethod
-    def _credential_config(files: ConfinedCollection, path: Path) -> bool:
+    def _read_loading_config(self, files: ConfinedCollection, path: Path) -> bytes | None:
         linked = files.in_root_target(path)
         reason = credential_gap(path.as_posix(), None if linked is None else linked.as_posix())
         if reason:
             files._fail(path, reason)
-        return reason is not None
+            return None
+        return self._read(files, path, expected_link_target=linked if linked != path else None)
 
     def observation(self, path: Path) -> ModelArtifactObservation | None:
         """The observation of root-relative ``path``, made now unless already made."""
@@ -1884,9 +1879,11 @@ class ModelPackages:
             self._observations[path] = observation
         return self._observations[path]
 
-    def _read(self, files: ConfinedCollection, path: Path) -> bytes | None:
+    def _read(
+        self, files: ConfinedCollection, path: Path, *, expected_link_target: Path | None = None
+    ) -> bytes | None:
         try:
-            with files.open_regular(path) as stream:
+            with files.open_regular(path, expected_link_target=expected_link_target) as stream:
                 self._charge(files, path, stream)
                 content = bytearray()
                 while chunk := stream.read(65536):
@@ -2390,12 +2387,12 @@ class ModelScanner(Scanner):
         tree = self._tree
 
         def read_config(files: ConfinedCollection, path: Path) -> bytes | None:
+            if self._credential_file(files, path):
+                return None
             self._read.add(path)
             return files.read_bytes(path)
 
-        configs, config_files = _read_model_configs(
-            files, tree, model_dir, read_config, self._credential_file
-        )
+        configs, config_files = _read_model_configs(files, tree, model_dir, read_config)
         merged: dict[str, Any] = {}
         templates: list[tuple[str, str]] = []
         escapes: list[str] = []
