@@ -307,6 +307,8 @@ The repository ships two [pre-commit](https://pre-commit.com) hooks. Both run
 apply the scan gate with the built-in policy, write nothing into the tree, and ignore
 the checkout's `.nexus-symbiote.yaml`, so a change cannot relax the gate it is checked
 under. Both accept Git metadata. Other occupied default exclusions still fail the gate.
+
+Coverage records preserve accepted path identities with reversible percent encoding where needed. If a path list reaches its display limit, the coverage record binds the remaining paths by digest.
 `nexus-symbiote-risk` is kept as the same gate so that existing configurations
 keep working; configure one of the two.
 

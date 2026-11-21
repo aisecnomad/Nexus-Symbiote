@@ -44,3 +44,39 @@ def test_moving_an_unlisted_accepted_directory_changes_the_receipt(tmp_path, mon
     assert before["unobserved_surfaces"] != after["unobserved_surfaces"]
     drift = runner.invoke(main, ["diff", str(old), str(new), "--fail-on-alert"])
     assert drift.exit_code == 1, drift.output
+
+
+def test_accepted_path_receipts_preserve_distinct_names(tmp_path):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "AGENTS.md").write_text("Read the project notes.\n")
+    for name in ("sample name", "sample\tname", "sample%09name"):
+        path = root / name / "node_modules"
+        path.mkdir(parents=True)
+        (path / "notes.txt").write_text("Sample.\n")
+    output = tmp_path / "inventory.json"
+    scan = CliRunner().invoke(
+        main,
+        [
+            "scan",
+            str(root),
+            "--no-project-policy",
+            "--accept-default-exclude=node_modules",
+            "-o",
+            str(output),
+        ],
+    )
+    assert scan.exit_code == 0, scan.output
+    coverage = json.loads(output.read_text())["metadata"]["completeness"]
+    paths = {
+        "sample name/node_modules",
+        "sample%09name/node_modules",
+        "sample%2509name/node_modules",
+    }
+    prefix = "accepted default exclusion path: "
+    assert paths <= set(coverage["exclusions"])
+    assert {
+        entry.removeprefix(prefix)
+        for entry in coverage["unobserved_surfaces"]
+        if entry.startswith(prefix)
+    } == paths

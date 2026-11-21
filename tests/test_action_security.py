@@ -29,7 +29,7 @@ def test_action_default_exclusion_acceptance_is_limited_to_git(tmp_path: Path) -
     action = yaml.safe_load((Path(__file__).parents[1] / "action.yml").read_text())
     value = action["inputs"]["accept-default-excludes"]["default"]
     config = configuration(tmp_path, SYMBIOTE_ACCEPT_DEFAULT_EXCLUDES=value)
-    assert config.accept_default_excludes == (".git",)
+    assert config.accept_default_excludes == ("root:.git",)
     with pytest.raises(runner.InputError, match="only built-in exclusions"):
         configuration(tmp_path, SYMBIOTE_ACCEPT_DEFAULT_EXCLUDES=".git,custom")
 

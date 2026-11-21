@@ -23,6 +23,7 @@ from typing import Any, BinaryIO, NoReturn, Self, cast
 
 from nexus_symbiote import limits
 from nexus_symbiote.core.hashing import descriptor_binding, open_directory_nofollow
+from nexus_symbiote.core.identifiers import reference_text
 from nexus_symbiote.limits import Bound
 from nexus_symbiote.scanner_catalog import INSTRUCTION_DIRECTORIES, SKILL_DIRECTORIES
 
@@ -1363,7 +1364,9 @@ class ConfinedCollection:
                         ):
                             self.accepted_default_names.add(canonical)
                             if self._accepted_default_exclusions is not None:
-                                self._accepted_default_exclusions.append(child.as_posix())
+                                self._accepted_default_exclusions.append(
+                                    reference_text(child.as_posix())
+                                )
                         else:
                             reason = (
                                 AGENT_DEFAULT_EXCLUDE_REASON
