@@ -3120,19 +3120,18 @@ def _mount_fields(spec: str) -> dict[str, str]:
     return dict(_mount_parts(spec))
 
 
+_VOLUME_VARIABLE = re.compile(r"\$\{(?:env|input|config|command|workspaceFolder):[^{}:]+\}")
+
+
 def _volume_source_end(spec: str) -> int:
-    """Where a -v source ends: the first colon outside a client ``${...}`` variable."""
-    # Each search starts past the last one, so the scan is linear in the spec.
-    index, colon = 0, spec.find(":")
-    while colon >= 0:
-        opened = spec.find("${", index, colon)
-        close = spec.find("}", opened) if opened >= 0 else -1
-        if close < 0:
+    """Find the source separator, accounting for a drive and documented client variables."""
+    index = 2 if re.match(r"[A-Za-z]:[\\/]", spec) else 0
+    for variable in _VOLUME_VARIABLE.finditer(spec, index):
+        colon = spec.find(":", index, variable.start())
+        if colon >= 0:
             return colon
-        index = close + 1
-        if colon < index:
-            colon = spec.find(":", index)
-    return -1
+        index = variable.end()
+    return spec.find(":", index)
 
 
 def _host_source(spec: str, *, mount: bool) -> str | None:
@@ -3162,10 +3161,6 @@ def _host_source(spec: str, *, mount: bool) -> str | None:
     if end < 0:
         return None
     source = spec[:end]
-    if re.match(r"[A-Za-z]:[\\/]", spec):
-        if ":" not in spec[2:]:
-            return None
-        source = spec[:2] + spec[2:].split(":", 1)[0]
     return (
         source
         if source in {".", ".."}
@@ -3494,7 +3489,8 @@ def _deno(name: str, rest: list[str], launch: Launch) -> None:
         words = rest[1 : rest.index("--") if "--" in rest else len(rest)]
         if "--eval" in words:
             # deno task --eval runs the task name as a command line in its task shell.
-            _shell_subcommand([word for word in rest[1:] if word != "--eval"], launch)
+            flag = words.index("--eval") + 1
+            _shell_subcommand([*rest[1:flag], *rest[flag + 1 :]], launch)
         else:
             _local_subcommand(rest[1:], launch)
         return
