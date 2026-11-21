@@ -42,7 +42,11 @@ from nexus_symbiote.runtime import (
     ToolCall,
     canonical_bytes,
 )
-from nexus_symbiote.runtime_validation import MAX_ARGUMENT_BYTES, validate_arguments
+from nexus_symbiote.runtime_validation import (
+    MAX_ARGUMENT_BYTES,
+    ValidationBudgetError,
+    validate_arguments,
+)
 from nexus_symbiote.scanners.live_mcp import SUPPORTED_PROTOCOL_VERSIONS
 
 T = TypeVar("T")
@@ -257,7 +261,13 @@ class PinnedStdioSession:
                 structured = result.get("structuredContent")
                 if not isinstance(structured, dict):
                     raise ValueError("MCP tool result lacks structured content")
-                validate_arguments(self._output_schema, structured)
+                try:
+                    validate_arguments(self._output_schema, structured)
+                except ValidationBudgetError as exc:
+                    raise ValidationBudgetError(
+                        "MCP structured result failed offline output schema validation",
+                        reason=exc.reason,
+                    ) from None
             return result
         except ToolCallError:
             raise

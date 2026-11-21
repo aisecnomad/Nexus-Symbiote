@@ -20,7 +20,7 @@ from nexus_symbiote.live.session import (
     invoke_pinned_stdio,
 )
 from nexus_symbiote.runtime import AuthorizationError, digest, sign_contract
-from nexus_symbiote.runtime_validation import MAX_ARGUMENT_BYTES
+from nexus_symbiote.runtime_validation import MAX_ARGUMENT_BYTES, ValidationBudgetError
 from tests.support import STDIO_HELLO, launcher_log, misbehaving_launcher
 from tests.test_runtime_authorization import DEFINITION, fixture
 
@@ -541,16 +541,21 @@ def test_a_launcher_over_the_byte_budget_is_denied_before_it_is_read_or_run(tmp_
 
 
 @pytest.mark.parametrize(
-    ("result", "accepted"),
+    ("result", "accepted", "validation_reason"),
     [
-        ({"structuredContent": {"count": 1}}, True),
-        ({"structuredContent": {"count": "one"}}, False),
-        ({"content": []}, False),
-        ({"isError": True, "content": []}, True),
-        ({"isError": "true", "content": []}, False),
+        ({"structuredContent": {"count": 1}}, True, None),
+        ({"structuredContent": {"count": "one"}}, False, "arguments-invalid"),
+        ({"content": []}, False, None),
+        ({"isError": True, "content": []}, True, None),
+        ({"isError": "true", "content": []}, False, None),
+        (
+            {"structuredContent": {"count": 1, "text": "a" * MAX_ARGUMENT_BYTES}},
+            False,
+            None,
+        ),
     ],
 )
-def test_stdio_checks_successful_structured_results(tmp_path, result, accepted):
+def test_stdio_checks_successful_structured_results(tmp_path, result, accepted, validation_reason):
     call = fixture(tmp_path)[1]
     schema = {
         "type": "object",
@@ -563,6 +568,11 @@ def test_stdio_checks_successful_structured_results(tmp_path, result, accepted):
         if accepted:
             assert session.execute(call) == result
         else:
-            with pytest.raises(ExecutionOutcomeUnknown):
+            with pytest.raises(ExecutionOutcomeUnknown) as failure:
                 session.execute(call)
+            if validation_reason is not None:
+                cause = failure.value.__cause__
+                assert isinstance(cause, ValidationBudgetError)
+                assert cause.reason == validation_reason
+                assert "output schema" in str(cause)
     assert sum(record[0] == "tools/call" for record in launcher_log(log)) == 1
