@@ -697,7 +697,7 @@ def _joined_surrogates(text: str) -> str:
 
 
 def _yaml_tree(text: str) -> object:
-    """The documents of ``text`` as dicts, lists and strings, built from at most
+    """The documents of ``text`` as dicts, lists, strings and booleans, built from at most
     ``YAML_TOKEN_LIMIT`` parser events in O(N). An alias is not expanded, a duplicate
     key is kept as ``_keep_duplicates`` keeps it, and a key that is not a string is
     kept with its value under a key no string can spell."""
@@ -734,6 +734,17 @@ def _yaml_tree(text: str) -> object:
                 node = mapping
         elif isinstance(event, yaml.ScalarEvent):
             node = _joined_surrogates(event.value)
+            # MCP annotations distinguish boolean true from the quoted string "true".
+            lower = event.value.lower() if len(event.value) <= 5 else ""
+            if lower in yaml.SafeLoader.bool_values and (
+                event.tag == "tag:yaml.org,2002:bool"
+                or (
+                    event.tag is None
+                    and event.implicit[0]
+                    and event.value in (lower, lower.capitalize(), lower.upper())
+                )
+            ):
+                node = yaml.SafeLoader.bool_values[lower]
         elif isinstance(event, yaml.AliasEvent):
             node = None
         else:
@@ -1051,8 +1062,6 @@ def _mask_hidden_markdown_markup(text: str) -> str:
 def _append_consolidated_risks(
     component: ComponentWithRisks,
     hits: list[TextPoisoningHit],
-    *,
-    seen_keys: set[tuple[str, str, str]],
 ) -> int:
     """Group hits by ``(category, surface)`` and append sanitized ``RiskAssessment`` entries."""
     grouped: dict[tuple[str, str], list[TextPoisoningHit]] = {}
@@ -1061,25 +1070,18 @@ def _append_consolidated_risks(
 
     added = 0
     for (category, surface), group in sorted(grouped.items()):
-        dedup_key = (component.bom_ref, category, surface)
-        if dedup_key in seen_keys:
-            continue
-        seen_keys.add(dedup_key)
         # The first location of each rule, so each offset is that of the rule printed beside
         # it; TP-SIDENOTE-004 shares its trigger's location and is listed after it.
-        firsts: dict[str, TextPoisoningHit] = {}
         order = sorted(
             group,
             key=lambda h: (h.where, h.byte_offset, h.rule_id == "TP-SIDENOTE-004", h.rule_id),
         )
-        for h in order:
-            firsts.setdefault(h.rule_id, h)
         located = [
             f"{h.rule_id} at byte_offset={h.byte_offset}"
             + (f" of {neutralize(h.where)[:_MAX_WHERE_CHARS]}" if h.where else "")
-            for h in firsts.values()
+            for h in order
         ]
-        first = next(iter(firsts.values()))
+        first = order[0]
         detail = (
             f"Surface '{neutralize(surface)}' ({neutralize(component.name)}) matched "
             f"{'; '.join(located)} (pack={RULE_PACK_VERSION}): {first.summary}. "
@@ -1095,7 +1097,7 @@ def _append_consolidated_risks(
                 category=category,
                 detail=detail,
                 recommendation=recommendation,
-                references=[f"{_RULE_REFERENCE_PREFIX}{rid}" for rid in firsts],
+                references=[f"{_RULE_REFERENCE_PREFIX}{hit.rule_id}" for hit in order],
             )
         )
         added += 1
@@ -1147,13 +1149,16 @@ def _scan_component_fields(comp: ComponentWithRisks) -> list[TextPoisoningHit]:
     return []
 
 
-def _scan_json_source(
+def _scan_structured_source(
     rel_path: str,
     parsed: object,
     comps: list[ComponentWithRisks],
     root_agent: AgentComponent | None,
+    *,
+    include_keys: bool = False,
+    tool_context: bool | None = None,
 ) -> list[tuple[ComponentWithRisks, list[TextPoisoningHit]]]:
-    """Scan each string of a JSON source and give its hits to the component that holds it.
+    """Scan a parsed configuration and evaluate each tool's text alongside its own schema.
 
     A string belongs to the innermost enclosing object whose ``name`` (or key) names a
     component recorded for this file, so a poisoned tool's text is never charged to a
@@ -1166,26 +1171,41 @@ def _scan_json_source(
     groups: dict[str, tuple[ComponentWithRisks, dict[str, Any] | None, list[TextPoisoningHit]]]
     groups = {}
     texts: dict[str, list[str]] = {}
-    for pointer, value, owner in _json_strings_with_owners(parsed, by_name):
+    for pointer, value, owner in _json_strings_with_owners(parsed, by_name, keys=include_keys):
         target, node = (by_name[owner[0]], owner[1]) if owner is not None else (fallback, None)
         if target is None:
             continue
-        is_tool = isinstance(target, (ToolComponent, A2AServerComponent, MCPServerComponent))
+        is_tool = (
+            isinstance(target, (ToolComponent, A2AServerComponent, MCPServerComponent))
+            if tool_context is None
+            else tool_context
+        )
         group = groups.setdefault(target.bom_ref, (target, node, []))
         if group[1] is None and node is not None:
             group = groups[target.bom_ref] = (target, node, group[2])
         group[2].extend(
-            scan_text_block(value, surface=rel_path, is_tool_surface=is_tool, where=pointer)
+            scan_text_block(
+                value,
+                surface=rel_path,
+                is_tool_surface=is_tool,
+                where=pointer or ("$" if include_keys else ""),
+            )
         )
-        texts.setdefault(target.bom_ref, []).append(value)
+        if isinstance(target, ToolComponent):
+            texts.setdefault(target.bom_ref, []).append(value)
     results: list[tuple[ComponentWithRisks, list[TextPoisoningHit]]] = []
     for ref, (target, node, hits) in groups.items():
-        if isinstance(target, ToolComponent) and node is not None:
+        if isinstance(target, ToolComponent) and hits:
+            declaration = node or {}
             schema = next(
-                (node[k] for k in ("inputSchema", "input_schema", "parameters") if k in node),
-                None,
+                (
+                    declaration[k]
+                    for k in ("inputSchema", "input_schema", "parameters")
+                    if k in declaration
+                ),
+                target.input_schema,
             )
-            ann = node.get("annotations")
+            ann = declaration.get("annotations", target.annotations)
             hits = hits + check_sidenote_tool_schema(
                 schema if isinstance(schema, dict) else None,
                 "\n".join(texts[ref]),
@@ -1237,19 +1257,12 @@ def _scan_text_source(
         # A decoded string is reported at its pointer, as in a JSON source, unless the raw
         # text already gave its owner the same rule.
         found = {(ref, h.rule_id) for ref, (_, group) in by_target.items() for h in group}
-        by_name: dict[str, ComponentWithRisks] = {}
-        for comp in sorted(comps, key=_priority_key):
-            by_name.setdefault(comp.name, comp)
-        fallback = _fallback_component(comps, root_agent)
-        for pointer, value, owner in _json_strings_with_owners(tree, by_name, keys=True):
-            target = by_name[owner[0]] if owner is not None else fallback
-            if target is None:
-                continue
-            for h in scan_text_block(
-                value, surface=rel_path, is_tool_surface=is_tool_ctx, where=pointer or "$"
-            ):
-                if (target.bom_ref, h.rule_id) not in found:
-                    by_target.setdefault(target.bom_ref, (target, []))[1].append(h)
+        for target, decoded in _scan_structured_source(
+            rel_path, tree, comps, root_agent, include_keys=True, tool_context=is_tool_ctx
+        ):
+            extra = [h for h in decoded if (target.bom_ref, h.rule_id) not in found]
+            if extra:
+                by_target.setdefault(target.bom_ref, (target, []))[1].extend(extra)
     return list(by_target.values())
 
 
@@ -1296,7 +1309,7 @@ def apply_text_poisoning_rules(
                 components_by_path.setdefault(path, []).append(comp)
     agents = [c for c in components if isinstance(c, AgentComponent)]
     root_agent = min(agents, key=lambda a: a.bom_ref) if agents else None
-    seen_keys: set[tuple[str, str, str]] = set()
+    located_hits: dict[str, dict[tuple[str, str, str], TextPoisoningHit]] = {}
     own_failures: list[str] = []
     own_exclusions: list[str] = []
     scanned_rel_paths: set[str] = set()
@@ -1306,6 +1319,24 @@ def apply_text_poisoning_rules(
         own_failures.append(
             f"{neutralize(subject)}: text-poisoning rules could not be applied ({reason})"
         )
+
+    def remember(target: ComponentWithRisks, hits: list[TextPoisoningHit]) -> None:
+        if not hits:
+            return
+        # Source passes come first. Keep their locations for shared rules while
+        # admitting additional rules derived from component fields afterwards.
+        firsts: dict[tuple[str, str, str], TextPoisoningHit] = {}
+        for hit in hits:
+            key = (hit.category, hit.surface, hit.rule_id)
+            previous = firsts.get(key)
+            if previous is None or (hit.where, hit.byte_offset) < (
+                previous.where,
+                previous.byte_offset,
+            ):
+                firsts[key] = hit
+        saved = located_hits.setdefault(target.bom_ref, {})
+        for key, hit in firsts.items():
+            saved.setdefault(key, hit)
 
     # Source files first: their findings carry file byte offsets or JSON pointers, which
     # the in-memory fields scanned after them cannot give for the same component.
@@ -1347,22 +1378,22 @@ def apply_text_poisoning_rules(
                             if not all(isinstance(c, _INSTRUCTION_KINDS) for c in comps):
                                 failed(rel_path, "not JSON")
                     owned = (
-                        _scan_json_source(rel_path, parsed, comps, root_agent)
+                        _scan_structured_source(rel_path, parsed, comps, root_agent)
                         if isinstance(parsed, (dict, list))
                         else _scan_text_source(rel_path, raw_text, comps, root_agent)
                     )
                     for target, hits in owned:
-                        added += _append_consolidated_risks(target, hits, seen_keys=seen_keys)
+                        remember(target, hits)
                 except (ValueError, RecursionError) as exc:
                     failed(rel_path, type(exc).__name__)
 
     for comp in components:
         try:
-            added += _append_consolidated_risks(
-                comp, _scan_component_fields(comp), seen_keys=seen_keys
-            )
+            remember(comp, _scan_component_fields(comp))
         except (ValueError, RecursionError) as exc:
             failed(comp.bom_ref, type(exc).__name__)
+        if comp.bom_ref in located_hits:
+            added += _append_consolidated_risks(comp, list(located_hits.pop(comp.bom_ref).values()))
 
     if surfaces is not None:
         surfaces.extend(sorted(scanned_rel_paths))
