@@ -1059,6 +1059,8 @@ _ASSIGNMENT_FLAGS = frozenset({"env", "e", "build-arg"})
 # The scheme words _AUTH reads, after which cmd's `set NAME=<scheme> <credential>` splits.
 _ASSIGNMENT_SCHEMES = frozenset({"bearer", "basic", "token", "bot", "apikey", "api-key"})
 _SCHEME_DESCRIPTORS = frozenset({"type", "mode", "scheme", "method", "transport", "strategy"})
+_PUBLIC_TOKEN_SELECTORS = frozenset({"format", "source", "profile"})
+_SCHEME_ASSIGNMENT_OPERAND = re.compile(r"[A-Za-z0-9_-]+=[A-Za-z0-9_+=-]+")
 # curl's `-u user:password`, also in a cluster of short flags (`-su`), and httpie's `-a`
 # (`--auth`) only under a fetcher. Under another command (docker -u www-data:www-data) the
 # part after the colon counts only when it reads as a literal under a non-password name.
@@ -1102,7 +1104,17 @@ def _scheme_assignment_name(name: str) -> bool:
     words = name_words(name)
     if not words or words[-1] in _SCHEME_DESCRIPTORS:
         return False
-    auth = {"auth", "authorization", "authentication", "oauth", "bearer", "bot"}
+    auth = {
+        "auth",
+        "authorization",
+        "authentication",
+        "authz",
+        "oauth",
+        "bearer",
+        "bot",
+        "conn",
+        "session",
+    }
     return (
         credential_name(name)
         or words[-1] in auth
@@ -1118,6 +1130,8 @@ def _following_option(word: str) -> bool:
     if equals and argument not in {"", "="}:
         return True
     body = flag[2:]
+    if not equals and len(body) >= MIN_SECRET_LENGTH and body.isalpha() and body.islower():
+        return False
     # Padding or mixed case and digits distinguish an opaque value from CLI
     # labels such as --enable-automatic-updates= and common short switches.
     has_digit = any(c.isdigit() for c in body)
@@ -1151,10 +1165,13 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     if (
         following is not None
         and value.lower() in _ASSIGNMENT_SCHEMES
-        and (words := name_words(name))
-        and words[-1] not in _SCHEME_DESCRIPTORS
+        and not (value.lower() == "token" and name.lower() in _PUBLIC_TOKEN_SELECTORS)
         and not _following_option(following)
-        and literal_value(following)
+        and (
+            literal_value(following)
+            or (following.isascii() and following.isdecimal())
+            or _SCHEME_ASSIGNMENT_OPERAND.fullmatch(following) is not None
+        )
     ):
         hits.extend(value_hits(name, f"{value} {following}"))
     return hits
@@ -1344,10 +1361,14 @@ def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
             if (
                 not named_credential
                 and not {"name", "key"}.intersection(item)
-                and name.lower() not in {"auth", "oauth", "headers", "http_headers"}
-                and _scheme_assignment_name(name)
+                and (
+                    name.lower() in {"auth", "oauth", "headers", "http_headers"}
+                    or _scheme_assignment_name(name)
+                )
             ):
-                label = name
+                # A value-only record inherits its credential container. An explicit
+                # public label above continues to describe its own value.
+                label = "auth"
             pending.extend(
                 (label if label and key in {"value", "values"} else str(key), value)
                 for key, value in item.items()
