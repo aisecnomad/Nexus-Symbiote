@@ -1616,23 +1616,33 @@ def test_python_transport_functions_are_launcher_gaps(tmp_path, source, gap):
 @pytest.mark.parametrize(
     "source",
     [
-        "import logging, importlib\nlogging.getLogger = importlib.import_module\n"
-        "logging.getLogger('mcp.client.stdio')\n",
-        "import importlib as logging\nlogging.getLogger('mcp.client.stdio')\n",
-        "import logging\nsetattr(logging, 'getLogger', __import__)\n"
-        "logging.getLogger('mcp.client.stdio')\n",
-        "import logging\nfrom loaders import *\nlogging.getLogger('mcp.client.stdio')\n",
-        "import logging\ndef use(logging):\n    logging.getLogger('mcp.client.stdio')\n",
-        "from logging import getLogger\nfrom loaders import load\ngetLogger = load\n"
-        "getLogger('mcp.client.stdio')\n",
-    ],
-    ids=[
-        "attribute-rebound",
-        "other-module-as-logging",
-        "setattr",
-        "star-import",
-        "parameter",
-        "imported-name-rebound",
+        pytest.param(
+            "import logging, importlib\nlogging.getLogger = importlib.import_module\n"
+            "logging.getLogger('mcp.client.stdio')\n",
+            id="attribute-rebound",
+        ),
+        pytest.param(
+            "import importlib as logging\nlogging.getLogger('mcp.client.stdio')\n",
+            id="other-module-as-logging",
+        ),
+        pytest.param(
+            "import logging\nsetattr(logging, 'getLogger', __import__)\n"
+            "logging.getLogger('mcp.client.stdio')\n",
+            id="setattr",
+        ),
+        pytest.param(
+            "import logging\nfrom loaders import *\nlogging.getLogger('mcp.client.stdio')\n",
+            id="star-import",
+        ),
+        pytest.param(
+            "import logging\ndef use(logging):\n    logging.getLogger('mcp.client.stdio')\n",
+            id="parameter",
+        ),
+        pytest.param(
+            "from logging import getLogger\nfrom loaders import load\ngetLogger = load\n"
+            "getLogger('mcp.client.stdio')\n",
+            id="imported-name-rebound",
+        ),
     ],
 )
 def test_a_logger_that_may_not_be_the_stdlib_one_loses_its_exemption(tmp_path, source):

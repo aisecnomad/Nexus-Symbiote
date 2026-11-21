@@ -1503,27 +1503,41 @@ def test_every_path_to_the_low_level_server_is_a_gap(tmp_path, source):
 @pytest.mark.parametrize(
     "source",
     [
-        "from agents import tool\n@tool.function_tool\ndef t(): pass\n",
-        "from pydantic_ai import agent\nag = agent.Agent('m')\n"
-        "@ag.tool_plain\ndef t() -> str: return 'x'\n",
-        "from pydantic_ai import Tool\nTool(print, name='t')\n",
-        "from langchain_core.tools import StructuredTool\n"
-        "StructuredTool.from_function(print, name='t')\n",
-        "from smolagents.tools import tool as decorators\n"
-        "from smolagents.default_tools import tool\n@tool\ndef t(): pass\n",
-        "from crewai.tools import *\n",
-        "import agents.tool\n@agents.tool.function_tool\ndef t(): pass\n",
-        "from pydantic_ai import agent\n",
-    ],
-    ids=[
-        "agents-submodule",
-        "pydantic-ai-submodule",
-        "tool-class",
-        "tool-class-factory",
-        "unrecognized-module",
-        "star",
-        "qualified-submodule",
-        "passed-on",
+        pytest.param(
+            "from agents import tool\n@tool.function_tool\ndef t(): pass\n",
+            id="agents-submodule",
+        ),
+        pytest.param(
+            "from pydantic_ai import agent\nag = agent.Agent('m')\n"
+            "@ag.tool_plain\ndef t() -> str: return 'x'\n",
+            id="pydantic-ai-submodule",
+        ),
+        pytest.param(
+            "from pydantic_ai import Tool\nTool(print, name='t')\n",
+            id="tool-class",
+        ),
+        pytest.param(
+            "from langchain_core.tools import StructuredTool\n"
+            "StructuredTool.from_function(print, name='t')\n",
+            id="tool-class-factory",
+        ),
+        pytest.param(
+            "from smolagents.tools import tool as decorators\n"
+            "from smolagents.default_tools import tool\n@tool\ndef t(): pass\n",
+            id="unrecognized-module",
+        ),
+        pytest.param(
+            "from crewai.tools import *\n",
+            id="star",
+        ),
+        pytest.param(
+            "import agents.tool\n@agents.tool.function_tool\ndef t(): pass\n",
+            id="qualified-submodule",
+        ),
+        pytest.param(
+            "from pydantic_ai import agent\n",
+            id="passed-on",
+        ),
     ],
 )
 def test_unrecognized_framework_imports_are_gaps(tmp_path, source):
