@@ -116,15 +116,31 @@ _NAMED_TOKEN = re.compile(rf"(?<![\w-]){_JWT}|(?<![A-Za-z0-9])(?:{_DISTINCT_SHAP
 # The same shapes with no boundary before them: a credential glued to a prefix, as in
 # "prod-sk-ant-...", "1ghp_..." or "xAKIA...". The sk- form also needs two digits, so a
 # plain name such as disk-management-service-v2 does not read as one.
-_EMBEDDED_TOKEN = re.compile(
-    rf"{_JWT}|sk-(?=(?:[\w-]*?\d){{2}})[\w-]{{20,}}+|(?:AKIA|ASIA)[A-Z0-9]{{16}}"
-    rf"|(?:{_DISTINCT_SHAPES})"
-)
+_EMBEDDED_TOKEN = re.compile(rf"(?:AKIA|ASIA)[A-Z0-9]{{16}}|(?:{_DISTINCT_SHAPES})")
+_TOKEN_SEGMENT = re.compile(r"[\w-]++")
+_DECIMAL_DIGIT = re.compile(r"\d")
+_JWT_PAYLOAD_START = re.compile(r"\.[\w-]{8}")
 
 
 def holds_token_shape(text: str) -> bool:
     """Whether a credential shape occurs anywhere in ``text``, also glued to other text."""
-    return _EMBEDDED_TOKEN.search(text) is not None
+    if _EMBEDDED_TOKEN.search(text) is not None:
+        return True
+    if "sk-" not in text and "eyJ" not in text:
+        return False
+    # Every later prefix in the same segment has a shorter suffix. Only the first
+    # can tell us anything new about the remaining length and digit count.
+    for segment in _TOKEN_SEGMENT.finditer(text):
+        start, end = segment.span()
+        key = text.find("sk-", start, end)
+        if key >= 0 and end - key >= 23:
+            first = _DECIMAL_DIGIT.search(text, key + 3, end)
+            if first is not None and _DECIMAL_DIGIT.search(text, first.end(), end) is not None:
+                return True
+        jwt = text.find("eyJ", start, end)
+        if jwt >= 0 and end - jwt >= 11 and _JWT_PAYLOAD_START.match(text, end):
+            return True
+    return False
 
 
 # A header value with no scheme is redacted when it looks like a credential; after
