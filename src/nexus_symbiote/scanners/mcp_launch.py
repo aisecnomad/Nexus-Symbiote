@@ -60,7 +60,8 @@ _POSIX_PATH_OPERATOR = re.compile(r"[;&|<>()`$\\'\"\n\r]")
 _WINDOWS_PATH_OPERATOR = re.compile(r"[&|<>^\"\n\r]")
 _NOT_SIMPLE = "command line is not a simple command"
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=", re.ASCII)
-_HOSTNAME = re.compile(r"[\w.-]+|[0-9a-f:.]+")
+# ASCII only: a non-ASCII host is an ambiguous authority, not a plain name.
+_HOSTNAME = re.compile(r"[\w.-]+|[0-9a-f:.]+", re.ASCII)
 _COMMIT = re.compile(r"[0-9a-fA-F]{40}")
 
 _NPM_NAME = r"(?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*"
@@ -104,6 +105,9 @@ _INLINE_SOURCES = ("data:", "http:", "https:")
 # Rarely used interpreters: inline code flags anywhere before the script file, alone, at
 # the end of a cluster, or with the code attached after a run of options that take none.
 _INLINE_FLAGS = {
+    "lua": re.compile(r"-e.*", re.S),
+    "rscript": re.compile(r"-e"),
+    "osascript": re.compile(r"-e"),
     "ruby": re.compile(r"-[a-zA-Z]*e|-[acdlnpsSvwyhUW0-9]*e.+", re.S),
     "perl": re.compile(r"-[a-zA-Z]*[eE]|-[acdfgnpsStTuUvwWXhl0-9]*[eE].+", re.S),
     "php": re.compile(
@@ -113,6 +117,9 @@ _INLINE_FLAGS = {
 # Their options that take the next word as a value when none is attached (ruby --help,
 # perl -h, php --help); the value is never the script.
 _INLINE_VALUES = {
+    "lua": _set("-l"),
+    "rscript": frozenset(),
+    "osascript": _set("-l -s"),
     "ruby": _set(
         "-I -r -C -E --encoding --external-encoding --internal-encoding --enable --disable"
         " --dump --parser --backtrace-limit --crash-report"
@@ -126,6 +133,10 @@ _INLINE_VALUES = {
 _SCRIPT_SUFFIX = re.compile(r"(?:-cli)?\.[cm]?js$|\.py$")
 # Python options that end a short-option cluster: inline code, a module, or a value.
 _PYTHON_SPECIAL = re.compile("[cmWX]")
+# Windows' windowed interpreters (pythonw, pyw) and free-threaded builds (python3.13t).
+_PYTHON_NAME = re.compile(r"(?:python|pypy)w?[0-9.]*t?w?(?:d|-dbg)?|pyw?")
+# Standard library modules that run their arguments as Python code.
+_PYTHON_CODE_MODULES = frozenset({"timeit"})
 # TypeScript and transpiling Node runners accept node's inline code options.
 _NODE_RUNNERS = frozenset({"tsx", "esno", "babel-node"})
 _TS_NODE = frozenset(
@@ -201,6 +212,8 @@ class Launch:
     xtrace: bool = False
     # npm exec names packages and no command, so npm runs a configured call or its script shell.
     script_shell: bool = False
+    # env -S and --split-string values read so far, across every env wrapper.
+    split_strings: int = 0
 
     def mark(self, flag: str, count: int = 1) -> None:
         self.context[flag] = self.context.get(flag, 0) + count
@@ -220,7 +233,8 @@ def known_executable(name: str | None) -> bool:
         or _runner_key(name) in _UNCLASSIFIED_RUNNERS
         or name in _NODE_RUNNERS
         or name in _TS_NODE
-        or bool(re.fullmatch(r"(?:python|pypy)[0-9.]*|py|node(?:js)?", name))
+        or bool(_PYTHON_NAME.fullmatch(name))
+        or name in {"node", "nodejs"}
     )
 
 
@@ -849,6 +863,16 @@ _UV_SOURCE = frozenset(
     }
 )
 _UV_LOCATION = frozenset({"--directory", "--project"})
+# uv tool run options that name local files that change what is installed.
+_UV_TOOL_PATHS = frozenset(
+    {
+        "--with-editable",
+        "--with-requirements",
+        "--constraints",
+        "--overrides",
+        "--build-constraints",
+    }
+)
 _PIPX_RUN = _table(
     "--no-cache --pypackages --path --system-site-packages -e --editable -v --verbose -q"
     " --quiet --fetch-missing-python --global",
@@ -1001,7 +1025,7 @@ _FISH_LONG = {
     "version": ("v", False),
 }
 _INTERPRETERS = frozenset(
-    {"cmd", "powershell", "pwsh", "wsl", "env", "exec", "nohup", "java", "ruby", "perl", "php"}
+    {"cmd", "powershell", "pwsh", "wsl", "env", "exec", "nohup", "java", *_INLINE_FLAGS}
 )
 _INJECTORS = frozenset({"op", "doppler", "infisical", "dotenvx", "aws-vault", "with-secrets"})
 # Injectors that add variables the inventory cannot read (files, secret stores).
@@ -1054,6 +1078,11 @@ _ENV_OPTIONS = _set(
 # Characters env -S gives a meaning a shell reading would not (escapes, quotes,
 # expansion, comments) and whitespace other than space and tab.
 _ENV_SPLIT_SPECIAL = re.compile(r"[\\'\"$#\v\f]")
+# Each env -S value is spliced back into the words, so the reads are bounded: a value
+# that splits into another -S would otherwise cost quadratic time in its length.
+MAX_SPLIT_STRINGS = MAX_WRAPPERS
+# GNU env reads any operand with an = after a non-empty name as an assignment.
+_ENV_ASSIGNMENT = re.compile(r"[^=]+=", re.S)
 MAX_SCAN_WORDS = 4096
 
 
@@ -1089,7 +1118,7 @@ def _interpreter_family(name: str) -> str | None:
         return "node"
     if name in _TS_NODE:
         return "ts-node"
-    if re.fullmatch(r"python[0-9.]*|py|pypy[0-9.]*", name):
+    if _PYTHON_NAME.fullmatch(name):
         return "python"
     return name if name in _INLINE_FLAGS else None
 
@@ -1357,7 +1386,9 @@ def _launches(
     if name in {"powershell", "pwsh"}:
         return first[:1] in {"-", "/"} and not first.startswith("--")
     if name == "env":
-        return option in _ENV_OPTIONS or first.startswith("-S") or bool(_ASSIGNMENT.match(first))
+        return (
+            option in _ENV_OPTIONS or first.startswith("-S") or bool(_ENV_ASSIGNMENT.match(first))
+        )
     grammar = _STARTS.get(name)
     if grammar is not None:
         return _subcommands(words, start, grammar, budget)
@@ -1457,10 +1488,13 @@ def _interpreter_reason(
                 if letter == "m":
                     module = letters[position + 1 :] or follows
                     name = module.split(".")[0].replace("_", "-").casefold()
+                    if name in _PYTHON_CODE_MODULES:
+                        return _inline(family, launch)
                     return f"python -m {name}" if name in _PROGRAM_NAMES else None
                 if letter in {"W", "X"}:
                     step = 2 if position + 1 == len(letters) else 1
-        elif _INLINE_FLAGS[family].fullmatch(word):
+        elif word == "-" or _INLINE_FLAGS[family].fullmatch(word):
+            # `-` reads the script from standard input, as it does for node and python.
             return _inline(family, launch)
         elif option in _INLINE_VALUES[family] and not equals:
             step = 2
@@ -2170,6 +2204,11 @@ def _unwrap_env(rest: list[str], launch: Launch) -> list[str] | None:
                 value, skip = word[2:], 1
             # env -S has its own grammar: \_ separates words, \c ends the string,
             # ${VAR} expands and # starts a comment. Such a value is not read here.
+            launch.split_strings += 1
+            if launch.split_strings > MAX_SPLIT_STRINGS:
+                launch.launcher = "unknown"
+                launch.fail("env -S values nest beyond the collector limit")
+                return None
             words = None if _ENV_SPLIT_SPECIAL.search(value) else _split_script(value, literal=True)
             if words is None:
                 launch.fail("env -S value is not a simple command")
@@ -2179,7 +2218,7 @@ def _unwrap_env(rest: list[str], launch: Launch) -> list[str] | None:
         elif word.startswith("-"):
             launch.fail("unrecognised env option")
             return None
-        elif _ASSIGNMENT.match(word):
+        elif _ENV_ASSIGNMENT.match(word):
             name, _, value = word.partition("=")
             launch.environment.append((name, value))
             index += 1
@@ -2299,44 +2338,101 @@ def _unwrap_cmd(rest: list[str], launch: Launch) -> list[str] | None:
     return words
 
 
+# PowerShell parameters (pwsh 7 and Windows PowerShell 5.1) and the shortest prefix of
+# each that names it, as CommandLineParameterParser matches them. Prefixes err short: a
+# word either edition may read as another parameter matches two kinds and fails closed.
+_POWERSHELL_PARAMETERS = (
+    ("command", "c", "command"),
+    ("commandwithargs", "commandw", "command"),
+    ("cwa", "cwa", "command"),
+    ("file", "f", "file"),
+    ("encodedcommand", "e", "encoded"),
+    ("ec", "ec", "encoded"),
+    ("encodedarguments", "encodeda", "encoded"),
+    ("executionpolicy", "ex", "value"),
+    ("ep", "ep", "value"),
+    ("configurationname", "co", "value"),
+    ("configurationfile", "configurationf", "value"),
+    ("custompipename", "cu", "value"),
+    ("settingsfile", "se", "value"),
+    ("inputformat", "in", "value"),
+    ("if", "if", "value"),
+    ("outputformat", "o", "value"),
+    ("of", "of", "value"),
+    ("windowstyle", "w", "value"),
+    ("workingdirectory", "wo", "directory"),
+    ("wd", "wd", "directory"),
+    ("psconsolefile", "ps", "value"),
+    ("version", "v", "value"),
+    ("noprofile", "nop", "switch"),
+    ("noprofileloadtime", "noprofilel", "switch"),
+    ("nologo", "nol", "switch"),
+    ("noninteractive", "noni", "switch"),
+    ("noexit", "noe", "switch"),
+    ("interactive", "i", "switch"),
+    ("login", "l", "switch"),
+    ("mta", "mta", "switch"),
+    ("sta", "sta", "switch"),
+    ("servermode", "s", "switch"),
+    ("socketservermode", "so", "switch"),
+    ("namedpipeservermode", "nam", "switch"),
+    ("sshservermode", "ss", "switch"),
+    ("removeworkingdirectorytrailingcharacter", "r", "switch"),
+    ("help", "h", "switch"),
+    ("?", "?", "switch"),
+)
+
+
+def _powershell_parameter(word: str) -> str | None:
+    """The kind of PowerShell parameter a word names; None for none, or several kinds."""
+    if word[:1] != "-":
+        return None
+    name = word[2:] if word[1:2] == "-" else word[1:]
+    kinds = {
+        kind
+        for full, shortest, kind in _POWERSHELL_PARAMETERS
+        if len(name) >= len(shortest) and full.startswith(name)
+    }
+    return kinds.pop() if len(kinds) == 1 else None
+
+
 def _unwrap_powershell(rest: list[str], launch: Launch) -> list[str] | None:
     index = 0
-    with_value = {
-        "-executionpolicy",
-        "-ep",
-        "-ex",
-        "-windowstyle",
-        "-w",
-        "-inputformat",
-        "-outputformat",
-        "-configurationname",
-        "-workingdirectory",
-        "-wd",
-        "-version",
-    }
     while index < len(rest):
-        word = rest[index].lower()
-        if word in {"-c", "-command"} or (word.startswith("-com") and "-command".startswith(word)):
+        kind = _powershell_parameter(rest[index].lower())
+        if kind == "command":
             break
-        if word in {"-file", "-f"}:
+        if kind == "file":
             launch.launcher = "local"
             launch.executable = "powershell"
+            if rest[index + 1 : index + 2] == ["-"]:
+                # -File - reads the script from standard input, as node - does.
+                launch.fail(_inline("powershell", launch))
             return None
-        if word in with_value:
-            if word in {"-workingdirectory", "-wd"} and index + 1 < len(rest):
+        if kind in {"value", "directory"}:
+            if kind == "directory" and index + 1 < len(rest):
                 launch.relocated = launch.relocated or _moves(rest[index + 1])
             index += 2
-        elif word.startswith("-") and not word.startswith(("-e", "-enc")):
+        elif kind == "switch":
             index += 1
         else:
+            # Encoded code, a script path or an unmodelled parameter, whose value may be
+            # the next word: where PowerShell's command starts is not established.
             index = len(rest)
     launch.launcher = "shell"
     launch.mark("shell_wrapper")
     script = " ".join(rest[index + 1 :])
+    if script == "-":
+        launch.mark("inline_shell_code")
+        launch.fail("PowerShell reads its command from standard input")
+        return None
     words = _split_script(script, _POWERSHELL_OPERATOR, literal=True) if script else None
     if words is None:
         launch.mark("inline_shell_code")
         launch.fail("PowerShell command is not a simple command")
+        return None
+    if words and words[0].casefold() in {"iex", "invoke-expression"}:
+        launch.fail(_inline("powershell", launch))
         return None
     launch.wrappers.append("powershell -Command")
     return words
@@ -2768,6 +2864,11 @@ def _bun(name: str, rest: list[str], launch: Launch) -> None:
     elif subcommand == "exec":
         # bun exec runs its words as a Bun Shell script.
         _shell_subcommand(remainder, launch)
+    elif subcommand == "-" or (
+        subcommand == "run" and next((w for w in remainder if w == "-" or w[:1] != "-"), "") == "-"
+    ):
+        # `bun -` and `bun run -` read the script from standard input, as node - does.
+        launch.fail(_inline("bun", launch))
     else:
         _local_subcommand([subcommand, *remainder], launch)
 
@@ -2795,7 +2896,7 @@ def _python_runner(
     *,
     primary: str | None,
     extras: set[str],
-    paths: set[str],
+    paths: set[str] | frozenset[str],
     shorthand: bool,
 ) -> list[tuple[str, str | None]] | None:
     scanned = _scan(rest, table)
@@ -2847,7 +2948,7 @@ def _uvx(name: str, rest: list[str], launch: Launch) -> None:
         _UV_TOOL_RUN,
         primary="--from",
         extras={"--with"},
-        paths={"--with-editable", "--with-requirements", "--constraints", "--overrides"},
+        paths=_UV_TOOL_PATHS,
         shorthand=True,
     )
 
@@ -2868,7 +2969,7 @@ def _uv(name: str, rest: list[str], launch: Launch) -> None:
             _UV_TOOL_RUN,
             primary="--from",
             extras={"--with"},
-            paths={"--with-editable", "--with-requirements", "--constraints", "--overrides"},
+            paths=_UV_TOOL_PATHS,
             shorthand=True,
         )
     elif subcommand == "run":
@@ -2976,7 +3077,7 @@ _SOCKET_DIRECTORIES = re.compile(
 _ENGINE_STATE = re.compile(r"/var/lib/(?:docker|containers|containerd|kubelet)(?:/.*)?")
 # /proc/<pid>/root is that process's root directory, and init's cwd is "/": the host's,
 # for a host process.
-_PROC_ROOT = re.compile(r"/proc/[^/]+/(?:root|cwd)(?=/|$)")
+_PROC_ROOT = re.compile(r"(?:/proc/[^/]+/(?:root|cwd)(?=/|$))+")
 # A home directory named by the client or shell, which normpath does not resolve.
 _HOME = re.compile(
     r"(?:~|\$\{?home\}?|%userprofile%|\$\{?userprofile\}?|\$\{userhome\}"
@@ -3006,27 +3107,61 @@ _CONTAINER_HOME_ENVIRONMENT = _set("HOME ZDOTDIR XDG_CONFIG_HOME PYTHONUSERBASE"
 _CONTAINER_PATH = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
 
 
-def _mount_fields(spec: str) -> dict[str, str]:
+def _mount_parts(spec: str) -> list[tuple[str, str]]:
     # docker reads --mount as one CSV record and lower-cases each key and the type.
     try:
         parts = next(csv.reader([spec]), [])
     except csv.Error:
         parts = spec.split(",")
-    return {key.lower(): value for key, _, value in (part.partition("=") for part in parts)}
+    return [(key.lower(), value) for key, _, value in (part.partition("=") for part in parts)]
+
+
+def _mount_fields(spec: str) -> dict[str, str]:
+    return dict(_mount_parts(spec))
+
+
+def _volume_source_end(spec: str) -> int:
+    """Where a -v source ends: the first colon outside a client ``${...}`` variable."""
+    # Each search starts past the last one, so the scan is linear in the spec.
+    index, colon = 0, spec.find(":")
+    while colon >= 0:
+        opened = spec.find("${", index, colon)
+        close = spec.find("}", opened) if opened >= 0 else -1
+        if close < 0:
+            return colon
+        index = close + 1
+        if colon < index:
+            colon = spec.find(":", index)
+    return -1
 
 
 def _host_source(spec: str, *, mount: bool) -> str | None:
     if mount:
-        fields = _mount_fields(spec)
-        if fields.get("type", "volume").lower() != "bind":
+        parts = _mount_parts(spec)
+        fields = dict(parts)
+        kind = fields.get("type", "volume").lower()
+        if kind == "bind":
+            return fields.get("source") or fields.get("src") or None
+        # The local volume driver with o=bind mounts its device option, a host path.
+        driver = {
+            key.lower(): value
+            for name, option in parts
+            if name == "volume-opt"
+            for key, _, value in [option.partition("=")]
+        }
+        binds = {"bind", "rbind"} & set(driver.get("o", "").lower().split(","))
+        device = driver.get("device", "")
+        local_device = fields.get(
+            "volume-driver", "local"
+        ).lower() == "local" and device.startswith("/")
+        if kind != "volume" or not (binds or local_device):
             return None
-        return fields.get("source") or fields.get("src") or None
+        return device or None
     # A client variable such as ${env:HOME} holds a colon of its own.
-    variable = re.match(r"\$\{[^}]*\}", spec)
-    skip = variable.end() if variable else 0
-    if ":" not in spec[skip:]:
+    end = _volume_source_end(spec)
+    if end < 0:
         return None
-    source = spec[:skip] + spec[skip:].split(":", 1)[0]
+    source = spec[:end]
     if re.match(r"[A-Za-z]:[\\/]", spec):
         if ":" not in spec[2:]:
             return None
@@ -3053,7 +3188,8 @@ def _container_context(options: list[tuple[str, str | None]], launch: Launch) ->
         if option == "--privileged" and text in {"", "true", "1"}:
             launch.mark("privileged")
         elif option in {"--network", "--net", "--pid", "--ipc", "--uts", "--userns", "--cgroupns"}:
-            if text == "host":
+            # ns:<path> joins the namespace at that path, which may be the host's.
+            if text == "host" or text.startswith("ns:"):
                 launch.mark("host_namespaces")
         elif option == "--cap-add":
             launch.mark("added_capabilities")
@@ -3068,8 +3204,11 @@ def _container_context(options: list[tuple[str, str | None]], launch: Launch) ->
         elif option == "--security-opt" and re.match(r"seccomp[:=]", text):
             # A profile file, possibly from the checkout, may allow every system call.
             launch.mark("custom_security_profile")
-        elif option in {"-e", "--env"} and value is not None:
+        elif option in {"-e", "--env", "--env-merge"} and value is not None:
             name, equals, assigned = value.partition("=")
+            if name.upper().startswith("NPM_CONFIG_"):
+                # npm reads a dash and an underscore alike in a configuration name.
+                name = name.replace("-", "_")
             # bash in the image imports BASH_FUNC_<name>%% as a function that replaces a program.
             if equals and (
                 name.upper() in _CONTAINER_CODE_ENVIRONMENT
@@ -3352,7 +3491,12 @@ def _deno(name: str, rest: list[str], launch: Launch) -> None:
         rest = rest[1:]
     elif rest[:1] == ["task"]:
         launch.launcher = "deno task"
-        _local_subcommand(rest[1:], launch)
+        words = rest[1 : rest.index("--") if "--" in rest else len(rest)]
+        if "--eval" in words:
+            # deno task --eval runs the task name as a command line in its task shell.
+            _shell_subcommand([word for word in rest[1:] if word != "--eval"], launch)
+        else:
+            _local_subcommand(rest[1:], launch)
         return
     elif rest[:1] in (["eval"], ["repl"]):
         launch.fail(_inline("deno", launch))
@@ -3459,8 +3603,9 @@ def _go(name: str, rest: list[str], launch: Launch) -> None:
         launch.fail("unrecognised go run option")
         return
     options, position = scanned
-    if any(option.lstrip("-") in {"exec", "toolexec"} for option, _ in options):
-        # A program that wraps the build tools or the built binary is local code.
+    if any(option.lstrip("-") in {"exec", "toolexec", "overlay"} for option, _ in options):
+        # A program that wraps the build tools or the built binary is local code, and an
+        # overlay replaces the module's source files with local ones.
         launch.mark("code_loading_option")
     target = rest[1 + position]
     if "@" in target:

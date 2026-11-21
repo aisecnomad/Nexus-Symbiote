@@ -244,7 +244,19 @@ A way around a limit that its entry does not describe is worth a
   or `cmd` may rewrite it (quoting removed, `@` prefixes dropped, expansions empty
   or at their default, brace lists expanded, patterns matched against runner
   names), but it can miss a launch in a form it does not know, and a prose
-  argument that only reads like a launch is a gap too.
+  argument that only reads like a launch is a gap too. `pythonw`, `pyw` and
+  free-threaded names such as `python3.13t` are Python; `python -m timeit` is inline
+  code; `-` (standard input) is inline code for node, python, ruby, perl, php,
+  `bun`, `bun run`, `pwsh -File` and `pwsh -Command`.
+- **PowerShell parameters are read from a table.** `pwsh` and `powershell`
+  parameters are matched by prefix, as PowerShell matches them, against a table of
+  switches and value-taking parameters; a parameter outside the table, or a prefix
+  that may name parameters of different kinds (`-co`), is a gap, because its value
+  may hide where `-Command` starts. `-Param:value` is not split.
+- **env is read as GNU env reads it.** Any word with `=` after a non-empty name is an
+  assignment (`BASH_FUNC_sh%%=...`, `npm_config_script-shell=...`), and its variable is
+  rated as a declared `env` entry is. At most four `-S` or `--split-string` values are
+  read in one launch; more is a gap.
 - **Text a shell reads again must read as written.** An `sh -c`, `bash -c`,
   `zsh -c` or `fish -c` script, a command line, `env -S`, `wsl` without `-e`,
   `eval`, `pwsh -Command`, the command word of `npx -p` or `npm exec --package`
