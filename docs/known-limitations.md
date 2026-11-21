@@ -1013,7 +1013,9 @@ A way around a limit that its entry does not describe is worth a
   starts with an end record, which `np.load` also reads as an archive; and by an
   object-dtype array as any member, read from the member's local
   header and the start of its stored or DEFLATE-compressed data. A longer array
-  header, a longer or malformed directory, a member compressed by another method,
+  header, a longer or malformed directory, a ZIP64 locator that points before the
+  last 1 MiB of the archive, where `zipfile` from Python 3.13 reads its record first,
+  a member compressed by another method,
   such as BZIP2 or LZMA, and a member whose data runs past the next member's local
   header are rated `unknown`, a high finding. The directory is read with the
   tolerances of `zipfile` and the specification; another reader's, such as the C++
@@ -1027,8 +1029,9 @@ A way around a limit that its entry does not describe is worth a
   templates are checked for potential Python-internals access patterns, not evaluated;
   a match does not establish a sandbox escape or execution. Computed names can evade
   the heuristic: some constructions of dunder names, such as `dict(__class__=1)|first`
-  or `("_"*2) ~ "class" ~ ("_"*2)`, are not found, although direct attribute access such
-  as `obj.__class__` is. Without other unsafe evidence, a SafeTensors model beside an
+  or `"_Template" ~ "Reference__context"`, are not found, although direct attribute
+  access such as `obj.__class__` or `self._TemplateReference__context`, and an
+  underscore string repeated with `*`, as in `("_"*2) ~ "class" ~ ("_"*2)`, are. Without other unsafe evidence, a SafeTensors model beside an
   unrecognized template keeps its `safe` serialization rating; that rating does not
   establish that the template is safe to render. A template file larger
   than the `file-bytes` limit is digested but not checked, and is a coverage gap.

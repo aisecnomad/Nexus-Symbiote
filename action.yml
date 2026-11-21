@@ -72,6 +72,24 @@ inputs:
       without that key, launch arguments, environment values and endpoint paths are not
       compared. Empty means no drift gate
     default: ""
+  reviewed-baseline-attestation:
+    description: >-
+      Absolute path to a caller-owned DSSE attestation envelope for reviewed-baseline outside
+      GITHUB_WORKSPACE. Requires reviewed-baseline and trusted-keys. When set, the Action
+      verifies the envelope against reviewed-baseline for purpose 'reviewed' before running
+      the drift comparison
+    default: ""
+  trusted-keys:
+    description: >-
+      Comma- or newline-separated absolute paths to caller-owned trusted Ed25519 public key PEM
+      files outside GITHUB_WORKSPACE for reviewed-baseline-attestation
+    default: ""
+  attest:
+    description: >-
+      When 'true', sign build provenance over the exported AIBOM with
+      actions/attest-build-provenance (requires id-token: write and attestations: write
+      permissions on the calling job)
+    default: "false"
   source-binding-key:
     description: >-
       Operator secret of at least 32 characters. It keys the bindings that let drift
@@ -128,6 +146,9 @@ outputs:
   aibom-path:
     description: Path to the requested export; empty when collection did not produce one
     value: ${{ steps.scan.outputs.aibom_path }}
+  aibom-digest:
+    description: SHA-256 of the exported AIBOM file bytes, as sha256:<hex>; empty when collection did not produce one
+    value: ${{ steps.scan.outputs.aibom_digest }}
   result:
     description: >-
       passed when collection and every enabled gate passed, otherwise failed (the step also
@@ -201,6 +222,9 @@ runs:
         SYMBIOTE_RISK_THRESHOLD: ${{ inputs.risk-threshold }}
         SYMBIOTE_FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
         SYMBIOTE_REVIEWED_BASELINE: ${{ inputs.reviewed-baseline }}
+        SYMBIOTE_REVIEWED_BASELINE_ATTESTATION: ${{ inputs.reviewed-baseline-attestation }}
+        SYMBIOTE_TRUSTED_KEYS: ${{ inputs.trusted-keys }}
+        SYMBIOTE_ATTEST: ${{ inputs.attest }}
         SYMBIOTE_SOURCE_BINDING_KEY: ${{ inputs.source-binding-key }}
         SYMBIOTE_SARIF: ${{ inputs.sarif-upload }}
         SYMBIOTE_UPLOAD_ARTIFACT: ${{ inputs.upload-artifact }}
@@ -223,3 +247,9 @@ runs:
           ${{ steps.scan.outputs.aibom_path }}
           ${{ steps.scan.outputs.sarif_path }}
         if-no-files-found: error
+    - name: Attest exported AIBOM provenance
+      if: success() && inputs.attest == 'true' && steps.scan.outputs.aibom_path != ''
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      with:
+        subject-path: ${{ steps.scan.outputs.aibom_path }}
+
