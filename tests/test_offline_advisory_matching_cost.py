@@ -69,10 +69,10 @@ def _reference_range_matches(
     below any limit is in range), or past a parsable bound of an interval with none unparsable.
     """
     raw_type = rng.get("type")
-    if isinstance(raw_type, str) and raw_type.upper() in _UNMATCHED_RANGE_TYPES:
+    if isinstance(raw_type, str) and raw_type in _UNMATCHED_RANGE_TYPES:
         return False, [], []
     if raw_type is not None and (
-        not isinstance(raw_type, str) or raw_type.upper() not in _SUPPORTED_RANGE_TYPES
+        not isinstance(raw_type, str) or raw_type not in _SUPPORTED_RANGE_TYPES
     ):
         raise ValueError("OSV range type is not supported")
     events = rng.get("events")
@@ -144,27 +144,34 @@ def _reference_range_matches(
 
 def _reference_matches_affected_version(
     affected: dict[str, Any], ecosystem: str, version: str
-) -> tuple[bool, list[str], list[str]]:
-    """(matched, fixed, undecided bounds), empty bounds once a listing or range decides."""
-    fixed_versions: list[str] = []
+) -> tuple[bool, list[str], list[str], str | None]:
+    """Evaluate each range independently; keep a settled match alongside the first error."""
     raw_versions, raw_ranges = affected.get("versions", []), affected.get("ranges", [])
     if not isinstance(raw_versions, list) or not isinstance(raw_ranges, list):
-        raise ValueError("OSV affected versions or ranges are not a list")
-    matched = decided = any(
+        return False, [], [], "OSV affected versions or ranges are not a list"
+    listed = any(
         isinstance(ver, str)
         and (ver == version or _reference_compare(ecosystem, version, ver) == 0)
         for ver in raw_versions
     )
-    undecided: list[str] = []
+    hits = []
+    reason = None
     for rng in raw_ranges:
-        in_range, rng_fixed, rng_unparsed = _reference_range_matches(
-            ecosystem, version, rng if isinstance(rng, dict) else {}
-        )
-        if in_range:
-            matched, decided = True, decided or not rng_unparsed
-            fixed_versions.extend(rng_fixed)
-            undecided.extend(rng_unparsed)
-    return matched, sorted(set(fixed_versions)), [] if decided else sorted(set(undecided))
+        try:
+            matched, fixes, bounds = _reference_range_matches(
+                ecosystem, version, rng if isinstance(rng, dict) else {}
+            )
+        except ValueError as exc:
+            reason = reason or str(exc)
+            continue
+        if matched:
+            hits.append((fixes, bounds))
+    if reason is not None:
+        hits = [(fixes, bounds) for fixes, bounds in hits if not bounds]
+    fixes = sorted({fix for found, _ in hits for fix in found})
+    settled = listed or any(not bounds for _, bounds in hits)
+    bounds = [] if settled else sorted({bound for _, items in hits for bound in items})
+    return listed or bool(hits), fixes, bounds, reason
 
 
 _Block = tuple[str, list[str], list[str]]
@@ -181,13 +188,12 @@ def _reference_blocks(
     undecided: list[tuple[str, str]] = []
     outcomes: list[str | None] = []
     for record_id, affected in blocks:
-        try:
-            hit, fixed, bounds = _reference_matches_affected_version(affected, ecosystem, version)
-        except ValueError as exc:
-            undecided.append((record_id, str(exc)))
-            outcomes.append(str(exc))
-            continue
-        outcomes.append(None)
+        hit, fixed, bounds, reason = _reference_matches_affected_version(
+            affected, ecosystem, version
+        )
+        outcomes.append(reason)
+        if reason is not None:
+            undecided.append((record_id, reason))
         if hit:
             found.append((record_id, fixed, bounds))
     return found, undecided, outcomes
@@ -533,17 +539,15 @@ def test_a_random_bundle_gives_the_report_pairwise_matching_gave(tmp_path, monke
                     component.name,
                 ):
                     continue
-                try:
-                    is_match, fixed, undecided = _reference_matches_affected_version(
-                        block, ecosystem, component.version
-                    )
-                except ValueError as exc:
+                is_match, fixed, undecided, reason = _reference_matches_affected_version(
+                    block, ecosystem, component.version
+                )
+                if reason is not None:
                     unlisted_errors += len(errors) >= offline.MAX_OFFLINE_ERRORS
                     if len(errors) < offline.MAX_OFFLINE_ERRORS:
                         errors.append(
-                            f"{component.bom_ref}: offline advisory {adv.record_id}: {exc}"
+                            f"{component.bom_ref}: offline advisory {adv.record_id}: {reason}"
                         )
-                    continue
                 if is_match:
                     hit = matched_by_adv.setdefault(adv.record_id, (adv, [], list(undecided)))
                     hit[1].extend(fixed)
