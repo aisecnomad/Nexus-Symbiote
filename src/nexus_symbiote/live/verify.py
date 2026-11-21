@@ -25,7 +25,7 @@ from nexus_symbiote.core.hashing import (
 )
 from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolComponent
 from nexus_symbiote.graph import validate_graph
-from nexus_symbiote.live import stdio
+from nexus_symbiote.live import pinned_process, stdio
 from nexus_symbiote.live.stdio import (
     LaunchPolicyError,
     PinnedObservation,
@@ -58,7 +58,8 @@ REASONS: dict[str, str] = {
     "launcher-start-failed": "The pinned launcher could not be started.",
     "isolation-unavailable": (
         "Kernel PID containment is unavailable; the pinned launcher was not executed. "
-        "Use an independently isolated worker or explicitly accept --no-isolation."
+        "Use an independently isolated worker or, on Linux only, explicitly accept "
+        "--no-isolation."
     ),
     "isolation-teardown-failed": (
         "The pinned launcher's processes could not be confirmed ended after the session "
@@ -96,6 +97,20 @@ REASONS: dict[str, str] = {
     ),
     "internal-error": "The pinned observation stopped on an unexpected internal error.",
 }
+
+# Off Linux the isolation opt-out is refused as well, so the remedy there names no option.
+ISOLATION_UNAVAILABLE_OFF_LINUX = (
+    "Kernel PID containment is unavailable on this platform, and so is running without it; "
+    "the pinned launcher was not executed. Run verify-live on Linux, in an independently "
+    "isolated worker."
+)
+
+
+def reason_message(reason: str) -> str:
+    """The error a result shows for ``reason``, true for the platform it runs on."""
+    if reason == "isolation-unavailable" and not pinned_process.opt_out_supported():
+        return ISOLATION_UNAVAILABLE_OFF_LINUX
+    return REASONS[reason]
 
 
 # Transport labels of servers reached over the network; discover-mcp observes them.
@@ -141,6 +156,9 @@ class ServerVerifyResult:
     identity_hash: str | None = None
     identity_status: str | None = None  # "match" | "changed" | "unrecorded"
     transport_evidence: dict[str, str] | None = None
+    # "confirmed" only for a verified server whose cleanup could list what the launcher
+    # started; None otherwise, so a result never claims a teardown that was not checked.
+    teardown: str | None = None  # "confirmed"
 
     @property
     def rug_pull_detected(self) -> bool:
@@ -167,6 +185,7 @@ class ServerVerifyResult:
             "declaration_status": self.declaration_status,
             "identity_hash": self.identity_hash,
             "identity_status": self.identity_status,
+            "teardown": self.teardown,
             **({"transport_evidence": self.transport_evidence} if self.transport_evidence else {}),
             "tools": [
                 {
@@ -665,7 +684,7 @@ def verify_mcp_servers(
         elif not remote and server.transport not in ("stdio", None):
             result.reason = "unsupported-transport"
         if result.reason is not None:
-            result.error = REASONS[result.reason]
+            result.error = reason_message(result.reason)
             continue
         deadline = time.monotonic() + stdio.DEADLINE_SECONDS
         try:
@@ -689,6 +708,8 @@ def verify_mcp_servers(
             by_name = {t.name: t for t in approved}
             if len(by_name) != len(approved):
                 raise _RefusedError("ambiguous-approved-tools")
+            if observation.teardown_confirmed:
+                result.teardown = "confirmed"
         except (LaunchPolicyError, SessionDeadlineError, StdioProtocolError) as exc:
             result.reason = exc.reason
         except _RefusedError as exc:
@@ -698,7 +719,7 @@ def verify_mcp_servers(
         except Exception:
             result.reason = "internal-error"
         if result.reason is not None:
-            result.error = REASONS[result.reason]
+            result.error = reason_message(result.reason)
             continue
         result.reachable, result.status = True, "verified"
         result.protocol_version = declared.version
