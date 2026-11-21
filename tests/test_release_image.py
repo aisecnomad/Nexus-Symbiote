@@ -83,13 +83,30 @@ case "$1 $2" in
   "run --rm") exit "${FAIL_RUN:-0}" ;;
   "image inspect") echo "${IMAGE_USER:-10001:10001}" ;;
   "login ghcr.io") cat > "$CALLS.token" ;;
-  "buildx imagetools") printf '{"mediaType":"x","digest":"%s","size":1}\\n' "$REGISTRY_DIGEST" ;;
+  "push "*)
+    [[ -z "${PUSH_FAIL:-}" ]] || exit 1
+    [[ -z "${EMPTY_RECEIPT:-}" ]] || exit 0
+    [[ -z "${DUPLICATE_RECEIPT:-}" ]] || printf '%s: digest: %s size: 1234\\n' "${2##*:}" "$PUSH_DIGEST"
+    printf '%s: digest: %s size: 1234\\n' "${2##*:}" "$PUSH_DIGEST" ;;
+  "buildx imagetools") exit 1 ;;
 esac
 """
 
 
 @pytest.mark.parametrize(
-    "case", ["success", "no-wheel", "two-wheels", "symlinked-wheel", "root", "run-fails", "digest"]
+    "case",
+    [
+        "success",
+        "no-wheel",
+        "two-wheels",
+        "symlinked-wheel",
+        "root",
+        "run-fails",
+        "digest",
+        "no-receipt",
+        "duplicate",
+        "push-fails",
+    ],
 )
 def test_the_image_step_pushes_only_the_one_verified_wheel_that_ran_offline(tmp_path, case):
     for directory in ("bin", "dist", "runner"):
@@ -116,7 +133,10 @@ def test_the_image_step_pushes_only_the_one_verified_wheel_that_ran_offline(tmp_
             GITHUB_OUTPUT=str(output),
             GITHUB_STEP_SUMMARY=str(summary),
             REGISTRY_TOKEN="registry-token",  # noqa: S106 - a stub's input, not a credential
-            REGISTRY_DIGEST="sha256:" + "ab" * 31 if case == "digest" else DIGEST,
+            PUSH_DIGEST="sha256:" + "ab" * 31 if case == "digest" else DIGEST,
+            PUSH_FAIL="yes" if case == "push-fails" else "",
+            EMPTY_RECEIPT="yes" if case == "no-receipt" else "",
+            DUPLICATE_RECEIPT="yes" if case == "duplicate" else "",
             IMAGE_USER="0:0" if case == "root" else "10001:10001",
             FAIL_RUN=str(int(case == "run-fails")),
         ),

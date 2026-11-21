@@ -351,8 +351,10 @@ jobs:
           docker run --rm --network none "$name:$version" --version
           test "$(docker image inspect --format '{{.Config.User}}' "$name:$version")" = 10001:10001
           printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker push "$name:$version"
-          digest="$(docker buildx imagetools inspect "$name:$version" --format '{{json .Manifest}}' | jq -r .digest)"
+          # Sign the pushed manifest using Docker's receipt for this push.
+          receipt="$RUNNER_TEMP/image-push.log"
+          docker push "$name:$version" | tee "$receipt"
+          digest="$(awk -v tag="$version:" '$1 == tag && $2 == "digest:" && $4 == "size:" {print $3}' "$receipt")"
           docker logout ghcr.io
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
           printf 'name=%s\ndigest=%s\n' "$name" "$digest" >> "$GITHUB_OUTPUT"
