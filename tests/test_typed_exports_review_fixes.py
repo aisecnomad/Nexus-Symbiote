@@ -536,3 +536,27 @@ def test_dataset_omits_non_string_pii_status(tmp_path: Path, value: str) -> None
     assert dataset is not None and notices == []
     assert dataset.properties["declared_version"] == "1.0"
     assert "declared_sensitive_pii" not in dataset.properties
+
+
+@pytest.mark.parametrize("value", [["yes"], {"value": "yes"}, [["no"]], 1])
+def test_spdx_omits_non_string_supplied_pii_status(value: object) -> None:
+    bom = _observed()
+    dataset = bom.get_component("dataset:d")
+    assert dataset is not None
+    dataset.properties["declared_sensitive_pii"] = value
+    spdx_doc = SPDXGenerator(projection_version=4).generate(bom)
+    assert spdx_errors(spdx_doc) == []
+    assert "dataset_hasSensitivePersonalInformation" not in _graph_node(spdx_doc, name="tickets")
+
+
+def test_spdx_cli_exports_inventory_with_non_string_pii_status(tmp_path: Path) -> None:
+    bom = _observed()
+    dataset = bom.get_component("dataset:d")
+    assert dataset is not None
+    dataset.properties["declared_sensitive_pii"] = ["yes"]
+    inventory = tmp_path / "inv.json"
+    inventory.write_text(json.dumps(native_document(bom)), encoding="utf-8")
+    result = CliRunner().invoke(
+        main, ["export-standard", "-f", "spdx", str(inventory), "-o", str(tmp_path / "o.json")]
+    )
+    assert result.exit_code == 0, result.output

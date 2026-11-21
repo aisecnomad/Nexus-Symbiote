@@ -599,7 +599,7 @@ class SPDXGenerator(Generator):
                     element["dataset_datasetAvailability"] = avail
                     declared_fields.append("dataset_datasetAvailability")
                 pii = comp.properties.get("declared_sensitive_pii")
-                if pii in {"yes", "no", "noAssertion"}:
+                if isinstance(pii, str) and pii in {"yes", "no", "noAssertion"}:
                     element["dataset_hasSensitivePersonalInformation"] = pii
                     declared_fields.append("dataset_hasSensitivePersonalInformation")
             else:
