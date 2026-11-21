@@ -21,6 +21,8 @@ the markers are inventoried by the `prompt` collector.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import fnmatch
 import os
 import re
@@ -1236,7 +1238,13 @@ def _skip_env(words: list[str], index: int) -> int:
     while index < len(words):
         word = _decode_word(words[index], drop_ifs=True)
         if word == "--":
-            return index + 1
+            index += 1
+            while index < len(words):
+                operand = _decode_word(words[index], drop_ifs=True)
+                if not (_assignment(operand) or _SHELL_ASSIGNMENT.match(operand)):
+                    break
+                index += 1
+            return index
         if word in {"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}:
             index += 1
             continue
@@ -1419,14 +1427,28 @@ def _executable_index(words: list[str]) -> int | None:
     index = 0
     while index < len(words):
         raw = _decode_word(words[index], drop_ifs=True).strip()
-        if raw in {"(", "{", ")", "}"}:
+        if raw in {"(", "{", ")", "}"} or words[index] == "!":
             index += 1
+            continue
+        if words[index] == "time" and (
+            index + 1 == len(words)
+            or words[index + 1] == "-p"
+            or not words[index + 1].startswith("-")
+        ):
+            index += 1
+            if index < len(words) and words[index] == "-p":
+                index += 1
             continue
         # bash reads a word as an assignment only when its name is unquoted and valid;
         # `1=/bin/sh`, `a.b=/bin/sh` and `"X"=/bin/sh` are commands, run by path.
         if _SHELL_ASSIGNMENT.match(words[index]):
             index = _assignment_end(words, index)
             continue
+        break
+
+    # A wrapper consumes a program from its own argv. Shell assignment syntax
+    # does not apply again after that command word.
+    while index < len(words):
         names = _name_variants(words[index])
         if "env" in names:
             index = _skip_env(words, index + 1)
@@ -2554,11 +2576,26 @@ _BASE64_PAYLOAD = re.compile(
 
 
 def _encoded_payload(segment: str, end: int) -> bool:
-    """Whether the argument after an encoded-command switch ending at `end` is base64."""
+    """Whether a short ambiguous switch is followed by evidence of UTF-16LE script text."""
     argument = _ARGUMENT.search(segment, end)
     if argument is None:
         return False
-    return _BASE64_PAYLOAD.fullmatch(_decode_word(argument.group(), drop_ifs=True)) is not None
+    encoded = _decode_word(argument.group(), drop_ifs=True)
+    if not _BASE64_PAYLOAD.fullmatch(encoded):
+        return False
+    try:
+        text = base64.b64decode(encoded, validate=True).decode("utf-16-le")
+    except (binascii.Error, UnicodeDecodeError):
+        return False
+    # Ordinary option operands can also be valid base64, sometimes decoding to
+    # unrelated Unicode letters. A BOM or ASCII syntax distinguishes script text.
+    has_bom = text.startswith("\ufeff")
+    text = text.removeprefix("\ufeff")
+    return (
+        bool(text)
+        and (has_bom or any(char.isascii() for char in text))
+        and all(char.isprintable() or char in "\t\n\r" for char in text)
+    )
 
 
 def _parameter_name(token: str) -> str | None:
