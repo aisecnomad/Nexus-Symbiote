@@ -203,13 +203,36 @@ def _read_html_dialects(
         yield reader
 
 
+def _only_html_disagrees(exc: _AmbiguousError, readers: list[_Reader]) -> bool:
+    return (
+        isinstance(exc, _HTMLDisagreementError)
+        and len(readers) == 2
+        and not any(r.recovered_setext for r in readers)
+    )
+
+
+def _import_boundaries(blocks: list[tuple[str, str]]) -> list[str]:
+    parts = []
+    for kind, content in blocks:
+        if kind not in {"paragraph", "heading"} or "`@" not in content:
+            continue
+        inline = _outside_spans(content, import_boundaries_only=True)
+        if inline == content:
+            # An earlier container can hold the opening backtick. Preserve the
+            # literal filename that follows a possible close in this block.
+            inline = re.sub(r"(?<=[^\s`])`++(?=@)", " ", content)
+        if inline != content:
+            parts.append(inline)
+    return parts
+
+
 def text_outside_code(text: str) -> list[str]:
     """The parts of ``text`` that a CommonMark reader does not read as code.
 
     Each paragraph and heading is one part, with its code spans replaced by a space;
     an HTML block or indented code line is returned as written, and fenced code is left
-    out. An ambiguous file is returned whole, with an additional reading of import
-    lines at container and inline-code boundaries. A file that opens
+    out. A difference confined to HTML uses both complete block readings. Other
+    ambiguities retain the whole file and container and inline-code boundaries. A file that opens
     with front matter is read both whole and without it, and the parts of either
     reading are returned.
     """
@@ -227,7 +250,17 @@ def _text_outside_code(text: str) -> list[str]:
         for line in lines:
             reader.read(line)
         reader.finish()
-    except _AmbiguousError:
+    except _AmbiguousError as exc:
+        readers = list(_read_html_dialects(lines, len(text)))
+        if _only_html_disagrees(exc, readers):
+            # Both readings completed. Each keeps the prose and raw HTML it
+            # sees, so a fence agreed by both cannot supply a real import.
+            parts: list[str] = []
+            for alternative in readers:
+                parts = _union(
+                    parts, _union(alternative.parts, _import_boundaries(alternative.blocks))
+                )
+            return parts
         # A quote marker or a closing code span can put an import at the start of
         # rendered text even when the raw file has no whitespace before its @.
         alternatives = [text]
@@ -256,7 +289,7 @@ def _text_outside_code(text: str) -> list[str]:
                         boundary = re.sub(r"(?<=[^\s`])`++(?=@)", " ", bare)
                         if boundary != bare:
                             alternatives.append(boundary)
-        for alternative in _read_html_dialects(lines, len(text)):
+        for alternative in readers:
             alternatives = _union(alternatives, alternative.parts)
         return alternatives
     return reader.parts
@@ -272,13 +305,16 @@ def commonmark_block_readings(text: str) -> dict[str, list[tuple[str, str]]]:
         for line in lines:
             reader.read(line)
         reader.finish()
-    except _AmbiguousError:
+    except _AmbiguousError as exc:
         # The raw reading keeps unmodeled evidence. A fenced example in that
         # reading must not hide a new prose instruction in another reading.
-        readings = {"source": [("paragraph", "\n".join(lines))]}
-        bare = "\n".join(_CONTAINER_MARKS.sub("", line, count=1) for line in lines)
-        readings["containers"] = [("paragraph", bare)]
-        for alternative in _read_html_dialects(lines, len(text), include_fence=True):
+        readers = list(_read_html_dialects(lines, len(text), include_fence=True))
+        readings: dict[str, list[tuple[str, str]]] = {}
+        if not _only_html_disagrees(exc, readers):
+            readings["source"] = [("paragraph", "\n".join(lines))]
+            bare = "\n".join(_CONTAINER_MARKS.sub("", line, count=1) for line in lines)
+            readings["containers"] = [("paragraph", bare)]
+        for alternative in readers:
             readings["ascii" if alternative.ascii_html else "unicode"] = alternative.blocks
         return readings
     return {"common": reader.blocks}
@@ -293,6 +329,7 @@ class _Reader:
         self.matches = matches
         self.include_fence = include_fence
         self.ascii_html = ascii_html
+        self.recovered_setext = False
         self.parts: list[str] = []
         # Each paragraph, heading and HTML block as written, with its kind, in order.
         self.blocks: list[tuple[str, str]] = []
@@ -531,13 +568,13 @@ class _Reader:
             ):
                 self._close_unmatched()
                 content = "\n".join(parent.lines)
-                if self.ascii_html is None and (
-                    _DEFINITION.match(content) or _FOOTNOTE.search(content)
-                ):
+                if _DEFINITION.match(content) or _FOOTNOTE.search(content):
                     # A paragraph of nothing but definitions is no heading, and cmark-gfm
                     # ends the paragraph at a footnote. Retain the raw reading and the
                     # complete CommonMark heading reading of the rest of the file.
-                    raise _AmbiguousError
+                    if self.ascii_html is None:
+                        raise _AmbiguousError
+                    self.recovered_setext = True
                 self.parts.append(_outside_spans(content))
                 if parent.after_code:
                     self.after_code.add(len(self.blocks))
