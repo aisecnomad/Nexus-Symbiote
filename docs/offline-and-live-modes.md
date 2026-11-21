@@ -147,8 +147,11 @@ server only when the inventory records that server's `https` origin; a missing o
 `[redacted]` endpoint, another origin, or evidence that is not a complete live
 observation fails with reason `invalid-transport-evidence`. Until a `--record` run
 stores the evidence's full-URL digest on the server (`observed_endpoint_hash`), the
-binding is origin-only, so an observation of another path on the same origin passes;
-each server's report names its `endpoint_binding` and the evidence's `observed_at`,
+binding is origin-only, so an observation of another path on the same origin passes.
+For tools verified through transport evidence, `--record` preserves the tool's
+observation method, collector and timestamp and records the verified attestation's
+SHA-256 digest in the tool claim's `evidence_refs`.
+Each server's report names its `endpoint_binding` and the evidence's `observed_at`.
 `--require-full-url-binding` refuses origin-only evidence (it checks the inventory's recorded digest against the evidence, not the configured URL, so an inventory that records the digest of another URL satisfies it), `--max-evidence-age HOURS` refuses older evidence, and future-dated evidence is always refused. `--require-transport-evidence` makes a remote server
 without such evidence fail with reason `remote-transport`. Such a server that records a launch command, which
 a client may start, fails with reason `ambiguous-transport` unless the launch policy

@@ -176,6 +176,7 @@ class VerifiedAttestation:
 
     ``subject_sha256`` is the digest of the bytes verified and ``attested_sha256`` the
     one the statement records; they differ only when ``match`` is ``content``.
+    ``envelope_digest`` references the original envelope bytes when available.
     """
 
     predicate: InventoryPredicate
@@ -183,6 +184,7 @@ class VerifiedAttestation:
     match: Match
     subject_sha256: str
     attested_sha256: str
+    envelope_digest: str | None = None
 
 
 def subject_name(name: str) -> str:

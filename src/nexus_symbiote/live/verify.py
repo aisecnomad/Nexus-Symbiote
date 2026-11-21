@@ -23,7 +23,7 @@ from nexus_symbiote.core.hashing import (
     normalize_digest,
     tool_definition_extensions,
 )
-from nexus_symbiote.core.models import MCPServerComponent, ToolComponent
+from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolComponent
 from nexus_symbiote.graph import validate_graph
 from nexus_symbiote.live import stdio
 from nexus_symbiote.live.stdio import (
@@ -119,6 +119,7 @@ class LiveToolFinding:
     display_differs: bool = False
     observed_hash: str | None = field(default=None, repr=False)
     unprofiled_fields: tuple[str, ...] = ()
+    remote_claim: ClaimEvidence | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -492,6 +493,8 @@ def _verify_remote_evidence(
             or tool_claim.assurance != AssuranceLevel.OBSERVED
             or tool_claim.collector != "live-mcp"
             or tool_claim.method != "https-mcp-tools-list"
+            or tool_claim.observed_at is None
+            or not _recent(tool_claim.observed_at, max_age)
             or obs_tool.definition_hash_version != TOOL_DEFINITION_HASH_VERSION
             or fp is None
         ):
@@ -555,6 +558,13 @@ def _verify_remote_evidence(
                 unprofiled_fields=tuple(str(x) for x in unprofiled)
                 if isinstance(unprofiled, list | tuple)
                 else (),
+                remote_claim=ClaimEvidence(
+                    assurance=AssuranceLevel.OBSERVED,
+                    method="https-mcp-tools-list",
+                    scope="served-descriptor",
+                    collector="live-mcp",
+                    observed_at=obs_tool.claims["tool_definition"].observed_at,
+                ),
             )
         )
     for old in approved:
@@ -771,19 +781,30 @@ def verify_mcp_servers(
     return report
 
 
-def record_candidate(bom: AIBOM, report: LiveVerifyReport) -> None:
+def record_candidate(
+    bom: AIBOM, report: LiveVerifyReport, *, remote_attestations: dict[str, str] | None = None
+) -> None:
     """Update a separate unsigned candidate; observations confer no authority."""
-    from datetime import UTC, datetime
     from urllib.parse import quote
 
     from nexus_symbiote.core.aibom import DependencyEdge
     from nexus_symbiote.core.enums import AssuranceLevel
-    from nexus_symbiote.core.models import ClaimEvidence
 
     if not report.complete or any(
         finding.status == "missing" for result in report.results for finding in result.tool_findings
     ):
         raise ValueError("incomplete inventory; candidate cannot be emitted")
+    attestation_digests = remote_attestations or {}
+    if any(
+        result.status == "verified"
+        and result.transport_evidence
+        and (
+            _valid_digest(attestation_digests.get(result.server_ref)) is None
+            or any(finding.remote_claim is None for finding in result.tool_findings)
+        )
+        for result in report.results
+    ):
+        raise ValueError("remote candidate requires verified attestation provenance")
     for result in report.results:
         if result.status != "verified":
             continue
@@ -861,13 +882,18 @@ def record_candidate(bom: AIBOM, report: LiveVerifyReport) -> None:
                 )
             )
             tool.assurance_level = AssuranceLevel.OBSERVED
-            tool.claims["tool_definition"] = ClaimEvidence(
-                assurance=AssuranceLevel.OBSERVED,
-                method="operator-pinned-stdio-tools-list",
-                scope="served-descriptor",
-                collector="nexus-symbiote-live-stdio",
-                observed_at=datetime.now(UTC),
-            )
+            if finding.remote_claim is not None:
+                tool.claims["tool_definition"] = finding.remote_claim.model_copy(
+                    update={"evidence_refs": [attestation_digests[result.server_ref]]}
+                )
+            else:
+                tool.claims["tool_definition"] = ClaimEvidence(
+                    assurance=AssuranceLevel.OBSERVED,
+                    method="operator-pinned-stdio-tools-list",
+                    scope="served-descriptor",
+                    collector="nexus-symbiote-live-stdio",
+                    observed_at=datetime.now(UTC),
+                )
         server = bom.get_component(result.server_ref)
         if isinstance(server, MCPServerComponent):
             server.schema_hash = result.live_schema_hash

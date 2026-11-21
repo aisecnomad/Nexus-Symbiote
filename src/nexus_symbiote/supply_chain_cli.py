@@ -273,6 +273,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
 
         from nexus_symbiote.attestation import Purpose
         from nexus_symbiote.core.hashing import hash_bytes, open_regular_file, parse_json_strict
+        from nexus_symbiote.core.models import MCPServerComponent
         from nexus_symbiote.live.pinned_process import isolation_off
         from nexus_symbiote.live.verify import record_candidate, verify_mcp_servers
         from nexus_symbiote.policy_export import verify_file_attestation
@@ -358,9 +359,10 @@ def register_supply_chain_commands(main: click.Group) -> None:
                 raw_evidence_pairs.append((ev_path, att_path, ev_bytes))
         except (OSError, ValueError, TypeError, RecursionError):
             raise click.ClickException("invalid BOM or operator launch policy") from None
+        evidence_attestations: dict[str, str] = {}
         effective_purpose = cast(Purpose, transport_evidence_purpose or "generated")
         for ev_path, att_path, ev_bytes in raw_evidence_pairs:
-            verify_file_attestation(
+            verified = verify_file_attestation(
                 ev_path,
                 att_path,
                 trusted_keys=trusted_keys,
@@ -372,10 +374,17 @@ def register_supply_chain_commands(main: click.Group) -> None:
             )
             try:
                 ev_doc = parse_json_strict(ev_bytes, max_bytes=16 * 1024 * 1024)
-                evidence_boms.append(AIBOM.from_document(ev_doc))
+                evidence_bom = AIBOM.from_document(ev_doc)
+                evidence_boms.append(evidence_bom)
                 evidence_digests.append(hash_bytes(ev_bytes))
             except (ValueError, TypeError, RecursionError):
                 raise click.ClickException("invalid transport evidence inventory") from None
+            if verified.envelope_digest is not None:
+                evidence_attestations.update(
+                    (server.bom_ref, verified.envelope_digest)
+                    for server in evidence_bom.components
+                    if isinstance(server, MCPServerComponent)
+                )
         if no_isolation:
             click.echo(
                 "warning: --no-isolation: kernel PID containment is disabled. On Linux the "
@@ -418,7 +427,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
         }
         if record:
             try:
-                record_candidate(bom, report)
+                record_candidate(bom, report, remote_attestations=evidence_attestations)
             except ValueError:
                 raise click.ClickException("incomplete inventory; candidate not emitted") from None
             try:
