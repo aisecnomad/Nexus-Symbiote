@@ -527,6 +527,18 @@ def test_requirement_naming_the_project_or_a_package_stays_complete(tmp_path, li
             "ollama/ollama:latest",
             "version_pinning",
         ),
+        # BuildKit parity, pinned: an escaped backslash after a stage does not hide the
+        # next FROM, and BuildKit reads `<<- EOF` as no heredoc.
+        (
+            "FROM python:3\nRUN echo foo\\\\\nFROM ollama/ollama:latest\n",
+            "ollama/ollama:latest",
+            "version_pinning",
+        ),
+        (
+            "FROM python:3\nRUN cat <<- EOF\nFROM ollama/ollama:latest\nEOF\n",
+            "ollama/ollama:latest",
+            "version_pinning",
+        ),
         ("FROM \\\r\r\nollama/ollama:latest\r\n", "ollama/ollama:latest", "version_pinning"),
         # Go's unicode.IsSpace has no \x1c-\x1f.
         (

@@ -111,6 +111,14 @@ spec's stanza and another `resolved`, `integrity` or `checksum`: Yarn 1 reuses t
 first record it resolves with that version, so when a dependency listed earlier in
 `package.json` depends on the other range, Yarn installs the other stanza.
 
+When `package.json` declares a package in more than one section with different
+specs, Yarn 1 takes the first that is neither `""` nor `*`, in the order
+`optionalDependencies`, `dependencies`, `devDependencies`, and that spec's stanza is
+the one bound, not the stanza of npm's last-section spec. Which spec Yarn Berry takes
+is not resolved here, so a Berry lockfile binds neither and reports `multiple package
+resolutions for <package> are ambiguous`. So does a pnpm root importer that resolves
+the package to different versions in two of its sections.
+
 So is, in a Yarn Berry lockfile, a second stanza whose `resolution` names the
 declared spec's locator, under any key (`openai@npm:^4.0.0` or `zzz@npm:1.0.0` with
 `resolution: "openai@npm:4.0.0"`). Yarn writes one stanza per locator, and Yarn 4
