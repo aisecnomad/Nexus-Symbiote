@@ -1404,8 +1404,7 @@ IMAGE = "img@sha256:" + "a" * 64
         (
             [
                 "--mount",
-                "type=volume,volume-opt=type=none,volume-opt=o=bind,volume-opt=device=/,"
-                "target=/host",
+                "type=volume,volume-opt=type=none,volume-opt=o=bind,volume-opt=device=/,target=/host",
             ],
             "host_root_mount",
         ),
