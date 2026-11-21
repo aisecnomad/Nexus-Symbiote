@@ -772,10 +772,25 @@ def _allows_mcp_server(rules: list[str], prefix: str) -> bool:
     return index < len(rules) and rules[index].startswith(scoped)
 
 
+def _claude_unconditional_rule(rule: str) -> str | None:
+    if "(" not in rule and ")" not in rule:
+        return rule
+    # Only a tool name that failed MCP namespace parsing can use the client's
+    # literal-name fallback. An ordinary MCP call rule with parentheses is invalid.
+    if rule.startswith("mcp____") and rule.endswith("(*)"):
+        literal = rule[:-3]
+        if "(" not in literal and ")" not in literal and "*" not in literal:
+            return literal
+    return None
+
+
 def _claude_mcp_allow(rule: str) -> str | None:
     """Return the client's unconditional MCP rule, preserving literal tool names."""
-    rule = rule.removesuffix("(*)")
-    if not rule.startswith("mcp__") or any(c.isspace() or c in "()" for c in rule):
+    normalized = _claude_unconditional_rule(rule)
+    if normalized is None:
+        return None
+    rule = normalized
+    if not rule.startswith("mcp__") or any(c.isspace() for c in rule):
         return None
     server, separator, tool = rule[5:].partition("__")
     if not server:
@@ -801,7 +816,7 @@ def _denies_mcp_server(rules: set[str], prefixes: list[str], server: str) -> boo
     """Accept a denial only when it covers all present and future tools of the server."""
     address = server + "__"
     parsed_server = address[5:].partition("__")[0]
-    if server in rules or (parsed_server and "mcp__" + parsed_server in rules):
+    if parsed_server and "mcp__" + parsed_server in rules:
         return True
     index = bisect_right(prefixes, address) - 1
     return index >= 0 and address.startswith(prefixes[index])
@@ -842,7 +857,10 @@ def _inspect_steering_surfaces(
                 normalized for rule in allow if (normalized := _claude_mcp_allow(rule)) is not None
             )
             claude_denies.update(
-                r.removesuffix("(*)") for r in _as_list(perms.get("deny")) if isinstance(r, str)
+                normalized
+                for rule in _as_list(perms.get("deny"))
+                if isinstance(rule, str)
+                and (normalized := _claude_unconditional_rule(rule)) is not None
             )
         if doc.get("approvalPolicy") in ("never", "auto-edit"):
             auto_edit_modes.append(f"{s_path}:{doc['approvalPolicy']}")
