@@ -118,12 +118,13 @@ _NAMED_TOKEN = re.compile(rf"(?<![\w-]){_JWT}|(?<![A-Za-z0-9])(?:{_DISTINCT_SHAP
 # plain name such as disk-management-service-v2 does not read as one.
 _EMBEDDED_TOKEN = re.compile(rf"(?:AKIA|ASIA)[A-Z0-9]{{16}}|(?:{_DISTINCT_SHAPES})")
 _TOKEN_SEGMENT = re.compile(r"[\w-]++")
+_SK_BOUNDARY = re.compile(r"(?<!\w)sk-")
 _DECIMAL_DIGIT = re.compile(r"\d")
 _JWT_PAYLOAD_START = re.compile(r"\.[\w-]{8}")
 
 
-def holds_token_shape(text: str) -> bool:
-    """Whether a credential shape occurs anywhere in ``text``, also glued to other text."""
+def holds_token_shape(text: str, *, require_sk_boundary: bool = False) -> bool:
+    """Find token shapes, optionally distinguishing a generic sk- prefix from a word suffix."""
     if _EMBEDDED_TOKEN.search(text) is not None:
         return True
     if "sk-" not in text and "eyJ" not in text:
@@ -132,7 +133,11 @@ def holds_token_shape(text: str) -> bool:
     # can tell us anything new about the remaining length and digit count.
     for segment in _TOKEN_SEGMENT.finditer(text):
         start, end = segment.span()
-        key = text.find("sk-", start, end)
+        if require_sk_boundary:
+            match = _SK_BOUNDARY.search(text, start, end)
+            key = match.start() if match is not None else -1
+        else:
+            key = text.find("sk-", start, end)
         if key >= 0 and end - key >= 23:
             first = _DECIMAL_DIGIT.search(text, key + 3, end)
             if first is not None and _DECIMAL_DIGIT.search(text, first.end(), end) is not None:

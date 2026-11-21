@@ -707,6 +707,7 @@ class _PipDeclaration:
     untranslated: str | None = None
     hashes: tuple[str, ...] = ()
     marker: str = ""
+    sensitive_marker: bool = False
     pin: str | None = None
     pin_key: object = None
     # The name or an extra held a credential and is recorded redacted.
@@ -1834,14 +1835,17 @@ class RegistryScanner(Scanner):
     ) -> RegistryEntryComponent:
         spec = specs[-1][1]
         name = redact_text(package)
-        sensitive_specs = {value for _, value in specs if holds_token_shape(value)}
+        sensitive_specs = {
+            value for _, value in specs if holds_token_shape(value, require_sk_boundary=True)
+        }
         recorded_specs = {
             value: REDACTED if value in sensitive_specs else redact_text(value)
             for _, value in specs
         }
         locked_version = record.get("version") if isinstance(record, dict) else None
         sensitive_version = spec in sensitive_specs or (
-            isinstance(locked_version, str) and holds_token_shape(locked_version)
+            isinstance(locked_version, str)
+            and holds_token_shape(locked_version, require_sk_boundary=True)
         )
         properties: dict[str, Any] = {
             "collection_mode": "manifest-reference",
@@ -2243,15 +2247,25 @@ class RegistryScanner(Scanner):
         ``checksum_recorded`` says the record holds Yarn's own checksum instead, and
         ``requested`` is the spec the package manager takes when it is not npm's.
         Nothing is bound, and a failure says why, when a check fails."""
-        sensitive_locator = holds_token_shape(locator) or redact_text(locator) != locator
-        sensitive = (
-            sensitive_locator or holds_token_shape(version) or redact_text(version) != version
-        )
+
+        def private(value: str) -> bool:
+            return holds_token_shape(value, require_sk_boundary=True) or redact_text(value) != value
+
+        sensitive_locator = private(locator)
+        sensitive = sensitive_locator or private(version)
         if sensitive:
             component.package_url = component.registry_uri = None
-            component.risks.append(
-                _identifier_risk(f"npm package '{component.name}'", "lock record")
+            # The selected version can appear in both the manifest and the lock
+            # key. Check the rest of the key for an independently private value.
+            repeated = (
+                requested == version
+                and any(r.category == "credential_exposure" for r in component.risks)
+                and not private(locator.replace(_pointer_token(version), ""))
             )
+            if not repeated:
+                component.risks.append(
+                    _identifier_risk(f"npm package '{component.name}'", "lock record")
+                )
         if sensitive_locator:
             # The file digest still supports this claim. Its selector cannot be exported.
             locator = lock_name
@@ -3039,7 +3053,18 @@ class RegistryScanner(Scanner):
             # Retain markers and URLs as declared, unresolved conditions; they
             # must not silently turn into an unconditional exact package URL.
             marker = str(requirement.marker) if requirement.marker else ""
-            sensitive = holds_token_shape(str(requirement.specifier)) or holds_token_shape(marker)
+            # Packaging normalizes extra-marker operands, including case and
+            # underscores. Check the original marker before that can hide a token.
+            raw_marker = ""
+            if marker:
+                after_url = (
+                    reference.partition(requirement.url)[2] if requirement.url else reference
+                )
+                raw_marker = after_url.partition(";")[2] or reference
+            sensitive_marker = holds_token_shape(raw_marker, require_sk_boundary=True)
+            sensitive = sensitive_marker or holds_token_shape(
+                str(requirement.specifier), require_sk_boundary=True
+            )
             if requirement.url:
                 spec = "@ " + _url_origin(requirement.url)
             else:
@@ -3082,6 +3107,7 @@ class RegistryScanner(Scanner):
             requirement=requirement,
             hashes=hashes,
             marker=marker,
+            sensitive_marker=sensitive_marker,
             pin=pin[0] if pin else None,
             pin_key=pin[1] if pin else None,
             redacted=redacted or sensitive,
@@ -3203,6 +3229,8 @@ class RegistryScanner(Scanner):
         redacted = any(d.redacted for d in declarations)
         if redacted:
             where = "version" if any(d.spec == REDACTED for d in declarations) else "name or extras"
+            if any(d.sensitive_marker for d in declarations):
+                where = "environment marker"
             risks.append(_identifier_risk(f"PyPI package '{name}'", where))
         package_url = None
         if (
@@ -3823,7 +3851,7 @@ class RegistryScanner(Scanner):
                     continue
             resolved_version = record.get("version")
             sensitive_version = isinstance(resolved_version, str) and holds_token_shape(
-                resolved_version
+                resolved_version, require_sk_boundary=True
             )
             if sensitive_version:
                 comp.package_url = comp.registry_uri = None
