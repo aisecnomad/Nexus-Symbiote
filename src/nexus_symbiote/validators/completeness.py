@@ -1096,13 +1096,31 @@ def discovery_producer_check(
             f"{local.source_report_path}; its producer is unverified."
         )
         return "failed", problems
+    if policy.allow_oms_dsse:
+        problems.append(
+            "ShadowScan report requires a sigstore-message-signature entry, not OpenSSF Model Signing DSSE."
+        )
+        return "failed", problems
     if policy.expected_sha256 is not None and not hmac.compare_digest(
         policy.expected_sha256, recorded
     ):
         problems.append("ShadowScan report differs from the operator's expected_sha256 pin.")
-    verified = verify_sigstore_bundle(
-        policy.artifact_path, policy.bundle_path, policy.expected_identity, policy.expected_issuer
-    )
+    if policy.rekor_root_hash is not None or policy.minimum_rekor_tree_size is not None:
+        verified = verify_sigstore_bundle(
+            policy.artifact_path,
+            policy.bundle_path,
+            policy.expected_identity,
+            policy.expected_issuer,
+            rekor_root_hash=policy.rekor_root_hash,
+            minimum_rekor_tree_size=policy.minimum_rekor_tree_size,
+        )
+    else:
+        verified = verify_sigstore_bundle(
+            policy.artifact_path,
+            policy.bundle_path,
+            policy.expected_identity,
+            policy.expected_issuer,
+        )
     if verified.error == SIGSTORE_MISSING:
         problems.append(SIGSTORE_MISSING)
     elif not (

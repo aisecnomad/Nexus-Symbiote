@@ -38,11 +38,14 @@ from nexus_symbiote.utils.crypto import (
 MAX_POLICY_BYTES = 4 * 1024 * 1024
 MAX_POLICY_ARTIFACTS = 1000
 SIGSTORE_KIND = "sigstore-message-signature"
+OMS_DSSE_KIND = "openssf-model-signing-dsse"
 DIGEST_PIN_KIND = "digest-pin"
 _FIELDS = frozenset({"artifact_path", "bundle_path", "expected_identity", "expected_issuer"})
+_SIGSTORE_OPTIONAL = frozenset({"expected_sha256", "rekor_root_hash", "minimum_rekor_tree_size"})
 # Version 2: required fields and optional fields for each kind.
 _KINDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
-    SIGSTORE_KIND: (_FIELDS | {"kind"}, frozenset({"expected_sha256"})),
+    SIGSTORE_KIND: (_FIELDS | {"kind"}, _SIGSTORE_OPTIONAL),
+    OMS_DSSE_KIND: (_FIELDS | {"kind"}, _SIGSTORE_OPTIONAL),
     DIGEST_PIN_KIND: (frozenset({"kind", "artifact_path", "expected_sha256"}), frozenset()),
 }
 
@@ -112,6 +115,32 @@ def _pin(record: dict[str, Any]) -> str | None:
             "Signature policy expected_sha256 must be a SHA-256 digest"
         ) from None
     return f"{algorithm}:{digest}"
+
+
+def _rekor_root_hash(record: dict[str, Any]) -> str | None:
+    if "rekor_root_hash" not in record:
+        return None
+    value = record["rekor_root_hash"]
+    try:
+        if not isinstance(value, str):
+            raise ValueError
+        algorithm, digest = normalize_digest(value, "sha256")
+    except ValueError:
+        raise SignaturePolicyError(
+            "Signature policy rekor_root_hash must be a SHA-256 digest"
+        ) from None
+    return f"{algorithm}:{digest}"
+
+
+def _minimum_rekor_tree_size(record: dict[str, Any]) -> int | None:
+    if "minimum_rekor_tree_size" not in record:
+        return None
+    value = record["minimum_rekor_tree_size"]
+    if type(value) is not int or value < 1:
+        raise SignaturePolicyError(
+            "Signature policy minimum_rekor_tree_size must be a positive integer"
+        )
+    return value
 
 
 def _record(record: object, version: int) -> tuple[str, dict[str, Any]]:
@@ -242,7 +271,7 @@ def load_signature_policies(policy_path: Path, project_root: Path) -> SignatureP
             pin = _pin(record)
             entry: ArtifactPolicy
             bundle: Path | None = None
-            if kind == SIGSTORE_KIND:
+            if kind in (SIGSTORE_KIND, OMS_DSSE_KIND):
                 bundle = _relative_path(_required_string(record, "bundle_path"))
                 entry = SigstoreArtifactPolicy(
                     files.root / artifact,
@@ -251,6 +280,9 @@ def load_signature_policies(policy_path: Path, project_root: Path) -> SignatureP
                     _issuer(record),
                     expected_sha256=pin,
                     policy_digest=digest,
+                    allow_oms_dsse=(kind == OMS_DSSE_KIND),
+                    rekor_root_hash=_rekor_root_hash(record),
+                    minimum_rekor_tree_size=_minimum_rekor_tree_size(record),
                 )
             elif pin is not None:
                 entry = DigestPinPolicy(files.root / artifact, pin, digest)
