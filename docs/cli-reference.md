@@ -1120,6 +1120,7 @@ nexus-symbiote verify-live [OPTIONS] AIBOM_PATH
 |---|---|
 | `--project` `DIRECTORY` | Untrusted project root (required); the launch policy must be outside it and outside every repository that encloses the project or the inventory. |
 | `--launch-policy` `FILE` | Operator-owned JSON outside the project: exact server references to absolute commands and SHA-256 pins; see [launch policy](#launch-policy). (required) |
+| `--allow-host-credentials` | Allow verification while credential environment variables are set on the host. The launcher starts with a cleared environment. Use an isolated worker to protect host credentials. |
 | `--json-output` | Output the verification report as JSON. |
 | `--record` | Print an unsigned candidate BOM with the observed descriptors instead of a report; exits 1 when served tools, declarations or the server identity drifted, unless `--accept-drift`. |
 | `--accept-drift` | With `--record`, exit 0 although changed or new tools, declarations or server identity were recorded. |
