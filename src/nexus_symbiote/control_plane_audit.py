@@ -7,7 +7,7 @@ import json
 import posixpath
 import re
 import shlex
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -768,16 +768,43 @@ def _allows_mcp_server(rules: list[str], prefix: str) -> bool:
     if bare_address and exact < len(rules) and rules[exact] == prefix:
         return True
     scoped = f"{prefix}__"
-    index = bisect_left(rules, scoped)
+    index = bisect_right(rules, scoped)  # A tool-qualified address needs a nonempty tool.
     return index < len(rules) and rules[index].startswith(scoped)
 
 
-def _claude_mcp_allow(rule: str) -> bool:
-    """Claude accepts MCP allow globs only in the tool part of a literal server address."""
+def _claude_mcp_allow(rule: str) -> str | None:
+    """Return the client's unconditional MCP rule, preserving literal tool names."""
+    rule = rule.removesuffix("(*)")
     if not rule.startswith("mcp__") or any(c.isspace() or c in "()" for c in rule):
-        return False
+        return None
     server, separator, tool = rule[5:].partition("__")
-    return bool(server and "*" not in server and (not separator or tool))
+    if not server:
+        # A leading delimiter makes the client's namespace parser fall back to
+        # exact full-tool equality. Such a name cannot authorize a wildcard.
+        return rule if separator and tool and "*" not in tool else None
+    return rule if "*" not in server and (not separator or tool) else None
+
+
+def _deny_prefixes(rules: set[str]) -> list[str]:
+    """Disjoint literal prefixes with a terminal wildcard, sorted for lookup."""
+    prefixes: list[str] = []
+    for rule in sorted(rules):
+        if not rule.endswith("*") or not re.fullmatch(r"[a-zA-Z0-9_-]*\*", rule):
+            continue
+        prefix = rule[:-1]
+        if not prefixes or not prefix.startswith(prefixes[-1]):
+            prefixes.append(prefix)
+    return prefixes
+
+
+def _denies_mcp_server(rules: set[str], prefixes: list[str], server: str) -> bool:
+    """Accept a denial only when it covers all present and future tools of the server."""
+    address = server + "__"
+    parsed_server = address[5:].partition("__")[0]
+    if server in rules or (parsed_server and "mcp__" + parsed_server in rules):
+        return True
+    index = bisect_right(prefixes, address) - 1
+    return index >= 0 and address.startswith(prefixes[index])
 
 
 def _inspect_steering_surfaces(
@@ -811,12 +838,17 @@ def _inspect_steering_surfaces(
             auto_edit_modes.append(f"{s_path}:write-allowance")
         if host == "claude":
             claude_prompting |= mode in ("default", "plan")
-            claude_allows[s_path] = sorted(rule for rule in allow if _claude_mcp_allow(rule))
-            claude_denies.update(r for r in _as_list(perms.get("deny")) if isinstance(r, str))
+            claude_allows[s_path] = sorted(
+                normalized for rule in allow if (normalized := _claude_mcp_allow(rule)) is not None
+            )
+            claude_denies.update(
+                r.removesuffix("(*)") for r in _as_list(perms.get("deny")) if isinstance(r, str)
+            )
         if doc.get("approvalPolicy") in ("never", "auto-edit"):
             auto_edit_modes.append(f"{s_path}:{doc['approvalPolicy']}")
 
     project_roots = (files.root.as_posix(), files.root.resolve().as_posix())
+    deny_prefixes = _deny_prefixes(claude_denies)
 
     for cfg_path, doc in _load_json_docs(files, all_paths, MCP_CONFIG_FILES, summary.gaps):
         for srv_name, srv_cfg in _extract_mcp_servers(doc):
@@ -831,7 +863,9 @@ def _inspect_steering_surfaces(
             prefix = _claude_mcp_prefix(srv_name)
             # A future or custom server can publish additional write tools. Only the
             # owning client's deny of the whole server covers this open-ended surface.
-            deny_covered = host == "claude" and bool(claude_denies & {prefix, f"{prefix}__*"})
+            deny_covered = host == "claude" and _denies_mcp_server(
+                claude_denies, deny_prefixes, prefix
+            )
             srv_auto = (
                 bool(srv_cfg.get("autoApprove")) or len(_as_list(srv_cfg.get("alwaysAllow"))) > 0
             )
