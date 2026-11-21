@@ -243,6 +243,36 @@ def test_verify_live_never_launches_project_command(tmp_path):
     assert not marker.exists()
 
 
+def test_verify_live_refuses_host_credentials(tmp_path, monkeypatch):
+    source = tmp_path / "bom.json"
+    project = tmp_path / "project"
+    project.mkdir()
+    source.write_text(AIBOM().to_json())
+    policy = project / "launch.json"
+    policy.write_text("{}")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "not-a-real-secret")
+    monkeypatch.setenv("NEXUS_SYMBIOTE_SOURCE_BINDING_KEY", "k" * 32)
+    args = [
+        "--live",
+        "verify-live",
+        str(source),
+        "--project",
+        str(project),
+        "--launch-policy",
+        str(policy),
+    ]
+    refused = CliRunner().invoke(main, args)
+    assert refused.exit_code == 2
+    assert "AWS_SECRET_ACCESS_KEY" in refused.output
+    assert "not-a-real-secret" not in refused.output
+    assert "--allow-host-credentials" in refused.output
+    allowed = CliRunner().invoke(main, [*args, "--allow-host-credentials"])
+    assert allowed.exit_code == 2
+    assert "launch policy must be provisioned outside the untrusted project" in allowed.output
+    assert "AWS_SECRET_ACCESS_KEY" not in allowed.output
+    assert "not-a-real-secret" not in allowed.output
+
+
 def test_advisories_cli_fails_when_inventory_identity_is_unknown(tmp_path):
     path = tmp_path / "bom.json"
     path.write_text(

@@ -19,10 +19,11 @@ import os
 import tempfile
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast, get_args
+from typing import Final, get_args
 
 import click
 from click.testing import CliRunner
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import ValidationError
 
 from nexus_symbiote import attestation, limits
@@ -58,9 +59,6 @@ from nexus_symbiote.validators.completeness import (
 )
 from nexus_symbiote.validators.integrity import IntegrityValidator
 from nexus_symbiote.validators.risk import RiskScorer
-
-if TYPE_CHECKING:
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 MAX_OPERATOR_POLICY_BYTES = 1024 * 1024
 # The signed-policy contract of `nexus_symbiote.operator_policy` and the CLI's operator-policy
@@ -269,7 +267,9 @@ def run_staged_gate(
         if attestation_source is not None:
             ring: dict[str, Ed25519PublicKey] = {}
             for key_path in trusted_keys:
-                pub = cast("Ed25519PublicKey", _load_trusted_public(key_path))
+                pub = _load_trusted_public(key_path)
+                if not isinstance(pub, Ed25519PublicKey):
+                    raise _KeyFileError("only Ed25519 public keys are supported")
                 ring[key_id(pub)] = pub
             raw_env = _read(attestation_source, attestation.MAX_ENVELOPE_BYTES)
             attestation.verify_attestation(
