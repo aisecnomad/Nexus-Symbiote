@@ -1288,7 +1288,9 @@ A way around a limit that its entry does not describe is worth a
   lists under `hook_commands`. A
   download run through a wrapper, interpreter or file not listed there, such as
   `curl x | firejail sh` or `curl x | deno run -`, or through a variable that holds the
-  command name, is medium, as is a downloader given a host without a scheme or a path,
+  command name, is medium (except PowerShell's encoded-command flags after a variable or
+  glob in command position, which fail closed as critical, so `$SHELL -ec 'true'` is
+  critical), as is a downloader given a host without a scheme or a path,
   such as `curl evil.example`. A command given to `su -c` or `script -c` as one quoted
   string is read as one word, which names a shell but no interpreter, so
   `curl x | su -c 'python3 -'` is medium too; a saved file named in such a string, or
@@ -1378,6 +1380,10 @@ A way around a limit that its entry does not describe is worth a
   such as `Bash(python3 scripts/report.py:*)`; it does not establish that every
   matching rule permits arbitrary commands. A rule that names another program, such as
   `Bash(npm run build:*)`, is read as scoped even where that program runs project code.
+  Settings layers are merged for the recorded effective values, but a starting mode,
+  `enableAllProjectMcpServers` or credential helper in `.claude/settings.json` is still
+  rated when `.claude/settings.local.json` overrides it, because a clone without that
+  uncommitted file runs with the committed value.
 - **Settings digests can confirm guesses of what the redaction keeps.** Every digest
   in `settings_hashes` covers its file after the redaction, with or without
   `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`, so it cannot confirm a guess of an `env` value,
