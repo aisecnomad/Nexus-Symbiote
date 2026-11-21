@@ -68,6 +68,9 @@ def _as_dict(val: Any) -> dict[str, Any]:
 BRIDGE_PACKAGES = _words("mcp-remote supergateway mcp-proxy @modelcontextprotocol/server-proxy")
 RUNTIME_LAUNCHERS = _words("node python python3 sh bash zsh deno bun tsx uvx npx")
 PACKAGE_RUNNERS = _words("npx uvx")
+RUNNER_VALUE_OPTIONS = _words(
+    "-p --package --from --with --with-editable --with-requirements --python"
+)
 INSTALLED_BIN_DIRS = _tup("node_modules/.bin/ .venv/bin/ venv/bin/")
 SCRIPT_SUFFIXES = _tup(".sh .py .js .mjs .cjs .ts .rb .pl")
 CODE_EXEC_HOSTED_TOOLS = _words("code_interpreter computer_use bash local_shell code_execution")
@@ -116,22 +119,13 @@ def _clean(val: Any) -> str:
     return neutralize(redact_text(raw))
 
 
-def _yaml_error_text(exc: yaml.YAMLError) -> str:
-    # PyYAML's message quotes the offending source line, which can hold a secret.
-    if isinstance(exc, yaml.MarkedYAMLError) and exc.problem_mark is not None:
-        mark = exc.problem_mark
-        problem = redact_text(exc.problem or "syntax error")
-        return f"invalid YAML: {problem} at line {mark.line + 1}, column {mark.column + 1}"
-    return f"invalid YAML ({type(exc).__name__})"
-
-
 def _parse_yaml(text: str) -> dict[str, Any]:
     try:
-        for index, _token in enumerate(yaml.scan(text)):
+        for index, _token in enumerate(yaml.scan(text, Loader=yaml.SafeLoader)):
             if index >= 20_000:
                 raise ValueError("YAML exceeds 20,000 tokens")
-    except yaml.YAMLError as exc:
-        raise ValueError(_yaml_error_text(exc)) from exc
+    except yaml.YAMLError:
+        raise ValueError("invalid YAML") from None
     return parse_yaml_mapping(text)
 
 
@@ -154,8 +148,8 @@ def _read_confined_bytes(files: ConfinedCollection, rel_path: str, gaps: list[st
         named = rel_path.startswith(INSTALLED_BIN_DIRS)
         raw = files.read_named(rel_path) if named else files.read_bytes(rel_path, missing_ok=True)
         gap = credential_gap(rel_path, files.link_target(rel_path))
-    except (OSError, ValueError) as exc:
-        gaps.append(f"{rel_path}: {neutralize(str(exc))}")
+    except (OSError, ValueError):
+        gaps.append(f"{rel_path}: read refused")
         return None
     if gap is not None:
         gaps.append(f"{rel_path}: {gap}")
@@ -181,8 +175,8 @@ def _load_json_docs(
             continue
         try:
             parsed = parse_json_strict(strip_jsonc(text) if rel_path in JSONC_FILES else text)
-        except (ValueError, RecursionError) as exc:
-            gaps.append(f"{rel_path}: invalid JSON ({neutralize(str(exc))})")
+        except (ValueError, RecursionError):
+            gaps.append(f"{rel_path}: invalid JSON")
             continue
         if isinstance(parsed, dict):
             docs.append((rel_path, parsed))
@@ -213,7 +207,51 @@ def _normalize_rel_candidate(token: str, *, allow_any_file: bool = False) -> str
     return None
 
 
-def _extract_local_script_target(tokens: list[str]) -> str | None:
+def _package_runner_target(operands: list[str], project_paths: frozenset[str]) -> str | None:
+    """Bind the script a package runner (npx, uvx) executes, never its package or option values."""
+    package_seen = after_option = False
+    option = ""
+    fallback: str | None = None
+    for arg in operands:
+        if arg in {"-c", "-e", "-m"}:
+            return None
+        if arg.startswith("-"):
+            after_option, option = "=" not in arg, arg
+            continue
+        follows_option, after_option = after_option, False
+        if not package_seen and follows_option and option in RUNNER_VALUE_OPTIONS:
+            continue
+        local = _normalize_rel_candidate(arg, allow_any_file=True)
+        path = posixpath.normpath(local) if local is not None else None
+        explicit = arg.startswith("./") or bool(_PROJECT_DIR_RE.match(arg))
+        scripted = arg.endswith(SCRIPT_SUFFIXES)
+        path_like = explicit or "/" in arg or scripted
+        listed = path in project_paths
+        if not package_seen:
+            package_seen = True
+            # The first operand names the package. A bare name is resolved from the
+            # registry, so a project file of that name (a decoy `tsx`) is not the script.
+            if (
+                path is not None
+                and not arg.startswith("@")
+                and (explicit or scripted or ("/" in arg and listed))
+            ):
+                return path
+            continue
+        if path is None or (arg.startswith("@") and not listed) or f"{path}/" in project_paths:
+            continue
+        if not follows_option and path_like:
+            return path
+        # An option's value (--tsconfig tsconfig.json) is configuration. A bare listed
+        # name or a script-suffixed option value is used only when nothing path-like follows.
+        if fallback is None and ((not follows_option and listed) or (follows_option and scripted)):
+            fallback = path
+    return fallback
+
+
+def _extract_local_script_target(
+    tokens: list[str], project_paths: frozenset[str] = frozenset()
+) -> str | None:
     if not tokens:
         return None
     first = tokens[0].strip()
@@ -221,14 +259,13 @@ def _extract_local_script_target(tokens: list[str]) -> str | None:
     direct = _normalize_rel_candidate(first)
     if direct is not None and base not in RUNTIME_LAUNCHERS:
         return direct
+    if base in PACKAGE_RUNNERS:
+        return _package_runner_target(tokens[1:], project_paths)
     if base in RUNTIME_LAUNCHERS:
         for arg in tokens[1:]:
             if arg in {"-c", "-e", "-m"}:
                 return None
-            # A package runner takes registry package specifiers, not project paths.
-            if base in PACKAGE_RUNNERS and not arg.startswith("./"):
-                continue
-            if not arg.startswith(("-", "@")):
+            if not arg.startswith("-"):
                 cand = _normalize_rel_candidate(arg)
                 if cand is not None:
                     return cand
@@ -478,10 +515,14 @@ def _iter_hook_commands(doc: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def _inspect_hooks_and_preambles(
-    files: ConfinedCollection, all_paths: list[str], summary: ControlPlaneAuditSummary
+    files: ConfinedCollection,
+    all_paths: list[str],
+    project_paths: frozenset[str],
+    summary: ControlPlaneAuditSummary,
 ) -> None:
     for cfg_path, doc in _load_json_docs(files, all_paths, HOOK_CONFIG_FILES, summary.gaps):
-        for event_name, cmd_str in _iter_hook_commands(doc):
+        for raw_event, cmd_str in _iter_hook_commands(doc):
+            event_name = _clean(raw_event)
             summary.hook_commands.append(
                 _rec(
                     source_file=cfg_path,
@@ -489,7 +530,7 @@ def _inspect_hooks_and_preambles(
                     command_digest=_sha256_hex(cmd_str.encode()),
                 )
             )
-            target = _extract_local_script_target(_tokenize_command(cmd_str))
+            target = _extract_local_script_target(_tokenize_command(cmd_str), project_paths)
             if target is not None:
                 rec = _bind_script_target(
                     files,
@@ -532,7 +573,7 @@ def _inspect_hooks_and_preambles(
                 skill_path,
                 skill_ref,
             )
-            target = _extract_local_script_target(_tokenize_command(cmd_body))
+            target = _extract_local_script_target(_tokenize_command(cmd_body), project_paths)
             if target is not None:
                 _bind_script_target(
                     files,
@@ -571,6 +612,7 @@ def _find_bridge_package(tokens: list[str]) -> tuple[str, int] | None:
 def _inspect_mcp_launchers_and_bridges(
     files: ConfinedCollection,
     all_paths: list[str],
+    project_paths: frozenset[str],
     summary: ControlPlaneAuditSummary,
     live_versions: dict[str, str],
 ) -> None:
@@ -617,8 +659,8 @@ def _inspect_mcp_launchers_and_bridges(
                     if cfg_body is not None and norm_cfg is not None:
                         try:
                             sub_doc = parse_json_strict(cfg_body)
-                        except (ValueError, RecursionError) as exc:
-                            summary.gaps.append(f"{norm_cfg}: invalid JSON ({exc})")
+                        except (ValueError, RecursionError):
+                            summary.gaps.append(f"{norm_cfg}: invalid JSON")
                             sub_doc = None
                         if isinstance(sub_doc, dict):
                             for sub_name, _sub_cfg in _extract_mcp_servers(sub_doc):
@@ -692,7 +734,7 @@ def _inspect_mcp_launchers_and_bridges(
                 )
                 continue
 
-            target = _extract_local_script_target(tokens)
+            target = _extract_local_script_target(tokens, project_paths)
             props = {"registry_origin": reg_origin} if reg_origin else {}
             if target is not None:
                 rec = _bind_script_target(
@@ -1019,8 +1061,8 @@ def _record_ci_agent(
     if isinstance(mcp_config_raw, str) and mcp_config_raw.strip():
         try:
             mcp_doc = parse_json_strict(mcp_config_raw)
-        except (ValueError, RecursionError) as exc:
-            summary.gaps.append(f"{source_file}: invalid inline mcp_config ({exc})")
+        except (ValueError, RecursionError):
+            summary.gaps.append(f"{source_file}: invalid inline mcp_config")
             mcp_doc = None
         if isinstance(mcp_doc, dict):
             for s_name, s_cfg in _extract_mcp_servers(mcp_doc):
@@ -1103,8 +1145,8 @@ def _inspect_workflows_and_claims(
             continue
         try:
             doc = _parse_yaml(_ON_KEY_RE.sub(r'\1"on"\2', text))
-        except (PolicyError, ValueError, RecursionError) as exc:
-            summary.gaps.append(f"{wf_path}: {neutralize(str(exc))}")
+        except (PolicyError, ValueError, RecursionError):
+            summary.gaps.append(f"{wf_path}: invalid YAML")
             continue
         on_block = doc.get("on")
         if isinstance(on_block, str):
@@ -1474,28 +1516,32 @@ def audit_project_control_plane(
                         summary.gaps.append(f"claims: invalid {section} collection")
                 decl_sources.append(("shadowscan:claims", parsed, AssuranceLevel.DECLARED))
         except (OSError, ValueError, RecursionError):
-            summary.gaps.append(
-                f"{neutralize(claims_path.name)}: claims file unreadable, over 4 MiB, or invalid UTF-8 JSON object"
-            )
+            summary.gaps.append(f"{neutralize(claims_path.name)}: invalid JSON")
 
     with ConfinedCollection(project_root, summary.gaps) as files:
         all_paths = sorted(p.as_posix() for p in files.iter_files())
+        # Directories carry a trailing '/', so an operand naming one is not read as a script.
+        project_paths = frozenset(all_paths).union(
+            p[: i + 1] for p in all_paths for i, c in enumerate(p) if c == "/"
+        )
         for decl_path in ("agent.yaml", "agent.yml"):
             if decl_path in all_paths:
                 text = _read_confined_text(files, decl_path, summary.gaps)
                 if text is not None:
                     try:
                         decl_sources.append((decl_path, _parse_yaml(text), AssuranceLevel.DECLARED))
-                    except (PolicyError, ValueError, RecursionError) as exc:
-                        summary.gaps.append(f"{decl_path}: {neutralize(str(exc))}")
-        _inspect_hooks_and_preambles(files, all_paths, summary)
-        _inspect_mcp_launchers_and_bridges(files, all_paths, summary, live_versions or {})
+                    except (PolicyError, ValueError, RecursionError):
+                        summary.gaps.append(f"{decl_path}: invalid YAML")
+        _inspect_hooks_and_preambles(files, all_paths, project_paths, summary)
+        _inspect_mcp_launchers_and_bridges(
+            files, all_paths, project_paths, summary, live_versions or {}
+        )
         _inspect_steering_surfaces(files, all_paths, summary)
         _inspect_workflows_and_claims(files, all_paths, summary, decl_sources)
         _inspect_identities_and_authority(summary, decl_sources)
 
     if baseline_root is not None:
-        base_summary = audit_project_control_plane(baseline_root)
+        base_summary = audit_project_control_plane(baseline_root, claims_path=claims_path)
         # An unreadable baseline hides what changed, so its gaps fail the gate too.
         summary.gaps.extend(f"baseline: {gap}" for gap in base_summary.gaps)
         summary.reach_alerts = diff_control_plane_audits(
