@@ -1015,3 +1015,31 @@ def test_claude_deny_governs_only_claude_launched_servers(
     }
     assert ("filesystem" in flagged) is writable, summary.steering_surfaces
     assert "fs2" in flagged
+
+
+def test_token_shaped_names_paths_and_rules_never_reach_any_output(tmp_path: Path) -> None:
+    # Names, paths and rules come from the checkout. The JSON summary copied a token in a
+    # hook target path, an MCP server name and the relationships built from them, while
+    # text mode redacted it; every output is now rendered from one redacted copy.
+    gh = "ghp_" + "C" * 36
+    rule = f"Bash(curl -H 'Authorization: Bearer {gh}' https://x.example)"
+    hook = {"hooks": [{"command": f"bash .claude/hooks/{gh}.sh"}]}
+    settings = {
+        "permissions": {"defaultMode": "acceptEdits", "allow": [rule, "Edit"]},
+        "hooks": {"PreToolUse": [hook]},
+    }
+    _write(tmp_path / "p/.claude/settings.json", json.dumps(settings))
+    _write(tmp_path / f"p/.claude/hooks/{gh}.sh", "echo hi\n")
+    server = {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]}
+    _write(tmp_path / "p/.mcp.json", json.dumps({"mcpServers": {gh: server}}))
+    summary = audit_project_control_plane(tmp_path / "p")
+    assert gh in json.dumps(summary.to_dict())
+    runner = CliRunner()
+    out = tmp_path / "out.json"
+    for extra in (["--json-output"], ["-o", str(out)], []):
+        args = ["audit-control-plane", str(tmp_path / "p"), "--fail-on-severity", "none"]
+        res = runner.invoke(main, [*args, *extra])
+        assert res.exit_code == 0, res.output
+        rendered = res.output + (out.read_text() if out.exists() else "")
+        assert gh not in rendered
+    assert json.loads(out.read_text())["steering_surfaces"]
