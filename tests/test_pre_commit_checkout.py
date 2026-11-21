@@ -14,7 +14,7 @@ from nexus_symbiote.cli import main
 def test_published_hooks_accept_git_and_keep_dependency_gaps(tmp_path, monkeypatch):
     git = shutil.which("git")
     assert git is not None
-    subprocess.run([git, "init", "--quiet", str(tmp_path)], check=True)  # noqa: S603 - local fixture
+    subprocess.run([git, "init", "--quiet", str(tmp_path)], check=True, timeout=30)  # noqa: S603
     (tmp_path / "AGENTS.md").write_text("Keep receipts.\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     hooks = yaml.safe_load((Path(__file__).parents[1] / ".pre-commit-hooks.yaml").read_text())
