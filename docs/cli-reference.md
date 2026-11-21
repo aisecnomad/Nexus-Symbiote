@@ -69,7 +69,7 @@ change them. See [collection limits](collection-limits.md).
 | [`verify-discovery`](#verify-discovery) | offline | Check that a ShadowScan report's bytes match the digest a BOM records; with `--projection` or `--bundle`, also compare the BOM's imported components with the report |
 | [`export-inventory`](#export-inventory) | offline | Write the reviewed repository agent as an approved inventory that ShadowScan's `--inventory` accepts |
 | [`import-sbom`](#import-sbom) | offline | Import a foreign CycloneDX or SPDX SBOM as DECLARED evidence without picking silent winners |
-| [`evidence-profile`](#evidence-profile) | offline | Report concrete evidence attributes per component without a scalar TrustScore |
+| [`evidence-profile`](#evidence-profile) | offline | Report inventory claims and corroborated evidence per component. |
 | [`init`](#init) | offline | Create a `.nexus-symbiote.yaml` policy file |
 | [`runtime keygen`](#runtime-keygen) | offline | Create an Ed25519 key pair for runtime contracts |
 | [`runtime sign`](#runtime-sign) | offline | Sign a runtime contract |
@@ -575,7 +575,20 @@ nexus-symbiote discover-mcp [OPTIONS] ENDPOINT
 
 ### `evidence-profile`
 
-Report concrete evidence attributes per component without a scalar TrustScore (`signed_under_policy` is `true` only when `--project` and `--signature-policy` corroborate the artifact; inventory `signing_status` assertions appear separately under `declared_signing_status`).
+The v2 profile reports per-component evidence without a scalar TrustScore.
+`policy_loaded` records policy use. `policy_verified` requires corroboration
+with no integrity issues. `digest_recorded` reflects inventory fields, while
+`digest_bound` requires locally corroborated weight files.
+
+`signed_under_policy` and `digest_pinned_under_policy` require their respective
+verification on every weight file. A package can have `digest_bound: true`
+when signatures and operator pins together cover all files. Artifact evidence
+can coexist with an unsafe-format or code-execution finding.
+
+`inventory_claims` carries collector and runtime assertions.
+`declared_signing_status` records the inventory's signing claim.
+`runtime_matched` requires runtime evidence supplied by the library caller.
+Finding counts include intrinsic model risks.
 
 ```text
 nexus-symbiote evidence-profile [OPTIONS] AIBOM_PATH
@@ -1201,7 +1214,7 @@ kept.
 
 ### `trifecta`
 
-Analyze an inventory offline for lethal trifectas, chained toxic flows, and tool shadowing.
+Analyze an inventory offline for lethal trifectas, chained toxic flows, and tool shadowing. Approval declarations in the inventory do not suppress CLI findings. The Python API can explicitly assume those declarations when modeling a proposed design.
 
 ```text
 nexus-symbiote trifecta [OPTIONS] AIBOM_PATH

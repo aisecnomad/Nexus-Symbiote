@@ -126,14 +126,16 @@ def test_lethal_trifecta_ungated_is_critical() -> None:
 
 
 def test_lethal_trifecta_gated_twin_stays_clean() -> None:
-    report = analyze_trifecta(_trifecta_bom(gated=True))
+    report = analyze_trifecta(_trifecta_bom(gated=True), assume_declared_approvals=True)
     assert not report.has_critical
     assert [f for f in report.findings if f.kind == "lethal_trifecta"] == []
     assert [f for f in report.findings if f.kind == "toxic_flow"] == []
 
 
 def test_lethal_trifecta_partial_gate_still_fails_closed() -> None:
-    report = analyze_trifecta(_trifecta_bom(gated=True, partial_gate=True))
+    report = analyze_trifecta(
+        _trifecta_bom(gated=True, partial_gate=True), assume_declared_approvals=True
+    )
     assert report.has_critical
     trifecta = [f for f in report.findings if f.kind == "lethal_trifecta"]
     assert len(trifecta) == 1
@@ -160,7 +162,7 @@ def test_authorization_record_approval_gates_agent() -> None:
     agent.authorizations = [
         AuthorizationRecord(principal="user:alice", action="egress", approval_required=True)
     ]
-    report = analyze_trifecta(bom)
+    report = analyze_trifecta(bom, assume_declared_approvals=True)
     assert not report.has_critical
 
 
@@ -521,7 +523,7 @@ def test_chained_toxic_flow_two_tools_is_one_finding() -> None:
         egress_domains=["reports.example.org"],
         human_in_the_loop=HumanInTheLoop.REQUIRED,
     )
-    clean_report = analyze_trifecta(bom)
+    clean_report = analyze_trifecta(bom, assume_declared_approvals=True)
     assert [f for f in clean_report.findings if f.kind == "toxic_flow"] == []
 
 
@@ -653,9 +655,9 @@ def test_trifecta_cli_gate_and_determinism(tmp_path: Path) -> None:
     assert res_rev.exit_code == 1
     assert res_rev.output == res_fail.output
 
-    res_pass = runner.invoke(main, ["trifecta", str(gated_path)])
-    assert res_pass.exit_code == 0
-    assert json.loads(res_pass.output)["finding_count"] == 0
+    res_declared = runner.invoke(main, ["trifecta", str(gated_path)])
+    assert res_declared.exit_code == 1
+    assert json.loads(res_declared.output)["severity_counts"]["critical"] == 1
 
 
 def _name_only_tools() -> list[ToolComponent]:
@@ -772,7 +774,9 @@ def test_approval_record_gates_only_what_it_covers(
             for record in records
         ],
     )
-    report = analyze_trifecta(AIBOM(components=[agent, *_name_only_tools()]), now=_NOW)
+    report = analyze_trifecta(
+        AIBOM(components=[agent, *_name_only_tools()]), now=_NOW, assume_declared_approvals=True
+    )
     assert report.has_critical is not gated
 
 

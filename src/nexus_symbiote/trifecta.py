@@ -4,8 +4,7 @@ Evaluates an AgentBOM offline for three structural agentic risks:
 
 1. **Lethal trifecta (Item 15):** an agent scope combining untrusted input, private
    data access, and external egress or state mutation without an explicit approval gate
-   is rated ``critical``. An identical agent with an explicit approval gate on the
-   egress/mutating surface stays clean.
+   is rated ``critical``. The CLI treats declared approvals as uncorroborated.
 2. **Chained toxic flows (Item 24):** a leak or state-mutation chain possible only by
    combining two distinct components (source + sink) produces one ``toxic_flow`` finding
    naming both components rather than treating each in isolation as clean.
@@ -585,7 +584,7 @@ def _is_explicitly_ungated(component: AnyComponent) -> bool:
 
 
 def _has_explicit_approval_gate(component: AnyComponent, now: datetime) -> bool:
-    """Fail-closed check: True only when typed approval evidence covers the component.
+    """Check whether typed approval declarations cover the component.
 
     Untrusted ad-hoc properties (such as ``properties.requires_approval`` or
     ``properties.effective_authorization_verified``) are ignored, and so is an IDE
@@ -1176,10 +1175,14 @@ def _scope_findings(
     return findings
 
 
-def analyze_trifecta(bom: AIBOM, *, now: datetime | None = None) -> TrifectaReport:
+def analyze_trifecta(
+    bom: AIBOM, *, now: datetime | None = None, assume_declared_approvals: bool = False
+) -> TrifectaReport:
     """Analyze an inventory for lethal trifectas, chained toxic flows, and tool shadowing.
 
     ``now`` is the time approval records' expiry is read against; the default is the clock.
+    ``assume_declared_approvals`` is for modeling a proposed design. Admission gates
+    must use the default, since an inventory cannot establish effective authorization.
     """
     moment = now or datetime.now(UTC)
     signals: dict[str, _ComponentSignals] = {}
@@ -1192,7 +1195,8 @@ def analyze_trifecta(bom: AIBOM, *, now: datetime | None = None) -> TrifectaRepo
             untrusted_basis=_untrusted_input_basis(comp, rc),
             private_basis=_private_data_basis(comp, rc),
             egress_basis=_egress_basis(comp, rc),
-            explicitly_gated=_has_explicit_approval_gate(comp, moment),
+            explicitly_gated=assume_declared_approvals
+            and _has_explicit_approval_gate(comp, moment),
             explicitly_ungated=_is_explicitly_ungated(comp),
         )
 

@@ -90,6 +90,13 @@ class IntegrityIssue:
     severity: str = "error"
 
 
+@dataclass(frozen=True)
+class ModelPolicyEvidence:
+    weight_files: int
+    signatures_verified: int
+    digest_pins_verified: int
+
+
 @dataclass
 class IntegrityReport:
     components_checked: int = 0
@@ -103,6 +110,7 @@ class IntegrityReport:
     bytes_charged: int = 0
     issues_omitted: int = 0
     omitted_severities: set[str] = field(default_factory=set)
+    model_policy_evidence: dict[str, ModelPolicyEvidence] = field(default_factory=dict)
 
     @property
     def status(self) -> Literal["pass", "fail", "unknown"]:
@@ -369,6 +377,12 @@ class IntegrityValidator:
                         )
                     )
             self._check_file_hash(comp, project_root, report)
+            # Matching artifact bytes and safe model behavior are separate facts.
+            if any(
+                issue.category not in {"unsafe_format", "trust_remote_code"}
+                for issue in report.issues[first_issue:]
+            ):
+                report.model_policy_evidence.pop(comp.bom_ref, None)
             if comp.bom_ref in bound_imports and is_imported(comp):
                 for issue in report.issues[first_issue:]:
                     if issue.severity == "unknown" and issue.category in _IMPORTED_EVIDENCE_GAPS:
@@ -789,6 +803,11 @@ class IntegrityValidator:
         report.signatures_checked += verification.signatures_checked
         report.signatures_verified += verification.signatures_verified
         report.hashes_verified += verification.pins_verified
+        weight_count = len(package.weight_files)
+        if verification.signatures_verified + verification.pins_verified == weight_count:
+            report.model_policy_evidence[comp.bom_ref] = ModelPolicyEvidence(
+                weight_count, verification.signatures_verified, verification.pins_verified
+            )
         for category, detail, severity in verification.issues:
             if severity == "unknown" and not self.require_model_signatures:
                 severity = "warning"
