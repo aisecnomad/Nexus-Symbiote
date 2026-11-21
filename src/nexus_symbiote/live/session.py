@@ -22,6 +22,7 @@ import tempfile
 import time
 from collections.abc import Mapping
 from contextlib import ExitStack, suppress
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -41,7 +42,11 @@ from nexus_symbiote.runtime import (
     ToolCall,
     canonical_bytes,
 )
-from nexus_symbiote.runtime_validation import MAX_ARGUMENT_BYTES
+from nexus_symbiote.runtime_validation import (
+    MAX_ARGUMENT_BYTES,
+    ValidationBudgetError,
+    validate_arguments,
+)
 from nexus_symbiote.scanners.live_mcp import SUPPORTED_PROTOCOL_VERSIONS
 
 T = TypeVar("T")
@@ -98,6 +103,7 @@ class PinnedStdioSession:
         self._next_id = 1
         self._lookup_attempted = False
         self._described: str | None = None
+        self._output_schema: Any = None
         self._called = False
         self._used = False
 
@@ -219,10 +225,10 @@ class PinnedStdioSession:
             if cursor is None:
                 if tool_name not in tools:
                     raise AuthorizationError("approved tool missing from session")
+                definition = tools[tool_name]
+                self._output_schema = deepcopy(definition.get("outputSchema"))
                 self._described = tool_name
-                return ServedTool(
-                    endpoint_identity=self.endpoint_identity, definition=tools[tool_name]
-                )
+                return ServedTool(endpoint_identity=self.endpoint_identity, definition=definition)
             if (
                 not isinstance(cursor, str)
                 or not cursor
@@ -245,9 +251,24 @@ class PinnedStdioSession:
         self._called = True
         self._deadline = time.monotonic() + self._call_deadline_seconds
         try:
-            return self._request(
+            result = self._request(
                 "tools/call", {"name": call.tool_name, "arguments": call.arguments}
             )
+            is_error = result.get("isError", False)
+            if not isinstance(is_error, bool):
+                raise ValueError("MCP tool result has an invalid error flag")
+            if self._output_schema is not None and not is_error:
+                structured = result.get("structuredContent")
+                if not isinstance(structured, dict):
+                    raise ValueError("MCP tool result lacks structured content")
+                try:
+                    validate_arguments(self._output_schema, structured)
+                except ValidationBudgetError as exc:
+                    raise ValidationBudgetError(
+                        "MCP structured result failed offline output schema validation",
+                        reason=exc.reason,
+                    ) from None
+            return result
         except ToolCallError:
             raise
         except Exception as exc:

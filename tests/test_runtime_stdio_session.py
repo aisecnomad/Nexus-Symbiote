@@ -20,7 +20,7 @@ from nexus_symbiote.live.session import (
     invoke_pinned_stdio,
 )
 from nexus_symbiote.runtime import AuthorizationError, digest, sign_contract
-from nexus_symbiote.runtime_validation import MAX_ARGUMENT_BYTES
+from nexus_symbiote.runtime_validation import MAX_ARGUMENT_BYTES, ValidationBudgetError
 from tests.support import STDIO_HELLO, launcher_log, misbehaving_launcher
 from tests.test_runtime_authorization import DEFINITION, fixture
 
@@ -28,15 +28,24 @@ pytestmark = pytest.mark.usefixtures("nonisolated_pinned_fixtures")
 
 
 def launcher(
-    tmp_path: Path, *, altered: bool = False, missing: bool = False, mode: str = "normal"
+    tmp_path: Path,
+    *,
+    altered: bool = False,
+    missing: bool = False,
+    mode: str = "normal",
+    output_schema: dict | None = None,
+    tool_result: dict | None = None,
 ) -> tuple[Path, str, Path]:
     log = tmp_path / "calls.jsonl"
     path = tmp_path / "launcher"
     definition = dict(DEFINITION)
     if altered:
         definition["description"] = "changed after approval"
+    if output_schema is not None:
+        definition["outputSchema"] = output_schema
     script = f"""#!{sys.executable}
 import json, os, sys, time
+tool_result = {tool_result!r}
 definition = {definition!r}
 log = {str(log)!r}
 mode = {mode!r}
@@ -65,6 +74,8 @@ for line in sys.stdin:
         with open(log, "a") as f:
             f.write(json.dumps([method, int(os.readlink("/proc/self")), msg["params"]]) + "\\n")
         result = {{"content": [{{"type": "text", "text": "ok"}}]}}
+        if tool_result is not None:
+            result = tool_result
     else:
         raise SystemExit(1)
     reply_id = msg["id"] + 1 if method == "tools/list" and mode == "wrong-id" else msg["id"]
@@ -527,3 +538,41 @@ def test_a_launcher_over_the_byte_budget_is_denied_before_it_is_read_or_run(tmp_
         PinnedStdioSession(command=str(path), sha256=pin, server_id="server:mail"),
     ):
         pass
+
+
+@pytest.mark.parametrize(
+    ("result", "accepted", "validation_reason"),
+    [
+        ({"structuredContent": {"count": 1}}, True, None),
+        ({"structuredContent": {"count": "one"}}, False, "arguments-invalid"),
+        ({"content": []}, False, None),
+        ({"isError": True, "content": []}, True, None),
+        ({"isError": "true", "content": []}, False, None),
+        (
+            {"structuredContent": {"count": 1, "text": "a" * MAX_ARGUMENT_BYTES}},
+            False,
+            None,
+        ),
+    ],
+)
+def test_stdio_checks_successful_structured_results(tmp_path, result, accepted, validation_reason):
+    call = fixture(tmp_path)[1]
+    schema = {
+        "type": "object",
+        "properties": {"count": {"type": "integer"}},
+        "required": ["count"],
+    }
+    path, pin, log = launcher(tmp_path, output_schema=schema, tool_result=result)
+    with PinnedStdioSession(command=str(path), sha256=pin, server_id="server:mail") as session:
+        session.describe("server:mail", "send")
+        if accepted:
+            assert session.execute(call) == result
+        else:
+            with pytest.raises(ExecutionOutcomeUnknown) as failure:
+                session.execute(call)
+            if validation_reason is not None:
+                cause = failure.value.__cause__
+                assert isinstance(cause, ValidationBudgetError)
+                assert cause.reason == validation_reason
+                assert "output schema" in str(cause)
+    assert sum(record[0] == "tools/call" for record in launcher_log(log)) == 1

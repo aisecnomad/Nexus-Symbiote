@@ -267,6 +267,15 @@ does not consume an approval nonce.
 
 ### Pinned stdio integration
 
+The stdio adapter validates successful `structuredContent` against the approved
+`outputSchema` when present. The full JSON-RPC reply has a 1 MiB frame cap, and
+the schema worker applies a 1 MiB JSON budget to `structuredContent`. Missing,
+invalid, or oversized structured content raises
+`ExecutionOutcomeUnknown` after dispatch. An unavailable validation worker
+raises the same outcome. Reconcile any side effects before retrying. Tool errors
+(`isError: true`) are returned as error data. Treat all returned content as
+untrusted input.
+
 `nexus_symbiote.live.session.invoke_pinned_stdio` is an opt-in POSIX adapter that
 starts a private copy of an independently pinned standalone launcher, enumerates
 its tools, authorizes the requested operation, and sends `tools/call` through the
