@@ -202,7 +202,9 @@ def _normalize_rel_candidate(token: str, *, allow_any_file: bool = False) -> str
     return None
 
 
-def _extract_local_script_target(tokens: list[str]) -> str | None:
+def _extract_local_script_target(
+    tokens: list[str], project_paths: frozenset[str] = frozenset()
+) -> str | None:
     if not tokens:
         return None
     first = tokens[0].strip()
@@ -214,9 +216,18 @@ def _extract_local_script_target(tokens: list[str]) -> str | None:
         for arg in tokens[1:]:
             if arg in {"-c", "-e", "-m"}:
                 return None
-            # A package runner takes registry package specifiers, not project paths.
-            if base in PACKAGE_RUNNERS and not arg.startswith("./"):
-                continue
+            if base in PACKAGE_RUNNERS:
+                # A bare operand may be a package locator. Bind it if the confined
+                # project listing identifies a file, even without a script suffix.
+                local = _normalize_rel_candidate(arg, allow_any_file=True)
+                if local is not None and (path := posixpath.normpath(local)) in project_paths:
+                    return path
+                if not (
+                    arg.startswith("./")
+                    or _PROJECT_DIR_RE.match(arg)
+                    or arg.endswith(SCRIPT_SUFFIXES)
+                ):
+                    continue
             if not arg.startswith(("-", "@")):
                 cand = _normalize_rel_candidate(arg)
                 if cand is not None:
@@ -467,7 +478,10 @@ def _iter_hook_commands(doc: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def _inspect_hooks_and_preambles(
-    files: ConfinedCollection, all_paths: list[str], summary: ControlPlaneAuditSummary
+    files: ConfinedCollection,
+    all_paths: list[str],
+    project_paths: frozenset[str],
+    summary: ControlPlaneAuditSummary,
 ) -> None:
     for cfg_path, doc in _load_json_docs(files, all_paths, HOOK_CONFIG_FILES, summary.gaps):
         for event_name, cmd_str in _iter_hook_commands(doc):
@@ -478,7 +492,7 @@ def _inspect_hooks_and_preambles(
                     command_digest=_sha256_hex(cmd_str.encode()),
                 )
             )
-            target = _extract_local_script_target(_tokenize_command(cmd_str))
+            target = _extract_local_script_target(_tokenize_command(cmd_str), project_paths)
             if target is not None:
                 rec = _bind_script_target(
                     files,
@@ -521,7 +535,7 @@ def _inspect_hooks_and_preambles(
                 skill_path,
                 skill_ref,
             )
-            target = _extract_local_script_target(_tokenize_command(cmd_body))
+            target = _extract_local_script_target(_tokenize_command(cmd_body), project_paths)
             if target is not None:
                 _bind_script_target(
                     files,
@@ -560,6 +574,7 @@ def _find_bridge_package(tokens: list[str]) -> tuple[str, int] | None:
 def _inspect_mcp_launchers_and_bridges(
     files: ConfinedCollection,
     all_paths: list[str],
+    project_paths: frozenset[str],
     summary: ControlPlaneAuditSummary,
     live_versions: dict[str, str],
 ) -> None:
@@ -681,7 +696,7 @@ def _inspect_mcp_launchers_and_bridges(
                 )
                 continue
 
-            target = _extract_local_script_target(tokens)
+            target = _extract_local_script_target(tokens, project_paths)
             props = {"registry_origin": reg_origin} if reg_origin else {}
             if target is not None:
                 rec = _bind_script_target(
@@ -1361,6 +1376,7 @@ def audit_project_control_plane(
 
     with ConfinedCollection(project_root, summary.gaps) as files:
         all_paths = sorted(p.as_posix() for p in files.iter_files())
+        project_paths = frozenset(all_paths)
         for decl_path in ("agent.yaml", "agent.yml"):
             if decl_path in all_paths:
                 text = _read_confined_text(files, decl_path, summary.gaps)
@@ -1369,8 +1385,10 @@ def audit_project_control_plane(
                         decl_sources.append((decl_path, _parse_yaml(text), AssuranceLevel.DECLARED))
                     except (PolicyError, ValueError, RecursionError):
                         summary.gaps.append(f"{decl_path}: invalid YAML")
-        _inspect_hooks_and_preambles(files, all_paths, summary)
-        _inspect_mcp_launchers_and_bridges(files, all_paths, summary, live_versions or {})
+        _inspect_hooks_and_preambles(files, all_paths, project_paths, summary)
+        _inspect_mcp_launchers_and_bridges(
+            files, all_paths, project_paths, summary, live_versions or {}
+        )
         _inspect_steering_surfaces(files, all_paths, summary)
         _inspect_workflows_and_claims(files, all_paths, summary, decl_sources)
         _inspect_identities_and_authority(summary, decl_sources)
