@@ -134,6 +134,7 @@ def _verify_policy_attestation(
         _check_key_placement,
         _InputTooLargeError,
         _KeyFileError,
+        _verify_outside_checkout,
     )
 
     if not trusted_keys:
@@ -144,6 +145,9 @@ def _verify_policy_attestation(
         raise OperatorPolicyError("--operator-policy-max-age-days must be >= 0")
     raw_envelope, _ = _read_confined_operator_policy(envelope_path, root)
     try:
+        if root is not None:
+            for key_path in trusted_keys:
+                _verify_outside_checkout(key_path, (root,), label="--operator-policy-key")
         _check_key_placement(
             trusted_keys,
             (policy_path, envelope_path),
@@ -260,6 +264,8 @@ def append_step_summary(path: Path, rendered: str) -> None:
                 info = os.fstat(fd)
                 if not stat.S_ISREG(info.st_mode):
                     raise OutputRefusedError(_errno.EINVAL, "output must be a regular file")
+                if info.st_nlink != 1:
+                    raise OutputRefusedError(_errno.EINVAL, "output must have only one hard link")
                 prefix = b""
                 if info.st_size > 0:
                     last_byte = os.pread(fd, 1, info.st_size - 1)
