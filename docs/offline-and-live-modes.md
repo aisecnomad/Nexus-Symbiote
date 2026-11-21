@@ -150,9 +150,11 @@ generated`, and pass it to `verify-live` with `--transport-evidence`,
 repository that holds the project, the inventory or the evidence. Evidence verifies a
 server only when the inventory records that server's `https` origin; a missing or
 `[redacted]` endpoint, another origin, or evidence that is not a complete live
-observation fails with reason `invalid-transport-evidence`. Until a `--record` run
-stores the evidence's full-URL digest on the server (`observed_endpoint_hash`), the
-binding is origin-only, so an observation of another path on the same origin passes.
+observation fails with reason `invalid-transport-evidence`. An inventory endpoint that
+names a path, query or fragment binds the full URL: the evidence must have observed
+exactly that URL. Otherwise, until a `--record` run stores the evidence's full-URL
+digest on the server (`observed_endpoint_hash`), the binding is origin-only, so an
+observation of another path on the same origin passes.
 For tools verified through transport evidence, `--record` preserves the tool's
 observation method, collector and timestamp and records the verified attestation's
 SHA-256 digest in the tool claim's `evidence_refs`.

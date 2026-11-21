@@ -994,6 +994,12 @@ _INVENTORY_REFUSALS: dict[str, Any] = {
     "other-full-url": lambda b: _approved_server(b).properties.update(
         observed_endpoint_hash="sha256:" + "c" * 64
     ),
+    "endpoint-other-path": lambda b: setattr(
+        _approved_server(b), "endpoint_url", "https://mcp.example.com/another-server/mcp"
+    ),
+    "endpoint-other-query": lambda b: setattr(
+        _approved_server(b), "endpoint_url", "https://mcp.example.com/mcp?tenant=other"
+    ),
 }
 _EVIDENCE_REFUSALS: dict[str, Any] = {
     "server-assurance": lambda s, t: setattr(s, "assurance_level", "declared"),
@@ -1054,6 +1060,32 @@ def test_remote_evidence_needs_the_inventory_to_name_its_endpoint(case):
     approved, evidence, _server, _tool = _remote_case()
     _INVENTORY_REFUSALS[case](approved)
     assert _remote_reason(approved, evidence) == ("failed", "invalid-transport-evidence", False)
+
+
+@pytest.mark.parametrize("named", ["https://mcp.example.com/mcp", "https://mcp.example.com/"])
+def test_an_inventory_endpoint_that_names_the_observed_path_binds_the_full_url(named):
+    approved, evidence, _server, _tool = _remote_case()
+    _approved_server(approved).endpoint_url = named
+    report = verify_mcp_servers(
+        approved, transport_evidence=[evidence], require_transport_evidence=True
+    )
+    [result] = report.results
+    binding = (result.transport_evidence or {}).get("endpoint_binding")
+    if named.endswith("/mcp"):
+        assert (result.status, binding, report.all_servers_verified) == (
+            "verified",
+            "full-url",
+            True,
+        )
+        strict = verify_mcp_servers(
+            approved,
+            transport_evidence=[evidence],
+            require_transport_evidence=True,
+            require_full_url_binding=True,
+        )
+        assert strict.all_servers_verified
+    else:
+        assert (result.status, binding) == ("verified", "origin")
 
 
 @pytest.mark.parametrize("case", sorted(_EVIDENCE_REFUSALS))

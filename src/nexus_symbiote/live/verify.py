@@ -383,6 +383,18 @@ def _canonical_https_origin(url: str | None) -> tuple[str, str, int] | None:
     return scheme, host.lower(), (443 if port is None else port)
 
 
+def _named_endpoint_hash(url: str | None) -> str | None:
+    """The full-URL digest an inventory endpoint binds when it names more than an origin."""
+    from urllib.parse import urlsplit
+
+    if not isinstance(url, str):
+        return None
+    parts = urlsplit(url)
+    if parts.path in ("", "/") and not parts.query and not parts.fragment:
+        return None
+    return hash_canonical({"observed_endpoint": url})
+
+
 def _recent(observed_at: datetime, max_age: timedelta | None) -> bool:
     now = datetime.now(UTC)
     if observed_at.tzinfo is None or observed_at > now + timedelta(minutes=5):
@@ -471,14 +483,17 @@ def _verify_remote_evidence(
     # The bom_ref does not change with the URL, and the scanner withholds an endpoint it
     # cannot read unambiguously ("[redacted]"), so only the inventory's own origin, and
     # its recorded full-URL digest when present, bind the evidence to this server.
+    # An inventory endpoint that names a path binds the full URL as observed.
     expected_ep_hash = server.properties.get("observed_endpoint_hash")
+    named_ep_hash = _named_endpoint_hash(server.endpoint_url)
     if (
         obs_origin is None
         or _canonical_https_origin(server_claim.locator) != obs_origin
         or _canonical_https_origin(server.endpoint_url) != obs_origin
         or endpoint_hash is None
-        or (require_full_url and expected_ep_hash is None)
+        or (require_full_url and expected_ep_hash is None and named_ep_hash is None)
         or (expected_ep_hash is not None and _valid_digest(expected_ep_hash) != endpoint_hash)
+        or (named_ep_hash is not None and named_ep_hash != endpoint_hash)
     ):
         return _refuse(result, "invalid-transport-evidence")
     approved = [
@@ -521,7 +536,9 @@ def _verify_remote_evidence(
         fingerprints[name] = fp
     result.reachable, result.status = True, "verified"
     result.transport_evidence = {
-        "endpoint_binding": "origin" if expected_ep_hash is None else "full-url",
+        "endpoint_binding": (
+            "origin" if expected_ep_hash is None and named_ep_hash is None else "full-url"
+        ),
         "observed_endpoint_hash": endpoint_hash,
         "observed_at": server_claim.observed_at.isoformat(),
     }
