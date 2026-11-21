@@ -25,7 +25,6 @@ from nexus_symbiote.core.hashing import (
 from nexus_symbiote.core.models import MCPServerComponent, ToolComponent
 from nexus_symbiote.graph import validate_graph
 from nexus_symbiote.live import pinned_process, stdio
-from nexus_symbiote.live.pinned_process import teardown_verifiable
 from nexus_symbiote.live.stdio import (
     LaunchPolicyError,
     PinnedObservation,
@@ -388,6 +387,8 @@ def verify_mcp_servers(
             by_name = {t.name: t for t in approved}
             if len(by_name) != len(approved):
                 raise _RefusedError("ambiguous-approved-tools")
+            if observation.teardown_confirmed:
+                result.teardown = "confirmed"
         except (LaunchPolicyError, SessionDeadlineError, StdioProtocolError) as exc:
             result.reason = exc.reason
         except _RefusedError as exc:
@@ -396,8 +397,6 @@ def verify_mcp_servers(
             result.reason = "invalid-descriptor"
         except Exception:
             result.reason = "internal-error"
-        if result.reason is None and teardown_verifiable():
-            result.teardown = "confirmed"
         if result.reason is not None:
             result.error = reason_message(result.reason)
             continue
