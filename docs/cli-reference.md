@@ -636,6 +636,21 @@ nexus-symbiote export-policy [OPTIONS] INVENTORY
 
 By default (`--verified-only`), `export-policy` refuses uncorroborated inventories unless `--project` reconciles and integrity-validates `INVENTORY` against the project or `--require-attestation` with `--trusted-key` verifies a reviewed DSSE attestation over `INVENTORY`. Pass `--include-declared` only when exporting uncorroborated declarations intentionally. With `--require-attestation` and no `--project`, tool and MCP server permits rest on the reviewer's attestation of the inventory's own claims, and no model is permitted: only `--project` with `--signature-policy` corroborates a model's digest and signature.
 
+For `--format json`, the top-level `format` is
+`nexus-symbiote/authorization-policy/v1`. The `serial_number` is the source
+inventory's serial number, or `null` if absent. The boolean `verified_only` records the assurance mode used
+for this export. Each allowlist is an array ordered by component `bom_ref`.
+
+| Allowlist | Fields in each entry |
+|---|---|
+| `allowed_tools` | `bom_ref`, `name`, `mcp_server_ref` (nullable), `definition_hash` (prefixed with `sha256:`). |
+| `allowed_mcp_servers` | `bom_ref`, `name`, `transport`, `version_pinned`, `mcp_role`. |
+| `allowed_models` | `bom_ref`, `name`, `sha256` (64 hexadecimal digits), `signing_status`. |
+
+An external authorization engine should deny entries absent from the relevant
+allowlist and check the runtime tool definition hash or model digest against
+the listed value before permitting use.
+
 ### `graph`
 
 Write a view of an inventory's associations, risk classes and exposure paths.
