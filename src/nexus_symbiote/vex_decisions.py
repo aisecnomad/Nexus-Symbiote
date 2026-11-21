@@ -65,10 +65,14 @@ class VEXDecisionEntry(BaseModel):
     detail: str = Field(min_length=1, max_length=2048)
     owner: str = Field(min_length=1, max_length=256)
     expires_at: datetime | None = None
+    inventory_sha256: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
+    deployment_id: str | None = Field(default=None, min_length=1, max_length=256)
 
-    @field_validator("id", "detail", "owner")
+    @field_validator("id", "detail", "owner", "deployment_id")
     @classmethod
-    def _clean_text(cls, value: str) -> str:
+    def _clean_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if not value.strip() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
             raise ValueError("must be a non-empty string without control characters")
         return value.strip()
