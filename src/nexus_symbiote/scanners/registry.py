@@ -723,6 +723,14 @@ class _Package:
     states: dict[tuple[str, str], _Declared] = field(default_factory=dict)
     conflict: bool = False
 
+    @property
+    def representative(self) -> _PipDeclaration:
+        """The unconditional pin, or the first declaration when no such pin exists."""
+        return next(
+            (d for d in self.declarations if d.pin is not None and not d.marker),
+            self.declarations[0],
+        )
+
     def add(self, declaration: _PipDeclaration) -> None:
         # One component per package across manifests. Every declaration is kept
         # on it, so a change to any of them changes the inventory and its diff.
@@ -2226,6 +2234,7 @@ class RegistryScanner(Scanner):
         *,
         checksum_recorded: bool = False,
         requested: str | None = None,
+        bind_identity: bool = True,
     ) -> None:
         """Bind a pnpm or Yarn record's exact version to a component, checked as an npm
         record is: an exact spec must agree with it, a download URL is read as a
@@ -2234,8 +2243,10 @@ class RegistryScanner(Scanner):
         ``checksum_recorded`` says the record holds Yarn's own checksum instead, and
         ``requested`` is the spec the package manager takes when it is not npm's.
         Nothing is bound, and a failure says why, when a check fails."""
-        sensitive_locator = holds_token_shape(locator)
-        sensitive = holds_token_shape(version) or sensitive_locator
+        sensitive_locator = holds_token_shape(locator) or redact_text(locator) != locator
+        sensitive = (
+            sensitive_locator or holds_token_shape(version) or redact_text(version) != version
+        )
         if sensitive:
             component.package_url = component.registry_uri = None
             component.risks.append(
@@ -2278,6 +2289,10 @@ class RegistryScanner(Scanner):
             )
         digest_recorded = integrity is not None or checksum_recorded
         component.risks.extend(self._npm_record_risks(shown, digest_recorded, origin))
+        if not bind_identity:
+            # A registry record can expose an independent integrity or origin problem
+            # even when its source does not match the one the package manager selected.
+            return
         if digest_recorded and consistent:
             component.risks = [r for r in component.risks if r.category != "version_pinning"]
         component.version = REDACTED if sensitive else version
@@ -2580,6 +2595,17 @@ class RegistryScanner(Scanner):
             else:
                 locator = "pnpm-lock.yaml#/importers/./" + _pointer_token(comp.name)
             selected_specs = specifiers.get(comp.name, set())
+            requested = next(iter(selected_specs)) if len(selected_specs) == 1 else None
+            kind = self._npm_spec(requested)[0] if requested is not None else "registry"
+            bind_identity = kind in ("registry", "alias")
+            if not bind_identity and requested is not None:
+                comp.registry_uri = None
+                risk = self._npm_source_risk(comp.name, kind, requested)
+                if risk not in comp.risks:
+                    comp.risks.append(risk)
+                result.surfaces_excluded.append(
+                    f"pnpm-lock.yaml: selected non-registry source for {comp.name} is unverified"
+                )
             self._bind_npm_resolution(
                 comp,
                 "pnpm-lock.yaml",
@@ -2590,7 +2616,8 @@ class RegistryScanner(Scanner):
                 locator,
                 lock_digest,
                 result,
-                requested=next(iter(selected_specs)) if len(selected_specs) == 1 else None,
+                requested=requested,
+                bind_identity=bind_identity,
             )
         return True
 
@@ -3094,7 +3121,7 @@ class RegistryScanner(Scanner):
             (urls if requirement is not None and requirement.url else others).append(declaration)
         exact = [d for d in others if d.pin is not None]
         unconditional = [d for d in exact if not d.marker]
-        chosen = unconditional[0] if unconditional else declarations[0]
+        chosen = package.representative
         loose: list[_PipDeclaration] = []
         if chosen.pin is not None and unconditional:
             pinned = _parsed(chosen.pin)
@@ -3762,7 +3789,12 @@ class RegistryScanner(Scanner):
             # A record is still checked for a package declared only under markers, or
             # through a source, override or conflict the lockfile does not stand for,
             # but it names no package URL or PyPI origin for it.
-            conditional = bool(comp.version and ";" in comp.version)
+            # Rendering can redact the complete declared version, including its marker.
+            conditional = (
+                bool(package.representative.marker)
+                if package is not None and declarations
+                else bool(comp.version and ";" in comp.version)
+            )
             unresolved = (package is not None and package.conflict) or any(
                 d.untranslated is not None or d.redacted for d in declarations
             )
