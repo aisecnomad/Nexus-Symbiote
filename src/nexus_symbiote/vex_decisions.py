@@ -22,13 +22,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-import yaml
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from nexus_symbiote.core.hashing import hash_bytes, open_regular_file, parse_json_strict
+from nexus_symbiote.policy import parse_yaml_mapping
+from nexus_symbiote.utils.terminal import UNSAFE_TEXT
 
 MAX_DECISIONS_BYTES = 4 * 1024 * 1024
 MAX_DECISIONS = 5_000
@@ -69,8 +70,10 @@ class VEXDecisionEntry(BaseModel):
     @field_validator("id", "detail", "owner")
     @classmethod
     def _clean_text(cls, value: str) -> str:
-        if not value.strip() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
-            raise ValueError("must be a non-empty string without control characters")
+        if not value.strip() or "\t" in value or UNSAFE_TEXT.search(value):
+            raise ValueError(
+                "must be a non-empty string without control, bidirectional or invisible characters"
+            )
         return value.strip()
 
     @field_validator("expires_at")
@@ -240,14 +243,16 @@ def load_vex_decisions(
         label="Operator VEX decisions file",
     )
     raw = _read_regular_bytes(path, MAX_DECISIONS_BYTES, "VEX decisions file", single_link=True)
-    text = raw.decode("utf-8")
     try:
+        text = raw.decode("utf-8")
+        # Aliases expand into repeated validation work, and a repeated key (a second
+        # ``state:``) would silently replace the first: both are refused.
         payload: Any = (
             parse_json_strict(text, max_bytes=MAX_DECISIONS_BYTES)
             if path.suffix.lower() == ".json" or text.lstrip().startswith("{")
-            else yaml.safe_load(text)
+            else parse_yaml_mapping(text)
         )
-    except (ValueError, yaml.YAMLError) as exc:
+    except ValueError as exc:
         raise VEXDecisionError(f"Invalid VEX decisions syntax: {exc}") from exc
     if not isinstance(payload, dict):
         raise VEXDecisionError(

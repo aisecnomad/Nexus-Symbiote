@@ -487,7 +487,7 @@ nexus-symbiote diff [OPTIONS] OLD_PATH NEW_PATH
 | `--json-output` | Output as JSON |
 | `--report-format` `text\|json\|markdown\|junit` | Gate report format (cannot disagree with `--json-output`; default: `text`). |
 | `--step-summary` `PATH` | Append a sanitized Markdown gate summary to this file (for example, `GITHUB_STEP_SUMMARY`). |
-| `--expect-upgrade` `FROM_VERSION` | Attribute documented profile/schema transitions from `FROM_VERSION` (`0.1.0` or `0.2.0`) into `tool_upgrade_changes` when `metadata.tool_version` matches; configuration/hash drift still alerts. |
+| `--expect-upgrade` `FROM_VERSION` | Attribute documented profile/schema transitions from `FROM_VERSION` (`0.1.0` or `0.2.0`) into `tool_upgrade_changes` when `metadata.tool_version` matches; configuration/hash drift still alerts, and so do a tool fingerprint version change (both releases wrote `rfc8785-jcs-v2`) and an unsupported `spec_version`. |
 | `--fail-on-alert` / `--no-fail-on-alert` | Exit with status 1 if the diff reports a security alert (default: fail). |
 | `--detailed-exit-codes` | Use distinct exit codes (`0` passed, `2` usage, `3` gate failed, `4` input/internal failure). |
 | `--legacy-exit-codes` | Use legacy exit codes (`0` passed, `1` gate/input failed, `2` usage). |
@@ -1174,10 +1174,10 @@ nexus-symbiote vex [OPTIONS] AIBOM_PATH
 | Option | Description |
 |---|---|
 | `-o`, `--output` `PATH` | Write the VEX document to this file instead of standard output. |
-| `--decisions` `PATH` | Operator-owned VEX decisions YAML/JSON stored outside the scanned project and enclosing git trees; expired decisions revert to `in_triage` against wall-clock UTC time. |
+| `--decisions` `PATH` | Operator-owned VEX decisions YAML/JSON stored outside the scanned project and enclosing git trees; expired decisions revert to `in_triage` against wall-clock UTC time. YAML anchors, aliases and repeated mapping keys are refused, and so is an `id`, `detail` or `owner` with a control, bidirectional or invisible character. |
 | `--project-root` `PATH` | Scanned project root used to refuse policy and trace files stored inside the checkout. |
-| `--advisories` `PATH` | Link matched advisories from a live or offline `advisories` report JSON bound to this AIBOM's SHA-256 into the VEX document. |
-| `--trace-evidence` `PATH` | `trace-diff` or execution-evidence JSON bound to this AIBOM's SHA-256 (`unobserved` and `invoked` stay `in_triage`; critical, KEV, and static-execution findings cannot be suppressed without an expiring operator decision). Requires `--trace-attestation` with `--trusted-key` unless `--allow-unsigned-trace-evidence` is set. |
+| `--advisories` `PATH` | Link matched advisories from a live or offline `advisories` report JSON bound to this AIBOM's SHA-256 into the VEX document. An advisory whose `in_kev` is not a JSON boolean, whose `epss_score` is not a finite JSON number, or whose `aliases` or `kev_sources` entry contains a comma is refused. |
+| `--trace-evidence` `PATH` | `trace-diff` or execution-evidence JSON bound to this AIBOM's SHA-256 (`unobserved` and `invoked` stay `in_triage`; critical, KEV, static-execution, and hidden or injected instruction text findings cannot be suppressed without an expiring operator decision). Requires `--trace-attestation` with `--trusted-key` unless `--allow-unsigned-trace-evidence` is set. |
 | `--trace-attestation` `PATH` | Ed25519 DSSE attestation envelope authenticating `--trace-evidence`. |
 | `--trusted-key` `PATH` | Trusted Ed25519 public key PEM outside the scanned project (repeatable; used with `--trace-attestation`). |
 | `--allow-unsigned-trace-evidence` | Explicitly accept unsigned `--trace-evidence` without `--trace-attestation`. |

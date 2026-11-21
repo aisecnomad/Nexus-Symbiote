@@ -13,6 +13,7 @@ evidence never sets ``exploitable``. ``NEXUS-`` identifiers match no public data
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from datetime import datetime
@@ -40,17 +41,38 @@ _SERIAL = re.compile(
     r"urn:uuid:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
 _CDX_SEVERITIES = frozenset({"critical", "high", "medium", "low", "info", "none", "unknown"})
+# Findings whose risk does not depend on the component being loaded at run time: code that
+# runs at install, launch or load, and hidden or injected text an agent reads as written.
 _NON_SUPPRESSIBLE_CATEGORIES = frozenset(
     {
         "hook_commands",
         "settings_environment",
         "credential_exposure",
+        "credential_helper",
         "serialization_format",
+        "serialization_format_unknown",
+        "code_execution",
+        "custom_code",
         "permission_scope",
-        "hidden_content",
-        "trust_remote_code",
+        "hidden_markup",
+        "invisible_characters",
+        "bidi_override",
+        "tag_characters",
+        "directional_marks",
+        "line_separators",
+        "identifier_characters",
+        "instruction_injection",
+        "tool_description_poisoning",
     }
 )
+
+
+def _joined(values: list[Any], field: str) -> str:
+    """Comma-join identifiers, refusing one that holds the delimiter and would read as two."""
+    items = [value for value in values if isinstance(value, str)]
+    if any("," in item for item in items):
+        raise ValueError(f"Advisory {field} entries must not contain ','")
+    return ",".join(items)
 
 
 def finding_id(component_ref: str, category: str, detail: str) -> str:
@@ -79,6 +101,7 @@ def _resolve_analysis(
     analysis: dict[str, Any] = {"state": "in_triage", "detail": default_detail}
     decision = decisions.lookup(vuln_id, component_ref) if decisions is not None else None
     if decision is not None:
+        owner = plain_text(decision.owner)
         if (
             decision.expires_at is not None
             and ref_time is not None
@@ -86,21 +109,21 @@ def _resolve_analysis(
         ):
             warning = (
                 f"Expired operator VEX decision for {vuln_id} "
-                f"(owner={decision.owner}, expired_at={decision.expires_at.isoformat()}); "
+                f"(owner={owner}, expired_at={decision.expires_at.isoformat()}); "
                 "reverted to in_triage."
             )
             expired_warnings.append(warning)
             analysis["detail"] = f"{warning} {default_detail}"
             props["nexus-symbiote:vexDecisionStatus"] = "expired-reverted"
-            props["nexus-symbiote:vexDecisionOwner"] = decision.owner
+            props["nexus-symbiote:vexDecisionOwner"] = owner
             props["nexus-symbiote:vexDecisionExpiredAt"] = decision.expires_at.isoformat()
         else:
             analysis["state"] = decision.state
             if decision.justification is not None:
                 analysis["justification"] = decision.justification
-            analysis["detail"] = f"{plain_text(decision.detail)} (owner: {decision.owner})"
+            analysis["detail"] = f"{plain_text(decision.detail)} (owner: {owner})"
             props["nexus-symbiote:vexDecisionStatus"] = "active"
-            props["nexus-symbiote:vexDecisionOwner"] = decision.owner
+            props["nexus-symbiote:vexDecisionOwner"] = owner
             if decision.expires_at is not None:
                 props["nexus-symbiote:vexDecisionExpiresAt"] = decision.expires_at.isoformat()
     elif execution_evidence is not None:
@@ -269,18 +292,24 @@ class VEXGenerator(Generator):
                 ),
             }
             if isinstance(adv.get("aliases"), list) and adv["aliases"]:
-                props["nexus-symbiote:aliases"] = ",".join(
-                    str(a) for a in adv["aliases"] if isinstance(a, str)
-                )
-            in_kev = bool(adv.get("in_kev"))
+                props["nexus-symbiote:aliases"] = _joined(adv["aliases"], "aliases")
+            in_kev = adv.get("in_kev")
+            if in_kev is None:
+                in_kev = False
+            elif not isinstance(in_kev, bool):
+                # The string "false" is truthy: a coerced flag would invert KEV handling.
+                raise ValueError("Advisory in_kev must be a JSON boolean")
             if in_kev:
                 props["nexus-symbiote:inKev"] = "true"
                 if isinstance(adv.get("kev_sources"), list) and adv["kev_sources"]:
-                    props["nexus-symbiote:kevSources"] = ",".join(
-                        str(s) for s in adv["kev_sources"] if isinstance(s, str)
-                    )
-            if isinstance(adv.get("epss_score"), (int, float)):
-                props["nexus-symbiote:epssScore"] = f"{float(adv['epss_score']):.6f}"
+                    props["nexus-symbiote:kevSources"] = _joined(adv["kev_sources"], "kev_sources")
+            epss = adv.get("epss_score")
+            if epss is not None:
+                if isinstance(epss, bool) or not isinstance(epss, (int, float)):
+                    raise ValueError("Advisory epss_score must be a JSON number")
+                if not math.isfinite(epss):
+                    raise ValueError("Advisory epss_score must be finite")
+                props["nexus-symbiote:epssScore"] = f"{float(epss):.6f}"
             if adv.get("range_undecidable") is True:
                 props["nexus-symbiote:rangeUndecidable"] = "true"
             summary = plain_text(

@@ -167,7 +167,7 @@ The exporter checks its output with a structural SARIF validator (required prope
 - Descriptions and details are neutralized like SARIF messages.
 - Findings on components imported from a ShadowScan report are omitted; the metadata property `nexus-symbiote:omittedImportedFindings` counts them.
 
-What it cannot express on its own: a statement is `in_triage` unless an unexpired `--decisions` entry sets its state and justification, or `--trace-evidence` reports that a component was declared but never loaded, which sets `not_affected` (`code_not_reachable`) except for critical findings, KEV-listed advisories and categories such as hook commands or credential exposure; trace evidence never sets `exploitable` or `resolved`. `NEXUS-` identifiers name inventory findings, not entries in any vulnerability database, so tools that apply VEX statements to known vulnerabilities have nothing to apply them to. VEX output states no coverage.
+What it cannot express on its own: a statement is `in_triage` unless an unexpired `--decisions` entry sets its state and justification, or `--trace-evidence` reports that a component was declared but never loaded, which sets `not_affected` (`code_not_reachable`) except for critical findings, KEV-listed advisories and categories such as hook commands, credential exposure, custom model code, and hidden or injected instruction text; trace evidence never sets `exploitable` or `resolved`. `NEXUS-` identifiers name inventory findings, not entries in any vulnerability database, so tools that apply VEX statements to known vulnerabilities have nothing to apply them to. VEX output states no coverage.
 
 ## Minimum elements
 
