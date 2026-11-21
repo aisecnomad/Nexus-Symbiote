@@ -614,7 +614,10 @@ If the service owns a dedicated directory, make that directory private (0700).
 For a shared parent, move the trusted current database and its SQLite companions
 together into a dedicated 0700 directory owned by the service account. Check
 ownership and permissions before restarting all gateways against the same
-store. Reinitializing the store or discarding a journal can lose consumed
+store. A crash can leave a journal or WAL with the database’s old group-write
+permission. With every writer stopped, verify the files’ provenance and owner,
+then remove group write permission with `chmod g-w` on those files. Keep a hot
+journal with its database so SQLite can complete recovery. Reinitializing the store or discarding a journal can lose consumed
 approvals and accepted serials.
 
 The store records, per tenant, the accepted trust status (serial, digest and

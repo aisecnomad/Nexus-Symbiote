@@ -425,8 +425,24 @@ def _triggers(document: dict[Any, Any]) -> set[str]:
 def _covers_main(options: Any, event: str) -> bool:
     if options is None:
         return True
-    if not isinstance(options, dict) or options.keys() - {"branches", "branches-ignore", "types"}:
+    allowed_keys = {"branches", "branches-ignore", "types"}
+    if event == "push":
+        allowed_keys.update({"tags", "tags-ignore"})
+    if not isinstance(options, dict) or options.keys() - allowed_keys:
         return False
+    tag_keys = options.keys() & {"tags", "tags-ignore"}
+    if tag_keys:
+        # A tags-only push trigger does not run on any branch. With branch
+        # filters, tag filters are independent of which branch pushes run.
+        if len(tag_keys) != 1 or not options.keys() & {"branches", "branches-ignore"}:
+            return False
+        tags = options[next(iter(tag_keys))]
+        if (
+            not isinstance(tags, list)
+            or not tags
+            or not all(isinstance(tag, str) and tag for tag in tags)
+        ):
+            return False
     if "types" in options:
         types = options["types"]
         if event != "pull_request" or not isinstance(types, list):
@@ -437,17 +453,22 @@ def _covers_main(options: Any, event: str) -> bool:
         return False
     ignored = "branches-ignore" in options
     patterns = options.get("branches-ignore" if ignored else "branches")
-    if patterns is None:
+    if not options.keys() & {"branches", "branches-ignore"}:
         return True
-    if not isinstance(patterns, list):
+    if not isinstance(patterns, list) or not patterns:
         return False
     allowed = ignored
     for pattern in patterns:
         if not isinstance(pattern, str):
             return False
         negative = pattern.startswith("!")
+        if negative and ignored:
+            return False
         enables = negative == ignored
         glob = pattern.removeprefix("!")
+        if re.match(r"^[a-zA-Z0-9._-]+/", glob):
+            # A literal first directory cannot match the single branch name "main".
+            continue
         # For a single branch name, literal characters and '*' have the same
         # meaning in GitHub and fnmatch. An unmodeled exclusion can remove main.
         if re.fullmatch(r"[a-zA-Z0-9._*-]+", glob):
@@ -1358,6 +1379,17 @@ def _unsafe_env_scope(workflow_env: Any, job_env: Any, step_env: Any) -> str | N
     return None
 
 
+# Reviewed together with the CodeQL jobs in ci.yml and codeql.yml.
+_CODEQL_ACTION_SHA = "33d7b85da1a04171e211befe2c739303b9a4c066"
+_CODEQL_PRODUCER_SHAS = {
+    "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/setup-python": "6d4fd22b20465ccc0f7354476588e8df7c9ca0e0",
+    "github/codeql-action/init": _CODEQL_ACTION_SHA,
+    "github/codeql-action/autobuild": _CODEQL_ACTION_SHA,
+    "github/codeql-action/analyze": _CODEQL_ACTION_SHA,
+}
+
+
 def _codeql_producer_issues(
     path: Path, name: str, job: dict[str, Any], workflow_env: Any
 ) -> list[str]:
@@ -1391,8 +1423,15 @@ def _codeql_producer_issues(
         return error
     for environment in (workflow_env, job.get("env")):
         if isinstance(environment, dict) and any(
-            str(key).upper().startswith(("CODEQL_", "LGTM_"))
-            or str(key).upper() in {"NODE_OPTIONS", "NODE_PATH"}
+            str(key).upper().startswith(("CODEQL_", "LGTM_", "SEMMLE_"))
+            or str(key).upper()
+            in {
+                "NODE_OPTIONS",
+                "NODE_PATH",
+                "JAVA_TOOL_OPTIONS",
+                "JDK_JAVA_OPTIONS",
+                "_JAVA_OPTIONS",
+            }
             for key in environment
         ):
             return error
@@ -1413,8 +1452,7 @@ def _codeql_producer_issues(
             or step.get("continue-on-error", False) is not False
         ):
             return error
-        uses = step.get("uses")
-        if not isinstance(uses, str) or not PIN.fullmatch(uses) or uses.partition("@")[0] != action:
+        if step.get("uses") != f"{action}@{_CODEQL_PRODUCER_SHAS[action]}":
             return error
         if step.get("with", {}) != inputs:
             return error
