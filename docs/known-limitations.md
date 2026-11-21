@@ -249,10 +249,16 @@ A way around a limit that its entry does not describe is worth a
   code; `-` (standard input) is inline code for node, python, ruby, perl, php,
   `bun`, `bun run`, `pwsh -File` and `pwsh -Command`.
 - **PowerShell parameters are read from a table.** `pwsh` and `powershell`
-  parameters are matched by prefix, as PowerShell matches them, against a table of
-  switches and value-taking parameters; a parameter outside the table, or a prefix
-  that may name parameters of different kinds (`-co`), is a gap, because its value
-  may hide where `-Command` starts. `-Param:value` is not split.
+  parameters are matched against a table of switches and value-taking parameters,
+  each from the shortest prefix pwsh 7's command-line parser accepts (`-config`,
+  `-cus`, `-settings`). A shorter word, which pwsh reads as the script path, a
+  parameter outside the table, and a prefix that may name parameters of different
+  kinds (`-co`, `-in`) are gaps, because a value may hide where `-Command` starts.
+  So are `-Version` and `-PSConsoleFile`, which pwsh 7 and Windows PowerShell 5.1
+  read differently, and `-ConfigurationName`, `-ConfigurationFile` and
+  `-SettingsFile`, which select a configuration that can run code first. The
+  prefixes were taken from pwsh 7's source, not checked against Windows PowerShell
+  5.1. `-Param:value` is not split.
 - **env is read as GNU env reads it.** Any word with `=` after a non-empty name is an
   assignment (`BASH_FUNC_sh%%=...`, `npm_config_script-shell=...`), and its variable is
   rated as a declared `env` entry is. At most four `-S` or `--split-string` values are
@@ -325,7 +331,11 @@ A way around a limit that its entry does not describe is worth a
   rated by their written source: a mount through a link, a client variable other than `${userHome}`,
   `${env:HOME}`, `${env:USERPROFILE}`, `${workspaceFolder}` and `$PWD`, and a
   credential directory other than `.ssh`, `.aws`, `.gnupg`, `.kube`, `.docker`,
-  `.config`, `.azure` and `.gcloud` are only `host_mounts`. Variables in an
+  `.config`, `.azure` and `.gcloud` are only `host_mounts`. A `-v` source is rated
+  as cut at the first colon outside a client variable such as `${env:X}` and as cut
+  at the first colon, as an engine cuts a variable the client left unexpanded, and
+  a variable in it also as empty and as one path component, so
+  `/${env:X}/..:/host` is a host root mount. Variables in an
   `--env-file`, a `--health-cmd` and a seccomp profile file are a medium finding
   without being read, and `podman --env-host` is not rated. An `--entrypoint` is a
   medium finding only beside a host mount. An image command is a medium

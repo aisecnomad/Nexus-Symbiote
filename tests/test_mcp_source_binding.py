@@ -14,6 +14,7 @@ from nexus_symbiote.core.hashing import hash_tool_definition
 from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolComponent
 from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV, MCPScanner
 from nexus_symbiote.validators.completeness import CompletenessValidator
+from tests.support import scaling_ratio
 
 KEY = "k" * 40
 
@@ -1147,6 +1148,42 @@ def test_a_launched_package_scope_is_still_named(tmp_path):
     assert server.properties["package_sources"] == ["--@acme:registry=https://r.test"]
     server = _with_files(tmp_path, PINNED_NPX, {".npmrc": "@acme:registry=https://r.test/\n"})
     assert server.properties["resolver_settings"] == [".npmrc:@acme:registry"]
+
+
+def test_a_launched_scope_that_is_a_server_secret_is_withheld(tmp_path):
+    # Not token-shaped: only the scrubbed-label guards keep the scope out of the labels.
+    secret = "zq7xk3mw9pv2"  # noqa: S105 - a fixture, not a credential
+    config = {
+        "command": "npx",
+        "args": ["-y", f"--@{secret}:registry=https://o.test/", f"@{secret}/s@1.2.3"],
+        "env": {"NPM_TOKEN": secret},
+    }
+    server = _with_files(tmp_path, config, {".npmrc": f"@{secret}:registry=https://r.test/\n"})
+    assert secret not in server.model_dump_json()
+    assert server.properties["resolver_settings"] == ["[redacted]"]
+    assert server.properties["package_sources"] == [
+        "[redacted]=https://o.test",
+        "[redacted]=https://r.test",
+    ]
+
+
+def test_scoped_registry_labels_stay_linear_in_packages_times_settings(tmp_path):
+    projects = {}
+    for scale in (1, 8):
+        project = tmp_path / str(scale)
+        project.mkdir()
+        packages = [word for i in range(50 * scale) for word in ("-p", f"@s{i}/p@1.0.0")]
+        config = {"command": "npx", "args": ["-y", *packages, "p"]}
+        (project / ".mcp.json").write_text(json.dumps({"mcpServers": {"db": config}}))
+        settings = "".join(f"@z{i}:registry=https://r.test/\n" for i in range(800 * scale))
+        (project / ".npmrc").write_text(settings)
+        projects[scale] = project
+
+    def run(scale: int) -> None:
+        MCPScanner().scan(projects[scale])
+
+    # Checking each scoped setting against every launched package grows 64 times.
+    assert scaling_ratio(run, factor=8) < 16
 
 
 @pytest.mark.parametrize("variable", ["YARN_YARN_PATH", "YARN_PLUGINS"])

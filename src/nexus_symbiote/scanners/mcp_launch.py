@@ -2338,34 +2338,34 @@ def _unwrap_cmd(rest: list[str], launch: Launch) -> list[str] | None:
     return words
 
 
-# PowerShell parameters (pwsh 7 and Windows PowerShell 5.1) and the shortest prefix of
-# each that names it, as CommandLineParameterParser matches them. Prefixes err short: a
-# word either edition may read as another parameter matches two kinds and fails closed.
+# PowerShell parameters and the shortest prefix of each that names it, as pwsh 7's
+# CommandLineParameterParser matches them. A word pwsh does not recognise starts the -File
+# path, so it fails closed here; so does -Version and -PSConsoleFile, which pwsh 7 and
+# Windows PowerShell 5.1 read differently.
 _POWERSHELL_PARAMETERS = (
     ("command", "c", "command"),
-    ("commandwithargs", "commandw", "command"),
+    ("commandwithargs", "commandwithargs", "command"),
     ("cwa", "cwa", "command"),
     ("file", "f", "file"),
     ("encodedcommand", "e", "encoded"),
-    ("ec", "ec", "encoded"),
+    ("ec", "e", "encoded"),
     ("encodedarguments", "encodeda", "encoded"),
+    ("ea", "ea", "encoded"),
     ("executionpolicy", "ex", "value"),
     ("ep", "ep", "value"),
-    ("configurationname", "co", "value"),
-    ("configurationfile", "configurationf", "value"),
-    ("custompipename", "cu", "value"),
-    ("settingsfile", "se", "value"),
-    ("inputformat", "in", "value"),
+    ("configurationname", "config", "configuration"),
+    ("configurationfile", "configurationfile", "configuration"),
+    ("custompipename", "cus", "value"),
+    ("settingsfile", "settings", "configuration"),
+    ("inputformat", "inp", "value"),
     ("if", "if", "value"),
     ("outputformat", "o", "value"),
-    ("of", "of", "value"),
+    ("of", "o", "value"),
     ("windowstyle", "w", "value"),
     ("workingdirectory", "wo", "directory"),
     ("wd", "wd", "directory"),
-    ("psconsolefile", "ps", "value"),
-    ("version", "v", "value"),
     ("noprofile", "nop", "switch"),
-    ("noprofileloadtime", "noprofilel", "switch"),
+    ("noprofileloadtime", "noprofileloadtime", "switch"),
     ("nologo", "nol", "switch"),
     ("noninteractive", "noni", "switch"),
     ("noexit", "noe", "switch"),
@@ -2376,8 +2376,12 @@ _POWERSHELL_PARAMETERS = (
     ("servermode", "s", "switch"),
     ("socketservermode", "so", "switch"),
     ("namedpipeservermode", "nam", "switch"),
-    ("sshservermode", "ss", "switch"),
-    ("removeworkingdirectorytrailingcharacter", "r", "switch"),
+    ("sshservermode", "sshs", "switch"),
+    (
+        "removeworkingdirectorytrailingcharacter",
+        "removeworkingdirectorytrailingcharacter",
+        "switch",
+    ),
     ("help", "h", "switch"),
     ("?", "?", "switch"),
 )
@@ -2388,12 +2392,17 @@ def _powershell_parameter(word: str) -> str | None:
     if word[:1] != "-":
         return None
     name = word[2:] if word[1:2] == "-" else word[1:]
-    kinds = {
-        kind
-        for full, shortest, kind in _POWERSHELL_PARAMETERS
-        if len(name) >= len(shortest) and full.startswith(name)
-    }
-    return kinds.pop() if len(kinds) == 1 else None
+    kinds: set[str] = set()
+    short: set[str] = set()
+    for full, shortest, kind in _POWERSHELL_PARAMETERS:
+        if full.startswith(name):
+            if len(name) >= len(shortest):
+                kinds.add(kind)
+            elif len(name) > 1 and kind != "switch":
+                short.add(kind)
+    # A word too short for a parameter of another kind that takes a value or code (-co,
+    # -in) may resolve there in another edition, so it is ambiguous.
+    return kinds.pop() if len(kinds) == 1 and short <= kinds else None
 
 
 def _unwrap_powershell(rest: list[str], launch: Launch) -> list[str] | None:
@@ -2408,6 +2417,11 @@ def _unwrap_powershell(rest: list[str], launch: Launch) -> list[str] | None:
             if rest[index + 1 : index + 2] == ["-"]:
                 # -File - reads the script from standard input, as node - does.
                 launch.fail(_inline("powershell", launch))
+            return None
+        if kind == "configuration":
+            # A session configuration or settings file can import modules and run a
+            # startup script before the command; the inventory does not read it.
+            launch.fail("PowerShell configuration selection is not collected")
             return None
         if kind in {"value", "directory"}:
             if kind == "directory" and index + 1 < len(rest):
@@ -3134,7 +3148,7 @@ def _volume_source_end(spec: str) -> int:
     return spec.find(":", index)
 
 
-def _host_source(spec: str, *, mount: bool) -> str | None:
+def _host_source(spec: str, *, mount: bool, end: int | None = None) -> str | None:
     if mount:
         parts = _mount_parts(spec)
         fields = dict(parts)
@@ -3157,7 +3171,8 @@ def _host_source(spec: str, *, mount: bool) -> str | None:
             return None
         return device or None
     # A client variable such as ${env:HOME} holds a colon of its own.
-    end = _volume_source_end(spec)
+    if end is None:
+        end = _volume_source_end(spec)
     if end < 0:
         return None
     source = spec[:end]
@@ -3168,6 +3183,74 @@ def _host_source(spec: str, *, mount: bool) -> str | None:
         or re.match(r"[A-Za-z]:", source)
         else None
     )
+
+
+def _volume_source_ends(spec: str) -> list[int]:
+    """The separator a client-variable reading finds, then the engine's first colon."""
+    drive = 2 if re.match(r"[A-Za-z]:[\\/]", spec) else 0
+    return list(dict.fromkeys((_volume_source_end(spec), spec.find(":", drive))))
+
+
+def _host_sources(spec: str, *, mount: bool) -> list[str]:
+    """Every host source a mount spec may name, under each reading of its separator."""
+    if mount:
+        source = _host_source(spec, mount=True)
+        return [] if source is None else [source]
+    sources: list[str] = []
+    # A client that does not expand a variable hands it to the engine, which splits the
+    # spec at its first colon; an unset variable may expand to nothing, and a set one
+    # is one component, so a following ".." climbs past it rather than into its text.
+    for end in _volume_source_ends(spec):
+        source = _host_source(spec, mount=False, end=end)
+        if source is not None:
+            sources.append(source)
+    for source in list(sources):
+        if _VOLUME_VARIABLE.search(source):
+            sources.append(_VOLUME_VARIABLE.sub("v", source))
+            empty = _VOLUME_VARIABLE.sub("", source)
+            if empty:
+                sources.append(empty)
+    return list(dict.fromkeys(sources))
+
+
+def _host_source_flag(source: str) -> str | None:
+    """The host root, runtime socket or broad host mount flag a source earns, if any."""
+    if _WORKSPACE.match(source):
+        source = _WORKSPACE.sub(".", source, count=1)
+    normalized = source.rstrip("/\\") or ("/" if source.startswith("/") else "\\")
+    # normpath keeps a leading "//", which Linux and Go's filepath.Clean read as "/".
+    canonical = (
+        posixpath.normpath("/" + normalized.lstrip("/"))
+        if normalized.startswith("/") and "\\" not in normalized
+        else normalized
+    )
+    if _PROC_ROOT.match(canonical):
+        canonical = _PROC_ROOT.sub("", canonical, count=1) or "/"
+    home = _HOME.match(canonical)
+    climbs = False
+    if home:
+        tail = posixpath.normpath(canonical[home.end() :].replace("\\", "/").strip("/") or ".")
+        climbs = tail == ".." or tail.startswith("../")
+        canonical = home.group() + ("" if tail == "." else "/" + tail)
+    if canonical in {"/", "\\"} or re.fullmatch(r"[A-Za-z]:[\\/]?", canonical):
+        return "host_root_mount"
+    if canonical.lower().endswith(_SOCKETS) or _SOCKET_DIRECTORIES.fullmatch(canonical):
+        return "runtime_socket_mount"
+    if (
+        climbs
+        or _BROAD.fullmatch(canonical)
+        or _ENGINE_STATE.fullmatch(canonical)
+        or canonical.startswith("/proc/")
+        or canonical == ".."
+        or canonical.startswith(("../", "..\\"))
+        or posixpath.normpath(normalized.replace("\\", "/")).startswith("..")
+        or (
+            not canonical.startswith(".")
+            and not _CREDENTIAL_DIRECTORIES.isdisjoint(re.split(r"[\\/]", canonical))
+        )
+    ):
+        return "broad_host_mount"
+    return None
 
 
 def _container_context(options: list[tuple[str, str | None]], launch: Launch) -> None:
@@ -3220,47 +3303,12 @@ def _container_context(options: list[tuple[str, str | None]], launch: Launch) ->
             # The engine runs a string health check with /bin/sh -c inside the container.
             launch.mark("container_command")
         elif option in {"-v", "--volume", "--mount"} and value:
-            source = _host_source(value, mount=option == "--mount")
-            if source is None:
-                continue
-            launch.mark("host_mounts")
-            if _WORKSPACE.match(source):
-                source = _WORKSPACE.sub(".", source, count=1)
-            normalized = source.rstrip("/\\") or ("/" if source.startswith("/") else "\\")
-            # normpath keeps a leading "//", which Linux and Go's filepath.Clean read as "/".
-            canonical = (
-                posixpath.normpath("/" + normalized.lstrip("/"))
-                if normalized.startswith("/") and "\\" not in normalized
-                else normalized
-            )
-            if _PROC_ROOT.match(canonical):
-                canonical = _PROC_ROOT.sub("", canonical, count=1) or "/"
-            home = _HOME.match(canonical)
-            climbs = False
-            if home:
-                tail = posixpath.normpath(
-                    canonical[home.end() :].replace("\\", "/").strip("/") or "."
-                )
-                climbs = tail == ".." or tail.startswith("../")
-                canonical = home.group() + ("" if tail == "." else "/" + tail)
-            if canonical in {"/", "\\"} or re.fullmatch(r"[A-Za-z]:[\\/]?", canonical):
-                launch.mark("host_root_mount")
-            elif canonical.lower().endswith(_SOCKETS) or _SOCKET_DIRECTORIES.fullmatch(canonical):
-                launch.mark("runtime_socket_mount")
-            elif (
-                climbs
-                or _BROAD.fullmatch(canonical)
-                or _ENGINE_STATE.fullmatch(canonical)
-                or canonical.startswith("/proc/")
-                or canonical == ".."
-                or canonical.startswith(("../", "..\\"))
-                or posixpath.normpath(normalized.replace("\\", "/")).startswith("..")
-                or (
-                    not canonical.startswith(".")
-                    and not _CREDENTIAL_DIRECTORIES.isdisjoint(re.split(r"[\\/]", canonical))
-                )
-            ):
-                launch.mark("broad_host_mount")
+            sources = _host_sources(value, mount=option == "--mount")
+            if sources:
+                launch.mark("host_mounts")
+            for flag in dict.fromkeys(_host_source_flag(source) for source in sources):
+                if flag is not None:
+                    launch.mark(flag)
         elif option == "--entrypoint":
             launch.mark("entrypoint_override")
     if launch.context.get("entrypoint_override") and launch.context.get("host_mounts"):
@@ -3315,16 +3363,18 @@ def _mount_targets(options: list[tuple[str, str | None]]) -> list[str]:
     for option, value in options:
         if option not in {"-v", "--volume", "--mount"} or not value:
             continue
-        source = _host_source(value, mount=option == "--mount")
-        if source is None:
-            continue
         if option == "--mount":
+            if _host_source(value, mount=True) is None:
+                continue
             fields = _mount_fields(value)
-            target = fields.get("target") or fields.get("dst") or fields.get("destination")
+            found = [fields.get("target") or fields.get("dst") or fields.get("destination")]
         else:
-            target = value[len(source) + 1 :].split(":", 1)[0]
-        if target and target.startswith("/"):
-            targets.append(_absolute(target))
+            found = [
+                value[end + 1 :].split(":", 1)[0]
+                for end in _volume_source_ends(value)
+                if _host_source(value, mount=False, end=end) is not None
+            ]
+        targets.extend(_absolute(target) for target in found if target and target.startswith("/"))
     return targets
 
 
@@ -3478,6 +3528,21 @@ _DENO_SUBCOMMANDS = _set(
     " update upgrade vendor x"
 )
 _DENO_SOURCES = frozenset({"--import-map", "--cert"})
+_DENO_TASK_VALUES = frozenset({"-c", "--config", "--cwd", "-f", "--filter", "-L", "--log-level"})
+
+
+def _deno_task_eval(rest: list[str]) -> int | None:
+    """The index of deno task's own --eval, among its options before the task word.
+
+    Deno hands every word after the task name to the task, so an --eval there belongs
+    to the program the task runs.
+    """
+    index = 1
+    while index < len(rest) and rest[index].startswith("-") and rest[index] != "--":
+        if rest[index] == "--eval":
+            return index
+        index += 2 if rest[index] in _DENO_TASK_VALUES else 1
+    return None
 
 
 def _deno(name: str, rest: list[str], launch: Launch) -> None:
@@ -3486,13 +3551,11 @@ def _deno(name: str, rest: list[str], launch: Launch) -> None:
         rest = rest[1:]
     elif rest[:1] == ["task"]:
         launch.launcher = "deno task"
-        words = rest[1 : rest.index("--") if "--" in rest else len(rest)]
-        if "--eval" in words:
+        flag = _deno_task_eval(rest)
+        if flag is not None:
             # deno task --eval runs the task name as a command line in its task shell.
-            flag = words.index("--eval") + 1
             _shell_subcommand([*rest[1:flag], *rest[flag + 1 :]], launch)
-        else:
-            _local_subcommand(rest[1:], launch)
+        _local_subcommand(rest[1:], launch)
         return
     elif rest[:1] in (["eval"], ["repl"]):
         launch.fail(_inline("deno", launch))

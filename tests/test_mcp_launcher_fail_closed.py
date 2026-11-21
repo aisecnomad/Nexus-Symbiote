@@ -1315,6 +1315,29 @@ def test_powershell_parameters_are_read_from_a_table(tmp_path, args):
 
 
 @pytest.mark.parametrize(
+    "parameter",
+    [
+        # Shorter than pwsh 7's own minimum prefix: pwsh reads the word as the script path.
+        ["-con", "x"],
+        ["-set", "x"],
+        ["-cu", "x"],
+        ["-ss"],
+        ["-commandw", "x"],
+        # pwsh 7 stops at -Version, and only Windows PowerShell 5.1 reads -PSConsoleFile.
+        ["-v", "x"],
+        ["-ps", "x"],
+        ["-PSConsoleFile", "x"],
+        # A session configuration or settings file can run code before the command.
+        ["-SettingsFile", "x"],
+        ["-config", "x"],
+        ["-ConfigurationFile", "x"],
+    ],
+)
+def test_powershell_parameters_use_pwsh_minimum_prefixes(tmp_path, parameter):
+    unknown_reason(tmp_path, {"command": "pwsh", "args": [*parameter, "-c", "npx -y t@1.2.3"]})
+
+
+@pytest.mark.parametrize(
     "args,executable,relocated",
     [
         (["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "server.ps1"], "pwsh", False),
@@ -1322,10 +1345,17 @@ def test_powershell_parameters_are_read_from_a_table(tmp_path, args):
         (["-NoLogo", "-NonInteractive", "-Command", "Write-Output", "1"], "write-output", False),
         (["-WorkingDirectory", "./sub", "-f", "server.ps1"], "pwsh", True),
         (["-Work", "./sub", "-c", "Write-Output", "1"], "write-output", True),
+        (["--NoProfile", "-c", "Write-Output", "1"], "write-output", False),
+        (["-CustomPipeName", "p", "-c", "Write-Output", "1"], "write-output", False),
+        (["-cus", "p", "-in", "-c", "Write-Output", "1"], None, False),
     ],
 )
 def test_powershell_parameters_from_the_table_still_unwrap(args, executable, relocated):
     launch = analyze("pwsh", args)
+    if executable is None:
+        # -in is -Interactive to pwsh 7 but a prefix of -InputFormat, which takes a value.
+        assert launch.unknown is not None
+        return
     assert launch.unknown is None
     assert (launch.executable, launch.relocated) == (executable, relocated)
 
@@ -1395,6 +1425,22 @@ def test_deno_task_eval_is_a_task_shell_command_line(tmp_path):
     assert analyze("deno", ["task", "start"]).unknown is None
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["task", "--eval", "node", "--eval", "x=1"],
+        # After the task word, --eval is the launched program's, not deno's.
+        ["task", "build", "node", "--eval", "x"],
+        ["task", "-c", "deno.json", "build", "node", "--eval", "x"],
+        ["task", "--cwd", ".", "build", "tsx", "--eval", "x"],
+        ["task", "build", "node", "--eval", "x", "--"],
+    ],
+)
+def test_deno_task_keeps_the_task_program_eval(tmp_path, args):
+    detail = unknown_reason(tmp_path, {"command": "deno", "args": args})
+    assert "inline" in detail
+
+
 IMAGE = "img@sha256:" + "a" * 64
 
 
@@ -1410,6 +1456,14 @@ IMAGE = "img@sha256:" + "a" * 64
         ),
         (["-v", "/proc/1/root/proc/1/root:/host"], "host_root_mount"),
         (["-v", "./${env:X}:/usr/local/bin"], "code_loading_option"),
+        (["-v", "/${/..:/host}"], "host_root_mount"),
+        (["-v", "/var/run/${/../docker.sock:/var/run/docker.sock}"], "runtime_socket_mount"),
+        # The engine cuts an unexpanded client variable at its colon; an expanded one may
+        # be empty, so a following ".." climbs past it.
+        (["-v", "/root/.ssh/${env:/k}"], "broad_host_mount"),
+        (["-v", "/${env:/host}"], "host_mounts"),
+        (["--volume=/${input:/host}"], "host_mounts"),
+        (["-v", "/${env:/x}/..:/host"], "host_root_mount"),
         (["--pid=ns:/proc/1/ns/pid"], "host_namespaces"),
         (["--network", "ns:/proc/1/ns/net"], "host_namespaces"),
         (["--env-merge", "LD_PRELOAD=/x.so"], "code_loading_environment"),

@@ -27,7 +27,7 @@ import re
 import shlex
 from array import array
 from bisect import bisect_left
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from pathlib import Path
@@ -2074,6 +2074,21 @@ def _runner_environment(
     return sources, reasons
 
 
+class _Launched(frozenset[str]):
+    """A server's launched package names, with their npm scopes computed once."""
+
+    scopes: frozenset[str]
+
+    def __new__(cls, names: Iterable[str]) -> _Launched:
+        launched = super().__new__(cls, names)
+        launched.scopes = frozenset(name.partition("/")[0] for name in launched if "/" in name)
+        return launched
+
+    @classmethod
+    def of(cls, names: Iterable[str]) -> _Launched:
+        return names if isinstance(names, _Launched) else cls(names)
+
+
 def _setting_name(key: str, launched: Iterable[str], *, selected: bool = False) -> str:
     """A resolver setting name safe to export; a name from no vocabulary is ``[other]``.
 
@@ -2089,7 +2104,7 @@ def _setting_name(key: str, launched: Iterable[str], *, selected: bool = False) 
         _SCOPED_REGISTRY.fullmatch(key)
         and _NPM_SCOPE.fullmatch(scope)
         and not TOKEN_SHAPE.search(scope)
-        and (selected or any(name.startswith(f"{scope}/") for name in launched))
+        and (selected or scope in _Launched.of(launched).scopes)
     ):
         return f"{scope}:{rest}"
     if key.startswith("sources.") and key[8:] in launched:
@@ -2153,7 +2168,7 @@ def _yarnrc(text: str) -> tuple[tuple[str, str], ...]:
     return tuple(settings.items())
 
 
-def _file_setting(path: str, family: str, key: str, value: str, launched: set[str]) -> str:
+def _file_setting(path: str, family: str, key: str, value: str, launched: Collection[str]) -> str:
     """What a project resolver file setting does: identity, code, source or inert.
 
     Registry entries are inert here; they apply per package scope.
@@ -3526,7 +3541,7 @@ class MCPScanner(Scanner):
         runner_sources: list[tuple[str, str]],
     ) -> list[str]:
         """Exported sources that redirect package resolution: label and origin only."""
-        launched = {str(package.name) for package in launch.packages if package.registry}
+        launched = _Launched(str(package.name) for package in launch.packages if package.registry)
         found: list[tuple[str, str]] = [
             (_option_label(option, launched), value) for option, value in launch.sources
         ]
@@ -3585,7 +3600,7 @@ class MCPScanner(Scanner):
             # Variables from an environment file or secret store may redirect or
             # replace what the runner fetches; their names are not visible here.
             view.unresolved.append("environment-file")
-        launched = {str(package.name) for package in packages}
+        launched = _Launched(str(package.name) for package in packages)
         # The label and value of a `scope` from the environment, which wins over .npmrc.
         environment_scope: tuple[str, str] | None = None
         if family == "npm":
