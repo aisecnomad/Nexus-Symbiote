@@ -766,10 +766,12 @@ def test_a_pinned_clock_does_not_revive_an_expired_suppression(tmp_path):
     """SOURCE_DATE_EPOCH, often a commit time an author chooses, never moves a gate's clock."""
     before_expiry = "1748736000"  # 2025-06-01, before the suppression expired on 2026-01-01
     active = _project_with_suppressed_pickle(tmp_path / "active", "2999-12-31")
-    passed = _invoke("scan", str(active), "--check", epoch=before_expiry)
+    passed = _invoke("scan", str(active), "--check", "--accept-project-policy", epoch=before_expiry)
     assert passed.exit_code == 0, passed.output
     expired = _project_with_suppressed_pickle(tmp_path / "expired", "2026-01-01")
-    failed = _invoke("scan", str(expired), "--check", epoch=before_expiry)
+    failed = _invoke(
+        "scan", str(expired), "--check", "--accept-project-policy", epoch=before_expiry
+    )
     assert failed.exit_code == 1
     assert "expired on 2026-01-01" in failed.stderr
 

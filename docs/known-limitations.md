@@ -1936,14 +1936,17 @@ is a failure; everything below is neither a gap nor a failure.
   although nothing about its MCP servers was verified. Without a signer policy,
   passing integrity shows only that the inventory matches the checkout. The
   [roadmap](../ROADMAP.md#plan) tracks the change (N12).
-- **A project policy can weaken its own gate.** `scan`, and `validate` and `risk`
-  with `--project`, apply the checkout's `.nexus-symbiote.yaml`, including
-  suppressions, ignored categories and raised thresholds. Each relaxation is listed
-  in `policy_weakened`, in the inventory's metadata and in `risk --json-output`, and
-  printed as a warning. When a CI variable such as `CI` or `GITHUB_ACTIONS` is set, a
-  policy that weakens a gate fails the command unless `--no-project-policy` ignores it
-  or `--accept-project-policy` accepts it explicitly; interactive runs only warn. There
-  is no operator-owned policy file. See
+- **A project policy is not applied unless the operator accepts it.** `scan`, and
+  `validate` and `risk` with `--project`, read `.nexus-symbiote.yaml` only when
+  `--accept-project-policy` is passed. Without that flag the built-in policy is used,
+  and if a policy file is present the command warns and names `--accept-project-policy`
+  and `--no-project-policy`. `--no-project-policy` selects the built-in policy and does
+  not warn. A CI variable is not a reason to apply the file or to refuse it: an
+  unattended run that forgets the flag keeps the built-in gates, including a stricter
+  checkout policy. When the file is accepted, each relaxation is listed in
+  `policy_weakened`, in the inventory's metadata and in `risk --json-output`, and
+  printed as a warning. The Action and the pre-commit hooks pass `--no-project-policy`.
+  There is no operator-owned policy file other than `--operator-policy`. See
   [what `policy_weakened` reports](policy-reference.md#what-policy_weakened-reports).
 - **A suppressed chat template finding is bound to the model file.** A suppression
   names the [fingerprint](policy-reference.md#suppressions) of the finding, which

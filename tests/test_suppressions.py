@@ -36,7 +36,15 @@ def _ref(doc: dict, name: str) -> str:
 
 
 def _risk(inventory: Path, project: Path, *extra: str) -> dict:
-    args = ["risk", str(inventory), "--project", str(project), "--json-output", *extra]
+    args = [
+        "risk",
+        str(inventory),
+        "--project",
+        str(project),
+        "--accept-project-policy",
+        "--json-output",
+        *extra,
+    ]
     return json.loads(CliRunner().invoke(main, args).stdout)
 
 
@@ -70,7 +78,14 @@ def test_a_suppression_accepts_one_component_while_the_same_category_still_fails
     fixture = _ref(doc, "firmware.pkl")
     fingerprint = _fingerprint(inventory, project, fixture, "serialization_format")
     (project / ".nexus-symbiote.yaml").write_text(_suppression(fixture, fingerprint))
-    args = ["risk", str(inventory), "--project", str(project), "--json-output"]
+    args = [
+        "risk",
+        str(inventory),
+        "--project",
+        str(project),
+        "--accept-project-policy",
+        "--json-output",
+    ]
     result = CliRunner().invoke(main, args)
     payload = json.loads(result.stdout)
     assert result.exit_code == 1
@@ -100,7 +115,14 @@ def test_an_expired_suppression_no_longer_suppresses_and_fails_the_gate(tmp_path
     (project / ".nexus-symbiote.yaml").write_text(
         _suppression(fixture, fingerprint, expires="2026-01-01")
     )
-    args = ["risk", str(inventory), "--project", str(project), "--json-output"]
+    args = [
+        "risk",
+        str(inventory),
+        "--project",
+        str(project),
+        "--accept-project-policy",
+        "--json-output",
+    ]
     payload = json.loads(CliRunner().invoke(main, args).stdout)
     assert payload["suppressed_findings"] == []
     assert any(f["component_ref"] == fixture for f in payload["findings"])
@@ -254,7 +276,17 @@ def test_scan_records_the_governing_policy_and_its_relaxations(tmp_path):
         _suppression(_ref(doc, "firmware.pkl"), FINGERPRINT)
     )
     inventory = tmp_path / "governed.json"
-    result = CliRunner().invoke(main, ["scan", str(project), "--report-only", "-o", str(inventory)])
+    result = CliRunner().invoke(
+        main,
+        [
+            "scan",
+            str(project),
+            "--report-only",
+            "--accept-project-policy",
+            "-o",
+            str(inventory),
+        ],
+    )
     assert result.exit_code == 0, result.output
     metadata = json.loads(inventory.read_text())["metadata"]
     assert metadata["policy_source"] == "project:.nexus-symbiote.yaml"
@@ -296,7 +328,10 @@ def test_a_suppression_stops_when_the_accepted_finding_grows(tmp_path):
     assert stale["fingerprint"] == reviewed
     assert stale["current_fingerprints"] == [finding["fingerprint"]]
     assert grown["suppressions_unused"] == [] and grown["policy_weakened"] == weakened
-    text = CliRunner().invoke(main, ["risk", str(inventory), "--project", str(project)])
+    text = CliRunner().invoke(
+        main,
+        ["risk", str(inventory), "--project", str(project), "--accept-project-policy"],
+    )
     assert text.exit_code == 1
     assert f"    fingerprint: {finding['fingerprint']}" in text.stdout.splitlines()
     assert (
@@ -378,7 +413,9 @@ def test_a_suppression_on_a_withheld_import_stops_when_its_content_changes(
     (stale,) = changed["suppressions_stale"]
     assert stale["fingerprint"] == reviewed
     assert (finding["fingerprint"] != reviewed) is keyed
-    run = CliRunner().invoke(main, ["risk", str(inventory), "--project", str(project)])
+    run = CliRunner().invoke(
+        main, ["risk", str(inventory), "--project", str(project), "--accept-project-policy"]
+    )
     assert run.exit_code == 1
 
 

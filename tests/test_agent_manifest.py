@@ -223,7 +223,10 @@ def test_operator_exclusions_bind_manifest_declared_files(tmp_path):
     (project / "agent.yaml").write_text("name: x\ninstructions: [secrets/service.env]\n")
     (project / ".nexus-symbiote.yaml").write_text("scan: {exclude_paths: [secrets]}\n")
     output = tmp_path / "bom.json"
-    result = CliRunner().invoke(main, ["scan", str(project), "--report-only", "-o", str(output)])
+    result = CliRunner().invoke(
+        main,
+        ["scan", str(project), "--report-only", "--accept-project-policy", "-o", str(output)],
+    )
     assert result.exit_code == 0, result.output
     bom = json.loads(output.read_text())
     assert not _components(bom, "prompt-template")

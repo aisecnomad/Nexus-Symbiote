@@ -33,6 +33,10 @@ class PolicyError(ValueError):
     """An existing policy cannot be interpreted without weakening its meaning."""
 
 
+class PolicyListingError(PolicyError):
+    """The project root could not be fully listed to locate its policy."""
+
+
 class PolicySection(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
@@ -203,13 +207,15 @@ def find_policy_path(project_root: Path) -> Path | None:
         with os.scandir(current) as stream:
             for item in stream:
                 if len(entries) >= entry_bound.value:
-                    raise PolicyError(f"project root {current}: {entry_bound.exceeded()}")
+                    raise PolicyListingError(f"project root {current}: {entry_bound.exceeded()}")
                 entries.append(item.name)
     except (FileNotFoundError, NotADirectoryError):
         return None
     except OSError as exc:
         # A directory that cannot be listed may hold a policy, so it is not "no policy".
-        raise PolicyError(f"project root {current} cannot be listed: {exc.strerror}") from None
+        raise PolicyListingError(
+            f"project root {current} cannot be listed: {exc.strerror}"
+        ) from None
     folded_targets = {fold_name(name): name for name in POLICY_FILE_NAMES}
     found: list[Path] = []
     variants: list[tuple[str, str]] = []

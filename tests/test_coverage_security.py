@@ -50,10 +50,18 @@ def test_component_collision_is_rejected_on_add_and_import():
 
 
 def test_policy_with_typo_or_invalid_yaml_does_not_fall_back(tmp_path):
-    output = tmp_path / "bom.json"
     (tmp_path / ".nexus-symbiote.yaml").write_text("scan:\n  scaners: [mcp]\n")
-    result = CliRunner().invoke(main, ["scan", str(tmp_path), "-o", str(output)])
+    ignored = tmp_path / "ignored.json"
+    warned = CliRunner().invoke(main, ["scan", str(tmp_path), "--report-only", "-o", str(ignored)])
+    assert "was not applied" in warned.output
+    assert "--accept-project-policy" in warned.output
+    assert ignored.is_file()
+    output = tmp_path / "bom.json"
+    result = CliRunner().invoke(
+        main, ["scan", str(tmp_path), "--accept-project-policy", "-o", str(output)]
+    )
     assert result.exit_code != 0
+    assert "invalid policy" in result.output
     assert not output.exists()
 
 

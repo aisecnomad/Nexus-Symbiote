@@ -253,6 +253,7 @@ def test_signed_operator_policy_clamps_checkout_weakening_and_records_provenance
             str(att_path),
             "--operator-policy-key",
             str(pub_path),
+            "--accept-project-policy",
         ],
     )
     assert check_res.exit_code == EXIT_GATE_FAILED, check_res.output
@@ -271,6 +272,7 @@ def test_signed_operator_policy_clamps_checkout_weakening_and_records_provenance
             str(att_path),
             "--operator-policy-key",
             str(pub_path),
+            "--accept-project-policy",
             "-f",
             "sarif",
             "-o",
@@ -298,6 +300,7 @@ def test_signed_operator_policy_clamps_checkout_weakening_and_records_provenance
             str(att_path),
             "--operator-policy-key",
             str(pub_path),
+            "--accept-project-policy",
             "-o",
             str(bom_out),
         ],
@@ -317,6 +320,7 @@ def test_signed_operator_policy_clamps_checkout_weakening_and_records_provenance
             str(att_path),
             "--operator-policy-key",
             str(pub_path),
+            "--accept-project-policy",
             "--report-format",
             "json",
             "--detailed-exit-codes",

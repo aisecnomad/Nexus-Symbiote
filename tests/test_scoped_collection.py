@@ -152,7 +152,8 @@ def test_repository_baseline_refuses_actual_collection_gaps(tmp_path, gap):
         (root / "hidden/weights.pkl").write_bytes(b"unexamined")
     report.write_text(json.dumps(raw))
     observed = tmp_path / "observed.json"
-    result = runner.invoke(main, ["scan", str(root), "--report-only", "-o", str(observed)])
+    accept = ["--accept-project-policy"] if gap == "custom-exclusion" else []
+    result = runner.invoke(main, ["scan", str(root), "--report-only", "-o", str(observed), *accept])
     assert result.exit_code == 0, result.output
     bom = AIBOM.load(observed)
     claim = bom.metadata.completeness
@@ -180,6 +181,6 @@ def test_repository_baseline_refuses_actual_collection_gaps(tmp_path, gap):
         assert claim.source_report_status == "complete"
         assert not claim.scan_failures
     destination = tmp_path / "baseline.json"
-    result = runner.invoke(main, ["baseline", str(root), "-o", str(destination)])
+    result = runner.invoke(main, ["baseline", str(root), "-o", str(destination), *accept])
     assert result.exit_code == 1, result.output
     assert not destination.exists()

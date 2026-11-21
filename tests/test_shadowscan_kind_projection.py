@@ -767,7 +767,10 @@ def test_a_critical_agent_config_rating_closes_the_risk_gate_unless_its_category
     (root / ".nexus-symbiote.yaml").write_text(
         'version: "1.0"\nrisk:\n  ignore_categories: ["shadowscan-heuristic"]\n', encoding="utf-8"
     )
-    ignored = runner.invoke(main, ["scan", str(root), "-o", str(tmp_path / "ignored.json")])
+    ignored = runner.invoke(
+        main,
+        ["scan", str(root), "--accept-project-policy", "-o", str(tmp_path / "ignored.json")],
+    )
     assert ignored.exit_code == 0, ignored.output
 
 

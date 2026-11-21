@@ -339,9 +339,9 @@ def register_supply_chain_commands(main: click.Group) -> None:
         "--accept-project-policy",
         is_flag=True,
         help=(
-            "In CI, accept a project policy that weakens the built-in gates explicitly for "
-            "collection, as scan does; the staged inventory is still re-gated by the built-in "
-            "policy."
+            "Apply the checkout's project policy for collection, as scan does. Without this "
+            "flag the built-in policy is used. The staged inventory is still re-gated by "
+            "the built-in policy."
         ),
     )
     @click.option(
@@ -441,8 +441,13 @@ def register_supply_chain_commands(main: click.Group) -> None:
                 raise click.ClickException("Baseline was not written: static scan gate failed")
             resolved_root = Path(project_path).resolve()
             try:
-                loaded_policy = None if no_project_policy else load_policy_file(resolved_root)
-                active_policy = loaded_policy[0] if loaded_policy is not None else default_policy()
+                if no_project_policy or not accept_project_policy:
+                    active_policy = default_policy()
+                else:
+                    loaded_policy = load_policy_file(resolved_root)
+                    active_policy = (
+                        loaded_policy[0] if loaded_policy is not None else default_policy()
+                    )
                 sig_policies = (
                     load_signature_policies(signature_policy, project_root=resolved_root)
                     if signature_policy is not None
