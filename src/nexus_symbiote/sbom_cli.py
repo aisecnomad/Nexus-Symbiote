@@ -128,6 +128,20 @@ def import_sbom_cmd(
     _validate_io(output, root, foreign_bom_path, into_bom)
     base_bom = _load_native(into_bom) if into_bom is not None else None
     pre_refs = {c.bom_ref for c in base_bom.components} if base_bom is not None else None
+    all_failures: list[str] = []
+    nested_count = 0
+    if walk_manifests and root is not None:
+        nested_items, manifest_failures = _imp.walk_nested_manifests(root)
+        all_failures.extend(manifest_failures)
+        if base_bom is None:
+            base_bom = _aibom.AIBOM()
+        existing_refs = {c.bom_ref for c in base_bom.components}
+        for comp in nested_items:
+            if comp.bom_ref not in existing_refs:
+                base_bom.components.append(comp)
+                existing_refs.add(comp.bom_ref)
+                nested_count += 1
+
     try:
         summary = _imp.import_foreign_sbom(
             foreign_bom_path, target_aibom=base_bom, project_root=root, reveal_names=reveal_names
@@ -139,16 +153,8 @@ def import_sbom_cmd(
         )
         raise click.ClickException(f"Cannot safely import foreign SBOM: {detail}") from exc
 
-    bom, all_failures, nested_count = summary.aibom, list(summary.scan_failures), 0
-    if walk_manifests and root is not None:
-        nested_items, manifest_failures = _imp.walk_nested_manifests(root)
-        all_failures.extend(manifest_failures)
-        existing_refs = {c.bom_ref for c in bom.components}
-        for comp in nested_items:
-            if comp.bom_ref not in existing_refs:
-                bom.components.append(comp)
-                existing_refs.add(comp.bom_ref)
-                nested_count += 1
+    bom = summary.aibom
+    all_failures.extend(summary.scan_failures)
 
     shapes_payload: list[dict[str, Any]] = []
     if census and root is not None:
@@ -181,6 +187,7 @@ def import_sbom_cmd(
             "imported_count": summary.imported_count,
             "bound_local_count": summary.bound_local_count,
             "conflict_count": summary.conflict_count,
+            "unresolved_conflict_count": summary.unresolved_conflict_count,
             "nested_manifest_components": nested_count,
             "scan_failure_count": len(all_failures),
             "unread_shapes": shapes_payload,
