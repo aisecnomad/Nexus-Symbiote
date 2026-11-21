@@ -1005,17 +1005,19 @@ SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
 @pytest.mark.parametrize(
-    "pyproject",
+    "uv_settings",
     [
-        '[project]\ndependencies = ["openai>=1"]\n'
         '[tool.uv.sources]\nopenai = { git = "https://git.example/openai-python" }\n',
-        '[project]\ndependencies = ["openai>=1"]\n'
         '[tool.uv]\noverride-dependencies = ["openai @ https://evil.example/o.whl"]\n',
     ],
     ids=["uv-source", "uv-override"],
 )
-def test_a_lock_record_names_no_pypi_identity_for_an_untranslated_declaration(tmp_path, pyproject):
-    (tmp_path / "pyproject.toml").write_text(pyproject)
+def test_a_lock_record_names_no_pypi_identity_for_an_untranslated_declaration(
+    tmp_path, uv_settings
+):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["openai>=1"]\n' + uv_settings
+    )
     (tmp_path / "uv.lock").write_text(_uv_lock(PYPI_SOURCE))
     result = RegistryScanner().scan(tmp_path)
     (comp,) = result.components
