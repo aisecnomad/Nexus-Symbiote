@@ -268,6 +268,12 @@ def load_policy_file(project_root: Path) -> tuple[Policy, Path, str] | None:
     return policy, path, digest
 
 
+def resolved_project_policy(project_root: Path) -> tuple[Policy, Path | None]:
+    """Return the governing checkout policy, or the built-in default without a source path."""
+    loaded = load_policy_file(project_root)
+    return (default_policy(), None) if loaded is None else (loaded[0], loaded[1])
+
+
 def load_policy(project_root: Path) -> Policy | None:
     loaded = load_policy_file(project_root)
     return None if loaded is None else loaded[0]
@@ -288,6 +294,11 @@ def nearest_policy_file(start: Path) -> Path | None:
             except OSError:
                 continue
     return None
+
+
+def additional_exclusions(scan: ScanPolicy) -> list[str]:
+    """Project exclusions that can narrow collection beyond the built-in exclusions."""
+    return [path for path in scan.exclude_paths if path not in _ALWAYS_EXCLUDED_NAMES]
 
 
 def weakened_settings(policy: Policy) -> list[str]:
@@ -317,7 +328,7 @@ def weakened_settings(policy: Policy) -> list[str]:
         weaker.append("scan.failure_mode=report-only")
     if set(policy.scan.scanners) < set(base.scan.scanners):
         weaker.append("scan.scanners=" + ",".join(policy.scan.scanners))
-    extra = [path for path in policy.scan.exclude_paths if path not in _ALWAYS_EXCLUDED_NAMES]
+    extra = additional_exclusions(policy.scan)
     if extra:
         weaker.append("scan.exclude_paths=" + ",".join(extra))
     if policy.output.default_format != base.output.default_format:

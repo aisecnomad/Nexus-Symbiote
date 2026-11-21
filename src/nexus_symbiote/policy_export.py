@@ -27,11 +27,9 @@ from nexus_symbiote.core.models import MCPServerComponent, ModelComponent, ToolC
 from nexus_symbiote.graph import validate_graph
 from nexus_symbiote.policy import (
     PolicyError,
-    default_policy,
-    gate_weakenings,
-    load_policy,
+    additional_exclusions,
+    resolved_project_policy,
     running_in_ci,
-    weakened_settings,
 )
 from nexus_symbiote.runtime import key_id
 from nexus_symbiote.runtime_cli import (
@@ -192,10 +190,12 @@ def corroborate_against_project(
     require_binding_key()
     sig_policies = load_signer_policies(signature_policy, root)
     try:
-        policy = load_policy(root) or default_policy()
+        policy, _ = resolved_project_policy(root)
     except PolicyError as exc:
-        raise click.ClickException("could not load validation settings for --project") from exc
-    if running_in_ci() and gate_weakenings(weakened_settings(policy)):
+        raise click.ClickException(
+            neutralize(f"could not load validation settings for --project: {exc}")
+        ) from exc
+    if running_in_ci() and additional_exclusions(policy.scan):
         raise click.ClickException("the project policy weakens the built-in gates in CI")
     excluded = policy.scan.exclude_paths
     c_report = CompletenessValidator().validate_against_project(
