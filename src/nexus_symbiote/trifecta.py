@@ -4,7 +4,7 @@ Evaluates an AgentBOM offline for three structural agentic risks:
 
 1. **Lethal trifecta (Item 15):** an agent scope combining untrusted input, private
    data access, and external egress or state mutation without an explicit approval gate
-   is rated ``critical``. The CLI treats declared approvals as uncorroborated.
+   is rated ``critical``. Complete declared approval coverage lowers it to ``high``.
 2. **Chained toxic flows (Item 24):** a leak or state-mutation chain possible only by
    combining two distinct components (source + sink) produces one ``toxic_flow`` finding
    naming both components rather than treating each in isolation as clean.
@@ -813,10 +813,12 @@ def _own_reach(sig: _ComponentSignals) -> _Reach:
         tags.append("untrusted")
     if sig.private_basis:
         tags.extend(("private", "source") if chained else ("private",))
-    # "egress" holds what an ungated owner leaves open; "forced" what even a gated owner
-    # does, because the component itself opts out of approval.
-    if sig.egress_basis and not sig.explicitly_gated:
+    # Keep every egress for reporting unverified declarations. Track uncovered
+    # egress separately so the display cap cannot hide a single open path.
+    if sig.egress_basis:
         tags.extend(("egress", "sink") if chained else ("egress",))
+        if not sig.explicitly_gated:
+            tags.extend(("egress_open", "sink_open") if chained else ("egress_open",))
         if sig.explicitly_ungated:
             tags.extend(("egress_forced", "sink_forced") if chained else ("egress_forced",))
     if isinstance(comp, IDEAgentComponent) and sig.explicitly_ungated:
@@ -848,6 +850,7 @@ def _summarize(refs: Iterable[str], own: dict[str, _Reach]) -> _Reach:
 def _scopes(
     bom: AIBOM,
     signals: dict[str, _ComponentSignals],
+    assume_declared_approvals: bool,
 ) -> list[tuple[str, bool, _Reach]]:
     """Compute evaluation scopes in O(V + E) time using SCC condensation.
 
@@ -994,12 +997,13 @@ def _scopes(
         unbound.difference_update(surface)
     pool = _summarize(unbound, own)
 
+    scope_legs = {"untrusted", "private", "egress_open"} if assume_declared_approvals else _LEGS
     result: list[tuple[str, bool, _Reach]] = []
     for scc_id in selected_sccs:
         scope = dict(reach[scc_id])
         if scc_id in inherits:
             _merge(scope, workspace)
-        if _LEGS & scope.keys():
+        if scope_legs & scope.keys():
             _merge(scope, pool)
         result.append((scc_agents[scc_id][0].bom_ref, scc_gated[scc_id], scope))
     if unbound:
@@ -1081,6 +1085,7 @@ def _scope_findings(
     owner_gated: bool,
     reach: _Reach,
     signals: dict[str, _ComponentSignals],
+    assume_declared_approvals: bool,
 ) -> list[FlowFinding]:
     # Fail closed: an IDE agent that opts out of approval overrides an owner gate.
     gated_owner = owner_gated and "ungated_ide" not in reach
@@ -1098,7 +1103,9 @@ def _scope_findings(
                     sig.untrusted_basis if tag == "untrusted" else basis,
                     sig.locator,
                     comp.assurance_level,
-                    (gated_owner or sig.explicitly_gated) and not sig.explicitly_ungated,
+                    assume_declared_approvals
+                    and (gated_owner or sig.explicitly_gated)
+                    and not sig.explicitly_ungated,
                 )
             )
         return found
@@ -1106,26 +1113,33 @@ def _scope_findings(
     findings: list[FlowFinding] = []
     untrusted = items("untrusted")
     private = items("private")
-    ungated_egress = items("egress_forced" if gated_owner else "egress")
-    if untrusted and private and ungated_egress:
-        involved = sorted({i.component_ref for i in (*untrusted, *private, *ungated_egress)})
-        capped = EVIDENCE_LIMIT in (len(untrusted), len(private), len(ungated_egress))
+    open_egress = items("egress_forced" if gated_owner else "egress_open")
+    egress = open_egress
+    if not egress and not assume_declared_approvals:
+        egress = items("egress")
+    if untrusted and private and egress:
+        involved = sorted({i.component_ref for i in (*untrusted, *private, *egress)})
+        capped = EVIDENCE_LIMIT in (len(untrusted), len(private), len(egress))
         findings.append(
             FlowFinding(
                 kind="lethal_trifecta",
-                severity=RiskSeverity.CRITICAL,
+                severity=RiskSeverity.CRITICAL if open_egress else RiskSeverity.HIGH,
                 scope_ref=scope_ref,
                 summary=(
                     f"Scope '{scope_ref}' combines untrusted input, private data access, "
-                    "and ungated external egress/state mutation across "
-                    f"{'at least ' if capped else ''}{len(involved)} "
-                    "component(s) without an approval gate."
+                    "and external egress/state mutation across "
+                    f"{'at least ' if capped else ''}{len(involved)} component(s). "
+                    + (
+                        "At least one egress has no applicable declared approval gate."
+                        if open_egress
+                        else "A human-approval declaration covers every egress. Runtime enforcement is unverified."
+                    )
                 ),
                 component_refs=tuple(involved),
                 evidence=(
                     *(_evidence_entry("untrusted_input", i) for i in untrusted),
                     *(_evidence_entry("private_data", i) for i in private),
-                    *(_evidence_entry("egress", i) for i in ungated_egress),
+                    *(_evidence_entry("egress", i) for i in egress),
                 ),
                 recommendation=(
                     "Break at least one leg of the trifecta or enforce an explicit "
@@ -1138,7 +1152,10 @@ def _scope_findings(
     # Item 24: Chained toxic flow across two distinct components where neither alone
     # is EXFIL_CAPABLE (linear time without materializing Cartesian pairs).
     chained_sources = items("source")
-    chained_sinks = items("sink_forced" if gated_owner else "sink")
+    sink_tag = "sink"
+    if assume_declared_approvals:
+        sink_tag = "sink_forced" if gated_owner else "sink_open"
+    chained_sinks = items(sink_tag)
     source_refs = {src.component_ref for src in chained_sources}
     sink_refs = {snk.component_ref for snk in chained_sinks}
     active_sources = [
@@ -1159,7 +1176,7 @@ def _scope_findings(
                     f"Scope '{scope_ref}' enables a chained toxic flow across "
                     f"{'at least ' if capped else ''}{len(pair_refs)} distinct components "
                     f"({', '.join(pair_refs)}) where "
-                    "private data from one component can leave through an ungated sink."
+                    "private data from one component can leave through a sink with unverified approval enforcement."
                 ),
                 component_refs=pair_refs,
                 evidence=(
@@ -1195,15 +1212,16 @@ def analyze_trifecta(
             untrusted_basis=_untrusted_input_basis(comp, rc),
             private_basis=_private_data_basis(comp, rc),
             egress_basis=_egress_basis(comp, rc),
-            explicitly_gated=assume_declared_approvals
-            and _has_explicit_approval_gate(comp, moment),
+            explicitly_gated=_has_explicit_approval_gate(comp, moment),
             explicitly_ungated=_is_explicitly_ungated(comp),
         )
 
-    scopes = _scopes(bom, signals)
+    scopes = _scopes(bom, signals, assume_declared_approvals)
     findings: list[FlowFinding] = []
     for scope_ref, owner_gated, reach in scopes:
-        findings.extend(_scope_findings(scope_ref, owner_gated, reach, signals))
+        findings.extend(
+            _scope_findings(scope_ref, owner_gated, reach, signals, assume_declared_approvals)
+        )
 
     shadow_findings, shadowed_refs = _detect_shadowing(bom)
     findings.extend(shadow_findings)

@@ -1214,7 +1214,7 @@ kept.
 
 ### `trifecta`
 
-Analyze an inventory offline for lethal trifectas, chained toxic flows, and tool shadowing. Approval declarations in the inventory do not suppress CLI findings. The Python API can explicitly assume those declarations when modeling a proposed design.
+Analyze an inventory offline for lethal trifectas, chained toxic flows, and tool shadowing. A trifecta is high when applicable human-approval declarations cover every egress in its scope. It stays critical if any egress lacks coverage. The high finding reports that enforcement is unverified. Use `--fail-on-finding` to gate on it. The Python API can explicitly assume those declarations when modeling a proposed design.
 
 ```text
 nexus-symbiote trifecta [OPTIONS] AIBOM_PATH
