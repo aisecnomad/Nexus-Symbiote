@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
 import pickle
 import random
@@ -557,6 +559,28 @@ def test_a_locator_naming_no_held_record_does_not_hide_the_classic_directory(
     for relative in relatives:
         (tmp_path / relative).write_bytes(archive)
         assert inspect_model_format(tmp_path / relative) == expected, relative
+
+
+# The second review's reproducer of the gate bypass, as found: two stored members, the
+# second model/data.pkl, and that entry's comment shaped like a ZIP64 locator at offset 0.
+_DECOY_LOCATOR_288 = base64.b64decode(
+    "UEsDBBQAAAAAAAAAAAB9DhbaAwAAAAMAAAARAAAAa2VyYXNfbWV0YWRhdGEucGJvawpQSwMEFAAAAAAAAAAAAG2k"
+    "rIcdAAAAHQAAAA4AAABtb2RlbC9kYXRhLnBrbGNfX2J1aWx0aW5fXwpldmFsCihTJzErMScKdFIuUEsBAhQAFAAA"
+    "AAAAAAAAAH0OFtoDAAAAAwAAABEAAAAAAAAAAAAAAAAAAAAAAGtlcmFzX21ldGFkYXRhLnBiUEsBAhQAFAAAAAAA"
+    "AAAAAG2krIcdAAAAHQAAAA4AAAAUAAAAAAAAAAAAMgAAAG1vZGVsL2RhdGEucGtsUEsGBwAAAAAAAAAAAAAAAAEA"
+    "AABQSwUGAAAAAAIAAgCPAAAAewAAAAAA"
+)
+
+
+@pytest.mark.parametrize("name", ["m.keras", "m.npz", "m.onnx", "m.pt"])
+def test_the_reported_decoy_locator_archive_is_critical(tmp_path: Path, name: str) -> None:
+    assert hashlib.sha256(_DECOY_LOCATOR_288).hexdigest() == (
+        "1f9a167fbc9e88fa10ffd3b23a94786fcd0c220dec9606325b46878de453acb5"
+    )
+    (tmp_path / name).write_bytes(_DECOY_LOCATOR_288)
+    assert inspect_model_format(tmp_path / name) == (UNSAFE, ZIP_PICKLE_MEMBER)
+    found = {c.source_path: c for c in ModelScanner().scan(tmp_path).components}
+    assert found[name].serialization_safety == UNSAFE
 
 
 def _cut_out(members: list[tuple[str, bytes]], prefix: int = 19) -> bytes:
