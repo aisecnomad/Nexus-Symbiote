@@ -499,3 +499,40 @@ def test_a_conflict_finding_neutralizes_the_declaration_locator() -> None:
 
     risk = _conflict_risk("version", "m", "agent\x1b[31m.yaml")
     assert "\x1b" not in risk.detail and "\x1b" not in risk.recommendation
+
+
+def test_declarations_link_to_both_observed_types_when_names_match(tmp_path: Path) -> None:
+    bom = _observed()
+    model = bom.get_component("model:m")
+    dataset = bom.get_component("dataset:d")
+    assert model is not None and dataset is not None
+    model.name = dataset.name = "validation"
+    (tmp_path / "agent.yaml").write_text(
+        'datasets:\n  - name: validation\n    version: "1.0"\n'
+        'models:\n  - name: validation\n    version: "2.0"\n'
+        "    training:\n      datasets: [validation]\n",
+        encoding="utf-8",
+    )
+    assert apply_agent_yaml_declarations(bom, tmp_path) == []
+    assert dataset.properties["declared_version"] == "1.0"
+    assert model.properties["declared_version"] == "2.0"
+    assert any(
+        edge.source_ref == model.bom_ref
+        and edge.target_ref == dataset.bom_ref
+        and edge.relationship == "trained-on"
+        for edge in bom.dependencies
+    )
+
+
+@pytest.mark.parametrize("value", ["[unknown]", "{value: unknown}"])
+def test_dataset_omits_non_string_pii_status(tmp_path: Path, value: str) -> None:
+    bom, notices = _declare(
+        tmp_path,
+        "datasets:\n  - name: tickets\n"
+        f"    sensitive_personal_information: {value}\n"
+        '    version: "1.0"\n',
+    )
+    dataset = bom.get_component("dataset:d")
+    assert dataset is not None and notices == []
+    assert dataset.properties["declared_version"] == "1.0"
+    assert "declared_sensitive_pii" not in dataset.properties

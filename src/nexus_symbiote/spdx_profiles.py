@@ -493,10 +493,11 @@ def apply_agent_yaml_declarations(
             ds_name = _clean_text(entry.get("name"), max_len=200)
             if not ds_name:
                 continue
-            holder = by_key.get((ComponentType.MODEL, ds_name))
-            if _type_conflict(holder, "dataset", locator, notices):
-                continue
             existing = by_key.get((ComponentType.DATA_SOURCE, ds_name))
+            if existing is None and _type_conflict(
+                by_key.get((ComponentType.MODEL, ds_name)), "dataset", locator, notices
+            ):
+                continue
             ds_ver = _clean_text(entry.get("version"), max_len=128)
             ds_sup = _clean_text(entry.get("supplier"), max_len=200) or owner
             ds_lic = clean_license_identifier(entry.get("license")) or default_license
@@ -560,7 +561,7 @@ def apply_agent_yaml_declarations(
             if ds_avail in _SPDX_AVAILABILITY_TYPES:
                 ds_comp.properties["declared_availability"] = ds_avail
                 _record_claim(ds_comp, "availability", locator)
-            if ds_pii in {"yes", "no", "noAssertion"}:
+            if isinstance(ds_pii, str) and ds_pii in {"yes", "no", "noAssertion"}:
                 ds_comp.properties["declared_sensitive_pii"] = ds_pii
                 _record_claim(ds_comp, "sensitive_personal_information", locator)
             ds_comp.properties["declaration_source_sha256"] = doc_digest
@@ -578,10 +579,11 @@ def apply_agent_yaml_declarations(
             m_name = _clean_text(entry.get("name"), max_len=200)
             if not m_name:
                 continue
-            holder = by_key.get((ComponentType.DATA_SOURCE, m_name))
-            if _type_conflict(holder, "model", locator, notices):
-                continue
             existing = by_key.get((ComponentType.MODEL, m_name))
+            if existing is None and _type_conflict(
+                by_key.get((ComponentType.DATA_SOURCE, m_name)), "model", locator, notices
+            ):
+                continue
             m_ver = _clean_text(entry.get("version"), max_len=128)
             m_sup = _clean_text(entry.get("supplier"), max_len=200) or owner
             m_lic = clean_license_identifier(entry.get("license")) or default_license
