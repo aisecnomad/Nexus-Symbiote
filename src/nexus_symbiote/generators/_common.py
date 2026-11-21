@@ -321,8 +321,13 @@ def document_properties(
     bom: AIBOM, target: str, native: dict[str, Any] | None = None
 ) -> list[dict[str, str]]:
     document = native_document(bom) if native is None else native
+    if _nested_deeper_than(document, MAX_NATIVE_NESTING):
+        raise ValueError("embedded native document is nested too deeply")
+    encoded = json_text(document)
+    if len(encoded.encode("utf-8")) > NATIVE_DOCUMENT_LIMIT:
+        raise ValueError("embedded native document exceeds the byte limit")
     return [
-        {"name": "nexus-symbiote:document", "value": json_text(document)},
+        {"name": "nexus-symbiote:document", "value": encoded},
         {"name": "nexus-symbiote:documentDigest", "value": content_digest(document)},
         {
             "name": "nexus-symbiote:lossReport",

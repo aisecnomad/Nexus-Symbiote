@@ -161,7 +161,12 @@ def test_an_export_embedding_a_too_deep_inventory_is_refused_as_a_native_file_is
     assert recover_native(embedded(MAX_NATIVE_NESTING))[0].components[0].name == "search"
     with pytest.raises(ValueError, match="embedded native document is nested too deeply"):
         recover_native(embedded(MAX_NATIVE_NESTING + 1))
-    deep = AIBOM.from_document(nested_document(MAX_NATIVE_NESTING + 1))
-    text = CycloneDXGenerator(projection_version=3).generate_json(deep)
+    accepted = AIBOM.from_document(nested_document(MAX_NATIVE_NESTING))
+    export = CycloneDXGenerator(projection_version=3).generate(accepted)
+    properties = export["metadata"]["properties"]
+    oversized = {prop["name"]: prop["value"] for prop in embedded(MAX_NATIVE_NESTING + 1)[:2]}
+    for prop in properties:
+        if prop["name"] in oversized:
+            prop["value"] = oversized[prop["name"]]
     with pytest.raises(ValueError, match="embedded native document is nested too deeply"):
-        recover_export(text)
+        recover_export(json.dumps(export))

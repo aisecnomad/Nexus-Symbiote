@@ -43,6 +43,7 @@ _PROGRAM_SUFFIXES = frozenset(
         ".tsx",
         ".rb",
         ".go",
+        ".co",
     }
 )
 # Directories named for what the files in them hold, such as `secrets/`. Only a whole
@@ -100,13 +101,19 @@ def link_gap(target: str | None) -> str | None:
 
 
 def withheld(files: ConfinedCollection, path: str, excluded: list[str]) -> bool:
-    """Whether ``credential_gap`` names the file at ``path``, recorded once in ``excluded``.
+    """Record credential-name refusals for RAG, guardrail and A2A inputs.
 
-    Checked before the read, so neither the file's values nor an unkeyed digest of its
-    bytes reach the inventory.
+    Known collector files use their own names. Colang files are program surfaces.
+    For a symlink, also check the resolved target's name and directory before reading.
     """
-    linked = None if credential_shaped(path) else files.in_root_target(path)
-    reason = credential_gap(path, None if linked is None else linked.as_posix())
+    relative = PurePosixPath(path)
+    reason: str | None
+    if relative.suffix.lower() != ".co" and credential_shaped(relative.name):
+        reason = "its name says it holds credentials"
+    else:
+        linked = files.in_root_target(path)
+        resolved = None if linked is None else linked.as_posix()
+        reason = None if resolved == relative.as_posix() else link_gap(resolved)
     if reason is None:
         return False
     message = f"{path}: {reason}; not read or inventoried"

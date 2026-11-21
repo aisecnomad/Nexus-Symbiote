@@ -48,6 +48,9 @@ _SAFE_URL_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:https|s3|gs|hf|oci)://[\x21\x23-\x26\x28-\x3b\x3d\x3f-\x5b\x5d-\x7e]+",
     re.ASCII,
 )
+_PREVIOUS_URL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:https|s3|gs|hf|oci)://[^\s<>\"'\\]+", re.ASCII
+)
 _ALLOWED_URL_SCHEMES: Final[frozenset[str]] = frozenset({"https", "s3", "gs", "hf", "oci"})
 _SPDX_DATASET_TYPES: Final[frozenset[str]] = frozenset(
     {
@@ -172,7 +175,7 @@ def _clean_text(value: Any, *, max_len: int = 512) -> str | None:
     return cleaned[:max_len] if cleaned else None
 
 
-def _clean_url(value: Any) -> str | None:
+def _clean_url(value: Any, *, legacy: bool = False) -> str | None:
     """Sanitize a declared download URI, preserving safe paths while stripping query/fragment/credentials."""
     if not isinstance(value, str) or not value.strip():
         return None
@@ -192,7 +195,15 @@ def _clean_url(value: Any) -> str | None:
     if parts.path and REDACTED in redact_text(unquote(parts.path)):
         return None
     rebuilt = urlunsplit((scheme, parts.netloc, parts.path, "", ""))
-    return rebuilt if _SAFE_URL_RE.fullmatch(rebuilt) else None
+    pattern = _PREVIOUS_URL_RE if legacy else _SAFE_URL_RE
+    return rebuilt if pattern.fullmatch(rebuilt) else None
+
+
+def _projected_download_location(value: Any, *, legacy: bool) -> str | None:
+    # Recovery recreates previously written projections in memory for comparison.
+    if legacy:
+        return value if isinstance(value, str) and value else None
+    return _clean_url(value)
 
 
 def _declared_url(value: Any, owner: str, notices: list[str]) -> str | None:
@@ -314,14 +325,31 @@ def _conflict_risk(field_name: str, component_name: str, locator: str) -> RiskAs
 def _type_conflict(
     holder: AnyComponent | None, declared: str, locator: str, notices: list[str]
 ) -> bool:
-    """Whether a component of another type holds the name of a declared ``declared``.
+    """Whether a collected component of another type holds the declared name.
 
     The declaration is then a conflict on the holder and is not applied.
     """
-    if holder is None:
+    if holder is None or holder.assurance_level == AssuranceLevel.DECLARED:
         return False
     holder.risks.append(_conflict_risk("component_type", holder.name, locator))
     notices.append(f"{holder.bom_ref}: {declared} name conflict with {locator}")
+    return True
+
+
+def _repeat_declaration(
+    seen: dict[str, dict[str, Any]],
+    name: str,
+    entry: dict[str, Any],
+    holder: AnyComponent | None,
+    locator: str,
+    notices: list[str],
+) -> bool:
+    if name not in seen:
+        seen[name] = entry
+        return False
+    if seen[name] != entry and holder is not None:
+        holder.risks.append(_conflict_risk("duplicate_declaration", name, locator))
+        notices.append(f"{holder.bom_ref}: conflicting declaration repeated in {locator}")
     return True
 
 
@@ -486,6 +514,7 @@ def apply_agent_yaml_declarations(
 
     raw_datasets = parsed.get("datasets")
     dataset_refs_by_name: dict[str, str] = {}
+    dataset_declarations: dict[str, dict[str, Any]] = {}
     if isinstance(raw_datasets, list):
         for entry in raw_datasets[:200]:
             if not isinstance(entry, dict):
@@ -498,14 +527,15 @@ def apply_agent_yaml_declarations(
                 by_key.get((ComponentType.MODEL, ds_name)), "dataset", locator, notices
             ):
                 continue
+            if _repeat_declaration(
+                dataset_declarations, ds_name, entry, existing, locator, notices
+            ):
+                continue
             ds_ver = _clean_text(entry.get("version"), max_len=128)
             ds_sup = _clean_text(entry.get("supplier"), max_len=200) or owner
             ds_lic = clean_license_identifier(entry.get("license")) or default_license
-            ds_uri = _declared_url(
-                entry.get("download_location") or entry.get("source_uri"),
-                f"dataset {ds_name}",
-                notices,
-            )
+            raw_uri = entry.get("download_location") or entry.get("source_uri")
+            ds_uri = _declared_url(raw_uri, f"dataset {ds_name}", notices)
             ds_rel = _clean_rfc3339(entry.get("release_time") or entry.get("collection_date"))
             ds_type = _clean_text(entry.get("dataset_type"), max_len=64)
             ds_avail = _clean_text(entry.get("availability"), max_len=64)
@@ -521,7 +551,8 @@ def apply_agent_yaml_declarations(
                     ds_comp.risks.append(_conflict_risk("license", ds_name, locator))
                     notices.append(f"{ds_comp.bom_ref}: license conflict with {locator}")
                     ds_lic = None
-                if ds_uri and ds_comp.source_uri and ds_comp.source_uri != ds_uri:
+                comparison_uri = ds_uri or _clean_url(raw_uri, legacy=True)
+                if comparison_uri and ds_comp.source_uri and ds_comp.source_uri != comparison_uri:
                     ds_comp.risks.append(_conflict_risk("source_uri", ds_name, locator))
                     notices.append(f"{ds_comp.bom_ref}: source_uri conflict with {locator}")
                     ds_uri = None
@@ -569,6 +600,7 @@ def apply_agent_yaml_declarations(
             dataset_refs_by_name[ds_name] = ds_comp.bom_ref
 
     raw_models = parsed.get("models")
+    model_declarations: dict[str, dict[str, Any]] = {}
     edge_keys: set[tuple[str, str, str]] = {
         (e.source_ref, e.target_ref, e.relationship) for e in aibom.dependencies
     }
@@ -583,6 +615,8 @@ def apply_agent_yaml_declarations(
             if existing is None and _type_conflict(
                 by_key.get((ComponentType.DATA_SOURCE, m_name)), "model", locator, notices
             ):
+                continue
+            if _repeat_declaration(model_declarations, m_name, entry, existing, locator, notices):
                 continue
             m_ver = _clean_text(entry.get("version"), max_len=128)
             m_sup = _clean_text(entry.get("supplier"), max_len=200) or owner

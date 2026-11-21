@@ -24,6 +24,7 @@ _HOSTNAME = re.compile(r"[\w.-]+|[0-9a-f:.]+")
 # A2A 1.0 gRPC interfaces give a "hostname:port" address without a scheme.
 _HOST_PORT = re.compile(r"(?:(?:[\w-]+\.)+[\w-]+|localhost|\[[0-9a-f:.]+\]):\d{1,5}", re.I)
 _SPECIAL_SCHEME = re.compile(r"(ftp|https?|wss?):(?!//)", re.I)
+_URL_ASCII_WHITESPACE = str.maketrans("", "", "\t\r\n")
 
 
 class BindingError(ValueError):
@@ -88,7 +89,9 @@ def whatwg_form(url: str) -> str:
     match = _SPECIAL_SCHEME.match(value)
     if match is None:
         return url
-    rest = value[match.end() :].lstrip("/\\")
+    rest = value[match.end() :].translate(_URL_ASCII_WHITESPACE).lstrip("/\\")
+    if not rest or rest.startswith(" "):
+        return url
     return f"{match[1]}://{rest}"
 
 

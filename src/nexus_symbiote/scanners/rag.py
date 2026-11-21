@@ -456,8 +456,6 @@ class RAGScanner(Scanner):
                 for rail in siblings
                 if not withheld(files, rail.as_posix(), result.surfaces_excluded)
             ]
-            if canonical in NEMO_CONFIG_NAMES and not siblings:
-                continue
             if withheld(files, relative, result.surfaces_excluded):
                 continue
             raw = files.read_bytes(path)
