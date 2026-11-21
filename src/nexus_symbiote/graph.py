@@ -735,19 +735,22 @@ def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
     principals = sorted(
         {auth.principal for ref in reach for auth in getattr(nodes[ref], "authorizations", [])}
     )
-    candidate_credentials = [
-        (var, sorted(holders))
-        for var, holders in sorted(env_index.items())
-        if len(holders) > 1 and (holders & reach)
-    ]
-    shared_credentials = {
-        var: holders[:MAX_SHARED_CREDENTIAL_HOLDERS]
-        for var, holders in candidate_credentials[:MAX_SHARED_CREDENTIAL_VARS]
-    }
-    truncated_creds = len(candidate_credentials) > MAX_SHARED_CREDENTIAL_VARS or any(
-        len(holders) > MAX_SHARED_CREDENTIAL_HOLDERS
-        for _, holders in candidate_credentials[:MAX_SHARED_CREDENTIAL_VARS]
+    credential_names = sorted(
+        var
+        for var, holders in env_index.items()
+        if len(holders) > 1 and not holders.isdisjoint(reach)
     )
+    shared_credentials: dict[str, list[str]] = {}
+    omitted_holders: dict[str, int] = {}
+    for var in credential_names[:MAX_SHARED_CREDENTIAL_VARS]:
+        holders = env_index[var]
+        if len(holders) > MAX_SHARED_CREDENTIAL_HOLDERS:
+            # Keep the subject and other reachable holders that explain the association.
+            ranked = sorted(holders, key=lambda ref: (ref != component_ref, ref not in reach, ref))
+            shared_credentials[var] = ranked[:MAX_SHARED_CREDENTIAL_HOLDERS]
+            omitted_holders[var] = len(holders) - MAX_SHARED_CREDENTIAL_HOLDERS
+        else:
+            shared_credentials[var] = sorted(holders)
     gateways = sorted(
         ref
         for ref in reach
@@ -761,7 +764,7 @@ def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
         limitations.append(
             "The component has no recorded relationships: reachability is unknown, not empty."
         )
-    if truncated_creds:
+    if omitted_holders or len(credential_names) > MAX_SHARED_CREDENTIAL_VARS:
         limitations.append(
             f"shared_credential_surfaces is bounded to at most {MAX_SHARED_CREDENTIAL_VARS} "
             f"credential variables and {MAX_SHARED_CREDENTIAL_HOLDERS} holders each."
@@ -773,6 +776,7 @@ def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
         "reachable_components": sorted(reach),
         "declared_principals": principals,
         "shared_credential_surfaces": shared_credentials,
+        "shared_credential_holders_omitted": omitted_holders,
         "mcp_gateways": gateways,
         "scope": "repository-association",
         "effective_authority": "unknown",
