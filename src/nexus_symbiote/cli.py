@@ -1112,6 +1112,7 @@ def scan(
     surfaces_scanned: list[str] = []
     surfaces_excluded: list[str] = []
     accepted_default_exclusions: set[str] = set()
+    accepted_default_names: set[str] = set()
     scan_failures: list[str] = []
     failures_by: dict[str, list[str]] = {}
     excluded_by: dict[str, list[str]] = {}
@@ -1164,6 +1165,7 @@ def scan(
             surfaces_scanned.extend(result.surfaces_scanned)
             surfaces_excluded.extend(result.surfaces_excluded)
             accepted_default_exclusions.update(result.accepted_default_exclusions)
+            accepted_default_names.update(result.accepted_default_names)
             scan_failures.extend(result.scan_failures)
             failures_by[name] = scan_failures[failure_count:]
             excluded_by[name] = list(result.surfaces_excluded)
@@ -1257,6 +1259,7 @@ def scan(
             }
         ),
         unobserved_surfaces=[
+            *(f"accepted default exclusion: {name}" for name in sorted(accepted_default_names)),
             "runtime",
             "effective-identity",
             "effective-authorization",

@@ -32,6 +32,11 @@ jobs:
 
 The Action installs its own hash-locked runtime, including Sigstore verification, in a private virtual environment (`--isolated`, `PIP_CONFIG_FILE=/dev/null`, and `--no-index` for the local Action package) that it keeps off the job's `PATH`, without changing the job's default Python or reading runner/workspace pip configuration. It ignores policy in the scanned checkout and fails on collection errors. Text from the checkout reaches the job log only inside a `stop-commands` block, neutralized, so it cannot set outputs or create annotations. Keep a job timeout like the one above: hostile input can keep a scan running until the job times out.
 
+The native inventory lists each occupied, accepted default name in
+`metadata.completeness.unobserved_surfaces`, including a root name that also
+appears in the configured `exclusions` on an empty checkout. Project
+reconciliation checks this evidence against the directories it observes.
+
 ## What each gate checks
 
 - **Every gate states its result.** The `result` output is `passed` or `failed`, and `gates` is a JSON object with the state of each gate (`collection`, `completeness`, `integrity`, `risk`, `drift`): `passed`, `failed`, `skipped` (switched off by an input) or `not-run`. Every gate an input switches off is printed as a warning.

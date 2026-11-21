@@ -208,6 +208,7 @@ class ScanResult:
     source_unmapped_count: int = 0
     source_unmapped_indexes: list[int] = field(default_factory=list)
     discovery_verification: DiscoveryVerification | None = None
+    accepted_default_names: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if not isinstance(self.scan_failures, BoundedRecords):
@@ -326,6 +327,7 @@ class Scanner(ABC):
             try:
                 yield files
             finally:
+                result.accepted_default_names.update(files.accepted_default_names)
                 self._files = None
 
     @abstractmethod

@@ -22,6 +22,7 @@ from nexus_symbiote.core.models import (
     RiskAssessment,
     SkillPackageComponent,
 )
+from nexus_symbiote.scanner_catalog import INSTRUCTION_DIRECTORIES, SKILL_DIRECTORIES
 from nexus_symbiote.scanners.base import Scanner, ScanResult
 from nexus_symbiote.scanners.credential_files import MARKDOWN_SUFFIXES as _MARKUP_SUFFIXES
 from nexus_symbiote.scanners.credential_files import credential_gap as _credential_gap
@@ -684,20 +685,6 @@ _FOLDED_NESTED_NAMES = {fold_name(name): name for name in NESTED_INSTRUCTION_NAM
 # Subagent definitions and rule or prompt directories. Every file in them is inventoried
 # by digest, and each directory is walked on its own, so a directory symlink out of one
 # is followed. `.clinerules` is either a single rules file or a directory of them.
-INSTRUCTION_DIRECTORIES: dict[str, str] = {
-    ".clinerules": "rules-file",
-    ".claude/rules": "rules-file",
-    ".cursor/rules": "rules-file",
-    ".windsurf/rules": "rules-file",
-    ".roo/rules": "rules-file",
-    ".kiro/steering": "rules-file",
-    ".github/instructions": "instruction",
-    ".github/prompts": "instruction",
-    ".claude/output-styles": "instruction",
-    ".claude/agents": "subagent",
-    ".github/agents": "subagent",
-}
-
 _INSTRUCTION_DIRECTORY_PARTS = tuple(
     PurePosixPath(directory).parts for directory in INSTRUCTION_DIRECTORIES
 )
@@ -720,21 +707,6 @@ PROMPT_TEMPLATE_TYPE = "template"
 # the same names.
 PROMPT_SEARCH_SKIPPED = frozenset({*SOURCE_SEARCH_SKIPPED, "node_modules", "vendor"})
 
-SKILL_DIRECTORIES = [
-    ".claude/skills",
-    ".claude/commands",
-    "skills",
-    ".agents/skills",
-    ".github/skills",
-    ".cursor/skills",
-    ".gemini/skills",
-    ".cursor/commands",
-    ".gemini/commands",
-    # The scripts hooks conventionally run: settings bind only the program word that
-    # names one, so the script itself is bound here.
-    ".claude/hooks",
-    ".cursor/hooks",
-]
 # No agent reads these as instructions: every file is a resource, checked only for
 # hidden characters.
 _RESOURCE_DIRECTORIES = frozenset({".claude/hooks", ".cursor/hooks"})

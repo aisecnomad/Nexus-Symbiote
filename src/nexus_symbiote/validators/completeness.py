@@ -337,6 +337,7 @@ class CompletenessValidator:
         surfaces: list[str] = []
         excluded: list[str] = []
         accepted_default_exclusions: set[str] = set()
+        accepted_default_names: set[str] = set()
         status: dict[str, str] = {}
         report_digest: str | None = None
 
@@ -376,6 +377,7 @@ class CompletenessValidator:
             surfaces.extend(local.surfaces_scanned)
             excluded.extend(local.surfaces_excluded)
             accepted_default_exclusions.update(local.accepted_default_exclusions)
+            accepted_default_names.update(local.accepted_default_names)
             status[scanner.name] = (
                 "failed" if failed else "partial" if local.surfaces_excluded else "complete"
             )
@@ -402,6 +404,9 @@ class CompletenessValidator:
             excluded,
             status,
             [*exclude_paths, *accepted_default_exclusions],
+        )
+        coverage.unobserved_surfaces.extend(
+            f"accepted default exclusion: {name}" for name in sorted(accepted_default_names)
         )
         report.assurance_level = coverage.assurance_level
         report.surfaces_covered = coverage.surfaces_scanned
@@ -551,7 +556,7 @@ class CompletenessValidator:
                 "Coverage claim asserts verified assurance; offline collection cannot "
                 "establish it.",
             )
-        missing = sorted(UNOBSERVED_SURFACES.difference(claim.unobserved_surfaces))
+        missing = sorted(set(local.unobserved_surfaces).difference(claim.unobserved_surfaces))
         if missing:
             report.add_issue(
                 COVERAGE_CLAIM,
