@@ -186,7 +186,7 @@ _LAST_CLAMPED_SETTINGS: contextvars.ContextVar[tuple[str, ...]] = contextvars.Co
 )
 
 
-def _warn_unapplied_project_policy(root: Path) -> None:
+def _warn_unapplied_project_policy(root: Path) -> dict[str, str] | None:
     """Say that a checkout policy exists and was left unused.
 
     Applying it is opt-in. A file that is not a safe regular policy is named only as
@@ -207,9 +207,9 @@ def _warn_unapplied_project_policy(root: Path) -> None:
             "to keep the built-in policy without this warning.",
             err=True,
         )
-        return
+        return {"reason": "invalid-or-ambiguous"}
     if path is None:
-        return
+        return None
     echo_line(
         "WARNING: project policy ",
         path,
@@ -217,6 +217,7 @@ def _warn_unapplied_project_policy(root: Path) -> None:
         "--no-project-policy to keep the built-in policy without this warning.",
         err=True,
     )
+    return {"file": path.name, "reason": "not-accepted"}
 
 
 def _policy_with_source(
@@ -228,7 +229,7 @@ def _policy_with_source(
     operator: Policy | None = None,
     operator_digest: str | None = None,
     operator_signers: tuple[str, ...] = (),
-) -> tuple[Policy, str, list[str]]:
+) -> tuple[Policy, str, list[str], dict[str, str] | None]:
     """Load the governing policy and say where it came from and what it relaxes.
 
     A project policy is applied only with ``allow_weakening`` (``--accept-project-policy``).
@@ -245,18 +246,19 @@ def _policy_with_source(
 
     _LAST_CLAMPED_SETTINGS.set(())
     apply_project = allow_weakening and not ignore_project
+    unapplied = (
+        _warn_unapplied_project_policy(root) if not (apply_project or ignore_project) else None
+    )
     if operator is not None and operator_digest is not None:
         op_label = _format_operator_source(operator_digest, operator_signers)
         if not apply_project:
-            if not ignore_project and warn:
-                _warn_unapplied_project_policy(root)
-            return operator, op_label, weakened_settings(operator)
+            return operator, op_label, weakened_settings(operator), unapplied
         try:
             loaded_proj = load_policy_file(root)
         except PolicyError as exc:
             raise _failure(exc) from exc
         if loaded_proj is None:
-            return operator, op_label, weakened_settings(operator)
+            return operator, op_label, weakened_settings(operator), None
         proj_policy, proj_path, _ = loaded_proj
         narrowed, clamped = narrow_policy(operator, proj_policy)
         _LAST_CLAMPED_SETTINGS.set(tuple(clamped))
@@ -268,18 +270,16 @@ def _policy_with_source(
                 "; ".join(clamped),
                 err=True,
             )
-        return narrowed, op_label, weakened_settings(narrowed)
+        return narrowed, op_label, weakened_settings(narrowed), None
 
     if not apply_project:
-        if not ignore_project and warn:
-            _warn_unapplied_project_policy(root)
-        return default_policy(), "built-in", []
+        return default_policy(), "built-in", [], unapplied
     try:
         loaded = load_policy_file(root)
     except PolicyError as exc:
         raise _failure(exc) from exc
     if loaded is None:
-        return default_policy(), "built-in", []
+        return default_policy(), "built-in", [], None
     policy, path, _ = loaded
     weaker = weakened_settings(policy)
     if weaker and warn:
@@ -288,7 +288,7 @@ def _policy_with_source(
         echo_line(
             "WARNING: policy ", path, " weakens the built-in gates: ", "; ".join(weaker), err=True
         )
-    return policy, f"project:{path}", weaker
+    return policy, f"project:{path}", weaker, None
 
 
 def _inventory_policy(
@@ -301,7 +301,7 @@ def _inventory_policy(
     operator: Policy | None = None,
     operator_digest: str | None = None,
     operator_signers: tuple[str, ...] = (),
-) -> tuple[Policy, str, list[str]]:
+) -> tuple[Policy, str, list[str], dict[str, str] | None]:
     """Policy for a command that reads an inventory: only a named project or operator supplies one."""
     from nexus_symbiote.policy import default_policy, nearest_policy_file, weakened_settings
 
@@ -321,6 +321,7 @@ def _inventory_policy(
             operator,
             _format_operator_source(operator_digest, operator_signers),
             weakened_settings(operator),
+            None,
         )
     if not ignore_project:
         unapplied = nearest_policy_file(Path(aibom_path).resolve().parent)
@@ -332,7 +333,13 @@ def _inventory_policy(
                 "use --project and --accept-project-policy to apply a trusted project's policy.",
                 err=True,
             )
-    return default_policy(), "built-in", []
+            return (
+                default_policy(),
+                "built-in",
+                [],
+                {"file": unapplied.name, "reason": "project-not-specified"},
+            )
+    return default_policy(), "built-in", [], None
 
 
 def _gate_sources(
@@ -1081,7 +1088,7 @@ def scan(
         allow_unsigned=allow_unsigned_operator_policy,
         max_age_days=operator_policy_max_age_days,
     )
-    policy, policy_source, policy_weakened = _policy_with_source(
+    policy, policy_source, policy_weakened, _ = _policy_with_source(
         root,
         ignore_project=no_project_policy,
         allow_weakening=accept_project_policy,
@@ -1875,7 +1882,7 @@ def validate(
         allow_unsigned=allow_unsigned_operator_policy,
         max_age_days=operator_policy_max_age_days,
     )
-    policy, policy_source, policy_weakened = _inventory_policy(
+    policy, policy_source, policy_weakened, policy_unapplied = _inventory_policy(
         root,
         aibom_path,
         ignore_project=no_project_policy,
@@ -1961,6 +1968,8 @@ def validate(
         "assurance_errors": assurance_errors,
         "graph_issues": graph_issues,
     }
+    if policy_unapplied is not None:
+        document["policy_unapplied"] = policy_unapplied
     if op_digest is not None:
         document["operator_policy_digest"] = op_digest
         document["operator_policy_signers"] = list(op_signers)
@@ -2099,7 +2108,7 @@ def risk(
         allow_unsigned=allow_unsigned_operator_policy,
         max_age_days=operator_policy_max_age_days,
     )
-    policy, policy_source, policy_weakened = _inventory_policy(
+    policy, policy_source, policy_weakened, policy_unapplied = _inventory_policy(
         root,
         aibom_path,
         ignore_project=no_project_policy,
@@ -2120,6 +2129,8 @@ def risk(
         "policy_source": policy_source,
         "policy_weakened": policy_weakened,
     }
+    if policy_unapplied is not None:
+        context["policy_unapplied"] = policy_unapplied
     if op_digest is not None:
         context["operator_policy_digest"] = op_digest
         context["operator_policy_signers"] = list(op_signers)

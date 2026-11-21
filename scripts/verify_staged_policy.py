@@ -201,11 +201,9 @@ def validation_failures(bom: AIBOM, root: Path, policy: Policy) -> list[str]:
     return failures
 
 
-def _cli_supports_operator_policy() -> bool:
-    scan_cmd = cli_main.commands.get("scan")
-    if scan_cmd is None:
-        return False
-    return any("--operator-policy" in param.opts for param in scan_cmd.params)
+def _has_option(command: str, option: str) -> bool:
+    subcommand = cli_main.commands.get(command)
+    return subcommand is not None and any(option in param.opts for param in subcommand.params)
 
 
 def run_staged_gate(
@@ -298,8 +296,12 @@ def run_staged_gate(
         return 2, _line("Error: ", exc)
 
     cli_policy_args: list[str] = []
-    scan_extra_args: list[str] = []
-    if _cli_supports_operator_policy():
+    # Collection uses the operator's settings. The checks below apply any stricter checkout floor.
+    supports_operator = _has_option("scan", "--operator-policy")
+    scan_extra_args = []
+    if not supports_operator or _has_option("scan", "--no-project-policy"):
+        scan_extra_args.append("--no-project-policy")
+    if supports_operator:
         cli_policy_args.extend(["--operator-policy", str(operator_policy_source)])
         if attestation_source is not None:
             cli_policy_args.extend(["--operator-policy-attestation", str(attestation_source)])
@@ -313,7 +315,6 @@ def run_staged_gate(
         # Ignore untrusted checkout .nexus-symbiote.yaml during collection so a PR cannot
         # hide files via scan.exclude_paths, disable collectors via scan.scanners, or
         # trigger the CI weakened-project-policy abort before operator clamping runs.
-        scan_extra_args.append("--no-project-policy")
         for scanner_name in operator_policy.scan.scanners:
             scan_extra_args.extend(["--scanner", scanner_name])
 
@@ -349,6 +350,8 @@ def run_staged_gate(
 
         effective = clamp_operator_floor(operator_policy, project_policy)
         lines = [scan_res.output, f"Policy: operator:{policy_digest}\n"]
+        if project_policy is not None:
+            lines.append("The checkout policy was used only to tighten the operator's checks.\n")
 
         failures = validation_failures(bom, resolved_project, effective)
         lines.extend(_line("Error: ", failure) for failure in failures)
@@ -367,10 +370,13 @@ def run_staged_gate(
         if failures or not passed:
             return 1, "".join(lines)
 
-        if _cli_supports_operator_policy():
+        if supports_operator:
+            risk_args = [*cli_policy_args]
+            if _has_option("risk", "--no-project-policy"):
+                risk_args.append("--no-project-policy")
             risk_res = runner.invoke(
                 cli_main,
-                ["risk", str(candidate_bom), "--project", str(project_dir), *cli_policy_args],
+                ["risk", str(candidate_bom), "--project", str(project_dir), *risk_args],
             )
             lines.append(risk_res.output)
             if risk_res.exit_code != 0:
