@@ -388,13 +388,20 @@ consumed; a fresh approval does not establish that a retry is safe.
 10. Arguments against the approved input schema in a bounded worker
     (`arguments-invalid`, `schema-invalid`, `validation-capacity`,
     `validation-timeout`, `validation-unavailable`, `validation-failed`).
-11. Authenticate again; the context must be unchanged (`identity-changed`).
-12. In one state transaction: the recorded trust status and snapshot must still
+11. For a pinned tool with an `outputSchema`, preflight the schema and reserve a
+    pending-response slot. Refuse unsupported schemas, cycles at the same result
+    location, paths deeper than 96 same-location applicators, or more than 1,024
+    same-location evaluation steps per subschema. This happens before an approval
+    nonce is consumed or the tool is called. Up to four responses can be pending.
+    A pending call releases its preflight worker. Its returned result takes
+    priority for the next available worker and can wait up to 12 seconds.
+12. Authenticate again. The context must be unchanged (`identity-changed`).
+13. In one state transaction: the recorded trust status and snapshot must still
     be the ones checked (`trust-superseded`, `snapshot-superseded`), the approval
     nonce is consumed (`approval-replayed`), and every contract and signer scope
     is checked against the clock again, including the distinct approver quorum.
     The commit admits the call.
-13. Report the decision to `on_decision`, then call `execute(call)`.
+14. Report the decision to `on_decision`, then call `execute(call)`.
 
 `ReferenceGateway.register_snapshot(snapshot, trust=...)` runs steps 3 and 4 for
 the snapshot's own tenant, deployment and agent, without a workload context or a
