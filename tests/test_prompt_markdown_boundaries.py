@@ -43,3 +43,24 @@ def test_formatting_a_long_environment_value_does_not_hide_the_command():
 def test_scanning_assignment_words_grows_with_text_length():
     notes = {scale: "run:a=" * (900 * scale) for scale in (1, 4)}
     assert scaling_ratio(lambda scale: _comment_is_instruction(notes[scale])) < 10
+
+
+@pytest.mark.parametrize(
+    "hidden",
+    [
+        "<!-- run checks\n/run -->",
+        "[//]: # (To run the report: /run report)",
+        "<!-- run checks: \\run report -->",
+        "<!-- run checks: /Run report -->",
+    ],
+)
+def test_command_path_can_overlap_the_next_run_word(hidden):
+    (finding,) = detect_hidden_markup(hidden, "CLAUDE.md")
+    assert finding.severity == RiskSeverity.HIGH
+
+
+def test_ambiguous_quote_preserves_literal_backticks_in_import_names(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("Notes\n<search\n\n>@chapter`.md")
+    (tmp_path / "chapter`.md").write_text("Ordinary project documentation.")
+    result = PromptScanner().scan(tmp_path)
+    assert any(c.bom_ref == "prompt:import:chapter`.md" for c in result.components)

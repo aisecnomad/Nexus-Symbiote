@@ -591,7 +591,9 @@ def _run_starts_later_command(text: str) -> bool:
             end = _SENTENCE_END.search(text, verb.end())
             sentence_end = len(text) if end is None else end.start()
         following = next(verbs, None)
-        stop = sentence_end if following is None else min(sentence_end, following.start())
+        # A path can start before the next verb and include that verb's first
+        # letter. Overlap one verb so each interval is scanned at most twice.
+        stop = sentence_end if following is None else min(sentence_end, following.end())
         for target in _LATER_TARGET.finditer(text, verb.end(), stop):
             if _starts_command(text, verb.end(), target.start()):
                 return True

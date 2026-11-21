@@ -214,9 +214,12 @@ def _text_outside_code(text: str) -> list[str]:
         alternatives = []
         for line in lines:
             if "@" in line:
-                bare = _CONTAINER_MARKS.sub("", line, count=1).replace("`", " ")
+                bare = _CONTAINER_MARKS.sub("", line, count=1)
                 if bare != line:
                     alternatives.append(bare)
+                inline = bare.replace("`", " ")
+                if inline != bare:
+                    alternatives.append(inline)
         return [text, *alternatives]
     return reader.parts
 
