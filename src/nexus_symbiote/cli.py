@@ -291,16 +291,6 @@ def _policy_with_source(
     return policy, f"project:{path}", weaker
 
 
-# Relaxations that change what a command reports, not whether its gate passes; they
-# are recorded and warned about like every other, but CI need not accept them.
-_REPORT_ONLY_WEAKENING_PREFIXES = ("output.",)
-
-
-def _gate_weakenings(weaker: list[str]) -> list[str]:
-    """Every relaxation but those that change only what is reported (``output.*``)."""
-    return [entry for entry in weaker if not entry.startswith(_REPORT_ONLY_WEAKENING_PREFIXES)]
-
-
 def _inventory_policy(
     project: Path | None,
     aibom_path: str,
@@ -983,15 +973,15 @@ def _render_aibom(
     "output_format",
     type=click.Choice(["json", "cyclonedx", "spdx", "sarif"]),
     default=None,
-    help="Output format (default: json, or from .nexus-symbiote.yaml)",
+    help="Output format. Defaults to json unless the accepted policy sets a format.",
 )
 @click.option(
     "--scanner",
     "scanners",
     multiple=True,
     help=(
-        f"Collector to run, once each: {BUILTIN_SCANNERS} (default: all, or from "
-        ".nexus-symbiote.yaml). A collector left out makes coverage partial."
+        f"Collector to run, once each: {BUILTIN_SCANNERS}. Defaults to all unless the "
+        "accepted policy selects collectors. A collector left out makes coverage partial."
     ),
 )
 @click.option(
@@ -2427,7 +2417,7 @@ def init(force: bool, path: str) -> None:
 
     write_cli_output(target, DEFAULT_POLICY_YAML, overwrite=force)
     echo_line("Created ", target)
-    click.echo("  Edit this file to customize scan, risk, and validation policies.")
+    click.echo("  Apply this file in a trusted checkout with --accept-project-policy.")
 
 
 register_runtime_commands(main)

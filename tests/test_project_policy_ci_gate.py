@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from nexus_symbiote.cli import _gate_weakenings, main
+from nexus_symbiote.cli import main
 
 NOT_APPLIED = "was not applied"
 
@@ -150,11 +150,8 @@ def test_a_stricter_project_policy_is_not_applied_without_the_flag(
     assert str(accepted_meta.get("policy_source", "")).startswith("project:")
 
 
-def test_only_gate_affecting_relaxations_are_named() -> None:
-    weaker = [
-        "output.default_format=cyclonedx",
-        "risk.fail_threshold=1000000.0",
-        "scan.failure_mode=report-only",
-    ]
-    assert _gate_weakenings(weaker) == weaker[1:]
-    assert _gate_weakenings(["output.default_format=sarif"]) == []
+def test_init_tells_the_operator_how_to_apply_the_created_policy(tmp_path: Path) -> None:
+    result = CliRunner().invoke(main, ["init", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / ".nexus-symbiote.yaml").is_file()
+    assert "--accept-project-policy" in result.output
