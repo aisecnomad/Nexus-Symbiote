@@ -2540,7 +2540,7 @@ def _computed_powershell(segment: str) -> int | None:
 
     A variable or glob can select PowerShell. `-e`, `-ec`, `-en` and `-E` are shared by
     other programs (`$SED -En`, `$SHELL -ec`), so require a program-name hint, `-enc` or
-    a longer prefix of `-EncodedCommand`, or a base64 argument after the switch.
+    a longer prefix of `-EncodedCommand`, or an argument encoding UTF-16LE text.
     """
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
@@ -2570,9 +2570,7 @@ def _computed_powershell(segment: str) -> int | None:
 
 
 # An -EncodedCommand value: base64 of UTF-16LE text, so a whole number of quads.
-_BASE64_PAYLOAD = re.compile(
-    r"(?=.*[A-Z])(?:[A-Za-z0-9+/]{4}){2,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?"
-)
+_BASE64_PAYLOAD = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
 
 
 def _encoded_payload(segment: str, end: int) -> bool:

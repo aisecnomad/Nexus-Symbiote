@@ -57,3 +57,9 @@ def test_encoded_text_and_a_program_name_hint_are_recognized():
     payload = base64.b64encode("Write-Output 'café'".encode("utf-16-le")).decode("ascii")
     assert ide_agents._encoded_powershell("$READER -e " + payload)
     assert ide_agents._encoded_powershell("pwsh -e Makefile")
+
+
+@pytest.mark.parametrize("script", ["1", "42", "\ufeffπ"])
+def test_short_or_bom_marked_encoded_text_is_recognized(script):
+    payload = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    assert ide_agents._encoded_powershell("$READER -e " + payload)
