@@ -50,8 +50,9 @@ property (`collection_mode`, `content_hash_withheld`, `identity_source`,
 `weight_files`, `config_hash`, or any `static_value_binding*`,
 `static_config_hash*` or `static_card_hash*` key): integrity, suppression
 fingerprints and the static binding checks read them as collected evidence, so
-reconciliation fails instead. A
-mismatch makes `validate` report the basis `project-reconciliation-failed` and
+reconciliation fails instead. `trifecta` and `diff` read saved inventories,
+so their conclusions depend on the provenance of those files.
+A mismatch makes `validate` report the basis `project-reconciliation-failed` and
 makes the project-backed risk command exit unsuccessfully with that basis, an
 unknown risk level and a null score. Without a project, `risk` scores the supplied claims
 and labels the result `supplied-bom`. For an operator-configured signature
