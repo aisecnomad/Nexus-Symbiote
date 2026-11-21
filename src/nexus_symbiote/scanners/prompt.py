@@ -1035,7 +1035,7 @@ def _found_by_name(path: str, prompt_type: str | None, directory: object = None)
         return True
     if prompt_type == PROMPT_TEMPLATE_TYPE and _prompt_named(parts[-1]):
         return True
-    if directory in INSTRUCTION_DIRECTORIES and "." not in parts[-1]:
+    if isinstance(directory, str) and directory in INSTRUCTION_DIRECTORIES and "." not in parts[-1]:
         return True
     return "." not in parts[-1] and any(
         parts[: len(directory)] == directory and len(parts) > len(directory)
