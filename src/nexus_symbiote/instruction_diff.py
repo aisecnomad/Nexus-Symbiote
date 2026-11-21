@@ -60,7 +60,7 @@ from nexus_symbiote.scanners.prompt import (
     _resolve_import,
 )
 from nexus_symbiote.utils.confined import ConfinedCollection, fold_name
-from nexus_symbiote.utils.markdown import commonmark_blocks, hidden_text
+from nexus_symbiote.utils.markdown import commonmark_block_readings, hidden_text
 from nexus_symbiote.utils.secrets import redact_metadata, redact_text
 from nexus_symbiote.utils.terminal import echo_line, json_text, neutralize
 
@@ -175,6 +175,7 @@ class _ParsedInstruction:
     inline_tools: tuple[frozenset[str], dict[str, list[tuple[int, int]]]]
     imports: tuple[frozenset[str], dict[str, list[tuple[int, int]]]]
     refs: tuple[frozenset[str], dict[str, list[tuple[int, int]]]]
+    signal_readings: dict[str, tuple[frozenset[str], frozenset[str]]]
 
 
 def _mask_multiline_pem_spans(content: str, *, start_in_pem: bool = False) -> tuple[str, bool]:
@@ -505,7 +506,12 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
     always_apply = str(meta.get("alwaysApply")).strip().lower() == "true"
     fm_grants = _frontmatter_grants(meta)
 
-    blocks = tuple(commonmark_blocks(body))
+    readings = commonmark_block_readings(body)
+    blocks = (
+        tuple(readings["common"])
+        if "common" in readings
+        else tuple(dict.fromkeys(block for reading in readings.values() for block in reading))
+    )
     hidden = hidden_text(body)
     comments: list[str] = []
     pos = 0
@@ -516,6 +522,20 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
         pos = stop
     hidden_sigs = Counter([*comments, *hidden.definitions, *hidden.html])
     inline_tools, imports, refs = _extract_block_signals(blocks)
+    # The same path can be prose under one dialect and a fenced example under
+    # another. Keep the evidence for each reading comparable across revisions.
+    signals = {(blocks): (inline_tools[0], imports[0])}
+    signal_readings = {}
+    for name, reading in readings.items():
+        all_blocks = tuple(reading)
+        prose = tuple(b for b in reading if b[0] not in {"fence", "indented"})
+        for suffix, selected in (("", all_blocks), ("-prose", prose)):
+            if selected not in signals:
+                tool_signals, import_signals, _ = _extract_block_signals(selected)
+                signals[selected] = (tool_signals[0], import_signals[0])
+            names = ("ascii", "unicode") if name == "common" else (name,)
+            for dialect in names:
+                signal_readings[dialect + suffix] = signals[selected]
     return _ParsedInstruction(
         rel_path=rel_path,
         content=content,
@@ -529,6 +549,7 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
         inline_tools=inline_tools,
         imports=imports,
         refs=refs,
+        signal_readings=signal_readings,
     )
 
 
@@ -966,9 +987,18 @@ def diff_instruction_trees(
             )
         base_inline_tools = base.inline_tools[0] if base is not None else frozenset()
         head_inline_tools, head_tool_locs = head.inline_tools
-        if base_inline_tools != head_inline_tools:
-            diff_tools = sorted(base_inline_tools ^ head_inline_tools)
-            blk, line_no = _pick_loc(head_tool_locs, changed_indices, changed_set, diff_tools[0])
+        diff_tools = set(base_inline_tools ^ head_inline_tools)
+        base_imports = base.imports[0] if base is not None else frozenset()
+        head_imports, head_import_locs = head.imports
+        added_imports = set(head_imports - base_imports)
+        if base is not None:
+            for name in base.signal_readings.keys() & head.signal_readings.keys():
+                old_tools, old_imports = base.signal_readings[name]
+                new_tools, new_imports = head.signal_readings[name]
+                diff_tools.update(old_tools ^ new_tools)
+                added_imports.update(new_imports - old_imports)
+        if diff_tools:
+            blk, line_no = _pick_loc(head_tool_locs, changed_indices, changed_set, min(diff_tools))
             txt = _get_text(blk, line_no)
             changes.append(
                 InstructionChange(
@@ -981,9 +1011,7 @@ def diff_instruction_trees(
             )
 
         # 3. import_added
-        base_imports = base.imports[0] if base is not None else frozenset()
-        head_imports, head_import_locs = head.imports
-        for imp in sorted(head_imports - base_imports):
+        for imp in sorted(added_imports):
             blk, line_no = _pick_loc(head_import_locs, changed_indices, changed_set, imp)
             txt = _get_text(blk, line_no)
             changes.append(

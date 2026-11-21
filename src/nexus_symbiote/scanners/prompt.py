@@ -607,7 +607,7 @@ def _run_starts_later_command(text: str) -> bool:
                 verb = next(verbs, None)
             if _starts_command(text, latest_end, target.start()):
                 return True
-        while verb is not None and verb.start() < sentence_end:
+        while verb is not None and verb.end() <= sentence_end:
             verb = next(verbs, None)
     return False
 

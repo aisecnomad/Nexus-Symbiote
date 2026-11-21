@@ -227,7 +227,7 @@ def _text_outside_code(text: str) -> list[str]:
         for line in lines:
             reader.read(line)
         reader.finish()
-    except _AmbiguousError as exc:
+    except _AmbiguousError:
         # A quote marker or a closing code span can put an import at the start of
         # rendered text even when the raw file has no whitespace before its @.
         alternatives = [text]
@@ -250,15 +250,20 @@ def _text_outside_code(text: str) -> list[str]:
                         rendered = _outside_spans(bare)
                         if rendered != inline:
                             alternatives.append(rendered)
-        if isinstance(exc, _HTMLDisagreementError):
-            for alternative in _read_html_dialects(lines, len(text)):
-                alternatives = _union(alternatives, alternative.parts)
+                    else:
+                        # The opener may be on an earlier line. Keep backticks in
+                        # the filename and leave ordinary inline-code examples alone.
+                        boundary = re.sub(r"(?<=[^\s`])`++(?=@)", " ", bare)
+                        if boundary != bare:
+                            alternatives.append(boundary)
+        for alternative in _read_html_dialects(lines, len(text)):
+            alternatives = _union(alternatives, alternative.parts)
         return alternatives
     return reader.parts
 
 
-def commonmark_blocks(text: str) -> list[tuple[str, str]]:
-    """Return ``(kind, content)`` for each CommonMark block in ``text``."""
+def commonmark_block_readings(text: str) -> dict[str, list[tuple[str, str]]]:
+    """Each bounded reading with its own code and container boundaries."""
     lines = _LINE_END.split(text)
     if text.endswith("\n"):
         lines.pop()
@@ -267,22 +272,16 @@ def commonmark_blocks(text: str) -> list[tuple[str, str]]:
         for line in lines:
             reader.read(line)
         reader.finish()
-    except _AmbiguousError as exc:
-        # Keep raw evidence as well as the block readings that expose signals inside
-        # quotes or lists. A marker before allowed-tools must not erase a grant.
-        blocks = [("paragraph", text)]
+    except _AmbiguousError:
+        # The raw reading keeps unmodeled evidence. A fenced example in that
+        # reading must not hide a new prose instruction in another reading.
+        readings = {"source": [("paragraph", "\n".join(lines))]}
         bare = "\n".join(_CONTAINER_MARKS.sub("", line, count=1) for line in lines)
-        if bare != "\n".join(lines):
-            blocks.append(("paragraph", bare))
-        if isinstance(exc, _HTMLDisagreementError):
-            seen = set(blocks)
-            for alternative in _read_html_dialects(lines, len(text), include_fence=True):
-                for block in alternative.blocks:
-                    if block not in seen:
-                        blocks.append(block)
-                        seen.add(block)
-        return blocks
-    return reader.blocks
+        readings["containers"] = [("paragraph", bare)]
+        for alternative in _read_html_dialects(lines, len(text), include_fence=True):
+            readings["ascii" if alternative.ascii_html else "unicode"] = alternative.blocks
+        return readings
+    return {"common": reader.blocks}
 
 
 class _Reader:
@@ -532,9 +531,12 @@ class _Reader:
             ):
                 self._close_unmatched()
                 content = "\n".join(parent.lines)
-                if _DEFINITION.match(content) or _FOOTNOTE.search(content):
+                if self.ascii_html is None and (
+                    _DEFINITION.match(content) or _FOOTNOTE.search(content)
+                ):
                     # A paragraph of nothing but definitions is no heading, and cmark-gfm
-                    # ends the paragraph at a footnote, which then takes the underline.
+                    # ends the paragraph at a footnote. Retain the raw reading and the
+                    # complete CommonMark heading reading of the rest of the file.
                     raise _AmbiguousError
                 self.parts.append(_outside_spans(content))
                 if parent.after_code:
