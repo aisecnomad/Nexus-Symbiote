@@ -528,6 +528,7 @@ JSON_HEADERS = {"Content-Type": "application/json"}
 SSE_HEADERS = {"Content-Type": "text/event-stream"}
 NOT_ASCII = "endpoint must be an ASCII HTTPS URL without controls"
 NOT_PLAIN = "endpoint credentials, queries, fragments or non-HTTPS scheme refused"
+NOT_DOTS = "endpoint dot segments refused"
 
 
 def raw_reply(
@@ -828,6 +829,10 @@ def test_a_bearer_credential_in_the_endpoint_is_refused_before_any_request(endpo
         ("https://fixture.example\\mcp", NOT_PLAIN),
         ("https://fixture%2eexample/mcp", NOT_PLAIN),
         ("https:///mcp", NOT_PLAIN),
+        ("https://fixture.example/a/../mcp", NOT_DOTS),
+        ("https://fixture.example/./mcp", NOT_DOTS),
+        ("https://fixture.example/a/%2E%2e/mcp", NOT_DOTS),
+        ("https://fixture.example/mcp/..", NOT_DOTS),
     ],
 )
 def test_endpoint_encoding_and_authority_checks_fail_before_any_request(endpoint, failure):
@@ -837,6 +842,15 @@ def test_endpoint_encoding_and_authority_checks_fail_before_any_request(endpoint
     assert not result.complete
     assert transport.calls == [] and transport.replies == [SENTINEL]
     assert result.endpoint == "[invalid-endpoint]"
+
+
+@pytest.mark.parametrize(
+    "path", ["/a%2F..%2Fmcp", "/x/.%2Fmcp", "/.well-known/mcp", "/v1.0/mcp", "/..hidden/mcp"]
+)
+def test_a_path_without_a_dot_segment_is_observed_as_written(path):
+    from nexus_symbiote.scanners.live_mcp import _endpoint
+
+    assert _endpoint("https://fixture.example" + path)[3] == path
 
 
 def test_an_allowed_origin_that_fails_the_same_checks_is_refused():

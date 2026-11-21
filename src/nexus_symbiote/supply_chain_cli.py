@@ -249,7 +249,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
     @click.option(
         "--require-full-url-binding",
         is_flag=True,
-        help="Refuse --transport-evidence for a server whose inventory records no full-URL digest. It compares the evidence with the digest the inventory records, not with the configured URL: an inventory that records the digest of another URL satisfies it.",
+        help="Refuse --transport-evidence for a server whose inventory endpoint names no path and records no full-URL digest. It compares the evidence with the inventory, not with the configured URL: an inventory that names or records another URL satisfies it.",
     )
     @click.option(
         "--no-isolation",
