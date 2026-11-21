@@ -445,6 +445,24 @@ def _unsigned_discovery_flags(fail_on_unsigned_discovery: bool, allow: bool) -> 
         )
 
 
+DISCOVERY_SIGNATURE_NEEDS_PROJECT = (
+    "The policy sets validate.require_discovery_signature and the inventory carries "
+    "ShadowScan discovery evidence; only --project with --signature-policy can verify "
+    "the report's signer."
+)
+
+
+def _discovery_signature_unverifiable(policy: Policy, bom: AIBOM) -> bool:
+    """The policy requires a verified discovery signer that this run has no project to check.
+
+    ``--allow-unsigned-discovery`` does not waive it: like ``scan --check``, the policy
+    requirement is the operator's and only a producer check over the report bytes meets it.
+    """
+    from nexus_symbiote.validators.completeness import carries_discovery_evidence
+
+    return policy.validation.require_discovery_signature and carries_discovery_evidence(bom)
+
+
 def _unsigned_discovery_failure_reason(
     bom: AIBOM,
     *,
@@ -2027,6 +2045,7 @@ def validate(
     # Only the reconciliation below may claim that the inventory was compared with the project.
     basis = "project-not-reconciled" if root is not None else "supplied-bom"
     bound_imports: frozenset[str] = frozenset()
+    supplier_observed: frozenset[str] = frozenset()
     completeness: dict[str, Any] = {"status": "skipped", "skipped_by": "policy"}
     if policy.validation.require_completeness:
         cv = CompletenessValidator()
@@ -2042,6 +2061,7 @@ def validate(
         )
         completeness = {"status": "pass" if c_report.is_complete else "fail", **c_report.to_dict()}
         bound_imports = c_report.bound_imports
+        supplier_observed = c_report.supplier_observed
         if root is not None:
             # The risk command's vocabulary: reconciled, with supplier claims, or failed.
             basis = c_report.basis
@@ -2082,6 +2102,9 @@ def validate(
         )
         discovery = {"status": status, "problems": problems}
         passed = passed and not problems
+    elif root is None and _discovery_signature_unverifiable(policy, bom):
+        discovery = {"status": "failed", "problems": [DISCOVERY_SIGNATURE_NEEDS_PROJECT]}
+        passed = False
     elif carries_discovery_evidence(bom):
         discovery = {"status": "not-verified", "problems": []}
     producer_verified = discovery is not None and discovery["status"] == "verified"
@@ -2092,7 +2115,9 @@ def validate(
         already_verified=producer_verified,
     )
     passed = passed and unsigned_reason is None
-    assurance_errors = assurance_problems(bom, minimum, imported_claims=bound_imports)
+    assurance_errors = assurance_problems(
+        bom, minimum, imported_claims=bound_imports, supplier_observed=supplier_observed
+    )
     # Graph integrity is structural and cannot be disabled by a coverage policy.
     graph_issues = validate_graph(bom)
     passed = passed and not assurance_errors and not graph_issues
@@ -2387,6 +2412,8 @@ def risk(
         allow_unsigned_discovery=allow_unsigned_discovery,
         already_verified=producer_verified,
     )
+    if root is None and _discovery_signature_unverifiable(policy, bom):
+        unsigned_reason, producer = DISCOVERY_SIGNATURE_NEEDS_PROJECT, "failed"
     if unsigned_reason is not None:
         reasons = [unsigned_reason]
         if attestation_failure_reason is not None:

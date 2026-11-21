@@ -682,7 +682,17 @@ class AIBOMDiffer:
         new_hash = getattr(new, "definition_hash", None)
         old_hash_version = getattr(old, "definition_hash_version", None)
         new_hash_version = getattr(new, "definition_hash_version", None)
-        if (
+        # Digests under one named profile are comparable even when it is not current; an
+        # absent profile names no serializer, so two absent ones are not.
+        comparable = old_hash_version == new_hash_version and new_hash_version is not None
+        if old_hash and new_hash and old_hash != new_hash and comparable:
+            modifications.append(
+                {
+                    "detail": "Tool definition hash changed — possible rug-pull attack.",
+                    "severity": "critical",
+                }
+            )
+        elif (
             old_hash
             and new_hash
             and (
@@ -696,14 +706,6 @@ class AIBOMDiffer:
                     "severity": "high",
                 }
             )
-        elif old_hash and new_hash and old_hash != new_hash:
-            modifications.append(
-                {
-                    "detail": "Tool definition hash changed — possible rug-pull attack.",
-                    "severity": "critical",
-                }
-            )
-
         elif old_hash and not new_hash:
             modifications.append(
                 {
@@ -1260,10 +1262,12 @@ class AIBOMDiffer:
                 "discovery_verification",
                 "ShadowScan discovery evidence is no longer signature-verified.",
             )
-        elif before_status != "verified" and after_status == "verified":
+        elif before_status != "verified" and after is not None and after.status == "verified":
+            # The snapshot is unsigned, so the reviewer must see whose signature it claims.
             improvement(
                 "discovery_verification",
-                "ShadowScan discovery evidence is now signature-verified.",
+                "ShadowScan discovery evidence is now signature-verified (signer "
+                f"{_clip(after.signer_identity)}, issuer {_clip(after.issuer)}).",
             )
         elif (
             before is not None
