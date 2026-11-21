@@ -279,7 +279,9 @@ def test_scan_with_payload_project_policy_fails_closed_promptly(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
     (project / ".nexus-symbiote.yaml").write_text(MIB_PAYLOAD, encoding="utf-8")
-    scanned = limited_scan(tmp_path, "-o", str(tmp_path / "aibom.json"), str(project))
+    scanned = limited_scan(
+        tmp_path, "--accept-project-policy", "-o", str(tmp_path / "aibom.json"), str(project)
+    )
     assert scanned.returncode == 1, scanned.stderr[-2000:]
     assert "invalid or unsupported settings: x" in scanned.stderr
     assert not (tmp_path / "aibom.json").exists()
