@@ -68,6 +68,8 @@ change them. See [collection limits](collection-limits.md).
 | [`verify-artifact`](#verify-artifact) | offline | Check a file's SHA-256, and optionally its Sigstore bundle |
 | [`verify-discovery`](#verify-discovery) | offline | Check that a ShadowScan report's bytes match the digest a BOM records; with `--projection` or `--bundle`, also compare the BOM's imported components with the report |
 | [`export-inventory`](#export-inventory) | offline | Write the reviewed repository agent as an approved inventory that ShadowScan's `--inventory` accepts |
+| [`import-sbom`](#import-sbom) | offline | Import a foreign CycloneDX or SPDX SBOM as DECLARED evidence without picking silent winners |
+| [`evidence-profile`](#evidence-profile) | offline | Report concrete evidence attributes per component without a scalar TrustScore |
 | [`init`](#init) | offline | Create a `.nexus-symbiote.yaml` policy file |
 | [`runtime keygen`](#runtime-keygen) | offline | Create an Ed25519 key pair for runtime contracts |
 | [`runtime sign`](#runtime-sign) | offline | Sign a runtime contract |
@@ -275,8 +277,8 @@ directory above the policy are owned by root or by you.
 
 | Command | Document |
 |---|---|
-| `validate --json-output` | `passed`; `assessment_basis` (`supplied-bom`, `project-reconciled`, `project-reconciled-with-supplier-claims`, `project-reconciliation-failed`, or `project-not-reconciled` when the project policy skips the completeness check); `policy_source` and `policy_weakened`; `completeness` and `integrity`, each with a `status` (`pass`, `fail`, `unknown` for integrity, or `skipped` with `skipped_by`) and the validator's report (its own `assessment_basis`, issues, `issues_omitted`; for completeness `supplier_claims` and `supplier_claims_omitted`; for integrity `bytes_charged`); `discovery_producer` (`null` without discovery evidence or a producer check, otherwise a `status` of `verified`, `failed`, `not-applicable` or `not-verified`, with `problems`); `unsigned_discovery` (`null`, or why unverified discovery evidence failed the run); `minimum_assurance_level`, `assurance_errors` and `graph_issues`. |
-| `risk --json-output` | `passed`; `overall_score` (`null` when the run is not scored: `--project` reconciliation or the discovery producer check failed, or unverified discovery evidence was gated); `risk_level`; `coverage_status` and `coverage_gaps`; `gate_reasons`; `gate` (the effective thresholds, cutoff, ignored categories and suppression count, each with a `*_source` of `cli`, `project policy` or `built-in`); `findings`, each with its `fingerprint`; `severity_counts`; `category_scores`; `ignored_findings`; `suppressed_findings`, `suppressions_expired`, `suppressions_unused` and `suppressions_stale`; `total_components` and `components_with_risks`; `warning_threshold_exceeded`; `assessment_basis` (`supplied-bom`, `project-reconciled`, `project-reconciled-with-supplier-claims`, `project-reconciliation-failed`, or `unsigned-discovery-evidence` when unverified discovery evidence fails the run); `supplier_claims` and `supplier_claims_omitted`; `discovery_producer` (`verified`, `failed`, `not-verified` or `not-applicable`); `score_threshold` (`null` with `--no-score-threshold`); `fail_on_severity`; `policy_source` and `policy_weakened`. A failed reconciliation has the same keys, with empty findings. |
+| `validate --json-output` | `passed`; `assessment_basis` (`supplied-bom`, `project-reconciled`, `project-reconciled-with-supplier-claims`, `project-reconciliation-failed`, or `project-not-reconciled` when the project policy skips the completeness check); `verification_mode` (`static-offline`); `policy_source` and `policy_weakened`; `completeness` and `integrity`, each with a `status` (`pass`, `fail`, `unknown` for integrity, or `skipped` with `skipped_by`) and the validator's report (its own `assessment_basis`, issues, `issues_omitted`; for completeness `supplier_claims` and `supplier_claims_omitted`; for integrity `bytes_charged`); optional `attestation` when `--require-attestation` is given; `discovery_producer` (`null` without discovery evidence or a producer check, otherwise a `status` of `verified`, `failed`, `not-applicable` or `not-verified`, with `problems`); `unsigned_discovery` (`null`, or why unverified discovery evidence failed the run); `minimum_assurance_level`, `assurance_errors` and `graph_issues`. |
+| `risk --json-output` | `passed`; `overall_score` (`null` when the run is not scored: `--project` reconciliation or the discovery producer check failed, or unverified discovery evidence was gated); `risk_level`; `coverage_status` and `coverage_gaps`; `gate_reasons`; `gate` (the effective thresholds, cutoff, ignored categories and suppression count, each with a `*_source` of `cli`, `project policy` or `built-in`); `findings`, each with its `fingerprint`; `severity_counts`; `category_scores`; `ignored_findings`; `suppressed_findings`, `suppressions_expired`, `suppressions_unused` and `suppressions_stale`; `total_components` and `components_with_risks`; `warning_threshold_exceeded`; `assessment_basis` (`supplied-bom`, `project-reconciled`, `project-reconciled-with-supplier-claims`, `project-reconciliation-failed`, or `unsigned-discovery-evidence` when unverified discovery evidence fails the run); `verification_mode` (`static-offline`); optional `attestation` when `--require-attestation` is given; `supplier_claims` and `supplier_claims_omitted`; `discovery_producer` (`verified`, `failed`, `not-verified` or `not-applicable`); `score_threshold` (`null` with `--no-score-threshold`); `fail_on_severity`; `policy_source` and `policy_weakened`. A failed reconciliation has the same keys, with empty findings. |
 | `diff --json-output` | `has_changes`, `total_changes`, `components_added`, `components_removed`, `components_modified`, `dependencies_added`, `dependencies_removed` (each with its `severity` and `conditions`), `security_alerts`, `metadata_changes` and `notes`. |
 | `diff-instructions --json-output` | `format` (`nexus-symbiote/instruction-diff/v1`), `base_tree`, `head_tree`, `files_scanned`, `failures` (`base`, `head`), `excluded` (`base`, `head`), `changes` (each with `class`, `file`, `block_index`, `summary` and optional redacted `text`), and `summary` (`total_changes`, `total_failures`, `total_excluded`, `by_class`). |
 | `summary --json-output` | `total_components`, `component_types`, `total_dependencies`, `total_risks`, `risk_breakdown` and the inventory's `completeness` claim. |
@@ -342,7 +344,7 @@ nexus-symbiote advisories [OPTIONS] AIBOM_PATH
 | `--exclude` `NAME` | Never send this package name to OSV; a trailing `*` matches a prefix, and a `*` anywhere else is refused. Names are compared as PyPI normalizes them, and in any case (repeatable). |
 | `--exclude-private-origins` | Send only packages whose lockfile resolution records the public PyPI or npm registry. A Python package that no `uv.lock` or `poetry.lock` resolves has no recorded origin, so it is withheld; withhold private names with `--exclude` instead to keep public ones checked. |
 | `--dry-run` | List the package identities that would be sent, without contacting OSV (works offline). |
-| `--offline-db` `PATH` | Match exact pinned PyPI/npm packages offline against an OSV JSON bundle or directory without contacting `api.osv.dev`; deduplicates alias pairs and records bundle SHA-256 provenance. A directory is read flat, and one with a subdirectory is refused, as is a bundle with no records, with an entry that is not an OSV record, or with two different records under one id. A package whose ecosystem the bundle holds no record for is an error, so the report is not complete, as is a record for the package with malformed `affected` data or an unparsable `introduced` (at most 100 such errors are listed, then a count). A `fixed`, `last_affected` or `limit` the version parser rejects is not an error: the advisory matches unless the lower bound excludes the version, the version is at or above every `limit` while all limits parse and none is `*`, or a parsable bound does and event order puts no rejected bound in the version's interval, and when no exact `versions` entry or other range decides the match it carries `range_undecidable: true` and up to 16 `undecidable_bounds` (64 characters each). Like any match it fails this command; an operator decision passed to `vex --decisions` records its triage there, and the `vex` export marks it `rangeUndecidable`. Matching stops with one error, and exit status 1, past the [`advisory-matches`](collection-limits.md#limits) limit. |
+| `--offline-db` `PATH` | Match exact pinned PyPI/npm packages offline against an OSV JSON bundle or directory without contacting `api.osv.dev`; deduplicates alias pairs and records bundle SHA-256 provenance. A directory is read flat, and one with a subdirectory is refused, as is a bundle with no records, with an entry that is not an OSV record, or with two different records under one id. A package whose ecosystem the bundle holds no record for is an error, so the report is not complete, as is a record for the package with malformed `affected` data, an unparsable `introduced`, a range `type` the OSV schema does not define, or a range with no `introduced` event (at most 100 such errors are listed, then a count); a GIT range is skipped, since it is matched by commit, not version. A `fixed`, `last_affected` or `limit` the version parser rejects is not an error: the advisory matches unless the lower bound excludes the version, the version is at or above every `limit` while all limits parse and none is `*`, or a parsable bound does and event order puts no rejected bound in the version's interval, and when no exact `versions` entry or other range decides the match it carries `range_undecidable: true` and up to 16 `undecidable_bounds` (64 characters each). Like any match it fails this command; an operator decision passed to `vex --decisions` records its triage there, and the `vex` export marks it `rangeUndecidable`. Matching stops with one error, and exit status 1, past the [`advisory-matches`](collection-limits.md#limits) limit. |
 | `--kev` `PATH` | Offline CISA/ENISA KEV JSON catalog used with `--offline-db` to elevate matched advisories to `critical` with source provenance (repeatable). A catalog with no entries is refused. |
 | `--epss` `PATH` | Offline EPSS CSV/JSON catalog used with `--offline-db` to attach EPSS scores and percentiles. A catalog with no entries is refused. |
 | `--max-feed-age-days` `INTEGER RANGE` | With `--offline-db`, the report is incomplete (exit 1) when the bundle's newest record, a KEV catalog's `dateReleased` or the EPSS `score_date` is missing or more than this many days old (1 to 36500; default: 30). The check cannot be turned off. |
@@ -571,6 +573,21 @@ nexus-symbiote discover-mcp [OPTIONS] ENDPOINT
 | `--user-agent` `TEXT` | `User-Agent` header to send; none is sent by default. |
 | `--raw-descriptors` `PATH` | Also write the unredacted server info, capabilities, instructions, tool descriptors, prompts and resource templates to this new file (mode 0600) for review; only the bearer token is masked, and a server whose declarations repeat its own session ID (of eight or more characters) ends the observation. |
 
+### `evidence-profile`
+
+Report concrete evidence attributes per component without a scalar TrustScore (`signed_under_policy` is `true` only when `--project` and `--signature-policy` corroborate the artifact; inventory `signing_status` assertions appear separately under `declared_signing_status`).
+
+```text
+nexus-symbiote evidence-profile [OPTIONS] AIBOM_PATH
+```
+
+| Option | Description |
+|---|---|
+| `-o`, `--output` `PATH` | Write the evidence profile report to this file instead of standard output. |
+| `--project` `DIRECTORY` | Project root for corroborating artifact signatures and digest pins under `--signature-policy`. |
+| `--signature-policy` `FILE` | Explicit operator signer policy JSON outside the project; requires `--project`. |
+| `--json-output` | Emit the per-component evidence profile as JSON. |
+
 ### `export-inventory`
 
 Offline: write the reviewed repository agent as a ShadowScan approved inventory.
@@ -621,6 +638,24 @@ Content-Security-Policy hash, and shows inventory text only escaped. A graph lar
 than `--max-nodes` fails with exit status 1 instead of being cut. The output may not
 be the inventory itself. [Graph view](graph-view.md) gives the risk-class rules, the
 ranking and the JSON document.
+
+### `import-sbom`
+
+Import a foreign CycloneDX or SPDX SBOM as DECLARED evidence without picking silent winners. By default component names are hashed (`imported-<16hex>`): keyed HMAC-SHA256 (`hmac-sha256`) when `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` has at least 32 characters, or unsalted SHA-256 (`unsalted-sha256`) otherwise. Local digest matching (`declared_digest_local_match`) checks only non-empty, non-symlink, non-credential artifact files of matching type beneath `--project` and never sets `digest_bound`. The project is always walked, but files are hashed only when the SBOM declares a SHA-256, within the `model-bytes` and `model-total-bytes` limits; a file larger than `model-bytes` is left unbound, warned about and listed in `scan_failures`, while any other limit reached under `--project` ends the import with exit 1. Conflicts are found by purl, and by name within one ecosystem; an entry whose ecosystem is unknown (no purl) is compared with every record of the same name.
+
+```text
+nexus-symbiote import-sbom [OPTIONS] FOREIGN_BOM_PATH
+```
+
+| Option | Description |
+|---|---|
+| `-o`, `--output` `PATH` | Write the resulting native AgentBOM JSON to this file (must lie outside `--project`). |
+| `--into` `PATH` | Existing native AgentBOM to merge imported SBOM claims into. |
+| `--project` `PATH` | Trusted project root for SHA-256 local file binding, nested manifests, and shape census. |
+| `--reveal-names` | Retain plain component names from the foreign SBOM instead of hashed names. |
+| `--walk-manifests` | Walk nested manifests below `--project` and record manifest-only vs locked pinning state. |
+| `--census` | Count unread non-control-plane artifact shapes (`*.ipynb`, `n8n/*.json`, `*.tf`, `Chart.yaml`). |
+| `--json-output` | Print a structured JSON summary of imported, bound, and conflicting entries. |
 
 ### `import-shadowscan`
 
@@ -702,6 +737,12 @@ nexus-symbiote risk [OPTIONS] AIBOM_PATH
 | `--operator-policy-key` `FILE` | Trusted Ed25519 public key for `--operator-policy-attestation` (repeatable). |
 | `--allow-unsigned-operator-policy` | Accept `--operator-policy` without a verified DSSE signature envelope. |
 | `--operator-policy-max-age-days` `INT` | Maximum attestation age in days when `--operator-policy-attestation` is verified (default: `90`; `0` disables). |
+| `--require-attestation` `ENVELOPE` | Require a verified DSSE inventory attestation envelope for `AIBOM_PATH`; requires at least one `--trusted-key`. |
+| `--trusted-key` `FILE` | Trusted Ed25519 public key PEM for `--require-attestation`; must lie outside every git working tree holding `AIBOM_PATH`, the envelope, `--project` or the current directory (repeatable). |
+| `--attestation-purpose` `generated\|reviewed` | Purpose the attestation must have been signed for (default: `reviewed`). |
+| `--attestation-threshold` `INTEGER RANGE` | Minimum number of distinct trusted keys that must have signed, 1 to 32 (default: `1`). |
+| `--attestation-match` `bytes\|content` | `bytes` (default): `AIBOM_PATH` is the attested file; `content`: same inventory content digest. |
+| `--attestation-max-age-days` `INTEGER RANGE` | Refuse an attestation signed more than this many days ago (1 to 36500). |
 | `--detailed-exit-codes` | Use distinct exit codes (`0` passed, `2` usage, `3` gate failed, `4` collection/input failure). |
 | `--legacy-exit-codes` | Use legacy exit codes (`0` passed, `1` gate/input failed, `2` usage). |
 
@@ -966,6 +1007,12 @@ nexus-symbiote validate [OPTIONS] AIBOM_PATH
 | `--operator-policy-key` `FILE` | Trusted Ed25519 public key for `--operator-policy-attestation` (repeatable). |
 | `--allow-unsigned-operator-policy` | Accept `--operator-policy` without a verified DSSE signature envelope. |
 | `--operator-policy-max-age-days` `INT` | Maximum attestation age in days when `--operator-policy-attestation` is verified (default: `90`; `0` disables). |
+| `--require-attestation` `ENVELOPE` | Require a verified DSSE inventory attestation envelope for `AIBOM_PATH`; requires at least one `--trusted-key`. |
+| `--trusted-key` `FILE` | Trusted Ed25519 public key PEM for `--require-attestation`; must lie outside every git working tree holding `AIBOM_PATH`, the envelope, `--project` or the current directory (repeatable). |
+| `--attestation-purpose` `generated\|reviewed` | Purpose the attestation must have been signed for (default: `reviewed`). |
+| `--attestation-threshold` `INTEGER RANGE` | Minimum number of distinct trusted keys that must have signed, 1 to 32 (default: `1`). |
+| `--attestation-match` `bytes\|content` | `bytes` (default): `AIBOM_PATH` is the attested file; `content`: same inventory content digest. |
+| `--attestation-max-age-days` `INTEGER RANGE` | Refuse an attestation signed more than this many days ago (1 to 36500). |
 | `--detailed-exit-codes` | Use distinct exit codes (`0` passed, `2` usage, `3` gate failed, `4` collection/input failure). |
 | `--legacy-exit-codes` | Use legacy exit codes (`0` passed, `1` gate/input failed, `2` usage). |
 
@@ -1004,6 +1051,9 @@ nexus-symbiote verify-artifact [OPTIONS] ARTIFACT_PATH
 | `--issuer` `TEXT` | Expected Sigstore OIDC issuer |
 | `--trust-root` `PATH` | Explicit Sigstore trusted_root.json file (or directory holding one); overrides `NEXUS_SYMBIOTE_SIGSTORE_TRUST_ROOT` and the user cache; requires `--bundle` |
 | `--trust-root-sha256` `TEXT` | Pinned SHA-256 (sha256:\<hex\>) the explicit trust root must match; requires `--bundle` |
+| `--oms-dsse` | Verify an OpenSSF Model Signing DSSE in-toto Statement/v1 Sigstore bundle. |
+| `--rekor-root-hash` `TEXT` | Operator-witnessed Rekor checkpoint root hash (`sha256:<hex>`) that the bundle inclusion proof must match. |
+| `--minimum-rekor-tree-size` `INT` | Minimum Rekor transparency log tree size required in the bundle checkpoint. |
 
 A malformed `--sha256`, or a `--bundle`, `--signer-identity` and `--issuer` set that
 is incomplete, is a usage error (exit 2).
@@ -1070,6 +1120,7 @@ nexus-symbiote verify-live [OPTIONS] AIBOM_PATH
 |---|---|
 | `--project` `DIRECTORY` | Untrusted project root (required); the launch policy must be outside it and outside every repository that encloses the project or the inventory. |
 | `--launch-policy` `FILE` | Operator-owned JSON outside the project: exact server references to absolute commands and SHA-256 pins; see [launch policy](#launch-policy). (required) |
+| `--allow-host-credentials` | Allow verification while credential environment variables are set on the host. The launcher starts with a cleared environment. Use an isolated worker to protect host credentials. |
 | `--json-output` | Output the verification report as JSON. |
 | `--record` | Print an unsigned candidate BOM with the observed descriptors instead of a report; exits 1 when served tools, declarations or the server identity drifted, unless `--accept-drift`. |
 | `--accept-drift` | With `--record`, exit 0 although changed or new tools, declarations or server identity were recorded. |
