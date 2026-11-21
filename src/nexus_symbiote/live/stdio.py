@@ -65,6 +65,7 @@ class PinnedObservation:
     prompts: list[dict[str, Any]] | None = None
     resource_templates: list[dict[str, Any]] | None = None
     launcher_sha256: str | None = field(default=None)
+    teardown_confirmed: bool = False
 
 
 def _ready(fd: int, event: int, deadline: float) -> None:
@@ -227,11 +228,10 @@ def _capture(binary: Path, work: Path) -> PinnedObservation:
             observation.resource_templates = listing(
                 "resources/templates/list", "resourceTemplates", "uriTemplate"
             )
-        return observation
     finally:
         try:
             try:
-                terminate_process_group(proc)
+                teardown_confirmed = terminate_process_group(proc)
             except PinnedProcessError as exc:
                 raise LaunchPolicyError(exc.reason, str(exc)) from exc
         finally:
@@ -241,6 +241,8 @@ def _capture(binary: Path, work: Path) -> PinnedObservation:
                 proc.stdout.close()
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5.0)
+    observation.teardown_confirmed = teardown_confirmed
+    return observation
 
 
 def observe_pinned(command: str, digest: str) -> PinnedObservation:
