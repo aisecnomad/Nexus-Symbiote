@@ -284,37 +284,45 @@ _RULE_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=\S*")
 _WINDOWS_SUFFIX = re.compile(r"\.(?:exe|cmd|bat|com)\Z", re.IGNORECASE)
 
 
-def _rule_program(specifier: str) -> str:
-    """A Bash rule's specifier with its program as a bare name.
+_QUOTED_RULE_PROGRAM = re.compile(r"""(?:"([^"]*)"|'([^']*)')(?=\s|:|\Z)""")
+_EVAL_ARGUMENT = re.compile(r"\s+(?:-c|-e|/c|--?command)(?=\s|:|\Z)", re.IGNORECASE)
 
-    Leading `VAR=val` words are dropped, the program's directory is removed whether
-    written with `/` or `\\` (an unquoted `C:\\Program Files\\...` path included), and a
-    Windows `.exe`, `.cmd`, `.bat` or `.com` suffix is removed: `C:\\Python312\\python.exe
-    -c *` is `python -c *`.
-    """
+
+def _rule_program(specifier: str) -> tuple[str, str]:
+    """Separate the bare program name from its Bash permission rule arguments."""
     words = specifier.split()
     index = 0
     while index < len(words) - 1 and _RULE_ASSIGNMENT.fullmatch(words[index]):
         index += 1
     if index >= len(words):
-        return specifier
+        return "", ""
+    command = " ".join(words[index:])
+    quoted = _QUOTED_RULE_PROGRAM.match(command)
+    if quoted:
+        path = quoted[1] if quoted[1] is not None else quoted[2]
+        program = re.split(r"[/\\]", path)[-1]
+        return _WINDOWS_SUFFIX.sub("", program), command[quoted.end() :]
+
+    # Preserve the existing recognition of an unquoted Windows path with spaces.
     end = index + 1
     while "\\" in words[index] and end < len(words) and "\\" in words[end]:
         end += 1
-    program = " ".join(words[index:end]).strip("\"'")
-    program = re.split(r"[/\\]", program)[-1]
-    return " ".join([_WINDOWS_SUFFIX.sub("", program), *words[end:]])
+    path = " ".join(words[index:end]).strip("\"'")
+    program = re.split(r"[/\\]", path)[-1]
+    name, colon, pattern = program.partition(":")
+    arguments = " " + " ".join(words[end:]) if words[end:] else ""
+    return _WINDOWS_SUFFIX.sub("", name), colon + pattern + arguments
 
 
-def _runs_any_command(specifier: str) -> bool:
+def _runs_any_command(program: str, arguments: str) -> bool:
     """Whether a wildcard Bash rule names a known command runner or interpreter."""
-    if "*" not in specifier:
+    if "*" not in program and "*" not in arguments:
         return False
-    words = specifier.split(":", 1)[0].split()
-    if not words:
-        return False
-    program = words[0].lower()
-    return program in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(program) is not None
+    name = program.lower()
+    if " " in name and _EVAL_ARGUMENT.match(arguments):
+        # A locally named interpreter such as "my python.exe" with an evaluation switch.
+        name = name.rsplit(" ", 1)[-1]
+    return name in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(name) is not None
 
 
 def _broad_grants(allowed: list[str]) -> list[str]:
@@ -341,8 +349,10 @@ def _broad_grants(allowed: list[str]) -> list[str]:
             continue
         broad = specifier is None or bool(_WILDCARD_SPECIFIER.fullmatch(specifier))
         if key == "bash" and specifier is not None:
-            program = _rule_program(specifier)
-            broad |= _runs_any_command(program) or bool(_SUBSHELL_SPECIFIER.fullmatch(program))
+            program, arguments = _rule_program(specifier)
+            broad |= _runs_any_command(program, arguments) or bool(
+                _SUBSHELL_SPECIFIER.fullmatch(program + arguments)
+            )
         if key == "webfetch" and specifier is not None:
             # `domain:**` and `domain:*.*` match every host, as `domain:*` does.
             domain = specifier.replace(" ", "")
