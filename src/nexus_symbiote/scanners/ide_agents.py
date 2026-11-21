@@ -308,9 +308,17 @@ def _rule_program(specifier: str) -> tuple[str, str]:
     while "\\" in words[index] and end < len(words) and "\\" in words[end]:
         end += 1
     path = " ".join(words[index:end]).strip("\"'")
+    arguments = " " + " ".join(words[end:]) if words[end:] else ""
+    drive_end = 2 if re.match(r"[A-Za-z]:[\\/]", path) else 0
+    separator = path.find(":", drive_end)
+    if separator >= 0:
+        prefix = re.split(r"[/\\]", path[:separator])[-1]
+        runner = _WINDOWS_SUFFIX.sub("", prefix)
+        scoped = path[separator:] + arguments
+        if _runs_any_command(runner, scoped):
+            return runner, scoped
     program = re.split(r"[/\\]", path)[-1]
     name, colon, pattern = program.partition(":")
-    arguments = " " + " ".join(words[end:]) if words[end:] else ""
     return _WINDOWS_SUFFIX.sub("", name), colon + pattern + arguments
 
 
@@ -1353,7 +1361,7 @@ def _executable_index(words: list[str]) -> int | None:
     index = 0
     while index < len(words):
         raw = _decode_word(words[index], drop_ifs=True).strip()
-        if raw in {"(", "{", ")", "}"}:
+        if raw in {"(", "{", ")", "}"} or _assignment(raw):
             index += 1
             continue
         names = _name_variants(words[index])
@@ -1708,14 +1716,15 @@ _OUTPUT_REDIRECTION = re.compile(
 )
 
 
-def _saved_names(segment: str) -> tuple[set[str], set[str]]:
-    """Filenames a downloader's output option, and a redirection, in this segment write.
+def _saved_names(segment: str) -> tuple[set[str], set[str], set[str]]:
+    """Explicit output, URL-derived filenames and redirected output in this segment.
 
     Standard output is excluded. One forward pass: a segment of repeated downloaders must
     not rescan its tail.
     """
     words = _shell_words(segment)
     saved: set[str] = set()
+    inferred: set[str] = set()
     tool: str | None = None
     # One downloader's URLs, and whether it names its output or saves under the URL's name.
     urls: list[str] = []
@@ -1724,11 +1733,11 @@ def _saved_names(segment: str) -> tuple[set[str], set[str]]:
 
     def url_names() -> None:
         if (tool == "wget" and not named) or (tool == "curl" and remote):
-            for url in urls[:64]:
+            for url in urls:
                 for name in _url_file_names(url, "index.html" if tool == "wget" else None):
-                    saved.update(_file_keys(name))
+                    inferred.update(_file_keys(name))
 
-    while cursor < len(words) and len(saved) < 64:
+    while cursor < len(words):
         names = _name_variants(words[cursor])
         detected = _downloader_name(names)
         if detected is not None:
@@ -1759,7 +1768,7 @@ def _saved_names(segment: str) -> tuple[set[str], set[str]]:
     if tool is not None or _segment_fetches(segment):
         for redirection in _OUTPUT_REDIRECTION.finditer(segment):
             redirected.update(_file_keys(redirection.group("target")))
-    return saved, redirected
+    return saved, inferred, redirected
 
 
 # Runners the released classifier counted a file a downloader's output option wrote as
@@ -2157,8 +2166,9 @@ def _download_then_run(pipelines: list[list[str]]) -> bool:
             source = (
                 "download" if names & saved.fetched else "decode" if copied is not None else None
             )
-            options, written = _saved_names(segment)
+            options, inferred, written = _saved_names(segment)
             saved.add_outputs(options)
+            saved.add_downloaded(inferred)
             if fetched:
                 written |= _relayed_names(segment)
             written |= copied or set()
@@ -2432,28 +2442,32 @@ def _powershell_name(token: str, plain: bool) -> bool:
 def _computed_powershell(segment: str) -> int | None:
     """Offset of the command word when the shell computes a name that may be PowerShell.
 
-    `$p` or `/usr/bin/pw?h` in command position runs whatever the variable or glob names,
-    so an encoded-command flag after it is rated as PowerShell's, failing closed.
+    A variable or glob can select PowerShell. A short `-e` switch is shared by
+    other programs, so require a program-name hint or a longer encoded-command switch.
     """
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
-    skip = 0
-    while skip < len(words) and _assignment(_decode_word(words[skip], drop_ifs=True)):
-        skip += 1
-    index = _executable_index(words[skip:])
+    index = _executable_index(words)
     if index is None:
         return None
-    word = words[skip + index]
+    word = words[index]
     pattern = _EXPANSION.sub("*", re.split(r"[/\\]", word)[-1])
     if not any(char in pattern for char in "*?["):
         return None
     pattern = re.sub(r"\*+", "*", _decode_word(pattern, drop_ifs=True).lower())
+    stem = _WINDOWS_SUFFIX.sub("", pattern)
+    literal = re.sub(r"\[[^]]*\]", "", stem)
+    if re.search(r"[a-z]{2}", literal) is None and not any(
+        len(flag.group().lstrip("\"'‘’“”\\^`-/–—―")) > 1
+        for flag in _ENCODED_COMMAND.finditer(segment, spans[index][1])
+    ):
+        return None
     # A longer pattern is mostly bracket expressions; it is not matched, so as not to
     # compile hostile globs, and is read as PowerShell.
     if len(pattern) > 64 or any(
         fnmatch.fnmatchcase(name, pattern) for name in _POWERSHELL_FILE_NAMES
     ):
-        return spans[skip + index][0]
+        return spans[index][0]
     return None
 
 
