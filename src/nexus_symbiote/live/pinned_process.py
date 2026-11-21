@@ -19,8 +19,10 @@ the wrapper had adopted may have left the tree, as it does when something below 
 wrapper cannot be killed. An opted-out launch also joins a private cgroup v2 when the
 current cgroup allows a child, and cleanup writes ``cgroup.kill``, and it signals every
 process still in the wrapper's session; that cgroup, where one exists, still reaches
-what a launcher that killed its wrapper started. Elsewhere that cleanup is best effort.
-Neither is a PID or filesystem namespace.
+what a launcher that killed its wrapper started. Neither is a PID or filesystem
+namespace. Off Linux the opt-out is refused before anything runs, as the default launch
+is: only ``killpg`` would remain there, and a process that leaves the launcher's group
+would outlive a session that reported success.
 """
 
 from __future__ import annotations
@@ -231,14 +233,32 @@ def isolation_enabled() -> bool:
     return _ISOLATION.get()
 
 
+def opt_out_supported() -> bool:
+    """Whether this host may run an opted-out launch: only Linux has the subreaper
+    wrapper and the /proc sweep that reach a process leaving the launcher's group."""
+    return sys.platform.startswith("linux")
+
+
 @contextlib.contextmanager
 def isolation_off() -> Iterator[None]:
-    """Explicitly accept a launch without kernel containment; descendants can escape."""
+    """Explicitly accept a launch without kernel containment; descendants can escape.
+
+    Only on Linux: elsewhere every launch in this context is refused with
+    ``isolation-unavailable`` before anything is executed.
+    """
     token = _ISOLATION.set(False)
     try:
         yield
     finally:
         _ISOLATION.reset(token)
+
+
+def teardown_verifiable() -> bool:
+    """Whether the configured mode can support verified cleanup if its prerequisites hold.
+
+    Only the receipt from terminate_process_group confirms an individual launch.
+    """
+    return isolation_enabled() or sys.platform.startswith("linux")
 
 
 def stage_pinned_executable(command: str, digest: str, work: Path) -> Path:
@@ -288,8 +308,11 @@ def namespace_available() -> bool:
 
     The result is cached. Ubuntu 24.04 with AppArmor's unprivileged-user-namespace
     restriction returns false; the probe is one short ``unshare`` of ``/bin/true``.
+    Only Linux has these namespaces, so elsewhere it is false without a probe.
     """
     global _NAMESPACE_OK
+    if not sys.platform.startswith("linux"):
+        return False
     if _NAMESPACE_OK is None:
         _NAMESPACE_OK = _probe_namespace()
     return _NAMESPACE_OK
@@ -332,11 +355,20 @@ def isolated_argv(staged: Path) -> list[str]:
     return _launch_argv(staged)[0]
 
 
-def _launch_argv(staged: Path) -> tuple[list[str], bool]:
-    """The argv that runs ``staged``, and whether the namespace init waits to be released."""
+def _launch_argv(staged: Path) -> tuple[list[str], bool, bool]:
+    """Return the launch argv, whether it uses the namespace gate, and whether it uses a subreaper."""
     if not isolation_enabled():
-        return _subreaper_argv(staged) or [str(staged)], False
-    if not namespace_available():
+        if not opt_out_supported():
+            raise PinnedProcessError(
+                "isolation-unavailable",
+                "the isolation opt-out is refused off Linux, where cleanup cannot reach a "
+                "process that leaves the launcher's process group; no launcher was executed",
+            )
+        wrapper = _subreaper_argv(staged)
+        return wrapper or [str(staged)], False, wrapper is not None
+    # Off Linux an ``unshare`` on the default path is not util-linux's, and confirming
+    # the teardown reads /proc, so no launch there may count as contained.
+    if not sys.platform.startswith("linux") or not namespace_available():
         raise PinnedProcessError(
             "isolation-unavailable",
             "kernel PID containment is unavailable; no launcher was executed. "
@@ -349,7 +381,7 @@ def _launch_argv(staged: Path) -> tuple[list[str], bool]:
     # --kill-child is a parent-death signal, which the launcher can clear, so cleanup
     # kills the namespace init itself; the flag covers an unshare that dies first.
     argv = [tool, "--user", "--map-root-user", "--pid", "--fork", "--kill-child", "--"]
-    return [*argv, *(gate or [str(staged)])], gate is not None
+    return [*argv, *(gate or [str(staged)])], gate is not None, False
 
 
 def _parent(pid: int) -> int | None:
@@ -980,8 +1012,8 @@ def _subreaper_argv(staged: Path) -> list[str] | None:
     The wrapper runs before the pinned bytes, with this interpreter, a fixed program,
     the fixed launch environment and ``-I -S``, so environment variables, the working
     directory and site-packages do not reach it. Only Linux has
-    ``PR_SET_CHILD_SUBREAPER``; elsewhere, or without a separately runnable
-    interpreter, an opted-out launch keeps best-effort cleanup. The calling process
+    ``PR_SET_CHILD_SUBREAPER``, and elsewhere the opt-out is refused; without prctl or a
+    separately runnable interpreter, an opted-out launch keeps best-effort cleanup. The calling process
     is never marked.
     """
     interpreter = _interpreter()
@@ -1024,16 +1056,14 @@ def spawn_pinned(staged: Path, work: Path) -> subprocess.Popen[bytes]:
     if not _executable_image(staged):
         raise PinnedProcessError("launcher-start-failed", "launcher could not be run")
     namespaced = isolation_enabled()
-    wrapped = not namespaced and _subreaper_argv(staged) is not None
-    # Only the exec wrapper can join before the pinned bytes run. Moving a process that
-    # has already forked, then cgroup.kill, would kill the parent and orphan the child
-    # ahead of the descendant sweep.
-    cgroup = _prepare_cgroup(work) if wrapped else None
+    cgroup: Path | None = None
     done: int | None = None
     finished: int | None = None
     try:
-        argv, gated = _launch_argv(staged)
+        argv, gated, wrapped = _launch_argv(staged)
         if wrapped:
+            # Only the wrapper can join the cgroup before the pinned bytes run.
+            cgroup = _prepare_cgroup(work)
             done, finished = _wrapper_channel()
             argv = [*argv, str(finished), str(os.getpid())]
         proc = subprocess.Popen(  # noqa: S603
@@ -1100,8 +1130,8 @@ def _release(proc: subprocess.Popen[bytes]) -> None:
         _INITS[proc.pid] = init
 
 
-def terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
-    """Kill the session and every process the launcher started.
+def terminate_process_group(proc: subprocess.Popen[bytes]) -> bool:
+    """Clean up the launch and return whether its containment was verified.
 
     In a PID namespace, the init is killed through the pidfd taken at launch, and
     cleanup waits until the kernel has ended the namespace. Without that pidfd,
@@ -1170,6 +1200,12 @@ def terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
             except ProcessLookupError:
                 # The group already exited; the caller's wait() still reaps the launcher.
                 pass
+            except PermissionError:
+                # macOS refuses killpg when it signals no member, as when the group holds
+                # only the exited, unreaped launcher, which Linux signals without error. A
+                # launcher that still runs and cannot be signalled stays an error.
+                if sys.platform.startswith("linux") or proc.poll() is None:
+                    raise
         if not namespaced:
             _kill_descendants(proc.pid)
     finally:
@@ -1213,3 +1249,4 @@ def terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
             "the launcher's wrapper did not outlive everything it started; "
             "a process the launcher started may still be running",
         )
+    return namespaced or done is not None
