@@ -11,9 +11,23 @@ from nexus_symbiote.cli import main
 from nexus_symbiote.scanners.base import Scanner
 from nexus_symbiote.scanners.mcp import MCPScanner
 from nexus_symbiote.scanners.prompt import PromptScanner
-from nexus_symbiote.utils.confined import ConfinedCollection
+from nexus_symbiote.utils import confined
+from nexus_symbiote.utils.confined import BoundedRecords, ConfinedCollection
 
 GAP = "node_modules: default collection exclude; not collected"
+
+
+def test_agent_gap_replaces_a_listed_reason_after_the_log_fills(tmp_path, monkeypatch):
+    monkeypatch.setattr(confined, "MAX_LISTED_FAILURES", 1)
+    gaps = BoundedRecords([GAP, "another directory"], noun="excluded surface")
+    with ConfinedCollection(tmp_path, [], gaps) as files:
+        files.report_agent_default_exclude(Path("node_modules"))
+        files.report_agent_default_exclude(Path("node_modules"))
+        gaps.append("last directory")
+    assert gaps == [
+        f"node_modules: {confined.AGENT_DEFAULT_EXCLUDE_REASON}",
+        "another directory (and 1 more excluded surface not listed)",
+    ]
 
 
 def test_agent_tree_excludes_are_reported_even_without_the_prompt_scanner(tmp_path: Path) -> None:

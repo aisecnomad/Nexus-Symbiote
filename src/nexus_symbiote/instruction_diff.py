@@ -585,15 +585,9 @@ def _read_confined_tree(root: Path) -> tuple[dict[str, _ParsedInstruction], list
         texts[rel_path] = text
 
     def _note_skipped(skipped: list[Path]) -> None:
-        generic = ": default collection exclude; not collected"
         for skipped_path in skipped:
             if skipped_path not in reported_skipped:
                 reported_skipped.add(skipped_path)
-                plain = f"{skipped_path.as_posix()}{generic}"
-                try:
-                    excluded.remove(plain)
-                except ValueError:
-                    pass
                 excluded.append(
                     f"{skipped_path.as_posix()}: default-excluded name inside an agent "
                     "configuration directory; not collected"

@@ -207,6 +207,21 @@ class _MessageLog:
         self.record(message)
         return True
 
+    def prefer(self, specific: str, generic: str) -> None:
+        """Upgrade a listed reason without moving the bounded log's overflow row."""
+        if specific in self:
+            return
+        if generic in self:
+            growth = len(specific) - len(generic)
+            if not self._bounded or self._characters + growth <= MAX_LISTED_FAILURE_CHARACTERS:
+                self.messages[self.messages.index(generic)] = specific
+                self._seen.remove(generic)
+                self._seen.add(specific)
+                if self._bounded:
+                    self._characters += growth
+                return
+        self.add(specific)
+
 
 class BoundedRecords(list[str]):
     """A collector's failures or gaps, listed within the listing bounds.
@@ -1713,6 +1728,12 @@ class ConfinedCollection:
         if not target.parts or len(target.parts) > self.max_depth or self.excluded(target):
             return None
         return target
+
+    def report_agent_default_exclude(self, path: Path) -> None:
+        relative = path.as_posix()
+        self._exclusion_log.prefer(
+            f"{relative}: {AGENT_DEFAULT_EXCLUDE_REASON}", f"{relative}: {DEFAULT_EXCLUDE_REASON}"
+        )
 
     def report_case_variant(self, variant: str | Path, path: str | Path) -> None:
         """Record ``variant``, another spelling of ``path`` found by a walk, as a failure.

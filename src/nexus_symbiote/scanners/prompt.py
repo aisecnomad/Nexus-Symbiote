@@ -29,13 +29,7 @@ from nexus_symbiote.scanners.credential_files import credential_shaped as _crede
 from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV
 from nexus_symbiote.scanners.mcp_sources import SOURCE_SEARCH_SKIPPED
 from nexus_symbiote.scanners.source_binding import BindingError, value_binding
-from nexus_symbiote.utils.confined import (
-    AGENT_DEFAULT_EXCLUDE_REASON,
-    DEFAULT_EXCLUDE_REASON,
-    CollectionError,
-    ConfinedCollection,
-    fold_name,
-)
+from nexus_symbiote.utils.confined import CollectionError, ConfinedCollection, fold_name
 from nexus_symbiote.utils.markdown import hidden_text, text_outside_code
 from nexus_symbiote.utils.terminal import neutralize
 from nexus_symbiote.utils.toml import loads as toml_loads
@@ -1205,7 +1199,7 @@ class _ImportListing:
         return hash_bytes(b"".join(sorted(leaves[target] for target in targets)))
 
 
-def _report_skipped(skipped: list[Path], reported: set[Path], result: ScanResult) -> None:
+def _report_skipped(skipped: list[Path], reported: set[Path], files: ConfinedCollection) -> None:
     """A coverage gap for each entry that a walk of an agent configuration directory
     skipped because its name, such as ``venv`` or ``node_modules``, is excluded by
     default. A host reads such a skill or subagent file like any other, so it is not
@@ -1216,14 +1210,7 @@ def _report_skipped(skipped: list[Path], reported: set[Path], result: ScanResult
     for path in skipped:
         if path not in reported:
             reported.add(path)
-            plain = f"{path.as_posix()}: {DEFAULT_EXCLUDE_REASON}"
-            specific = f"{path.as_posix()}: {AGENT_DEFAULT_EXCLUDE_REASON}"
-            try:
-                result.surfaces_excluded.remove(plain)
-            except ValueError:
-                pass
-            if specific not in result.surfaces_excluded:
-                result.surfaces_excluded.append(specific)
+            files.report_agent_default_exclude(path)
 
 
 class PromptScanner(Scanner):
@@ -1327,7 +1314,7 @@ class PromptScanner(Scanner):
                     if component is not None:
                         recorded[relative] = component
                         texts[relative] = content.decode("utf-8")
-                _report_skipped(skipped, reported, result)
+                _report_skipped(skipped, reported, files)
 
             skill_listing = self._list_skills(files)
             walked.update(path.as_posix() for _, paths, _ in skill_listing for path in paths)
@@ -1740,7 +1727,7 @@ class PromptScanner(Scanner):
                         risks=risks,
                     )
                 )
-            _report_skipped(skipped, reported, result)
+            _report_skipped(skipped, reported, files)
         if not seen and not result.scan_failures and not result.surfaces_excluded:
             result.surfaces_scanned.append("skills (no skill or command files found)")
 
