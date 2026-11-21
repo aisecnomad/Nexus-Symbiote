@@ -4,29 +4,32 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from nexus_symbiote import runtime_validation as validation
+from tests import test_runtime_validation_in_process as in_process_tests
+
+dialects = in_process_tests.dialects
 
 
-def preflight(schema):
-    return validation._evaluate(validation._load_dialects(), schema, None)
+def preflight(dialects, schema):
+    return validation._evaluate(dialects, schema, None)
 
 
-def test_annotation_pass_counts_its_applicator_children(monkeypatch):
+def test_annotation_pass_counts_its_applicator_children(monkeypatch, dialects):
     monkeypatch.setattr(validation, "_MAX_OUTPUT_APPLICATOR_STEPS", 2)
     schema = {"type": "object", "allOf": [{"type": "object"}]}
-    assert preflight(schema) == validation._VALID
+    assert preflight(dialects, schema) == validation._VALID
     schema["unevaluatedProperties"] = False
-    assert preflight(schema) == validation._SCHEMA
+    assert preflight(dialects, schema) == validation._SCHEMA
 
 
-def test_instance_descent_does_not_reset_the_call_stack(monkeypatch):
+def test_instance_descent_does_not_reset_the_call_stack(monkeypatch, dialects):
     monkeypatch.setattr(validation, "_MAX_OUTPUT_APPLICATOR_DEPTH", 3)
     leaf = {"allOf": [{"type": "string"}]}
     child = {"type": "object", "properties": {"name": leaf}}
-    assert preflight(child) == validation._VALID
-    assert preflight({"type": "object", "allOf": [child]}) == validation._SCHEMA
+    assert preflight(dialects, child) == validation._VALID
+    assert preflight(dialects, {"type": "object", "allOf": [child]}) == validation._SCHEMA
 
 
-def test_composed_union_for_ordinary_tagged_responses():
+def test_composed_union_for_ordinary_tagged_responses(dialects):
     schema = {
         "type": "object",
         "$defs": {"base": {"type": "object"}},
@@ -40,7 +43,6 @@ def test_composed_union_for_ordinary_tagged_responses():
             for name in range(275)
         ],
     }
-    dialects = validation._load_dialects()
     assert validation._evaluate(dialects, schema, None) == validation._VALID
     assert validation._evaluate(dialects, schema, {"kind": 24}) == validation._VALID
 

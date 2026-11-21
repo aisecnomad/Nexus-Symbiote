@@ -11,15 +11,17 @@ import pytest
 from nexus_symbiote import runtime_validation as validation
 from nexus_symbiote.live.session import invoke_pinned_stdio
 from nexus_symbiote.runtime import AuthorizationError
+from tests import test_runtime_validation_in_process as in_process_tests
 from tests.test_runtime_authorization import fixture
 from tests.test_runtime_stdio_session import launcher, launcher_log, signed_inputs
 
+dialects = in_process_tests.dialects
 pytestmark = pytest.mark.usefixtures("nonisolated_pinned_fixtures")
 
 
 @pytest.mark.parametrize("bound", ["depth", "steps", "cycle"])
 def test_output_description_must_pass_preflight_before_dispatch_or_nonce(
-    tmp_path, monkeypatch, bound
+    tmp_path, monkeypatch, bound, dialects
 ):
     schema = {"type": "object", "allOf": [{"type": "object"}, {"type": "object"}]}
     if bound == "cycle":
@@ -32,7 +34,6 @@ def test_output_description_must_pass_preflight_before_dispatch_or_nonce(
             "_MAX_OUTPUT_APPLICATOR_DEPTH" if bound == "depth" else "_MAX_OUTPUT_APPLICATOR_STEPS",
             1 if bound == "depth" else 2,
         )
-        dialects = validation._load_dialects()
 
         def evaluate(wire):
             request = json.loads(wire)
@@ -50,8 +51,7 @@ def test_output_description_must_pass_preflight_before_dispatch_or_nonce(
         assert db.execute("SELECT COUNT(*) FROM tenant_nonces").fetchone() == (0,)
 
 
-def test_shared_schema_work_is_counted_once_per_application(monkeypatch):
-    dialects = validation._load_dialects()
+def test_shared_schema_work_is_counted_once_per_application(monkeypatch, dialects):
     schema = {
         "type": "object",
         "$defs": {"shape": {"type": "object"}},
