@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from pathlib import PurePosixPath
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nexus_symbiote.utils.confined import ConfinedCollection
 
 MARKDOWN_SUFFIXES = frozenset({".md", ".mdc", ".markdown"})
 # Names that hold credentials wherever they appear. A memory file names what to
@@ -93,3 +97,26 @@ def link_gap(target: str | None) -> str | None:
     if target is not None and credential_shaped(target):
         return f"a symlink leads to {target}, whose name says it holds credentials"
     return None
+
+
+def withheld(files: ConfinedCollection, path: str, excluded: list[str]) -> bool:
+    """Whether ``credential_gap`` names the file at ``path``, recorded once in ``excluded``.
+
+    Checked before the read, so neither the file's values nor an unkeyed digest of its
+    bytes reach the inventory.
+    """
+    linked = None if credential_shaped(path) else files.in_root_target(path)
+    reason = credential_gap(path, None if linked is None else linked.as_posix())
+    if reason is None:
+        return False
+    message = f"{path}: {reason}; not read or inventoried"
+    if message not in excluded:
+        excluded.append(message)
+    return True
+
+
+def relinked(files: ConfinedCollection, path: str) -> bool:
+    """Whether the read of ``path`` followed a symlink to a file named as holding
+    credentials: one replaced after ``withheld`` checked it."""
+    followed = files.link_target(path)
+    return followed is not None and credential_shaped(followed)

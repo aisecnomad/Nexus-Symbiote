@@ -496,9 +496,10 @@ class CycloneDXGenerator(Generator):
                     result["licenses"] = [{"license": {"id": expr} | ack}]
                 else:
                     result["licenses"] = [{"expression": expr} | ack]
-            # An observed URI may carry a query token; the same cleaning applies.
+            # An observed URI may carry a query token, and a supplied inventory any declared
+            # value, such as javascript: or a credentialed URL; the same cleaning applies.
             observed_dl = _clean_url(getattr(comp, "source_uri", None))
-            dl = observed_dl or comp.properties.get("declared_download_location")
+            dl = observed_dl or _clean_url(comp.properties.get("declared_download_location"))
             if isinstance(dl, str) and _is_uri(dl):
                 ref = {"type": "distribution", "url": dl}
                 result["externalReferences"] = [

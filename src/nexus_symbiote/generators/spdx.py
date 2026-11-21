@@ -535,8 +535,9 @@ class SPDXGenerator(Generator):
                 if isinstance(rel_ts, str) and rel_ts:
                     element["releaseTime"] = rel_ts
                     declared_fields.append("releaseTime")
-                dl_loc = comp.properties.get("declared_download_location")
-                if isinstance(dl_loc, str) and dl_loc:
+                # A supplied inventory may declare any value; it is cleaned as agent.yaml's is.
+                dl_loc = _clean_url(comp.properties.get("declared_download_location"))
+                if dl_loc:
                     element["software_downloadLocation"] = dl_loc
                     declared_fields.append("software_downloadLocation")
                 domain = comp.properties.get("declared_domain")
@@ -571,7 +572,9 @@ class SPDXGenerator(Generator):
                     element["releaseTime"] = rel_ts
                     declared_fields.append("releaseTime")
                 observed_loc = _clean_url(getattr(comp, "source_uri", None))
-                dl_loc = observed_loc or comp.properties.get("declared_download_location")
+                dl_loc = observed_loc or _clean_url(
+                    comp.properties.get("declared_download_location")
+                )
                 if isinstance(dl_loc, str) and dl_loc:
                     element["software_downloadLocation"] = dl_loc
                     if not observed_loc:

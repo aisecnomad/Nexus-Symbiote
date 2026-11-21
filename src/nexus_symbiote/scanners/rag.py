@@ -28,6 +28,7 @@ from nexus_symbiote.scanners.base import (
     parse_python,
     source_collection_bytes,
 )
+from nexus_symbiote.scanners.credential_files import relinked, withheld
 from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV
 from nexus_symbiote.scanners.source_binding import (
     ORIGIN_PATHS,
@@ -35,6 +36,7 @@ from nexus_symbiote.scanners.source_binding import (
     beyond_origin,
     url_shape,
     value_binding,
+    whatwg_form,
 )
 from nexus_symbiote.utils.confined import ConfinedCollection, fold_name
 from nexus_symbiote.utils.secrets import redact_text, redact_url
@@ -227,8 +229,9 @@ def _exported_uri(raw: str) -> tuple[str, bool]:
 
 
 def _scheme(raw: str) -> str | None:
-    match = _SCHEME.match(raw.strip())
-    return match.group(1).lower() if match and "://" in raw else None
+    value = whatwg_form(raw.strip())
+    match = _SCHEME.match(value)
+    return match.group(1).lower() if match and "://" in value else None
 
 
 def _transport(raw: str) -> str | None:
@@ -302,9 +305,11 @@ def _describe(value: Any, urls: list[str], depth: int = 0) -> tuple[Any, bool]:
             raise _TooManyURLsError(
                 f"RAG configuration declares more than {_MAX_ENTRIES} endpoint URLs"
             )
-        urls.append(value)
-        exported, unbound = _exported_uri(value)
-        return {"url": exported, "shape": url_shape(value.strip(), ORIGIN_PATHS)}, unbound
+        # Recorded as a client connects to it: ``http:host`` is ``http://host``.
+        url = whatwg_form(value.strip())
+        urls.append(url)
+        exported, unbound = _exported_uri(url)
+        return {"url": exported, "shape": url_shape(url, ORIGIN_PATHS)}, unbound
     return type(value).__name__, True
 
 
@@ -424,7 +429,9 @@ class RAGScanner(Scanner):
         binds those siblings too. Another spelling of a recognised name is a
         collection failure, as for the RAG configuration names. A file that cannot be
         read, or a directory with a Colang file that cannot be read, yields no record:
-        the collection has named the failure.
+        the collection has named the failure. A file named as holding credentials, by
+        its own name or that of the in-root file a symlink there leads to, is a gap and
+        is not read or digested; the record binds the directory's other files.
         """
         components = []
         for path in sorted(candidates):
@@ -444,8 +451,17 @@ class RAGScanner(Scanner):
                     f"{relative}: more than {_MAX_ENTRIES} Colang files beside the configuration"
                 )
                 continue
+            siblings = [
+                rail
+                for rail in siblings
+                if not withheld(files, rail.as_posix(), result.surfaces_excluded)
+            ]
+            if canonical in NEMO_CONFIG_NAMES and not siblings:
+                continue
+            if withheld(files, relative, result.surfaces_excluded):
+                continue
             raw = files.read_bytes(path)
-            if raw is None:
+            if raw is None or self._relinked(path, files, result):
                 continue
             digest = hash_bytes(raw)
             properties: dict[str, Any] = {
@@ -454,7 +470,9 @@ class RAGScanner(Scanner):
             }
             if siblings:
                 contents = [files.read_bytes(rail) for rail in siblings]
-                if any(content is None for content in contents):
+                if any(content is None for content in contents) or any(
+                    self._relinked(rail, files, result) for rail in siblings
+                ):
                     continue
                 rail_files = {
                     rail.name: hash_bytes(content)
@@ -561,11 +579,22 @@ class RAGScanner(Scanner):
             "active file on case-insensitive file systems and is not inventoried"
         )
 
+    @staticmethod
+    def _relinked(path: Path, files: ConfinedCollection, result: ScanResult) -> bool:
+        if not relinked(files, path.as_posix()):
+            return False
+        result.scan_failures.append(f"{path.as_posix()}: file changed during collection")
+        return True
+
     def _read_config(self, path: Path, files: ConfinedCollection, result: ScanResult) -> Any:
+        """The parsed configuration, or None; a credential-named file is a gap, unread."""
+        if withheld(files, path.as_posix(), result.surfaces_excluded):
+            return None
         if path.suffix.lower() == ".json":
-            return files.read_json(path)
+            data = files.read_json(path)
+            return None if self._relinked(path, files, result) else data
         content = files.read_text(path)
-        if content is None:
+        if content is None or self._relinked(path, files, result):
             return None
         try:
             import yaml

@@ -142,3 +142,26 @@ def test_the_writer_refuses_what_the_reader_refuses(tmp_path):
     with pytest.raises(NativeFormatError, match=f"nests deeper than {MAX_NATIVE_NESTING} levels"):
         _deep_inventory(MAX_NATIVE_NESTING - 3).save(refused)
     assert not refused.exists()
+
+
+def test_an_export_embedding_a_too_deep_inventory_is_refused_as_a_native_file_is():
+    from nexus_symbiote.core.canonical import content_digest
+    from nexus_symbiote.generators._common import recover_native
+    from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
+    from nexus_symbiote.generators.recovery import recover_export
+
+    def embedded(levels: int) -> list[dict[str, str]]:
+        document = nested_document(levels)
+        return [
+            {"name": "nexus-symbiote:document", "value": json.dumps(document)},
+            {"name": "nexus-symbiote:documentDigest", "value": content_digest(document)},
+            {"name": "nexus-symbiote:lossReport", "value": "[]"},
+        ]
+
+    assert recover_native(embedded(MAX_NATIVE_NESTING))[0].components[0].name == "search"
+    with pytest.raises(ValueError, match="embedded native document is nested too deeply"):
+        recover_native(embedded(MAX_NATIVE_NESTING + 1))
+    deep = AIBOM.from_document(nested_document(MAX_NATIVE_NESTING + 1))
+    text = CycloneDXGenerator(projection_version=3).generate_json(deep)
+    with pytest.raises(ValueError, match="embedded native document is nested too deeply"):
+        recover_export(text)

@@ -12,7 +12,13 @@ from typing import Any, Final
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
-from nexus_symbiote.core.enums import AssuranceLevel, AutonomyLevel, RiskSeverity, TrustTier
+from nexus_symbiote.core.enums import (
+    AssuranceLevel,
+    AutonomyLevel,
+    ComponentType,
+    RiskSeverity,
+    TrustTier,
+)
 from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.models import (
     AgentComponent,
@@ -36,8 +42,10 @@ _RFC3339_RE: Final[re.Pattern[str]] = re.compile(
 )
 _SAFE_LICENSE_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9.()+\- ]{1,128}", re.ASCII)
 _LICENSE_REF_RE: Final[re.Pattern[str]] = re.compile(r"LicenseRef-[A-Za-z0-9.-]+", re.ASCII)
+# Printable ASCII only: a control, bidirectional or invisible character must arrive
+# percent-encoded, so an export never carries one that a terminal or viewer acts on.
 _SAFE_URL_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?:https|s3|gs|hf|oci)://[^\s<>\"'\\]+",
+    r"(?:https|s3|gs|hf|oci)://[\x21\x23-\x26\x28-\x3b\x3d\x3f-\x5b\x5d-\x7e]+",
     re.ASCII,
 )
 _ALLOWED_URL_SCHEMES: Final[frozenset[str]] = frozenset({"https", "s3", "gs", "hf", "oci"})
@@ -288,6 +296,7 @@ def spdx_license_expression(value: Any) -> str | None:
 
 
 def _conflict_risk(field_name: str, component_name: str, locator: str) -> RiskAssessment:
+    locator = neutralize(locator)
     return RiskAssessment(
         severity=RiskSeverity.MEDIUM,
         category="declaration_conflict",
@@ -300,6 +309,20 @@ def _conflict_risk(field_name: str, component_name: str, locator: str) -> RiskAs
             "do not override observed collector evidence."
         ),
     )
+
+
+def _type_conflict(
+    holder: AnyComponent | None, declared: str, locator: str, notices: list[str]
+) -> bool:
+    """Whether a component of another type holds the name of a declared ``declared``.
+
+    The declaration is then a conflict on the holder and is not applied.
+    """
+    if holder is None:
+        return False
+    holder.risks.append(_conflict_risk("component_type", holder.name, locator))
+    notices.append(f"{holder.bom_ref}: {declared} name conflict with {locator}")
+    return True
 
 
 def _record_claim(comp: AnyComponent, key: str, locator: str) -> None:
@@ -455,7 +478,11 @@ def apply_agent_yaml_declarations(
                 elif extra_key == "version" and (ver := _clean_text(raw_val, max_len=128)):
                     _apply_version_declaration(comp, ver, locator, notices)
 
-    by_name: dict[str, AnyComponent] = {c.name: c for c in aibom.components}
+    # Keyed by type too: a dataset declared under a collected model's name must not take
+    # that model's slot, or a later conflicting model declaration skips the conflict check.
+    by_key: dict[tuple[ComponentType, str], AnyComponent] = {
+        (c.component_type, c.name): c for c in aibom.components
+    }
 
     raw_datasets = parsed.get("datasets")
     dataset_refs_by_name: dict[str, str] = {}
@@ -466,7 +493,10 @@ def apply_agent_yaml_declarations(
             ds_name = _clean_text(entry.get("name"), max_len=200)
             if not ds_name:
                 continue
-            existing = by_name.get(ds_name)
+            holder = by_key.get((ComponentType.MODEL, ds_name))
+            if _type_conflict(holder, "dataset", locator, notices):
+                continue
+            existing = by_key.get((ComponentType.DATA_SOURCE, ds_name))
             ds_ver = _clean_text(entry.get("version"), max_len=128)
             ds_sup = _clean_text(entry.get("supplier"), max_len=200) or owner
             ds_lic = clean_license_identifier(entry.get("license")) or default_license
@@ -512,7 +542,7 @@ def apply_agent_yaml_declarations(
                     trust_tier=TrustTier.UNKNOWN,
                 )
                 aibom.components.append(ds_comp)
-                by_name[ds_name] = ds_comp
+                by_key[(ComponentType.DATA_SOURCE, ds_name)] = ds_comp
                 if ds_ver:
                     _record_claim(ds_comp, "version", locator)
                 if ds_sup:
@@ -548,7 +578,10 @@ def apply_agent_yaml_declarations(
             m_name = _clean_text(entry.get("name"), max_len=200)
             if not m_name:
                 continue
-            existing = by_name.get(m_name)
+            holder = by_key.get((ComponentType.DATA_SOURCE, m_name))
+            if _type_conflict(holder, "model", locator, notices):
+                continue
+            existing = by_key.get((ComponentType.MODEL, m_name))
             m_ver = _clean_text(entry.get("version"), max_len=128)
             m_sup = _clean_text(entry.get("supplier"), max_len=200) or owner
             m_lic = clean_license_identifier(entry.get("license")) or default_license
@@ -576,7 +609,7 @@ def apply_agent_yaml_declarations(
                     trust_tier=TrustTier.UNKNOWN,
                 )
                 aibom.components.append(m_comp)
-                by_name[m_name] = m_comp
+                by_key[(ComponentType.MODEL, m_name)] = m_comp
                 if m_ver:
                     _record_claim(m_comp, "version", locator)
                 if m_sup:

@@ -428,3 +428,31 @@ def test_exports_validate_and_reports_run(runner, tmp_path):
         run = runner.invoke(main, command)
         assert run.exit_code == 0, (command[0], run.output)
     assert "guardrail-policy: 3" in runner.invoke(main, ["summary", str(inventory)]).output
+
+
+def test_a_configuration_linked_to_a_credential_file_is_a_gap_and_not_digested(tmp_path):
+    _write(tmp_path, ".env.prod", b"API_TOKEN=synthetic-value\n")
+    (tmp_path / "guardrails.yml").symlink_to(".env.prod")
+    result = RAGScanner().scan(tmp_path)
+    assert result.components == [] and result.scan_failures == []
+    assert result.surfaces_excluded == [
+        "guardrails.yml: a symlink leads to .env.prod, whose name says it holds credentials; "
+        "not read or inventoried"
+    ]
+
+
+def test_a_colang_file_linked_to_a_credential_file_is_a_gap_and_not_digested(tmp_path):
+    secret = b"define flow x\n  synthetic\n"
+    _write(tmp_path, "rails/config.yml")
+    _write(tmp_path, "rails/flows.co", b"define flow greet\n")
+    _write(tmp_path, "rails/secret.token", secret)
+    (tmp_path / "rails" / "main.co").symlink_to("secret.token")
+    result = RAGScanner().scan(tmp_path)
+    assert result.scan_failures == []
+    assert result.surfaces_excluded == [
+        "rails/main.co: a symlink leads to rails/secret.token, whose name says it holds "
+        "credentials; not read or inventoried"
+    ]
+    (component,) = result.components
+    assert component.properties["rail_files"] == {"flows.co": _sha256(b"define flow greet\n")}
+    assert _sha256(secret) not in json.dumps(component.model_dump(mode="json"))

@@ -432,3 +432,70 @@ def test_an_observed_http_source_uri_left_out_is_noted(tmp_path: Path, args) -> 
     assert result.exit_code == 0, result.output
     noted = "dataset:d: source_uri left out of standard fields" in result.stderr
     assert noted == ("--cyclonedx-projection" not in args)
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "https://user:pass@host.example/x",
+        "https://example.com/a\x1b[31mb",
+    ],
+)
+def test_a_supplied_declared_download_location_is_cleaned_at_export(declared: str) -> None:
+    bom = _observed()
+    bom.get_component("dataset:d").source_uri = None
+    for comp in bom.components:
+        comp.properties["declared_download_location"] = declared
+    cdx = CycloneDXGenerator(projection_version=3).generate(bom)
+    assert [c["bom-ref"] for c in cdx["components"] if "externalReferences" in c] == []
+    spdx = SPDXGenerator(projection_version=4).generate(bom)
+    assert [n["name"] for n in spdx["@graph"] if "software_downloadLocation" in n] == []
+    clean = "https://example.com/models/clf.safetensors"
+    bom.get_component("model:m").properties["declared_download_location"] = clean
+    spdx = SPDXGenerator(projection_version=4).generate(bom)
+    assert _graph_node(spdx, name="models/clf.safetensors")["software_downloadLocation"] == clean
+
+
+@pytest.mark.parametrize("char", ["\x1b", "\x00", "\x7f", "\u202e", "\u200b", "\u00e9"])
+def test_a_declared_url_with_a_control_or_non_ascii_character_is_refused(char: str) -> None:
+    from urllib.parse import quote
+
+    from nexus_symbiote.spdx_profiles import _clean_url
+
+    assert _clean_url(f"https://example.com/a{char}b") is None
+    encoded = f"https://example.com/a{quote(char)}b"
+    assert _clean_url(encoded) == encoded
+
+
+def test_a_declaration_named_like_a_component_of_the_other_type_is_a_conflict(
+    tmp_path: Path,
+) -> None:
+    bom = _observed()
+    model = bom.get_component("model:m")
+    model.version, model.supplier = "1.0.0", "Good Org"
+    (tmp_path / "agent.yaml").write_text(
+        "datasets:\n  - name: models/clf.safetensors\n"
+        "models:\n  - name: models/clf.safetensors\n    version: 9.9.9\n"
+        "    supplier: Evil Corp\n  - name: tickets\n",
+        encoding="utf-8",
+    )
+    notices = apply_agent_yaml_declarations(bom, tmp_path, relative_path="agent.yaml")
+    assert [c.bom_ref for c in bom.components] == ["agent:a", "model:m", "dataset:d"]
+    assert notices == [
+        "model:m: dataset name conflict with agent.yaml",
+        "model:m: version conflict with agent.yaml",
+        "model:m: supplier conflict with agent.yaml",
+        "dataset:d: model name conflict with agent.yaml",
+    ]
+    assert (model.version, model.supplier) == ("1.0.0", "Good Org")
+    assert [r.category for r in model.risks] == ["declaration_conflict"] * 3
+    assert [r.category for r in bom.get_component("dataset:d").risks] == ["declaration_conflict"]
+
+
+def test_a_conflict_finding_neutralizes_the_declaration_locator() -> None:
+    from nexus_symbiote.spdx_profiles import _conflict_risk
+
+    risk = _conflict_risk("version", "m", "agent\x1b[31m.yaml")
+    assert "\x1b" not in risk.detail and "\x1b" not in risk.recommendation
