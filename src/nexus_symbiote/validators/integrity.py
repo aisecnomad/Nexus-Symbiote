@@ -714,6 +714,25 @@ class IntegrityValidator:
             package = packages.observe(relative)
         except (OSError, ValueError):
             package = None
+        if package is not None:
+            if package.trust_remote_code and not comp.trust_remote_code:
+                report.issues.append(
+                    IntegrityIssue(
+                        comp.bom_ref,
+                        "trust_remote_code",
+                        "Local model configuration permits repository code execution",
+                        "critical",
+                    )
+                )
+            if not package.loading_config_complete:
+                report.issues.append(
+                    IntegrityIssue(
+                        comp.bom_ref,
+                        "model_config_unverified",
+                        "Local model loading configuration could not be checked completely",
+                        "unknown",
+                    )
+                )
         observation = package.observation if package is not None else None
         if observation is None:
             actual, explanation = (
