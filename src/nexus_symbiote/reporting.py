@@ -176,6 +176,40 @@ def _producer_lines(document: Mapping[str, Any]) -> list[ReportLine]:
     return [(f"  Discovery producer: not verified ({outcome})", None)]
 
 
+def _attestation_summary_lines(document: Mapping[str, Any]) -> list[ReportLine]:
+    attestation = document.get("attestation")
+    if not isinstance(attestation, Mapping):
+        return []
+    if attestation.get("verified") is True:
+        signers = ", ".join(str(s) for s in attestation.get("signers") or [])
+        return [
+            (
+                safe_line(
+                    "  Attestation: verified (purpose ",
+                    attestation.get("purpose"),
+                    ", match ",
+                    attestation.get("match"),
+                    ", signers ",
+                    signers,
+                    ")",
+                ),
+                None,
+            )
+        ]
+    return [
+        (
+            safe_line(
+                "  Attestation: FAILED (",
+                attestation.get("reason"),
+                ": ",
+                attestation.get("detail"),
+                ")",
+            ),
+            "red",
+        )
+    ]
+
+
 def risk_report_lines(
     document: Mapping[str, Any], *, failures: Sequence[str] = ()
 ) -> list[ReportLine]:
@@ -192,6 +226,7 @@ def risk_report_lines(
         else:
             lines.append((safe_line("Risk unknown (", basis, "): not scored."), "yellow"))
         lines.extend(_producer_lines(document))
+        lines.extend(_attestation_summary_lines(document))
     else:
         level = neutralize(document.get("risk_level", "unknown"))
         color = {"critical": "red", "high": "red", "moderate": "yellow", "clean": "green"}
@@ -200,6 +235,7 @@ def risk_report_lines(
         basis = document.get("assessment_basis", "unknown")
         lines.append((safe_line("  Assessment basis: ", basis), None))
         lines.extend(_producer_lines(document))
+        lines.extend(_attestation_summary_lines(document))
         lines.append((safe_line("  Coverage: ", document.get("coverage_status", "unknown")), None))
         total = _shown(document.get("total_components"))
         risky = _shown(document.get("components_with_risks"))
@@ -405,6 +441,39 @@ def validation_report_lines(
         )
         if status == "UNKNOWN" and not explained:
             lines.append(("  UNKNOWN: no hash or signature could be verified", None))
+    attestation = document.get("attestation")
+    if isinstance(attestation, Mapping):
+        lines.append(("Attestation check", "bold"))
+        if attestation.get("verified") is True:
+            lines.append(("  Status: PASS", "green"))
+            signers = ", ".join(str(s) for s in attestation.get("signers") or [])
+            lines.append(
+                (
+                    safe_line(
+                        "  Purpose: ",
+                        attestation.get("purpose"),
+                        ", match: ",
+                        attestation.get("match"),
+                        ", signers: ",
+                        signers,
+                    ),
+                    None,
+                )
+            )
+        else:
+            lines.append(("  Status: FAIL", "red"))
+            lines.append(
+                (
+                    safe_line(
+                        "  ERROR [attestation] ",
+                        attestation.get("detail"),
+                        " (",
+                        attestation.get("reason"),
+                        ")",
+                    ),
+                    None,
+                )
+            )
     discovery = document.get("discovery_producer")
     if isinstance(discovery, Mapping):
         problems = discovery.get("problems") or []
