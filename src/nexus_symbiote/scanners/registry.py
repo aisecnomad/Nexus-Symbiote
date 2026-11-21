@@ -1637,9 +1637,7 @@ class RegistryScanner(Scanner):
             components.append(component)
             if kind in ("registry", "alias"):
                 fetched.append((component, package))
-                if not patched and not any(
-                    r.category == "credential_exposure" for r in component.risks
-                ):
+                if not patched:
                     registry.append(component)
         if overrides is None or any(self._is_ai_package(t) for t in overrides[1]):
             # Too many overrides to read, or one that installs an AI package under
@@ -1834,7 +1832,7 @@ class RegistryScanner(Scanner):
             for _, value in specs
         }
         locked_version = record.get("version") if isinstance(record, dict) else None
-        sensitive = bool(sensitive_specs) or (
+        sensitive_version = spec in sensitive_specs or (
             isinstance(locked_version, str) and holds_token_shape(locked_version)
         )
         properties: dict[str, Any] = {
@@ -1854,7 +1852,7 @@ class RegistryScanner(Scanner):
         version = redact_text(version_range if registry and version_range else spec)
         source = "package.json"
         resolution = None
-        if lock is not None and record is not None and not sensitive:
+        if lock is not None and record is not None:
             lock_name, _, lock_digest = lock
             # The key as the inventory records the name or alias it installs: redacted.
             locator = f"{lock_name}#/packages/" + _pointer_token("node_modules/" + redact_text(key))
@@ -1891,7 +1889,7 @@ class RegistryScanner(Scanner):
                 # A record that was not taken binds nothing; the failure or gap says why.
                 del properties["lockfile_sha256"], properties["lockfile_record"]
         risks = list(resolution.risks) if resolution else []
-        if sensitive:
+        if sensitive_specs or sensitive_version:
             risks.append(_identifier_risk(f"npm package '{name}'", "version"))
         if kind == "alias":
             risks.append(
@@ -1932,11 +1930,16 @@ class RegistryScanner(Scanner):
         package_url = None
         # A name the redaction changed is exported as the marker; no package URL may
         # spell it out.
-        if name == package and resolution is not None and resolution.consistent:
+        if (
+            name == package
+            and not sensitive_version
+            and resolution is not None
+            and resolution.consistent
+        ):
             package_url = self._npm_purl(package, resolution.version, resolution.origin)
         elif (
             name == package
-            and not sensitive
+            and not sensitive_version
             and registry
             and record is None
             and not in_doubt
@@ -1949,7 +1952,7 @@ class RegistryScanner(Scanner):
         return RegistryEntryComponent(
             bom_ref=f"registry:npm/{reference_text(redact_text(key))}",
             name=name,
-            version=REDACTED if sensitive else version or None,
+            version=REDACTED if sensitive_version else version or None,
             package_url=package_url,
             registry_type="npm",
             registry_uri=resolution.origin if resolution else None,
@@ -2231,12 +2234,16 @@ class RegistryScanner(Scanner):
         ``checksum_recorded`` says the record holds Yarn's own checksum instead, and
         ``requested`` is the spec the package manager takes when it is not npm's.
         Nothing is bound, and a failure says why, when a check fails."""
-        if holds_token_shape(version) or holds_token_shape(locator):
+        sensitive_locator = holds_token_shape(locator)
+        sensitive = holds_token_shape(version) or sensitive_locator
+        if sensitive:
             component.package_url = component.registry_uri = None
             component.risks.append(
                 _identifier_risk(f"npm package '{component.name}'", "lock record")
             )
-            return
+        if sensitive_locator:
+            # The file digest still supports this claim. Its selector cannot be exported.
+            locator = lock_name
         if requested is None:
             requested = str(component.properties.get("requested_version", "")).strip()
         if _npm_exact(requested) and requested != version:
@@ -2273,9 +2280,11 @@ class RegistryScanner(Scanner):
         component.risks.extend(self._npm_record_risks(shown, digest_recorded, origin))
         if digest_recorded and consistent:
             component.risks = [r for r in component.risks if r.category != "version_pinning"]
-        component.version = version
+        component.version = REDACTED if sensitive else version
         component.package_url = (
-            self._npm_purl(component.name, version, origin) if consistent else None
+            self._npm_purl(component.name, version, origin)
+            if consistent and not sensitive
+            else None
         )
         component.registry_uri = origin
         component.source_path = lock_name
@@ -2570,6 +2579,7 @@ class RegistryScanner(Scanner):
                 locator = "pnpm-lock.yaml#/packages/" + _pointer_token(recorded)
             else:
                 locator = "pnpm-lock.yaml#/importers/./" + _pointer_token(comp.name)
+            selected_specs = specifiers.get(comp.name, set())
             self._bind_npm_resolution(
                 comp,
                 "pnpm-lock.yaml",
@@ -2580,6 +2590,7 @@ class RegistryScanner(Scanner):
                 locator,
                 lock_digest,
                 result,
+                requested=next(iter(selected_specs)) if len(selected_specs) == 1 else None,
             )
         return True
 
@@ -2687,11 +2698,14 @@ class RegistryScanner(Scanner):
                     f"yarn.lock: multiple package resolutions for {comp.name} are ambiguous"
                 )
                 continue
-            req = str(comp.properties.get("requested_version", "")).strip()
+            raw_specs = (declared_specs or {}).get(comp.name, ())
+            req = (
+                raw_specs[-1][1] if raw_specs else str(comp.properties.get("requested_version", ""))
+            ).strip()
             # requested_version is npm's choice, the last section's spec. Yarn 1 takes
             # another, so a decoy spec in devDependencies must not pick the record;
             # which one Yarn Berry takes is not resolved here.
-            by_section = dict((declared_specs or {}).get(comp.name, ()))
+            by_section = dict(raw_specs)
             installed = [by_section[s] for s in _YARN_V1_SECTION_ORDER if s in by_section]
             if len(set(installed)) > 1:
                 comp.package_url = None
@@ -2709,7 +2723,7 @@ class RegistryScanner(Scanner):
                         f"yarn.lock: selected non-registry source for {comp.name} is unverified"
                     )
                     continue
-                req = redact_text(selected).strip()
+                req = selected.strip()
             entries = by_pkg.get(comp.name)
             if not entries:
                 continue
@@ -2995,20 +3009,17 @@ class RegistryScanner(Scanner):
             shown, redacted = _identifier(requirement.name)
             redacted = redacted or any(_identifier(extra)[1] for extra in requirement.extras)
             name = str(canonicalize_name(shown))
-            if holds_token_shape(str(requirement.specifier)):
-                return _PipDeclaration(
-                    name, source, reference, shown + REDACTED, REDACTED, group, redacted=True
-                )
             # Retain markers and URLs as declared, unresolved conditions; they
             # must not silently turn into an unconditional exact package URL.
             marker = str(requirement.marker) if requirement.marker else ""
+            sensitive = holds_token_shape(str(requirement.specifier)) or holds_token_shape(marker)
             if requirement.url:
                 spec = "@ " + _url_origin(requirement.url)
             else:
                 spec = _unparsed(str(requirement.specifier))
             if marker:
                 spec += "; " + _unparsed(marker)
-            recorded = _recorded_requirement(requirement)
+            recorded = shown + REDACTED if sensitive else _recorded_requirement(requirement)
             pin = _exact_pin(requirement)
         except (InvalidRequirement, RecursionError):
             # packaging parses markers by recursion; a deeply nested one is invalid
@@ -3039,14 +3050,14 @@ class RegistryScanner(Scanner):
             source=source,
             reference=reference,
             recorded=recorded,
-            spec=redact_text(spec) or None,
+            spec=REDACTED if sensitive else redact_text(spec) or None,
             group=group,
             requirement=requirement,
             hashes=hashes,
             marker=marker,
             pin=pin[0] if pin else None,
             pin_key=pin[1] if pin else None,
-            redacted=redacted,
+            redacted=redacted or sensitive,
         )
 
     def _pip_component(
@@ -3779,12 +3790,15 @@ class RegistryScanner(Scanner):
                     )
                     continue
             resolved_version = record.get("version")
-            if isinstance(resolved_version, str) and holds_token_shape(resolved_version):
+            sensitive_version = isinstance(resolved_version, str) and holds_token_shape(
+                resolved_version
+            )
+            if sensitive_version:
                 comp.package_url = comp.registry_uri = None
                 comp.risks.append(
                     _identifier_risk(f"PyPI package '{comp.name}'", "lock record version")
                 )
-                continue
+                unresolved = True
             pinned = (
                 extract_version_pin(f"{comp.name}=={resolved_version}", ecosystem="python")
                 if isinstance(resolved_version, str) and len(resolved_version) <= _LONGEST_VERSION
@@ -3841,10 +3855,15 @@ class RegistryScanner(Scanner):
                     if index_origin.startswith("https://")
                     else index_origin
                 )
-            package_url = f"pkg:pypi/{quote(comp.name, safe='')}@{quote(resolved_version, safe='')}"
+            package_url = (
+                None
+                if unresolved
+                else f"pkg:pypi/{quote(comp.name, safe='')}@{quote(resolved_version, safe='')}"
+            )
             if registry_origin not in _PYPI_ORIGINS:
                 # As for npm: the package URL names the index it was resolved from.
-                package_url += f"?repository_url={registry_origin}"
+                if package_url is not None:
+                    package_url += f"?repository_url={registry_origin}"
                 cleartext = registry_origin.startswith("http://")
                 comp.risks.append(
                     _risk(
@@ -3867,8 +3886,8 @@ class RegistryScanner(Scanner):
                 # The declared version keeps its markers; no exact identity is claimed.
                 continue
             locator = f"{lock_name}#/package/{index}"
-            comp.version = resolved_version
-            comp.package_url = None if unresolved else package_url
+            comp.version = REDACTED if sensitive_version else resolved_version
+            comp.package_url = package_url
             comp.source_path = lock_name
             comp.assurance_level = AssuranceLevel.DECLARED
             comp.properties.update(
