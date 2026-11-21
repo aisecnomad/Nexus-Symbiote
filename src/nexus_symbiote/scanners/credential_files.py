@@ -43,7 +43,6 @@ _PROGRAM_SUFFIXES = frozenset(
         ".tsx",
         ".rb",
         ".go",
-        ".co",
     }
 )
 # Directories named for what the files in them hold, such as `secrets/`. Only a whole
@@ -100,15 +99,17 @@ def link_gap(target: str | None) -> str | None:
     return None
 
 
-def withheld(files: ConfinedCollection, path: str, excluded: list[str]) -> bool:
+def withheld(
+    files: ConfinedCollection, path: str, excluded: list[str], *, colang_source: bool = False
+) -> bool:
     """Record credential-name refusals for RAG, guardrail and A2A inputs.
 
-    Known collector files use their own names. Colang files are program surfaces.
-    For a symlink, also check the resolved target's name and directory before reading.
+    Known collector files use their own names. The NeMo collector can designate a
+    direct Colang file as a program. Symlinks always check the target's name and directory.
     """
     relative = PurePosixPath(path)
     reason: str | None
-    if relative.suffix.lower() != ".co" and credential_shaped(relative.name):
+    if not colang_source and credential_shaped(relative.name):
         reason = "its name says it holds credentials"
     else:
         linked = files.in_root_target(path)

@@ -37,6 +37,28 @@ def test_unobserved_dataset_and_model_can_share_a_name(tmp_path: Path):
     )
 
 
+@pytest.mark.parametrize(
+    ("component_type", "section"),
+    [(ModelComponent, "datasets"), (DataSourceComponent, "models")],
+)
+def test_cross_type_declaration_respects_existing_collected_record(
+    tmp_path: Path, component_type, section: str
+):
+    (tmp_path / "agent.yaml").write_text(f"{section}:\n  - name: evaluation\n")
+    collected = component_type(
+        bom_ref="collected:evaluation",
+        name="evaluation",
+        assurance_level=AssuranceLevel.DECLARED,
+    )
+    bom = AIBOM(components=[collected])
+
+    notices = apply_agent_yaml_declarations(bom, tmp_path)
+
+    assert bom.components == [collected]
+    assert len(notices) == 1 and "name conflict" in notices[0]
+    assert [risk.category for risk in collected.risks] == ["declaration_conflict"]
+
+
 def test_conflicting_duplicate_declaration_keeps_first_values(tmp_path: Path):
     (tmp_path / "agent.yaml").write_text(
         "datasets:\n  - name: evaluation\n    release_time: '2025-01-01'\n"

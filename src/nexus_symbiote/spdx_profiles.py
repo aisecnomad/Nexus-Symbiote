@@ -323,13 +323,18 @@ def _conflict_risk(field_name: str, component_name: str, locator: str) -> RiskAs
 
 
 def _type_conflict(
-    holder: AnyComponent | None, declared: str, locator: str, notices: list[str]
+    holder: AnyComponent | None,
+    declared: str,
+    locator: str,
+    notices: list[str],
+    *,
+    declaration_refs: set[str],
 ) -> bool:
     """Whether a collected component of another type holds the declared name.
 
     The declaration is then a conflict on the holder and is not applied.
     """
-    if holder is None or holder.assurance_level == AssuranceLevel.DECLARED:
+    if holder is None or holder.bom_ref in declaration_refs:
         return False
     holder.risks.append(_conflict_risk("component_type", holder.name, locator))
     notices.append(f"{holder.bom_ref}: {declared} name conflict with {locator}")
@@ -511,6 +516,7 @@ def apply_agent_yaml_declarations(
     by_key: dict[tuple[ComponentType, str], AnyComponent] = {
         (c.component_type, c.name): c for c in aibom.components
     }
+    declaration_refs: set[str] = set()
 
     raw_datasets = parsed.get("datasets")
     dataset_refs_by_name: dict[str, str] = {}
@@ -524,7 +530,11 @@ def apply_agent_yaml_declarations(
                 continue
             existing = by_key.get((ComponentType.DATA_SOURCE, ds_name))
             if existing is None and _type_conflict(
-                by_key.get((ComponentType.MODEL, ds_name)), "dataset", locator, notices
+                by_key.get((ComponentType.MODEL, ds_name)),
+                "dataset",
+                locator,
+                notices,
+                declaration_refs=declaration_refs,
             ):
                 continue
             if _repeat_declaration(
@@ -575,6 +585,7 @@ def apply_agent_yaml_declarations(
                 )
                 aibom.components.append(ds_comp)
                 by_key[(ComponentType.DATA_SOURCE, ds_name)] = ds_comp
+                declaration_refs.add(ds_comp.bom_ref)
                 if ds_ver:
                     _record_claim(ds_comp, "version", locator)
                 if ds_sup:
@@ -613,7 +624,11 @@ def apply_agent_yaml_declarations(
                 continue
             existing = by_key.get((ComponentType.MODEL, m_name))
             if existing is None and _type_conflict(
-                by_key.get((ComponentType.DATA_SOURCE, m_name)), "model", locator, notices
+                by_key.get((ComponentType.DATA_SOURCE, m_name)),
+                "model",
+                locator,
+                notices,
+                declaration_refs=declaration_refs,
             ):
                 continue
             if _repeat_declaration(model_declarations, m_name, entry, existing, locator, notices):
@@ -646,6 +661,7 @@ def apply_agent_yaml_declarations(
                 )
                 aibom.components.append(m_comp)
                 by_key[(ComponentType.MODEL, m_name)] = m_comp
+                declaration_refs.add(m_comp.bom_ref)
                 if m_ver:
                     _record_claim(m_comp, "version", locator)
                 if m_sup:

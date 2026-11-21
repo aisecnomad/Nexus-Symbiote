@@ -454,7 +454,9 @@ class RAGScanner(Scanner):
             siblings = [
                 rail
                 for rail in siblings
-                if not withheld(files, rail.as_posix(), result.surfaces_excluded)
+                if not withheld(
+                    files, rail.as_posix(), result.surfaces_excluded, colang_source=True
+                )
             ]
             if withheld(files, relative, result.surfaces_excluded):
                 continue
