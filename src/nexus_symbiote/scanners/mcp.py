@@ -73,6 +73,7 @@ from nexus_symbiote.scanners.mcp_credentials import (
     credential_name,
     endpoint_hits,
     literal_value,
+    name_words,
     rewrapped_key_literals,
     strongest,
     value_hits,
@@ -708,8 +709,8 @@ def _opencode_server(config: dict[str, Any]) -> _Normalized:
     command = config.get("command")
     if isinstance(command, list):
         if not command or not all(isinstance(word, str) for word in command):
+            # Keep the refused words for sibling redaction. Validation rejects the list.
             problem = _INVALID_SERVER
-            config["command"] = ""
         else:
             config["command"] = command[0]
             if "args" in config:
@@ -1095,6 +1096,18 @@ def _explicit_header(previous: str | None, word: str) -> bool:
     )
 
 
+def _scheme_assignment_name(name: str) -> bool:
+    words = name_words(name)
+    if not words or words[-1] in {"type", "mode", "scheme", "method", "transport", "strategy"}:
+        return False
+    auth = {"auth", "authorization", "authentication", "oauth", "bearer", "bot"}
+    return (
+        credential_name(name)
+        or words[-1] in auth
+        or (words[-1] == "header" and not auth.isdisjoint(words[:-1]))
+    )
+
+
 def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     """The hits of a ``NAME=value`` word, ``--name=value`` and ``--env=NAME=value`` included.
 
@@ -1116,12 +1129,9 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     if (
         following is not None
         and value.lower() in _ASSIGNMENT_SCHEMES
-        and not (
-            word.startswith("-")
-            and following.startswith("--")
-            and "=" in following
-            and _CLI_FLAG.fullmatch(following.partition("=")[0])
-        )
+        and _scheme_assignment_name(name)
+        and not (following.startswith("--") and _CLI_FLAG.fullmatch(following.partition("=")[0]))
+        and literal_value(following)
     ):
         hits.extend(value_hits(name, f"{value} {following}"))
     return hits
@@ -1303,11 +1313,35 @@ def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
     while pending:
         name, item = pending.pop()
         if isinstance(item, dict):
-            pending.extend((str(k), value) for k, value in item.items())
+            named_credential = any(
+                isinstance(item.get(key), str) and _scheme_assignment_name(item[key])
+                for key in ("name", "key")
+            )
+            label = "auth" if named_credential else name
+            pending.extend(
+                (label if key in {"value", "values"} else str(key), value)
+                for key, value in item.items()
+            )
         elif isinstance(item, list):
-            pending.extend((name, value) for value in item)
+            if name in {"args", "command"}:
+                for index, word in enumerate(item):
+                    if isinstance(word, str):
+                        previous = item[index - 1] if index else None
+                        following = item[index + 1] if index + 1 < len(item) else None
+                        yield from (
+                            literal
+                            for _, literal in _argument_hits(
+                                previous if isinstance(previous, str) else None,
+                                word,
+                                following=following if isinstance(following, str) else None,
+                            )
+                        )
+            if len(item) == 2 and isinstance(item[0], str) and _scheme_assignment_name(item[0]):
+                pending.extend(((name, item[0]), ("auth", item[1])))
+            else:
+                pending.extend((name, value) for value in item)
         elif isinstance(item, str) and not is_reference(item):
-            if secret_like(name, item):
+            if secret_like(name, item) or (_scheme_assignment_name(name) and literal_value(item)):
                 yield item
             yield from _text_credentials(item)
             yield from _shape_secrets(item)
