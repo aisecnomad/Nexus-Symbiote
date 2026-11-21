@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -78,7 +79,7 @@ def verify_drift_kinds() -> list[str]:
 
 
 BENCH_DIR = Path(__file__).resolve().parent.parent / "benchmarks" / "aibom-bench"
-FRESH_STEP_SECONDS = 900
+FRESH_RUN_SECONDS = 600
 
 
 def fresh_scores(work: Path, scan_options: tuple[str, ...] = ()) -> dict[str, Any]:
@@ -89,6 +90,8 @@ def fresh_scores(work: Path, scan_options: tuple[str, ...] = ()) -> dict[str, An
     class. This run is scored with strict matching and no reviewer overrides: a name in a
     coverage or log line, and a correction made for the graded run, are not detections.
     """
+    work = work.resolve(strict=True)
+    deadline = time.monotonic() + FRESH_RUN_SECONDS
     corpus, home = work / "corpus", work / "home"
     out = work / "results" / "nexus-symbiote" / "airgap"
     out.mkdir(parents=True)
@@ -98,7 +101,12 @@ def fresh_scores(work: Path, scan_options: tuple[str, ...] = ()) -> dict[str, An
     scores = work / "scores.json"
     # The benchmark runner's environment: an empty HOME and a fixed build date.
     env = {
-        **os.environ,
+        **{
+            name: value
+            for name, value in os.environ.items()
+            if not name.startswith("NEXUS_SYMBIOTE_")
+        },
+        "PYTHONPATH": str(BENCH_DIR.parents[1] / "src"),
         "HOME": str(home),
         "XDG_CACHE_HOME": str(home / ".cache"),
         "XDG_CONFIG_HOME": str(home / ".config"),
@@ -111,14 +119,15 @@ def fresh_scores(work: Path, scan_options: tuple[str, ...] = ()) -> dict[str, An
             cwd=work,
             env=env,
             capture_output=True,
-            timeout=FRESH_STEP_SECONDS,
+            timeout=max(0.0, deadline - time.monotonic()),
             check=False,
         )
         return done.returncode
 
     manifest = str(work / "manifest.json")
-    if run(str(BENCH_DIR / "build_corpus.py"), "--out", str(corpus), "--manifest", manifest):
-        raise ValueError("the benchmark corpus could not be built")
+    status = run(str(BENCH_DIR / "build_corpus.py"), "--out", str(corpus), "--manifest", manifest)
+    if status:
+        raise ValueError(f"the benchmark corpus could not be built (status {status})")
     inventory = out / "bom.json"
     status = run(
         "-m", "nexus_symbiote", "scan", str(corpus), "-f", "json", "-o", str(inventory),
@@ -127,15 +136,16 @@ def fresh_scores(work: Path, scan_options: tuple[str, ...] = ()) -> dict[str, An
     # The corpus plants findings, so the scan gate fails with status 1 and still writes.
     if status not in (0, 1) or not inventory.is_file():
         raise ValueError(f"the scan of the benchmark corpus wrote no inventory (status {status})")
-    if run(
+    status = run(
         str(BENCH_DIR / "score.py"),
         "--results", str(work / "results"),
         "--schemas", str(BENCH_DIR / "schemas"),
         "--overrides", str(overrides),
         "--strict",
         "--out", str(scores),
-    ):  # fmt: skip
-        raise ValueError("the benchmark run could not be scored")
+    )  # fmt: skip
+    if status:
+        raise ValueError(f"the benchmark run could not be scored (status {status})")
     document = json.loads(scores.read_text(encoding="utf-8"))
     if not isinstance(document, dict):
         raise ValueError("scores root must be an object")
