@@ -26,7 +26,7 @@ import click
 
 from nexus_symbiote.core.aibom import AIBOM, NativeFormatError
 from nexus_symbiote.crosswalk import FRAMEWORK_KEYS
-from nexus_symbiote.supply_chain_cli import _refuse_source_overwrite
+from nexus_symbiote.runtime_cli import _refuse_source_overwrite
 from nexus_symbiote.utils.terminal import json_text, neutralize, write_cli_output
 
 if TYPE_CHECKING:
@@ -253,10 +253,10 @@ def render_markdown(document: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _load(path: Path) -> AIBOM:
+def _load_with_bytes(path: Path) -> tuple[AIBOM, bytes]:
     # The error names the class of problem; it never quotes the document.
     try:
-        return AIBOM.load(path)
+        return AIBOM.load_with_bytes(path)
     except NativeFormatError as exc:
         raise click.ClickException(
             f"{neutralize(path)} is not a valid native AIBOM file. {neutralize(exc)}"
@@ -287,11 +287,31 @@ def register_crosswalk_commands(main: click.Group) -> None:
         type=click.Path(path_type=Path),
         help="Write the report to this file instead of standard output.",
     )
+    @click.option(
+        "--include-evidence-pack",
+        is_flag=True,
+        help="Attach cryptographic inventory digests, verified models, pinned MCP servers, and fingerprinted tools.",
+    )
+    @click.option(
+        "--project",
+        type=click.Path(exists=True, file_okay=False, path_type=Path),
+        default=None,
+        help="Reconcile AIBOM_PATH against this project to corroborate verified_models in --include-evidence-pack.",
+    )
+    @click.option(
+        "--signature-policy",
+        type=click.Path(exists=True, dir_okay=False, path_type=Path),
+        default=None,
+        help="Explicit operator signer policy JSON for --include-evidence-pack; requires --project.",
+    )
     def crosswalk(
         aibom_path: Path,
         frameworks: tuple[str, ...],
         output_format: str,
         output: Path | None,
+        include_evidence_pack: bool = False,
+        project: Path | None = None,
+        signature_policy: Path | None = None,
     ) -> None:
         """Map findings to OWASP, MITRE ATLAS, NIST AI RMF, EU AI Act, ISO/IEC 42001 and CWE.
 
@@ -304,11 +324,25 @@ def register_crosswalk_commands(main: click.Group) -> None:
         from nexus_symbiote.policy import default_policy
         from nexus_symbiote.validators.risk import RiskScorer
 
+        if signature_policy is not None and project is None:
+            raise click.UsageError("--signature-policy requires --project")
+        if project is not None and not include_evidence_pack:
+            raise click.UsageError(
+                "--project and --signature-policy require --include-evidence-pack"
+            )
+        if include_evidence_pack and output_format == "markdown":
+            raise click.UsageError("--include-evidence-pack requires --format json")
         _refuse_source_overwrite(output, aibom_path)
-        bom = _load(aibom_path)
+        bom, raw_bytes = _load_with_bytes(aibom_path)
         report = RiskScorer.from_policy(default_policy().risk).score(bom)
         selected = [key for key in FRAMEWORK_KEYS if not frameworks or key in frameworks]
         document = build_report(report, selected)
+        if include_evidence_pack:
+            from nexus_symbiote.policy_export import build_evidence_pack
+
+            document["evidence_pack"] = build_evidence_pack(
+                raw_bytes, bom, project=project, signature_policy=signature_policy
+            )
         if output_format == "markdown":
             text = render_markdown(document)
             if output:

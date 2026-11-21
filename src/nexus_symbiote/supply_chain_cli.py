@@ -15,6 +15,7 @@ import click
 from nexus_symbiote import modes
 from nexus_symbiote.core.aibom import AIBOM, NativeFormatError
 from nexus_symbiote.live_cli import review_notice
+from nexus_symbiote.runtime_cli import _refuse_source_overwrite as _refuse_source_overwrite
 from nexus_symbiote.utils.files import create_staging_file
 from nexus_symbiote.utils.terminal import (
     echo_line,
@@ -46,21 +47,6 @@ def _load_inventory(path: Path) -> AIBOM:
         ) from exc
     except (OSError, ValueError, RecursionError) as exc:
         raise click.ClickException(f"{neutralize(path)} is not a valid native AIBOM file.") from exc
-
-
-def _refuse_source_overwrite(output: Path | None, source: Path) -> None:
-    if output is None:
-        return
-    try:
-        # Path text alone misses a second name for the same file (a hard link, a bind
-        # mount or a case variant), so an existing output is also compared by identity.
-        same = output.resolve() == source.resolve() or (
-            output.exists() and os.path.samefile(output, source)
-        )
-    except (OSError, RuntimeError) as exc:
-        raise output_failure(exc) from exc
-    if same:
-        raise click.BadParameter("output must not overwrite the source inventory")
 
 
 def _repository_roots(path: Path) -> list[Path]:
@@ -187,6 +173,59 @@ def register_supply_chain_commands(main: click.Group) -> None:
         ),
     )
     @click.option(
+        "--transport-evidence",
+        multiple=True,
+        type=click.Path(exists=True, dir_okay=False, path_type=Path),
+        help=(
+            "Recorded discover-mcp --record inventory providing live observation evidence "
+            "for remote MCP servers; requires --transport-evidence-attestation and --trusted-key (repeatable)."
+        ),
+    )
+    @click.option(
+        "--transport-evidence-attestation",
+        "transport_evidence_attestations",
+        multiple=True,
+        type=click.Path(exists=True, dir_okay=False, path_type=Path),
+        help=(
+            "DSSE inventory attestation envelope matching each --transport-evidence file in order (repeatable)."
+        ),
+    )
+    @click.option(
+        "--trusted-key",
+        "trusted_keys",
+        multiple=True,
+        type=click.Path(exists=True, dir_okay=False, path_type=Path),
+        help=(
+            "Trusted Ed25519 public key PEM for --transport-evidence-attestation; must lie outside "
+            "--project and every repository enclosing --project, the inventory or the evidence (repeatable)."
+        ),
+    )
+    @click.option(
+        "--transport-evidence-purpose",
+        type=click.Choice(["generated", "reviewed"]),
+        default=None,
+        help="Expected attestation purpose for --transport-evidence-attestation (default: generated).",
+    )
+    @click.option(
+        "--require-transport-evidence",
+        is_flag=True,
+        help=(
+            "Fail closed when any remote MCP server in the inventory lacks verified "
+            "--transport-evidence instead of skipping it as not verifiable here."
+        ),
+    )
+    @click.option(
+        "--max-evidence-age",
+        type=click.IntRange(min=1, max=876000),
+        default=None,
+        help="Refuse --transport-evidence observed more than this many hours ago.",
+    )
+    @click.option(
+        "--require-full-url-binding",
+        is_flag=True,
+        help="Refuse --transport-evidence for a server whose inventory records no full-URL digest. It compares the evidence with the digest the inventory records, not with the configured URL: an inventory that records the digest of another URL satisfies it.",
+    )
+    @click.option(
         "--no-isolation",
         is_flag=True,
         help=(
@@ -209,6 +248,13 @@ def register_supply_chain_commands(main: click.Group) -> None:
         json_output: bool,
         record: bool,
         accept_drift: bool,
+        transport_evidence: tuple[Path, ...],
+        transport_evidence_attestations: tuple[Path, ...],
+        trusted_keys: tuple[Path, ...],
+        transport_evidence_purpose: str | None,
+        require_transport_evidence: bool,
+        max_evidence_age: int | None,
+        require_full_url_binding: bool,
         no_isolation: bool,
     ) -> None:
         """Live: observe independently pinned stdio launchers; optionally emit an unsigned candidate.
@@ -217,19 +263,71 @@ def register_supply_chain_commands(main: click.Group) -> None:
         cover launcher bytes; use an externally isolated worker to restrict its
         host dependencies, filesystem, identity and egress. Project settings do
         not supply launch authority. Descriptor matches do not establish safety.
-        Remote MCP servers in the inventory are reported as not verifiable here;
-        observe them with discover-mcp --record.
+        Remote MCP servers in the inventory are reported as not verifiable here
+        unless verified with attested --transport-evidence or required with
+        --require-transport-evidence.
         """
         modes.require_live("verify-live")
+        from datetime import timedelta
+        from typing import cast
+
+        from nexus_symbiote.attestation import Purpose
         from nexus_symbiote.core.hashing import hash_bytes, open_regular_file, parse_json_strict
         from nexus_symbiote.live.pinned_process import isolation_off
         from nexus_symbiote.live.verify import record_candidate, verify_mcp_servers
+        from nexus_symbiote.policy_export import verify_file_attestation
 
         if record and json_output:
             raise click.UsageError("choose a candidate BOM or a JSON verification report")
         if accept_drift and not record:
             raise click.UsageError("--accept-drift applies only to --record")
-        expected_info = _check_launch_policy(launch_policy, Path(project), Path(aibom_path))
+        if (
+            transport_evidence_attestations
+            or trusted_keys
+            or transport_evidence_purpose is not None
+            or max_evidence_age is not None
+            or require_full_url_binding
+        ) and not transport_evidence:
+            raise click.UsageError(
+                "--transport-evidence-attestation, --trusted-key, --transport-evidence-purpose, "
+                "--max-evidence-age and --require-full-url-binding require --transport-evidence"
+            )
+        if transport_evidence:
+            if len(transport_evidence_attestations) != len(transport_evidence):
+                raise click.UsageError(
+                    "each --transport-evidence file requires a matching "
+                    "--transport-evidence-attestation envelope"
+                )
+            if not trusted_keys:
+                raise click.UsageError("--transport-evidence requires at least one --trusted-key")
+        project_path = Path(project)
+        inventory_path = Path(aibom_path)
+        untrusted_roots = [
+            project_path.resolve(),
+            *_repository_roots(project_path.resolve()),
+            *_repository_roots(inventory_path.resolve().parent),
+        ]
+        for ev_path, att_path in zip(
+            transport_evidence, transport_evidence_attestations, strict=True
+        ):
+            for candidate_path, flag_name in (
+                (ev_path, "--transport-evidence"),
+                (att_path, "--transport-evidence-attestation"),
+            ):
+                resolved_ev = candidate_path.resolve()
+                if any(resolved_ev.is_relative_to(root) for root in untrusted_roots):
+                    raise click.UsageError(
+                        f"{flag_name} must lie outside --project and any repository enclosing "
+                        "--project or AIBOM_PATH"
+                    )
+                try:
+                    if resolved_ev == inventory_path.resolve() or os.path.samefile(
+                        candidate_path, inventory_path
+                    ):
+                        raise click.UsageError(f"{flag_name} must not alias AIBOM_PATH")
+                except OSError as exc:
+                    raise click.UsageError(f"{flag_name} cannot be inspected") from exc
+        expected_info = _check_launch_policy(launch_policy, project_path, inventory_path)
         try:
             with open_regular_file(launch_policy) as stream:
                 finfo = os.fstat(stream.fileno())
@@ -245,12 +343,39 @@ def register_supply_chain_commands(main: click.Group) -> None:
             policy = parse_json_strict(policy_bytes)
             if not isinstance(policy, dict):
                 raise ValueError("launch policy must be an object")
-            with open_regular_file(Path(aibom_path)) as stream:
+            with open_regular_file(inventory_path) as stream:
                 inventory_bytes = stream.read(16 * 1024 * 1024 + 1)
             document = parse_json_strict(inventory_bytes, max_bytes=16 * 1024 * 1024)
             bom = AIBOM.from_document(document)
+            evidence_boms: list[AIBOM] = []
+            evidence_digests: list[str] = []
+            raw_evidence_pairs: list[tuple[Path, Path, bytes]] = []
+            for ev_path, att_path in zip(
+                transport_evidence, transport_evidence_attestations, strict=True
+            ):
+                with open_regular_file(ev_path) as stream:
+                    ev_bytes = stream.read(16 * 1024 * 1024 + 1)
+                raw_evidence_pairs.append((ev_path, att_path, ev_bytes))
         except (OSError, ValueError, TypeError, RecursionError):
             raise click.ClickException("invalid BOM or operator launch policy") from None
+        effective_purpose = cast(Purpose, transport_evidence_purpose or "generated")
+        for ev_path, att_path, ev_bytes in raw_evidence_pairs:
+            verify_file_attestation(
+                ev_path,
+                att_path,
+                trusted_keys=trusted_keys,
+                purpose=effective_purpose,
+                project=project_path,
+                inventory=inventory_path,
+                subject_bytes=ev_bytes,
+                failure_prefix="transport evidence attestation failed",
+            )
+            try:
+                ev_doc = parse_json_strict(ev_bytes, max_bytes=16 * 1024 * 1024)
+                evidence_boms.append(AIBOM.from_document(ev_doc))
+                evidence_digests.append(hash_bytes(ev_bytes))
+            except (ValueError, TypeError, RecursionError):
+                raise click.ClickException("invalid transport evidence inventory") from None
         if no_isolation:
             click.echo(
                 "warning: --no-isolation: kernel PID containment is disabled. On Linux the "
@@ -272,10 +397,24 @@ def register_supply_chain_commands(main: click.Group) -> None:
                     err=True,
                 )
         with isolation_off() if no_isolation else contextlib.nullcontext():
-            report = verify_mcp_servers(bom, trusted_launchers=policy)
+            report = verify_mcp_servers(
+                bom,
+                trusted_launchers=policy,
+                transport_evidence=evidence_boms,
+                require_transport_evidence=require_transport_evidence,
+                max_evidence_age=None
+                if max_evidence_age is None
+                else timedelta(hours=max_evidence_age),
+                require_full_url_binding=require_full_url_binding,
+            )
         report.inputs = {
             "inventory_sha256": hash_bytes(inventory_bytes),
             "launch_policy_sha256": hash_bytes(policy_bytes),
+            **(
+                {"transport_evidence_sha256": ",".join(evidence_digests)}
+                if evidence_digests
+                else {}
+            ),
         }
         if record:
             try:
@@ -313,6 +452,9 @@ def register_supply_chain_commands(main: click.Group) -> None:
                 f"{report.servers_skipped} remote not verifiable here; ",
                 f"complete={report.complete}; drift={report.has_drift}",
             )
+            for result in report.origin_bound:
+                shown = f"{result.server_ref}: verified by origin-only transport evidence observed "
+                echo_line("Server ", shown, (result.transport_evidence or {})["observed_at"])
             for result in report.results:
                 if result.reason is not None:
                     echo_line(

@@ -70,6 +70,7 @@ change them. See [collection limits](collection-limits.md).
 | [`export-inventory`](#export-inventory) | offline | Write the reviewed repository agent as an approved inventory that ShadowScan's `--inventory` accepts |
 | [`import-sbom`](#import-sbom) | offline | Import a foreign CycloneDX or SPDX SBOM as DECLARED evidence without picking silent winners |
 | [`evidence-profile`](#evidence-profile) | offline | Report concrete evidence attributes per component without a scalar TrustScore |
+| [`export-policy`](#export-policy) | offline | Export a default-deny Cedar, Rego v1 or JSON runtime allowlist from a corroborated inventory |
 | [`init`](#init) | offline | Create a `.nexus-symbiote.yaml` policy file |
 | [`runtime keygen`](#runtime-keygen) | offline | Create an Ed25519 key pair for runtime contracts |
 | [`runtime sign`](#runtime-sign) | offline | Sign a runtime contract |
@@ -464,6 +465,9 @@ nexus-symbiote crosswalk [OPTIONS] AIBOM_PATH
 | `--framework` `NAME` | Report only this framework edition: `owasp-llm-2025`, `owasp-llm-2026`, `owasp-asi-2026`, `mitre-atlas-2026.10`, `nist-ai-rmf-1.0`, `eu-ai-act-2024`, `iso-iec-42001-2023` or `cwe`. Repeatable; default: every edition. |
 | `--format` `json\|markdown` | Report format (default: `json`). |
 | `-o`, `--output` `PATH` | Write the report to this file instead of standard output. A path that names the inventory is a usage error. |
+| `--include-evidence-pack` | Attach cryptographic inventory digests, corroborated `verified_models`, `declared_signed_models`, pinned MCP servers, and fingerprinted tools to the JSON report; requires `--format json`. Only `verified_models` is corroborated by `--project`: the pinned servers and fingerprinted tools are the inventory's own claims. |
+| `--project` `DIRECTORY` | Reconcile `AIBOM_PATH` against this project to corroborate `verified_models` in `--include-evidence-pack`. |
+| `--signature-policy` `FILE` | Explicit operator signer policy JSON for `--include-evidence-pack`; requires `--project`. |
 
 The findings are those that `risk` scores under the built-in policy; no project policy
 is read. For each framework edition the report lists every entry that a finding
@@ -611,6 +615,26 @@ inventory's file SHA-256 and content digest. The command exits 1 when the
 inventory is invalid, holds no repository agent or more than one, or its agent
 has no declared identity and `--include-unnamed` is absent; see
 [Approve agents for ShadowScan reconciliation](shadowscan-inventory-export.md).
+
+### `export-policy`
+
+Export a default-deny Cedar, Rego, or JSON runtime allowlist from an inventory.
+
+```text
+nexus-symbiote export-policy [OPTIONS] INVENTORY
+```
+
+| Option | Description |
+|---|---|
+| `--format` `cedar\|rego\|json` | Target authorization policy language (default: `cedar`). |
+| `--verified-only` / `--include-declared` | Allowlist only observed or verified components with pinned digests (default: `--verified-only`), or include declared entries (`--include-declared`). |
+| `--project` `DIRECTORY` | Reconcile `INVENTORY` against this project before exporting a `--verified-only` policy. |
+| `--signature-policy` `FILE` | Explicit operator signer policy JSON for model verification; requires `--project`. |
+| `--require-attestation` `FILE` | Verify a reviewed DSSE inventory attestation envelope for `INVENTORY`; requires `--trusted-key`. |
+| `--trusted-key` `FILE` | Trusted Ed25519 public key PEM for `--require-attestation` (repeatable). |
+| `-o`, `--output` `PATH` | Write the policy to this file instead of standard output. |
+
+By default (`--verified-only`), `export-policy` refuses uncorroborated inventories unless `--project` reconciles and integrity-validates `INVENTORY` against the project or `--require-attestation` with `--trusted-key` verifies a reviewed DSSE attestation over `INVENTORY`. Pass `--include-declared` only when exporting uncorroborated declarations intentionally. With `--require-attestation` and no `--project`, tool and MCP server permits rest on the reviewer's attestation of the inventory's own claims, and no model is permitted: only `--project` with `--signature-policy` corroborates a model's digest and signature.
 
 ### `graph`
 
@@ -1123,6 +1147,13 @@ nexus-symbiote verify-live [OPTIONS] AIBOM_PATH
 | `--json-output` | Output the verification report as JSON. |
 | `--record` | Print an unsigned candidate BOM with the observed descriptors instead of a report; exits 1 when served tools, declarations or the server identity drifted, unless `--accept-drift`. |
 | `--accept-drift` | With `--record`, exit 0 although changed or new tools, declarations or server identity were recorded. |
+| `--transport-evidence` `FILE` | Recorded `discover-mcp --record` inventory providing live observation evidence for remote MCP servers; requires `--transport-evidence-attestation` and `--trusted-key` (repeatable). |
+| `--transport-evidence-attestation` `FILE` | DSSE inventory attestation envelope matching each `--transport-evidence` file in order (repeatable). |
+| `--trusted-key` `FILE` | Trusted Ed25519 public key PEM for `--transport-evidence-attestation`; must lie outside `--project` and every repository enclosing `--project`, the inventory or the evidence (repeatable). |
+| `--transport-evidence-purpose` `generated\|reviewed` | Expected attestation purpose for `--transport-evidence-attestation` (default: `generated`). |
+| `--require-transport-evidence` | Fail closed when any remote MCP server in the inventory lacks verified `--transport-evidence` instead of skipping it as not verifiable here. Evidence verifies only a server whose inventory endpoint is the observed `https` origin; until `--record` stores its full-URL digest, the binding is origin-only (`transport_evidence.endpoint_binding` in the report). |
+| `--max-evidence-age` `HOURS` | Refuse `--transport-evidence` observed more than this many hours ago. Evidence dated in the future is always refused. |
+| `--require-full-url-binding` | Refuse `--transport-evidence` for a server whose inventory records no `observed_endpoint_hash`. It compares the evidence with the digest the inventory records, not with the URL in the project's configuration, so an inventory that records the digest of another URL satisfies it. Text output names each origin-only server; JSON counts them in `origin_bound_servers`. |
 | `--no-isolation` | Explicitly allow execution without a PID namespace; printed as a warning. On Linux the launcher runs in its own process group under a wrapper that stays its parent as a child subreaper and ignores the signals it can, and cleanup kills the wrapper's whole tree, including a `clone(CLONE_PARENT)` child that has called `setsid` and what a launcher that already exited left behind. A launcher that kills its wrapper with SIGKILL can escape, except from a cgroup v2 child where one can be created, which cleanup also kills; the server then fails with `isolation-teardown-failed`, unless the launcher runs as root or holds `CAP_SYS_PTRACE` or `CAP_SYS_ADMIN`, which can hide the escape. Never opt out as root; doing so prints a second warning. Elsewhere cleanup is best effort. This is not a namespace or sandbox. |
 
 By default the launcher must run as pid 1 of a new user and PID namespace

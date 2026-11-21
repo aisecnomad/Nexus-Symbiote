@@ -678,6 +678,19 @@ def _reach(graph: dict[str, set[str]], starts: Iterable[str]) -> set[str]:
     return seen
 
 
+MAX_SHARED_CREDENTIAL_VARS = 32
+MAX_SHARED_CREDENTIAL_HOLDERS = 20
+_VALID_ENV_VAR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,127}")
+
+
+def _is_credential_env_var_name(name: str) -> bool:
+    from nexus_symbiote.utils.secrets import _CREDENTIAL_KEY
+
+    if not _VALID_ENV_VAR_NAME.fullmatch(name) or "redacted" in name.lower():
+        return False
+    return _CREDENTIAL_KEY.search(name) is not None
+
+
 def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
     """Potential reach of a compromised component through recorded relationships.
 
@@ -693,10 +706,25 @@ def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
         raise ValueError(f"unknown component: {_clip(component_ref)}")
     forward: dict[str, set[str]] = {}
     reverse: dict[str, set[str]] = {}
+    env_index: dict[str, set[str]] = {}
     for component in bom.components:
         for _, ref in _references(component):
             forward.setdefault(component.bom_ref, set()).add(ref)
             reverse.setdefault(ref, set()).add(component.bom_ref)
+        upstreams = component.properties.get("upstream_server_refs")
+        if isinstance(upstreams, list):
+            for srv_ref in upstreams:
+                if isinstance(srv_ref, str) and srv_ref in nodes:
+                    forward.setdefault(component.bom_ref, set()).add(srv_ref)
+                    reverse.setdefault(srv_ref, set()).add(component.bom_ref)
+        env_map = getattr(component, "env", None)
+        env_vars = list(env_map.keys()) if isinstance(env_map, dict) else []
+        prop_vars = component.properties.get("env_vars_referenced")
+        if isinstance(prop_vars, list):
+            env_vars.extend(v for v in prop_vars if isinstance(v, str))
+        for var in env_vars:
+            if isinstance(var, str) and _is_credential_env_var_name(var):
+                env_index.setdefault(var, set()).add(component.bom_ref)
     for edge in bom.dependencies:
         forward.setdefault(edge.source_ref, set()).add(edge.target_ref)
         reverse.setdefault(edge.target_ref, set()).add(edge.source_ref)
@@ -707,6 +735,25 @@ def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
     principals = sorted(
         {auth.principal for ref in reach for auth in getattr(nodes[ref], "authorizations", [])}
     )
+    candidate_credentials = [
+        (var, sorted(holders))
+        for var, holders in sorted(env_index.items())
+        if len(holders) > 1 and (holders & reach)
+    ]
+    shared_credentials = {
+        var: holders[:MAX_SHARED_CREDENTIAL_HOLDERS]
+        for var, holders in candidate_credentials[:MAX_SHARED_CREDENTIAL_VARS]
+    }
+    truncated_creds = len(candidate_credentials) > MAX_SHARED_CREDENTIAL_VARS or any(
+        len(holders) > MAX_SHARED_CREDENTIAL_HOLDERS
+        for _, holders in candidate_credentials[:MAX_SHARED_CREDENTIAL_VARS]
+    )
+    gateways = sorted(
+        ref
+        for ref in reach
+        if nodes[ref].properties.get("mcp_role") == "gateway"
+        or isinstance(nodes[ref].properties.get("upstream_server_refs"), list)
+    )
     limitations = [
         "Reachability describes potential dependencies, not proven exploitability or runtime access."
     ]
@@ -714,12 +761,19 @@ def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
         limitations.append(
             "The component has no recorded relationships: reachability is unknown, not empty."
         )
+    if truncated_creds:
+        limitations.append(
+            f"shared_credential_surfaces is bounded to at most {MAX_SHARED_CREDENTIAL_VARS} "
+            f"credential variables and {MAX_SHARED_CREDENTIAL_HOLDERS} holders each."
+        )
     return {
         "subject": component_ref,
         "affected_agents": affected,
         "dependent_components": sorted(upstream - {component_ref}),
         "reachable_components": sorted(reach),
         "declared_principals": principals,
+        "shared_credential_surfaces": shared_credentials,
+        "mcp_gateways": gateways,
         "scope": "repository-association",
         "effective_authority": "unknown",
         "linked": bool(forward.get(component_ref) or reverse.get(component_ref)),

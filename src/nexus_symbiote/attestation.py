@@ -80,6 +80,7 @@ MAX_SUBJECT_NAME_CHARACTERS = 255
 MAX_NATIVE_DEPTH = 256
 # A complete envelope holds at most a 1 MiB statement in base64 and 32 signatures.
 MAX_ENVELOPE_BYTES = 2 * 1024 * 1024
+MAX_SUBJECT_BYTES = 64 * 1024 * 1024
 CLOCK_SKEW = timedelta(minutes=5)
 
 REASONS: dict[str, str] = {
