@@ -284,15 +284,18 @@ class PinnedStdioSession:
             result = self._request(
                 "tools/call", {"name": call.tool_name, "arguments": call.arguments}
             )
+            validate_output = self._validate_output
+            if validate_output is None:
+                return result
             is_error = result.get("isError", False)
             if not isinstance(is_error, bool):
                 raise ValueError("MCP tool result has an invalid error flag")
-            if self._validate_output is not None and not is_error:
+            if not is_error:
                 structured = result.get("structuredContent")
                 if not isinstance(structured, dict):
                     raise ValueError("MCP tool result lacks structured content")
                 try:
-                    self._validate_output(structured)
+                    validate_output(structured)
                 except ValidationBudgetError as exc:
                     raise ValidationBudgetError(
                         "MCP structured result failed offline output schema validation",

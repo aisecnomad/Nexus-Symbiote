@@ -34,6 +34,9 @@ WORKER_CPU_SECONDS = 1
 WORKER_MEMORY_BYTES = 256 * 1024 * 1024
 WORKER_SLOTS = 4
 _WORKER_SLOTS = threading.BoundedSemaphore(WORKER_SLOTS)
+OUTPUT_RESERVATIONS = 4
+_OUTPUT_RESERVATIONS = threading.BoundedSemaphore(OUTPUT_RESERVATIONS)
+_OUTPUT_WAIT_SECONDS = WORKER_STARTUP_SECONDS + WORKER_TIMEOUT_SECONDS
 _WORKER_COMMAND = (sys.executable, "-I", "-m", "nexus_symbiote.runtime_validation")
 _READY = b"ready\n"
 _VALID = b"valid\n"
@@ -174,15 +177,24 @@ def validate_arguments(schema: Any, arguments: dict[str, Any]) -> None:
 
 @contextmanager
 def prepare_output_validation(schema: Any) -> Iterator[Callable[[dict[str, Any]], None]]:
-    """Check schema support and reserve capacity through the tool response."""
+    """Check schema support and reserve one pending response without holding a worker."""
     preflight = _validation_request(schema, None)
 
     def validate(result: dict[str, Any]) -> None:
-        _validate(_validation_request(schema, result))
+        wire = _validation_request(schema, result)
+        with _validation_slot(wait_for_output=True):
+            _validate(wire)
 
-    with _validation_slot():
-        _validate(preflight)
+    if not _OUTPUT_RESERVATIONS.acquire(blocking=False):
+        raise ValidationBudgetError(
+            "pending output validation capacity unavailable", reason="validation-capacity"
+        )
+    try:
+        with _validation_slot():
+            _validate(preflight)
         yield validate
+    finally:
+        _OUTPUT_RESERVATIONS.release()
 
 
 def _validation_request(schema: Any, instance: dict[str, Any] | None) -> bytes:
@@ -205,8 +217,13 @@ def _validation_request(schema: Any, instance: dict[str, Any] | None) -> bytes:
 
 
 @contextmanager
-def _validation_slot() -> Iterator[None]:
-    if not _WORKER_SLOTS.acquire(blocking=False):
+def _validation_slot(*, wait_for_output: bool = False) -> Iterator[None]:
+    acquired = (
+        _WORKER_SLOTS.acquire(timeout=_OUTPUT_WAIT_SECONDS)
+        if wait_for_output
+        else _WORKER_SLOTS.acquire(blocking=False)
+    )
+    if not acquired:
         raise ValidationBudgetError(
             "validation worker capacity unavailable", reason="validation-capacity"
         )
@@ -942,7 +959,7 @@ def _unsupported_vocabulary(node: dict[str, Any], dialect: str, *, is_root: bool
 
 
 def _ignores_a_keyword(
-    schema: dict[str, Any], dialect: str, validator: Any, *, check_patterns: bool = False
+    schema: dict[str, Any], dialect: str, validator: Any, *, preflight: bool = False
 ) -> bool:
     """Whether evaluation would skip a constraint that whoever approves the schema reads.
 
@@ -968,7 +985,7 @@ def _ignores_a_keyword(
     pending: list[Any] = [schema]
     seen: set[int] = set()
     nodes: list[dict[str, Any]] = []
-    regex = _EcmaRegex() if check_patterns else None
+    regex = _EcmaRegex() if preflight else None
     while pending:
         node = pending.pop()
         if not isinstance(node, dict) or id(node) in seen:
@@ -1005,7 +1022,44 @@ def _ignores_a_keyword(
                 if not isinstance(target, (dict, bool)):
                     return True
                 pending.append(target)
+    if preflight and _has_in_place_cycle(schema, resolver):
+        return True
     return dialect == DIALECTS[3] and _contains_meets_unevaluated_items(nodes, resolver)
+
+
+def _has_in_place_cycle(schema: dict[str, Any], resolver: Any) -> bool:
+    """Reject recursion that can revisit a schema without descending into the instance."""
+    pending = [schema]
+    graph: dict[int, list[int]] = {}
+    maps = _SUBSCHEMA_MAPS - {"$defs", "definitions"}
+    while pending:
+        node = pending.pop()
+        if not isinstance(node, dict) or id(node) in graph:
+            continue
+        in_place = [child for child in _applied_in_place(node, resolver) if isinstance(child, dict)]
+        graph[id(node)] = [id(child) for child in in_place]
+        pending.extend(in_place)
+        # Inspect schemas applied to subvalues, too. The edge to each of these
+        # descends in the instance, so it does not participate in an in-place cycle.
+        for keyword, value in node.items():
+            if keyword in maps and isinstance(value, dict):
+                pending.extend(value.values())
+            elif keyword in _SUBSCHEMA | _SUBSCHEMA_LISTS:
+                pending.extend(value if isinstance(value, list) else [value])
+
+    incoming = dict.fromkeys(graph, 0)
+    for edges in graph.values():
+        for child_id in edges:
+            incoming[child_id] += 1
+    ready = [node_id for node_id, count in incoming.items() if count == 0]
+    visited = 0
+    while ready:
+        visited += 1
+        for child_id in graph[ready.pop()]:
+            incoming[child_id] -= 1
+            if incoming[child_id] == 0:
+                ready.append(child_id)
+    return visited != len(graph)
 
 
 def _contains_meets_unevaluated_items(nodes: list[dict[str, Any]], resolver: Any) -> bool:
@@ -1037,16 +1091,19 @@ def _contains_meets_unevaluated_items(nodes: list[dict[str, Any]], resolver: Any
 
 
 def _applied_in_place(node: dict[str, Any], resolver: Any) -> list[Any]:
-    """The subschemas that 2019-09 applies to the instance location of ``node``."""
-    children = [node[keyword] for keyword in ("not", "if", "then", "else") if keyword in node]
+    """The applicable subschemas that evaluate the same instance location as ``node``."""
+    children = [node["not"]] if "not" in node else []
+    if "if" in node:
+        children.extend(node[keyword] for keyword in ("if", "then", "else") if keyword in node)
     for keyword in ("allOf", "anyOf", "oneOf"):
         if isinstance(node.get(keyword), list):
             children.extend(node[keyword])
-    if isinstance(node.get("dependentSchemas"), dict):
-        children.extend(node["dependentSchemas"].values())
+    for keyword in ("dependencies", "dependentSchemas"):
+        if isinstance(node.get(keyword), dict):
+            children.extend(node[keyword].values())
     children.extend(
         _reference_target(resolver, keyword, node[keyword])
-        for keyword in ("$ref", "$recursiveRef")
+        for keyword in _REFERENCES
         if keyword in node
     )
     return children
@@ -1097,7 +1154,7 @@ def _evaluate(dialects: dict[str, Any], schema: dict[str, Any], arguments: Any) 
     try:
         validator.check_schema(schema)
         preflight = arguments is None
-        if _ignores_a_keyword(schema, dialect, validator, check_patterns=preflight):
+        if _ignores_a_keyword(schema, dialect, validator, preflight=preflight):
             return _SCHEMA
         if not preflight:
             validator(schema, registry=Registry()).validate(arguments)

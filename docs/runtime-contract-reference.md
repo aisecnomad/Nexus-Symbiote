@@ -583,11 +583,12 @@ gateway whose only use is `register_snapshot`; `invoke` on it is refused with
 `configuration-invalid`. `approval_keys` is optional and only checked, so the
 gateways' scope map can be reused.
 
-`bind_adapters(describe=..., execute=...)` returns a gateway with the same policy
-and state that uses other description and execution adapters, as
-`invoke_pinned_stdio` does. `check_validation_worker()` runs one trivial schema
-validation and raises the worker's reason code; call it at start-up or from a
-readiness probe.
+`bind_adapters(describe=..., execute=..., prepare=...)` returns a gateway with
+the same policy and state. The optional `prepare` callback receives the verified
+descriptor after input validation and before approval is recorded. The pinned
+stdio adapter uses it to prepare output validation. `check_validation_worker()`
+runs one trivial schema validation and raises the worker's reason code. Call it
+at start-up or from a readiness probe.
 
 ## State store
 

@@ -212,9 +212,10 @@ host does not spend the evaluation budget on start-up. Call
 `check_validation_worker()` at start-up or from a readiness probe to find a host
 where the worker cannot run. Validation requires POSIX resource limits and fails
 closed if a worker cannot start, crashes, times out or returns an invalid result.
-At most four validations run concurrently in one gateway process; additional
-requests fail closed with `validation-capacity`, and a timeout with
-`validation-timeout`, both of which can be retried. JSON input is bounded to 32
+At most four validations run concurrently in one gateway process. A capacity
+refusal or timeout during authorization leaves the approval available for a
+retry. Validation errors after dispatch leave an unknown execution outcome.
+JSON input is bounded to 32
 levels and 20,000 nodes per value, 256 KiB per served descriptor/schema and 1 MiB
 per argument object. Deployments must also rate-limit requests and bound the
 trusted authentication, description, scope and execution adapters. Workers load
@@ -262,17 +263,19 @@ jsonschema upgrade changed that, the worker does not start and calls fail with
 `validation-unavailable`.
 
 Revocation and required operation approvals are checked before schema evaluation.
-The worker cannot retrieve schema references from the network. Validation failure
-does not consume an approval nonce.
+The worker cannot retrieve schema references from the network. Input validation
+and output schema preparation take place before the gateway records the approval.
 
 ### Pinned stdio integration
 
 The stdio adapter validates successful `structuredContent` against the approved
 `outputSchema` when present. Before dispatch, the gateway checks that the worker
-supports the schema and reserves validation capacity for the response. An
-unsupported schema or unavailable capacity denies the call before the approval
-is consumed. A call may hold one of the four shared slots until its response
-arrives or its deadline expires. The full JSON-RPC reply has a 1 MiB frame cap.
+supports the schema, including that references cannot recurse indefinitely on
+one value. It reserves one of four pending response checks before consuming the
+approval. An unsupported schema or unavailable capacity denies the call at
+this point. A pending response reservation occupies no validation worker.
+Inputs and outputs share four active workers. A response can wait up to 12
+seconds for a worker. The full JSON-RPC reply has a 1 MiB frame cap.
 The worker also caps `structuredContent` at 20,000 JSON values, 32 nesting
 levels, and 1 MiB using a conservative estimate of its ASCII-escaped JSON size.
 Missing, invalid, oversized, or unverifiable structured content raises
@@ -298,11 +301,11 @@ scope resolution, state storage or other synchronous gateway work. Operators
 must impose an external end-to-end deadline on the invocation and its adapters.
 
 Use `invoke_pinned_stdio(gateway, call, command=..., sha256=..., snapshot=...,
-trust=..., bom=..., approval=..., call_deadline_seconds=...)`. It replaces only
-the gateway's `describe` and `execute` callbacks, through `bind_adapters`, and
-uses the same process for both steps; the gateway's keys, quorums, signer scopes,
-state and `on_decision` callback still apply. It raises `AuthorizationError` only
-before `tools/call` is sent. After that, a JSON-RPC error reply raises
+trust=..., bom=..., approval=..., call_deadline_seconds=...)`. It binds a
+`prepare` callback for the verified descriptor alongside the `describe` and
+`execute` callbacks. The same process handles both MCP requests. The gateway's
+keys, quorums, signer scopes, state and `on_decision` callback still apply.
+`AuthorizationError` is raised only before `tools/call` is sent. After that, a JSON-RPC error reply raises
 `ToolCallError`, which carries the error `code`, and any other failure raises
 `ExecutionOutcomeUnknown`. Neither means that the gateway refused the call: it was
 admitted and its approval spent, and an unknown outcome means the tool may have
