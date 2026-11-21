@@ -7,6 +7,7 @@ import json
 import posixpath
 import re
 import shlex
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -67,7 +68,6 @@ def _as_dict(val: Any) -> dict[str, Any]:
 BRIDGE_PACKAGES = _words("mcp-remote supergateway mcp-proxy @modelcontextprotocol/server-proxy")
 RUNTIME_LAUNCHERS = _words("node python python3 sh bash zsh deno bun tsx uvx npx")
 PACKAGE_RUNNERS = _words("npx uvx")
-FS_WRITE_TOOLS = _words("write_file edit_file move_file")
 INSTALLED_BIN_DIRS = _tup("node_modules/.bin/ .venv/bin/ venv/bin/")
 SCRIPT_SUFFIXES = _tup(".sh .py .js .mjs .cjs .ts .rb .pl")
 CODE_EXEC_HOSTED_TOOLS = _words("code_interpreter computer_use bash local_shell code_execution")
@@ -186,6 +186,8 @@ def _load_json_docs(
             continue
         if isinstance(parsed, dict):
             docs.append((rel_path, parsed))
+        else:
+            gaps.append(f"{rel_path}: configuration must be a JSON object")
     return docs
 
 
@@ -745,34 +747,49 @@ def _covers_steering_path(root_arg: str, project_roots: tuple[str, ...]) -> bool
     return False
 
 
-def _deny_covers_steering(deny_rules: list[str], server_name: str, reference_server: bool) -> bool:
-    # Claude Code Read/Edit/Write path rules govern its built-in file tools, not an MCP server,
-    # which writes from its own process. Only a deny of the server's tools stops it.
-    prefix = f"mcp__{server_name}"
-    rules = {r.strip() for r in deny_rules}
-    if prefix in rules or f"{prefix}__*" in rules:
+def _steering_host(path: str) -> str:
+    if path.startswith(".claude/") or path == ".mcp.json":
+        return "claude"
+    return path.split("/", 1)[0]
+
+
+def _allows_mcp_server(rules: list[str], prefix: str) -> bool:
+    exact = bisect_left(rules, prefix)
+    if exact < len(rules) and rules[exact] == prefix:
         return True
-    return reference_server and all(f"{prefix}__{tool}" in rules for tool in FS_WRITE_TOOLS)
+    scoped = f"{prefix}__"
+    index = bisect_left(rules, scoped)
+    return index < len(rules) and rules[index].startswith(scoped)
 
 
 def _inspect_steering_surfaces(
     files: ConfinedCollection, all_paths: list[str], summary: ControlPlaneAuditSummary
 ) -> None:
-    auto_edit_modes: list[str] = []
-    deny_rules: list[str] = []
-
+    modes: dict[str, list[str]] = {}
+    claude_allows: dict[str, list[str]] = {}
+    claude_denies: set[str] = set()
+    claude_prompting = False
     for s_path, doc in _load_json_docs(files, all_paths, PERMISSION_CONFIG_FILES, summary.gaps):
+        host = _steering_host(s_path)
+        auto_edit_modes = modes.setdefault(host, [])
         perms = _as_dict(doc.get("permissions"))
-        mode = str(perms.get("defaultMode") or perms.get("mode") or "")
-        if mode in {"acceptEdits", "bypassPermissions", "auto"}:
+        mode = perms.get("defaultMode") or perms.get("mode")
+        if mode in ("acceptEdits", "bypassPermissions", "auto"):
             auto_edit_modes.append(f"{s_path}:{mode}")
-        for item in _as_list(perms.get("allow")):
-            s_item = str(item)
-            if s_item in {"*", "Edit", "Write"} or "filesystem" in s_item:
-                auto_edit_modes.append(f"{s_path}:allow:{s_item}")
-        for x in _as_list(perms.get("deny")):
-            deny_rules.append(str(x))
-        if doc.get("approvalPolicy") in {"never", "auto-edit"}:
+        allow = [r.strip() for r in _as_list(perms.get("allow")) if isinstance(r, str)]
+        if any(
+            rule in {"*", "Edit", "Write"}
+            or (not rule.startswith("mcp__") and "filesystem" in rule)
+            for rule in allow
+        ):
+            auto_edit_modes.append(f"{s_path}:write-allowance")
+        if host == "claude":
+            claude_prompting |= mode in ("default", "plan")
+            claude_allows[s_path] = sorted(rule for rule in allow if rule.startswith("mcp__"))
+            claude_denies.update(
+                r.strip() for r in _as_list(perms.get("deny")) if isinstance(r, str)
+            )
+        if doc.get("approvalPolicy") in ("never", "auto-edit"):
             auto_edit_modes.append(f"{s_path}:{doc['approvalPolicy']}")
 
     project_roots = (files.root.as_posix(), files.root.resolve().as_posix())
@@ -786,15 +803,29 @@ def _inspect_steering_surfaces(
             joined = " ".join([cmd, *args]).lower()
             if "filesystem" not in srv_name.lower() and "server-filesystem" not in joined:
                 continue
-            server_read_only = (
-                bool(srv_cfg.get("readOnly")) or "--readonly" in joined or "--read-only" in joined
-            )
-            deny_covered = _deny_covers_steering(
-                deny_rules, srv_name, "server-filesystem" in joined
-            )
+            host = _steering_host(cfg_path)
+            prefix = f"mcp__{srv_name}"
+            # A future or custom server can publish additional write tools. Only the
+            # owning client's deny of the whole server covers this open-ended surface.
+            deny_covered = host == "claude" and bool(claude_denies & {prefix, f"{prefix}__*"})
             srv_auto = (
                 bool(srv_cfg.get("autoApprove")) or len(_as_list(srv_cfg.get("alwaysAllow"))) > 0
             )
+            eff_modes = list(modes.get(host, ()))
+            if host == "claude":
+                eff_modes.extend(
+                    f"{source}:mcp-allowance"
+                    for source, rules in claude_allows.items()
+                    if _allows_mcp_server(rules, prefix)
+                )
+            if srv_auto:
+                eff_modes.append(f"{cfg_path}:{srv_name}:alwaysAllow")
+            writable = bool(eff_modes) and not deny_covered
+            approval_status = "preapproved" if writable else "unverified"
+            if deny_covered:
+                approval_status = "denied"
+            elif not writable and host == "claude" and claude_prompting:
+                approval_status = "prompting"
             roots = [
                 a
                 for a in args
@@ -803,21 +834,18 @@ def _inspect_steering_surfaces(
                 and a not in {"-y", "npx", "uvx"}
             ] or ["."]
             for raw_root in roots:
-                # ':ro' marks only the root it is appended to as read-only.
+                # MCP stdio has no standard readOnly field or CLI switch. Positional
+                # launcher text is not an access-control decision by a filesystem.
                 r_arg = raw_root.removesuffix(":ro")
-                read_only = server_read_only or raw_root.endswith(":ro")
                 if not _covers_steering_path(r_arg, project_roots):
                     continue
-                eff_modes = list(auto_edit_modes)
-                if srv_auto:
-                    eff_modes.append(f"{cfg_path}:{srv_name}:alwaysAllow")
-                writable = bool(eff_modes) and not read_only and not deny_covered
                 summary.steering_surfaces.append(
                     _rec(
                         server_name=srv_name,
                         root_path=r_arg,
                         permission_modes=eff_modes,
-                        read_only=read_only,
+                        approval_status=approval_status,
+                        read_only=False,
                         deny_covered=deny_covered,
                         writable=writable,
                         source_file=cfg_path,
@@ -828,6 +856,15 @@ def _inspect_steering_surfaces(
                         "steering_surface_writable",
                         RiskSeverity.CRITICAL,
                         f"Filesystem server '{srv_name}' rooted at '{r_arg}' can modify steering files under {', '.join(eff_modes)} (F20).",
+                        cfg_path,
+                        srv_name,
+                    )
+                elif approval_status == "unverified":
+                    summary.flag(
+                        "steering_surface_unverified",
+                        RiskSeverity.MEDIUM,
+                        f"Write approval for filesystem server '{srv_name}' rooted at '{r_arg}' "
+                        "could not be established from the declaring client's configuration.",
                         cfg_path,
                         srv_name,
                     )
@@ -1362,14 +1399,26 @@ def audit_project_control_plane(
     if claims_path is not None:
         try:
             with open_regular_file(claims_path) as stream:
-                raw_claims = stream.read(4_194_304).decode("utf-8", errors="replace")
-            parsed = parse_json_strict(raw_claims)
-            if isinstance(parsed, dict):
-                decl_sources.append(("shadowscan:claims", parsed, AssuranceLevel.DECLARED))
+                raw_claims = stream.read(4_194_304 + 1)
+            if len(raw_claims) > 4_194_304:
+                raise ValueError("claims exceed byte budget")
+            parsed = parse_json_strict(raw_claims.decode("utf-8"), max_bytes=4_194_304)
+            if not isinstance(parsed, dict):
+                summary.gaps.append(
+                    f"{neutralize(claims_path.name)}: claims file is not a JSON object"
+                )
             else:
-                summary.gaps.append(f"{claims_path.name}: claims file is not a JSON object")
-        except (OSError, ValueError, RecursionError) as exc:
-            summary.gaps.append(f"{claims_path.name}: {neutralize(str(exc))}")
+                for section in ("hosted_tools", "ci_agents", "agent_constructors", "identities"):
+                    if section in parsed and (
+                        not isinstance(parsed[section], list)
+                        or not all(isinstance(item, dict) for item in parsed[section])
+                    ):
+                        summary.gaps.append(f"claims: invalid {section} collection")
+                decl_sources.append(("shadowscan:claims", parsed, AssuranceLevel.DECLARED))
+        except (OSError, ValueError, RecursionError):
+            summary.gaps.append(
+                f"{neutralize(claims_path.name)}: claims file unreadable, over 4 MiB, or invalid UTF-8 JSON object"
+            )
 
     with ConfinedCollection(project_root, summary.gaps) as files:
         all_paths = sorted(p.as_posix() for p in files.iter_files())
