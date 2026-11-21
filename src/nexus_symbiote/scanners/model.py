@@ -563,9 +563,10 @@ def _zip_directory(
     one another reads. A reader that follows the specification reads the directory at
     the offset its end record stores. ``zipfile``, which ``np.load`` uses, reads the
     directory that ends where its end record starts and moves every member's offset by
-    the difference. When a ZIP64 locator precedes the end record, ``zipfile`` reads the
-    ZIP64 record right before the locator whatever the classic record holds, and other
-    readers the one at the locator's offset. Every reading that lists members is
+    the difference. When a ZIP64 locator precedes the end record, ``zipfile`` reads a
+    ZIP64 record whatever the classic record holds: the one at the locator's offset,
+    taking the bytes up to the locator as extensible data, and only when no record
+    starts there the one right before the locator. Every reading that lists members is
     returned, with the offset its directory starts at, its members' offsets as that
     reader moves them.
 
@@ -574,7 +575,8 @@ def _zip_directory(
     record with its comment and the ZIP64 records. ``read`` holds the bytes that end at
     ``consumed``, already read from the stream. ``None`` when no directory can be
     read, when any directory that lies within the archive is beyond that bound, as it
-    may list what the others do not, or when the stream ends before ``size``.
+    may list what the others do not, when a ZIP64 locator stores an offset before that
+    tail, or when the stream ends before ``size``.
     """
     tail: deque[bytes] = deque([read])
     held = len(read)
@@ -601,7 +603,12 @@ def _zip_directory(
     records = [(end_record, _little(data, end_record + 12, 4), _little(data, end_record + 16, 4))]
     locator = end_record - 20
     if locator >= 0 and data[locator : locator + 4] == b"PK\x06\x07":
-        for record in sorted({locator - 56, _little(data, locator + 8, 8) - start}):
+        stored = _little(data, locator + 8, 8) - start
+        if stored < 0:
+            # zipfile reads the record there over the one before the locator, and the
+            # tail does not hold it, so what zipfile lists is not decided.
+            return None
+        for record in sorted({locator - 56, stored}):
             if (
                 record >= 0
                 and record + 56 <= locator

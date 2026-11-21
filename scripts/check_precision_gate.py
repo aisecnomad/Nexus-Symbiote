@@ -3,14 +3,18 @@
 Enforces:
 1. Committed per-case security regression contracts (`benchmarks/manifest.json`).
 2. `model_drift` and `a2a_scope_drift` drift-detection invariants over `AIBOMDiffer`.
-3. Per-class recall floors when an AIBOM-Bench score file (`--scores`) is present or supplied.
+3. Per-class recall floors over AIBOM-Bench scores: of a run made now with this checkout
+   (`--fresh`), of a supplied score file (`--scores`), or of the committed one.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +77,71 @@ def verify_drift_kinds() -> list[str]:
     return failures
 
 
+BENCH_DIR = Path(__file__).resolve().parent.parent / "benchmarks" / "aibom-bench"
+FRESH_STEP_SECONDS = 900
+
+
+def fresh_scores(work: Path, scan_options: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Scan a newly built AIBOM-Bench corpus with this checkout and score that run.
+
+    The committed score file records one graded run, so a gate over it only catches a
+    commit that lowers the recorded numbers, never a collector that stopped finding a
+    class. This run is scored with strict matching and no reviewer overrides: a name in a
+    coverage or log line, and a correction made for the graded run, are not detections.
+    """
+    corpus, home = work / "corpus", work / "home"
+    out = work / "results" / "nexus-symbiote" / "airgap"
+    out.mkdir(parents=True)
+    home.mkdir()
+    overrides = work / "no-overrides.json"
+    overrides.write_text('{"overrides": []}\n', encoding="utf-8")
+    scores = work / "scores.json"
+    # The benchmark runner's environment: an empty HOME and a fixed build date.
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "SOURCE_DATE_EPOCH": "1700000000",
+    }
+
+    def run(*argv: str) -> int:
+        done = subprocess.run(  # noqa: S603 - this interpreter, on files of this checkout
+            [sys.executable, *argv],
+            cwd=work,
+            env=env,
+            capture_output=True,
+            timeout=FRESH_STEP_SECONDS,
+            check=False,
+        )
+        return done.returncode
+
+    manifest = str(work / "manifest.json")
+    if run(str(BENCH_DIR / "build_corpus.py"), "--out", str(corpus), "--manifest", manifest):
+        raise ValueError("the benchmark corpus could not be built")
+    inventory = out / "bom.json"
+    status = run(
+        "-m", "nexus_symbiote", "scan", str(corpus), "-f", "json", "-o", str(inventory),
+        *scan_options,
+    )  # fmt: skip
+    # The corpus plants findings, so the scan gate fails with status 1 and still writes.
+    if status not in (0, 1) or not inventory.is_file():
+        raise ValueError(f"the scan of the benchmark corpus wrote no inventory (status {status})")
+    if run(
+        str(BENCH_DIR / "score.py"),
+        "--results", str(work / "results"),
+        "--schemas", str(BENCH_DIR / "schemas"),
+        "--overrides", str(overrides),
+        "--strict",
+        "--out", str(scores),
+    ):  # fmt: skip
+        raise ValueError("the benchmark run could not be scored")
+    document = json.loads(scores.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ValueError("scores root must be an object")
+    return document
+
+
 def evaluate_class_floors(
     scores_doc: dict[str, Any], floors: dict[str, float] = DEFAULT_CLASS_FLOORS
 ) -> list[str]:
@@ -111,8 +180,14 @@ def evaluate_class_floors(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
         "--scores", type=Path, default=None, help="Optional AIBOM-Bench scores JSON"
+    )
+    source.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Build the AIBOM-Bench corpus, scan it with this checkout and gate on that run",
     )
     parser.add_argument(
         "--out", type=Path, default=Path("precision-gate.json"), help="Summary output path"
@@ -127,23 +202,36 @@ def main(argv: list[str] | None = None) -> int:
     default_bench = Path("benchmarks/aibom-bench/results/scores.json")
     score_path = args.scores or (default_bench if default_bench.is_file() else None)
     bench_status = "not-present"
-    if score_path is not None:
-        try:
+    bench_source = "fresh-run" if args.fresh else "score-file"
+    scores_doc: object = None
+    fresh_recall: dict[str, object] | None = None
+    try:
+        if args.fresh:
+            with tempfile.TemporaryDirectory(prefix="precision-gate-") as work:
+                scores_doc = fresh_scores(Path(work))
+            measured = scores_doc["nexus-symbiote"]["d1"]["class_recall"]
+            fresh_recall = {name: measured.get(name) for name in sorted(DEFAULT_CLASS_FLOORS)}
+        elif score_path is not None:
             scores_doc = json.loads(score_path.read_text(encoding="utf-8"))
+        if args.fresh or score_path is not None:
             if not isinstance(scores_doc, dict):
                 raise ValueError("scores root must be an object")
             floor_failures = evaluate_class_floors(scores_doc)
             failures.extend(floor_failures)
             bench_status = "failed" if floor_failures else "passed"
-        except (OSError, ValueError) as exc:
-            failures.append(f"scores: {type(exc).__name__}")
-            bench_status = "failed"
+    except (OSError, ValueError, KeyError, AttributeError, subprocess.TimeoutExpired) as exc:
+        # Only this script's own fixed messages are shown; a score file's text is not.
+        shown = f": {exc}" if args.fresh and type(exc) is ValueError else ""
+        failures.append(f"scores: {type(exc).__name__}{shown}")
+        bench_status = "failed"
 
     summary = {
         "passed": not failures,
         "security_cases": len(reg_report.get("results", [])),
         "drift_kinds_checked": ["model_drift", "a2a_scope_drift"],
         "aibom_bench_status": bench_status,
+        "aibom_bench_source": bench_source if bench_status != "not-present" else None,
+        "aibom_bench_fresh_class_recall": fresh_recall,
         "failures": failures,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
