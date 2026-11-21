@@ -661,6 +661,7 @@ def _emit_gate_report(
     text_lines: Any,
     *,
     step_summary: Path | None = None,
+    project: Path | None = None,
     operator_source: str | None = None,
 ) -> None:
     from nexus_symbiote.operator_policy import (
@@ -671,7 +672,9 @@ def _emit_gate_report(
 
     if step_summary is not None:
         _refuse_step_summary_input(step_summary)
-        append_step_summary(step_summary, render_gate_markdown(gate_name, document))
+        append_step_summary(
+            step_summary, render_gate_markdown(gate_name, document), project=project
+        )
     if report_format == "json":
         click.echo(json_text(json.dumps(document, indent=2)))
     elif report_format == "markdown":
@@ -756,7 +759,10 @@ def _gate_report_options(func: _F) -> _F:
             "--step-summary",
             type=click.Path(dir_okay=False, path_type=Path),
             default=None,
-            help="Write an injection-safe Markdown gate summary to this file (for example GITHUB_STEP_SUMMARY).",
+            help=(
+                "Append a Markdown gate summary (for example GITHUB_STEP_SUMMARY). With --project, "
+                "use a new file inside the project or a singly linked file outside it."
+            ),
         ),
     )
 
@@ -2138,6 +2144,7 @@ def validate(
         document,
         lambda: validation_report_lines(document, project=root),
         step_summary=step_summary,
+        project=root,
         operator_source=policy_source if op_digest is not None else None,
     )
     if not passed:
@@ -2389,6 +2396,7 @@ def risk(
                 failed,
                 lambda: risk_report_lines(failed),
                 step_summary=step_summary,
+                project=root,
                 operator_source=op_source_line,
             )
             _gate_exit(detailed)
@@ -2428,6 +2436,7 @@ def risk(
             unsigned,
             lambda: risk_report_lines(unsigned),
             step_summary=step_summary,
+            project=root,
             operator_source=op_source_line,
         )
         _gate_exit(detailed)
@@ -2467,6 +2476,7 @@ def risk(
         document,
         lambda: risk_report_lines(document, failures=failures),
         step_summary=step_summary,
+        project=root,
         operator_source=op_source_line,
     )
     if not passed:

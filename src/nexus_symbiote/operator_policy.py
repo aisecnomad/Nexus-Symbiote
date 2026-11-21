@@ -251,9 +251,29 @@ def load_operator_policy(
     return LoadedOperatorPolicy(policy=parsed, digest=policy_digest, signers=signers)
 
 
-def append_step_summary(path: Path, rendered: str) -> None:
+def _inside_project_directory(parent: int, project: Path) -> bool:
+    """Compare the opened output directory and its parents to the checked project by inode."""
+    root = project.stat()
+    directory = os.dup(parent)
+    try:
+        while True:
+            current = os.fstat(directory)
+            if os.path.samestat(current, root):
+                return True
+            above = os.open("..", os.O_RDONLY | os.O_DIRECTORY, dir_fd=directory)
+            os.close(directory)
+            directory = above
+            if os.path.samestat(current, os.fstat(directory)):
+                return False
+    finally:
+        os.close(directory)
+
+
+def append_step_summary(path: Path, rendered: str, *, project: Path | None = None) -> None:
     """Append Markdown to an explicitly selected regular file without following symlinks."""
     import errno as _errno
+
+    import click
 
     from nexus_symbiote.utils.files import OutputRefusedError, _parent, _relative
     from nexus_symbiote.utils.terminal import output_failure, refuse_dash_output
@@ -267,11 +287,23 @@ def append_step_summary(path: Path, rendered: str) -> None:
             raise OSError("Secure output requires descriptor-relative no-symlink file operations")
         flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
         with _parent(root, relative, create_parents=False) as parent:
-            fd = os.open(relative.name, flags, 0o600, dir_fd=parent)
+            create_only = project is not None and _inside_project_directory(parent, project)
+            if create_only:
+                flags |= os.O_EXCL
+            try:
+                fd = os.open(relative.name, flags, 0o600, dir_fd=parent)
+            except FileExistsError as exc:
+                if create_only:
+                    raise click.UsageError(
+                        "--step-summary must use a new file inside the checked project"
+                    ) from exc
+                raise
             try:
                 info = os.fstat(fd)
                 if not stat.S_ISREG(info.st_mode):
                     raise OutputRefusedError(_errno.EINVAL, "output must be a regular file")
+                if info.st_nlink != 1:
+                    raise OutputRefusedError(_errno.EINVAL, "output must have only one hard link")
                 prefix = b""
                 if info.st_size > 0:
                     last_byte = os.pread(fd, 1, info.st_size - 1)
