@@ -921,7 +921,15 @@ def test_a_supplier_added_hash_cannot_turn_integrity_unknown_into_pass(tmp_path)
 def _minimum_observed(project: Path, target: Path, doc: dict) -> dict:
     (project / ".nexus-symbiote.yaml").write_text("validate: {minimum_assurance_level: observed}\n")
     target.write_text(json.dumps(doc))
-    args = ["validate", "--skip-integrity", "--json-output", str(target), "--project", str(project)]
+    args = [
+        "validate",
+        "--skip-integrity",
+        "--json-output",
+        str(target),
+        "--project",
+        str(project),
+        "--accept-project-policy",
+    ]
     return json.loads(CliRunner().invoke(main, args).stdout)
 
 
