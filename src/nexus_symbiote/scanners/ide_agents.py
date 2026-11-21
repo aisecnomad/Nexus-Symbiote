@@ -322,9 +322,13 @@ def _rule_program(specifier: str) -> tuple[str, str]:
     return _WINDOWS_SUFFIX.sub("", name), colon + pattern + arguments
 
 
-def _runs_any_command(program: str, arguments: str) -> bool:
-    """Whether a wildcard Bash rule names a known command runner or interpreter."""
-    if "*" not in program and "*" not in arguments:
+def _runs_any_command(program: str, arguments: str, wildcard: bool = False) -> bool:
+    """Whether a wildcard Bash rule names a known command runner or interpreter.
+
+    `wildcard` is set when the `*` is in the program's directory, which the program
+    name no longer holds, as in `Bash(*/bash)`.
+    """
+    if not wildcard and "*" not in program and "*" not in arguments:
         return False
     name = program.lower()
     if " " in name and _EVAL_ARGUMENT.match(arguments):
@@ -358,7 +362,7 @@ def _broad_grants(allowed: list[str]) -> list[str]:
         broad = specifier is None or bool(_WILDCARD_SPECIFIER.fullmatch(specifier))
         if key == "bash" and specifier is not None:
             program, arguments = _rule_program(specifier)
-            broad |= _runs_any_command(program, arguments) or bool(
+            broad |= _runs_any_command(program, arguments, "*" in specifier) or bool(
                 _SUBSHELL_SPECIFIER.fullmatch(program + arguments)
             )
         if key == "webfetch" and specifier is not None:
@@ -1167,6 +1171,60 @@ def _name_variants(word: str) -> set[str]:
     return names
 
 
+_SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+
+
+# How many words one assignment's substitution is followed across.
+_MAX_ASSIGNMENT_WORDS = 32
+
+
+def _assignment_end(words: list[str], index: int) -> int:
+    """Index after the assignment at `index` and the words its substitutions span.
+
+    The word splitter breaks `X=$(id -u)`, backticks and `${A:-a b}` at their spaces, so
+    the command after them is found only once each `$(`, `${` and backtick is closed. A
+    substitution not closed within the bound ends at its own word, so the next word is
+    still read as the possible command.
+    """
+    closers: list[str] = []
+    quotes: list[str] = []
+    quote = ""
+    for end in range(index, min(len(words), index + _MAX_ASSIGNMENT_WORDS)):
+        word = words[end]
+        position = 0
+        while position < len(word):
+            char = word[position]
+            if quote == "'":
+                if char == "'":
+                    quote = ""
+            elif char == "\\":
+                position += 1
+            elif closers and char == closers[-1] and not quote:
+                closers.pop()
+                quote = quotes.pop()
+            elif word.startswith(("$(", "${"), position):
+                quotes.append(quote)
+                closers.append(")" if word[position + 1] == "(" else "}")
+                quote = ""
+                position += 1
+            elif char == "`":
+                quotes.append(quote)
+                closers.append("`")
+                quote = ""
+            elif quote == '"':
+                if char == '"':
+                    quote = ""
+            elif char in "'\"":
+                quote = char
+            elif closers and closers[-1] == ")" and char == "(":
+                quotes.append(quote)
+                closers.append(")")
+            position += 1
+        if not closers:
+            return end + 1
+    return index + 1
+
+
 def _assignment(word: str) -> bool:
     if not word or word.startswith("-") or "=" not in word:
         return False
@@ -1361,8 +1419,13 @@ def _executable_index(words: list[str]) -> int | None:
     index = 0
     while index < len(words):
         raw = _decode_word(words[index], drop_ifs=True).strip()
-        if raw in {"(", "{", ")", "}"} or _assignment(raw):
+        if raw in {"(", "{", ")", "}"}:
             index += 1
+            continue
+        # bash reads a word as an assignment only when its name is unquoted and valid;
+        # `1=/bin/sh`, `a.b=/bin/sh` and `"X"=/bin/sh` are commands, run by path.
+        if _SHELL_ASSIGNMENT.match(words[index]):
+            index = _assignment_end(words, index)
             continue
         names = _name_variants(words[index])
         if "env" in names:
@@ -1643,8 +1706,10 @@ def _curl_output(word: str, args: list[str], index: int) -> tuple[str | None, in
                 return None, 1
             if flag in _CURL_VALUE_FLAGS:
                 break
-        # The released reading, kept so no form is rated lower: a cluster that ends in `o`
-        # names its output in the next argument.
+        # The released reading is kept: a cluster that ends in `o` names its output in the
+        # next argument. An earlier `o` takes the rest of the cluster, as curl reads it, so
+        # `-sozo` and `-fo/tmp/foo`, which the released reading took as naming the next
+        # argument, are rated by the file curl writes.
         if word.endswith("o") and index + 1 < len(args):
             return _decode_word(args[index + 1], drop_ifs=True), 2
     return None, 1
@@ -1725,47 +1790,45 @@ def _saved_names(segment: str) -> tuple[set[str], set[str], set[str]]:
     words = _shell_words(segment)
     saved: set[str] = set()
     inferred: set[str] = set()
-    tool: str | None = None
-    # One downloader's URLs, and whether it names its output or saves under the URL's name.
+    # A later downloader name in the same command, such as `-U curl` or a URL ending in
+    # `/wget`, is an argument: the words after it are read with every named tool's
+    # options, so it cannot switch which tool's output flags are read.
+    tools: set[str] = set()
+    # The URLs, and whether wget names its output and curl saves under the URL's name.
     urls: list[str] = []
     named = remote = False
     cursor = 0
-
-    def url_names() -> None:
-        if (tool == "wget" and not named) or (tool == "curl" and remote):
-            for url in urls:
-                for name in _url_file_names(url, "index.html" if tool == "wget" else None):
-                    inferred.update(_file_keys(name))
+    readers = {"curl": _curl_output, "wget": _wget_output, "iwr": _iwr_output}
 
     while cursor < len(words):
-        names = _name_variants(words[cursor])
-        detected = _downloader_name(names)
+        detected = _downloader_name(_name_variants(words[cursor]))
+        if not tools:
+            if detected is not None:
+                tools.add(detected)
+            cursor += 1
+            continue
         if detected is not None:
-            url_names()
-            tool = detected
-            urls, named, remote = [], False, False
-            cursor += 1
-            continue
-        if tool is None:
-            cursor += 1
-            continue
+            tools.add(detected)
         word = _decode_word(words[cursor], drop_ifs=True)
-        if tool == "curl":
-            found, step = _curl_output(word, words, cursor)
-            remote = remote or _curl_remote_name(word)
-        elif tool == "wget":
-            found, step = _wget_output(word, words, cursor)
-        else:
-            found, step = _iwr_output(word, words, cursor)
-        if found:
-            named = True
-            saved.update(_file_keys(found))
-        elif step == 1 and ("://" in word or _HOST_PATH.match(word)):
+        step = len(words)
+        found_any = False
+        for tool in sorted(tools):
+            found, taken = readers[tool](word, words, cursor)
+            step = min(step, taken)
+            if found:
+                found_any = True
+                named = named or tool == "wget"
+                saved.update(_file_keys(found))
+        remote = remote or ("curl" in tools and _curl_remote_name(word))
+        if not found_any and step == 1 and ("://" in word or _HOST_PATH.match(word)):
             urls.append(word)
         cursor += step
-    url_names()
+    if ("wget" in tools and not named) or ("curl" in tools and remote):
+        for url in urls:
+            for name in _url_file_names(url, "index.html" if "wget" in tools else None):
+                inferred.update(_file_keys(name))
     redirected: set[str] = set()
-    if tool is not None or _segment_fetches(segment):
+    if tools or _segment_fetches(segment):
         for redirection in _OUTPUT_REDIRECTION.finditer(segment):
             redirected.update(_file_keys(redirection.group("target")))
     return saved, inferred, redirected
@@ -1773,8 +1836,9 @@ def _saved_names(segment: str) -> tuple[set[str], set[str], set[str]]:
 
 # Runners the released classifier counted a file a downloader's output option wrote as
 # run wherever it appeared in their arguments. They keep that rule, so no form is rated
-# lower than it was. Shells count any download that way; a decoded file, and for Python
-# and Perl a download saved another way, counts only as the program.
+# lower than it was. Shells count any download that way except one saved under its URL's
+# name, which was not tracked then; that one and a decoded file count only as the
+# script, and for Python and Perl a download saved another way only as the program.
 _ANY_ARGUMENT_RUNNERS = _SHELL_NAMES | _PYTHON_NAMES | _IEX_NAMES | _EVAL_NAMES | {"perl"}
 # How deep a `-c` script, `eval` or `su -c` command line inside another is read.
 _MAX_SCRIPT_DEPTH = 4
@@ -1784,7 +1848,10 @@ class _Saved:
     """Files earlier segments saved, by how, and the unions of them that segments read.
 
     `outputs` holds files a downloader's output option wrote, `downloaded` files a
-    download wrote otherwise, and `decoded` those only `base64 -d` wrote. The unions grow
+    download wrote otherwise, and `decoded` those only `base64 -d` wrote. `programs`
+    adds to `decoded` the files a download saved under its URL's name, which a shell
+    runs only as its script: the name is also what a data file fetched for a script's
+    argument is saved as, as in `wget URL/data.csv && sh load.sh data.csv`. The unions grow
     with them: rebuilding one for each segment cost time in proportion to every file
     saved before it, which made a long chain of saves quadratic.
     """
@@ -1793,6 +1860,7 @@ class _Saved:
         self.outputs: set[str] = set()
         self.downloaded: set[str] = set()
         self.decoded: set[str] = set()
+        self.programs: set[str] = set()
         self.fetched: set[str] = set()
         self.every: set[str] = set()
 
@@ -1808,9 +1876,15 @@ class _Saved:
         self.every |= names
         self.decoded -= names
 
+    def add_named_by_url(self, names: set[str]) -> None:
+        self.programs |= names
+        self.fetched |= names
+        self.every |= names
+
     def add_decoded(self, names: set[str]) -> None:
         names = names - self.downloaded
         self.decoded |= names
+        self.programs |= names
         self.every |= names
 
 
@@ -1867,10 +1941,10 @@ def _executes_saved(segment: str, saved: _Saved, depth: int = 0) -> bool:
     if names & _SHELL_NAMES:
         return _shell_program(
             program,
-            lambda word: bool(_file_keys(word) & saved.decoded),
-            lambda rest: _any_argument(rest, saved.decoded),
+            lambda word: bool(_file_keys(word) & saved.programs),
+            lambda rest: _any_argument(rest, saved.programs),
         )
-    return _any_argument(args, saved.decoded)
+    return _any_argument(args, saved.programs)
 
 
 def _any_argument(args: list[str], saved: set[str]) -> bool:
@@ -2168,7 +2242,7 @@ def _download_then_run(pipelines: list[list[str]]) -> bool:
             )
             options, inferred, written = _saved_names(segment)
             saved.add_outputs(options)
-            saved.add_downloaded(inferred)
+            saved.add_named_by_url(inferred)
             if fetched:
                 written |= _relayed_names(segment)
             written |= copied or set()
@@ -2442,8 +2516,9 @@ def _powershell_name(token: str, plain: bool) -> bool:
 def _computed_powershell(segment: str) -> int | None:
     """Offset of the command word when the shell computes a name that may be PowerShell.
 
-    A variable or glob can select PowerShell. A short `-e` switch is shared by
-    other programs, so require a program-name hint or a longer encoded-command switch.
+    A variable or glob can select PowerShell. `-e`, `-ec`, `-en` and `-E` are shared by
+    other programs (`$SED -En`, `$SHELL -ec`), so require a program-name hint, `-enc` or
+    a longer prefix of `-EncodedCommand`, or a base64 argument after the switch.
     """
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
@@ -2456,9 +2531,10 @@ def _computed_powershell(segment: str) -> int | None:
         return None
     pattern = re.sub(r"\*+", "*", _decode_word(pattern, drop_ifs=True).lower())
     stem = _WINDOWS_SUFFIX.sub("", pattern)
-    literal = re.sub(r"\[[^]]*\]", "", stem)
+    # `[^][]` keeps the scan linear on a run of `[`.
+    literal = re.sub(r"\[[^][]*\]", "", stem)
     if re.search(r"[a-z]{2}", literal) is None and not any(
-        len(flag.group().lstrip("\"'‘’“”\\^`-/–—―")) > 1
+        len(flag.group().lstrip("\"'‘’“”\\^`-/–—―")) > 2 or _encoded_payload(segment, flag.end())
         for flag in _ENCODED_COMMAND.finditer(segment, spans[index][1])
     ):
         return None
@@ -2469,6 +2545,20 @@ def _computed_powershell(segment: str) -> int | None:
     ):
         return spans[index][0]
     return None
+
+
+# An -EncodedCommand value: base64 of UTF-16LE text, so a whole number of quads.
+_BASE64_PAYLOAD = re.compile(
+    r"(?=.*[A-Z])(?:[A-Za-z0-9+/]{4}){2,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?"
+)
+
+
+def _encoded_payload(segment: str, end: int) -> bool:
+    """Whether the argument after an encoded-command switch ending at `end` is base64."""
+    argument = _ARGUMENT.search(segment, end)
+    if argument is None:
+        return False
+    return _BASE64_PAYLOAD.fullmatch(_decode_word(argument.group(), drop_ifs=True)) is not None
 
 
 def _parameter_name(token: str) -> str | None:
