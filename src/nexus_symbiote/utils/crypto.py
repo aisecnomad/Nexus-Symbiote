@@ -365,11 +365,13 @@ def _ancestor_error(directory: Path, *, dir_what: str, remedy: str) -> str | Non
     return None
 
 
-def _trust_anchor_error(path: Path, info: os.stat_result) -> str | None:
+def _trust_anchor_error(path: Path, info: os.stat_result | None) -> str | None:
     """Why someone other than the caller or root could replace a trust anchor, or ``None``.
 
     ``info`` is the ``fstat`` of the anchor as opened without following symlinks, so the
-    file judged is the file read. Whoever can write a directory above the anchor can
+    file judged is the file read. When preparing a temporary anchor, pass its parent
+    directory and ``None`` to check that directory and its ancestors. Whoever can
+    write a directory above the anchor can
     rename the directory below it away and put another anchor in its place, so every
     ancestor up to the file system root must be a real directory owned by the caller or
     root that its group and others cannot write unless it is sticky. Ancestors are
@@ -380,11 +382,13 @@ def _trust_anchor_error(path: Path, info: os.stat_result) -> str | None:
     if uid is None:
         return None
     trusted_uids = _trusted_ancestor_uids(uid)
-    if info.st_uid not in trusted_uids:
-        return "must be owned by the current user or root"
-    if info.st_mode & 0o022:
-        return "must not be group- or world-writable"
-    for ancestor in _absolute_through_root_links(path).parents:
+    if info is not None:
+        if info.st_uid not in trusted_uids:
+            return "must be owned by the current user or root"
+        if info.st_mode & 0o022:
+            return "must not be group- or world-writable"
+    directory = _absolute_through_root_links(path if info is None else path.parent)
+    for ancestor in (directory, *directory.parents):
         try:
             entry = os.lstat(ancestor)
         except OSError:

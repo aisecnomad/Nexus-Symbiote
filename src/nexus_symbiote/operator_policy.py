@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from xml.sax.saxutils import escape as xml_escape
 
-from nexus_symbiote.core.hashing import open_regular_file
+from nexus_symbiote.core.hashing import open_directory_nofollow, open_regular_file
 from nexus_symbiote.policy import (
     MAX_POLICY_YAML_NODES,
     Policy,
@@ -53,9 +53,12 @@ class LoadedOperatorPolicy:
     signers: tuple[str, ...] = ()
 
 
-def _read_confined_operator_policy(policy_path: Path, root: Path | None) -> tuple[bytes, str]:
+def _read_confined_operator_policy(
+    policy_path: Path, root: Path | None, *, attestation: bool = False
+) -> tuple[bytes, str]:
+    label = "Operator policy attestation" if attestation else "Operator policy"
     inside_msg = (
-        "Operator policy must be provisioned outside the scanned project and outside "
+        f"{label} must be provisioned outside the scanned project and outside "
         "every repository that holds it"
     )
     untrusted: list[Path] = []
@@ -75,25 +78,41 @@ def _read_confined_operator_policy(policy_path: Path, root: Path | None) -> tupl
         with open_regular_file(policy_path) as stream:
             info = os.fstat(stream.fileno())
             if info.st_size > MAX_OPERATOR_POLICY_BYTES:
-                raise OperatorPolicyError("Operator policy exceeds the 1 MiB byte limit")
+                raise OperatorPolicyError(f"{label} exceeds the 1 MiB byte limit")
             if info.st_nlink != 1:
-                raise OperatorPolicyError("Operator policy must not have other hard links")
+                raise OperatorPolicyError(f"{label} must not have other hard links")
             if uid is not None and info.st_uid not in trusted_uids:
-                raise OperatorPolicyError("Operator policy must be owned by the current user")
-            if info.st_mode & 0o002:
-                raise OperatorPolicyError(
-                    "Operator policy and its directory must not be world-writable"
+                raise OperatorPolicyError(f"{label} must be owned by the current user")
+            if info.st_mode & stat.S_IWOTH:
+                raise OperatorPolicyError(f"{label} and its directory must not be world-writable")
+            if attestation:
+                # The envelope is signed evidence. The key and the exact policy bytes
+                # are checked independently, so keep the envelope's placement rules.
+                parent_fd = open_directory_nofollow(policy_path.parent)
+                try:
+                    parent = os.fstat(parent_fd)
+                finally:
+                    os.close(parent_fd)
+                sticky = bool(parent.st_mode & stat.S_ISVTX) and (
+                    uid is None or parent.st_uid in trusted_uids
                 )
-            if (reason := _trust_anchor_error(policy_path, info)) is not None:
-                raise OperatorPolicyError(f"Operator policy {reason}")
+                if parent.st_mode & stat.S_IWOTH and not sticky:
+                    raise OperatorPolicyError(f"{label} directory must not be world-writable")
+            elif (reason := _trust_anchor_error(policy_path, info)) is not None:
+                raise OperatorPolicyError(f"{label} {reason}")
             raw = stream.read(MAX_OPERATOR_POLICY_BYTES + 1)
             if len(raw) > MAX_OPERATOR_POLICY_BYTES:
-                raise OperatorPolicyError("Operator policy exceeds the 1 MiB byte limit")
+                raise OperatorPolicyError(f"{label} exceeds the 1 MiB byte limit")
             ancestors = {_identity(parent) for parent in Path(os.path.abspath(policy_path)).parents}
     except OperatorPolicyError:
         raise
     except OSError as exc:
-        raise OperatorPolicyError("Selected operator policy cannot be safely read") from exc
+        message = (
+            "Operator policy attestation cannot be safely read"
+            if attestation
+            else "Selected operator policy cannot be safely read"
+        )
+        raise OperatorPolicyError(message) from exc
 
     if untrusted:
         try:
@@ -135,7 +154,7 @@ def _verify_policy_attestation(
         )
     if max_age_days is not None and max_age_days < 0:
         raise OperatorPolicyError("--operator-policy-max-age-days must be >= 0")
-    raw_envelope, _ = _read_confined_operator_policy(envelope_path, root)
+    raw_envelope, _ = _read_confined_operator_policy(envelope_path, root, attestation=True)
     try:
         _check_key_placement(
             trusted_keys,

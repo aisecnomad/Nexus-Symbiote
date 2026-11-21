@@ -261,7 +261,10 @@ def test_signed_operator_policy_clamps_checkout_weakening_and_records_provenance
         encoding="utf-8",
     )
     priv_path, pub_path, signer_kid = _write_keypair(op_dir)
-    att_path = op_dir / "operator-policy.dsse.json"
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    evidence_dir.chmod(0o775)
+    att_path = evidence_dir / "operator-policy.dsse.json"
 
     # Sign operator policy via CLI `attest --purpose policy` and verify via `verify-attestation`.
     att_res = runner.invoke(
