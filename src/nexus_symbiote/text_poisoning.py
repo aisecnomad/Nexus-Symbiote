@@ -19,9 +19,9 @@ import sys
 import tokenize
 import unicodedata
 from bisect import bisect_right
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -626,9 +626,9 @@ def _pointer_segment(key: str | tuple[str, int]) -> str:
 
 def _json_strings_with_owners(
     data: object, names: Iterable[str], *, keys: bool = False
-) -> Iterator[tuple[str, str, _Owner]]:
-    """``(JSON pointer, string, owner)`` for every nonblank string, and with ``keys``
-    every nonblank key at the pointer of its value, in O(size).
+) -> Iterator[tuple[str, str, _Owner, bool]]:
+    """``(JSON pointer, string, owner, is_key)`` for every nonblank string, and with
+    ``keys`` every nonblank key at the pointer of its value, in O(size).
 
     The owner is the innermost enclosing object whose ``name`` names a component in
     ``names``; failing that, the innermost one stored under a key that does (as in
@@ -642,7 +642,7 @@ def _json_strings_with_owners(
         pointer, node, by_name, by_key = queue.popleft()
         if isinstance(node, str):
             if node.strip():
-                yield pointer, node, by_name or by_key
+                yield pointer, node, by_name or by_key, False
             continue
         long = len(pointer) > _MAX_WHERE_CHARS
         if isinstance(node, dict):
@@ -653,7 +653,7 @@ def _json_strings_with_owners(
                 child = pointer if long else f"{pointer}/{_pointer_segment(key)}"
                 text = key[0] if isinstance(key, tuple) else key
                 if keys and isinstance(text, str) and text.strip():
-                    yield child, text, by_name or by_key
+                    yield child, text, by_name or by_key, True
                 inner = (key, val) if key in known and isinstance(val, dict) else by_key
                 queue.append((child, val, by_name, inner))
         elif isinstance(node, list):
@@ -858,7 +858,8 @@ def _collect_schema_property_names(schema: dict[str, Any] | None) -> set[str]:
         props = node.get("properties")
         if isinstance(props, dict):
             for k, v in props.items():
-                names.add(k)
+                if isinstance(k, str):
+                    names.add(k)
                 if isinstance(v, dict):
                     queue.append(v)
         for combiner in ("items", "additionalProperties"):
@@ -937,6 +938,20 @@ def _fallback_component(
         return candidates[0]
     others = [c for c in candidates if not isinstance(c, ToolComponent)]
     return min(others, key=_priority_key) if others else root_agent
+
+
+def _shared_names(candidates: list[ComponentWithRisks]) -> set[str]:
+    counts = Counter(comp.name for comp in candidates)
+    return {name for name, count in counts.items() if count > 1}
+
+
+def _file_level_owner(
+    candidates: list[ComponentWithRisks], root_agent: AgentComponent | None
+) -> ComponentWithRisks | None:
+    if root_agent is not None:
+        return root_agent
+    containers = [component for component in candidates if not isinstance(component, ToolComponent)]
+    return containers[0] if len(containers) == 1 else None
 
 
 def _attribute_source_component(
@@ -1149,6 +1164,18 @@ def _scan_component_fields(comp: ComponentWithRisks) -> list[TextPoisoningHit]:
     return []
 
 
+_SourceFindings = list[tuple[ComponentWithRisks | None, list[TextPoisoningHit]]]
+
+
+@dataclass
+class _DeclarationFindings:
+    target: ComponentWithRisks | None
+    node: dict[str, Any] | None
+    has_tool_schema: bool
+    hits: list[TextPoisoningHit] = field(default_factory=list)
+    text_values: list[str] = field(default_factory=list)
+
+
 def _scan_structured_source(
     rel_path: str,
     parsed: object,
@@ -1157,33 +1184,40 @@ def _scan_structured_source(
     *,
     include_keys: bool = False,
     tool_context: bool | None = None,
-) -> list[tuple[ComponentWithRisks, list[TextPoisoningHit]]]:
+) -> _SourceFindings:
     """Scan a parsed configuration and evaluate each tool's text alongside its own schema.
 
     A string belongs to the innermost enclosing object whose ``name`` (or key) names a
-    component recorded for this file, so a poisoned tool's text is never charged to a
-    sibling tool declared beside it.
+    component recorded for this file. Findings for a name shared by several components
+    stay at file scope. Evaluate each declaration's schema only against its own text.
     """
-    by_name: dict[str, ComponentWithRisks] = {}
-    for comp in sorted(comps, key=_priority_key):
-        by_name.setdefault(comp.name, comp)
+    shared_names = _shared_names(comps)
+    by_name = {comp.name: comp for comp in comps if comp.name not in shared_names}
+    tool_names = {comp.name for comp in comps if isinstance(comp, ToolComponent)}
+    file_owner = _file_level_owner(comps, root_agent)
     fallback = _fallback_component(comps, root_agent) if comps else root_agent
-    groups: dict[str, tuple[ComponentWithRisks, dict[str, Any] | None, list[TextPoisoningHit]]]
-    groups = {}
-    texts: dict[str, list[str]] = {}
-    for pointer, value, owner in _json_strings_with_owners(parsed, by_name, keys=include_keys):
-        target, node = (by_name[owner[0]], owner[1]) if owner is not None else (fallback, None)
-        if target is None:
+    groups: dict[tuple[str | None, int], _DeclarationFindings] = {}
+    for pointer, value, owner, is_key in _json_strings_with_owners(
+        parsed, by_name.keys() | shared_names, keys=include_keys
+    ):
+        name, node = owner if owner is not None else (None, None)
+        ambiguous = name in shared_names
+        target = file_owner if ambiguous else fallback
+        if name is not None and not ambiguous:
+            target = by_name[name]
+        if target is None and not ambiguous:
             continue
+        has_tool_schema = isinstance(target, ToolComponent) or name in tool_names
         is_tool = (
-            isinstance(target, (ToolComponent, A2AServerComponent, MCPServerComponent))
+            has_tool_schema or isinstance(target, (A2AServerComponent, MCPServerComponent))
             if tool_context is None
             else tool_context
         )
-        group = groups.setdefault(target.bom_ref, (target, node, []))
-        if group[1] is None and node is not None:
-            group = groups[target.bom_ref] = (target, node, group[2])
-        group[2].extend(
+        group_key = (None if target is None else target.bom_ref, id(node))
+        group = groups.get(group_key)
+        if group is None:
+            group = groups[group_key] = _DeclarationFindings(target, node, has_tool_schema)
+        group.hits.extend(
             scan_text_block(
                 value,
                 surface=rel_path,
@@ -1191,24 +1225,28 @@ def _scan_structured_source(
                 where=pointer or ("$" if include_keys else ""),
             )
         )
-        if isinstance(target, ToolComponent):
-            texts.setdefault(target.bom_ref, []).append(value)
-    results: list[tuple[ComponentWithRisks, list[TextPoisoningHit]]] = []
-    for ref, (target, node, hits) in groups.items():
-        if isinstance(target, ToolComponent) and hits:
-            declaration = node or {}
+        if has_tool_schema and not is_key:
+            group.text_values.append(value)
+    results: _SourceFindings = []
+    for group in groups.values():
+        target, hits = group.target, group.hits
+        if group.has_tool_schema and hits:
+            declaration = group.node or {}
+            explicit_tool = target if isinstance(target, ToolComponent) else None
             schema = next(
                 (
                     declaration[k]
                     for k in ("inputSchema", "input_schema", "parameters")
                     if k in declaration
                 ),
-                target.input_schema,
+                explicit_tool.input_schema if explicit_tool is not None else None,
             )
-            ann = declaration.get("annotations", target.annotations)
+            ann = declaration.get(
+                "annotations", explicit_tool.annotations if explicit_tool is not None else None
+            )
             hits = hits + check_sidenote_tool_schema(
                 schema if isinstance(schema, dict) else None,
-                "\n".join(texts[ref]),
+                "\n".join(group.text_values),
                 ann if isinstance(ann, dict) else None,
                 surface=rel_path,
                 existing_hits=hits,
@@ -1222,7 +1260,7 @@ def _scan_text_source(
     raw_text: str,
     comps: list[ComponentWithRisks],
     root_agent: AgentComponent | None,
-) -> list[tuple[ComponentWithRisks, list[TextPoisoningHit]]]:
+) -> _SourceFindings:
     suffix = PurePosixPath(rel_path).suffix.lower()
     is_tool_ctx = any(
         isinstance(c, (ToolComponent, A2AServerComponent, MCPServerComponent)) for c in comps
@@ -1247,12 +1285,19 @@ def _scan_text_source(
             for h in _escape_decoded_hits(raw_text, span, rel_path, is_tool_ctx)
             if (h.rule_id, h.byte_offset) not in located
         ]
-    raw_bytes = raw_text.encode("utf-8") if hits else b""
-    by_target: dict[str, tuple[ComponentWithRisks, list[TextPoisoningHit]]] = {}
+    shared_names = _shared_names(comps)
+    file_owner = _file_level_owner(comps, root_agent) if shared_names else None
+    raw_bytes = raw_text.encode("utf-8") if hits and not shared_names else b""
+    by_target: dict[str | None, tuple[ComponentWithRisks | None, list[TextPoisoningHit]]] = {}
     for h in hits:
-        chosen = _attribute_source_component(raw_text, raw_bytes, h.byte_offset, comps, root_agent)
-        if chosen is not None:
-            by_target.setdefault(chosen.bom_ref, (chosen, []))[1].append(h)
+        chosen = (
+            file_owner
+            if shared_names
+            else _attribute_source_component(raw_text, raw_bytes, h.byte_offset, comps, root_agent)
+        )
+        if chosen is not None or shared_names:
+            ref = None if chosen is None else chosen.bom_ref
+            by_target.setdefault(ref, (chosen, []))[1].append(h)
     if tree is not None:
         # A decoded string is reported at its pointer, as in a JSON source, unless the raw
         # text already gave its owner the same rule.
@@ -1260,9 +1305,10 @@ def _scan_text_source(
         for target, decoded in _scan_structured_source(
             rel_path, tree, comps, root_agent, include_keys=True, tool_context=is_tool_ctx
         ):
-            extra = [h for h in decoded if (target.bom_ref, h.rule_id) not in found]
+            ref = None if target is None else target.bom_ref
+            extra = [h for h in decoded if (ref, h.rule_id) not in found]
             if extra:
-                by_target.setdefault(target.bom_ref, (target, []))[1].extend(extra)
+                by_target.setdefault(ref, (target, []))[1].extend(extra)
     return list(by_target.values())
 
 
@@ -1383,7 +1429,10 @@ def apply_text_poisoning_rules(
                         else _scan_text_source(rel_path, raw_text, comps, root_agent)
                     )
                     for target, hits in owned:
-                        remember(target, hits)
+                        if target is not None:
+                            remember(target, hits)
+                        elif hits:
+                            failed(rel_path, "finding has no unambiguous component owner")
                 except (ValueError, RecursionError) as exc:
                     failed(rel_path, type(exc).__name__)
 
