@@ -34,19 +34,15 @@ _STATIC_BINDING_MSG = (
     "changed. Review before execution."
 )
 
+# 0.1.0 and 0.2.0 both wrote tool fingerprints as rfc8785-jcs-v2, the current profile, so no
+# supported upgrade changes a fingerprint version. "Tool fingerprint versions are unknown or
+# incompatible" therefore names a snapshot outside the documented transition, whose hash
+# change can be a changed descriptor, and is never attributed.
 SUPPORTED_UPGRADE_VERSIONS: dict[str, UpgradeRule] = {
     "0.1.0": UpgradeRule(
         from_version="0.1.0",
         detail_patterns=(
             _PROFILE_BUMP_RE,
-            re.compile(
-                r"^Tool fingerprint versions are unknown or incompatible; "
-                r"re-collect and re-approve\.$"
-            ),
-            re.compile(
-                r"^Changed security fields: "
-                r"(?:(?:definition_hash_version|tokenizer_hash|chat_template_hash)(?:, )?)+\.$"
-            ),
             re.compile(r"^Risk finding category changed: transport_security -> local_process\.$"),
         ),
     ),
@@ -54,22 +50,13 @@ SUPPORTED_UPGRADE_VERSIONS: dict[str, UpgradeRule] = {
         from_version="0.2.0",
         detail_patterns=(
             _PROFILE_BUMP_RE,
-            re.compile(
-                r"^Tool fingerprint versions are unknown or incompatible; "
-                r"re-collect and re-approve\.$"
-            ),
-            re.compile(
-                r"^Changed security fields: "
-                r"(?:(?:definition_hash_version|serialization_evidence)(?:, )?)+\.$"
-            ),
             re.compile(r"^properties\.(?:name_neutralized|serialization_evidence) added\.$"),
         ),
     ),
 }
 
-_METADATA_UPGRADE_RE = re.compile(
-    r"^(?:Native AIBOM format version|Tool version|The (?:baseline|candidate) snapshot uses a spec_version)\b"
-)
+# An unsupported spec_version is never an upgrade transition: the comparison can miss fields.
+_METADATA_UPGRADE_RE = re.compile(r"^(?:Native AIBOM format version|Tool version)\b")
 
 
 def _all_details_expected(details: list[str], rule: UpgradeRule) -> bool:

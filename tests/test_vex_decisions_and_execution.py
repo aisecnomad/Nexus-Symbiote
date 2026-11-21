@@ -20,6 +20,8 @@ from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.models import RegistryEntryComponent, RiskAssessment, ToolComponent
 from nexus_symbiote.generators.vex import VEXGenerator, finding_id
 from nexus_symbiote.vex_decisions import (
+    LoadedVEXDecisions,
+    VEXDecisionEntry,
     VEXDecisionError,
     load_advisory_report,
     load_execution_evidence,
@@ -587,6 +589,75 @@ def test_vex_operator_material_rejects_writable_files_and_duplicate_yaml(tmp_pat
 
 
 @pytest.mark.parametrize(
+    "category",
+    [
+        "custom_code",
+        "code_execution",
+        "credential_helper",
+        "hidden_markup",
+        "invisible_characters",
+        "bidi_override",
+        "tag_characters",
+        "instruction_injection",
+        "tool_description_poisoning",
+        "identifier_characters",
+    ],
+)
+def test_trace_evidence_cannot_suppress_a_high_static_or_hidden_text_finding(tmp_path, category):
+    risk = RiskAssessment(severity=RiskSeverity.HIGH, category=category, detail="finding")
+    bom = AIBOM(components=[ToolComponent(bom_ref="tool:t", name="t", risks=[risk])])
+    trace_file = tmp_path / "trace.json"
+    trace_file.write_text(json.dumps({"declared_never_loaded": ["tool:t"]}), encoding="utf-8")
+    evidence = load_execution_evidence(trace_file, allow_unsigned=True)
+    (vuln,) = VEXGenerator(execution_evidence=evidence).generate(bom)["vulnerabilities"]
+    assert vuln["analysis"]["state"] == "in_triage"
+    props = {p["name"]: p["value"] for p in vuln["properties"]}
+    assert props["nexus-symbiote:suppressionBlocked"] == "true"
+
+
+_ACCEPTED_DECISION = (
+    "version: 1\ndecisions:\n  - id: NEXUS-abc\n    state: in_triage\n    detail: d\n    owner: o\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        # A repeated key silently replaced the first, here the decision's state.
+        (
+            "version: 1\ndecisions:\n  - id: NEXUS-abc\n    state: in_triage\n"
+            "    state: not_affected\n    justification: code_not_reachable\n"
+            "    expires_at: 2027-01-01T00:00:00Z\n    detail: d\n    owner: o\n",
+            "unique",
+        ),
+        (_ACCEPTED_DECISION + "decisions: []\n", "unique"),
+        # Alias expansion multiplies validation work about tenfold per level.
+        (
+            "version: 1\nx:\n  a0: &a0 [x]\n  a1: &a1 [*a0, *a0]\ndecisions: *a1\n",
+            "anchors",
+        ),
+        (_ACCEPTED_DECISION.replace("detail: d", "detail: &d d"), "anchors"),
+    ],
+    ids=["repeated-state", "repeated-decisions", "alias-list", "anchored-scalar"],
+)
+def test_vex_decisions_refuse_yaml_aliases_and_repeated_keys(tmp_path, text, message):
+    path = tmp_path / "decisions.yaml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(VEXDecisionError, match="syntax or complexity") as refused:
+        load_vex_decisions(path)
+    assert message in str(refused.value.__cause__)
+    path.write_text(_ACCEPTED_DECISION, encoding="utf-8")
+    assert load_vex_decisions(path).entries[0].owner == "o"
+
+
+def test_vex_decisions_report_invalid_utf8_as_a_decision_error(tmp_path):
+    path = tmp_path / "decisions.yaml"
+    path.write_bytes(b"version: 1\ndecisions: []\n# \xff\xfe\n")
+    with pytest.raises(VEXDecisionError, match="Invalid VEX decisions syntax"):
+        load_vex_decisions(path)
+
+
+@pytest.mark.parametrize(
     "mutation",
     [
         {"complete": True},
@@ -669,3 +740,117 @@ def test_vex_loads_decisions_below_a_trusted_traverse_only_ancestor(tmp_path, mo
 
     monkeypatch.setattr(vex_decisions, "open_directory_nofollow", deny_directory_read)
     assert load_vex_decisions(path).entries == ()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Mallory\u202e",
+        "Mal\x9b[2J",
+        "a\u200bb",
+        "tab\there",
+        "esc\x1b[2J",
+        "two\nlines",
+        "iso\u2066late\u2069",
+        "line\u2028separator",
+        "tag\U000e0041\U000e007f",
+        "joiner\u2060",
+        "bom\ufeff",
+    ],
+    ids=[
+        "bidi-override",
+        "c1-csi",
+        "zero-width-space",
+        "tab",
+        "c0-escape",
+        "newline",
+        "bidi-isolate",
+        "line-separator",
+        "tag-characters",
+        "word-joiner",
+        "byte-order-mark",
+    ],
+)
+def test_vex_decision_text_refuses_c1_bidi_and_invisible_characters(text):
+    for field in ("id", "detail", "owner", "deployment_id"):
+        values = {"id": "NEXUS-abc", "detail": "d", "owner": "o", field: text}
+        with pytest.raises(ValueError, match="control, bidirectional or invisible"):
+            VEXDecisionEntry(state="in_triage", **values)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\u2714\ufe0f reviewed",
+        "\U0001f469\u200d\U0001f4bb on call",
+        "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645",
+        "\u0915\u094d\u200d\u0937",
+        "co\u00adoperate",
+        "glyph\U000e0100variant",
+    ],
+    ids=["emoji-vs16", "zwj-emoji", "persian-zwnj", "devanagari-zwj", "soft-hyphen", "vs17"],
+)
+def test_vex_decision_text_accepts_format_characters_ordinary_text_uses(text):
+    for field in ("detail", "owner", "deployment_id"):
+        values = {"id": "NEXUS-abc", "detail": "d", "owner": "o", field: text}
+        assert getattr(VEXDecisionEntry(state="in_triage", **values), field) == text
+    assert (
+        VEXDecisionEntry(id="NEXUS-abc", state="in_triage", detail="d", owner="o").deployment_id
+        is None
+    )
+
+
+def test_vex_decision_owner_is_neutralized_on_output():
+    bom = _three_component_bom()
+    fid = finding_id("tool:invoked", "unpinned_tool", "Tool definition is unpinned")
+    entry = VEXDecisionEntry.model_construct(
+        id=fid,
+        component_ref="tool:invoked",
+        state="in_triage",
+        justification=None,
+        detail="d",
+        owner="Mallory\u202e\x9b[2J\u200d\ufe0f",
+        expires_at=None,
+    )
+    decisions = LoadedVEXDecisions(entries=(entry,), sha256="sha256:" + "0" * 64)
+    doc = VEXGenerator(decisions=decisions).generate(bom)
+    vuln = next(v for v in doc["vulnerabilities"] if v["id"] == fid)
+    owner = {p["name"]: p["value"] for p in vuln["properties"]}["nexus-symbiote:vexDecisionOwner"]
+    for text in (owner, vuln["analysis"]["detail"]):
+        for character in ("\u202e", "\x9b", "\u200d", "\ufe0f"):
+            assert character not in text
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("in_kev", "false"),
+        ("in_kev", 0),
+        ("epss_score", True),
+        ("epss_score", "0.5"),
+        ("epss_score", float("nan")),
+        ("aliases", ["CVE-2024-1,CVE-2024-2", "CVE-2024-3"]),
+        ("kev_sources", ["cisa-kev,enisa"]),
+    ],
+)
+def test_vex_refuses_mistyped_or_ambiguous_advisory_fields(field, value):
+    pkg = RegistryEntryComponent(
+        bom_ref="pkg:pypi:torch@2.5.1",
+        name="torch",
+        version="2.5.1",
+        registry_type="pypi",
+        package_url="pkg:pypi/torch@2.5.1",
+    )
+    advisory = {"advisory_id": "GHSA-a", "component_ref": pkg.bom_ref, "in_kev": True}
+    advisory[field] = value
+    with pytest.raises(ValueError, match=field):
+        VEXGenerator(advisories=[advisory]).generate(AIBOM(components=[pkg]))
+    accepted = {"advisory_id": "GHSA-a", "component_ref": pkg.bom_ref, "in_kev": False}
+    accepted.update(epss_score=0.25, aliases=["CVE-2024-3"])
+    (vuln,) = VEXGenerator(advisories=[accepted]).generate(AIBOM(components=[pkg]))[
+        "vulnerabilities"
+    ]
+    props = {p["name"]: p["value"] for p in vuln["properties"]}
+    assert "nexus-symbiote:inKev" not in props
+    assert props["nexus-symbiote:epssScore"] == "0.250000"
+    assert props["nexus-symbiote:aliases"] == "CVE-2024-3"

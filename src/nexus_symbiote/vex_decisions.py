@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
 import stat
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -36,11 +37,16 @@ from nexus_symbiote.core.hashing import (
 )
 from nexus_symbiote.policy import parse_yaml_mapping
 from nexus_symbiote.utils.crypto import _trusted_ancestor_uids
+from nexus_symbiote.utils.terminal import UNSAFE_TEXT
 
 MAX_DECISIONS_BYTES = 4 * 1024 * 1024
 MAX_DECISIONS = 5_000
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 MAX_KEY_BYTES = 64 * 1024
+# Format characters that ordinary text needs: ZWNJ and ZWJ (Persian, Indic scripts, emoji
+# sequences), variation selectors (emoji presentation) and the soft hyphen. Output
+# neutralization replaces them; every other character UNSAFE_TEXT matches is refused.
+_ORDINARY_FORMAT_CHARACTERS = re.compile(r"[\xad\u200c\u200d\ufe00-\ufe0f\U000e0100-\U000e01ef]")
 
 VEXState = Literal["not_affected", "exploitable", "resolved", "false_positive", "in_triage"]
 VEXJustification = Literal[
@@ -80,8 +86,14 @@ class VEXDecisionEntry(BaseModel):
     def _clean_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        if not value.strip() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
-            raise ValueError("must be a non-empty string without control characters")
+        if (
+            not value.strip()
+            or "\t" in value
+            or UNSAFE_TEXT.search(_ORDINARY_FORMAT_CHARACTERS.sub("", value))
+        ):
+            raise ValueError(
+                "must be a non-empty string without control, bidirectional or invisible characters"
+            )
         return value.strip()
 
     @field_validator("expires_at")
@@ -305,8 +317,10 @@ def load_vex_decisions(
         label="Operator VEX decisions file",
     )
     raw = _read_regular_bytes(path, MAX_DECISIONS_BYTES, "VEX decisions file", single_link=True)
-    text = raw.decode("utf-8")
     try:
+        text = raw.decode("utf-8")
+        # Aliases expand into repeated validation work, and a repeated key (a second
+        # ``state:``) would silently replace the first: both are refused.
         payload: Any = (
             parse_json_strict(text, max_bytes=MAX_DECISIONS_BYTES)
             if path.suffix.lower() == ".json" or text.lstrip().startswith("{")
