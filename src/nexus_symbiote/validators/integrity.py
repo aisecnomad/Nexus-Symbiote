@@ -377,7 +377,11 @@ class IntegrityValidator:
                         )
                     )
             self._check_file_hash(comp, project_root, report)
-            if len(report.issues) != first_issue:
+            # Matching artifact bytes and safe model behavior are separate facts.
+            if any(
+                issue.category not in {"unsafe_format", "trust_remote_code"}
+                for issue in report.issues[first_issue:]
+            ):
                 report.model_policy_evidence.pop(comp.bom_ref, None)
             if comp.bom_ref in bound_imports and is_imported(comp):
                 for issue in report.issues[first_issue:]:
