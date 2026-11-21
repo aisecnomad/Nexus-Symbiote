@@ -95,3 +95,61 @@ def test_command_normalized_for_display_is_marked_unbound(tmp_path):
     assert any(
         UNBOUND_VALUES_DETAIL in risk.detail and "command" in risk.detail for risk in server.risks
     )
+
+
+@pytest.mark.parametrize("assignment,prefix", [("BOT=Bot", ""), ("--env=API_TOKEN=Bearer", "-X")])
+def test_scheme_arguments_protect_their_literal_in_siblings(tmp_path, assignment, prefix):
+    public_id = prefix + hashlib.sha256(b"public protocol test").hexdigest()[:32]
+    result, inventory = _scan(
+        tmp_path,
+        {
+            "source": {"command": "node", "args": [assignment, public_id]},
+            "sibling": _echo(public_id),
+        },
+    )
+    assert any(r.category == "credential_exposure" for c in result.components for r in c.risks)
+    assert public_id not in inventory.model_dump_json()
+
+
+@pytest.mark.parametrize("bad_shape", ["arguments", "entry", "environment"])
+def test_invalid_public_fields_preserve_a_sibling_package_identity(tmp_path, bad_shape):
+    package = "@fixtures/public-tool@1.2.3"
+    cases = {
+        "arguments": {"command": "npx", "args": ["-y", package, 42]},
+        "entry": ["npx", "-y", package],
+        "environment": {"command": "node", "env": [f"public-label-{n}" for n in range(4200)]},
+    }
+    result, _ = _scan(
+        tmp_path,
+        {"valid": {"command": "npx", "args": ["-y", package]}, "invalid": cases[bad_shape]},
+    )
+    server = next(c for c in result.components if isinstance(c, MCPServerComponent))
+    assert server.package_url == "pkg:npm/%40fixtures/public-tool@1.2.3"
+
+
+@pytest.mark.parametrize("width,separator", [(76, "\n"), (43, "\r\n")])
+def test_same_key_in_a_sibling_with_a_different_line_width(tmp_path, width, separator):
+    sample = json.dumps({"private_key": "Public example text only. " * 10})
+    encoded = base64.b64encode(sample.encode()).decode()
+    source = "\n".join(textwrap.wrap(encoded, 64))
+    sibling = separator.join(textwrap.wrap(encoded, width))
+    result, inventory = _scan(
+        tmp_path,
+        {"src": {"command": "node", "env": {"SERVICE_CONFIG": source}}, "copy": _echo(sibling)},
+    )
+    assert not result.scan_failures
+    for rendered in (
+        inventory.model_dump_json(),
+        json.dumps(CycloneDXGenerator().generate(inventory)),
+        json.dumps(SPDXGenerator().generate(inventory)),
+    ):
+        assert "Fixture echo:" in rendered
+        assert encoded[:35] not in rendered
+
+
+def test_ordinary_ascii_command_padding_preserves_binding(tmp_path):
+    _, inventory = _scan(tmp_path, {"local": {"command": "npx "}})
+    server = next(c for c in inventory.components if isinstance(c, MCPServerComponent))
+    assert not any(
+        UNBOUND_VALUES_DETAIL in r.detail and "command" in r.detail for r in server.risks
+    )

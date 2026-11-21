@@ -73,6 +73,7 @@ from nexus_symbiote.scanners.mcp_credentials import (
     credential_name,
     endpoint_hits,
     literal_value,
+    rewrapped_key_literals,
     strongest,
     value_hits,
 )
@@ -1114,9 +1115,13 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     hits = value_hits(name, value)
     if (
         following is not None
-        and credential_name(name)
         and value.lower() in _ASSIGNMENT_SCHEMES
-        and not (word.startswith("-") and _CLI_FLAG.fullmatch(following.partition("=")[0]))
+        and not (
+            word.startswith("-")
+            and following.startswith("--")
+            and "=" in following
+            and _CLI_FLAG.fullmatch(following.partition("=")[0])
+        )
     ):
         hits.extend(value_hits(name, f"{value} {following}"))
     return hits
@@ -1292,19 +1297,17 @@ def _declared_hits(config: dict[str, Any]) -> PositionHits:
     return list(_credential_hits(env if isinstance(env, dict) else {}, args, maps, ()))
 
 
-def _malformed_values(node: Any) -> Iterator[str]:
-    """A refused field has no reliable schema. Scrub its literals and any credentials
-    they contain, so repeating one in a valid sibling cannot publish it.
-    """
-    pending = [node]
+def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
+    """Select credentials by their field or value even when a server is refused."""
+    pending = [(field, node)]
     while pending:
-        item = pending.pop()
+        name, item = pending.pop()
         if isinstance(item, dict):
-            pending.extend(item.values())
+            pending.extend((str(k), value) for k, value in item.items())
         elif isinstance(item, list):
-            pending.extend(item)
+            pending.extend((name, value) for value in item)
         elif isinstance(item, str) and not is_reference(item):
-            if len(item) >= MIN_SECRET_LENGTH:
+            if secret_like(name, item):
                 yield item
             yield from _text_credentials(item)
             yield from _shape_secrets(item)
@@ -2790,6 +2793,7 @@ class MCPScanner(Scanner):
             values = self._file_secrets(
                 [*entries, *(("", config) for config in read.dropped)], dialect.shape, server_hits
             )
+            values.extend(dict.fromkeys(rewrapped_key_literals(data, values)))
             # Before either refusal below: a file that is not collected still holds them.
             if known is not None:
                 known.add(values)
@@ -2901,8 +2905,8 @@ class MCPScanner(Scanner):
                     # credential limit and so withhold every sibling from the inventory.
                     declared = {field: item for field, item in config.items() if field != "args"}
                     read = [hit for hit in hits if hit[0] != "argument"]
-                for value in cls._invalid_field_values(declared, shape):
-                    values.extend(_malformed_values(value))
+                for field, value in cls._invalid_field_values(declared, shape):
+                    values.extend(_malformed_values(value, field))
                 values.extend(_server_secrets(declared, Launch(), read))
                 if server_hits is not None:
                     server_hits[id(config)] = hits
@@ -3131,7 +3135,7 @@ class MCPScanner(Scanner):
         return _Entries(sorted(entries.items()), problems, unknown, tuple(dropped))
 
     @staticmethod
-    def _invalid_field_values(config: dict[str, Any], shape: str) -> Iterator[Any]:
+    def _invalid_field_values(config: dict[str, Any], shape: str) -> Iterator[tuple[str, Any]]:
         """Values whose type prevents an interpreted server field from being read."""
         for field, value in config.items():
             if not _interpreted(field, shape):
@@ -3157,7 +3161,7 @@ class MCPScanner(Scanner):
             else:
                 continue
             if not valid:
-                yield value
+                yield field, value
 
     @classmethod
     def _server_problem(cls, config: dict[str, Any], shape: str) -> str | None:
@@ -3840,7 +3844,7 @@ class MCPScanner(Scanner):
         unbound = []
         if command and (re.search(r"[\\/]", command) or launch.wrappers):
             unbound.append("command path")
-        elif command and identity.command != command:
+        elif command and identity.command != command.strip(" \t\r\n\f\v"):
             # A redacted command, or one exported case-folded or without its Windows
             # suffix: MCPServer and mcpserver are different files on POSIX.
             unbound.append("command")
