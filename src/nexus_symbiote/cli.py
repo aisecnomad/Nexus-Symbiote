@@ -220,8 +220,8 @@ def _policy_with_source(
 ) -> tuple[Policy, str, list[str], dict[str, str] | None]:
     """Load the governing policy and say where it came from and what it relaxes.
 
-    Tightening settings apply automatically. A mixed or relaxing checkout is withheld
-    as a unit unless accepted, and the operator's floor always bounds the result.
+    Apply each tightening even if the checkout also asks to relax a different
+    setting. An operator policy always bounds the result.
     """
     from nexus_symbiote.operator_policy import narrow_policy
     from nexus_symbiote.policy import (
@@ -254,10 +254,33 @@ def _policy_with_source(
     if loaded is None:
         return baseline, source, baseline_weaker, None
     project, path, _ = loaded
-    if operator is not None and operator_digest is not None:
+    has_operator = operator is not None and operator_digest is not None
+    weaker = weakened_settings(project)
+    if has_operator or (weaker and not allow_weakening):
         narrowed, clamped = narrow_policy(baseline, project, inherit_unspecified=True)
-        if not allow_weakening and clamped:
-            return baseline, source, baseline_weaker, _warn_unapplied_project_policy(root, path)
+        if not allow_weakening and (clamped or not has_operator):
+            if narrowed == baseline:
+                return baseline, source, baseline_weaker, _warn_unapplied_project_policy(root, path)
+            _LAST_CLAMPED_SETTINGS.set(tuple(clamped))
+            echo_line(
+                "WARNING: project policy ",
+                path,
+                " tightened the governing gates. Its relaxations were withheld. "
+                "Pass --accept-project-policy to accept relaxations within the operator policy.",
+                err=True,
+            )
+            if not has_operator:
+                # Attribute only effective overrides to the checkout in machine reports.
+                narrowed = type(baseline).model_validate(
+                    narrowed.model_dump(by_alias=True, exclude_defaults=True)
+                )
+                source = f"project:{path}"
+            return (
+                narrowed,
+                source,
+                weakened_settings(narrowed),
+                {"file": path.name, "reason": "relaxations-not-accepted"},
+            )
         _LAST_CLAMPED_SETTINGS.set(tuple(clamped))
         if clamped and warn:
             echo_line(
@@ -268,10 +291,6 @@ def _policy_with_source(
                 err=True,
             )
         return narrowed, source, weakened_settings(narrowed), None
-
-    weaker = weakened_settings(project)
-    if weaker and not allow_weakening:
-        return baseline, source, baseline_weaker, _warn_unapplied_project_policy(root, path)
     if weaker and warn:
         echo_line(
             "WARNING: policy ", path, " weakens the built-in gates: ", "; ".join(weaker), err=True

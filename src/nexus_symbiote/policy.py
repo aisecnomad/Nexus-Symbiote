@@ -456,7 +456,7 @@ risk:
   fail_threshold: 50.0  # aggregate score; lowering it is stricter
   warn_threshold: 25.0  # must not exceed fail_threshold
   fail_on_severity: "critical"  # critical, high, medium, low, info or none
-  ignore_categories: []  # whole categories, everywhere; prefer suppressions
+  # ignore_categories: []  # uncomment to require every category, including operator-approved ignores
   # Accept one reviewed finding, with a reason, owner and expiry. Copy component_ref,
   # category and fingerprint from `risk --json-output`; a changed finding no longer matches.
   # suppressions:

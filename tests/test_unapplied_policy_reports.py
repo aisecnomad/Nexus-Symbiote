@@ -60,7 +60,7 @@ def test_json_shortcut_reports_ambiguous_policy_without_echoing_its_content(tmp_
     assert "untrusted policy contents" not in run.output
 
 
-def test_mixed_checkout_policy_is_withheld_as_a_unit(tmp_path):
+def test_mixed_checkout_keeps_the_tightening_without_accepting_relaxations(tmp_path):
     project = _project(
         tmp_path / "project",
         "validate: {minimum_assurance_level: observed}\nrisk: {fail_on_severity: none}\n",
@@ -68,8 +68,8 @@ def test_mixed_checkout_policy_is_withheld_as_a_unit(tmp_path):
     inventory = _inventory(tmp_path, project)
     args = ["validate", str(inventory), "--project", str(project), "--report-format", "json"]
     implicit = CliRunner().invoke(main, args)
-    assert json.loads(implicit.stdout)["policy_source"] == "built-in"
-    assert json.loads(implicit.stdout)["policy_unapplied"]["reason"] == "not-accepted"
+    assert json.loads(implicit.stdout)["policy_source"].startswith("project:")
+    assert json.loads(implicit.stdout)["policy_unapplied"]["reason"] == "relaxations-not-accepted"
     explicit = CliRunner().invoke(main, [*args, "--accept-project-policy"])
     assert json.loads(explicit.stdout)["policy_source"].startswith("project:")
 
@@ -113,8 +113,9 @@ def test_checkout_tightening_preserves_unspecified_operator_settings(tmp_path):
     policy, _, _, unused = _policy_with_source(
         project, operator=operator, operator_digest="fixture"
     )
-    assert policy == operator
-    assert unused is not None and unused["reason"] == "not-accepted"
+    assert policy.risk.fail_threshold == 12 and policy.risk.fail_on_severity == "high"
+    assert policy.validation.minimum_assurance_level == "verified"
+    assert unused is not None and unused["reason"] == "relaxations-not-accepted"
 
 
 @pytest.mark.parametrize(
