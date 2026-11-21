@@ -574,3 +574,27 @@ def test_trusted_public_key_requires_protected_parent(tmp_path):
     directory.chmod(0o777)
     with pytest.raises(VEXDecisionError, match="writable or untrusted ancestor"):
         _load_trusted_keys((public,))
+
+
+def test_vex_checks_owner_of_writable_filesystem_anchor(tmp_path, monkeypatch):
+    import os
+    import stat
+    from types import SimpleNamespace
+
+    from nexus_symbiote.vex_decisions import _check_operator_directory
+
+    anchor = tmp_path.parents[-1].stat()
+    real_fstat = os.fstat
+
+    def stat_descriptor(fd):
+        result = real_fstat(fd)
+        if (result.st_dev, result.st_ino) == (anchor.st_dev, anchor.st_ino):
+            fields = list(result)
+            fields[stat.ST_UID] = 987654
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(os, "fstat", stat_descriptor)
+    monkeypatch.setattr(os, "fstatvfs", lambda fd: SimpleNamespace(f_flag=0))
+    with pytest.raises(VEXDecisionError, match="untrusted ancestor"):
+        _check_operator_directory(tmp_path / "decisions.json", {0, os.geteuid()})

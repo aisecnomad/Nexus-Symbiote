@@ -227,14 +227,20 @@ def _check_operator_directory(path: Path, trusted: set[int]) -> None:
     if ".." in absolute.parts:
         raise VEXDecisionError("Operator material must use a path without parent traversal")
     for directory in reversed(absolute.parents):
-        if directory == Path(absolute.anchor):
-            continue
         fd = open_directory_nofollow(directory)
         try:
             info = os.fstat(fd)
+            owner_trusted = info.st_uid in trusted
+            if not owner_trusted and directory == Path(absolute.anchor) and len(absolute.parts) > 2:
+                # A container's read-only namespace root can have an unmapped UID.
+                # An unprivileged writer cannot rename a direct mount point there.
+                owner_trusted = bool(os.fstatvfs(fd).f_flag & os.ST_RDONLY) and (
+                    os.stat(absolute.parts[1], dir_fd=fd, follow_symlinks=False).st_dev
+                    != info.st_dev
+                )
         finally:
             os.close(fd)
-        if info.st_uid not in trusted or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
+        if not owner_trusted or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
             raise VEXDecisionError("Operator material has a writable or untrusted ancestor")
 
 
