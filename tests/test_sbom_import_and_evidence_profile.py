@@ -1741,7 +1741,13 @@ def test_supplier_pypi_conflict_preserves_separator_equivalence(tmp_path):
 
 @pytest.mark.parametrize(
     ("supplier_suffix", "conflicts"),
-    [("", 1), ("?repository_url=https://mirror.example.test", 0), ("?=unknown", 1)],
+    [
+        ("", 1),
+        ("?repository_url=https://mirror.example.test", 0),
+        ("?repository_url=https://packages.example.test:443/&arch=x64#docs/api", 1),
+        ("?checksum=sha256:abc&repository_url=https://packages.example.test", 1),
+        ("?=unknown", 1),
+    ],
 )
 def test_supplier_partial_purl_identity_preserves_known_qualifiers(
     tmp_path, supplier_suffix, conflicts
@@ -1807,15 +1813,55 @@ def test_nested_go_require_accepts_adjacent_parenthesis(tmp_path):
     assert component.properties["pinning_state"] == "manifest-only"
 
 
-def test_nested_conda_version_remains_unresolved_without_a_lock(tmp_path):
-    (tmp_path / "environment.yml").write_text("dependencies:\n  - pytorch=2.1\n", encoding="utf-8")
+@pytest.mark.parametrize(
+    ("requirement", "version", "conflicts"),
+    [("=2.1", "2.1.1", 0), ("=2.1", "2.0.0", 1), ("==2.1.0", "2.1.1", 1), (">=2.1.0", "2.1.1", 0)],
+)
+def test_nested_conda_checks_supplier_version_without_lock(
+    tmp_path, requirement, version, conflicts
+):
+    (tmp_path / "environment.yml").write_text(
+        f"dependencies:\n  - pytorch{requirement}\n", encoding="utf-8"
+    )
     components, failures = walk_nested_manifests(tmp_path)
     assert not failures
-    path = _supplier_library(tmp_path / "sample.json", "pytorch", "2.1.1")
+    path = _supplier_library(tmp_path / "sample.json", "pytorch", version)
     result = import_foreign_sbom(path, target_aibom=AIBOM(components=components))
-    assert result.conflict_count == 0
-    assert result.unresolved_conflict_count == 1
-    assert result.aibom.components[-1].risks[0].category == "source_conflict_unresolved"
+    assert result.conflict_count == conflicts
+    assert result.unresolved_conflict_count == 0
+
+
+@pytest.mark.parametrize(
+    ("ecosystem", "requirement", "within", "outside"),
+    [
+        ("conda", "==2.1.0", "2.1.0", "2.1.1"),
+        ("cargo", "0.8.1", "0.8.6", "0.9.0"),
+        ("npm", "4.8", "4.8.6", "4.9.0"),
+        ("npm", "^4.0.0 || ^5.0.0", "5.2.0", "6.0.0"),
+        ("npm", ">=4.0.0 <5.0.0", "4.8.0", "5.0.0"),
+        ("npm", "4.0.0 - 4.9.0", "4.9.0", "4.9.1"),
+    ],
+)
+def test_supported_nested_ranges_keep_definite_conflicts(
+    tmp_path, ecosystem, requirement, within, outside
+):
+    for foreign_version, conflicts in ((within, 0), (outside, 1)):
+        peer = RegistryEntryComponent(
+            bom_ref="registry:sample-lib",
+            name="sample-lib",
+            version=requirement,
+            registry_type=ecosystem,
+            properties={"manifest_path": "project/manifest", "pinning_state": "manifest-only"},
+        )
+        path = _supplier_library(tmp_path / "sample.json", peer.name, foreign_version)
+        result = import_foreign_sbom(path, target_aibom=AIBOM(components=[peer]))
+        assert result.conflict_count == conflicts
+        assert result.unresolved_conflict_count == 0
+        reconciled = result.aibom.get_component(peer.bom_ref)
+        assert reconciled is not None
+        assert any(risk.category == "source_conflict" for risk in reconciled.risks) == bool(
+            conflicts
+        )
 
 
 def test_nested_locks_resolve_supported_partial_npm_and_cargo_versions(tmp_path):

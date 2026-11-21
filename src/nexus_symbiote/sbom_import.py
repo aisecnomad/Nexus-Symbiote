@@ -9,8 +9,10 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
-from typing import Any, Final
+from typing import Any, Final, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 
 from packageurl import PackageURL
 from packaging.requirements import InvalidRequirement, Requirement
@@ -104,7 +106,7 @@ class SBOMImportSummary:
 
 @dataclass
 class _IdentityBucket:
-    versions: dict[str, str] = field(default_factory=dict)
+    versions: dict[tuple[str | None, str], str] = field(default_factory=dict)
     incomparable_versions: dict[str, str] = field(default_factory=dict)
     digests: dict[str, str] = field(default_factory=dict)
     extra_version_conflicts: int = 0
@@ -216,34 +218,114 @@ def _versions_conflict(peer_ver: str | None, cand_ver: str | None) -> bool:
     return True
 
 
-def _nested_version_unresolved(component: AnyComponent) -> bool:
-    """Whether a nested declaration has no comparable exact version or range."""
+def _nested_version_ecosystem(component: AnyComponent) -> str | None:
+    """Find declarations whose version grammar depends on the package manager."""
     if (
         not isinstance(component, RegistryEntryComponent)
         or not component.properties.get("manifest_path")
         or component.properties.get("pinning_state") != "manifest-only"
-        or not component.version
     ):
-        return False
-    version = component.version
-    if component.registry_type == "conda":
-        return True
-    if component.registry_type == "cargo":
-        return re.fullmatch(r"=[0-9]+\.[0-9]+\.[0-9]+", version) is None
-    if component.registry_type != "npm" or _reg._npm_exact(version):
-        return False
-    specifier = _spec_to_pep440(version)
-    if specifier is None:
-        return True
+        return None
+    return component.registry_type if component.registry_type in {"conda", "cargo", "npm"} else None
+
+
+_VERSION_TERM = re.compile(r"(\^|~|<=|>=|==|=|<|>)?(v?[0-9]+(?:\.(?:[0-9]+|[xX*])){0,2})")
+
+
+def _numeric_semver_term(raw: str) -> str | None:
+    """Translate one stable npm or Cargo version comparator into numeric bounds."""
+    if raw in {"*", "x", "X"}:
+        return ""
+    match = _VERSION_TERM.fullmatch(raw)
+    if match is None:
+        return None
+    operator, literal = match.groups()
+    pieces = literal.removeprefix("v").split(".")
+    while pieces and pieces[-1] in {"*", "x", "X"}:
+        pieces.pop()
+    if not pieces or not all(piece.isascii() and piece.isdecimal() for piece in pieces):
+        return None
+    numbers = [int(piece) for piece in pieces]
+    version = ".".join(map(str, numbers))
+    if operator in {"^", "~"}:
+        return _spec_to_pep440(operator + version)
+    lower = version + ".0" * (3 - len(numbers))
+    if operator in {">=", "<"}:
+        return operator + lower
+    if len(numbers) == 3:
+        return (operator if operator in {">", "<="} else "==") + lower
+    numbers[-1] += 1
+    upper = ".".join(map(str, numbers)) + ".0" * (3 - len(numbers))
+    if operator == ">":
+        return ">=" + upper
+    if operator == "<=":
+        return "<" + upper
+    return f">={lower},<{upper}"
+
+
+@lru_cache(maxsize=512)
+def _nested_requirements(ecosystem: str, raw: str) -> tuple[SpecifierSet, ...] | None:
+    """Parse supported stable version ranges while keeping alternatives distinct."""
+    version = raw.strip()
+    if not version or len(version) > 128:
+        return None
+    groups: list[list[str]] = []
+    if ecosystem == "npm":
+        for alternative in version.split("||"):
+            hyphen = re.fullmatch(r"(\S+)\s+-\s+(\S+)", alternative.strip())
+            if hyphen:
+                groups.append([">=" + hyphen[1], "<=" + hyphen[2]])
+            else:
+                groups.append(re.sub(r"(?<=[<>=~^])\s+", "", alternative).split())
+    elif ecosystem == "cargo":
+        terms = [term.strip() for term in version.split(",")]
+        groups.append(["^" + term if term[:1].isdigit() else term for term in terms])
+    else:
+        # A single equals in a Conda MatchSpec matches a version prefix.
+        prefix = re.fullmatch(r"=([0-9]+(?:\.[0-9]+){0,2})", version)
+        if prefix:
+            return (SpecifierSet(f"=={prefix[1]}.*"),)
+        if not re.fullmatch(
+            r"(?:[<>=!]=?|==)[0-9]+(?:\.[0-9]+){0,2}(?:\s*,\s*(?:[<>]=?|==)[0-9]+(?:\.[0-9]+){0,2})*",
+            version,
+        ):
+            return None
+        try:
+            return (SpecifierSet(version),)
+        except InvalidSpecifier:
+            return None
+
+    parsed = []
+    for group in groups:
+        comparators = [_numeric_semver_term(term) for term in group]
+        if any(term is None for term in comparators):
+            return None
+        parsed.append(SpecifierSet(",".join(term for term in comparators if term)))
+    return tuple(parsed)
+
+
+def _satisfies_nested_requirement(ecosystem: str, requirement: str, version: str) -> bool | None:
+    alternatives = _nested_requirements(ecosystem, requirement)
+    if alternatives is None:
+        return None
     try:
-        SpecifierSet(specifier)
-    except InvalidSpecifier:
-        return True
-    return False
+        installed = Version(version)
+    except InvalidVersion:
+        return None
+    return any(
+        ranges.contains(installed, prereleases=ecosystem == "conda") for ranges in alternatives
+    )
+
+
+_BucketKey = TypeVar("_BucketKey", str, tuple[str | None, str])
 
 
 def _record_bucket_item(
-    mapping: dict[str, str], key: str, ref: str, overflow_attr: str, bucket: _IdentityBucket
+    mapping: dict[_BucketKey, str],
+    key: _BucketKey,
+    ref: str,
+    overflow_attr: str,
+    bucket: _IdentityBucket,
 ) -> None:
     if key not in mapping:
         if len(mapping) < MAX_CONFLICT_SAMPLES:
@@ -432,6 +514,28 @@ def _identity_binding(key: bytes | None, value: str) -> str:
     )
 
 
+_PURL_METADATA_QUALIFIERS = frozenset(
+    {"arch", "checksum", "download_url", "file_name", "tag", "vcs_url"}
+)
+
+
+def _repository_identity(value: str) -> str:
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        return value
+    default_port = {"http": 80, "https": 443}.get(parts.scheme)
+    if default_port is None or not parts.hostname or parts.username is not None:
+        return value
+    host = parts.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    if port is not None and port != default_port:
+        host += f":{port}"
+    return urlunsplit((parts.scheme, host, parts.path.rstrip("/"), parts.query, parts.fragment))
+
+
 def _identity_tokens(
     name: str, purl: str | None, eco: str, key: bytes | None, *, lookup: bool
 ) -> list[str]:
@@ -450,17 +554,21 @@ def _identity_tokens(
             stem = purl.partition("@")[0].partition("?")[0].partition("#")[0].lower()
             identity, qualified = stem, False
         else:
+            qualifiers = {
+                name: _repository_identity(value) if name == "repository_url" else value
+                for name, value in (package.qualifiers or {}).items()
+                if name not in _PURL_METADATA_QUALIFIERS
+            }
             identity = PackageURL(
                 type=package.type,
                 namespace=package.namespace,
                 name=package.name,
-                qualifiers=package.qualifiers,
-                subpath=package.subpath,
+                qualifiers=qualifiers,
             ).to_string()
             stem = PackageURL(
                 type=package.type, namespace=package.namespace, name=package.name
             ).to_string()
-            qualified = bool(package.qualifiers or package.subpath)
+            qualified = bool(qualifiers)
         values.append("purl:" + identity)
         # Compare a qualified package with an unspecified one, while keeping distinct
         # explicitly qualified packages separate.
@@ -543,7 +651,7 @@ def import_foreign_sbom(
     matches: dict[tuple[str, frozenset[str]], tuple[str | None, bool]] = {}
 
     buckets: dict[str, _IdentityBucket] = {}
-    context = _identity_binding(key, "context-v2")
+    context = _identity_binding(key, "context-v3")
     incomplete_identity = False
     for existing in bom.components:
         purl = existing.package_url if isinstance(existing, RegistryEntryComponent) else None
@@ -564,14 +672,37 @@ def import_foreign_sbom(
                 # that a differently spelled name or versionless PURL did not match.
                 incomplete_identity = True
                 keys_for_existing = ["legacy:" + existing.name]
-        version_unresolved = _nested_version_unresolved(existing)
+        version_ecosystem = _nested_version_ecosystem(existing)
+        comparison_version = existing.version
+        if version_ecosystem == "conda" and comparison_version:
+            declared = existing.properties.get("manifest_version_specifier")
+            if isinstance(declared, str):
+                comparison_version = declared
+            elif re.fullmatch(r"=?[0-9]+(?:\.[0-9]+){0,2}", comparison_version):
+                # Earlier Conda inventories dropped the first equals sign.
+                comparison_version = "=" + comparison_version
         for k in dict.fromkeys(keys_for_existing):
             b = buckets.setdefault(k, _IdentityBucket())
-            if existing.version:
-                versions = b.incomparable_versions if version_unresolved else b.versions
-                _record_bucket_item(
-                    versions, existing.version, existing.bom_ref, "extra_version_conflicts", b
-                )
+            if comparison_version:
+                if (
+                    version_ecosystem
+                    and _nested_requirements(version_ecosystem, comparison_version) is None
+                ):
+                    _record_bucket_item(
+                        b.incomparable_versions,
+                        comparison_version,
+                        existing.bom_ref,
+                        "extra_version_conflicts",
+                        b,
+                    )
+                else:
+                    _record_bucket_item(
+                        b.versions,
+                        (version_ecosystem, comparison_version),
+                        existing.bom_ref,
+                        "extra_version_conflicts",
+                        b,
+                    )
             sha = existing.hashes.get("sha256") or existing.properties.get("declared_sha256")
             if isinstance(sha, str) and sha:
                 _record_bucket_item(b.digests, sha, existing.bom_ref, "extra_digest_conflicts", b)
@@ -665,8 +796,18 @@ def import_foreign_sbom(
                     for version in bucket.incomparable_versions
                 ):
                     unresolved_versions = True
-                for p_ver, p_ref in bucket.versions.items():
-                    if (p_ref, "ver") not in seen_peer and _versions_conflict(p_ver, clean_ver):
+                for (p_eco, p_ver), p_ref in bucket.versions.items():
+                    if (p_ref, "ver") in seen_peer:
+                        continue
+                    if p_eco:
+                        satisfies = _satisfies_nested_requirement(p_eco, p_ver, clean_ver)
+                        if satisfies is None:
+                            unresolved_versions = True
+                            continue
+                        conflict = not satisfies
+                    else:
+                        conflict = _versions_conflict(p_ver, clean_ver)
+                    if conflict:
                         seen_peer.add((p_ref, "ver"))
                         if len(conflict_msgs) < 3:
                             conflict_msgs.append(
@@ -727,7 +868,7 @@ def import_foreign_sbom(
             bucket = buckets.setdefault(k, _IdentityBucket())
             if clean_ver:
                 _record_bucket_item(
-                    bucket.versions, clean_ver, comp_ref, "extra_version_conflicts", bucket
+                    bucket.versions, (None, clean_ver), comp_ref, "extra_version_conflicts", bucket
                 )
             if sha256_val:
                 _record_bucket_item(
@@ -1185,10 +1326,11 @@ def _parse_nested_manifest(
         if isinstance(parsed_conda.get("dependencies"), list):
             for dep in parsed_conda["dependencies"]:
                 if isinstance(dep, str):
-                    pkg, _, ver = dep.partition("=")
-                    if _is_ai_package_name(pkg):
+                    package = re.match(r"[A-Za-z0-9_.-]+", dep.strip())
+                    if package is not None and _is_ai_package_name(package[0]):
+                        requirement = dep.strip()[package.end() :].strip()
                         found.append(
-                            (pkg.strip(), ver.strip() or None, "conda", "manifest-only", {})
+                            (package[0], requirement or None, "conda", "manifest-only", {})
                         )
     elif name in {"devcontainer.json", ".devcontainer.json"}:
         parsed_dev = parse_json_strict(text)
@@ -1212,6 +1354,12 @@ def _parse_nested_manifest(
             "pinning_state": pin_state,
             "version_pinned": exact and pin_state != "manifest-only",
         }
+        if ecosystem == "conda" and spec:
+            requirement = neutralize(redact_text(spec))
+            nested_props["manifest_version_specifier"] = (
+                requirement if len(requirement) <= 128 else "[over version limit]"
+            )
+            clean_ver = spec.removeprefix("=").strip() or None
         if hashes.get("sha256"):
             nested_props["declared_sha256"] = hashes["sha256"]
         clm = ClaimEvidence(
