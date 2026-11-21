@@ -1743,7 +1743,7 @@ def test_supplier_pypi_conflict_preserves_separator_equivalence(tmp_path):
     ("supplier_suffix", "conflicts"),
     [
         ("", 1),
-        ("?repository_url=https://mirror.example.test", 0),
+        ("?repository_url=https://mirror.example.test", 1),
         ("?repository_url=https://packages.example.test:443/&arch=x64#docs/api", 1),
         ("?checksum=sha256:abc&repository_url=https://packages.example.test", 1),
         ("?=unknown", 1),

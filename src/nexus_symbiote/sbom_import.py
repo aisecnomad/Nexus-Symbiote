@@ -6,13 +6,14 @@ import configparser
 import hashlib
 import hmac
 import json
+import operator
 import os
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, TypeVar
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from packageurl import PackageURL
 from packaging.requirements import InvalidRequirement, Requirement
@@ -34,12 +35,13 @@ from nexus_symbiote.core.models import (
     RiskAssessment,
 )
 from nexus_symbiote.evidence_profile import is_exact_version, purl_has_exact_version
+from nexus_symbiote.offline_advisories import _semver_key
 from nexus_symbiote.policy import PolicyError, parse_yaml_mapping
 from nexus_symbiote.scanners import registry as _reg
 from nexus_symbiote.scanners.credential_files import credential_shaped
 from nexus_symbiote.scanners.mcp import _MIN_SOURCE_BINDING_KEY_LENGTH, SOURCE_BINDING_KEY_ENV
 from nexus_symbiote.utils.confined import ConfinedCollection
-from nexus_symbiote.utils.secrets import redact_text
+from nexus_symbiote.utils.secrets import redact_text, secret_like
 from nexus_symbiote.utils.terminal import neutralize
 from nexus_symbiote.utils.toml import loads as load_toml
 
@@ -49,7 +51,7 @@ MAX_NESTED_CDX_DEPTH: Final[int] = 32
 MAX_MANIFEST_YAML_BYTES: Final[int] = 512 * 1024
 MAX_CONFLICT_SAMPLES: Final[int] = 8
 MAX_CONFLICT_SUMMARY: Final[int] = 200
-MAX_IDENTITY_BINDINGS: Final[int] = 6
+MAX_IDENTITY_BINDINGS: Final[int] = 7
 _SUPPORTED_CDX_SPECS: Final[frozenset[str]] = frozenset(["1.4", "1.5", "1.6", "1.7"])
 _SUPPORTED_SPDX2_VERSIONS: Final[frozenset[str]] = frozenset(("SPDX-2.2", "SPDX-2.3"))
 _SHA256_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{64}", re.ASCII)
@@ -107,11 +109,13 @@ class SBOMImportSummary:
 @dataclass
 class _IdentityBucket:
     versions: dict[tuple[str | None, str], str] = field(default_factory=dict)
-    incomparable_versions: dict[str, str] = field(default_factory=dict)
     digests: dict[str, str] = field(default_factory=dict)
     extra_version_conflicts: int = 0
     extra_digest_conflicts: int = 0
     unmarked_peers: list[AnyComponent] = field(default_factory=list)
+    provenance_ids: set[str] = field(default_factory=set)
+    has_unspecified_provenance: bool = False
+    has_unknown_qualifiers: bool = False
 
 
 def _norm_pkg(name: str) -> str:
@@ -229,91 +233,183 @@ def _nested_version_ecosystem(component: AnyComponent) -> str | None:
     return component.registry_type if component.registry_type in {"conda", "cargo", "npm"} else None
 
 
-_VERSION_TERM = re.compile(r"(\^|~|<=|>=|==|=|<|>)?(v?[0-9]+(?:\.(?:[0-9]+|[xX*])){0,2})")
-
-
-def _numeric_semver_term(raw: str) -> str | None:
-    """Translate one stable npm or Cargo version comparator into numeric bounds."""
-    if raw in {"*", "x", "X"}:
-        return ""
-    match = _VERSION_TERM.fullmatch(raw)
-    if match is None:
-        return None
-    operator, literal = match.groups()
-    pieces = literal.removeprefix("v").split(".")
-    while pieces and pieces[-1] in {"*", "x", "X"}:
-        pieces.pop()
-    if not pieces or not all(piece.isascii() and piece.isdecimal() for piece in pieces):
-        return None
-    numbers = [int(piece) for piece in pieces]
-    version = ".".join(map(str, numbers))
-    if operator in {"^", "~"}:
-        return _spec_to_pep440(operator + version)
-    lower = version + ".0" * (3 - len(numbers))
-    if operator in {">=", "<"}:
-        return operator + lower
-    if len(numbers) == 3:
-        return (operator if operator in {">", "<="} else "==") + lower
-    numbers[-1] += 1
-    upper = ".".join(map(str, numbers)) + ".0" * (3 - len(numbers))
-    if operator == ">":
-        return ">=" + upper
-    if operator == "<=":
-        return "<" + upper
-    return f">={lower},<{upper}"
+_VersionKey = tuple[int, int, int, int, tuple[tuple[int, int | str], ...]]
+_VersionCore = tuple[int, int, int]
+_SemverBounds = tuple[tuple[str, _VersionKey], ...]
+_SemverGroup = tuple[_SemverBounds, frozenset[_VersionCore]]
+_WILDCARDS = frozenset({"x", "X", "*"})
+_VERSION_COMPARATORS = {
+    "<": operator.lt,
+    "<=": operator.le,
+    ">": operator.gt,
+    ">=": operator.ge,
+    "==": operator.eq,
+    "!=": operator.ne,
+}
+_SEMVER_TERM = re.compile(
+    r"(\^|~|<=|>=|==|=|<|>)?(v?(?:0|[1-9][0-9]*|[xX*])"
+    r"(?:\.(?:0|[1-9][0-9]*|[xX*])){0,2})"
+    r"(-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+)
 
 
 @lru_cache(maxsize=512)
-def _nested_requirements(ecosystem: str, raw: str) -> tuple[SpecifierSet, ...] | None:
-    """Parse supported stable version ranges while keeping alternatives distinct."""
-    version = raw.strip()
-    if not version or len(version) > 128:
+def _semver_parts(raw: str) -> tuple[str, _VersionKey, int, bool] | None:
+    match = _SEMVER_TERM.fullmatch(raw)
+    if match is None:
         return None
-    groups: list[list[str]] = []
-    if ecosystem == "npm":
-        for alternative in version.split("||"):
-            hyphen = re.fullmatch(r"(\S+)\s+-\s+(\S+)", alternative.strip())
-            if hyphen:
-                groups.append([">=" + hyphen[1], "<=" + hyphen[2]])
-            else:
-                groups.append(re.sub(r"(?<=[<>=~^])\s+", "", alternative).split())
-    elif ecosystem == "cargo":
-        terms = [term.strip() for term in version.split(",")]
-        groups.append(["^" + term if term[:1].isdigit() else term for term in terms])
-    else:
-        # A single equals in a Conda MatchSpec matches a version prefix.
-        prefix = re.fullmatch(r"=([0-9]+(?:\.[0-9]+){0,2})", version)
-        if prefix:
-            return (SpecifierSet(f"=={prefix[1]}.*"),)
-        if not re.fullmatch(
-            r"(?:[<>=!]=?|==)[0-9]+(?:\.[0-9]+){0,2}(?:\s*,\s*(?:[<>]=?|==)[0-9]+(?:\.[0-9]+){0,2})*",
-            version,
-        ):
-            return None
-        try:
-            return (SpecifierSet(version),)
-        except InvalidSpecifier:
-            return None
+    operation, core, prerelease = match.groups()
+    pieces = core.removeprefix("v").split(".")
+    size = next((i for i, part in enumerate(pieces) if part in _WILDCARDS), len(pieces))
+    wildcard = size < len(pieces)
+    if any(piece not in _WILDCARDS for piece in pieces[size:]):
+        return None
+    if prerelease and (
+        size != 3
+        or any(
+            identifier.isdecimal() and len(identifier) > 1 and identifier.startswith("0")
+            for identifier in prerelease[1:].split(".")
+        )
+    ):
+        return None
+    literal = ".".join([*pieces[:size], *(["0"] * (3 - size))])
+    parsed = _semver_key(literal + (prerelease or ""))
+    assert parsed is not None
+    return operation or "", parsed, size, wildcard
 
-    parsed = []
-    for group in groups:
-        comparators = [_numeric_semver_term(term) for term in group]
-        if any(term is None for term in comparators):
-            return None
-        parsed.append(SpecifierSet(",".join(term for term in comparators if term)))
+
+def _bump_semver(version: _VersionKey, position: int) -> _VersionKey:
+    parts = [version[0], version[1], version[2]]
+    parts[position] += 1
+    parts[position + 1 :] = [0] * (2 - position)
+    return (parts[0], parts[1], parts[2], 0, ((0, 0),))
+
+
+def _semver_bounds(operation: str, version: _VersionKey, precision: int) -> _SemverBounds:
+    if precision == 0:
+        return ()
+    if operation in {"^", "~"}:
+        if operation == "^":
+            position = next((i for i in range(precision) if version[i]), precision - 1)
+        else:
+            position = min(1, precision - 1)
+        return ((">=", version), ("<", _bump_semver(version, position)))
+    if precision == 3:
+        return (((operation if operation in {">", ">=", "<", "<="} else "=="), version),)
+    upper = _bump_semver(version, precision - 1)
+    if operation == ">":
+        return ((">=", (*upper[:3], 1, ())),)
+    if operation == "<=":
+        return (("<", upper),)
+    if operation in {">=", "<"}:
+        boundary = (*version[:3], 0, ((0, 0),)) if operation == "<" else version
+        return ((operation, boundary),)
+    return ((">=", version), ("<", upper))
+
+
+@lru_cache(maxsize=512)
+def _semver_requirements(ecosystem: str, raw: str) -> tuple[_SemverGroup, ...] | None:
+    if not raw.strip() or len(raw) > 128:
+        return None
+    npm = ecosystem == "npm"
+    alternatives = raw.split("||") if npm else [raw]
+    parsed: list[_SemverGroup] = []
+    for form in alternatives:
+        hyphen = re.fullmatch(r"(\S+)\s+-\s+(\S+)", form.strip()) if npm else None
+        if hyphen:
+            terms = [">=" + hyphen[1], "<=" + hyphen[2]]
+        elif npm:
+            terms = re.sub(r"(?<=[<>=~^])\s+", "", form).split()
+        else:
+            terms = [re.sub(r"(?<=[<>=~^])\s+", "", term.strip()) for term in form.split(",")]
+        bounds: list[tuple[str, _VersionKey]] = []
+        pre_cores: set[_VersionCore] = set()
+        for term in terms:
+            info = _semver_parts(term)
+            if info is None:
+                return None
+            operation, version, precision, wildcard = info
+            if not precision and operation not in {"", "=", "=="}:
+                return None
+            if not npm and not operation and not wildcard:
+                operation = "^"
+            if version[3] == 0:
+                pre_cores.add(version[:3])
+            bounds.extend(_semver_bounds(operation, version, precision))
+        parsed.append((tuple(bounds), frozenset(pre_cores)))
     return tuple(parsed)
 
 
-def _satisfies_nested_requirement(ecosystem: str, requirement: str, version: str) -> bool | None:
-    alternatives = _nested_requirements(ecosystem, requirement)
-    if alternatives is None:
+_CondaTerms = tuple[tuple[str, Version], ...]
+
+
+@lru_cache(maxsize=512)
+def _conda_requirement(raw: str) -> tuple[_CondaTerms, bool] | None:
+    if not raw.strip() or len(raw) > 128:
+        return None
+    text = raw.strip()
+    build = re.fullmatch(r"(={1,2}[0-9][^=,|]*)=([A-Za-z0-9_.+*?-]+)", text)
+    if build:
+        text = build[1]
+    comparisons: list[tuple[str, Version]] = []
+    for term in text.split(","):
+        match = re.fullmatch(r"(<=|>=|==|!=|=|<|>)\s*([0-9]\S*)", term.strip())
+        if match is None:
+            return None
+        operation, literal = match.groups()
+        if operation == "=" or literal.endswith(".*"):
+            if operation not in {"=", "==", "!="}:
+                return None
+            literal = literal.removesuffix(".*")
+            if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", literal):
+                return None
+            operation = "not-prefix" if operation == "!=" else "prefix"
+        try:
+            comparisons.append((operation, Version(literal)))
+        except InvalidVersion:
+            return None
+    return tuple(comparisons), build is not None
+
+
+def _satisfies_conda_requirement(requirement: str, version: str) -> bool | None:
+    parsed = _conda_requirement(requirement)
+    if parsed is None:
         return None
     try:
         installed = Version(version)
     except InvalidVersion:
         return None
+    comparisons, has_build = parsed
+    for operation, boundary in comparisons:
+        if operation in {"prefix", "not-prefix"}:
+            width = len(boundary.release)
+            prefix = (installed.release + (0,) * width)[:width]
+            matched = prefix == boundary.release and installed.epoch == boundary.epoch
+            if matched != (operation == "prefix"):
+                return False
+        elif not _VERSION_COMPARATORS[operation](installed, boundary):
+            return False
+    # A version can rule out a version-and-build pin. It cannot confirm the build.
+    return None if has_build else True
+
+
+def _satisfies_nested_requirement(ecosystem: str, requirement: str, version: str) -> bool | None:
+    if not version or len(version) > 128:
+        return None
+    if ecosystem == "conda":
+        return _satisfies_conda_requirement(requirement, version)
+    alternatives = _semver_requirements(ecosystem, requirement)
+    info = _semver_parts(version.strip())
+    if alternatives is None or info is None:
+        return None
+    operation, installed, precision, wildcard = info
+    if operation or precision != 3 or wildcard:
+        return None
     return any(
-        ranges.contains(installed, prereleases=ecosystem == "conda") for ranges in alternatives
+        (installed[3] == 1 or installed[:3] in allowed_pre)
+        and all(_VERSION_COMPARATORS[comparison](installed, bound) for comparison, bound in terms)
+        for terms, allowed_pre in alternatives
     )
 
 
@@ -536,8 +632,93 @@ def _repository_identity(value: str) -> str:
     return urlunsplit((parts.scheme, host, parts.path.rstrip("/"), parts.query, parts.fragment))
 
 
+@dataclass(frozen=True)
+class _PurlIdentity:
+    stem: str
+    identity: str
+    qualified: bool
+    unknown_qualifiers: bool
+    version: str | None = None
+
+
+def _purl_identity(purl: str | None) -> _PurlIdentity | None:
+    if not purl:
+        return None
+    try:
+        package = PackageURL.from_string(purl)
+    except ValueError:
+        # Preserve the legacy lexical identity for PURLs the parser cannot read.
+        stem = purl.partition("@")[0].partition("?")[0].partition("#")[0].lower()
+        return _PurlIdentity(stem, stem, False, False)
+    qualifiers = {
+        name: _repository_identity(value) if name == "repository_url" else value
+        for name, value in (package.qualifiers or {}).items()
+        if name not in _PURL_METADATA_QUALIFIERS
+    }
+    stem = PackageURL(type=package.type, namespace=package.namespace, name=package.name).to_string()
+    identity = PackageURL(
+        type=package.type, namespace=package.namespace, name=package.name, qualifiers=qualifiers
+    ).to_string()
+    return _PurlIdentity(
+        stem,
+        identity,
+        bool(qualifiers),
+        bool(qualifiers.keys() - {"repository_url"}),
+        package.version,
+    )
+
+
+def _public_purl_value(value: str, *, locator: bool = False) -> bool:
+    for _ in range(4):
+        decoded = unquote(value)
+        if decoded == value:
+            if locator or "://" in value:
+                try:
+                    url = value if "://" in value or value.startswith("//") else "//" + value
+                    if urlsplit(url).username is not None:
+                        return False
+                except ValueError:
+                    return False
+            return redact_text(value) == value
+        value = decoded
+    return False
+
+
+def _display_purl(raw: str | None) -> str | None:
+    """Keep locator credentials out of the displayed PURL without changing its identity."""
+    if not raw:
+        return None
+    try:
+        package = PackageURL.from_string(raw)
+    except ValueError:
+        return raw if _public_purl_value(raw) else None
+    if not all(
+        _public_purl_value(value)
+        for value in (package.namespace, package.name, package.version, package.subpath)
+        if value
+    ):
+        return None
+    qualifiers = package.qualifiers or {}
+    public = {
+        key: value
+        for key, value in qualifiers.items()
+        if not secret_like(key, value)
+        and _public_purl_value(value, locator=key in {"repository_url", "download_url", "vcs_url"})
+    }
+    if public == qualifiers:
+        return raw
+    return PackageURL(
+        type=package.type,
+        namespace=package.namespace,
+        name=package.name,
+        version=package.version,
+        qualifiers=public,
+        subpath=package.subpath,
+    ).to_string()
+
+
 def _identity_tokens(
-    name: str, purl: str | None, eco: str, key: bytes | None, *, lookup: bool
+    name: str, purl: _PurlIdentity | None, eco: str, key: bytes | None, *, lookup: bool
 ) -> list[str]:
     scopes = (("*",) if eco == "any" else (eco, "any")) if lookup else (eco, "*")
     values = [
@@ -546,35 +727,72 @@ def _identity_tokens(
     if eco in {"pypi", "any"}:
         # Ecosystem-free records can name a PyPI package with its original separators.
         values.extend(f"pypi-name:{e}:{_norm_pkg(name)}" for e in scopes if e in {"*", "any"})
-    if purl:
-        try:
-            package = PackageURL.from_string(purl)
-        except ValueError:
-            # Keep the legacy lexical comparison for PURLs the parser cannot read.
-            stem = purl.partition("@")[0].partition("?")[0].partition("#")[0].lower()
-            identity, qualified = stem, False
-        else:
-            qualifiers = {
-                name: _repository_identity(value) if name == "repository_url" else value
-                for name, value in (package.qualifiers or {}).items()
-                if name not in _PURL_METADATA_QUALIFIERS
-            }
-            identity = PackageURL(
-                type=package.type,
-                namespace=package.namespace,
-                name=package.name,
-                qualifiers=qualifiers,
-            ).to_string()
-            stem = PackageURL(
-                type=package.type, namespace=package.namespace, name=package.name
-            ).to_string()
-            qualified = bool(qualifiers)
-        values.append("purl:" + identity)
-        # Compare a qualified package with an unspecified one, while keeping distinct
-        # explicitly qualified packages separate.
-        suffix = "qualified" if qualified != lookup else "unspecified"
-        values.append(f"purl-{suffix}:{stem}")
+    if purl is not None:
+        values.append("purl:" + purl.identity)
+        suffix = "qualified" if purl.qualified != lookup else "unspecified"
+        values.append(f"purl-{suffix}:{purl.stem}")
+        # A common package may still have different registries or qualifiers.
+        values.append("purl-base:" + purl.stem)
     return [_identity_binding(key, v) for v in values]
+
+
+_Provenance = tuple[str, str | None, bool]
+
+
+def _purl_provenance(purl: _PurlIdentity | None, key: bytes | None) -> _Provenance | None:
+    if purl is None:
+        return None
+    base = _identity_binding(key, "purl-base:" + purl.stem)
+    qualified = (
+        _identity_binding(key, "purl-provenance:" + purl.identity) if purl.qualified else None
+    )
+    return base, qualified, purl.unknown_qualifiers
+
+
+def _stored_provenance(value: object, bindings: list[str]) -> _Provenance | None:
+    if not isinstance(value, list) or len(value) != 3:
+        return None
+    base, qualified, unknown = value
+    if (
+        not isinstance(base, str)
+        or base not in bindings
+        or (
+            qualified is not None
+            and (not isinstance(qualified, str) or not re.fullmatch(r"[0-9a-f]{64}", qualified))
+        )
+        or not isinstance(unknown, bool)
+    ):
+        return None
+    return base, qualified, unknown
+
+
+def _record_provenance(buckets: dict[str, _IdentityBucket], record: _Provenance | None) -> None:
+    if record is None:
+        return
+    base, qualified, unknown = record
+    bucket = buckets.setdefault(base, _IdentityBucket())
+    if qualified is None:
+        bucket.has_unspecified_provenance = True
+    elif len(bucket.provenance_ids) < 2:
+        # Two distinct values suffice to detect disagreement with any qualifier.
+        bucket.provenance_ids.add(qualified)
+    bucket.has_unknown_qualifiers |= unknown
+
+
+def _provenance_disagrees(
+    buckets: dict[str, _IdentityBucket], candidate: _Provenance | None
+) -> bool:
+    if candidate is None:
+        return False
+    base, qualified, unknown = candidate
+    bucket = buckets.get(base)
+    if bucket is None:
+        return False
+    if qualified is None:
+        return bucket.has_unknown_qualifiers
+    return any(peer != qualified for peer in bucket.provenance_ids) or (
+        unknown and bucket.has_unspecified_provenance
+    )
 
 
 def _comp_eco(c: AnyComponent) -> str:
@@ -651,10 +869,13 @@ def import_foreign_sbom(
     matches: dict[tuple[str, frozenset[str]], tuple[str | None, bool]] = {}
 
     buckets: dict[str, _IdentityBucket] = {}
-    context = _identity_binding(key, "context-v3")
+    context = _identity_binding(key, "context-v4")
     incomplete_identity = False
     for existing in bom.components:
-        purl = existing.package_url if isinstance(existing, RegistryEntryComponent) else None
+        purl = _purl_identity(
+            existing.package_url if isinstance(existing, RegistryEntryComponent) else None
+        )
+        provenance = _purl_provenance(purl, key)
         keys_for_existing = _identity_tokens(
             existing.name, purl, _comp_eco(existing), key, lookup=False
         )
@@ -667,13 +888,16 @@ def import_foreign_sbom(
                 and all(isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) for v in stored)
             ):
                 keys_for_existing = stored
+                provenance = _stored_provenance(existing.properties.get("purl_provenance"), stored)
             elif existing.properties.get("name_hashed"):
                 # Old exports preserve only the display pseudonym. It cannot establish
                 # that a differently spelled name or versionless PURL did not match.
                 incomplete_identity = True
                 keys_for_existing = ["legacy:" + existing.name]
+                provenance = None
+        _record_provenance(buckets, provenance)
         version_ecosystem = _nested_version_ecosystem(existing)
-        comparison_version = existing.version
+        comparison_version = existing.version or (purl.version if purl is not None else None)
         if version_ecosystem == "conda" and comparison_version:
             declared = existing.properties.get("manifest_version_specifier")
             if isinstance(declared, str):
@@ -684,25 +908,13 @@ def import_foreign_sbom(
         for k in dict.fromkeys(keys_for_existing):
             b = buckets.setdefault(k, _IdentityBucket())
             if comparison_version:
-                if (
-                    version_ecosystem
-                    and _nested_requirements(version_ecosystem, comparison_version) is None
-                ):
-                    _record_bucket_item(
-                        b.incomparable_versions,
-                        comparison_version,
-                        existing.bom_ref,
-                        "extra_version_conflicts",
-                        b,
-                    )
-                else:
-                    _record_bucket_item(
-                        b.versions,
-                        (version_ecosystem, comparison_version),
-                        existing.bom_ref,
-                        "extra_version_conflicts",
-                        b,
-                    )
+                _record_bucket_item(
+                    b.versions,
+                    (version_ecosystem, comparison_version),
+                    existing.bom_ref,
+                    "extra_version_conflicts",
+                    b,
+                )
             sha = existing.hashes.get("sha256") or existing.properties.get("declared_sha256")
             if isinstance(sha, str) and sha:
                 _record_bucket_item(b.digests, sha, existing.bom_ref, "extra_digest_conflicts", b)
@@ -729,7 +941,9 @@ def import_foreign_sbom(
     prefix_map = {"machine-learning-model": "sbom:model:", "data": "sbom:data:"}
     for index, entry in enumerate(entries):
         raw_name: str = entry["name"]
-        clean_ver = _clean_str(entry["version"])[:128] if entry["version"] else None
+        purl = _purl_identity(entry["purl"])
+        raw_version = entry["version"] or (purl.version if purl is not None else None)
+        clean_ver = _clean_str(raw_version)[:128] if raw_version else None
         if shareable and clean_ver and not re.fullmatch(r"v?[0-9]+(?:\.[0-9]+){1,3}", clean_ver):
             clean_ver = None
         ref_hash = hashlib.sha256(f"{doc_sha256}:{index}".encode()).hexdigest()[:16]
@@ -759,11 +973,13 @@ def import_foreign_sbom(
         else:
             nm_hex = hashlib.sha256(raw_name.strip().encode()).hexdigest()[:16]
             shown_name, hash_mode = f"imported-{nm_hex}", "unsalted-sha256"
-        clean_purl = _clean_str(entry["purl"])[:512] if entry["purl"] else None
+        display_purl = _display_purl(entry["purl"]) if reveal_names else None
+        clean_purl = _clean_str(display_purl)[:512] if display_purl else None
         sha256_val: str | None = entry["sha256"]
-        eco = _ENTRY_ECO_MAP.get(entry["type"]) or _purl_eco(clean_purl) or "any"
-        cand_keys = _identity_tokens(raw_name, entry["purl"], eco, key, lookup=True)
-        rec_keys = _identity_tokens(raw_name, entry["purl"], eco, key, lookup=False)
+        eco = _ENTRY_ECO_MAP.get(entry["type"]) or _purl_eco(entry["purl"]) or "any"
+        provenance = _purl_provenance(purl, key)
+        cand_keys = _identity_tokens(raw_name, purl, eco, key, lookup=True)
+        rec_keys = _identity_tokens(raw_name, purl, eco, key, lookup=False)
         if incomplete_identity and not reveal_names:
             cand_keys.append("legacy:" + shown_name)
 
@@ -791,11 +1007,6 @@ def import_foreign_sbom(
         for k in cand_keys:
             bucket = buckets.setdefault(k, _IdentityBucket())
             if clean_ver:
-                if any(
-                    _versions_conflict(version, clean_ver)
-                    for version in bucket.incomparable_versions
-                ):
-                    unresolved_versions = True
                 for (p_eco, p_ver), p_ref in bucket.versions.items():
                     if (p_ref, "ver") in seen_peer:
                         continue
@@ -853,13 +1064,18 @@ def import_foreign_sbom(
                             )
                         )
 
-        elif overflow or incomplete_identity or unresolved_versions:
+        elif (
+            overflow
+            or incomplete_identity
+            or unresolved_versions
+            or _provenance_disagrees(buckets, provenance)
+        ):
             summary.unresolved_conflict_count += 1
             risks.append(
                 RiskAssessment(
                     severity=RiskSeverity.MEDIUM,
                     category="source_conflict_unresolved",
-                    detail="Prior package identities, manifest ranges or the complete set of versions and digests cannot be reconciled.",
+                    detail="Package identities, registry provenance, manifest ranges or the complete set of versions and digests cannot be reconciled.",
                     recommendation="Reconcile the complete supplier and repository component records.",
                 )
             )
@@ -874,6 +1090,7 @@ def import_foreign_sbom(
                 _record_bucket_item(
                     bucket.digests, sha256_val, comp_ref, "extra_digest_conflicts", bucket
                 )
+        _record_provenance(buckets, provenance)
 
         clm = ClaimEvidence(
             assurance=AssuranceLevel.DECLARED,
@@ -884,7 +1101,7 @@ def import_foreign_sbom(
             else f"{neutralize(bom_path.name)}#{index}",
         )
         exact_ver = is_exact_version(clean_ver) or (
-            clean_ver is None and purl_has_exact_version(clean_purl)
+            clean_ver is None and purl_has_exact_version(entry["purl"])
         )
         props: dict[str, Any] = {
             (
@@ -898,6 +1115,8 @@ def import_foreign_sbom(
             "name_hash_mode": hash_mode,
             "pinning_state": "pinned-version" if exact_ver else "unpinned",
         }
+        if provenance is not None:
+            props["purl_provenance"] = list(provenance)
         if sha256_val and not shareable:
             props["declared_sha256"] = sha256_val
         if bound_target is not None:
