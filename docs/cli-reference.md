@@ -303,10 +303,11 @@ directory above the policy are owned by root or by you.
 ## Pre-commit hooks
 
 The repository ships two [pre-commit](https://pre-commit.com) hooks. Both run
-`nexus-symbiote scan . --no-project-policy --check`: they collect the working tree and
+`nexus-symbiote scan . --no-project-policy --accept-default-exclude .git --check`. They collect the working tree and
 apply the scan gate with the built-in policy, write nothing into the tree, and ignore
 the checkout's `.nexus-symbiote.yaml`, so a change cannot relax the gate it is checked
-under. `nexus-symbiote-risk` is kept as the same gate so that existing configurations
+under. Both accept Git metadata. Other occupied default exclusions still fail the gate.
+`nexus-symbiote-risk` is kept as the same gate so that existing configurations
 keep working; configure one of the two.
 
 ```yaml

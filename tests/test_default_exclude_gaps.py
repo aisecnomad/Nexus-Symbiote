@@ -166,7 +166,7 @@ def test_git_acceptance_keeps_the_path_and_other_coverage_gaps(tmp_path: Path) -
     result = runner.invoke(main, [*scan, "-o", str(output)])
     assert result.exit_code == 1, result.output
     completeness = json.loads(output.read_text())["metadata"]["completeness"]
-    assert ".git" in completeness["exclusions"]
+    assert "accepted default exclusion: .git" in completeness["unobserved_surfaces"]
     assert completeness["surfaces_excluded"] == [GAP]
 
 

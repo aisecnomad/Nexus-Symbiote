@@ -31,7 +31,7 @@
 Nexus SymBiote generates an **Agent Bill of Materials (AgentBOM)** — an evidence-backed inventory of the MCP servers, models, instructions, retrieval sources, A2A cards, IDE settings and container images an AI agent is assembled from. It reads a project **without running it**, flags supply-chain risk, fails CI on drift, and exports to CycloneDX 1.7, SPDX 3.0.1, SARIF and VEX.
 
 ```bash
-nexus-symbiote scan ./my-agent --no-project-policy -o agentbom.json    # inventory, offline
+nexus-symbiote scan ./my-agent --no-project-policy --accept-default-exclude .git -o agentbom.json    # inventory, offline
 nexus-symbiote risk agentbom.json --no-project-policy --threshold 50   # gate on risk
 nexus-symbiote diff reviewed.json agentbom.json --fail-on-alert        # gate on drift
 ```
@@ -115,9 +115,9 @@ nexus-symbiote validate demo.aibom.json --project examples/demo-agent --no-proje
 ### Scan your own agent
 
 ```bash
-nexus-symbiote scan /path/to/agent --no-project-policy -o agentbom.json
-nexus-symbiote validate agentbom.json --project /path/to/agent --no-project-policy
-nexus-symbiote risk agentbom.json --project /path/to/agent --no-project-policy --threshold 50
+nexus-symbiote scan /path/to/agent --no-project-policy --accept-default-exclude .git -o agentbom.json
+nexus-symbiote validate agentbom.json --project /path/to/agent --no-project-policy --accept-default-exclude .git
+nexus-symbiote risk agentbom.json --project /path/to/agent --no-project-policy --accept-default-exclude .git --threshold 50
 ```
 
 `--no-project-policy` stops a `.nexus-symbiote.yaml` in a checkout that is not yours from choosing your gates. With `--project`, `validate` and `risk` collect fresh evidence and fail when the BOM disagrees with it. The [public-agent tutorial](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/tutorials/scanning-a-public-agent.md) walks through a real repository end to end.
