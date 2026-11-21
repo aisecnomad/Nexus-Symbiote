@@ -21,7 +21,13 @@ from functools import lru_cache
 from importlib.resources import files
 from typing import Any
 
-from jsonschema import Draft7Validator, Draft202012Validator, FormatChecker, ValidationError
+from jsonschema import (
+    Draft4Validator,
+    Draft7Validator,
+    Draft202012Validator,
+    FormatChecker,
+    ValidationError,
+)
 from jsonschema import validators as jsonschema_validators
 from referencing import Registry, Resource
 from referencing.exceptions import Unresolvable
@@ -93,6 +99,9 @@ def _unique_items(
 
 
 # The jsonschema stubs leave extend() unannotated.
+_LinearDraft4 = jsonschema_validators.extend(  # type: ignore[no-untyped-call]
+    Draft4Validator, {"uniqueItems": _unique_items}
+)
 _LinearDraft7 = jsonschema_validators.extend(  # type: ignore[no-untyped-call]
     Draft7Validator, {"uniqueItems": _unique_items}
 )
@@ -145,12 +154,16 @@ def _is_iri_reference(instance: object) -> bool:
     return _IRI_EXCLUDED.search(instance) is None and instance.count("#") <= 1
 
 
+def _is_uri_reference(instance: object) -> bool:
+    if not isinstance(instance, str):
+        return True
+    return instance.isascii() and _is_iri_reference(instance)
+
+
 def _is_uri(instance: object) -> bool:
     if not isinstance(instance, str):
         return True
-    return (
-        instance.isascii() and _SCHEME.match(instance) is not None and _is_iri_reference(instance)
-    )
+    return _SCHEME.match(instance) is not None and _is_uri_reference(instance)
 
 
 def _is_email(instance: object) -> bool:
@@ -163,6 +176,7 @@ FORMAT_CHECKS: dict[str, Callable[[object], bool]] = {
     "idn-email": _is_email,
     "iri-reference": _is_iri_reference,
     "uri": _is_uri,
+    "uri-reference": _is_uri_reference,
 }
 
 
@@ -174,8 +188,14 @@ def format_checker() -> FormatChecker:
     return checker
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=3)
 def _validator(fmt: str) -> Any:
+    if fmt == "sarif":
+        return _LinearDraft4(
+            _schema("sarif/sarif-schema-2.1.0.json"),
+            registry=Registry(),
+            format_checker=format_checker(),
+        )
     if fmt == "spdx":
         return _LinearDraft202012(
             dispatched_spdx_schema(_schema("spdx/spdx-json-schema-3.0.1.json")),
@@ -426,17 +446,14 @@ def _sarif_result_errors(path: str, result: Any, rules: dict[str, int]) -> list[
 
 
 def validate_sarif(document: Any) -> list[str]:
-    """Structural SARIF 2.1.0 checks for what the exporter emits and GitHub requires.
-
-    This is not the OASIS JSON schema, which is not vendored; it checks the required
-    properties, enumerations and cross-references the exporter relies on.
-    """
+    """OASIS SARIF 2.1.0 schema validation plus GitHub code scanning profile checks."""
+    schema_errors = _schema_errors(document, "sarif")
     if not isinstance(document, dict) or document.get("version") != "2.1.0":
-        return ["version: SARIF 2.1.0 is required"]
+        return ["version: SARIF 2.1.0 is required", *schema_errors]
     runs = document.get("runs")
     if not isinstance(runs, list) or not runs:
-        return ["runs: at least one run is required"]
-    errors: list[str] = []
+        return ["runs: at least one run is required", *schema_errors]
+    errors: list[str] = list(schema_errors)
     for run_index, run in enumerate(runs):
         path = f"runs/{run_index}"
         driver = run.get("tool", {}).get("driver") if isinstance(run, dict) else None

@@ -23,6 +23,7 @@ from nexus_symbiote.utils.model_formats import (
     onnx_external_data,
     template_escape_markers,
 )
+from tests.support import scaling_ratio
 
 
 def varint(value: int) -> bytes:
@@ -377,7 +378,7 @@ def test_gguf_architecture_must_be_a_plain_name():
         (b"GGUF" + (1).to_bytes(4, "little"), GGUF_UNREADABLE),
         (b"NOPE" + (3).to_bytes(4, "little"), GGUF_UNREADABLE),
         (gguf((b"k", 13, b"")), GGUF_UNREADABLE),
-        (gguf((b"k", 9, array(9, [array(9, [array(4, [])])]))), GGUF_UNREADABLE),
+        (gguf((b"k", 9, array(9, [array(9, [array(4, [])])]))), GGUF_LIMIT),
         (gguf((b"k", 8, (1 << 40).to_bytes(8, "little"))), GGUF_LIMIT),
         (gguf((b"k", 9, (8).to_bytes(4, "little") + (1 << 40).to_bytes(8, "little"))), GGUF_LIMIT),
         (
@@ -439,10 +440,35 @@ def test_gguf_budget_is_shared():
         (b"{{ ''['__cl\\\\\nass__'] }}", False),
         (b"{{ '\\N{NO SUCH NAME}\\UFFFFFFFF\\x5' }}", False),
         (b"{{ '\xff__class__' }}", False),
+        # Audit P1-M10: Python-mangled private names reach the render context.
+        (b"{{ self._TemplateReference__context }}", True),
+        (b"{{ self. _TemplateReference__context.environment }}", True),
+        (b"{{ self['_TemplateReference__context'] }}", True),
+        (b'{{ self|attr("_TemplateReference__context") }}', True),
+        (b"{{ self._TemplateReference_context }}", False),
+        (b"{{ message._content }}", False),
+        # Audit P1-M10: underscores repeated by string multiplication.
+        (b"{{ ('_'*2) ~ 'class' ~ ('_'*2) }}", True),
+        (b"{{ ''[('_' * 2) ~ 'class' ~ (2 * \"_\")] }}", True),
+        (b"{{ ''[('\\x5f'*2)~'class'~('\\x5f'*2)] }}", True),
+        (b"{{ '-' * 80 }}", False),
+        (b"{{ 'a_' * 2 }}", False),
     ],
 )
 def test_template_escape_heuristic(template, escapes):
     assert template_escape_markers(template) is escapes
+
+
+def test_template_escape_check_stays_linear_on_near_misses():
+    # Near-misses of the mangled-name and multiplication shapes, which a backtracking
+    # pattern could make quadratic.
+    unit = "._a" + "b_" * 40 + " '_" + "c" * 40 + "_' '" + "_" * 40 + " * '_ " + ". " * 8
+    text = unit.encode()
+
+    def run(scale: int) -> None:
+        assert not template_escape_markers(text * 2_000 * scale)
+
+    assert scaling_ratio(run) < 10
 
 
 def test_simple_template_marker_short_circuits_joined_literal_analysis(monkeypatch):
