@@ -45,6 +45,7 @@ def launcher(
         definition["outputSchema"] = output_schema
     script = f"""#!{sys.executable}
 import json, os, sys, time
+tool_result = {tool_result!r}
 definition = {definition!r}
 log = {str(log)!r}
 mode = {mode!r}
@@ -72,7 +73,9 @@ for line in sys.stdin:
     elif method == "tools/call":
         with open(log, "a") as f:
             f.write(json.dumps([method, int(os.readlink("/proc/self")), msg["params"]]) + "\\n")
-        result = {tool_result!r} if {tool_result is not None!r} else {{"content": [{{"type": "text", "text": "ok"}}]}}
+        result = {{"content": [{{"type": "text", "text": "ok"}}]}}
+        if tool_result is not None:
+            result = tool_result
     else:
         raise SystemExit(1)
     reply_id = msg["id"] + 1 if method == "tools/list" and mode == "wrong-id" else msg["id"]
