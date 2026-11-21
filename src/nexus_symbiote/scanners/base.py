@@ -195,7 +195,7 @@ class ScanResult:
     surfaces_scanned: list[str] = field(default_factory=list)
     surfaces_excluded: list[str] = field(default_factory=list)
     accepted_default_exclusions: list[str] = field(
-        default_factory=lambda: BoundedRecords(noun="accepted default exclusion")
+        default_factory=lambda: BoundedRecords(noun="accepted default exclusion", bind_omitted=True)
     )
     scan_failures: list[str] = field(default_factory=list)
     source_report_digest: str | None = None

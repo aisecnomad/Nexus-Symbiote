@@ -116,7 +116,14 @@ class _MessageLog:
     message, listed, counted or already listed, so it grows when the list does not.
     """
 
-    def __init__(self, messages: list[str], *, bounded: bool = True, noun: str = "failure") -> None:
+    def __init__(
+        self,
+        messages: list[str],
+        *,
+        bounded: bool = True,
+        noun: str = "failure",
+        bind_omitted: bool = False,
+    ) -> None:
         self.messages = messages
         self._seen = set(messages)
         self._synced = len(messages)
@@ -130,6 +137,7 @@ class _MessageLog:
         self._end: int | None = None
         self._first = ""
         self._counted = 0
+        self._omitted_digest = hashlib.sha256() if bind_omitted else None
 
     def _sync(self) -> None:
         if len(self.messages) < self._synced:
@@ -184,6 +192,12 @@ class _MessageLog:
         """Count ``message`` as not listed, in the line at the end that names the first."""
         self._sync()
         self._counted += 1
+        if self._omitted_digest is not None:
+            # The directory walk is sorted. Frame each path so names containing
+            # newlines or other delimiters cannot share another listing's digest.
+            data = os.fsencode(message)
+            self._omitted_digest.update(len(data).to_bytes(8, "big"))
+            self._omitted_digest.update(data)
         if self._end is None:
             self._first, self._end = message, len(self.messages)
             list.append(self.messages, message)
@@ -191,6 +205,8 @@ class _MessageLog:
             more = self._counted - 1
             noun = self._noun if more == 1 else self._noun + "s"
             line = f"{self._first} (and {more} more {noun} not listed)"
+            if self._omitted_digest is not None:
+                line += f" [sha256:{self._omitted_digest.hexdigest()}]"
             list.__setitem__(self.messages, self._end, line)
         self._synced = len(self.messages)
 
@@ -236,9 +252,11 @@ class BoundedRecords(list[str]):
     bounds and sums up the rest by reason, before that line.
     """
 
-    def __init__(self, records: Iterable[str] = (), *, noun: str = "failure") -> None:
+    def __init__(
+        self, records: Iterable[str] = (), *, noun: str = "failure", bind_omitted: bool = False
+    ) -> None:
         super().__init__()
-        self.log = _MessageLog(self, noun=noun)
+        self.log = _MessageLog(self, noun=noun, bind_omitted=bind_omitted)
         self.extend(records)
 
     def append(self, record: str, /) -> None:
