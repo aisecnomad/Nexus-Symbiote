@@ -518,14 +518,16 @@ def scan_text_block(
     # 2. TP-CMT-001: HTML comments carrying override, exfil, or secret-read directives
     search_pos = 0
     while (cmt_start := normalized.find("<!--", search_pos)) != -1:
-        # A short empty comment shares its opening hyphens with the closing delimiter.
-        cmt_end = normalized.find("-->", cmt_start + 2, cmt_start + 4 + _MAX_COMMENT_BODY_CHARS)
+        # Read a possible body when the opener and closer overlap. Markdown masking
+        # handles short empty comments separately so subsequent text stays visible.
+        body_start = cmt_start + 4
+        cmt_end = normalized.find("-->", body_start, body_start + _MAX_COMMENT_BODY_CHARS)
         stop = (
             cmt_end + 3
             if cmt_end != -1
-            else min(len(normalized), cmt_start + 4 + _MAX_COMMENT_BODY_CHARS)
+            else min(len(normalized), body_start + _MAX_COMMENT_BODY_CHARS)
         )
-        if _COMMENT_ATTACK_RE.search(normalized[cmt_start + 4 : stop]) is not None:
+        if _COMMENT_ATTACK_RE.search(normalized[body_start:stop]) is not None:
             record("TP-CMT-001", base_category, cmt_start)
         search_pos = stop
 
@@ -776,7 +778,7 @@ def _decoded_source(rel_path: str, text: str) -> tuple[object, tuple[int, int] |
                 return toml_loads(body), None
             if _flow_depth(body) <= _MAX_YAML_FLOW_DEPTH:
                 return _yaml_tree(body), None
-    except (ValueError, RecursionError, yaml.YAMLError):
+    except (ValueError, OverflowError, RecursionError, yaml.YAMLError):
         # Malformed input still needs the same escape inspection as input over a parse limit.
         return None, span
     return None, span

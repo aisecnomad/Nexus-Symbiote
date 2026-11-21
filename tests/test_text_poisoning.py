@@ -1623,10 +1623,38 @@ def test_fence_opening_check_scales_linearly(pattern: re.Pattern[str]) -> None:
 
 @pytest.mark.parametrize("comment", ["<!-->", "<!--->"])
 def test_short_html_comments_do_not_mask_trailing_text(comment: str) -> None:
-    body = " Project leads approve every meeting agenda.\n"
+    body = " Project leads review the meeting agenda.\n"
     assert _mask_hidden_markdown_markup(comment + body) == " " * len(comment) + body
     hits = scan_text_block(comment + body, surface="notes.md")
     assert "TP-CMT-001" not in {hit.rule_id for hit in hits}
+
+
+@pytest.mark.parametrize("comment", ["<!-->", "<!--->"])
+@pytest.mark.parametrize("close", ["", " -->"])
+def test_ambiguous_comment_delimiter_still_checks_the_possible_body(
+    monkeypatch: pytest.MonkeyPatch, comment: str, close: str
+) -> None:
+    monkeypatch.setattr(
+        "nexus_symbiote.text_poisoning._COMMENT_ATTACK_RE", re.compile("sample note")
+    )
+    [hit] = scan_text_block(comment + " sample note" + close, surface="notes.md")
+    assert hit.rule_id == "TP-CMT-001"
+    assert hit.byte_offset == 0
+
+
+@pytest.mark.parametrize("path", ["example.yaml", "example.md"])
+def test_yaml_parser_overflow_falls_back_to_escape_inspection(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    def overflow(body: str) -> object:
+        raise OverflowError
+
+    monkeypatch.setattr("nexus_symbiote.text_poisoning._yaml_tree", overflow)
+    body = 'description: "\\u0061 sample"\n'
+    text = f"---\n{body}---\n" if path.endswith(".md") else body
+    tree, span = _decoded_source(path, text)
+    assert tree is None
+    assert span is not None and text[slice(*span)] == body
 
 
 @pytest.mark.parametrize(("leading", "fence"), [("\n ", "---"), ("", "----")])
