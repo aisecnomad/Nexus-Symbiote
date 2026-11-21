@@ -547,7 +547,8 @@ _LATER_TARGET = re.compile(
 )
 # `run` also counts when a target later in the same sentence starts a command: at the
 # start of a line or list item, or after `:`, `;`, `&`, `|`, `then`, `command(s)`,
-# `script`, `e.g.` or `i.e.`, with whitespace, quotes, brackets and emphasis between. So
+# `script`, or an example abbreviation directly after the verb. Whitespace, quotes,
+# brackets and emphasis may intervene. So
 # `run the command `rm -rf /``, `run as root: rm -rf /`, `run make test && rm -rf /`, `run
 # i.e. bash` and `run tests, then cat .env` count, while `run them with python` does not.
 # A sentence ends at `.`, `!` or `?` before whitespace, except after a digit, as in a `1.`
@@ -558,7 +559,8 @@ _ASSIGNMENT_START = re.compile(r"(?<![\w=])[A-Za-z_]\w*+=", re.IGNORECASE)
 _SENTENCE_END = re.compile(r"(?<!\d)(?<!\b[eE]\.[gG])(?<!\b[iI]\.[eE])[.!?](?=\s)")
 _COMMAND_SKIP = frozenset(" \t`'\"([*_>-\u201c\u2018$")
 _COMMAND_DELIMITER = frozenset(":;&|\n")
-_COMMAND_WORD = re.compile(r"(?<!\w)(?:then|commands?|script|e\.g\.|i\.e\.)\Z", re.IGNORECASE)
+_COMMAND_WORD = re.compile(r"(?<!\w)(?:then|commands?|script)\Z", re.IGNORECASE)
+_EXAMPLE_WORD = re.compile(r"(?<!\w)(?:e\.g\.|i\.e\.)\Z", re.IGNORECASE)
 
 
 def _starts_command(text: str, start: int, position: int) -> bool:
@@ -579,25 +581,34 @@ def _starts_command(text: str, start: int, position: int) -> bool:
         while index > start and text[index - 1] in " \t":
             index -= 1
         return index <= start or text[index - 1] == "\n"
-    return _COMMAND_WORD.search(text, max(start, index - 8), index) is not None
+    if _COMMAND_WORD.search(text, max(start, index - 8), index) is not None:
+        return True
+    example = _EXAMPLE_WORD.search(text, max(start, index - 5), index)
+    if example is None:
+        return False
+    index = example.start()
+    while index > start and text[index - 1] in _COMMAND_SKIP:
+        index -= 1
+    return index == start
 
 
 def _run_starts_later_command(text: str) -> bool:
     verbs = iter(_RUN_VERB.finditer(text))
     verb = next(verbs, None)
-    sentence_end = 0
     while verb is not None:
-        if verb.end() >= sentence_end:
-            end = _SENTENCE_END.search(text, verb.end())
-            sentence_end = len(text) if end is None else end.start()
-        following = next(verbs, None)
-        # A path can start before the next verb and include that verb's first
-        # letter. Overlap one verb so each interval is scanned at most twice.
-        stop = sentence_end if following is None else min(sentence_end, following.end())
-        for target in _LATER_TARGET.finditer(text, verb.end(), stop):
-            if _starts_command(text, verb.end(), target.start()):
+        latest_end = verb.end()
+        end = _SENTENCE_END.search(text, latest_end)
+        sentence_end = len(text) if end is None else end.start()
+        verb = next(verbs, None)
+        # Scan complete targets once. A variable or path may itself contain a verb.
+        for target in _LATER_TARGET.finditer(text, latest_end, sentence_end):
+            while verb is not None and verb.end() <= target.start():
+                latest_end = verb.end()
+                verb = next(verbs, None)
+            if _starts_command(text, latest_end, target.start()):
                 return True
-        verb = following
+        while verb is not None and verb.start() < sentence_end:
+            verb = next(verbs, None)
     return False
 
 

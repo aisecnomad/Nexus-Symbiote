@@ -34,7 +34,7 @@ from __future__ import annotations
 import re
 from bisect import bisect_left
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
 _LINE_END = re.compile(r"\r\n|\r|\n")
@@ -150,6 +150,10 @@ class _AmbiguousError(Exception):
     """The block structure turns on what the reader does not model."""
 
 
+class _HTMLDisagreementError(_AmbiguousError):
+    """CommonMark and cmark-gfm recognize different HTML block starts."""
+
+
 @dataclass(slots=True)
 class _Block:
     kind: str
@@ -184,6 +188,21 @@ def _union(first: tuple[str, ...] | list[str], second: tuple[str, ...] | list[st
     return merged
 
 
+def _read_html_dialects(
+    lines: list[str], size: int, *, include_fence: bool = False
+) -> Iterator[_Reader]:
+    """Preserve each complete, bounded block reading when the HTML dialects differ."""
+    for ascii_html in (False, True):
+        reader = _Reader(size + _SPARE_MATCHES, include_fence=include_fence, ascii_html=ascii_html)
+        try:
+            for line in lines:
+                reader.read(line)
+            reader.finish()
+        except _AmbiguousError:
+            continue
+        yield reader
+
+
 def text_outside_code(text: str) -> list[str]:
     """The parts of ``text`` that a CommonMark reader does not read as code.
 
@@ -208,19 +227,33 @@ def _text_outside_code(text: str) -> list[str]:
         for line in lines:
             reader.read(line)
         reader.finish()
-    except _AmbiguousError:
+    except _AmbiguousError as exc:
         # A quote marker or a closing code span can put an import at the start of
         # rendered text even when the raw file has no whitespace before its @.
-        alternatives = []
+        alternatives = [text]
+        if "`@" in text:
+            across_lines = _outside_spans(text, import_boundaries_only=True)
+            if across_lines != text:
+                alternatives.append(across_lines)
+                rendered = _outside_spans(text)
+                if rendered != across_lines:
+                    alternatives.append(rendered)
         for line in lines:
             if "@" in line:
                 bare = _CONTAINER_MARKS.sub("", line, count=1)
                 if bare != line:
                     alternatives.append(bare)
-                inline = bare.replace("`", " ")
-                if inline != bare:
-                    alternatives.append(inline)
-        return [text, *alternatives]
+                if "`@" in bare:
+                    inline = _outside_spans(bare, import_boundaries_only=True)
+                    if inline != bare:
+                        alternatives.append(inline)
+                        rendered = _outside_spans(bare)
+                        if rendered != inline:
+                            alternatives.append(rendered)
+        if isinstance(exc, _HTMLDisagreementError):
+            for alternative in _read_html_dialects(lines, len(text)):
+                alternatives = _union(alternatives, alternative.parts)
+        return alternatives
     return reader.parts
 
 
@@ -234,17 +267,33 @@ def commonmark_blocks(text: str) -> list[tuple[str, str]]:
         for line in lines:
             reader.read(line)
         reader.finish()
-    except _AmbiguousError:
-        return [("paragraph", text)]
+    except _AmbiguousError as exc:
+        # Keep raw evidence as well as the block readings that expose signals inside
+        # quotes or lists. A marker before allowed-tools must not erase a grant.
+        blocks = [("paragraph", text)]
+        bare = "\n".join(_CONTAINER_MARKS.sub("", line, count=1) for line in lines)
+        if bare != "\n".join(lines):
+            blocks.append(("paragraph", bare))
+        if isinstance(exc, _HTMLDisagreementError):
+            seen = set(blocks)
+            for alternative in _read_html_dialects(lines, len(text), include_fence=True):
+                for block in alternative.blocks:
+                    if block not in seen:
+                        blocks.append(block)
+                        seen.add(block)
+        return blocks
     return reader.blocks
 
 
 class _Reader:
     """commonmark.js block parsing, keeping only what decides code from text."""
 
-    def __init__(self, matches: int, *, include_fence: bool = False) -> None:
+    def __init__(
+        self, matches: int, *, include_fence: bool = False, ascii_html: bool | None = None
+    ) -> None:
         self.matches = matches
         self.include_fence = include_fence
+        self.ascii_html = ascii_html
         self.parts: list[str] = []
         # Each paragraph, heading and HTML block as written, with its kind, in order.
         self.blocks: list[tuple[str, str]] = []
@@ -462,12 +511,15 @@ class _Reader:
                 return 2
             if char == "<":
                 lazy = not self.all_closed and not self.blank and self.stack[-1].kind == "paragraph"
-                for kind, start in enumerate(_HTML_BLOCK_STARTS, 1):
+                starts = _ASCII_HTML_BLOCK_STARTS if self.ascii_html else _HTML_BLOCK_STARTS
+                for kind, start in enumerate(starts, 1):
                     if start.match(line, at) and (
                         kind < 7 or (parent.kind != "paragraph" and not lazy)
                     ):
-                        if not _ascii_html_block_agrees(kind, line, at, parent.kind, lazy):
-                            raise _AmbiguousError
+                        if self.ascii_html is None and not _ascii_html_block_agrees(
+                            kind, line, at, parent.kind, lazy
+                        ):
+                            raise _HTMLDisagreementError
                         self._close_unmatched()
                         block = self._add_child("html")
                         block.html = kind
@@ -624,7 +676,7 @@ def _can_contain(parent: str, child: str) -> bool:
     return parent in ("document", "quote", "item") and child != "item"
 
 
-def _outside_spans(text: str) -> str:
+def _outside_spans(text: str, *, import_boundaries_only: bool = False) -> str:
     """``text`` with each code span replaced by a space, as CommonMark pairs backticks.
 
     A backslash escapes a backtick. What follows is left as written where a reader
@@ -655,8 +707,13 @@ def _outside_spans(text: str) -> str:
             if index == len(starts):
                 position = end
             else:
-                kept += [text[copied:position], " "]
-                position = copied = starts[index] + end - position
+                span_end = starts[index] + end - position
+                # For an ambiguous block, only a closing span can expose a new @.
+                # Preserve later backticks that may be part of the import filename.
+                if not import_boundaries_only or text[span_end : span_end + 1] == "@":
+                    kept.extend((text[copied:position], " "))
+                    copied = span_end
+                position = span_end
         elif char == "<":
             position += 1
             if text[position : position + 1].strip():
