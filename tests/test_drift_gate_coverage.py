@@ -181,9 +181,7 @@ def test_a_baseline_can_ignore_the_checkout_policy_like_the_candidate_scan(tmp_p
     _project(project)
     (project / ".nexus-symbiote.yaml").write_text("scan: {exclude_paths: [vendor]}\n")
     assert _baseline(project, tmp_path / "operator.json", "--no-project-policy").exit_code == 0
-    assert _baseline(
-        project, tmp_path / "checkout.json", "--accept-project-policy"
-    ).exit_code == 0
+    assert _baseline(project, tmp_path / "checkout.json", "--accept-project-policy").exit_code == 0
     _scan(project, tmp_path / "candidate.json")
     exclusions = {
         name: json.loads((tmp_path / f"{name}.json").read_text())["metadata"]["completeness"][
