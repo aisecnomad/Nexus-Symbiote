@@ -60,6 +60,8 @@ _SEMVER_RE = re.compile(
     r"(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
 )
 _SUPPORTED_RANGE_TYPES = frozenset({"ECOSYSTEM", "SEMVER"})
+# OSV's other range type. Its events are commits, which no package version compares with.
+_UNMATCHED_RANGE_TYPES = frozenset({"GIT"})
 # Steps of evaluating a range, or of filtering its fixes, that cost about what one match does.
 _CHEAP_STEPS = 32
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
@@ -370,9 +372,11 @@ class _Range:
 
     A ranked bound the ecosystem cannot parse is None, and ``unparsed`` holds the reported
     form (cut to 64 characters) of each such ``fixed``, ``last_affected`` or ``limit``.
-    ``owners`` holds, per ``fixed`` or ``last_affected``, the ``introduced`` that event order
-    puts it after ("0" for the zero one, None before the first) with the bound; once ranked,
-    only the owner positions of the unparsable ones, and ``origin`` is the position of "0".
+    ``owners`` holds each run of consecutive ``introduced`` events ("0" for the zero one; empty
+    before the first) with the ``fixed`` and ``last_affected`` events that follow it: the run
+    opens one interval, whichever of its events comes first. Once ranked, it holds only the
+    positions of the runs that own an unparsable bound (None for the empty run), and
+    ``origin`` is the position of "0".
     """
 
     zero_intro: bool
@@ -389,33 +393,45 @@ class _Range:
 
 
 def _read_range(rng: dict[str, Any]) -> _Range | None:
-    """Read one range's events; None when its type is not matched, ``ValueError`` if malformed."""
+    """Read one range's events; None for a GIT range, ``ValueError`` if it cannot be read.
+
+    A type OSV does not define, and events with no ``introduced``, are errors: either would
+    otherwise make a damaged or unsupported record read as "not affected".
+    """
     raw_type = rng.get("type")
-    if raw_type is not None and (
-        not isinstance(raw_type, str) or raw_type.upper() not in _SUPPORTED_RANGE_TYPES
-    ):
-        return None
+    if raw_type is not None:
+        kind_of_range = raw_type.upper() if isinstance(raw_type, str) else ""
+        if kind_of_range in _UNMATCHED_RANGE_TYPES:
+            return None
+        if kind_of_range not in _SUPPORTED_RANGE_TYPES:
+            raise ValueError("OSV range type is not supported")
     events = rng.get("events")
     if not isinstance(events, list):
         raise ValueError("OSV range events are not a list")
 
     has_zero_intro = False
     found: dict[str, list[str]] = {"introduced": [], "fixed": [], "last_affected": [], "limit": []}
-    owner: str | None = None
-    owners: list[tuple[str | None, str]] = []
+    group: tuple[list[str], list[str]] = ([], [])
+    groups = [group]
     for ev in events:
         kind, raw = next(iter(ev.items())) if isinstance(ev, dict) and len(ev) == 1 else ("", "")
         if kind == "introduced" and raw in ("0", 0) and not isinstance(raw, bool):
-            has_zero_intro, owner = True, "0"
+            has_zero_intro, text = True, "0"
         elif kind in found and isinstance(raw, str) and raw.strip():
-            found[kind].append(raw.strip())
-            if kind == "introduced":
-                owner = raw.strip()
-            elif kind != "limit":
-                owners.append((owner, raw.strip()))
+            text = raw.strip()
+            found[kind].append(text)
         else:
             raise ValueError("OSV range event cannot be parsed")
+        if kind == "introduced":
+            if group[1]:
+                group = ([], [])
+                groups.append(group)
+            group[0].append(text)
+        elif kind != "limit":
+            group[1].append(text)
     intros, fixed_versions, last_affected, limits = found.values()
+    if not has_zero_intro and not intros:
+        raise ValueError("OSV range has no introduced event")
     # A "*" limit bounds nothing: it is kept, ranked as None, so limits cannot exclude a
     # version, and it is never reported.
     return _Range(
@@ -424,7 +440,7 @@ def _read_range(rng: dict[str, Any]) -> _Range | None:
         tuple((fix, fix) for fix in fixed_versions),
         tuple(last_affected),
         tuple(limits),
-        tuple(owners),
+        tuple((tuple(run), tuple(bounds)) for run, bounds in groups if bounds),
     )
 
 
@@ -434,7 +450,7 @@ def _in_range(version: int, rng: _Range) -> bool:
     Every ``introduced`` parses here; a block naming one that does not is an error before
     any range of it is evaluated. An upper bound that does not parse (None) excludes no
     version, so a range that only it could have ended still matches, reported undecided;
-    while one lies in the interval of the version's ``introduced`` (by event order), no
+    while one follows the run of ``introduced`` events that holds the version's own, no
     ``fixed`` or ``last_affected`` excludes the version either. Limits exclude it only when
     it is at or above every one of them, all parsable and none "*" (OSV: a version below any
     limit is in range).
@@ -569,9 +585,12 @@ class _PackageMatcher:
                 tuple(at(text) for text in raw.last_affected),
                 tuple(at(text) for text in raw.limits),
                 owners=tuple(
-                    None if owner is None else at(owner)
-                    for owner, bound in raw.owners
-                    if keys[bound] is None
+                    {
+                        owner
+                        for run, owned in raw.owners
+                        if any(keys[bound] is None for bound in owned)
+                        for owner in ([at(intro) for intro in run] or [None])
+                    }
                 ),
                 unparsed=tuple(text[:64] for text in bounds if keys[text] is None and text != "*"),
                 origin=at("0") if raw.owners else None,
