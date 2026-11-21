@@ -21,6 +21,7 @@ the markers are inventoried by the `prompt` collector.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 from collections.abc import Callable, Iterable
@@ -279,15 +280,49 @@ _COMMAND_RUNNERS = frozenset(
 _VERSIONED_INTERPRETER = re.compile(r"(?:python|pypy|ruby|php|perl|node)[0-9.]*")
 
 
-def _runs_any_command(specifier: str) -> bool:
+_RULE_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=\S*")
+_WINDOWS_SUFFIX = re.compile(r"\.(?:exe|cmd|bat|com)\Z", re.IGNORECASE)
+
+
+_QUOTED_RULE_PROGRAM = re.compile(r"""(?:"([^"]*)"|'([^']*)')(?=\s|:|\Z)""")
+_EVAL_ARGUMENT = re.compile(r"\s+(?:-c|-e|/c|--?command)(?=\s|:|\Z)", re.IGNORECASE)
+
+
+def _rule_program(specifier: str) -> tuple[str, str]:
+    """Separate the bare program name from its Bash permission rule arguments."""
+    words = specifier.split()
+    index = 0
+    while index < len(words) - 1 and _RULE_ASSIGNMENT.fullmatch(words[index]):
+        index += 1
+    if index >= len(words):
+        return "", ""
+    command = " ".join(words[index:])
+    quoted = _QUOTED_RULE_PROGRAM.match(command)
+    if quoted:
+        path = quoted[1] if quoted[1] is not None else quoted[2]
+        program = re.split(r"[/\\]", path)[-1]
+        return _WINDOWS_SUFFIX.sub("", program), command[quoted.end() :]
+
+    # Preserve the existing recognition of an unquoted Windows path with spaces.
+    end = index + 1
+    while "\\" in words[index] and end < len(words) and "\\" in words[end]:
+        end += 1
+    path = " ".join(words[index:end]).strip("\"'")
+    program = re.split(r"[/\\]", path)[-1]
+    name, colon, pattern = program.partition(":")
+    arguments = " " + " ".join(words[end:]) if words[end:] else ""
+    return _WINDOWS_SUFFIX.sub("", name), colon + pattern + arguments
+
+
+def _runs_any_command(program: str, arguments: str) -> bool:
     """Whether a wildcard Bash rule names a known command runner or interpreter."""
-    if "*" not in specifier:
+    if "*" not in program and "*" not in arguments:
         return False
-    words = specifier.split(":", 1)[0].split()
-    if not words:
-        return False
-    program = words[0].rsplit("/", 1)[-1].lower()
-    return program in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(program) is not None
+    name = program.lower()
+    if " " in name and _EVAL_ARGUMENT.match(arguments):
+        # A locally named interpreter such as "my python.exe" with an evaluation switch.
+        name = name.rsplit(" ", 1)[-1]
+    return name in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(name) is not None
 
 
 def _broad_grants(allowed: list[str]) -> list[str]:
@@ -314,9 +349,14 @@ def _broad_grants(allowed: list[str]) -> list[str]:
             continue
         broad = specifier is None or bool(_WILDCARD_SPECIFIER.fullmatch(specifier))
         if key == "bash" and specifier is not None:
-            broad |= _runs_any_command(specifier) or bool(_SUBSHELL_SPECIFIER.fullmatch(specifier))
+            program, arguments = _rule_program(specifier)
+            broad |= _runs_any_command(program, arguments) or bool(
+                _SUBSHELL_SPECIFIER.fullmatch(program + arguments)
+            )
         if key == "webfetch" and specifier is not None:
-            broad |= specifier.replace(" ", "") in {"domain:*", "domain:"}
+            # `domain:**` and `domain:*.*` match every host, as `domain:*` does.
+            domain = specifier.replace(" ", "")
+            broad |= domain.startswith("domain:") and not domain[7:].strip("*.")
         if key == "read" and specifier is None:
             # A bare Read grant covers the working directory, as reading does by default.
             continue
@@ -762,6 +802,7 @@ _PHP_CODE_FLAG = re.compile(r"-[A-Za-z]*[eEpr]\Z")
 # Where a flag's name ends when its value is attached: `--eval="$(...)"`, `-c"$(...)"`.
 _FLAG_NAME = re.compile(r"-[^\s|&;<>=\"'$`]*")
 _POWERSHELL = re.compile(r"\b(?:powershell|pwsh)(?:\.exe)?\b", re.IGNORECASE)
+_POWERSHELL_FILE_NAMES = ("pwsh", "pwsh.exe", "powershell", "powershell.exe")
 # PowerShell takes -, en dash, em dash or horizontal bar before a parameter name. A shell
 # removes quotes and escapes before PowerShell reads the argument. The console host reads
 # `-e`, `-ec` and every prefix of `-EncodedCommand` as that parameter
@@ -1573,22 +1614,58 @@ def _file_keys(word: str) -> set[str]:
     }
 
 
+# curl's short options that take a value: in a cluster such as `-sLo/tmp/x`, the first
+# of them takes the rest of the cluster, or the next argument.
+_CURL_VALUE_FLAGS = frozenset("AbcCdDeEFHKmoPQrTtuUwxXyYz")
+
+
 def _curl_output(word: str, args: list[str], index: int) -> tuple[str | None, int]:
     if word in {"-o", "--output"} and index + 1 < len(args):
         return _decode_word(args[index + 1], drop_ifs=True), 2
     if word.startswith("--output="):
         return word.split("=", 1)[1], 1
-    if word.startswith("-o") and not word.startswith("--") and len(word) > 2:
-        return word[2:], 1
-    if (
-        word.startswith("-")
-        and not word.startswith("--")
-        and word.endswith("o")
-        and word != "-o"
-        and index + 1 < len(args)
-    ):
-        return _decode_word(args[index + 1], drop_ifs=True), 2
+    if word.startswith("-") and not word.startswith("--"):
+        for position in range(1, len(word)):
+            flag = word[position]
+            if flag == "o":
+                if position + 1 < len(word):
+                    return word[position + 1 :], 1
+                if index + 1 < len(args):
+                    return _decode_word(args[index + 1], drop_ifs=True), 2
+                return None, 1
+            if flag in _CURL_VALUE_FLAGS:
+                break
+        # The released reading, kept so no form is rated lower: a cluster that ends in `o`
+        # names its output in the next argument.
+        if word.endswith("o") and index + 1 < len(args):
+            return _decode_word(args[index + 1], drop_ifs=True), 2
     return None, 1
+
+
+def _curl_remote_name(word: str) -> bool:
+    """Whether a curl argument saves under the URL's own file name: `-O`, `-LO`."""
+    if word in {"--remote-name", "--remote-name-all"}:
+        return True
+    if not word.startswith("-") or word.startswith("--"):
+        return False
+    for flag in word[1:]:
+        if flag == "O":
+            return True
+        if flag in _CURL_VALUE_FLAGS:
+            return False
+    return False
+
+
+def _url_file_names(url: str, default: str | None) -> set[str]:
+    """The names curl `-O` or wget without `-O` save a URL's download under.
+
+    The last path segment, with and without its query; wget names an empty one `default`.
+    """
+    rest = url.split("://", 1)[-1]
+    _authority, slash, path = rest.partition("/")
+    with_query = path.split("#", 1)[0].rsplit("/", 1)[-1] if slash else ""
+    names = {name for name in (with_query, with_query.split("?", 1)[0]) if name}
+    return names or ({default} if default else set())
 
 
 def _wget_output(word: str, args: list[str], index: int) -> tuple[str | None, int]:
@@ -1640,12 +1717,24 @@ def _saved_names(segment: str) -> tuple[set[str], set[str]]:
     words = _shell_words(segment)
     saved: set[str] = set()
     tool: str | None = None
+    # One downloader's URLs, and whether it names its output or saves under the URL's name.
+    urls: list[str] = []
+    named = remote = False
     cursor = 0
+
+    def url_names() -> None:
+        if (tool == "wget" and not named) or (tool == "curl" and remote):
+            for url in urls[:64]:
+                for name in _url_file_names(url, "index.html" if tool == "wget" else None):
+                    saved.update(_file_keys(name))
+
     while cursor < len(words) and len(saved) < 64:
         names = _name_variants(words[cursor])
         detected = _downloader_name(names)
         if detected is not None:
+            url_names()
             tool = detected
+            urls, named, remote = [], False, False
             cursor += 1
             continue
         if tool is None:
@@ -1654,13 +1743,18 @@ def _saved_names(segment: str) -> tuple[set[str], set[str]]:
         word = _decode_word(words[cursor], drop_ifs=True)
         if tool == "curl":
             found, step = _curl_output(word, words, cursor)
+            remote = remote or _curl_remote_name(word)
         elif tool == "wget":
             found, step = _wget_output(word, words, cursor)
         else:
             found, step = _iwr_output(word, words, cursor)
         if found:
+            named = True
             saved.update(_file_keys(found))
+        elif step == 1 and ("://" in word or _HOST_PATH.match(word)):
+            urls.append(word)
         cursor += step
+    url_names()
     redirected: set[str] = set()
     if tool is not None or _segment_fetches(segment):
         for redirection in _OUTPUT_REDIRECTION.finditer(segment):
@@ -2178,11 +2272,12 @@ def _substitution_at(command: str, index: int, interpreter: str | None = None) -
 
 
 def _substitution_exec(pipelines: list[list[str]]) -> bool:
-    """Whether a shell, `eval`, `source` or a bare substitution runs a download."""
-    for segments in pipelines:
-        if not segments:
-            continue
-        segment = segments[0]
+    """Whether a shell, `eval`, `source` or a bare substitution runs a download.
+
+    Every segment of a pipeline counts: in `true | bash -c "$(curl ...)"` the shell's
+    script is the download whatever is piped to it.
+    """
+    for segment in (segment for segments in pipelines for segment in segments):
         stripped = segment.lstrip(" \t")
         if _opens_substitution(stripped, 0) and _substitution_downloads(stripped, 0):
             return True
@@ -2265,15 +2360,19 @@ def _encoded_segment(segment: str) -> bool:
     are kept. Only a plain argument can end the parameters: after one that the shell may
     rewrite while they are read, every later encoded flag in the segment counts.
     """
-    first = _POWERSHELL.search(segment)
-    if first is None:
+    dynamic = _computed_powershell(segment)
+    if (
+        dynamic is None
+        and _POWERSHELL.search(segment) is None
+        and _POWERSHELL.search(_decode_word(segment, drop_ifs=True)) is None
+    ):
         return False
     # parameter: the next argument is read as a parameter, or else as the script or
     # command. value: the next argument may instead be the previous parameter's value.
     # script: the next argument may be -File's script, and `-` continues the parameters.
     # Nothing before the first PowerShell name can be its parameter.
     parameter = value = script = False
-    for argument in _ARGUMENT.finditer(segment, first.start()):
+    for argument in _ARGUMENT.finditer(segment):
         word = argument.group()
         plain = _PLAIN.fullmatch(word) is not None
         if parameter or value or script:
@@ -2285,7 +2384,7 @@ def _encoded_segment(segment: str) -> bool:
                 return True
             if not plain and (parameter or value or not _script_path(word)):
                 return _ENCODED_COMMAND.search(segment, argument.end()) is not None
-        if _powershell_name(word, plain):
+        if _powershell_name(word, plain) or argument.start() == dynamic:
             parameter, value, script = True, False, False
             continue
         name = _parameter_name(word) if plain else None
@@ -2322,7 +2421,40 @@ def _powershell_name(token: str, plain: bool) -> bool:
     The shell may rewrite any other token, so PowerShell's name anywhere in it counts.
     """
     start = max(token.rfind("/"), token.rfind("\\")) + 1 if plain else 0
-    return _POWERSHELL.search(token, start) is not None
+    if _POWERSHELL.search(token, start) is not None:
+        return True
+    # The shell removes quotes and escapes first, so `p'w'sh` and `p\\wsh` run pwsh.
+    decoded = _decode_word(token, drop_ifs=True)
+    start = decoded.rfind("/") + 1 if plain else 0
+    return decoded != token and _POWERSHELL.search(decoded, start) is not None
+
+
+def _computed_powershell(segment: str) -> int | None:
+    """Offset of the command word when the shell computes a name that may be PowerShell.
+
+    `$p` or `/usr/bin/pw?h` in command position runs whatever the variable or glob names,
+    so an encoded-command flag after it is rated as PowerShell's, failing closed.
+    """
+    spans = _shell_word_spans(segment)
+    words = [segment[start:end] for start, end in spans]
+    skip = 0
+    while skip < len(words) and _assignment(_decode_word(words[skip], drop_ifs=True)):
+        skip += 1
+    index = _executable_index(words[skip:])
+    if index is None:
+        return None
+    word = words[skip + index]
+    pattern = _EXPANSION.sub("*", re.split(r"[/\\]", word)[-1])
+    if not any(char in pattern for char in "*?["):
+        return None
+    pattern = re.sub(r"\*+", "*", _decode_word(pattern, drop_ifs=True).lower())
+    # A longer pattern is mostly bracket expressions; it is not matched, so as not to
+    # compile hostile globs, and is read as PowerShell.
+    if len(pattern) > 64 or any(
+        fnmatch.fnmatchcase(name, pattern) for name in _POWERSHELL_FILE_NAMES
+    ):
+        return spans[skip + index][0]
+    return None
 
 
 def _parameter_name(token: str) -> str | None:
@@ -2546,6 +2678,45 @@ def _starting_mode_risk(ide_type: str, mode: str | None) -> RiskAssessment | Non
     return None
 
 
+def _overridden(files: list[str]) -> str:
+    """Attribution for a finding a file declares and a later settings file overrides.
+
+    The committed file's declaration still holds wherever the later file, such as an
+    uncommitted settings.local.json, is absent, so the override never drops the finding.
+    """
+    return (
+        f" Declared in {_series([repr(name) for name in files])}; the effective merged value "
+        "differs because a later settings file overrides it."
+    )
+
+
+def _layered_mode_risk(
+    risk: RiskAssessment | None,
+    documents: dict[str, dict[str, Any]],
+    effective: str | None,
+    base: str,
+) -> RiskAssessment | None:
+    """The worse of the effective starting mode's finding and each settings file's own."""
+    for name in CLAUDE_SETTINGS:
+        relative = f"{base}/{name}" if base else name
+        permissions = documents.get(relative, {}).get("permissions")
+        declared = permissions.get("defaultMode") if isinstance(permissions, dict) else None
+        if not isinstance(declared, str) or declared == effective:
+            continue
+        candidate = _starting_mode_risk("claude-code", declared)
+        current = risk.severity if risk is not None else None
+        if candidate is None or _worse(current, candidate.severity) == current:
+            continue
+        risk = candidate.model_copy(
+            update={
+                "detail": candidate.detail
+                + f" Declared in '{relative}'; the effective merged starting mode is "
+                f"'{effective or 'default'}'."
+            }
+        )
+    return risk
+
+
 class IDEAgentScanner(Scanner):
     name = "ide_agents"
 
@@ -2655,6 +2826,8 @@ class IDEAgentScanner(Scanner):
                 ),
             )
         starting_mode = None if toml_mode else _starting_mode_risk(ide_type, mode)
+        if ide_type == "claude-code":
+            starting_mode = _layered_mode_risk(starting_mode, documents, mode, base)
         if starting_mode is not None:
             risks.insert(0, starting_mode)
         layered = (
@@ -2766,11 +2939,13 @@ class IDEAgentScanner(Scanner):
         permissions across trust, user or managed policy, flags or product versions.
         """
         merged: dict[str, Any] = {}
+        layers: dict[str, dict[str, Any]] = {}
         for relative in (f"{base}/{name}" if base else name for name in CLAUDE_SETTINGS):
             data = self._read_mapping(Path(relative), result)
             if data is None:
                 continue
             documents[relative] = data
+            layers[relative] = data
             hooks = _declared_hooks(data.get("hooks"))
             if hooks:
                 properties.setdefault("declared_hooks", {})[relative] = hooks
@@ -2916,13 +3091,34 @@ class IDEAgentScanner(Scanner):
         )
         if environment_risk is not None:
             risks.append(environment_risk)
-        helpers = [key for key in _CREDENTIAL_HELPER_KEYS if merged.get(key) is not None]
+        # Findings come from each file's own declarations; `declared` is the merged value.
+        helpers = [
+            key
+            for key in _CREDENTIAL_HELPER_KEYS
+            if any(data.get(key) is not None for data in layers.values())
+        ]
         commands = "a command that runs" if len(helpers) == 1 else "commands that run"
+        approving = [
+            relative
+            for relative, data in layers.items()
+            if data.get("enableAllProjectMcpServers") is True
+        ]
+        approval_note = (
+            _overridden(approving)
+            if approving and not declared["enable_all_project_mcp_servers"]
+            else ""
+        )
+        overridden_helpers = [
+            relative
+            for relative, data in layers.items()
+            if any(data.get(key) is not None and merged.get(key) is None for key in helpers)
+        ]
+        helper_note = _overridden(overridden_helpers) if overridden_helpers else ""
         for category, severity, present, detail in (
             (
                 "mcp_auto_approval",
                 RiskSeverity.MEDIUM,
-                declared["enable_all_project_mcp_servers"],
+                bool(approving),
                 "approves every MCP server in the project's .mcp.json without a prompt",
             ),
             (
@@ -2947,11 +3143,12 @@ class IDEAgentScanner(Scanner):
             ),
         ):
             if present:
+                note = {"mcp_auto_approval": approval_note, "credential_helper": helper_note}
                 risks.append(
                     RiskAssessment(
                         severity=severity,
                         category=category,
-                        detail=f"IDE agent 'claude-code' {detail}.",
+                        detail=f"IDE agent 'claude-code' {detail}.{note.get(category, '')}",
                         recommendation="Review this setting and approve its exact value.",
                     )
                 )
