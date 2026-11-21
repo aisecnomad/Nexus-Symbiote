@@ -6,7 +6,8 @@ the default collection limits, and must leave no operating mode enforced and no 
 Python-level connects, datagrams and name resolution to anywhere but loopback fail the test
 (subprocesses and native code are not covered). A
 test that runs longer than ``test_timeout`` seconds fails with its traceback. Every skip is listed with its reason; with ``--strict-skips`` (CI) a skip
-for any reason other than the host's file system, or, outside CI, a missing pip, fails the run.
+for any reason other than the host's file system, a Linux interface on another host, or, outside
+CI, a missing pip, fails the run.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import os
 import re
 import signal
 import socket
+import sys
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
@@ -86,15 +88,31 @@ EXPECTED_SKIP_REASONS = (
 LOCAL_SKIP_REASONS = (
     re.compile(r"\Apip is not importable here; CI, which installs with pip, runs this test\Z"),
 )
+# Expected only off Linux: these tests drive /proc, prctl, pidfds or clone(CLONE_PARENT),
+# which macOS lacks. A Linux run that skips one fails. Pinned execution elsewhere refuses
+# the namespace launch these mechanisms serve, which runs on every platform.
+NON_LINUX_SKIP_REASONS = (
+    re.compile(
+        r"\A(?:the subreaper wrapper|clone\(CLONE_PARENT\)|the /proc descendant sweep"
+        r"|the PID namespace teardown) is Linux-only\Z"
+    ),
+    re.compile(r"\Ano (?:/proc/self/cwd|/dev/fd link into /proc)\Z"),
+)
 DEFAULT_TIMEOUT_SECONDS = 300
 
 
 @pytest.fixture
-def nonisolated_pinned_fixtures() -> Iterator[None]:
-    """Protocol fixtures opt out explicitly; containment has separate default-denial tests."""
-    from nexus_symbiote.live.pinned_process import isolation_off
+def nonisolated_pinned_fixtures(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Protocol fixtures opt out explicitly; containment has separate default-denial tests.
 
-    with isolation_off():
+    Off Linux the product refuses the opt-out. These tests check the MCP exchange, not
+    containment, so they lift that refusal to keep running there; the refusal itself is
+    tested without this fixture, in tests/test_pinned_process_isolation.py.
+    """
+    from nexus_symbiote.live import pinned_process
+
+    monkeypatch.setattr(pinned_process, "opt_out_supported", lambda: True)
+    with pinned_process.isolation_off():
         yield
 
 
@@ -128,8 +146,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--strict-skips",
         action="store_true",
         help=(
-            "fail the run when a test is skipped for a reason other than the host file system "
-            "(or, outside CI, a missing pip)"
+            "fail the run when a test is skipped for a reason other than the host file system, "
+            "a Linux interface on another host, or, outside CI, a missing pip"
         ),
     )
 
@@ -177,6 +195,8 @@ class SkipAccounting:
 
     def unexpected(self) -> list[tuple[str, str]]:
         expected = EXPECTED_SKIP_REASONS + (() if os.environ.get("CI") else LOCAL_SKIP_REASONS)
+        if not sys.platform.startswith("linux"):
+            expected += NON_LINUX_SKIP_REASONS
         return [
             (nodeid, reason)
             for nodeid, reason in self.skips

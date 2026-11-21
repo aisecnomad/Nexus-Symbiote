@@ -812,3 +812,40 @@ def test_default_signed_operator_policy_empty_tool_version_step_summary_and_exit
         ],
     )
     assert bad_att.exit_code == EXIT_GATE_FAILED, bad_att.output
+
+
+@pytest.mark.parametrize("git_root", [False, True])
+def test_policy_key_cannot_come_from_explicit_target(tmp_path, monkeypatch, git_root):
+    from nexus_symbiote.operator_policy import OperatorPolicyError, _verify_policy_attestation
+
+    project = tmp_path / "project"
+    project.mkdir()
+    if git_root:
+        (project / ".git").mkdir()
+    target = project / "subproject" if git_root else project
+    target.mkdir(exist_ok=True)
+    independent = tmp_path / "operator"
+    independent.mkdir()
+    monkeypatch.chdir(independent)
+    envelope = independent / "policy.dsse"
+    envelope.write_bytes(b"{}")
+    key = project / "trust.pem"
+    key.write_bytes(b"fixture")
+    with pytest.raises(OperatorPolicyError, match="outside the target checkout"):
+        _verify_policy_attestation(b"{}", independent / "policy.yaml", target, envelope, (key,))
+
+
+def test_step_summary_preserves_hard_linked_file(tmp_path):
+    import os
+
+    import click
+
+    from nexus_symbiote.operator_policy import append_step_summary
+
+    original = tmp_path / "original"
+    original.write_bytes(b"existing")
+    summary = tmp_path / "summary"
+    os.link(original, summary)
+    with pytest.raises(click.ClickException):
+        append_step_summary(summary, "report")
+    assert original.read_bytes() == b"existing"
