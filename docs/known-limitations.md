@@ -1956,6 +1956,7 @@ is a failure; everything below is neither a gap nor a failure.
   or `--accept-project-policy` accepts it explicitly; interactive runs only warn. There
   is no operator-owned policy file. See
   [what `policy_weakened` reports](policy-reference.md#what-policy_weakened-reports).
+  `export-policy` and `crosswalk --include-evidence-pack` refuse such a policy with `--project`, in CI or not.
 - **A suppressed chat template finding is bound to the model file.** A suppression
   names the [fingerprint](policy-reference.md#suppressions) of the finding, which
   binds the model's own content digest, the `sha256` of its file, not the chat

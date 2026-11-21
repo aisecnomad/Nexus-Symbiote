@@ -17,6 +17,7 @@ A project policy selects collectors and sets the thresholds of the `scan`, `vali
 | --- | --- | --- |
 | `scan PATH` | `PATH/.nexus-symbiote.yaml` or `PATH/.nexus-symbiote.yml` | `--no-project-policy` |
 | `validate`, `risk` | the directory named with `--project`; without `--project`, the built-in policy | `--no-project-policy` |
+| `export-policy`, `crosswalk --include-evidence-pack` | the directory named with `--project`, for `validate.require_discovery_signature` and `validate.minimum_assurance_level`; a malformed policy, or one that weakens a gate, such as by excluding a path, is refused in every run, not only in CI | |
 | `baseline` | the scanned directory for collection, but the staged inventory is re-gated with the built-in risk policy | |
 
 A policy file in a parent directory, or beside an inventory file, is never applied; `validate` and `risk` name such a file on stderr when they did not apply it. When both `.nexus-symbiote.yaml` and `.nexus-symbiote.yml` exist, a command that reads the project policy refuses to run until one is removed, because either could silently shadow the other; `init` refuses too, and `init --force` overwrites the one file that exists. A symbolic link, a non-regular file or a file over 1 MiB is refused.

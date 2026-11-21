@@ -172,9 +172,12 @@ def corroborate_against_project(
     project: Path,
     signature_policy: Path | None = None,
 ) -> tuple[str, frozenset[str], frozenset[str]]:
-    """Reconcile and integrity-check ``bom`` against ``project`` under built-in gates."""
+    """Reconcile ``bom`` with ``project`` under its policy, refused if it weakens a gate."""
+    from nexus_symbiote.policy import Policy, PolicyError, load_policy, weakened_settings
     from nexus_symbiote.validators.completeness import (
         CompletenessValidator,
+        assurance_problems,
+        carries_discovery_evidence,
         discovery_producer_check,
         discovery_signature_required,
     )
@@ -183,22 +186,32 @@ def corroborate_against_project(
     root = resolve_project_root(project, label="--project")
     require_binding_key()
     sig_policies = load_signer_policies(signature_policy, root)
+    try:
+        policy = load_policy(root) or Policy()
+    except PolicyError as exc:
+        raise click.ClickException(neutralize(exc)) from None
+    if any(not entry.startswith("output.") for entry in weakened_settings(policy)):
+        raise click.ClickException("--project refuses a project policy that weakens a gate")
+    excludes, minimum = policy.scan.exclude_paths, policy.validation.minimum_assurance_level
+    required = policy.validation.require_discovery_signature or carries_discovery_evidence(bom)
     c_report = CompletenessValidator().validate_against_project(
-        bom, root, signature_policies=sig_policies
+        bom, root, exclude_paths=excludes, signature_policies=sig_policies
     )
     if not c_report.is_complete:
         raise click.ClickException("inventory failed completeness reconciliation against --project")
     i_report = IntegrityValidator(signature_policies=sig_policies).validate(
-        bom, root, bound_imports=c_report.bound_imports
+        bom, root, exclude_paths=excludes, bound_imports=c_report.bound_imports
     )
     if i_report.status == "fail" or bool(i_report.omitted_severities & _UNVERIFIED_SEVERITIES):
         raise click.ClickException("inventory failed integrity validation against --project")
-    if discovery_signature_required(False, root, sig_policies):
-        _status, problems = discovery_producer_check(bom, root, sig_policies)
+    if discovery_signature_required(required, root, sig_policies):
+        _, problems = discovery_producer_check(bom, root, sig_policies, exclude_paths=excludes)
         if problems:
             raise click.ClickException(
                 "inventory failed discovery producer verification against --project"
             )
+    if assurance_problems(bom, minimum, imported_claims=c_report.bound_imports):
+        raise click.ClickException("inventory failed validate.minimum_assurance_level")
     unverified_refs = frozenset(
         issue.component_ref for issue in i_report.issues if issue.severity in _UNVERIFIED_SEVERITIES
     )
