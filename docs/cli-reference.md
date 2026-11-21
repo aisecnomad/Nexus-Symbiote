@@ -634,7 +634,7 @@ nexus-symbiote export-policy [OPTIONS] INVENTORY
 | `--trusted-key` `FILE` | Trusted Ed25519 public key PEM for `--require-attestation` (repeatable). |
 | `-o`, `--output` `PATH` | Write the policy to this file instead of standard output. |
 
-By default (`--verified-only`), `export-policy` refuses uncorroborated inventories unless `--project` reconciles and integrity-validates `INVENTORY` against the project or `--require-attestation` with `--trusted-key` verifies a reviewed DSSE attestation over `INVENTORY`. Pass `--include-declared` only when exporting uncorroborated declarations intentionally. With `--require-attestation` and no `--project`, tool and MCP server permits rest on the reviewer's attestation of the inventory's own claims, and no model is permitted: only `--project` with `--signature-policy` corroborates a model's digest and signature.
+By default (`--verified-only`), `export-policy` refuses uncorroborated inventories unless `--project` reconciles and integrity-validates `INVENTORY` against the project or `--require-attestation` with `--trusted-key` verifies a reviewed DSSE attestation over `INVENTORY`. Pass `--include-declared` only when exporting uncorroborated declarations intentionally. With `--require-attestation` and no `--project`, tool permits rely on the reviewer's attestation. The JSON bundle also lists attested MCP servers in `allowed_mcp_servers`. Cedar and Rego emit tool and model decisions. A model permit requires `--project` and `--signature-policy` to corroborate the model's digest and signature.
 
 ### `graph`
 
