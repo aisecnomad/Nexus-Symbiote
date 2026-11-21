@@ -1623,8 +1623,10 @@ def test_fence_opening_check_scales_linearly(pattern: re.Pattern[str]) -> None:
 
 @pytest.mark.parametrize("comment", ["<!-->", "<!--->"])
 def test_short_html_comments_do_not_mask_trailing_text(comment: str) -> None:
-    body = " Visible text.\n"
+    body = " Project leads approve every meeting agenda.\n"
     assert _mask_hidden_markdown_markup(comment + body) == " " * len(comment) + body
+    hits = scan_text_block(comment + body, surface="notes.md")
+    assert "TP-CMT-001" not in {hit.rule_id for hit in hits}
 
 
 @pytest.mark.parametrize(("leading", "fence"), [("\n ", "---"), ("", "----")])

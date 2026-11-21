@@ -518,7 +518,8 @@ def scan_text_block(
     # 2. TP-CMT-001: HTML comments carrying override, exfil, or secret-read directives
     search_pos = 0
     while (cmt_start := normalized.find("<!--", search_pos)) != -1:
-        cmt_end = normalized.find("-->", cmt_start + 4, cmt_start + 4 + _MAX_COMMENT_BODY_CHARS)
+        # A short empty comment shares its opening hyphens with the closing delimiter.
+        cmt_end = normalized.find("-->", cmt_start + 2, cmt_start + 4 + _MAX_COMMENT_BODY_CHARS)
         stop = (
             cmt_end + 3
             if cmt_end != -1
