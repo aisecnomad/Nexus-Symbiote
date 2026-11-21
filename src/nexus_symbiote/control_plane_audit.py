@@ -27,6 +27,7 @@ from nexus_symbiote.core.models import (
 )
 from nexus_symbiote.policy import PolicyError, parse_yaml_mapping
 from nexus_symbiote.scanners.credential_files import credential_gap, credential_shaped
+from nexus_symbiote.scanners.mcp_launch import npm_spec
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.jsonc import strip_jsonc
 from nexus_symbiote.utils.secrets import redact_text
@@ -69,6 +70,9 @@ RUNTIME_LAUNCHERS = _words("node python python3 sh bash zsh deno bun tsx uvx npx
 PACKAGE_RUNNERS = _words("npx uvx")
 RUNNER_VALUE_OPTIONS = _words(
     "-p --package --from --with --with-editable --with-requirements --python"
+)
+SCRIPT_VALUE_OPTIONS = _words(
+    "--tsconfig --env-file -r --require --import --loader -X -W --output-dir"
 )
 FS_WRITE_TOOLS = _words("write_file edit_file move_file")
 INSTALLED_BIN_DIRS = _tup("node_modules/.bin/ .venv/bin/ venv/bin/")
@@ -205,28 +209,40 @@ def _normalize_rel_candidate(token: str, *, allow_any_file: bool = False) -> str
     return None
 
 
-def _package_runner_target(operands: list[str], project_paths: frozenset[str]) -> str | None:
-    """Bind the script a package runner (npx, uvx) executes, never its package or option values."""
-    package_seen = after_option = False
-    option = ""
+def _package_runner_target(
+    runner: str,
+    operands: list[str],
+    project_paths: frozenset[str],
+    files: ConfinedCollection | None,
+) -> str | None:
+    """Distinguish a package runner's script from known value-taking options."""
+    package_seen = pending_value = False
+    parse_options = True
     fallback: str | None = None
     for arg in operands:
-        if arg in {"-c", "-e", "-m"}:
-            return None
-        if arg.startswith("-"):
-            after_option, option = "=" not in arg, arg
+        if pending_value:
+            pending_value = False
             continue
-        follows_option, after_option = after_option, False
-        if not package_seen and follows_option and option in RUNNER_VALUE_OPTIONS:
+        if parse_options and arg == "--":
+            parse_options = False
+            continue
+        if parse_options and arg in {"-c", "-e", "-m"}:
+            return None
+        if parse_options and arg.startswith("-"):
+            value_options = SCRIPT_VALUE_OPTIONS if package_seen else RUNNER_VALUE_OPTIONS
+            pending_value = arg in value_options
             continue
         local = _normalize_rel_candidate(arg, allow_any_file=True)
         path = posixpath.normpath(local) if local is not None else None
+        if path is not None and (path.startswith("~") or "$" in path):
+            path = None
         explicit = arg.startswith("./") or bool(_PROJECT_DIR_RE.match(arg))
         scripted = arg.endswith(SCRIPT_SUFFIXES)
         path_like = explicit or "/" in arg or scripted
         listed = path in project_paths
         if not package_seen:
             package_seen = True
+            parse_options = True
             # The first operand names the package. A bare name is resolved from the
             # registry, so a project file of that name (a decoy `tsx`) is not the script.
             if (
@@ -236,19 +252,29 @@ def _package_runner_target(operands: list[str], project_paths: frozenset[str]) -
             ):
                 return path
             continue
-        if path is None or (arg.startswith("@") and not listed) or f"{path}/" in project_paths:
+        if path is None or f"{path}/" in project_paths:
             continue
-        if not follows_option and path_like:
+        if (
+            runner == "npx"
+            and arg.startswith("@")
+            and not (listed or scripted)
+            and npm_spec(arg).ecosystem == "npm"
+        ):
+            continue
+        if path_like:
+            if files is not None and files.is_directory(path):
+                continue
             return path
-        # An option's value (--tsconfig tsconfig.json) is configuration. A bare listed
-        # name or a script-suffixed option value is used only when nothing path-like follows.
-        if fallback is None and ((not follows_option and listed) or (follows_option and scripted)):
+        if fallback is None and listed:
             fallback = path
     return fallback
 
 
 def _extract_local_script_target(
-    tokens: list[str], project_paths: frozenset[str] = frozenset()
+    tokens: list[str],
+    project_paths: frozenset[str] = frozenset(),
+    *,
+    files: ConfinedCollection | None = None,
 ) -> str | None:
     if not tokens:
         return None
@@ -258,7 +284,7 @@ def _extract_local_script_target(
     if direct is not None and base not in RUNTIME_LAUNCHERS:
         return direct
     if base in PACKAGE_RUNNERS:
-        return _package_runner_target(tokens[1:], project_paths)
+        return _package_runner_target(base, tokens[1:], project_paths, files)
     if base in RUNTIME_LAUNCHERS:
         for arg in tokens[1:]:
             if arg in {"-c", "-e", "-m"}:
@@ -528,7 +554,9 @@ def _inspect_hooks_and_preambles(
                     command_digest=_sha256_hex(cmd_str.encode()),
                 )
             )
-            target = _extract_local_script_target(_tokenize_command(cmd_str), project_paths)
+            target = _extract_local_script_target(
+                _tokenize_command(cmd_str), project_paths, files=files
+            )
             if target is not None:
                 rec = _bind_script_target(
                     files,
@@ -571,7 +599,9 @@ def _inspect_hooks_and_preambles(
                 skill_path,
                 skill_ref,
             )
-            target = _extract_local_script_target(_tokenize_command(cmd_body), project_paths)
+            target = _extract_local_script_target(
+                _tokenize_command(cmd_body), project_paths, files=files
+            )
             if target is not None:
                 _bind_script_target(
                     files,
@@ -732,7 +762,7 @@ def _inspect_mcp_launchers_and_bridges(
                 )
                 continue
 
-            target = _extract_local_script_target(tokens, project_paths)
+            target = _extract_local_script_target(tokens, project_paths, files=files)
             props = {"registry_origin": reg_origin} if reg_origin else {}
             if target is not None:
                 rec = _bind_script_target(
