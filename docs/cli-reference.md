@@ -1224,6 +1224,7 @@ nexus-symbiote vex [OPTIONS] AIBOM_PATH
 | Option | Description |
 |---|---|
 | `-o`, `--output` `PATH` | Write the VEX document to this file instead of standard output. |
+| `--allow-partial-advisories` | Export incomplete advisory coverage with its checked, skipped, excluded and error counts and file digest. The report’s coverage limits suppressive advisory decisions. |
 | `--decisions` `PATH` | Operator-owned VEX decisions YAML/JSON stored outside the scanned project and enclosing git trees; expired decisions revert to `in_triage` against wall-clock UTC time. |
 | `--project-root` `PATH` | Scanned project root used to refuse policy and trace files stored inside the checkout. |
 | `--advisories` `PATH` | Link matched advisories from a live or offline `advisories` report JSON bound to this AIBOM's SHA-256 into the VEX document. |

@@ -562,7 +562,13 @@ def register_supply_chain_commands(main: click.Group) -> None:
         help="Explicitly accept unsigned --trace-evidence without --trace-attestation.",
     )
     @click.option("--deployment-id", help="Operator-selected deployment covered by VEX decisions.")
+    @click.option(
+        "--allow-partial-advisories",
+        is_flag=True,
+        help="Include an incomplete advisory report with its coverage and counters.",
+    )
     def vex(
+        allow_partial_advisories: bool,
         aibom_path: Path,
         output: Path | None,
         decisions_path: Path | None,
@@ -628,14 +634,18 @@ def register_supply_chain_commands(main: click.Group) -> None:
                 else None
             )
             loaded_advisories = (
-                load_advisory_report(advisories_path, expected_inventory_sha256=inv_sha)[0]
+                load_advisory_report(
+                    advisories_path,
+                    expected_inventory_sha256=inv_sha,
+                    allow_partial=allow_partial_advisories,
+                )
                 if advisories_path is not None
                 else None
             )
             text = VEXGenerator(
                 decisions=loaded_decisions,
                 execution_evidence=loaded_trace,
-                advisories=loaded_advisories,
+                advisory_report=loaded_advisories,
                 inventory_sha256=inv_sha,
                 deployment_id=deployment_id,
             ).generate_json(bom)

@@ -159,6 +159,8 @@ The exporter validates its output offline against the vendored official OASIS SA
 
 ## VEX
 
+The `nexus-symbiote/vex-content/v2` serial profile identifies the complete exported VEX document. It hashes the deterministic JSON document before adding `serialNumber`, then derives a UUIDv5 in the project namespace from `nexus-symbiote/vex-content/v2:` and the prefixed SHA-256 digest. A change to a decision, evidence authentication, or advisory coverage produces a new serial. The BOM-Link continues to identify the source inventory. Consumers upgrading from the inventory-only serial should re-baseline VEX identifiers.
+
 `vex` writes a CycloneDX 1.7 document whose `vulnerabilities` are the inventory's risk findings:
 
 - Its serial number is derived from the inventory's, so it never shares the inventory's identity, and its version is the inventory's version. `metadata` names the producing tool, and the inventory's timestamp only when it records one (a scan records none unless `SOURCE_DATE_EPOCH` is set, so the document is deterministic), and an external reference of type `bom` points at the inventory with a BOM-Link (`urn:cdx:<serial>/<version>`). An inventory without a serial number gets the content-derived serial its CycloneDX export would have, so the link names that export; one whose serial number is not a `urn:uuid:` UUID gets no link. Like the CycloneDX and SPDX exports, `vex` rejects an inventory whose timestamp has no time zone, whose component references repeat, or whose dependencies name an unknown component.
