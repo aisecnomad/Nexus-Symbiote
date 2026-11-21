@@ -32,6 +32,10 @@ MAX_DEPTH = limits.DEFAULTS.depth
 MAX_TOTAL_BYTES = limits.DEFAULTS.total_bytes
 MAX_HASH_BYTES = limits.DEFAULTS.model_bytes
 DEFAULT_EXCLUDES = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv"})
+DEFAULT_EXCLUDE_REASON = "default collection exclude; not collected"
+AGENT_DEFAULT_EXCLUDE_REASON = (
+    "default-excluded name inside an agent configuration directory; not collected"
+)
 # A walk, a search of every source file, or a collector reading file after file can
 # fail once per entry. Past these bounds a collection, and a collector's own list of
 # failures or gaps, counts further ones instead of listing them, so a tree that
@@ -327,11 +331,7 @@ def _default_excluded(name: str) -> bool:
 
 
 def _under_agent_configuration_directory(relative: Path) -> bool:
-    """Whether ``relative`` sits inside a directory the prompt collector walks whole.
-
-    That collector already records a coverage gap for a default-excluded name there.
-    A second generic gap from this walk would name the same path twice.
-    """
+    """Use the prompt collector's coverage reason for paths it would also report."""
     from nexus_symbiote.scanners.prompt import INSTRUCTION_DIRECTORIES, SKILL_DIRECTORIES
 
     parent = relative.parent.as_posix()
@@ -1174,9 +1174,8 @@ class ConfinedCollection:
         yielded because their name is one of ``DEFAULT_EXCLUDES``, in any spelling a
         case-insensitive file system treats as that name. A non-empty one of those
         entries is also a coverage gap, unless the collection was told to accept
-        default excludes, the entry is inside an agent configuration directory the
-        prompt collector reports itself, or ``skipped`` is set so the caller reports
-        it. An empty directory is not a gap. Every other symlink is a recorded
+        default excludes or ``skipped`` is set so the caller reports it. An empty
+        directory is not a gap. Every other symlink is a recorded
         failure. A directory whose
         ``st_dev`` differs from the root's is a mount point, recorded as excluded and
         not entered; regular files are not refused for their device alone. Past the
@@ -1256,18 +1255,18 @@ class ConfinedCollection:
                     if scope.skipped is not None and _default_excluded(name):
                         scope.skipped.append(child)
                     # A caller that collects skipped reports the entry itself.
-                    # Inside an agent configuration directory the prompt collector
-                    # reports it, including from a walk that does not collect skipped.
                     if (
                         scope.skipped is None
                         and not self._accept_default_excludes
                         and _default_excluded(name)
-                        and not _under_agent_configuration_directory(child)
                         and self._default_exclude_occupied(directory_fd, name)
                     ):
-                        self._exclusion_log.add(
-                            f"{child.as_posix()}: default collection exclude; not collected"
+                        reason = (
+                            AGENT_DEFAULT_EXCLUDE_REASON
+                            if _under_agent_configuration_directory(child)
+                            else DEFAULT_EXCLUDE_REASON
                         )
+                        self._exclusion_log.add(f"{child.as_posix()}: {reason}")
                     continue
                 metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 if (

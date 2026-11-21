@@ -104,7 +104,10 @@ def test_the_reported_skill_and_subagent_fail_the_default_gate(runner, tmp_path)
     run = runner.invoke(main, ["scan", str(project), "--no-project-policy", "-o", str(output)])
     assert run.exit_code == 1, run.output
     assert "Scan gate failed" in run.output
-    assert f"excluded: .claude/skills/venv: {GAP} (from prompt)" in run.output
+    marker = f"excluded: .claude/skills/venv: {GAP} (from "
+    matching = [line for line in run.output.splitlines() if marker in line]
+    assert len(matching) == 1
+    assert "prompt" in matching[0].split(marker, 1)[1].removesuffix(")").split(", ")
     completeness = json.loads(output.read_text(encoding="utf-8"))["metadata"]["completeness"]
     assert completeness["scanner_status"]["prompt"] == "partial"
     assert sorted(completeness["surfaces_excluded"]) == [

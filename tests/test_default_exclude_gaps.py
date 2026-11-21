@@ -10,9 +10,24 @@ from click.testing import CliRunner
 from nexus_symbiote.cli import main
 from nexus_symbiote.scanners.base import Scanner
 from nexus_symbiote.scanners.mcp import MCPScanner
+from nexus_symbiote.scanners.prompt import PromptScanner
 from nexus_symbiote.utils.confined import ConfinedCollection
 
 GAP = "node_modules: default collection exclude; not collected"
+
+
+def test_agent_tree_excludes_are_reported_even_without_the_prompt_scanner(tmp_path: Path) -> None:
+    excluded = tmp_path / ".claude" / "skills" / "node_modules"
+    excluded.mkdir(parents=True)
+    (excluded / "README.md").write_text("Fixture\n", encoding="utf-8")
+    expected = (
+        ".claude/skills/node_modules: default-excluded name inside an agent configuration "
+        "directory; not collected"
+    )
+
+    for scanner in (MCPScanner(), PromptScanner()):
+        result = scanner.scan(tmp_path)
+        assert list(result.surfaces_excluded) == [expected]
 
 
 def test_an_empty_default_exclude_is_not_a_gap(tmp_path: Path) -> None:

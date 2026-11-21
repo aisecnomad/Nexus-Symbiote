@@ -29,7 +29,13 @@ from nexus_symbiote.scanners.credential_files import credential_shaped as _crede
 from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV
 from nexus_symbiote.scanners.mcp_sources import SOURCE_SEARCH_SKIPPED
 from nexus_symbiote.scanners.source_binding import BindingError, value_binding
-from nexus_symbiote.utils.confined import CollectionError, ConfinedCollection, fold_name
+from nexus_symbiote.utils.confined import (
+    AGENT_DEFAULT_EXCLUDE_REASON,
+    DEFAULT_EXCLUDE_REASON,
+    CollectionError,
+    ConfinedCollection,
+    fold_name,
+)
 from nexus_symbiote.utils.markdown import hidden_text, text_outside_code
 from nexus_symbiote.utils.terminal import neutralize
 from nexus_symbiote.utils.toml import loads as toml_loads
@@ -1207,19 +1213,17 @@ def _report_skipped(skipped: list[Path], reported: set[Path], result: ScanResult
     collection gap for the same path, including one recorded through a directory
     symlink's target, is replaced by this one.
     """
-    generic = ": default collection exclude; not collected"
     for path in skipped:
         if path not in reported:
             reported.add(path)
-            plain = f"{path.as_posix()}{generic}"
+            plain = f"{path.as_posix()}: {DEFAULT_EXCLUDE_REASON}"
+            specific = f"{path.as_posix()}: {AGENT_DEFAULT_EXCLUDE_REASON}"
             try:
                 result.surfaces_excluded.remove(plain)
             except ValueError:
                 pass
-            result.surfaces_excluded.append(
-                f"{path.as_posix()}: default-excluded name inside an agent configuration "
-                "directory; not collected"
-            )
+            if specific not in result.surfaces_excluded:
+                result.surfaces_excluded.append(specific)
 
 
 class PromptScanner(Scanner):
