@@ -750,6 +750,14 @@ def _steering_host(path: str) -> str:
     return path.split("/", 1)[0]
 
 
+def _claude_mcp_prefix(server: str) -> str:
+    # The client replaces each non-identifier UTF-16 code unit when naming tools.
+    normalized = re.sub(
+        r"[^a-zA-Z0-9_-]", lambda match: "__" if ord(match[0]) > 0xFFFF else "_", server
+    )
+    return "mcp__" + normalized
+
+
 def _allows_mcp_server(rules: list[str], prefix: str) -> bool:
     exact = bisect_left(rules, prefix)
     if exact < len(rules) and rules[exact] == prefix:
@@ -801,7 +809,7 @@ def _inspect_steering_surfaces(
             if "filesystem" not in srv_name.lower() and "server-filesystem" not in joined:
                 continue
             host = _steering_host(cfg_path)
-            prefix = f"mcp__{srv_name}"
+            prefix = _claude_mcp_prefix(srv_name)
             # A future or custom server can publish additional write tools. Only the
             # owning client's deny of the whole server covers this open-ended surface.
             deny_covered = host == "claude" and bool(claude_denies & {prefix, f"{prefix}__*"})
@@ -814,6 +822,7 @@ def _inspect_steering_surfaces(
                     f"{source}:mcp-allowance"
                     for source, rules in claude_allows.items()
                     if _allows_mcp_server(rules, prefix)
+                    or _allows_mcp_server(rules, f"mcp__{srv_name}")
                 )
             if srv_auto:
                 eff_modes.append(f"{cfg_path}:{srv_name}:alwaysAllow")
