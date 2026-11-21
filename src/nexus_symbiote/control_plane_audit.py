@@ -67,6 +67,9 @@ def _as_dict(val: Any) -> dict[str, Any]:
 BRIDGE_PACKAGES = _words("mcp-remote supergateway mcp-proxy @modelcontextprotocol/server-proxy")
 RUNTIME_LAUNCHERS = _words("node python python3 sh bash zsh deno bun tsx uvx npx")
 PACKAGE_RUNNERS = _words("npx uvx")
+RUNNER_VALUE_OPTIONS = _words(
+    "-p --package --from --with --with-editable --with-requirements --python"
+)
 FS_WRITE_TOOLS = _words("write_file edit_file move_file")
 INSTALLED_BIN_DIRS = _tup("node_modules/.bin/ .venv/bin/ venv/bin/")
 SCRIPT_SUFFIXES = _tup(".sh .py .js .mjs .cjs .ts .rb .pl")
@@ -202,6 +205,48 @@ def _normalize_rel_candidate(token: str, *, allow_any_file: bool = False) -> str
     return None
 
 
+def _package_runner_target(operands: list[str], project_paths: frozenset[str]) -> str | None:
+    """Bind the script a package runner (npx, uvx) executes, never its package or option values."""
+    package_seen = after_option = False
+    option = ""
+    fallback: str | None = None
+    for arg in operands:
+        if arg in {"-c", "-e", "-m"}:
+            return None
+        if arg.startswith("-"):
+            after_option, option = "=" not in arg, arg
+            continue
+        follows_option, after_option = after_option, False
+        if not package_seen and follows_option and option in RUNNER_VALUE_OPTIONS:
+            continue
+        local = _normalize_rel_candidate(arg, allow_any_file=True)
+        path = posixpath.normpath(local) if local is not None else None
+        explicit = arg.startswith("./") or bool(_PROJECT_DIR_RE.match(arg))
+        scripted = arg.endswith(SCRIPT_SUFFIXES)
+        path_like = explicit or "/" in arg or scripted
+        listed = path in project_paths
+        if not package_seen:
+            package_seen = True
+            # The first operand names the package. A bare name is resolved from the
+            # registry, so a project file of that name (a decoy `tsx`) is not the script.
+            if (
+                path is not None
+                and not arg.startswith("@")
+                and (explicit or scripted or ("/" in arg and listed))
+            ):
+                return path
+            continue
+        if path is None or (arg.startswith("@") and not listed) or f"{path}/" in project_paths:
+            continue
+        if not follows_option and path_like:
+            return path
+        # An option's value (--tsconfig tsconfig.json) is configuration. A bare listed
+        # name or a script-suffixed option value is used only when nothing path-like follows.
+        if fallback is None and ((not follows_option and listed) or (follows_option and scripted)):
+            fallback = path
+    return fallback
+
+
 def _extract_local_script_target(
     tokens: list[str], project_paths: frozenset[str] = frozenset()
 ) -> str | None:
@@ -212,23 +257,13 @@ def _extract_local_script_target(
     direct = _normalize_rel_candidate(first)
     if direct is not None and base not in RUNTIME_LAUNCHERS:
         return direct
+    if base in PACKAGE_RUNNERS:
+        return _package_runner_target(tokens[1:], project_paths)
     if base in RUNTIME_LAUNCHERS:
         for arg in tokens[1:]:
             if arg in {"-c", "-e", "-m"}:
                 return None
-            if base in PACKAGE_RUNNERS:
-                # A bare operand may be a package locator. Bind it if the confined
-                # project listing identifies a file, even without a script suffix.
-                local = _normalize_rel_candidate(arg, allow_any_file=True)
-                if local is not None and (path := posixpath.normpath(local)) in project_paths:
-                    return path
-                if not (
-                    arg.startswith("./")
-                    or _PROJECT_DIR_RE.match(arg)
-                    or arg.endswith(SCRIPT_SUFFIXES)
-                ):
-                    continue
-            if not arg.startswith(("-", "@")):
+            if not arg.startswith("-"):
                 cand = _normalize_rel_candidate(arg)
                 if cand is not None:
                     return cand
@@ -484,7 +519,8 @@ def _inspect_hooks_and_preambles(
     summary: ControlPlaneAuditSummary,
 ) -> None:
     for cfg_path, doc in _load_json_docs(files, all_paths, HOOK_CONFIG_FILES, summary.gaps):
-        for event_name, cmd_str in _iter_hook_commands(doc):
+        for raw_event, cmd_str in _iter_hook_commands(doc):
+            event_name = _clean(raw_event)
             summary.hook_commands.append(
                 _rec(
                     source_file=cfg_path,
@@ -748,6 +784,12 @@ def _covers_steering_path(root_arg: str, project_roots: tuple[str, ...]) -> bool
     return False
 
 
+def _steering_host(path: str) -> str:
+    if path.startswith(".claude/") or path == ".mcp.json":
+        return "claude"
+    return path.split("/", 1)[0]
+
+
 def _deny_covers_steering(deny_rules: list[str], server_name: str, reference_server: bool) -> bool:
     # Claude Code Read/Edit/Write path rules govern its built-in file tools, not an MCP server,
     # which writes from its own process. Only a deny of the server's tools stops it.
@@ -773,8 +815,9 @@ def _inspect_steering_surfaces(
             s_item = str(item)
             if s_item in {"*", "Edit", "Write"} or "filesystem" in s_item:
                 auto_edit_modes.append(f"{s_path}:allow:{s_item}")
-        for x in _as_list(perms.get("deny")):
-            deny_rules.append(str(x))
+        # A Claude Code deny rule governs only the servers Claude Code itself launches.
+        if _steering_host(s_path) == "claude":
+            deny_rules.extend(str(x) for x in _as_list(perms.get("deny")))
         if doc.get("approvalPolicy") in {"never", "auto-edit"}:
             auto_edit_modes.append(f"{s_path}:{doc['approvalPolicy']}")
 
@@ -792,7 +835,7 @@ def _inspect_steering_surfaces(
             server_read_only = (
                 bool(srv_cfg.get("readOnly")) or "--readonly" in joined or "--read-only" in joined
             )
-            deny_covered = _deny_covers_steering(
+            deny_covered = _steering_host(cfg_path) == "claude" and _deny_covers_steering(
                 deny_rules, srv_name, "server-filesystem" in joined
             )
             srv_auto = (
@@ -1376,7 +1419,10 @@ def audit_project_control_plane(
 
     with ConfinedCollection(project_root, summary.gaps) as files:
         all_paths = sorted(p.as_posix() for p in files.iter_files())
-        project_paths = frozenset(all_paths)
+        # Directories carry a trailing '/', so an operand naming one is not read as a script.
+        project_paths = frozenset(all_paths).union(
+            p[: i + 1] for p in all_paths for i, c in enumerate(p) if c == "/"
+        )
         for decl_path in ("agent.yaml", "agent.yml"):
             if decl_path in all_paths:
                 text = _read_confined_text(files, decl_path, summary.gaps)
@@ -1394,7 +1440,7 @@ def audit_project_control_plane(
         _inspect_identities_and_authority(summary, decl_sources)
 
     if baseline_root is not None:
-        base_summary = audit_project_control_plane(baseline_root)
+        base_summary = audit_project_control_plane(baseline_root, claims_path=claims_path)
         # An unreadable baseline hides what changed, so its gaps fail the gate too.
         summary.gaps.extend(f"baseline: {gap}" for gap in base_summary.gaps)
         summary.reach_alerts = diff_control_plane_audits(
