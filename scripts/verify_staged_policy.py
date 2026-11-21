@@ -44,11 +44,10 @@ from nexus_symbiote.policy import (
 from nexus_symbiote.runtime import key_id
 from nexus_symbiote.runtime_cli import (
     _check_key_placement,
-    _identity,
     _InputTooLargeError,
     _KeyFileError,
     _read,
-    _working_trees,
+    _verify_outside_checkout,
 )
 from nexus_symbiote.utils.terminal import safe_line
 from nexus_symbiote.validators.completeness import (
@@ -76,38 +75,6 @@ _SEVERITY_STRICTNESS: dict[str, int] = {
     "info": 5,
 }
 _ASSURANCE_STRICTNESS: dict[str, int] = {"declared": 0, "observed": 1, "verified": 2}
-
-
-def _verify_outside_checkout(
-    target: Path, untrusted_roots: tuple[Path, ...], *, label: str
-) -> None:
-    try:
-        resolved_roots = [p.resolve() for p in untrusted_roots]
-        search_starts = [
-            *(p if p.is_dir() else p.parent for p in resolved_roots),
-            Path.cwd().resolve(),
-        ]
-        trees = _working_trees(search_starts)
-        forbidden_dirs = [
-            *trees,
-            *(p for p in resolved_roots if p.is_dir() and p not in trees),
-        ]
-        forbidden_ids = {_identity(d) for d in forbidden_dirs}
-        resolved_target = target.resolve()
-        ancestor_ids = {_identity(parent) for parent in resolved_target.parents}
-        if any(resolved_target.is_relative_to(d) for d in forbidden_dirs) or bool(
-            ancestor_ids & forbidden_ids
-        ):
-            raise click.UsageError(
-                f"{label} must lie outside the target checkout and every git working tree "
-                "that holds the checkout or the current directory"
-            )
-        if os.stat(resolved_target).st_nlink != 1:
-            raise click.UsageError(f"{label} must not have multiple hard links")
-    except click.UsageError:
-        raise
-    except (OSError, RuntimeError):
-        raise click.UsageError(f"{label} cannot be inspected safely") from None
 
 
 def clamp_operator_floor(operator_policy: Policy, project_policy: Policy | None) -> Policy:
