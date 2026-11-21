@@ -773,7 +773,8 @@ def _decoded_source(rel_path: str, text: str) -> tuple[object, tuple[int, int] |
             if _flow_depth(body) <= _MAX_YAML_FLOW_DEPTH:
                 return _yaml_tree(body), None
     except (ValueError, RecursionError, yaml.YAMLError):
-        pass
+        # Malformed input still needs the same escape inspection as input over a parse limit.
+        return None, span
     return None, span
 
 
