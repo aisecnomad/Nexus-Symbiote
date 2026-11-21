@@ -412,6 +412,7 @@ class LegEvidence:
     locator: str | None
     assurance: AssuranceLevel
     gated: bool
+    component_approval_declared: bool
 
 
 @dataclass(frozen=True)
@@ -1020,6 +1021,8 @@ def _evidence_entry(leg: str, item: LegEvidence) -> dict[str, Any]:
         "locator": item.locator,
         "assurance": item.assurance.value,
         "gated": item.gated,
+        "component_approval_declared": item.component_approval_declared,
+        "approval_enforcement_verified": False,
     }
 
 
@@ -1106,6 +1109,7 @@ def _scope_findings(
                     assume_declared_approvals
                     and (gated_owner or sig.explicitly_gated)
                     and not sig.explicitly_ungated,
+                    sig.explicitly_gated,
                 )
             )
         return found
