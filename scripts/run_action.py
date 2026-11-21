@@ -371,13 +371,11 @@ def _scratch_parent(config: Config) -> Path | None:
         except (OSError, RuntimeError):
             continue
         if any(directory.is_relative_to(root) for root in untrusted):
-            raise ActionError(
-                "signature-policy snapshot must be outside the project and outside every repository that holds it"
-            )
+            continue
         if _trust_anchor_error(directory, None) is None and os.access(directory, os.W_OK | os.X_OK):
             return directory
     raise ActionError(
-        "signature-policy needs a writable temporary directory with trusted ancestors"
+        "signature-policy needs a writable temporary directory with trusted ancestors outside the project and its repositories"
     )
 
 

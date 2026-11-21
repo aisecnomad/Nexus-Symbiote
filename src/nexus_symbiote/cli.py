@@ -625,16 +625,24 @@ def _refuse_step_summary_input(step_summary: Path) -> None:
     Appending Markdown to an input would corrupt it in place. Compared by identity, so a
     hard link or a case variant of the input is refused too.
     """
+    from nexus_symbiote.policy import POLICY_FILE_NAMES
+
     ctx = click.get_current_context(silent=True)
-    if ctx is None or not step_summary.exists():
+    if ctx is None:
         return
-    named: list[object] = []
-    for param in ctx.command.params:
-        if param.name == "step_summary" or not isinstance(param.type, click.Path):
-            continue
-        value = ctx.params.get(param.name or "")
-        named.extend(value if isinstance(value, tuple | list) else [value])
     try:
+        if not step_summary.exists():
+            return
+        named: list[object] = []
+        for param in ctx.command.params:
+            if param.name == "step_summary" or not isinstance(param.type, click.Path):
+                continue
+            value = ctx.params.get(param.name or "")
+            named.extend(value if isinstance(value, tuple | list) else [value])
+        project = ctx.params.get("project")
+        if project and not ctx.params.get("no_project_policy"):
+            # The checkout policy consulted by risk and validate has no explicit file option.
+            named.extend(Path(project) / name for name in POLICY_FILE_NAMES)
         same = any(
             os.path.exists(source) and os.path.samefile(step_summary, source)
             for source in named
