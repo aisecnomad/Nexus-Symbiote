@@ -835,7 +835,8 @@ def _parse_nested_manifest(
                 files._fail(rel_posix, "invalid nested npm lockfile")
                 npm_locks = {}
             declared: dict[str, list[tuple[str, str]]] = {}
-            for section in ("dependencies", "devDependencies", "optionalDependencies"):
+            # npm loads root dependency edges in this order. A later section wins.
+            for section in ("dependencies", "optionalDependencies", "devDependencies"):
                 deps = parsed.get(section)
                 if isinstance(deps, dict):
                     for pkg_name, spec in deps.items():
@@ -846,7 +847,7 @@ def _parse_nested_manifest(
                         ):
                             declared.setdefault(pkg_name, []).append((section, spec.strip()))
             for pkg_name, specs in declared.items():
-                spec = dict(specs).get("optionalDependencies", specs[0][1])
+                spec = specs[-1][1]
                 record = npm_locks.get("node_modules/" + pkg_name)
                 version = record.get("version") if isinstance(record, dict) else None
                 if (

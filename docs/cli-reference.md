@@ -653,7 +653,7 @@ nexus-symbiote import-sbom [OPTIONS] FOREIGN_BOM_PATH
 | `--into` `PATH` | Existing native AgentBOM to merge imported SBOM claims into. |
 | `--project` `PATH` | Trusted project root for SHA-256 local file binding, nested manifests, and shape census. |
 | `--reveal-names` | Retain plain component names from the foreign SBOM instead of hashed names. |
-| `--walk-manifests` | Walk nested manifests below `--project`. Nested npm lock evidence requires an applicable v2 or v3 root lock record. Go versions describe requirements and remain manifest-only. |
+| `--walk-manifests` | Walk nested manifests below `--project`. A nested npm lock must have an applicable v2 or v3 root record and agree with the effective dependency range. Nested pnpm and Yarn locks supply no lock evidence. Go versions describe requirements and remain manifest-only even with a `go.sum`. |
 | `--census` | Count unread non-control-plane artifact shapes (`*.ipynb`, `n8n/*.json`, `*.tf`, `Chart.yaml`). |
 | `--json-output` | Print a structured JSON summary of imported, bound, and conflicting entries. |
 
