@@ -121,6 +121,8 @@ Every gate prints each of its failure reasons. How many findings the console lis
 | `export-standard` | Experimental | offline | CycloneDX 1.6/1.7 or SPDX 3.0.1 export with typed AI and Dataset projections |
 | `audit-control-plane` | Experimental | offline | Hook targets, skill preambles, MCP bridges, steering surfaces, CI agents and identities |
 | `trifecta` | Experimental | offline | Lethal trifectas, chained toxic flows and tool shadowing in an inventory |
+| `import-sbom` | Experimental | offline | Foreign CycloneDX or SPDX SBOM imported as declared evidence |
+| `evidence-profile` | Experimental | offline | Evidence attributes per component, without a scalar trust score |
 | `discover-mcp` | Experimental | **live** | Opt-in HTTPS MCP tool listing without calling tools |
 | `advisories` | Experimental | **live** | Opt-in OSV lookup for exact PyPI and npm package versions |
 | `verify-live` | Experimental | **live** | Opt-in namespace-isolated stdio MCP verification against operator launch policy |

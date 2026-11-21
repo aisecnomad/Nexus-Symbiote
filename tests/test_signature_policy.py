@@ -207,3 +207,33 @@ def test_a_missing_project_root_is_an_explicit_error(policy_inputs, tmp_path):
     _, policy, _ = policy_inputs
     with pytest.raises(SignaturePolicyError, match="Project root is unavailable"):
         load_signature_policies(policy, tmp_path / "no-such-project")
+
+
+def test_version_2_supports_openssf_model_signing_dsse_and_rekor_witnesses(policy_inputs):
+    project, policy, record = policy_inputs
+    v2_record = {
+        **record,
+        "kind": "openssf-model-signing-dsse",
+        "rekor_root_hash": "sha256:" + "ab" * 32,
+        "minimum_rekor_tree_size": 1024,
+    }
+    policy.write_text(json.dumps({"version": 2, "artifacts": [v2_record]}))
+    loaded = load_signature_policies(policy, project)
+    assert len(loaded) == 1
+    entry = loaded[0]
+    assert entry.allow_oms_dsse is True
+    assert entry.rekor_root_hash == "sha256:" + "ab" * 32
+    assert entry.minimum_rekor_tree_size == 1024
+
+    for bad_field, bad_val, match in [
+        ("rekor_root_hash", "not-a-digest", "rekor_root_hash must be a SHA-256 digest"),
+        ("rekor_root_hash", None, "rekor_root_hash must be a SHA-256 digest"),
+        ("minimum_rekor_tree_size", 0, "minimum_rekor_tree_size must be a positive integer"),
+        ("minimum_rekor_tree_size", True, "minimum_rekor_tree_size must be a positive integer"),
+        ("minimum_rekor_tree_size", None, "minimum_rekor_tree_size must be a positive integer"),
+    ]:
+        policy.write_text(
+            json.dumps({"version": 2, "artifacts": [{**v2_record, bad_field: bad_val}]})
+        )
+        with pytest.raises(SignaturePolicyError, match=match):
+            load_signature_policies(policy, project)
