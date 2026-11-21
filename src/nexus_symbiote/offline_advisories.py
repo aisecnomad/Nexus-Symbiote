@@ -221,17 +221,22 @@ def load_offline_advisory_db(path: Path) -> tuple[list[_ParsedAdvisory], str]:
         records: list[_ParsedAdvisory] = []
         total_bytes = 0
         manifest_lines: list[str] = []
-        file_count = 0
-        for entry in sorted(os.scandir(path), key=lambda e: e.name):
+        # Bound directory iteration itself, including entries that are not advisory files.
+        with os.scandir(path) as listing:
+            entries: list[os.DirEntry[str]] = []
+            for entry in listing:
+                if len(entries) == MAX_DB_FILES:
+                    raise ValueError(
+                        f"Offline advisory DB exceeds {MAX_DB_FILES} directory entries"
+                    )
+                entries.append(entry)
+        for entry in sorted(entries, key=lambda e: e.name):
             if entry.is_dir():
                 raise ValueError("Offline advisory DB directory must not contain subdirectories")
             if not entry.name.endswith(".json"):
                 continue
             if entry.is_symlink():
                 raise ValueError("Offline advisory DB directory must not contain symbolic links")
-            file_count += 1
-            if file_count > MAX_DB_FILES:
-                raise ValueError(f"Offline advisory DB exceeds {MAX_DB_FILES} files")
             data = _read_bounded_bytes(Path(entry.path), MAX_DB_BYTES - total_bytes, entry.name)
             total_bytes += len(data)
             manifest_lines.append(f"{entry.name}:{hash_bytes(data)}")

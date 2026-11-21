@@ -717,6 +717,14 @@ def test_offline_advisories_refuse_an_empty_or_nested_database_directory(tmp_pat
         match_offline_advisories(_bom_with_package(), db_path=nested)
 
 
+def test_offline_feed_bounds_directory_entries_before_sorting(tmp_path, monkeypatch):
+    monkeypatch.setattr(offline_advisories, "MAX_DB_FILES", 2)
+    for filename in ("first.txt", "second.txt", "third.txt"):
+        (tmp_path / filename).touch()
+    with pytest.raises(ValueError, match="2 directory entries"):
+        offline_advisories.load_offline_advisory_db(tmp_path)
+
+
 def test_offline_advisories_database_without_the_queried_ecosystem_is_incomplete(tmp_path):
     db_file = tmp_path / "pypi-only.json"
     db_file.write_text(json.dumps([_pypi_record()]), encoding="utf-8")
