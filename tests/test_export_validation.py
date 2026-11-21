@@ -161,6 +161,7 @@ VENDORED = [
     "cyclonedx/jsf-0.82.schema.json",
     "cyclonedx/spdx.schema.json",
     "spdx/spdx-json-schema-3.0.1.json",
+    "sarif/sarif-schema-2.1.0.json",
 ]
 
 
@@ -244,3 +245,15 @@ def test_vex_affected_references_must_resolve_or_be_bom_links():
         assert validate_cyclonedx(vex) == [f"unresolved CycloneDX reference: {malformed}"]
     vex["vulnerabilities"][0]["affects"] = [{"ref": "elsewhere"}]
     assert validate_cyclonedx(vex) == ["unresolved CycloneDX reference: elsewhere"]
+
+
+def test_sarif_validates_against_the_vendored_oasis_schema(tmp_path):
+    from nexus_symbiote.generators.sarif import SARIFGenerator
+    from nexus_symbiote.generators.validation import validate_sarif
+
+    bom = fixture_bom()
+    document = SARIFGenerator(tmp_path).generate(bom)
+    assert validate_sarif(document) == []
+    unexpected = deepcopy(document)
+    unexpected["runs"][0]["unexpectedTopLevelRunField"] = True
+    assert any("unexpectedTopLevelRunField" in error for error in validate_sarif(unexpected))

@@ -126,6 +126,11 @@ repository secret.
 
 ### Verify pinned stdio servers
 
+Before running `verify-live`, unset the cloud, registry or API credential variables
+named in its refusal. The launcher starts with a cleared environment. On an
+operator-controlled host, `--allow-host-credentials` acknowledges the credentials
+still held by the parent process. The launch policy and isolation checks still apply.
+
 `verify-live` starts each stdio server that the inventory names, but only through
 an operator launch policy: a JSON object that maps the server's `bom_ref` in the
 inventory to an absolute launcher path and its SHA-256 pin.

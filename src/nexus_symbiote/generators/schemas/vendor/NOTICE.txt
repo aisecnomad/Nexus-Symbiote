@@ -17,11 +17,16 @@ Unported (CC-BY-3.0). LICENSE-SPDX-3.0.1.txt is the specification's license file
 at tag 3.0.1, unchanged: https://github.com/spdx/spdx-spec/blob/3.0.1/LICENSE
 Source https://spdx.github.io/spdx-spec/v3.0.1/
 
+SARIF 2.1.0 JSON schema resource is from OASIS Static Analysis Results Interchange
+Format (SARIF) Version 2.1.0 Errata 01 OASIS Standard. Copyright OASIS Open 2023.
+Source https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json
+
 SOURCES.json records the source of each copied file, the SHA-256 digest of the copy
-(sha256) and the SHA-256 digest of the source bytes (sourceSha256). Each copy equals
-its source except for one added final newline, so sourceSha256 is the digest of the
-copy without its last byte; compare it with the digest of a fresh download of the
-source to check a copy. jsf-0.82.schema.json also equals, byte for byte, the copy in
+(sha256) and the SHA-256 digest of the source bytes (sourceSha256). Each CycloneDX and
+SPDX copy equals its source except for one added final newline, so sourceSha256 is the
+digest of the copy without its last byte; the SARIF schema is stored in compact single-line
+JSON form while preserving identical JSON semantics, with sourceSha256 recording the
+upstream document digest. jsf-0.82.schema.json also equals, byte for byte, the copy in
 cyclonedx-python-lib 11.12.0. The package checks every copy against sha256 before it
 validates an export. These are offline records: they do not authenticate the
 upstream publisher. SymBiote validation and projection code is separate from these
