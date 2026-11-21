@@ -7,6 +7,7 @@ import json
 import posixpath
 import re
 import shlex
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -749,11 +750,22 @@ def _steering_host(path: str) -> str:
     return path.split("/", 1)[0]
 
 
+def _allows_mcp_server(rules: list[str], prefix: str) -> bool:
+    exact = bisect_left(rules, prefix)
+    if exact < len(rules) and rules[exact] == prefix:
+        return True
+    scoped = f"{prefix}__"
+    index = bisect_left(rules, scoped)
+    return index < len(rules) and rules[index].startswith(scoped)
+
+
 def _inspect_steering_surfaces(
     files: ConfinedCollection, all_paths: list[str], summary: ControlPlaneAuditSummary
 ) -> None:
     modes: dict[str, list[str]] = {}
+    claude_allows: dict[str, list[str]] = {}
     claude_denies: set[str] = set()
+    claude_prompting = False
     for s_path, doc in _load_json_docs(files, all_paths, PERMISSION_CONFIG_FILES, summary.gaps):
         host = _steering_host(s_path)
         auto_edit_modes = modes.setdefault(host, [])
@@ -761,12 +773,16 @@ def _inspect_steering_surfaces(
         mode = perms.get("defaultMode") or perms.get("mode")
         if mode in ("acceptEdits", "bypassPermissions", "auto"):
             auto_edit_modes.append(f"{s_path}:{mode}")
+        allow = [r.strip() for r in _as_list(perms.get("allow")) if isinstance(r, str)]
         if any(
-            isinstance(rule, str) and (rule in {"*", "Edit", "Write"} or "filesystem" in rule)
-            for rule in _as_list(perms.get("allow"))
+            rule in {"*", "Edit", "Write"}
+            or (not rule.startswith("mcp__") and "filesystem" in rule)
+            for rule in allow
         ):
             auto_edit_modes.append(f"{s_path}:write-allowance")
         if host == "claude":
+            claude_prompting |= mode in ("default", "plan")
+            claude_allows[s_path] = sorted(rule for rule in allow if rule.startswith("mcp__"))
             claude_denies.update(
                 r.strip() for r in _as_list(perms.get("deny")) if isinstance(r, str)
             )
@@ -785,14 +801,28 @@ def _inspect_steering_surfaces(
             if "filesystem" not in srv_name.lower() and "server-filesystem" not in joined:
                 continue
             host = _steering_host(cfg_path)
+            prefix = f"mcp__{srv_name}"
             # A future or custom server can publish additional write tools. Only the
             # owning client's deny of the whole server covers this open-ended surface.
-            deny_covered = host == "claude" and bool(
-                claude_denies & {f"mcp__{srv_name}", f"mcp__{srv_name}__*"}
-            )
+            deny_covered = host == "claude" and bool(claude_denies & {prefix, f"{prefix}__*"})
             srv_auto = (
                 bool(srv_cfg.get("autoApprove")) or len(_as_list(srv_cfg.get("alwaysAllow"))) > 0
             )
+            eff_modes = list(modes.get(host, ()))
+            if host == "claude":
+                eff_modes.extend(
+                    f"{source}:mcp-allowance"
+                    for source, rules in claude_allows.items()
+                    if _allows_mcp_server(rules, prefix)
+                )
+            if srv_auto:
+                eff_modes.append(f"{cfg_path}:{srv_name}:alwaysAllow")
+            writable = bool(eff_modes) and not deny_covered
+            approval_status = "preapproved" if writable else "unverified"
+            if deny_covered:
+                approval_status = "denied"
+            elif not writable and host == "claude" and claude_prompting:
+                approval_status = "prompting"
             roots = [
                 a
                 for a in args
@@ -806,19 +836,12 @@ def _inspect_steering_surfaces(
                 r_arg = raw_root.removesuffix(":ro")
                 if not _covers_steering_path(r_arg, project_roots):
                     continue
-                eff_modes = list(modes.get(host, ()))
-                if srv_auto:
-                    eff_modes.append(f"{cfg_path}:{srv_name}:alwaysAllow")
-                writable = bool(eff_modes) and not deny_covered
-                if not eff_modes and not deny_covered:
-                    summary.gaps.append(
-                        f"{cfg_path}: write approval policy for filesystem server is unverified"
-                    )
                 summary.steering_surfaces.append(
                     _rec(
                         server_name=srv_name,
                         root_path=r_arg,
                         permission_modes=eff_modes,
+                        approval_status=approval_status,
                         read_only=False,
                         deny_covered=deny_covered,
                         writable=writable,
@@ -830,6 +853,15 @@ def _inspect_steering_surfaces(
                         "steering_surface_writable",
                         RiskSeverity.CRITICAL,
                         f"Filesystem server '{srv_name}' rooted at '{r_arg}' can modify steering files under {', '.join(eff_modes)} (F20).",
+                        cfg_path,
+                        srv_name,
+                    )
+                elif approval_status == "unverified":
+                    summary.flag(
+                        "steering_surface_unverified",
+                        RiskSeverity.MEDIUM,
+                        f"Write approval for filesystem server '{srv_name}' rooted at '{r_arg}' "
+                        "could not be established from the declaring client's configuration.",
                         cfg_path,
                         srv_name,
                     )

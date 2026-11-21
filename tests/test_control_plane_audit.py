@@ -725,6 +725,41 @@ def _fs_project(root: Path, deny: list[str], args: list[str]) -> None:
 
 
 @pytest.mark.parametrize(
+    ("mode", "allow", "status"),
+    [
+        (None, [], "unverified"),
+        ("default", [], "prompting"),
+        ("plan", [], "prompting"),
+        ("default", ["mcp__fs"], "preapproved"),
+        ("plan", ["mcp__fs__*"], "preapproved"),
+        ("default", ["mcp__fs__write_file"], "preapproved"),
+        ("default", ["mcp__fs_backup__write_file"], "prompting"),
+    ],
+)
+def test_steering_distinguishes_prompting_from_preapproval(
+    tmp_path: Path, mode: str | None, allow: list[str], status: str
+) -> None:
+    _fs_project(tmp_path, [], ["."])
+    _write(
+        tmp_path / ".claude/settings.json",
+        json.dumps({"permissions": {"defaultMode": mode, "allow": allow}}),
+    )
+    summary = audit_project_control_plane(tmp_path)
+    [surface] = summary.steering_surfaces
+    assert surface["approval_status"] == status
+    assert surface["writable"] == (status == "preapproved")
+    assert summary.gaps == []
+
+    args = ["audit-control-plane", str(tmp_path)]
+    default = CliRunner().invoke(main, args)
+    assert default.exit_code == (1 if status == "preapproved" else 0), default.output
+    if status == "unverified":
+        strict = CliRunner().invoke(main, [*args, "--fail-on-severity", "medium"])
+        assert strict.exit_code == 1, strict.output
+        assert "steering_surface_unverified" in strict.output
+
+
+@pytest.mark.parametrize(
     ("deny", "args", "writable"),
     [
         (["Read(.claude/secret.txt)", "Read(.cursor/x)"], ["."], True),
