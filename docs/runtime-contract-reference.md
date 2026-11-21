@@ -595,15 +595,27 @@ readiness probe.
 0700 if it does not exist, and the file with mode 0600, refusing an existing file
 or a symbolic link. Creating, opening and using a store refuse a parent directory
 that other users can write (world-writable, or group-writable without the sticky
-bit) and a `-journal`, `-wal` or `-shm` file beside it that is a symbolic link, not
-a regular file, or owned by another user, since SQLite would roll a planted hot
-journal into the store (`state-invalid`). `StateStore(path)` opens an existing
+bit). A group-writable sticky directory is accepted for compatibility and requires
+every group member to be trusted. Its members can create files between inspection
+and SQLite opening them. Use an owner-controlled directory when consumed approvals
+and accepted serials must be protected from other group members.
+Any existing `-journal`, `-wal` or `-shm` companion must be a regular file
+with one link, owned by the service user and writable only by that user
+(`state-invalid`). `StateStore(path)` opens an existing
 store. It refuses a missing file or a database without a store's tables (`state-missing`), a symbolic
 link or anything but a regular file (`state-invalid`), and a file that is not an
 SQLite database (`state-unavailable`), and it restricts a group- or
 world-accessible file to 0600. A store removed while a gateway runs makes every
 call fail with `state-unavailable`; it is never recreated empty. Each store has a
 random `store_id`.
+
+For an existing store in a shared directory, stop every gateway that uses it.
+If the service owns a dedicated directory, make that directory private (0700).
+For a shared parent, move the trusted current database and its SQLite companions
+together into a dedicated 0700 directory owned by the service account. Check
+ownership and permissions before restarting all gateways against the same
+store. Reinitializing the store or discarding a journal can lose consumed
+approvals and accepted serials.
 
 The store records, per tenant, the accepted trust status (serial, digest and
 revoked signer IDs); per tenant, deployment and agent, the current snapshot

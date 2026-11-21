@@ -110,8 +110,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.lock
-          # Only the checkout is built from source: a newly floated release that ships no
-          # wheel fails the job instead of running its build code on the runner.
+          # Dependencies resolve to the newest allowed release with a compatible wheel.
+          # A source-only release is skipped. Resolution fails if no allowed wheel exists.
           python -m pip install --only-binary=:all: --no-build-isolation \
             --upgrade --upgrade-strategy eager -e '.[all]'
           python -m pip check

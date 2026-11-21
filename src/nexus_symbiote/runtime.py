@@ -1035,9 +1035,8 @@ def _refuse_shared_directory(info: os.stat_result) -> None:
         raise AuthorizationError(
             "state database directory cannot be world-writable", reason="state-invalid"
         )
-    # A member of a group that can write the directory could plant or swap a hot -journal
-    # or -wal that SQLite rolls into the store when it next opens it. In a sticky directory
-    # a planted file stays owned by its creator, which _refuse_planted_companions sees.
+    # The sticky exception is compatible with stores shared by a trusted group.
+    # A companion check cannot reserve an absent name for a later SQLite open.
     if info.st_mode & 0o020 and not info.st_mode & stat.S_ISVTX:
         raise AuthorizationError(
             "state database directory cannot be group-writable without the sticky bit",
@@ -1055,9 +1054,15 @@ def _refuse_planted_companions(parent_fd: int, name: str, uid: int | None) -> No
             raise AuthorizationError(
                 "state database journal cannot be inspected", reason="state-invalid"
             ) from exc
-        if not stat.S_ISREG(info.st_mode) or (uid is not None and info.st_uid != uid):
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or (uid is not None and info.st_uid != uid)
+            or info.st_mode & 0o022
+        ):
             raise AuthorizationError(
-                "state database journal must be a regular file owned by the current user",
+                "state database journal must be a singly linked regular file owned by the "
+                "current user and writable only by its owner",
                 reason="state-invalid",
             )
 

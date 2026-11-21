@@ -136,10 +136,11 @@ retained together.
 The policy script requires the actual Git `HEAD` to equal `GITHUB_SHA` and no
 tracked source changes. On pull requests, default checkout and `GITHUB_SHA` both
 identify the merge commit; substituting the PR head SHA fails. On `main` they
-identify the push commit. Optional SARIF revision metadata must agree, and any
-supplied invocation must explicitly report success. Native CodeQL can omit those
-optional fields: source binding then comes from the trusted, pinned preceding
-workflow step and the checked checkout, with a SARIF digest in the report. The
+identify the push commit. Each SARIF run must record at least one invocation and
+every invocation must explicitly report success. When a run supplies source
+revision metadata, each revision must match the checkout. The workflow checker
+binds checkout, initialization, analysis and their inputs to the policy step.
+The report records a digest of the SARIF produced by that sequence. The
 standalone SARIF evaluator does not authenticate an arbitrary file's origin.
 Weekly/manual CodeQL runs apply the same policy; only the exact-source CI run
 supplies publication acceptance.

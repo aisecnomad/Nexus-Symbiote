@@ -21,6 +21,9 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterator
+from fnmatch import fnmatchcase
+from itertools import product
+from math import prod
 from pathlib import Path
 from typing import Any
 
@@ -363,7 +366,8 @@ CODEQL_LANGUAGES: dict[str, dict[str, frozenset[str]]] = {
     "codeql.yml": {"analyze": frozenset({"python", "actions"})}
 }
 CODEQL_TRIGGERS: dict[str, frozenset[str]] = {
-    "codeql.yml": frozenset({"push", "pull_request", "schedule"})
+    "ci.yml": frozenset({"push", "pull_request"}),
+    "codeql.yml": frozenset({"push", "pull_request", "schedule"}),
 }
 # The timeout options that leave the command's status intact, alone or with a value.
 TIMEOUT_FLAGS = frozenset({"--foreground", "--preserve-status", "-v", "--verbose"})
@@ -416,6 +420,42 @@ def _triggers(document: dict[Any, Any]) -> set[str]:
     if isinstance(events, dict):
         return {str(event) for event in events}
     return set()
+
+
+def _covers_main(options: Any, event: str) -> bool:
+    if options is None:
+        return True
+    if not isinstance(options, dict) or options.keys() - {"branches", "branches-ignore", "types"}:
+        return False
+    if "types" in options:
+        types = options["types"]
+        if event != "pull_request" or not isinstance(types, list):
+            return False
+        if not all(kind in types for kind in ("opened", "synchronize", "reopened")):
+            return False
+    if "branches" in options and "branches-ignore" in options:
+        return False
+    ignored = "branches-ignore" in options
+    patterns = options.get("branches-ignore" if ignored else "branches")
+    if patterns is None:
+        return True
+    if not isinstance(patterns, list):
+        return False
+    allowed = ignored
+    for pattern in patterns:
+        if not isinstance(pattern, str):
+            return False
+        negative = pattern.startswith("!")
+        enables = negative == ignored
+        glob = pattern.removeprefix("!")
+        # For a single branch name, literal characters and '*' have the same
+        # meaning in GitHub and fnmatch. An unmodeled exclusion can remove main.
+        if re.fullmatch(r"[a-zA-Z0-9._*-]+", glob):
+            if fnmatchcase("main", glob):
+                allowed = enables
+        elif not enables:
+            allowed = False
+    return allowed
 
 
 def _read_only(permissions: Any) -> bool:
@@ -1318,13 +1358,104 @@ def _unsafe_env_scope(workflow_env: Any, job_env: Any, step_env: Any) -> str | N
     return None
 
 
+def _codeql_producer_issues(
+    path: Path, name: str, job: dict[str, Any], workflow_env: Any
+) -> list[str]:
+    if (path.name, name) not in (("ci.yml", "codeql"), ("codeql.yml", "analyze")):
+        return []
+    # The next step consumes these results from disk. Everything from checkout
+    # to the policy must be the reviewed producer sequence, including its inputs.
+    matrix_job = path.name == "codeql.yml"
+    language = "${{ matrix.language }}" if matrix_job else "python"
+    expected: list[tuple[str, dict[str, Any]]] = [
+        ("actions/checkout", {"persist-credentials": False})
+    ]
+    if not matrix_job:
+        expected.append(("actions/setup-python", {"python-version": "3.12"}))
+    expected.append(
+        ("github/codeql-action/init", {"languages": language, "queries": "security-and-quality"})
+    )
+    if matrix_job:
+        expected.append(("github/codeql-action/autobuild", {}))
+    expected.append(
+        (
+            "github/codeql-action/analyze",
+            {"category": "/language:" + language, "output": "${{ runner.temp }}/codeql-sarif"},
+        )
+    )
+    steps = job["steps"]
+    error = [
+        f"{path}: {name} must run the reviewed CodeQL producers and inputs immediately before the SARIF policy"
+    ]
+    if job.get("runs-on") != "ubuntu-24.04":
+        return error
+    for environment in (workflow_env, job.get("env")):
+        if isinstance(environment, dict) and any(
+            str(key).upper().startswith(("CODEQL_", "LGTM_"))
+            or str(key).upper() in {"NODE_OPTIONS", "NODE_PATH"}
+            for key in environment
+        ):
+            return error
+    if len(steps) <= len(expected):
+        return error
+    for step, (action, inputs) in zip(steps, expected, strict=False):
+        if not isinstance(step, dict) or step.keys() - {
+            "name",
+            "id",
+            "uses",
+            "with",
+            "if",
+            "continue-on-error",
+        }:
+            return error
+        if (
+            _condition(step) not in (None, *ALWAYS_RUNS)
+            or step.get("continue-on-error", False) is not False
+        ):
+            return error
+        uses = step.get("uses")
+        if not isinstance(uses, str) or not PIN.fullmatch(uses) or uses.partition("@")[0] != action:
+            return error
+        if step.get("with", {}) != inputs:
+            return error
+    policy = steps[len(expected)]
+    script, _ = REVIEWED_GATE_STEPS[path.name][name]["scripts/check_codeql_sarif.py"]
+    if not isinstance(policy, dict) or policy.get("run") != script:
+        return error
+    return []
+
+
+def _matrix_keeps_languages(matrix: dict[str, Any], required: frozenset[str]) -> bool:
+    """Apply exclusions to the original matrix, within GitHub's 256-job limit."""
+    excluded = matrix.get("exclude", [])
+    if not isinstance(excluded, list) or not all(isinstance(row, dict) for row in excluded):
+        return False
+    axes = {k: v for k, v in matrix.items() if k not in {"exclude", "include"}}
+    if not all(isinstance(values, list) and values for values in axes.values()):
+        return False
+    if prod(len(values) for values in axes.values()) > 256:
+        return False
+    kept: set[str] = set()
+    for values in product(*axes.values()):
+        row = dict(zip(axes, values, strict=True))
+        if not any(all(k in row and row[k] == v for k, v in rule.items()) for rule in excluded):
+            kept.add(str(row.get("language")))
+    # GitHub applies explicit includes after exclusions. Only a fully specified
+    # row independently guarantees a run of the named language.
+    included = matrix.get("include", [])
+    if not isinstance(included, list) or not all(isinstance(row, dict) for row in included):
+        return False
+    kept.update(str(row.get("language")) for row in included if row.keys() >= axes.keys())
+    return required <= kept
+
+
 def _gate_issues(
     path: Path, name: str, job: dict[str, Any], defaults: Any, workflow_env: Any = None
 ) -> list[str]:
     """A required job's gate commands must run, unskippable, and keep their exit status."""
     commands = REQUIRED_COMMANDS.get(path.name, {}).get(name, ())
     text_only = REQUIRED_TEXT.get(path.name, {}).get(name, frozenset())
-    errors = []
+    errors = _codeql_producer_issues(path, name, job, workflow_env)
     if commands and ("container" in job or "services" in job):
         # A job container supplies its own python, git and HOME, so the gate environment
         # rules above would not describe what the gate runs with.
@@ -1363,6 +1494,8 @@ def _gate_issues(
         analyzed = {str(item) for item in listed} if isinstance(listed, list) else set()
         for language in sorted(languages - analyzed):
             errors.append(f"{path}: {name} must analyze {language} with CodeQL")
+        if isinstance(matrix, dict) and not _matrix_keeps_languages(matrix, languages):
+            errors.append(f"{path}: {name} must keep required languages in the CodeQL matrix")
     reviewed = REVIEWED_STEP_CONDITIONS.get(path.name, {})
     found: set[str] = set()
     unstructured: set[str] = set()
@@ -1445,6 +1578,14 @@ def _workflow_issues(path: Path, document: dict[Any, Any]) -> list[str]:
         errors.append(f"{path}: triggers must be among {', '.join(sorted(ALLOWED_TRIGGERS))}")
     for event in sorted(CODEQL_TRIGGERS.get(path.name, frozenset()) - triggers):
         errors.append(f"{path}: must run on {event}, or code scanning blocks every merge")
+    events = document.get("on", document.get(True))
+    if path.name in CODEQL_TRIGGERS and isinstance(events, dict):
+        for event, scope in (
+            ("pull_request", "every pull request to main"),
+            ("push", "every push to main"),
+        ):
+            if event in events and not _covers_main(events[event], event):
+                errors.append(f"{path}: CodeQL must run on {scope}")
     if "permissions" not in document or not _read_only(document["permissions"]):
         errors.append(f"{path}: top-level permissions must be present and read-only")
     if _schedules_cancel_each_other(document):
