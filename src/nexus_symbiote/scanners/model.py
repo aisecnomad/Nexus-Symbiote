@@ -294,6 +294,7 @@ _CREDENTIAL_PYTHON_STEM = re.compile(
 _HUB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,95})?")
 _CONFIG_STRING_FIELDS = ("peft_type", "quantization_method", "quant_method")
 SIGSTORE_METHOD = "sigstore-message-signature"
+OMS_DSSE_METHOD = "openssf-model-signing-dsse"
 DIGEST_PIN_METHOD = "digest-pin"
 DOCUMENTATION = "https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/model-integrity.md"
 UNUSED_ENTRY = "signature policy entry names no collected model weight file"
@@ -329,7 +330,7 @@ SHARED_DIGESTS_EXHAUSTED = (
     "scan records; those of this and later models are not recorded"
 )
 
-Verify = Callable[[Path, Path, str | None, str | None], VerificationResult]
+Verify = Callable[..., VerificationResult]
 
 
 # A file no model name rates is checked by its content under these names and suffixes.
@@ -562,9 +563,10 @@ def _zip_directory(
     one another reads. A reader that follows the specification reads the directory at
     the offset its end record stores. ``zipfile``, which ``np.load`` uses, reads the
     directory that ends where its end record starts and moves every member's offset by
-    the difference. When a ZIP64 locator precedes the end record, ``zipfile`` reads the
-    ZIP64 record right before the locator whatever the classic record holds, and other
-    readers the one at the locator's offset. Every reading that lists members is
+    the difference. When a ZIP64 locator precedes the end record, ``zipfile`` reads a
+    ZIP64 record whatever the classic record holds: the one at the locator's offset,
+    taking the bytes up to the locator as extensible data, and only when no record
+    starts there the one right before the locator. Every reading that lists members is
     returned, with the offset its directory starts at, its members' offsets as that
     reader moves them.
 
@@ -573,7 +575,8 @@ def _zip_directory(
     record with its comment and the ZIP64 records. ``read`` holds the bytes that end at
     ``consumed``, already read from the stream. ``None`` when no directory can be
     read, when any directory that lies within the archive is beyond that bound, as it
-    may list what the others do not, or when the stream ends before ``size``.
+    may list what the others do not, when a ZIP64 locator stores an offset before that
+    tail, or when the stream ends before ``size``.
     """
     tail: deque[bytes] = deque([read])
     held = len(read)
@@ -600,7 +603,12 @@ def _zip_directory(
     records = [(end_record, _little(data, end_record + 12, 4), _little(data, end_record + 16, 4))]
     locator = end_record - 20
     if locator >= 0 and data[locator : locator + 4] == b"PK\x06\x07":
-        for record in sorted({locator - 56, _little(data, locator + 8, 8) - start}):
+        stored = _little(data, locator + 8, 8) - start
+        if stored < 0:
+            # zipfile reads the record there over the one before the locator, and the
+            # tail does not hold it, so what zipfile lists is not decided.
+            return None
+        for record in sorted({locator - 56, stored}):
             if (
                 record >= 0
                 and record + 56 <= locator
@@ -1658,11 +1666,37 @@ def memoized(verify: Verify, results: dict[tuple[Any, ...], VerificationResult])
     """
 
     def cached(
-        artifact: Path, bundle: Path, identity: str | None, issuer: str | None
+        artifact: Path,
+        bundle: Path,
+        identity: str | None,
+        issuer: str | None,
+        *,
+        allow_oms_dsse: bool = False,
+        rekor_root_hash: str | None = None,
+        minimum_rekor_tree_size: int | None = None,
     ) -> VerificationResult:
-        key = (artifact, bundle, identity, issuer)
+        key = (
+            artifact,
+            bundle,
+            identity,
+            issuer,
+            allow_oms_dsse,
+            rekor_root_hash,
+            minimum_rekor_tree_size,
+        )
         if key not in results:
-            results[key] = verify(artifact, bundle, identity, issuer)
+            if allow_oms_dsse or rekor_root_hash is not None or minimum_rekor_tree_size is not None:
+                results[key] = verify(
+                    artifact,
+                    bundle,
+                    identity,
+                    issuer,
+                    allow_oms_dsse=allow_oms_dsse,
+                    rekor_root_hash=rekor_root_hash,
+                    minimum_rekor_tree_size=minimum_rekor_tree_size,
+                )
+            else:
+                results[key] = verify(artifact, bundle, identity, issuer)
         return results[key]
 
     return cached
@@ -1868,7 +1902,7 @@ def unused_policy_entries(
             continue
         identity = files.path_identity(relative)
         if identity is not None and identity == report:
-            if isinstance(policy, SigstoreArtifactPolicy):
+            if isinstance(policy, SigstoreArtifactPolicy) and not policy.allow_oms_dsse:
                 continue
             unused.append((relative.as_posix(), REPORT_ENTRY_KIND))
         elif identity is not None and identity in found:
@@ -1903,7 +1937,7 @@ def verify_weight_files(
     root: Path,
     policies: Mapping[Path, ArtifactPolicy],
     *,
-    verify: Callable[[Path, Path, str | None, str | None], VerificationResult],
+    verify: Verify,
     unbound: str | None = None,
 ) -> WeightVerification:
     """Verify every weight file against its operator policy entry, main file first.
@@ -1935,9 +1969,12 @@ def verify_weight_files(
             continue
         if policy.policy_digest is not None:
             refs.add(POLICY_REF_PREFIX + policy.policy_digest)
-        attempted.append(
-            DIGEST_PIN_METHOD if isinstance(policy, DigestPinPolicy) else SIGSTORE_METHOD
+        entry_method = (
+            DIGEST_PIN_METHOD
+            if isinstance(policy, DigestPinPolicy)
+            else (OMS_DSSE_METHOD if policy.allow_oms_dsse else SIGSTORE_METHOD)
         )
+        attempted.append(entry_method)
         if digest is None:
             rejected = True
             reason = "Artifact could not be hashed through the confined reader"
@@ -1956,12 +1993,27 @@ def verify_weight_files(
                 issues.append(("signature_verification_failed", reason, "error"))
             continue
         checked += 1
-        result = verify(
-            policy.artifact_path,
-            policy.bundle_path,
-            policy.expected_identity,
-            policy.expected_issuer,
-        )
+        if (
+            policy.allow_oms_dsse
+            or policy.rekor_root_hash is not None
+            or policy.minimum_rekor_tree_size is not None
+        ):
+            result = verify(
+                policy.artifact_path,
+                policy.bundle_path,
+                policy.expected_identity,
+                policy.expected_issuer,
+                allow_oms_dsse=policy.allow_oms_dsse,
+                rekor_root_hash=policy.rekor_root_hash,
+                minimum_rekor_tree_size=policy.minimum_rekor_tree_size,
+            )
+        else:
+            result = verify(
+                policy.artifact_path,
+                policy.bundle_path,
+                policy.expected_identity,
+                policy.expected_issuer,
+            )
         details = result.details or {}
         if result.error == SIGSTORE_MISSING:
             unavailable = True
@@ -1979,14 +2031,18 @@ def verify_weight_files(
             and pinned
         ):
             signatures += 1
-            methods[path] = SIGSTORE_METHOD
+            methods[path] = entry_method
             refs.update(
                 {
-                    f"{SIGSTORE_METHOD}:{label}@{digest}",
+                    f"{entry_method}:{label}@{digest}",
                     f"identity:{policy.expected_identity}",
                     f"issuer:{policy.expected_issuer}",
                 }
             )
+            if policy.rekor_root_hash is not None:
+                refs.add(f"rekor-root:{policy.rekor_root_hash}")
+            if policy.minimum_rekor_tree_size is not None:
+                refs.add(f"rekor-min-tree-size:{policy.minimum_rekor_tree_size}")
             bundle_digest = details.get("bundle_digest")
             if isinstance(bundle_digest, str):
                 refs.add(f"bundle:{_label(policy.bundle_path, root)}@{bundle_digest}")
@@ -2017,7 +2073,7 @@ def verify_weight_files(
             )
             for label in uncovered
         )
-    elif methods.get(main) == SIGSTORE_METHOD:
+    elif methods.get(main) in {SIGSTORE_METHOD, OMS_DSSE_METHOD}:
         status = SigningStatus.SIGSTORE_SIGNED
     else:
         status = SigningStatus.DIGEST_PINNED

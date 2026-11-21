@@ -160,25 +160,32 @@ def _identity(path: Path) -> tuple[int, int]:
 def _check_key_placement(
     keys: tuple[Path, ...], inputs: tuple[Path, ...], *, option: str, holders: str
 ) -> None:
-    """Refuse a trusted key that a change to a working tree around the inputs could supply.
+    """Refuse a trusted key that a change to a working tree or untrusted root could supply.
 
-    This catches misplacement, such as a key committed beside the contracts it is to
-    judge; it does not authenticate the key.
+    This catches misplacement, such as a key committed beside the contracts or inside
+    the project directory it is to judge; it does not authenticate the key.
     """
     try:
-        trees = _working_trees([*(path.resolve().parent for path in inputs), Path.cwd().resolve()])
-        untrusted = {_identity(tree) for tree in trees}
+        resolved_inputs = [path.resolve() for path in inputs]
+        dir_inputs = [p for p in resolved_inputs if p.is_dir()]
+        search_starts = [
+            *(p if p.is_dir() else p.parent for p in resolved_inputs),
+            Path.cwd().resolve(),
+        ]
+        trees = _working_trees(search_starts)
+        untrusted_dirs = [*trees, *(d for d in dir_inputs if d not in trees)]
+        untrusted = {_identity(d) for d in untrusted_dirs}
         for key in keys:
             resolved = key.resolve()
             # Device and inode also find the tree directory itself under a name the path
             # text misses, such as a case variant or a bind mount of the tree. A mount of
             # a directory or file inside a tree gives the key another location: not found.
             ancestors = {_identity(parent) for parent in resolved.parents}
-            if any(resolved.is_relative_to(tree) for tree in trees) or ancestors & untrusted:
+            if any(resolved.is_relative_to(d) for d in untrusted_dirs) or ancestors & untrusted:
                 raise click.UsageError(
                     f"a {option} file must lie outside every git working tree that holds "
-                    f"{holders} or the current directory; this catches misplacement, it "
-                    "does not authenticate the key"
+                    f"{holders} or the current directory, and outside {holders}; "
+                    "this catches misplacement, it does not authenticate the key"
                 )
             if os.stat(resolved).st_nlink != 1:
                 raise click.UsageError(

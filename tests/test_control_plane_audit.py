@@ -624,6 +624,21 @@ def test_unresolved_inputs_fail_closed_and_project_dir_resolves(tmp_path: Path) 
     assert [b["server_name"] for b in maps.bridged_servers] == ["r"]
 
 
+def test_parser_errors_do_not_copy_document_text_into_gaps(tmp_path: Path) -> None:
+    """A parser's own message can quote the document; the gap names only the failure."""
+    secret = "sk-ant-api03-" + "C" * 44
+    _write(tmp_path / "agent.yaml", f'name: "{secret}\n')
+    _write(tmp_path / ".mcp.json", "{not-json " + secret)
+    claims = tmp_path / "claims.json"
+    _write(claims, "{not-json " + secret)
+    summary = audit_project_control_plane(tmp_path, claims_path=claims)
+    rendered = "\n".join(summary.gaps)
+    assert secret not in rendered
+    assert "agent.yaml: invalid YAML" in summary.gaps
+    assert ".mcp.json: invalid JSON" in summary.gaps
+    assert "claims.json: invalid JSON" in summary.gaps
+
+
 def test_workflow_and_hook_scans_stay_linear() -> None:
     """The on-key rewrite, write classifier and YAML reader are linear in hostile input."""
     newlines = {k: "\n" * (20_000 * k) for k in (1, 4)}
@@ -673,7 +688,7 @@ def test_workspace_variables_installed_executables_and_unresolved_targets(tmp_pa
 
     _write(tmp_path / "decl/agent.yaml", "x: [" + "1, " * 20_000 + "1]\n")
     decl_gaps = audit_project_control_plane(tmp_path / "decl").gaps
-    assert decl_gaps == ["agent.yaml: YAML exceeds 20,000 tokens"]
+    assert decl_gaps == ["agent.yaml: invalid YAML"]
 
 
 def test_named_reads_lift_only_default_excludes(tmp_path: Path) -> None:
