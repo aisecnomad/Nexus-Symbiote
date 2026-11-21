@@ -386,7 +386,10 @@ def test_a_zip64_record_before_the_retained_tail_is_not_hidden_by_a_decoy(
     padding = 2 * model._ZIP_TAIL_BYTES if large else 4096
     archive = _zip64_extensible_decoy(decoy, real, padding)
     with zipfile.ZipFile(io.BytesIO(archive)) as opened:
-        assert opened.namelist() == [decoy[0].decode(), real[0].decode()]
+        names = [decoy[0].decode(), real[0].decode()]
+        # CPython 3.12.10 and newer patch versions can select different records.
+        # The scanner must conservatively classify the same archive on both.
+        assert opened.namelist() in (names[:1], names)
     expected = (
         (SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD)
         if large
