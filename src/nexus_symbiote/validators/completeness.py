@@ -312,6 +312,7 @@ class CompletenessValidator:
         *,
         exclude_paths: Sequence[str] = (),
         signature_policies: Sequence[SigstoreArtifactPolicy] = (),
+        accept_default_excludes: bool | tuple[str, ...] = False,
     ) -> CompletenessReport:
         """Recollect the supported static inventory under caller-selected scope.
 
@@ -335,6 +336,8 @@ class CompletenessValidator:
         incomplete = report.add_issue
         surfaces: list[str] = []
         excluded: list[str] = []
+        accepted_default_exclusions: set[str] = set()
+        accepted_default_names: set[str] = set()
         status: dict[str, str] = {}
         report_digest: str | None = None
 
@@ -344,7 +347,10 @@ class CompletenessValidator:
                 if scanner_type is ModelScanner
                 else scanner_type()
             )
-            scanner.configure(exclude_paths=exclude_paths)
+            scanner.configure(
+                exclude_paths=exclude_paths,
+                accept_default_excludes=accept_default_excludes,
+            )
             try:
                 local = scanner.scan(root)
             except Exception:
@@ -370,6 +376,8 @@ class CompletenessValidator:
                     failed = True
             surfaces.extend(local.surfaces_scanned)
             excluded.extend(local.surfaces_excluded)
+            accepted_default_exclusions.update(local.accepted_default_exclusions)
+            accepted_default_names.update(local.accepted_default_names)
             status[scanner.name] = (
                 "failed" if failed else "partial" if local.surfaces_excluded else "complete"
             )
@@ -390,7 +398,16 @@ class CompletenessValidator:
         )
         for reason in text_failures:
             incomplete("text_poisoning", f"Local collection incomplete: {reason}")
-        coverage = self._local_coverage(report_digest, surfaces, excluded, status, exclude_paths)
+        coverage = self._local_coverage(
+            report_digest,
+            surfaces,
+            excluded,
+            status,
+            [*exclude_paths, *accepted_default_exclusions],
+        )
+        coverage.unobserved_surfaces.extend(
+            f"accepted default exclusion: {name}" for name in sorted(accepted_default_names)
+        )
         report.assurance_level = coverage.assurance_level
         report.surfaces_covered = coverage.surfaces_scanned
         report.surfaces_missing = coverage.surfaces_excluded
@@ -539,7 +556,7 @@ class CompletenessValidator:
                 "Coverage claim asserts verified assurance; offline collection cannot "
                 "establish it.",
             )
-        missing = sorted(UNOBSERVED_SURFACES.difference(claim.unobserved_surfaces))
+        missing = sorted(set(local.unobserved_surfaces).difference(claim.unobserved_surfaces))
         if missing:
             report.add_issue(
                 COVERAGE_CLAIM,

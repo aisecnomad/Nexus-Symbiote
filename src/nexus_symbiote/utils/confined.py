@@ -24,6 +24,7 @@ from typing import Any, BinaryIO, NoReturn, Self, cast
 from nexus_symbiote import limits
 from nexus_symbiote.core.hashing import descriptor_binding, open_directory_nofollow
 from nexus_symbiote.limits import Bound
+from nexus_symbiote.scanner_catalog import INSTRUCTION_DIRECTORIES, SKILL_DIRECTORIES
 
 # Defaults only: a collection reads the operator's current limits when it is created.
 MAX_FILE_BYTES = limits.DEFAULTS.file_bytes
@@ -32,6 +33,10 @@ MAX_DEPTH = limits.DEFAULTS.depth
 MAX_TOTAL_BYTES = limits.DEFAULTS.total_bytes
 MAX_HASH_BYTES = limits.DEFAULTS.model_bytes
 DEFAULT_EXCLUDES = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv"})
+DEFAULT_EXCLUDE_REASON = "default collection exclude; not collected"
+AGENT_DEFAULT_EXCLUDE_REASON = (
+    "default-excluded name inside an agent configuration directory; not collected"
+)
 # A walk, a search of every source file, or a collector reading file after file can
 # fail once per entry. Past these bounds a collection, and a collector's own list of
 # failures or gaps, counts further ones instead of listing them, so a tree that
@@ -203,6 +208,21 @@ class _MessageLog:
         self.record(message)
         return True
 
+    def prefer(self, specific: str, generic: str) -> None:
+        """Upgrade a listed reason without moving the bounded log's overflow row."""
+        if specific in self:
+            return
+        if generic in self:
+            growth = len(specific) - len(generic)
+            if not self._bounded or self._characters + growth <= MAX_LISTED_FAILURE_CHARACTERS:
+                self.messages[self.messages.index(generic)] = specific
+                self._seen.remove(generic)
+                self._seen.add(specific)
+                if self._bounded:
+                    self._characters += growth
+                return
+        self.add(specific)
+
 
 class BoundedRecords(list[str]):
     """A collector's failures or gaps, listed within the listing bounds.
@@ -324,6 +344,17 @@ def _default_excluded(name: str) -> bool:
     """Whether a path component is one of ``DEFAULT_EXCLUDES``, in any spelling a
     case-insensitive file system treats as the same name."""
     return name in DEFAULT_EXCLUDES or fold_name(name) in DEFAULT_EXCLUDES
+
+
+def _under_agent_configuration_directory(relative: Path) -> bool:
+    """Use the prompt collector's coverage reason for paths it would also report."""
+    parent = relative.parent.as_posix()
+    if parent == ".":
+        return False
+    for directory in (*INSTRUCTION_DIRECTORIES, *SKILL_DIRECTORIES):
+        if parent == directory or parent.startswith(directory + "/"):
+            return True
+    return False
 
 
 def _lexical_target(directory: Path, text: str) -> Path:
@@ -499,6 +530,8 @@ class ConfinedCollection:
         exclusions: list[str] | None = None,
         *,
         exclude_paths: Iterable[str | Path] = (),
+        accept_default_excludes: bool | tuple[str, ...] = False,
+        accepted_default_exclusions: list[str] | None = None,
         max_file_bytes: int | Bound | None = None,
         max_entries: int | Bound | None = None,
         max_depth: int | Bound | None = None,
@@ -550,6 +583,13 @@ class ConfinedCollection:
         self._excluded: set[tuple[str, ...]] = set()
         self._invalid_policy = False
         self._lifted: frozenset[str] = frozenset()
+        self._accepted_default_names = (
+            DEFAULT_EXCLUDES
+            if accept_default_excludes is True
+            else frozenset(accept_default_excludes or ())
+        )
+        self._accepted_default_exclusions = accepted_default_exclusions
+        self.accepted_default_names: set[str] = set()
         root_text = str(self.root)
         prefix = root_text.rstrip(os.sep) + os.sep
         for value in exclude_paths:
@@ -720,6 +760,33 @@ class ConfinedCollection:
         if denied:
             self._exclusion_log.add(f"{relative}: excluded by collection policy")
         return denied
+
+    def _default_exclude_occupied(self, directory_fd: int, name: str) -> bool:
+        """Whether a default-excluded entry holds something collection would have read.
+
+        An empty directory is not a gap. A regular file, a symlink, any other
+        non-directory, a directory that cannot be listed, and a directory with at
+        least one entry are. The check does not follow a symlink and does not
+        charge the entry budget: it stops at the first entry.
+        """
+        try:
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError:
+            return True
+        if not stat.S_ISDIR(metadata.st_mode):
+            return True
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        try:
+            child_fd = os.open(name, flags, dir_fd=directory_fd)
+        except OSError:
+            return True
+        try:
+            with os.scandir(child_fd) as stream:
+                return next(stream, None) is not None
+        except OSError:
+            return True
+        finally:
+            os.close(child_fd)
 
     def _has_exact_name(self, directory_fd: int, name: str) -> bool:
         """Whether ``directory_fd`` holds an entry whose exact spelling is ``name``."""
@@ -1126,8 +1193,11 @@ class ConfinedCollection:
         would follow a second link. ``directory_links`` collects the directory
         symlinks the walk met, and ``skipped`` the entries it neither entered nor
         yielded because their name is one of ``DEFAULT_EXCLUDES``, in any spelling a
-        case-insensitive file system treats as that name, which nothing records
-        otherwise. Every other symlink is a recorded failure. A directory whose
+        case-insensitive file system treats as that name. A non-empty one of those
+        entries is also a coverage gap, unless the collection was told to accept
+        default excludes or ``skipped`` is set so the caller reports it. An empty
+        directory is not a gap. Every other symlink is a recorded
+        failure. A directory whose
         ``st_dev`` differs from the root's is a mount point, recorded as excluded and
         not entered; regular files are not refused for their device alone. Past the
         collection's listing bounds, the walk's per-entry failures end it as one line
@@ -1205,6 +1275,25 @@ class ConfinedCollection:
                 if self.excluded(child):
                     if scope.skipped is not None and _default_excluded(name):
                         scope.skipped.append(child)
+                    # A caller that collects skipped reports the entry itself.
+                    if (
+                        scope.skipped is None
+                        and _default_excluded(name)
+                        and self._default_exclude_occupied(directory_fd, name)
+                    ):
+                        in_agent_config = _under_agent_configuration_directory(child)
+                        canonical = fold_name(name)
+                        if not in_agent_config and canonical in self._accepted_default_names:
+                            self.accepted_default_names.add(canonical)
+                            if self._accepted_default_exclusions is not None:
+                                self._accepted_default_exclusions.append(child.as_posix())
+                        else:
+                            reason = (
+                                AGENT_DEFAULT_EXCLUDE_REASON
+                                if in_agent_config
+                                else DEFAULT_EXCLUDE_REASON
+                            )
+                            self._exclusion_log.add(f"{child.as_posix()}: {reason}")
                     continue
                 metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 if (
@@ -1651,6 +1740,12 @@ class ConfinedCollection:
         if not target.parts or len(target.parts) > self.max_depth or self.excluded(target):
             return None
         return target
+
+    def report_agent_default_exclude(self, path: Path) -> None:
+        relative = path.as_posix()
+        self._exclusion_log.prefer(
+            f"{relative}: {AGENT_DEFAULT_EXCLUDE_REASON}", f"{relative}: {DEFAULT_EXCLUDE_REASON}"
+        )
 
     def report_case_variant(self, variant: str | Path, path: str | Path) -> None:
         """Record ``variant``, another spelling of ``path`` found by a walk, as a failure.

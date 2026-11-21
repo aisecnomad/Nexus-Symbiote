@@ -325,6 +325,7 @@ jobs:
           set -euo pipefail
           fixtures=action-fixtures
           mkdir -p "$fixtures/passing" "$fixtures/failing/models" "$fixtures/hostile/models"
+          git init -q "$fixtures/passing"
           for fixture in passing failing hostile; do
             printf 'Use the configured tools.\n' > "$fixtures/$fixture/CLAUDE.md"
             printf 'name: Demo\ninstructions: [CLAUDE.md]\n' > "$fixtures/$fixture/agent.yaml"

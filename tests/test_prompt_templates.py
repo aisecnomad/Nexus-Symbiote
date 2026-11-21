@@ -19,6 +19,7 @@ from nexus_symbiote.scanners.prompt import (
     PromptScanner,
     withholds_content_hash,
 )
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES
 from tests.support import scaling_ratio
 
 RLO = "\u202e"
@@ -140,7 +141,18 @@ def test_skipped_trees_and_other_names_are_not_collected(tmp_path, relative):
     _write(tmp_path, "prompts/kept.md", "Kept.")
     result = PromptScanner().scan(tmp_path)
     assert not result.scan_failures
-    assert not result.surfaces_excluded
+    prefix = next(
+        (
+            Path(*Path(relative).parts[: index + 1]).as_posix()
+            for index, part in enumerate(Path(relative).parts)
+            if part in DEFAULT_EXCLUDES
+        ),
+        None,
+    )
+    if prefix is None:
+        assert not result.surfaces_excluded
+    else:
+        assert result.surfaces_excluded == [f"{prefix}: default collection exclude; not collected"]
     assert set(_components(result)) == {"prompt:prompts/kept.md"}
     assert relative not in result.surfaces_scanned
 

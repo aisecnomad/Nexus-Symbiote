@@ -430,6 +430,8 @@ nexus-symbiote baseline [OPTIONS] [PROJECT_PATH]
 | Option | Description |
 |---|---|
 | `-o`, `--baseline-path` `PATH` | Where to write the unsigned baseline (default: .nexus-symbiote-baseline.json, in the working directory, not the project). |
+| `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. |
+| `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`), as `scan` does. The staged inventory is still re-gated, so this flag is what keeps that gap out of the baseline. An empty directory does not. |
 | `--no-project-policy` | Use built-in policy without reading configuration from the target, as scan does. |
 | `--accept-project-policy` | In CI, accept a project policy that weakens the built-in gates explicitly; without it such a policy fails the command there (exit 1). Interactive runs only warn. |
 | `--signature-policy` `FILE` | Explicit operator signer policy JSON, kept outside the project, as for scan; also verifies any merged ShadowScan discovery report. |
@@ -725,6 +727,8 @@ nexus-symbiote risk [OPTIONS] AIBOM_PATH
 | `--project` `DIRECTORY` | Reconcile the supplied BOM against this project's static evidence before scoring; a failed reconciliation reports an unknown risk level and a null score. The only source of a project policy: without it the built-in policy applies |
 | `--signature-policy` `FILE` | Explicit operator signer policy for model recollection; requires --project |
 | `--fail-on-severity` `critical\|high\|medium\|low\|info\|none` | Fail on any finding at or above this severity (default: from policy, built-in critical); none disables it. |
+| `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. |
+| `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`). Without this flag such an entry makes coverage partial. An empty directory does not. |
 | `--no-project-policy` | Use built-in policy without reading configuration from the target. |
 | `--accept-project-policy` | In CI, accept a project policy that weakens the built-in gates explicitly; without it such a policy fails the command there (exit 1). Interactive runs only warn. |
 | `--require-discovery-signature` | Require the operator signature policy to verify any ShadowScan report the inventory records or the project contains, whatever the project policy says; requires --project. JSON output reports the result as `discovery_producer` |
@@ -894,6 +898,8 @@ nexus-symbiote scan [OPTIONS] [PROJECT_PATH]
 | `--report-only` | Emit findings and collection failures without a CI failure. With `--check`, unverified discovery evidence and a failed producer check still exit 1. |
 | `--check` | Collect and apply the scan gate without writing an inventory. Cannot be combined with `-o`. |
 | `--signature-policy` `PATH` | Explicit operator signer policy JSON |
+| `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. |
+| `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`). Without this flag such an entry makes coverage partial. An empty directory does not. |
 | `--no-project-policy` | Use built-in policy without reading configuration from the target. |
 | `--accept-project-policy` | In CI, accept a project policy that weakens the built-in gates explicitly; without it such a policy fails the command there (exit 1). Interactive runs only warn. |
 | `--fail-on-unsigned-discovery` | With `--check`, exit with status 1 when ShadowScan discovery evidence is unverified. |
@@ -993,6 +999,8 @@ nexus-symbiote validate [OPTIONS] AIBOM_PATH
 |---|---|
 | `--project` `DIRECTORY` | Project root for cross-validation. The only source of a project policy: without it the built-in policy applies |
 | `--signature-policy` `PATH` | Explicit operator signer policy JSON; requires --project |
+| `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. |
+| `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`). Without this flag such an entry makes coverage partial. An empty directory does not. |
 | `--no-project-policy` | Use built-in policy without reading configuration from the target. |
 | `--accept-project-policy` | In CI, accept a project policy that weakens the built-in gates explicitly; without it such a policy fails the command there (exit 1). Interactive runs only warn. |
 | `--skip-integrity` | Check completeness only and report integrity as skipped, for a repository whose models cannot be signed yet. The skip is printed and recorded in `--json-output`. |
