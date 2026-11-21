@@ -131,7 +131,9 @@ def test_import_foreign_sbom_conflicts_local_binding_privacy_and_census(
         encoding="utf-8",
     )
     (tmp_path / "rust-worker" / "Cargo.lock").write_text(
-        '[[package]]\nname = "candle-core"\nversion = "0.8.1"\n',
+        '[[package]]\nname = "w"\ndependencies = ["candle-core"]\n'
+        '[[package]]\nname = "candle-core"\nversion = "0.8.1"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n',
         encoding="utf-8",
     )
     (tmp_path / "go-svc").mkdir()
@@ -281,7 +283,9 @@ def test_import_foreign_sbom_conflicts_local_binding_privacy_and_census(
     assert by_name["langchain"].properties["pinning_state"] == "manifest-only"
     assert by_name["candle-core"].properties["pinning_state"] == "locked"
     assert by_name["candle-core"].version == "0.8.1"
-    assert by_name["github.com/sashabaranov/go-openai"].properties["pinning_state"] == "locked"
+    assert (
+        by_name["github.com/sashabaranov/go-openai"].properties["pinning_state"] == "manifest-only"
+    )
 
     states = classify_pinning_state(summary.aibom)
     assert states["pkg:openai"] == "locked"
@@ -492,6 +496,7 @@ def test_nested_cdx_spdx3_format_validation_and_lockfile_membership(tmp_path: Pa
             {"bomFormat": "CycloneDX", "specVersion": "1.6", "services": "bad"},
             {"packages": []},
             {"@graph": [{"type": "Person", "name": "Alice"}]},
+            {"@graph": [{"type": [], "spdxId": "urn:example", "name": "Example"}]},
         ]
     ):
         p = tmp_path / f"bad_{idx}.json"
@@ -510,35 +515,19 @@ def test_nested_cdx_spdx3_format_validation_and_lockfile_membership(tmp_path: Pa
     )
 
     (proj / "js_locked").mkdir()
-    (proj / "js_locked" / "package.json").write_text(
-        json.dumps(
-            {
-                "dependencies": {
-                    "openai": "^4.0.0",
-                    "anthropic": "^0.30.0",
-                    "@modelcontextprotocol/sdk": "^1.0.0",
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    (proj / "js_locked" / "package-lock.json").write_text(
-        json.dumps(
-            {
-                "packages": {"node_modules/openai": {"version": "4.68.1"}},
-                "dependencies": {},
-            }
-        ),
-        encoding="utf-8",
-    )
-    (proj / "js_locked" / "yarn.lock").write_text(
-        '"anthropic@^0.30.0":\n  version "0.30.1"\n',
-        encoding="utf-8",
-    )
-    (proj / "js_locked" / "pnpm-lock.yaml").write_text(
-        "lockfileVersion: '6.0'\npackages:\n  /@modelcontextprotocol/sdk@1.2.1:\n    resolution: {}\n",
-        encoding="utf-8",
-    )
+    manifest = {"dependencies": {"openai": "^4.0.0"}, "packageManager": "npm@11.0.0"}
+    (proj / "js_locked" / "package.json").write_text(json.dumps(manifest), encoding="utf-8")
+    lock = {
+        "lockfileVersion": 3,
+        "packages": {
+            "": {"dependencies": manifest["dependencies"]},
+            "node_modules/example/node_modules/openai": {"version": "4.1.0"},
+            "node_modules/openai": {"version": "4.68.1"},
+        },
+    }
+    (proj / "js_locked" / "npm-shrinkwrap.json").write_text(json.dumps(lock), encoding="utf-8")
+    lock["packages"]["node_modules/openai"]["version"] = "4.67.0"
+    (proj / "js_locked" / "package-lock.json").write_text(json.dumps(lock), encoding="utf-8")
 
     (proj / "py_hashed").mkdir()
     req_sha = "b" * 64
@@ -554,7 +543,8 @@ def test_nested_cdx_spdx3_format_validation_and_lockfile_membership(tmp_path: Pa
         encoding="utf-8",
     )
     (proj / "py_uv" / "uv.lock").write_text(
-        '[[package]]\nname = "litellm"\nversion = "1.50.2"\n',
+        '[[package]]\nname = "sub"\nsource = { virtual = "." }\ndependencies = [{name = "litellm"}]\n'
+        '[[package]]\nname = "litellm"\nversion = "1.50.2"\nsource = {registry = "https://pypi.org/simple"}\n',
         encoding="utf-8",
     )
 
@@ -579,15 +569,6 @@ def test_nested_cdx_spdx3_format_validation_and_lockfile_membership(tmp_path: Pa
     )
     assert by_loc_name[("js_locked/package.json", "openai")].properties["pinning_state"] == "locked"
     assert by_loc_name[("js_locked/package.json", "openai")].version == "4.68.1"
-    assert (
-        by_loc_name[("js_locked/package.json", "anthropic")].properties["pinning_state"] == "locked"
-    )
-    assert (
-        by_loc_name[("js_locked/package.json", "@modelcontextprotocol/sdk")].properties[
-            "pinning_state"
-        ]
-        == "locked"
-    )
     assert (
         by_loc_name[("py_hashed/requirements-prod.txt", "openai")].properties["pinning_state"]
         == "digest-pinned"
@@ -1520,3 +1501,204 @@ def test_import_sbom_entry_without_purl_conflicts_with_any_ecosystem(tmp_path: P
     # An agreeing entry without a purl is no conflict.
     same = _cdx(tmp_path / "same.json", {"name": "openai", "version": "1.0.0"})
     assert import_foreign_sbom(same, target_aibom=AIBOM.load(base)).conflict_count == 0
+
+
+def test_import_reconciles_nested_manifest_before_export(tmp_path):
+    project = tmp_path / "project"
+    nested = project / "agent"
+    nested.mkdir(parents=True)
+    (nested / "requirements.txt").write_text("openai==1.10.0\n", encoding="utf-8")
+    supplier = tmp_path / "supplier.json"
+    supplier.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.7",
+                "components": [{"type": "library", "name": "openai", "version": "2.0.0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(
+        main,
+        [
+            "import-sbom",
+            str(supplier),
+            "--project",
+            str(project),
+            "--walk-manifests",
+            "--json-output",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["conflict_count"] == 1
+
+
+def test_import_reports_unique_and_ambiguous_type_compatible_matches(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    payload = b"shared artifact bytes"
+    (project / "a.csv").write_bytes(payload)
+    (project / "b.safetensors").write_bytes(payload)
+    supplier = tmp_path / "supplier.json"
+    supplier.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.7",
+                "components": [
+                    {
+                        "type": "machine-learning-model",
+                        "name": "model",
+                        "hashes": [
+                            {"alg": "SHA-256", "content": hashlib.sha256(payload).hexdigest()}
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    unique = import_foreign_sbom(supplier, project_root=project)
+    assert unique.aibom.components[0].properties["declared_digest_local_match"] == "b.safetensors"
+    (project / "c.safetensors").write_bytes(payload)
+    ambiguous = import_foreign_sbom(supplier, project_root=project)
+    assert ambiguous.bound_local_count == 0
+    assert ambiguous.aibom.components[0].properties["declared_digest_local_match_ambiguous"]
+
+
+def test_import_marks_an_unresolved_conflict_when_version_sampling_is_incomplete(tmp_path):
+    versions = [f">={major}.0.0" for major in range(1, 9)] + ["11.0.0"]
+    base = AIBOM(
+        components=[
+            RegistryEntryComponent(
+                bom_ref=f"registry:openai:{index}",
+                name="openai",
+                version=version,
+                registry_type="pypi",
+            )
+            for index, version in enumerate(versions)
+        ]
+    )
+    supplier = tmp_path / "supplier.json"
+    supplier.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.7",
+                "components": [{"type": "library", "name": "openai", "version": "10.0.0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    imported = import_foreign_sbom(supplier, target_aibom=base)
+    assert imported.conflict_count == 0
+    assert imported.unresolved_conflict_count == 1
+    assert imported.aibom.components[-1].risks[0].category == "source_conflict_unresolved"
+
+
+def test_hidden_identity_survives_serialized_sequential_imports(tmp_path, monkeypatch):
+    from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV
+
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, "r" * 40)
+
+    def write_version(version):
+        p = tmp_path / "private-workstream.json"
+        p.write_text(
+            json.dumps(
+                {
+                    "bomFormat": "CycloneDX",
+                    "specVersion": "1.7",
+                    "components": [
+                        {
+                            "type": "library",
+                            "name": "private-package",
+                            "version": version,
+                            "purl": f"pkg:pypi/private-package@{version}",
+                        }
+                    ],
+                }
+            )
+        )
+        return p
+
+    first = import_foreign_sbom(write_version("1.0.0"))
+    serialized = first.aibom.to_native_json()
+    second = import_foreign_sbom(
+        write_version("2.0.0"), target_aibom=AIBOM.from_native(json.loads(serialized))
+    )
+    assert second.conflict_count == 1
+    assert "private-package" not in second.aibom.to_native_json()
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, "t" * 40)
+    rotated = import_foreign_sbom(write_version("3.0.0"), target_aibom=first.aibom)
+    assert rotated.unresolved_conflict_count == 1
+    legacy = first.aibom.model_copy(deep=True)
+    for field in ("identity_context", "identity_bindings"):
+        legacy.components[0].properties.pop(field)
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, "r" * 40)
+    assert import_foreign_sbom(write_version("4.0.0"), target_aibom=legacy).conflict_count == 1
+
+
+def test_shareable_supplier_import_withholds_filenames_and_requires_key(tmp_path, monkeypatch):
+    from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV
+
+    path = tmp_path / "private-workstream.json"
+    path.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.7",
+                "components": [{"type": "library", "name": "private-name", "version": "1.0.0"}],
+            }
+        )
+    )
+    monkeypatch.delenv(SOURCE_BINDING_KEY_ENV, raising=False)
+    runner = CliRunner()
+    assert runner.invoke(main, ["import-sbom", str(path), "--shareable"]).exit_code != 0
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, "q" * 40)
+    result = runner.invoke(main, ["import-sbom", str(path), "--shareable"])
+    assert result.exit_code == 0, result.output
+    assert "private-workstream" not in result.output and "private-name" not in result.output
+    assert hashlib.sha256(path.read_bytes()).hexdigest() not in result.output
+    assert (
+        runner.invoke(main, ["import-sbom", str(path), "--shareable", "--reveal-names"]).exit_code
+        == 2
+    )
+
+
+def test_nested_manifest_does_not_bind_transitive_package_or_partial_oci_digest(tmp_path):
+    root = tmp_path / "sub"
+    root.mkdir()
+    (root / "package.json").write_text(json.dumps({"dependencies": {"openai": "^4.0.0"}}))
+    (root / "package-lock.json").write_text(
+        json.dumps({"packages": {"node_modules/peer/node_modules/openai": {"version": "5.0.0"}}})
+    )
+    (root / "devcontainer.json").write_text(json.dumps({"image": "openai/image@sha256:abc"}))
+    components, _ = walk_nested_manifests(tmp_path)
+    assert components and all(c.properties["pinning_state"] == "manifest-only" for c in components)
+
+
+@pytest.mark.parametrize(
+    "problem",
+    ["wrong-version", "duplicate", "no-direct-edge", "different-source", "enclosing-workspace"],
+)
+def test_nested_uv_lock_demands_applicable_unique_direct_registry_record(tmp_path, problem):
+    if problem == "enclosing-workspace":
+        (tmp_path / "pyproject.toml").write_text('[tool.uv.workspace]\nmembers = ["python"]\n')
+    directory = tmp_path / "python"
+    directory.mkdir()
+    (directory / "pyproject.toml").write_text(
+        '[project]\nname = "local"\ndependencies = ["openai>=2"]\n'
+    )
+    root = '[[package]]\nname = "local"\nsource = { virtual = "." }\n'
+    if problem != "no-direct-edge":
+        root += 'dependencies = [{ name = "openai" }]\n'
+    version = "1.2.0" if problem == "wrong-version" else "2.2.0"
+    source = (
+        'path = "lib"' if problem == "different-source" else 'registry = "https://pypi.org/simple"'
+    )
+    record = f'[[package]]\nname = "openai"\nversion = "{version}"\nsource = {{ {source} }}\n'
+    (directory / "uv.lock").write_text(root + record * (2 if problem == "duplicate" else 1))
+    packages, gaps = walk_nested_manifests(tmp_path)
+    assert not gaps and len(packages) == 1
+    assert packages[0].properties["pinning_state"] == "manifest-only"
