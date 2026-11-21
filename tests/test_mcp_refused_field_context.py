@@ -6,6 +6,8 @@ import json
 import pytest
 
 from nexus_symbiote.core.aibom import AIBOM
+from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
+from nexus_symbiote.generators.spdx import SPDXGenerator
 from nexus_symbiote.scanners.mcp import MCPScanner, _assignment_word_hits, _malformed_values
 from tests.test_mcp_redaction_boundaries import _echo, _scan
 
@@ -39,6 +41,29 @@ def test_scheme_settings_and_public_locators_do_not_report_a_credential(field, v
 def test_header_carrying_assignments_retain_real_scheme_evidence(label):
     marker = hashlib.sha256(b"public mock header value").hexdigest()[:32]
     assert any(value == marker for _, value in _assignment_word_hits(label + "=Bearer", marker))
+
+
+@pytest.mark.parametrize("name", ["AUTHZ", "CONN", "SESSION"])
+def test_split_scheme_credential_is_withheld_independent_of_assignment_name(tmp_path, name):
+    marker = hashlib.sha256(b"public split value example").hexdigest()[:32]
+    source = {"command": "node", "args": [f"{name}=Bearer", marker]}
+    result, inventory = _scan(tmp_path, {"source": source, "sibling": _echo(marker)})
+    assert any(
+        risk.category == "credential_exposure" and risk.severity == "high"
+        for component in result.components
+        for risk in component.risks
+    )
+    assert marker not in inventory.to_json()
+    assert marker not in json.dumps(CycloneDXGenerator().generate(inventory))
+    assert marker not in json.dumps(SPDXGenerator().generate(inventory))
+
+
+@pytest.mark.parametrize("field", ["headers", "http_headers", "auth", "oauth"])
+@pytest.mark.parametrize("key", ["name", "key"])
+def test_noncredential_record_does_not_inherit_container_authentication_context(field, key):
+    marker = hashlib.sha256(b"public metadata value example").hexdigest()[:32]
+    node = {field: [{key: "Content-Version", "value": marker}]}
+    assert marker not in list(_malformed_values(node))
 
 
 @pytest.mark.parametrize("layout", ["pair", "named", "nested", "pw", "argv", "opencode"])

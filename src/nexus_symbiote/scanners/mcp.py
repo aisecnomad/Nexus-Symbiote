@@ -1058,6 +1058,7 @@ _ENDPOINT_QUERY_POSITION = "endpoint URL query"
 _ASSIGNMENT_FLAGS = frozenset({"env", "e", "build-arg"})
 # The scheme words _AUTH reads, after which cmd's `set NAME=<scheme> <credential>` splits.
 _ASSIGNMENT_SCHEMES = frozenset({"bearer", "basic", "token", "bot", "apikey", "api-key"})
+_SCHEME_DESCRIPTORS = frozenset({"type", "mode", "scheme", "method", "transport", "strategy"})
 # curl's `-u user:password`, also in a cluster of short flags (`-su`), and httpie's `-a`
 # (`--auth`) only under a fetcher. Under another command (docker -u www-data:www-data) the
 # part after the colon counts only when it reads as a literal under a non-password name.
@@ -1099,7 +1100,7 @@ def _explicit_header(previous: str | None, word: str) -> bool:
 
 def _scheme_assignment_name(name: str) -> bool:
     words = name_words(name)
-    if not words or words[-1] in {"type", "mode", "scheme", "method", "transport", "strategy"}:
+    if not words or words[-1] in _SCHEME_DESCRIPTORS:
         return False
     auth = {"auth", "authorization", "authentication", "oauth", "bearer", "bot"}
     return (
@@ -1150,7 +1151,8 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     if (
         following is not None
         and value.lower() in _ASSIGNMENT_SCHEMES
-        and _scheme_assignment_name(name)
+        and (words := name_words(name))
+        and words[-1] not in _SCHEME_DESCRIPTORS
         and not _following_option(following)
         and literal_value(following)
     ):
@@ -1338,9 +1340,16 @@ def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
                 isinstance(item.get(key), str) and _scheme_assignment_name(item[key])
                 for key in ("name", "key")
             )
-            label = "auth" if named_credential else name
+            label = "auth" if named_credential else ""
+            if (
+                not named_credential
+                and not {"name", "key"}.intersection(item)
+                and name.lower() not in {"auth", "oauth", "headers", "http_headers"}
+                and _scheme_assignment_name(name)
+            ):
+                label = name
             pending.extend(
-                (label if key in {"value", "values"} else str(key), value)
+                (label if label and key in {"value", "values"} else str(key), value)
                 for key, value in item.items()
             )
         elif isinstance(item, list):
