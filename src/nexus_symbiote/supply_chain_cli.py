@@ -225,7 +225,8 @@ def register_supply_chain_commands(main: click.Group) -> None:
             "where one can be created, which cleanup also kills; the server then fails "
             "with isolation-teardown-failed, unless the launcher runs as root or holds "
             "CAP_SYS_PTRACE or CAP_SYS_ADMIN, which can hide the escape. Never opt out as "
-            "root. Elsewhere cleanup is best effort. This is not a namespace or sandbox."
+            "root. Refused off Linux, where no launcher runs. This is not a namespace or "
+            "sandbox."
         ),
     )
     @click.option(
@@ -258,6 +259,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
         """
         modes.require_live("verify-live")
         from nexus_symbiote.core.hashing import hash_bytes, open_regular_file, parse_json_strict
+        from nexus_symbiote.live import pinned_process
         from nexus_symbiote.live.pinned_process import isolation_off
         from nexus_symbiote.live.verify import record_candidate, verify_mcp_servers
 
@@ -295,7 +297,14 @@ def register_supply_chain_commands(main: click.Group) -> None:
             bom = AIBOM.from_document(document)
         except (OSError, ValueError, TypeError, RecursionError):
             raise click.ClickException("invalid BOM or operator launch policy") from None
-        if no_isolation:
+        if no_isolation and not pinned_process.opt_out_supported():
+            # Each server is then refused as isolation-unavailable before it is executed.
+            click.echo(
+                "error: --no-isolation is refused off Linux: cleanup there could not reach "
+                "a process that leaves the launcher's process group, so no launcher runs.",
+                err=True,
+            )
+        elif no_isolation:
             click.echo(
                 "warning: --no-isolation: kernel PID containment is disabled. On Linux the "
                 "launcher runs in its own process group under a wrapper that stays its parent "
@@ -306,7 +315,8 @@ def register_supply_chain_commands(main: click.Group) -> None:
                 "one can be created, which cleanup also kills; the server then fails with "
                 "isolation-teardown-failed, unless the launcher runs as root or holds "
                 "CAP_SYS_PTRACE or CAP_SYS_ADMIN, which can hide the escape. Never opt out as "
-                "root. Elsewhere cleanup is best effort. This is not a namespace or sandbox.",
+                "root. Refused off Linux, where no launcher runs. This is not a namespace or "
+                "sandbox.",
                 err=True,
             )
             if _running_as_root():

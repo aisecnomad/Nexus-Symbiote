@@ -239,8 +239,10 @@ def test_every_marker_is_bound_by_digest_or_inventoried_as_an_instruction(tmp_pa
     # A marker added later without a reader would otherwise be recorded as present only.
     agent_directories = {*INSTRUCTION_DIRECTORIES, *SKILL_DIRECTORIES}
     for ide_type, config in IDE_AGENT_CONFIGS.items():
-        for marker in config["markers"]:
-            project = tmp_path / ide_type / marker.replace("/", "_")
+        for index, marker in enumerate(config["markers"]):
+            # Numbered: codex.md and CODEX.md would name one directory on a case-insensitive
+            # file system.
+            project = tmp_path / ide_type / f"{index}-{marker.replace('/', '_')}"
             if marker in agent_directories:
                 _write(project, f"{marker}/inside.md", "Rule.")
                 expected = f"{marker}/inside.md"
@@ -824,6 +826,13 @@ def test_marker_existence_checks_spend_no_byte_budget(tmp_path):
     project = tmp_path / "project"
     for marker in INSTRUCTION_MARKERS:
         _write(project, marker, b"#" * limits.DEFAULTS.file_bytes)
+    # A case-insensitive file system holds one of codex.md and CODEX.md.
+    present = {
+        marker
+        for marker in INSTRUCTION_MARKERS
+        if PurePosixPath(marker).name in os.listdir(project / PurePosixPath(marker).parent)
+    }
+    assert len(present) * limits.DEFAULTS.file_bytes > limits.DEFAULTS.total_bytes
     result = IDEAgentScanner().scan(project)
     assert result.scan_failures == []
     assert {c.ide_type for c in result.components} == {
@@ -835,7 +844,7 @@ def test_marker_existence_checks_spend_no_byte_budget(tmp_path):
         "gemini",
         "copilot",
     }
-    assert set(INSTRUCTION_MARKERS) <= set(result.surfaces_scanned)
+    assert present <= set(result.surfaces_scanned)
 
 
 def test_a_root_marker_spelled_otherwise_is_still_reported(tmp_path):

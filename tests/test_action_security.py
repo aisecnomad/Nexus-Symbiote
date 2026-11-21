@@ -208,12 +208,14 @@ def test_workflow_pins_structure_and_release_privilege_separation():
     assert set(jobs["publish"]["needs"]) == {"build", "attest", "verify"}
     assert jobs["publish"]["permissions"] == {"id-token": "write"}
     assert "id-token" not in jobs["verify"]["permissions"]
-    for name in ["compatibility", "attest", "verify", "publish"]:
+    for name in ["compatibility", "attest", "verify", "publish", "image"]:
         downloads = [s for s in jobs[name]["steps"] if "download-artifact" in s.get("uses", "")]
         assert downloads
         assert all(s["with"]["digest-mismatch"] == "error" for s in downloads)
-    for name in ["attest", "publish"]:
+    for name in ["attest", "publish", "image-attest"]:
         assert all("run" not in step for step in jobs[name]["steps"])
+    for name in jobs.keys() - {"attest", "publish", "image-attest"}:
+        assert "id-token" not in jobs[name].get("permissions", {})
 
 
 def test_release_floating_dependencies_cannot_replace_attestation_or_publication_inputs():

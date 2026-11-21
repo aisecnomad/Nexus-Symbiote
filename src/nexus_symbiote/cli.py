@@ -562,6 +562,20 @@ _HELP_ERRORS = tuple(
 )
 
 
+def supported_platform() -> bool:
+    """Whether this host has the no-follow, descriptor-relative opens confinement needs.
+
+    Windows has neither, and every command refuses to run there rather than reading,
+    hashing or writing with checks that cannot hold (SECURITY.md, "Platforms").
+    """
+    return (
+        os.name == "posix"
+        and hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+        and os.open in os.supports_dir_fd
+    )
+
+
 class _CollectionClickException(click.ClickException):
     """Collection, input, or internal failure under Decision 4 (--detailed-exit-codes -> 4)."""
 
@@ -871,6 +885,11 @@ def main(
     """
     ctx.meta[DEBUG_KEY] = debug_flag
     _apply_exit_code_flags(detailed_exit_codes, legacy_exit_codes)
+    if not supported_platform():
+        raise click.ClickException(
+            "unsupported platform: confined file access needs POSIX O_NOFOLLOW, O_DIRECTORY "
+            "and descriptor-relative opens, which this host lacks; Windows is not supported"
+        )
     try:
         requested = modes.resolve(offline=offline_flag, live=live_flag, environ=os.environ)
         collection_limits = limits.resolve(limit_settings, os.environ)

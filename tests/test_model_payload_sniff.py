@@ -7,6 +7,7 @@ import os
 import pickle
 import pickletools
 import random
+import struct
 import subprocess
 import sys
 import zipfile
@@ -1322,6 +1323,28 @@ def _unpickler(base: type) -> type:
             if isinstance(saved, tuple) and len(saved) > 1 and saved[0] in ("module", b"module"):
                 return saved[1]
             return object()
+
+    if hasattr(base, "dispatch"):
+        # The pure-Python unpickler allocates and zero-fills a BYTEARRAY8 of the declared
+        # length before reading it. Linux refuses 39 TiB at once with MemoryError; macOS
+        # grants it and the zero fill runs until the runner kills the test process. A
+        # length past the end of the data ends the pickle in an error either way, so it
+        # is refused before anything is allocated.
+        def load_bytearray8(self: Recording) -> None:
+            (length,) = struct.unpack("<Q", self.read(8))
+            if length > self.size:
+                raise pickle.UnpicklingError("pickle data was truncated")
+            buffer = bytearray(length)
+            self.readinto(buffer)
+            self.append(buffer)
+
+        def init(self: Recording, file: BinaryIO, **options: object) -> None:
+            base.__init__(self, file, **options)
+            view = getattr(file, "getbuffer", None)
+            self.size = len(view()) if view is not None else sys.maxsize
+
+        Recording.__init__ = init  # type: ignore[method-assign]
+        Recording.dispatch = {**base.dispatch, pickle.BYTEARRAY8[0]: load_bytearray8}
 
     return Recording
 
