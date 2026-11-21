@@ -390,9 +390,14 @@ consumed; a fresh approval does not establish that a retry is safe.
     `validation-timeout`, `validation-unavailable`, `validation-failed`).
 11. For a pinned tool with an `outputSchema`, preflight the schema and reserve a
     pending-response slot. Refuse unsupported schemas, cycles at the same result
-    location, paths deeper than 96 same-location applicators, or more than 1,024
-    same-location evaluation steps per subschema. This happens before an approval
-    nonce is consumed or the tool is called. Up to four responses can be pending.
+    location, or an evaluation stack deeper than 96 schema applications across
+    the supported result depth. The usual budget is 1,024 same-location steps per
+    subschema. Annotation collection for `unevaluatedProperties` or `unevaluatedItems`
+    counts a second pass over the applicators. An explicit `oneOf` or `anyOf` with
+    at least 16 alternatives, each taking at most 32 steps, can use up to 4,096
+    steps. A single enclosing applicator can carry that allowance. A refusal is
+    reported as `schema-invalid` before approval consumption or dispatch.
+    Up to four responses can be pending.
     A pending call releases its preflight worker. Its returned result takes
     priority for the next available worker and can wait up to 12 seconds.
 12. Authenticate again. The context must be unchanged (`identity-changed`).

@@ -28,6 +28,7 @@ MAX_JSON_NODES = 20_000
 # longest path and total expansion before dispatching an output-validated call.
 _MAX_OUTPUT_APPLICATOR_DEPTH = 96
 _MAX_OUTPUT_APPLICATOR_STEPS = 1024
+_MAX_OUTPUT_UNION_STEPS = 4096
 MAX_SAFE_INTEGER = 2**53 - 1
 # Interpreter start-up and imports get their own budget, so a slow or throttled
 # host does not spend the evaluation budget before the untrusted input arrives.
@@ -1045,10 +1046,23 @@ def _ignores_a_keyword(
 
 
 def _in_place_evaluation_exceeds_budget(schema: dict[str, Any], resolver: Any) -> bool:
-    """Bound the same-value call stack and DAG expansion before dispatch."""
+    """Bound the evaluator stack and repeated same-value work before dispatch."""
     pending = [schema]
     graph: dict[int, list[int]] = {}
-    maps = _SUBSCHEMA_MAPS - {"$defs", "definitions"}
+    descends: dict[int, list[int]] = {}
+    annotations: set[int] = set()
+    alternatives: set[int] = set()
+    value_keywords = {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "items",
+        "prefixItems",
+        "propertyNames",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "contentSchema",
+    }
     while pending:
         node = pending.pop()
         if not isinstance(node, dict) or id(node) in graph:
@@ -1056,13 +1070,27 @@ def _in_place_evaluation_exceeds_budget(schema: dict[str, Any], resolver: Any) -
         in_place = [child for child in _applied_in_place(node, resolver) if isinstance(child, dict)]
         graph[id(node)] = [id(child) for child in in_place]
         pending.extend(in_place)
-        # Inspect schemas applied to subvalues, too. The edge to each of these
-        # descends in the instance, so it does not participate in an in-place cycle.
+        if "unevaluatedItems" in node or "unevaluatedProperties" in node:
+            annotations.add(id(node))
+        # A wide list of explicitly written alternatives can do more linear work
+        # than a compact repeated reference. Keep a separate absolute ceiling.
+        variants = node.get("oneOf", node.get("anyOf"))
+        if (
+            isinstance(variants, list)
+            and len(variants) >= 16
+            and len(variants) == len(in_place)
+            and all(a is b for a, b in zip(variants, in_place, strict=True))
+        ):
+            alternatives.add(id(node))
+        subvalues: list[Any] = []
         for keyword, value in node.items():
-            if keyword in maps and isinstance(value, dict):
-                pending.extend(value.values())
-            elif keyword in _SUBSCHEMA | _SUBSCHEMA_LISTS:
-                pending.extend(value if isinstance(value, list) else [value])
+            if keyword in {"properties", "patternProperties"} and isinstance(value, dict):
+                subvalues.extend(value.values())
+            elif keyword in value_keywords:
+                subvalues.extend(value if isinstance(value, list) else [value])
+        value_schemas = [child for child in subvalues if isinstance(child, dict)]
+        descends[id(node)] = [id(child) for child in value_schemas]
+        pending.extend(value_schemas)
 
     incoming = dict.fromkeys(graph, 0)
     for edges in graph.values():
@@ -1081,15 +1109,37 @@ def _in_place_evaluation_exceeds_budget(schema: dict[str, Any], resolver: Any) -
         return True
     depths: dict[int, int] = {}
     steps: dict[int, int] = {}
+    limits: dict[int, int] = {}
     for current in reversed(topological):
         children = graph[current]
         depth = 1 + max((depths[c] for c in children), default=0)
         # Each reference can evaluate the shared child again. Saturate by
         # refusing as soon as a subproblem exceeds the budget.
-        work = 1 + sum(steps[c] for c in children)
-        if depth > _MAX_OUTPUT_APPLICATOR_DEPTH or work > _MAX_OUTPUT_APPLICATOR_STEPS:
+        # Collecting evaluated locations can visit the same applicators again.
+        work = 1 + (2 if current in annotations else 1) * sum(steps[c] for c in children)
+        limit = _MAX_OUTPUT_APPLICATOR_STEPS
+        if current not in annotations:
+            if current in alternatives and all(steps[c] <= 32 for c in children):
+                limit = _MAX_OUTPUT_UNION_STEPS
+            elif len(children) == 1:
+                limit = limits[children[0]]
+        if depth > _MAX_OUTPUT_APPLICATOR_DEPTH or work > limit:
             return True
         depths[current], steps[current] = depth, work
+        limits[current] = limit
+    # Recursion through a child of the instance is permitted. Account for the
+    # frames it adds across every possible level of the bounded JSON input.
+    for _ in range(MAX_JSON_DEPTH):
+        previous = depths
+        depths = {}
+        for current in reversed(topological):
+            at_value = max((depths[c] for c in graph[current]), default=0)
+            below_value = max((previous[c] for c in descends[current]), default=0)
+            depths[current] = 1 + max(at_value, below_value)
+            if depths[current] > _MAX_OUTPUT_APPLICATOR_DEPTH:
+                return True
+        if depths == previous:
+            break
     return False
 
 
