@@ -1172,6 +1172,15 @@ def collect_source_references(
     python = _Kind(_python_source, _python_candidate)
     clients = [_Kind(_script_source(suffix), _client_candidate) for suffix in _CLIENT_SUFFIXES]
     kinds = (servers, python, *clients)
+    local_agents = any(
+        path.suffix == ".py"
+        and (
+            path.parts[:1] == ("agents",)
+            or path.parts[:2] == ("src", "agents")
+            or path.as_posix() in {"agents.py", "src/agents.py"}
+        )
+        for path in sources
+    )
     eligible = [path for path in sources if any(kind.eligible(path) for kind in kinds)]
     # Root files first, as before, so what a lowered budget reads stays predictable.
     eligible.sort(key=lambda path: len(path.parts) > 1)
@@ -1244,7 +1253,7 @@ def collect_source_references(
             if len(nodes) > python_nodes.value:
                 fail(path, python_nodes.exceeded())
                 continue
-            collect_python_tools(tree, nodes, text, path, result, known)
+            collect_python_tools(tree, nodes, text, path, result, known, local_agents=local_agents)
             client = _python_client(tree)
             if client:
                 detected.append(location)

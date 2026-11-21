@@ -311,6 +311,15 @@ _FRAMEWORK_ROOTS = (
     "smolagents",
 )
 _FRAMEWORK_CLIENTS = ("agents.mcp", "pydantic_ai.mcp")
+_NON_REGISTERING_IMPORTS = frozenset(
+    {
+        ("agents", "ToolCallItem"),
+        ("agents", "set_default_openai_key"),
+        ("agents", "trace"),
+        ("langchain_core.tools", "ToolException"),
+        ("pydantic_ai", "capture_run_messages"),
+    }
+)
 # Agent constructor keywords that carry tools, or could; a prepare function can add,
 # rename or drop the tool definitions of each step.
 _AGENT_REGISTERING_KEYWORDS = frozenset(
@@ -770,7 +779,12 @@ def _reaches_low_level(nodes: list[ast.AST]) -> bool:
 
 
 def _report_import_scope(
-    imports: list[ast.ImportFrom], nodes: list[ast.AST], path: Path, result: ScanResult
+    imports: list[ast.ImportFrom],
+    nodes: list[ast.AST],
+    path: Path,
+    result: ScanResult,
+    *,
+    local_agents: bool,
 ) -> None:
     if _reaches_low_level(nodes):
         result.surfaces_excluded.append(
@@ -786,10 +800,11 @@ def _report_import_scope(
     ):
         result.surfaces_excluded.append(f"{path.as_posix()}: unresolved Python MCP factory import")
     qualified_sdk_import = any(
-        isinstance(node, ast.Import) and any(_framework_module(a.name) for a in node.names)
+        isinstance(node, ast.Import)
+        and any(_framework_module(a.name, local_agents=local_agents) for a in node.names)
         for node in nodes
     )
-    if qualified_sdk_import or _unrecognized_framework_import(imports, nodes):
+    if qualified_sdk_import or _unrecognized_framework_import(imports, nodes, local_agents):
         result.surfaces_excluded.append(f"{path.as_posix()}: unresolved Python SDK tool import")
 
 
@@ -797,11 +812,15 @@ def _under(module: str, roots: Sequence[str]) -> bool:
     return any(module == root or module.startswith(f"{root}.") for root in roots)
 
 
-def _framework_module(module: str) -> bool:
+def _framework_module(module: str, *, local_agents: bool) -> bool:
+    if local_agents and _under(module, ("agents",)):
+        return False
     return _under(module, _FRAMEWORK_ROOTS) and not _under(module, _FRAMEWORK_CLIENTS)
 
 
-def _unrecognized_framework_import(imports: list[ast.ImportFrom], nodes: list[ast.AST]) -> bool:
+def _unrecognized_framework_import(
+    imports: list[ast.ImportFrom], nodes: list[ast.AST], local_agents: bool
+) -> bool:
     """Whether the file imports from a framework something that can carry tools unseen.
 
     A star import counts, and so does any name the collector does not read tools from
@@ -813,10 +832,12 @@ def _unrecognized_framework_import(imports: list[ast.ImportFrom], nodes: list[as
     found: set[str] = set()
     for stmt in imports:
         module = stmt.module
-        if module is None or not _framework_module(module):
+        if module is None or not _framework_module(module, local_agents=local_agents):
             continue
         for a in stmt.names:
             if (module, a.name) in _DECORATOR_IMPORTS or (module, a.name) in _AGENT_FACTORIES:
+                continue
+            if (module, a.name) in _NON_REGISTERING_IMPORTS:
                 continue
             if a.name == "*":
                 return True
@@ -1181,10 +1202,26 @@ _TYPE_BUILTINS = _names(
     "bool bytearray bytes complex dict float frozenset int list memoryview object set str tuple"
     " type"
 )
-# Packages whose classes an annotation may combine with ``|`` or subscript as types.
-_TYPE_PACKAGES = frozenset(
-    {"mcp", "fastmcp", "langchain_mcp_adapters", *(root.split(".")[0] for root in _FRAMEWORK_ROOTS)}
+# Named SDK types with specific annotation semantics. Other imports from these
+# packages still need analysis when operators such as subscription evaluate them.
+_SDK_GENERICS = frozenset(
+    {
+        ("agents", "Agent"),
+        ("agents", "RunContextWrapper"),
+        ("agents.agent", "Agent"),
+        ("agents.run_context", "RunContextWrapper"),
+        ("fastmcp", "Context"),
+        ("fastmcp.server", "Context"),
+        ("fastmcp.server.context", "Context"),
+        ("mcp.server.fastmcp", "Context"),
+        ("mcp.server.fastmcp.server", "Context"),
+        ("mcp.server.mcpserver", "Context"),
+        ("pydantic_ai", "RunContext"),
+        ("pydantic_ai.tools", "RunContext"),
+        *_AGENT_FACTORIES,
+    }
 )
+_SDK_TYPES = _SDK_GENERICS | _FACTORIES
 
 
 class _TypeSyntax:
@@ -1194,44 +1231,58 @@ class _TypeSyntax:
     and FastMCP and ``typing.get_type_hints`` evaluate annotations whatever the
     ``__future__`` import says. So a union is set aside only when every member is
     pure type syntax: a constant, a name or attribute path that resolves to a
-    ``typing`` name, a builtin class, or a class imported from an SDK or framework
-    package, a subscript of one of those whose arguments are pure too, or such a
+    ``typing`` name, a builtin class, or a recognized SDK type, a subscript of
+    an applicable generic whose arguments are pure too, or such a
     union. Each node is decided once, so the work stays linear in the nodes.
     """
 
     def __init__(self, nodes: list[ast.AST]) -> None:
         self._names, self._roots = _typing_generics(nodes)
         bindings = _bindings(nodes)
-        imported: Counter[str] = Counter()
+        imported: dict[str, list[tuple[str, str]]] = {}
         for node in nodes:
-            if (
-                isinstance(node, ast.ImportFrom)
-                and not node.level
-                and (node.module or "").split(".")[0] in _TYPE_PACKAGES
-            ):
-                imported.update(alias.asname or alias.name for alias in node.names)
-        self._classes = {name for name, count in imported.items() if bindings[name] == count}
-        self._classes.update(name for name in _TYPE_BUILTINS if not bindings[name])
+            if isinstance(node, ast.ImportFrom) and not node.level and node.module is not None:
+                for alias in node.names:
+                    identity = (node.module, alias.name)
+                    if identity in _SDK_TYPES:
+                        imported.setdefault(alias.asname or alias.name, []).append(identity)
+        self._classes = {
+            name: paths[0]
+            for name, paths in imported.items()
+            if bindings[name] == len(paths) and len(set(paths)) == 1
+        }
+        self._builtins = {name for name in _TYPE_BUILTINS if not bindings[name]}
         self._pure: dict[ast.AST, bool] = {}
 
-    def _package_class(self, node: ast.expr) -> bool:
-        chain = _chain(node)
-        root = chain[-1] if chain is not None else None
-        if not isinstance(root, ast.Name):
-            return False
-        if root is node:
-            return root.id in self._classes
-        return root.id in self._roots and self._roots[root.id].split(".")[0] in _TYPE_PACKAGES
+    def _sdk_type(self, node: ast.expr) -> tuple[str, str] | None:
+        attributes: list[str] = []
+        while isinstance(node, ast.Attribute):
+            attributes.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return None
+        if not attributes:
+            return self._classes.get(node.id)
+        module = self._roots.get(node.id)
+        if module is None:
+            return None
+        return ".".join((module, *reversed(attributes[1:]))), attributes[0]
 
     def subscriptable(self, node: ast.expr) -> bool:
-        return _generic(node, self._names, self._roots) or self._package_class(node)
+        return _generic(node, self._names, self._roots) or self._sdk_type(node) in _SDK_GENERICS
 
     def _children(self, node: ast.AST) -> list[ast.AST] | None:
         """The parts whose purity decides ``node``'s, or None when it is not pure."""
         if isinstance(node, ast.Constant):
             return []
         if isinstance(node, (ast.Name, ast.Attribute)):
-            return [] if self.subscriptable(node) else None
+            if isinstance(node, ast.Name) and node.id in self._builtins:
+                return []
+            return (
+                []
+                if _generic(node, self._names, self._roots) or self._sdk_type(node) in _SDK_TYPES
+                else None
+            )
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
             return [node.left, node.right]
         if isinstance(node, ast.Subscript):
@@ -2054,6 +2105,8 @@ def collect_python_tools(
     path: Path,
     result: ScanResult,
     known: KnownValues | None = None,
+    *,
+    local_agents: bool = False,
 ) -> None:
     """Support direct SDK imports, module constructors and top-level decorators.
 
@@ -2086,7 +2139,7 @@ def collect_python_tools(
     parents = {child: node for node in nodes for child in ast.iter_child_nodes(node)}
     sdk_import = _imports_mcp_sdk(nodes)
     parsed = _parse_string_annotations(nodes, parents)
-    _report_import_scope(imports, nodes, path, result)
+    _report_import_scope(imports, nodes, path, result, local_agents=local_agents)
     _report_context_handles(parsed, sdk_import, bindings, path, result)
     _report_unused_factories(nodes, factories, path, result)
     if not factories and not decorators and not agent_factories:

@@ -575,6 +575,8 @@ def _creators(index: _Index) -> set[str]:
     """
     creators = {"createRequire"}
     for node in index.nodes:
+        if node.id in index.erased:
+            continue
         if node.type == "import_specifier":
             if _imported_name(node.child_by_field_name("name")) == "createRequire":
                 alias = node.child_by_field_name("alias")
@@ -582,7 +584,11 @@ def _creators(index: _Index) -> set[str]:
                     creators.add(_name(alias))
         elif node.type == "pair_pattern":
             if _literal_key(node.child_by_field_name("key")) == "createRequire":
-                creators.update(_pattern_names(node.child_by_field_name("value")))
+                target = node.child_by_field_name("value")
+                if target is not None and target.type == "assignment_pattern":
+                    target = target.child_by_field_name("left")
+                if (alias_name := _identifier(target)) is not None:
+                    creators.add(alias_name)
         elif node.type in {"variable_declarator", "assignment_expression"}:
             value = _operand(
                 node.child_by_field_name("value" if node.type == "variable_declarator" else "right")
@@ -594,7 +600,8 @@ def _creators(index: _Index) -> set[str]:
                 target = node.child_by_field_name(
                     "name" if node.type == "variable_declarator" else "left"
                 )
-                creators.update(_pattern_names(target))
+                if (alias_name := _identifier(target)) is not None:
+                    creators.add(alias_name)
     return creators
 
 
@@ -618,6 +625,8 @@ def _bindings(index: _Index, root: Node) -> _Declarations:
             found.gaps.append((at, _UNSUPPORTED_BINDING))
 
     for node in index.nodes:
+        if node.id in index.erased:
+            continue
         parent = index.parent(node)
         at_root = parent is not None and parent.id == root.id
         if node.type == "import_statement" and at_root:
@@ -652,7 +661,7 @@ def _bindings(index: _Index, root: Node) -> _Declarations:
                 "parameter"
             )
             for parameter in _pattern_names(parameters):
-                bind(node, parameter, "other", node)
+                bind(node, parameter, "parameter", node)
         elif node.type in {"class_declaration", "enum_declaration"}:
             bind(index.scope(parent), _name(node.child_by_field_name("name")), "other", node)
         elif node.type == "catch_clause":
@@ -1144,6 +1153,12 @@ def _collect_source(
         resolver.bind(scope, receiver, (server, node.end_byte))
         servers[node.id] = (server, node.end_byte)
     components: list[MCPServerComponent | ToolComponent] = [s for s, _ in servers.values()]
+    aliases = {
+        node.id
+        for node in index.nodes
+        if node.type == "variable_declarator"
+        and _identifier(_operand(node.child_by_field_name("value"))) is not None
+    }
     registrations = 0
     for node in index.nodes:
         if node.type != "call_expression" or node.id in index.erased:
@@ -1156,14 +1171,19 @@ def _collect_source(
             continue
         receiver_node = member.child_by_field_name("object")
         if method is None:
-            # A computed name may spell either registration method, so a wrapped server
-            # counts, and in a file with a server so does a receiver no binding names.
+            # A computed method may register a tool. A parameter or alias in a server
+            # file can carry a server whose exact binding remains unproved.
             computed = resolver.lookup(_operand(receiver_node))
             if isinstance(computed, tuple):
                 result.surfaces_excluded.append(
                     f"{location}:{node.start_point.row + 1} (unresolved MCP method name)"
                 )
-            elif servers and computed is None:
+            elif servers and (
+                (computed is None and _identifier(receiver_node) not in {"Math", "console"})
+                or computed == "parameter"
+                or computed == "ambiguous"
+                or (isinstance(computed, int) and computed in aliases)
+            ):
                 result.surfaces_excluded.append(
                     f"{location}:{node.start_point.row + 1} (unresolved MCP registration receiver)"
                 )
