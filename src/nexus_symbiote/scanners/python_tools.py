@@ -31,6 +31,28 @@ def _names(words: str) -> frozenset[str]:
     return frozenset(words.split())
 
 
+class _ProjectImports(NamedTuple):
+    """Python modules found by the confined source walk on common import paths."""
+
+    sources: frozenset[Path]
+    roots: tuple[Path, ...]
+
+    def has_module(self, module: str) -> bool:
+        relative = Path(*module.split("."))
+        return any(
+            root / relative.with_suffix(".py") in self.sources
+            or root / relative / "__init__.py" in self.sources
+            for root in self.roots
+        )
+
+    def shadows(self, module: str) -> bool:
+        while module:
+            if self.has_module(module):
+                return True
+            module = module.rpartition(".")[0]
+        return False
+
+
 _FACTORIES = {
     ("mcp.server", "FastMCP"),
     ("mcp.server.fastmcp", "FastMCP"),
@@ -314,10 +336,19 @@ _FRAMEWORK_CLIENTS = ("agents.mcp", "pydantic_ai.mcp")
 _NON_REGISTERING_IMPORTS = frozenset(
     {
         ("agents", "ToolCallItem"),
+        ("agents", "ToolCallOutputItem"),
+        ("agents", "custom_span"),
+        ("agents", "gen_trace_id"),
+        ("agents", "set_default_openai_client"),
         ("agents", "set_default_openai_key"),
+        ("agents", "set_tracing_disabled"),
         ("agents", "trace"),
+        ("agents.items", "ToolCallItem"),
+        ("agents.tracing", "trace"),
+        ("langchain_core.tools", "InjectedToolCallId"),
         ("langchain_core.tools", "ToolException"),
         ("pydantic_ai", "capture_run_messages"),
+        ("pydantic_ai.messages", "ToolCallPart"),
     }
 )
 # Agent constructor keywords that carry tools, or could; a prepare function can add,
@@ -571,6 +602,7 @@ def _collect_agent_decorators(
     nodes: list[ast.AST],
     parents: dict[ast.AST, ast.AST],
     parsed: _ParsedAnnotations,
+    annotations: set[ast.AST],
     agent_factories: dict[str, tuple[ast.ImportFrom, str]],
     bindings: Counter[str],
     path: Path,
@@ -695,7 +727,6 @@ def _collect_agent_decorators(
         if isinstance(node, ast.withitem) and node.optional_vars is None
     )
     factory_calls = {call.func for call in calls}
-    annotations = _annotation_names(nodes, parsed.roots)
     escaped = any(
         isinstance(node, ast.Name)
         and isinstance(node.ctx, ast.Load)
@@ -781,10 +812,11 @@ def _reaches_low_level(nodes: list[ast.AST]) -> bool:
 def _report_import_scope(
     imports: list[ast.ImportFrom],
     nodes: list[ast.AST],
+    annotations: set[ast.AST],
     path: Path,
     result: ScanResult,
     *,
-    local_agents: bool,
+    project_imports: _ProjectImports | None,
 ) -> None:
     if _reaches_low_level(nodes):
         result.surfaces_excluded.append(
@@ -801,10 +833,12 @@ def _report_import_scope(
         result.surfaces_excluded.append(f"{path.as_posix()}: unresolved Python MCP factory import")
     qualified_sdk_import = any(
         isinstance(node, ast.Import)
-        and any(_framework_module(a.name, local_agents=local_agents) for a in node.names)
+        and any(_framework_module(a.name, project_imports) for a in node.names)
         for node in nodes
     )
-    if qualified_sdk_import or _unrecognized_framework_import(imports, nodes, local_agents):
+    if qualified_sdk_import or _unrecognized_framework_import(
+        imports, nodes, annotations, project_imports
+    ):
         result.surfaces_excluded.append(f"{path.as_posix()}: unresolved Python SDK tool import")
 
 
@@ -812,14 +846,17 @@ def _under(module: str, roots: Sequence[str]) -> bool:
     return any(module == root or module.startswith(f"{root}.") for root in roots)
 
 
-def _framework_module(module: str, *, local_agents: bool) -> bool:
-    if local_agents and _under(module, ("agents",)):
+def _framework_module(module: str, project_imports: _ProjectImports | None) -> bool:
+    if _under(module, ("agents",)) and project_imports and project_imports.has_module(module):
         return False
     return _under(module, _FRAMEWORK_ROOTS) and not _under(module, _FRAMEWORK_CLIENTS)
 
 
 def _unrecognized_framework_import(
-    imports: list[ast.ImportFrom], nodes: list[ast.AST], local_agents: bool
+    imports: list[ast.ImportFrom],
+    nodes: list[ast.AST],
+    annotations: set[ast.AST],
+    project_imports: _ProjectImports | None,
 ) -> bool:
     """Whether the file imports from a framework something that can carry tools unseen.
 
@@ -832,12 +869,14 @@ def _unrecognized_framework_import(
     found: set[str] = set()
     for stmt in imports:
         module = stmt.module
-        if module is None or not _framework_module(module, local_agents=local_agents):
+        if module is None or not _framework_module(module, project_imports):
             continue
         for a in stmt.names:
             if (module, a.name) in _DECORATOR_IMPORTS or (module, a.name) in _AGENT_FACTORIES:
                 continue
-            if (module, a.name) in _NON_REGISTERING_IMPORTS:
+            if (module, a.name) in _NON_REGISTERING_IMPORTS and (
+                project_imports is None or not project_imports.shadows(module)
+            ):
                 continue
             if a.name == "*":
                 return True
@@ -847,7 +886,6 @@ def _unrecognized_framework_import(
                 found.add(a.asname or a.name)
     if not found:
         return False
-    annotations = _annotation_names(nodes)
     typed = {
         node.id
         for node in nodes
@@ -1236,15 +1274,21 @@ class _TypeSyntax:
     union. Each node is decided once, so the work stays linear in the nodes.
     """
 
-    def __init__(self, nodes: list[ast.AST]) -> None:
+    def __init__(self, nodes: list[ast.AST], project_imports: _ProjectImports | None) -> None:
         self._names, self._roots = _typing_generics(nodes)
+        self._sdk_types = frozenset(
+            identity
+            for identity in _SDK_TYPES
+            if project_imports is None or not project_imports.shadows(identity[0])
+        )
+        self._sdk_generics = _SDK_GENERICS & self._sdk_types
         bindings = _bindings(nodes)
         imported: dict[str, list[tuple[str, str]]] = {}
         for node in nodes:
             if isinstance(node, ast.ImportFrom) and not node.level and node.module is not None:
                 for alias in node.names:
                     identity = (node.module, alias.name)
-                    if identity in _SDK_TYPES:
+                    if identity in self._sdk_types:
                         imported.setdefault(alias.asname or alias.name, []).append(identity)
         self._classes = {
             name: paths[0]
@@ -1269,7 +1313,9 @@ class _TypeSyntax:
         return ".".join((module, *reversed(attributes[1:]))), attributes[0]
 
     def subscriptable(self, node: ast.expr) -> bool:
-        return _generic(node, self._names, self._roots) or self._sdk_type(node) in _SDK_GENERICS
+        return (
+            _generic(node, self._names, self._roots) or self._sdk_type(node) in self._sdk_generics
+        )
 
     def _children(self, node: ast.AST) -> list[ast.AST] | None:
         """The parts whose purity decides ``node``'s, or None when it is not pure."""
@@ -1280,7 +1326,8 @@ class _TypeSyntax:
                 return []
             return (
                 []
-                if _generic(node, self._names, self._roots) or self._sdk_type(node) in _SDK_TYPES
+                if _generic(node, self._names, self._roots)
+                or self._sdk_type(node) in self._sdk_types
                 else None
             )
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
@@ -1334,16 +1381,21 @@ class _TypeSyntax:
         return found
 
 
-def _annotation_names(nodes: list[ast.AST], extra_roots: Sequence[ast.expr] = ()) -> set[ast.AST]:
+def _annotation_names(
+    nodes: list[ast.AST],
+    extra_roots: Sequence[ast.expr] = (),
+    *,
+    project_imports: _ProjectImports | None = None,
+) -> set[ast.AST]:
     """Names, and attributes of names, that annotations use only as types.
 
     Annotations are evaluated, at definition time or later, so only these parts are
     set aside: the whole annotation, a member of a ``|`` union of pure type syntax
     (see ``_TypeSyntax``), and an argument of a generic of ``typing``,
     ``typing_extensions`` or ``collections.abc``, such as ``Optional[...]``, of a
-    built-in generic such as ``list[...]``, or of a class an SDK or framework package
-    exports. A call, a walrus, any other subscript or union and every other
-    expression in an annotation is analyzed as code.
+    built-in generic such as ``list[...]``, or of a recognized SDK generic that
+    cannot resolve to a module in the checkout. A call, a walrus, any other
+    subscript or union and every other expression in an annotation is analyzed as code.
     """
     pending: list[ast.expr] = list(extra_roots)
     for node in nodes:
@@ -1353,7 +1405,7 @@ def _annotation_names(nodes: list[ast.AST], extra_roots: Sequence[ast.expr] = ()
             pending.append(node.returns)
         elif isinstance(node, ast.AnnAssign):
             pending.append(node.annotation)
-    return _TypeSyntax(nodes).parts(pending)
+    return _TypeSyntax(nodes, project_imports).parts(pending)
 
 
 class _ParsedAnnotations(NamedTuple):
@@ -1508,6 +1560,7 @@ def _has_unsupported_registration(
     nodes: list[ast.AST],
     parents: dict[ast.AST, ast.AST],
     parsed: _ParsedAnnotations,
+    annotations: set[ast.AST],
     sdk_import: bool,
     calls: set[ast.Call],
     handled: set[ast.AST],
@@ -1527,11 +1580,7 @@ def _has_unsupported_registration(
         return True
     factory_calls = {call.func for call in calls}
     # A server named in an annotation is exposed through __annotations__.
-    safe = {
-        node
-        for node in _annotation_names(nodes, parsed.roots)
-        if not (isinstance(node, ast.Name) and node.id in servers)
-    }
+    safe = {node for node in annotations if not (isinstance(node, ast.Name) and node.id in servers)}
     safe |= _safe_receivers(
         nodes, parents, servers, _SERVER_DATA, _SERVER_CALLS, _SERVER_DECORATORS
     )
@@ -1861,6 +1910,7 @@ def _context_bindings(
     roots: set[str],
     rooted: _RootedAt,
     scopes: dict[ast.AST, ast.AST | None],
+    project_imports: _ProjectImports | None,
 ) -> tuple[set[tuple[ast.AST | None, str]], bool]:
     """Parameters typed as an SDK context and names bound to ``get_context()``, by scope.
 
@@ -1882,7 +1932,7 @@ def _context_bindings(
         if isinstance(node, (ast.Global, ast.Nonlocal))
         for name in node.names
     }
-    syntax = _TypeSyntax(nodes)
+    syntax = _TypeSyntax(nodes, project_imports)
     parsed_roots = set(parsed.roots)
     annotations: set[ast.AST] = set()
     bound: set[tuple[ast.AST | None, str]] = set()
@@ -2007,6 +2057,7 @@ def _report_context_handles(
     bindings: Counter[str],
     path: Path,
     result: ScanResult,
+    project_imports: _ProjectImports | None,
 ) -> None:
     """A server reached through a request context can be given tools from any handler.
 
@@ -2058,7 +2109,7 @@ def _report_context_handles(
             break
     if not handle and sdk_import:
         scopes = _scopes(parents)
-        bound, handle = _context_bindings(parsed, roots, rooted, scopes)
+        bound, handle = _context_bindings(parsed, roots, rooted, scopes, project_imports)
         names = {name for _, name in bound}
         resolved: dict[tuple[ast.AST | None, str], bool] = {}
         handle = handle or any(
@@ -2075,7 +2126,11 @@ def _report_context_handles(
 
 
 def _report_unused_factories(
-    nodes: list[ast.AST], factories: dict[str, ast.ImportFrom], path: Path, result: ScanResult
+    nodes: list[ast.AST],
+    annotations: set[ast.AST],
+    factories: dict[str, ast.ImportFrom],
+    path: Path,
+    result: ScanResult,
 ) -> None:
     """A server class imported and not used other than as a type in an annotation is
     passed on.
@@ -2085,7 +2140,6 @@ def _report_unused_factories(
     """
     if not factories:
         return
-    annotations = _annotation_names(nodes)
     used = {
         node.id
         for node in nodes
@@ -2106,7 +2160,7 @@ def collect_python_tools(
     result: ScanResult,
     known: KnownValues | None = None,
     *,
-    local_agents: bool = False,
+    project_imports: _ProjectImports | None = None,
 ) -> None:
     """Support direct SDK imports, module constructors and top-level decorators.
 
@@ -2117,21 +2171,40 @@ def collect_python_tools(
     if not any(hint in source for hint in PYTHON_TOOL_HINTS):
         return
     imports = [node for node in nodes if isinstance(node, ast.ImportFrom) and not node.level]
+    candidates = [
+        stmt
+        for stmt in imports
+        if any(
+            (stmt.module, alias.name) in _SDK_TYPES
+            or (stmt.module, alias.name) in _DECORATOR_IMPORTS
+            for alias in stmt.names
+        )
+    ]
+    resolved = [
+        stmt
+        for stmt in candidates
+        if stmt.module is not None
+        and (project_imports is None or not project_imports.shadows(stmt.module))
+    ]
+    if len(resolved) != len(candidates):
+        result.surfaces_excluded.append(
+            f"{path.as_posix()}: Python SDK import may resolve to checkout code"
+        )
     factories = {
         a.asname or a.name: stmt
-        for stmt in imports
+        for stmt in resolved
         for a in stmt.names
         if (stmt.module, a.name) in _FACTORIES
     }
     decorators = {
         a.asname or a.name: (stmt, _DECORATOR_IMPORTS[(stmt.module, a.name)])
-        for stmt in imports
+        for stmt in resolved
         for a in stmt.names
         if stmt.module is not None and (stmt.module, a.name) in _DECORATOR_IMPORTS
     }
     agent_factories = {
         a.asname or a.name: (stmt, _AGENT_FACTORIES[(stmt.module, a.name)])
-        for stmt in imports
+        for stmt in resolved
         for a in stmt.names
         if stmt.module is not None and (stmt.module, a.name) in _AGENT_FACTORIES
     }
@@ -2139,9 +2212,10 @@ def collect_python_tools(
     parents = {child: node for node in nodes for child in ast.iter_child_nodes(node)}
     sdk_import = _imports_mcp_sdk(nodes)
     parsed = _parse_string_annotations(nodes, parents)
-    _report_import_scope(imports, nodes, path, result, local_agents=local_agents)
-    _report_context_handles(parsed, sdk_import, bindings, path, result)
-    _report_unused_factories(nodes, factories, path, result)
+    annotations = _annotation_names(nodes, parsed.roots, project_imports=project_imports)
+    _report_import_scope(imports, nodes, annotations, path, result, project_imports=project_imports)
+    _report_context_handles(parsed, sdk_import, bindings, path, result, project_imports)
+    _report_unused_factories(nodes, annotations, factories, path, result)
     if not factories and not decorators and not agent_factories:
         _report_imported_receivers(tree, path, result)
         if sdk_import and (
@@ -2172,6 +2246,7 @@ def collect_python_tools(
             nodes,
             parents,
             parsed,
+            annotations,
             agent_factories,
             bindings,
             path,
@@ -2221,7 +2296,17 @@ def collect_python_tools(
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             _record_decorated_tools(stmt, servers, handled, path, source_digest, result)
     if _has_unsupported_registration(
-        tree, nodes, parents, parsed, sdk_import, calls, handled, servers, factories, bindings
+        tree,
+        nodes,
+        parents,
+        parsed,
+        annotations,
+        sdk_import,
+        calls,
+        handled,
+        servers,
+        factories,
+        bindings,
     ) or _imported_receivers(tree):
         result.surfaces_excluded.append(
             f"{path.as_posix()}: unsupported Python MCP binding or dynamic registration"

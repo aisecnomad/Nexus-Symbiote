@@ -724,6 +724,33 @@ def _identifier(node: Node | None) -> str | None:
     return _name(node) if node is not None and node.type == "identifier" else None
 
 
+_COMPUTED_BUILTINS = frozenset({"Math", "console"})
+
+
+def _assigned_computed_builtins(index: _Index) -> set[str]:
+    assigned: set[str] = set()
+    for node in index.nodes:
+        if (
+            node.type not in {"assignment_expression", "augmented_assignment_expression"}
+            or node.id in index.erased
+        ):
+            continue
+        target = _operand(node.child_by_field_name("left"))
+        assigned.update(_COMPUTED_BUILTINS.intersection(_pattern_names(target)))
+        if target is None or target.type not in {"member_expression", "subscript_expression"}:
+            continue
+        receiver = _identifier(_operand(target.child_by_field_name("object")))
+        if receiver is not None and receiver in _COMPUTED_BUILTINS:
+            assigned.add(receiver)
+        elif receiver in {"globalThis", "global", "self", "window"}:
+            property_name = _called_method(target)
+            if property_name is None:
+                assigned.update(_COMPUTED_BUILTINS)
+            elif property_name in _COMPUTED_BUILTINS:
+                assigned.add(property_name)
+    return assigned
+
+
 def _called_method(member: Node) -> str | None:
     """Return the static method name, or None when its spelling needs evaluation."""
     if member.type == "member_expression":
@@ -1159,6 +1186,7 @@ def _collect_source(
         if node.type == "variable_declarator"
         and _identifier(_operand(node.child_by_field_name("value"))) is not None
     }
+    assigned_builtins = _assigned_computed_builtins(index) if servers else set()
     registrations = 0
     for node in index.nodes:
         if node.type != "call_expression" or node.id in index.erased:
@@ -1173,16 +1201,25 @@ def _collect_source(
         if method is None:
             # A computed method may register a tool. A parameter or alias in a server
             # file can carry a server whose exact binding remains unproved.
-            computed = resolver.lookup(_operand(receiver_node))
+            operand = _operand(receiver_node)
+            computed = resolver.lookup(operand)
+            computed_receiver = _identifier(operand)
+            builtin = computed_receiver in _COMPUTED_BUILTINS
+            unassigned_global = (
+                builtin and computed is None and computed_receiver not in assigned_builtins
+            )
             if isinstance(computed, tuple):
                 result.surfaces_excluded.append(
                     f"{location}:{node.start_point.row + 1} (unresolved MCP method name)"
                 )
-            elif servers and (
-                (computed is None and _identifier(receiver_node) not in {"Math", "console"})
-                or computed == "parameter"
-                or computed == "ambiguous"
-                or (isinstance(computed, int) and computed in aliases)
+            elif (
+                servers
+                and not unassigned_global
+                and (
+                    builtin
+                    or computed in (None, "parameter", "ambiguous")
+                    or (isinstance(computed, int) and computed in aliases)
+                )
             ):
                 result.surfaces_excluded.append(
                     f"{location}:{node.start_point.row + 1} (unresolved MCP registration receiver)"

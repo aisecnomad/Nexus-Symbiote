@@ -41,6 +41,7 @@ from nexus_symbiote.scanners.python_tools import (
     _FACTORIES,
     PYTHON_TOOL_HINTS,
     _annotation_names,
+    _ProjectImports,
     collect_python_tools,
 )
 from nexus_symbiote.scanners.ts_tools import (
@@ -1051,7 +1052,7 @@ def _record_attribute_gap(
         gaps.add(_SERVER_CLASS_ATTRIBUTE)
 
 
-def _python_launches(tree: ast.Module) -> list[str]:
+def _python_launches(tree: ast.Module, project_imports: _ProjectImports) -> list[str]:
     """Gaps for MCP servers a file starts or reaches, or loads through a dynamic import.
 
     A launcher class or function counts wherever it is used other than as a type in an
@@ -1111,7 +1112,7 @@ def _python_launches(tree: ast.Module) -> list[str]:
                             unused.add(alias.asname or name)
     loaders = _loader_aliases(nodes, loaders, bound_names)
     logging_module, loggers = _honest_loggers(nodes, loggers)
-    annotations = _annotation_names(nodes)
+    annotations = _annotation_names(nodes, project_imports=project_imports)
     for node in nodes:
         if isinstance(node, ast.Call):
             func_getattr = _unshadowed_getattr(node.func, bound_names)
@@ -1172,15 +1173,7 @@ def collect_source_references(
     python = _Kind(_python_source, _python_candidate)
     clients = [_Kind(_script_source(suffix), _client_candidate) for suffix in _CLIENT_SUFFIXES]
     kinds = (servers, python, *clients)
-    local_agents = any(
-        path.suffix == ".py"
-        and (
-            path.parts[:1] == ("agents",)
-            or path.parts[:2] == ("src", "agents")
-            or path.as_posix() in {"agents.py", "src/agents.py"}
-        )
-        for path in sources
-    )
+    python_paths = frozenset(path for path in sources if path.suffix == ".py")
     eligible = [path for path in sources if any(kind.eligible(path) for kind in kinds)]
     # Root files first, as before, so what a lowered budget reads stays predictable.
     eligible.sort(key=lambda path: len(path.parts) > 1)
@@ -1253,14 +1246,21 @@ def collect_source_references(
             if len(nodes) > python_nodes.value:
                 fail(path, python_nodes.exceeded())
                 continue
-            collect_python_tools(tree, nodes, text, path, result, known, local_agents=local_agents)
+            project_imports = _ProjectImports(
+                python_paths, tuple(dict.fromkeys((path.parent, Path(), Path("src"))))
+            )
+            collect_python_tools(
+                tree, nodes, text, path, result, known, project_imports=project_imports
+            )
             client = _python_client(tree)
             if client:
                 detected.append(location)
             gap = _hidden_import(text, tree)
             if gap is not None:
                 result.surfaces_excluded.append(f"{location}: {gap}")
-            result.surfaces_excluded.extend(f"{location}: {gap}" for gap in _python_launches(tree))
+            result.surfaces_excluded.extend(
+                f"{location}: {gap}" for gap in _python_launches(tree, project_imports)
+            )
         if _outcome(result) != before or client:
             surfaces.append(location)
     for path, content in (selected for kind in clients for selected in kind.selected):
