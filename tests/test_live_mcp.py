@@ -528,6 +528,7 @@ JSON_HEADERS = {"Content-Type": "application/json"}
 SSE_HEADERS = {"Content-Type": "text/event-stream"}
 NOT_ASCII = "endpoint must be an ASCII HTTPS URL without controls"
 NOT_PLAIN = "endpoint credentials, queries, fragments or non-HTTPS scheme refused"
+NOT_DOTS = "endpoint dot segments refused"
 
 
 def raw_reply(
@@ -828,6 +829,10 @@ def test_a_bearer_credential_in_the_endpoint_is_refused_before_any_request(endpo
         ("https://fixture.example\\mcp", NOT_PLAIN),
         ("https://fixture%2eexample/mcp", NOT_PLAIN),
         ("https:///mcp", NOT_PLAIN),
+        ("https://fixture.example/a/../mcp", NOT_DOTS),
+        ("https://fixture.example/./mcp", NOT_DOTS),
+        ("https://fixture.example/a/%2E%2e/mcp", NOT_DOTS),
+        ("https://fixture.example/mcp/..", NOT_DOTS),
     ],
 )
 def test_endpoint_encoding_and_authority_checks_fail_before_any_request(endpoint, failure):

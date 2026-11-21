@@ -384,15 +384,21 @@ def _canonical_https_origin(url: str | None) -> tuple[str, str, int] | None:
 
 
 def _named_endpoint_hash(url: str | None) -> str | None:
-    """The full-URL digest an inventory endpoint binds when it names more than an origin."""
+    """discover-mcp's digest of an endpoint that names a path; "" if discover-mcp refuses it."""
     from urllib.parse import urlsplit
+
+    from nexus_symbiote.scanners.live_mcp import _endpoint
 
     if not isinstance(url, str):
         return None
-    parts = urlsplit(url)
-    if parts.path in ("", "/") and not parts.query and not parts.fragment:
-        return None
-    return hash_canonical({"observed_endpoint": url})
+    try:
+        parts = urlsplit(url)
+        if parts.path in ("", "/") and not parts.query:
+            return None
+        origin, _, _, path = _endpoint(url.split("#", 1)[0])
+    except ValueError:
+        return ""
+    return hash_canonical({"observed_endpoint": origin + path})
 
 
 def _recent(observed_at: datetime, max_age: timedelta | None) -> bool:

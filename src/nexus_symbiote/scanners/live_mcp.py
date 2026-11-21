@@ -34,7 +34,7 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, NamedTuple, Protocol, cast
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from jsonschema import (
     Draft4Validator,
@@ -339,6 +339,8 @@ def _endpoint(value: str, *, origin_only: bool = False) -> tuple[str, str, int, 
         raise
     except ValueError as exc:
         raise DiscoveryError("invalid endpoint") from exc
+    if any(part in (".", "..") for part in unquote(parsed.path).split("/")):
+        raise DiscoveryError("endpoint dot segments refused")
     if host.endswith(".") or not 1 <= port <= 65535:
         raise DiscoveryError("invalid endpoint authority")
     authority = f"[{host}]" if ":" in host else host
