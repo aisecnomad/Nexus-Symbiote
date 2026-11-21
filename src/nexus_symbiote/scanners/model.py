@@ -158,6 +158,9 @@ MIN_PICKLE_OPCODES = 16
 MAX_ZIP_DIRECTORY_BYTES = MAX_MODEL_HEADER_BYTES
 _ZIP_END_RECORD_BYTES = 22 + 65_535 + 20 + 56
 _ZIP_TAIL_BYTES = MAX_ZIP_DIRECTORY_BYTES + _ZIP_END_RECORD_BYTES
+# How far from the end miniz finds an end record: it searches back in 4 KiB reads past
+# the 65,535-byte comment, so a record up to this far back is one it can take.
+_MINIZ_END_SEARCH = 69_584
 ZIP_PICKLE_MEMBER = "ZIP archive with a pickle member; torch.load unpickles it"
 ZIP_OBJECT_ARRAY = (
     "ZIP archive with a NumPy object-dtype array member; np.load(allow_pickle=True) unpickles it"
@@ -601,7 +604,13 @@ def _zip_directory(
     # comment, before it searches back, so a signature in its count fields is not one.
     end_record = len(data) - 22
     if end_record < 0 or data[end_record : end_record + 4] != b"PK\x05\x06" or data[-2:] != b"\0\0":
-        end_record = data.rfind(b"PK\x05\x06", max(0, len(data) - 22 - 65_535))
+        # The last signature with a whole record after it, as far back as miniz, which
+        # torch.load uses, searches: past zipfile's 65,557 bytes, and skipping a
+        # truncated signature at the end, both of which zipfile refuses. The last one
+        # within zipfile's reach is still the one zipfile takes.
+        end_record = data.rfind(
+            b"PK\x05\x06", max(0, len(data) - _MINIZ_END_SEARCH), len(data) - 18
+        )
     if end_record < 0 or end_record + 22 > len(data):
         return None
     if start > 0 and end_record < 76:

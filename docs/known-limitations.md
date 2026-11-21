@@ -1005,7 +1005,8 @@ A way around a limit that its entry does not describe is worth a
   object-dtype array, which makes the archive `unsafe-code-execution`. The directory
   is read with the
   tolerances of `zipfile` and the specification, and miniz's reading of a ZIP64
-  record at the locator's offset (the C++ reader `torch.load` uses); miniz's other
+  record at the locator's offset and its search for the end record (the C++ reader
+  `torch.load` uses); miniz's other
   tolerances are not modelled. A member name with a NUL byte is
   matched both whole and as `zipfile` cuts it at the NUL, and a member is also
   matched by the name a version-1 Info-ZIP Unicode Path field (0x7075) with a

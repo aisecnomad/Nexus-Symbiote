@@ -583,6 +583,31 @@ def test_the_reported_decoy_locator_archive_is_critical(tmp_path: Path, name: st
     assert found[name].serialization_safety == UNSAFE
 
 
+@pytest.mark.parametrize(
+    "trailer",
+    [b"PK\x05\x06" + b"\0" * 6, b"\0" * 69_500],
+    ids=["truncated-signature", "past-zipfile-search"],
+)
+@pytest.mark.parametrize("pickled", [False, True], ids=["array", "pickle"])
+def test_an_end_record_only_miniz_finds_is_read(
+    tmp_path: Path, trailer: bytes, pickled: bool
+) -> None:
+    # zipfile refuses an archive that ends in a truncated end-record signature, or whose
+    # end record lies more than 65,557 bytes from the end; miniz, which torch.load uses,
+    # skips the first and searches further back for the second. The scanner took the
+    # truncated signature, or searched no further than zipfile, and rated the archive as
+    # a directory not read, so a weights.dat with data.pkl passed the default gate.
+    real = (b"archive/data.pkl", _INERT_PICKLE) if pickled else (b"objects.npy", _npy("'|O'"))
+    archive = _zip([("archive/version", b"3\n"), (real[0].decode(), real[1])]) + trailer
+    with pytest.raises(zipfile.BadZipFile):
+        zipfile.ZipFile(io.BytesIO(archive))
+    expected = (UNSAFE, ZIP_PICKLE_MEMBER if pickled else ZIP_OBJECT_ARRAY)
+    (tmp_path / "models").mkdir()
+    for relative in ["models/archive", "weights.dat"]:
+        (tmp_path / relative).write_bytes(archive)
+        assert inspect_model_format(tmp_path / relative) == expected, relative
+
+
 def _cut_out(members: list[tuple[str, bytes]], prefix: int = 19) -> bytes:
     """An archive written after ``prefix`` bytes, with absolute offsets, then cut out of
     that file: every stored offset is ``prefix`` bytes too large. zipfile still lists it."""
