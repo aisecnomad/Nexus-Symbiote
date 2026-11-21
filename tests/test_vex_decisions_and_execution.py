@@ -64,7 +64,7 @@ def _sign_trace_file(trace_path: Path, att_path: Path, pub_path: Path) -> None:
 
 
 def test_execution_bound_vex_yields_distinct_outcomes_and_keeps_unobserved_in_triage(tmp_path):
-    """declared_never_loaded clears non-critical dynamic risk, while unobserved stays in_triage."""
+    """Trace observations retain triage for every outcome."""
     bom = _three_component_bom()
     bom.components.append(
         ToolComponent(
@@ -96,6 +96,10 @@ def test_execution_bound_vex_yields_distinct_outcomes_and_keeps_unobserved_in_tr
     evidence = load_execution_evidence(trace_file, allow_unsigned=True)
     doc = VEXGenerator(execution_evidence=evidence).generate(bom)
 
+    assert any(
+        p["value"] == "unsigned" and p["name"] == "nexus-symbiote:traceAuthentication"
+        for p in doc["metadata"]["properties"]
+    )
     by_comp = {v["affects"][0]["ref"]: v for v in doc["vulnerabilities"]}
     assert set(by_comp.keys()) == {
         "tool:never-loaded",
@@ -104,10 +108,10 @@ def test_execution_bound_vex_yields_distinct_outcomes_and_keeps_unobserved_in_tr
         "tool:shadowed",
     }
 
-    # 1. Explicit declared_never_loaded on non-critical dynamic finding -> not_affected.
+    # 1. A component absent from these observations stays in triage.
     never = by_comp["tool:never-loaded"]["analysis"]
-    assert never["state"] == "not_affected"
-    assert never["justification"] == "code_not_reachable"
+    assert never["state"] == "in_triage"
+    assert "justification" not in never
 
     # 2. Real trace-diff unobserved -> MUST remain in_triage (absence of spans proves nothing).
     unobs = by_comp["tool:unobserved"]["analysis"]
@@ -233,6 +237,8 @@ decisions:
     state: "not_affected"
     justification: "protected_at_runtime"
     detail: "Blocked by gateway policy"
+    inventory_sha256: "{hash_bytes(bom.to_native_json().encode())}"
+    deployment_id: "prod"
     owner: "secops@example.com"
     expires_at: "2027-01-01T00:00:00Z"
   - id: "{fid_expired}"
@@ -246,13 +252,22 @@ decisions:
     )
     loaded = load_vex_decisions(decisions_file)
     ref_time = datetime(2026, 11, 19, 0, 0, tzinfo=UTC)
-    doc = VEXGenerator(decisions=loaded, reference_time=ref_time).generate(bom)
+    generator = VEXGenerator(decisions=loaded, reference_time=ref_time, deployment_id="prod")
+    doc = generator.generate(bom)
 
     by_comp = {v["affects"][0]["ref"]: v for v in doc["vulnerabilities"]}
     assert by_comp["tool:never-loaded"]["analysis"]["state"] == "not_affected"
     assert by_comp["tool:invoked"]["analysis"]["state"] == "in_triage"
     meta_props = {p["name"]: p["value"] for p in doc["metadata"].get("properties", [])}
     assert meta_props["nexus-symbiote:expiredVexDecisions"] == "1"
+
+    ref_changed = VEXGenerator(decisions=loaded, reference_time=ref_time, deployment_id="staging")
+    wrong_deployment = ref_changed.generate(bom)
+    bom.components[0].hashes["sha256"] = "sha256:" + "a" * 64
+    changed_inventory = generator.generate(bom)
+    for result in (wrong_deployment, changed_inventory):
+        entry = next(v for v in result["vulnerabilities"] if v["id"] == fid_active)
+        assert entry["analysis"]["state"] == "in_triage"
 
     # Conflicting / duplicate (id, component_ref) decisions must be refused.
     dup_file = tmp_path / "dup-decisions.yaml"
@@ -276,6 +291,48 @@ decisions:
     )
     with pytest.raises(VEXDecisionError, match="duplicate VEX decision"):
         load_vex_decisions(dup_file)
+
+
+@pytest.mark.parametrize(
+    ("deployment", "state", "status"),
+    [
+        ("production", "not_affected", "active"),
+        ("staging", "in_triage", "scope-mismatch"),
+        (None, "in_triage", "scope-mismatch"),
+    ],
+)
+def test_vex_cli_scopes_suppression_to_deployment_and_exact_file_bytes(
+    tmp_path, deployment, state, status
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    inventory = project / "inventory.json"
+    # A valid noncanonical serialization distinguishes the file digest from a reserialization.
+    raw = _three_component_bom().to_native_json().encode() + b"\n\n"
+    inventory.write_bytes(raw)
+    ref = "tool:never-loaded"
+    fid = finding_id(ref, "unpinned_tool", "Tool definition is unpinned")
+    decision = {
+        "id": fid,
+        "component_ref": ref,
+        "inventory_sha256": hash_bytes(raw),
+        "deployment_id": "production",
+        "state": "not_affected",
+        "justification": "protected_at_runtime",
+        "detail": "Production policy blocks this tool",
+        "owner": "security",
+        "expires_at": "2099-01-01T00:00:00Z",
+    }
+    decisions = tmp_path / "decisions.yaml"
+    decisions.write_text(json.dumps({"version": 1, "decisions": [decision]}), encoding="utf-8")
+    args = ["vex", str(inventory), "--decisions", str(decisions), "--project-root", str(project)]
+    if deployment is not None:
+        args.extend(["--deployment-id", deployment])
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == 0, result.output
+    entry = next(v for v in json.loads(result.output)["vulnerabilities"] if v["id"] == fid)
+    assert entry["analysis"]["state"] == state
+    assert {"name": "nexus-symbiote:vexDecisionStatus", "value": status} in entry["properties"]
 
 
 def test_vex_confinement_refuses_in_repo_without_project_root_symlinks_and_hardlinks(
@@ -344,6 +401,13 @@ def test_vex_cli_requires_dsse_attestation_links_live_advisories_and_verifies_sh
         json.dumps(
             {
                 "inventory_sha256": inv_sha,
+                "coverage": "complete",
+                "complete": True,
+                "errors": [],
+                "components_checked": 1,
+                "components_skipped": 0,
+                "components_excluded": 0,
+                "dry_run": False,
                 "advisories": [
                     {
                         "component_ref": "pkg:pypi:transformers@4.35.0",
@@ -414,6 +478,9 @@ def test_vex_cli_requires_dsse_attestation_links_live_advisories_and_verifies_sh
     )
     assert res_signed.exit_code == 0, res_signed.output
     doc = json.loads(res_signed.output)
+    metadata = {p["name"]: p["value"] for p in doc["metadata"]["properties"]}
+    assert metadata["nexus-symbiote:traceAuthentication"] == "attested"
+    assert metadata["nexus-symbiote:traceAttestationSha256"] == hash_bytes(att_file.read_bytes())
     assert doc["bomFormat"] == "CycloneDX"
     assert doc["specVersion"] == "1.7"
     assert len(doc["vulnerabilities"]) == 1
@@ -484,3 +551,92 @@ def test_a_flagged_offline_match_says_its_range_was_undecidable():
         for vuln in doc["vulnerabilities"]
     }
     assert flags == {"PYSEC-2025-193": "true", "PYSEC-2025-194": None}
+
+
+def test_partial_advisory_report_requires_opt_in_and_carries_coverage(tmp_path):
+    from nexus_symbiote.advisories import AdvisoryReport
+
+    report = AdvisoryReport(components_checked=1, errors=["lookup unavailable"])
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(report.to_dict()))
+    with pytest.raises(VEXDecisionError, match="coverage"):
+        load_advisory_report(path)
+    loaded = load_advisory_report(path, allow_partial=True)
+    inventory = AIBOM()
+    doc = VEXGenerator(advisory_report=loaded).generate(inventory)
+    props = {p["name"]: p["value"] for p in doc["metadata"]["properties"]}
+    assert props["nexus-symbiote:advisoryCoverage"] == "partial"
+    assert props["nexus-symbiote:advisoryErrors"] == "1"
+    assert props["nexus-symbiote:advisoryReportSha256"] == hash_bytes(path.read_bytes())
+    assert doc["serialNumber"] != VEXGenerator().generate(inventory)["serialNumber"]
+    assert (
+        doc["serialNumber"]
+        == VEXGenerator(advisory_report=loaded).generate(inventory)["serialNumber"]
+    )
+
+
+def test_vex_operator_material_rejects_writable_files_and_duplicate_yaml(tmp_path):
+    path = tmp_path / "decisions.yaml"
+    path.write_text("version: 1\ndecisions: []\ndecisions: []\n")
+    with pytest.raises(VEXDecisionError):
+        load_vex_decisions(path)
+    path.write_text("version: 1\ndecisions: []\n")
+    path.chmod(0o666)
+    with pytest.raises(VEXDecisionError, match="writable"):
+        load_vex_decisions(path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"complete": True},
+        {"components_checked": False},
+        {"dry_run": "false"},
+        {"coverage": "complete"},
+    ],
+)
+def test_inconsistent_advisory_coverage_refused_even_with_partial_opt_in(tmp_path, mutation):
+    from nexus_symbiote.advisories import AdvisoryReport
+
+    payload = AdvisoryReport(components_checked=1, errors=["lookup incomplete"]).to_dict()
+    payload.update(mutation)
+    path = tmp_path / "advisories.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(VEXDecisionError, match="coverage"):
+        load_advisory_report(path, allow_partial=True)
+
+
+def test_trusted_public_key_requires_protected_parent(tmp_path):
+    from nexus_symbiote.vex_decisions import _load_trusted_keys
+
+    directory = tmp_path / "keys"
+    directory.mkdir(mode=0o700)
+    public = directory / "verify.pem"
+    public.write_bytes(b"invalid key fixture")
+    directory.chmod(0o777)
+    with pytest.raises(VEXDecisionError, match="writable or untrusted ancestor"):
+        _load_trusted_keys((public,))
+
+
+def test_vex_checks_owner_of_writable_filesystem_anchor(tmp_path, monkeypatch):
+    import os
+    import stat
+    from types import SimpleNamespace
+
+    from nexus_symbiote.vex_decisions import _check_operator_directory
+
+    anchor = tmp_path.parents[-1].stat()
+    real_fstat = os.fstat
+
+    def stat_descriptor(fd):
+        result = real_fstat(fd)
+        if (result.st_dev, result.st_ino) == (anchor.st_dev, anchor.st_ino):
+            fields = list(result)
+            fields[stat.ST_UID] = 987654
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(os, "fstat", stat_descriptor)
+    monkeypatch.setattr(os, "fstatvfs", lambda fd: SimpleNamespace(f_flag=0))
+    with pytest.raises(VEXDecisionError, match="untrusted ancestor"):
+        _check_operator_directory(tmp_path / "decisions.json", {0, os.geteuid()})

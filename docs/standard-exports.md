@@ -159,6 +159,8 @@ The exporter validates its output offline against the vendored official OASIS SA
 
 ## VEX
 
+The `nexus-symbiote/vex-content/v2` serial profile identifies the complete exported VEX document. It hashes the deterministic JSON document before adding `serialNumber`, then derives a UUIDv5 in the project namespace from `nexus-symbiote/vex-content/v2:` and the prefixed SHA-256 digest. A change to a decision, evidence authentication, or advisory coverage produces a new serial. The BOM-Link continues to identify the source inventory. Consumers upgrading from the inventory-only serial should re-baseline VEX identifiers.
+
 `vex` writes a CycloneDX 1.7 document whose `vulnerabilities` are the inventory's risk findings:
 
 - Its serial number is derived from the inventory's, so it never shares the inventory's identity, and its version is the inventory's version. `metadata` names the producing tool, and the inventory's timestamp only when it records one (a scan records none unless `SOURCE_DATE_EPOCH` is set, so the document is deterministic), and an external reference of type `bom` points at the inventory with a BOM-Link (`urn:cdx:<serial>/<version>`). An inventory without a serial number gets the content-derived serial its CycloneDX export would have, so the link names that export; one whose serial number is not a `urn:uuid:` UUID gets no link. Like the CycloneDX and SPDX exports, `vex` rejects an inventory whose timestamp has no time zone, whose component references repeat, or whose dependencies name an unknown component.
@@ -167,7 +169,7 @@ The exporter validates its output offline against the vendored official OASIS SA
 - Descriptions and details are neutralized like SARIF messages.
 - Findings on components imported from a ShadowScan report are omitted; the metadata property `nexus-symbiote:omittedImportedFindings` counts them.
 
-What it cannot express on its own: a statement is `in_triage` unless an unexpired `--decisions` entry sets its state and justification, or `--trace-evidence` reports that a component was declared but never loaded, which sets `not_affected` (`code_not_reachable`) except for critical findings, KEV-listed advisories and categories such as hook commands or credential exposure; trace evidence never sets `exploitable` or `resolved`. `NEXUS-` identifiers name inventory findings, not entries in any vulnerability database, so tools that apply VEX statements to known vulnerabilities have nothing to apply them to. VEX output states no coverage.
+A statement defaults to `in_triage`. Trace observations annotate findings and advisory matches without changing their state. To set `not_affected`, `resolved`, or `false_positive`, provide an unexpired operator decision naming the vulnerability, component reference, exact input file digest (`inventory_sha256: sha256:<hex>`), and deployment ID. Pass the same deployment ID with `--deployment-id` from trusted configuration. Use a new decision after changing the reviewed inventory. `NEXUS-` identifiers name inventory findings. VEX output states no coverage.
 
 ## Minimum elements
 
