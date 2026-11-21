@@ -1011,17 +1011,25 @@ A way around a limit that its entry does not describe is worth a
   archive is recognized by a pickle-family member in its first local header or in a
   central directory of at most 1 MiB, read from the end of the archive, including
   ZIP64, wherever the specification, `zipfile` (which `np.load` uses) or a ZIP64
-  locator puts it, so a member that any of them lists counts, and in a file that
+  locator puts it, also a locator or record inside the first local header or after
+  the locator, and the classic directory a reader falls back to when no ZIP64 record
+  lies where it looks, so a member that any of them lists counts, and in a file that
   starts with an end record, which `np.load` also reads as an archive; and by an
   object-dtype array as any member, read from the member's local
   header and the start of its stored or DEFLATE-compressed data. A longer array
-  header, a longer or malformed directory, a ZIP64 locator that points before the
+  header, a longer or malformed directory, a directory that starts at its stored
+  offset and runs past its end record, a ZIP64 locator that points before the
   last 1 MiB of the archive, where `zipfile` from Python 3.13 reads its record first,
   a member compressed by another method,
   such as BZIP2 or LZMA, and a member whose data runs past the next member's local
-  header are rated `unknown`, a high finding. The directory is read with the
-  tolerances of `zipfile` and the specification; another reader's, such as the C++
-  reader `torch.load` uses, are not modelled. A member name with a NUL byte is
+  header are rated `unknown`, a high finding, or `unsafe-code-execution` under a
+  pickle-family name, unless another reading lists a pickle-family member or an
+  object-dtype array, which makes the archive `unsafe-code-execution`. The directory
+  is read with the
+  tolerances of `zipfile` and the specification, and miniz's reading of a ZIP64
+  record at the locator's offset and its search for the end record (the C++ reader
+  `torch.load` uses); miniz's other
+  tolerances are not modelled. A member name with a NUL byte is
   matched both whole and as `zipfile` cuts it at the NUL, and a member is also
   matched by the name a version-1 Info-ZIP Unicode Path field (0x7075) with a
   matching CRC gives it, as `zipfile` from Python 3.12 lists it. A pickle hidden otherwise under
