@@ -1018,6 +1018,7 @@ _TOOL_REFUSALS: dict[str, Any] = {
     "tool-claim-assurance": lambda s, t: _claim(t, "tool_definition", assurance="declared"),
     "tool-claim-collector": lambda s, t: _claim(t, "tool_definition", collector="mcp"),
     "tool-claim-method": lambda s, t: _claim(t, "tool_definition", method="config"),
+    "tool-claim-time": lambda s, t: _claim(t, "tool_definition", observed_at=None),
     "tool-hash-version": lambda s, t: setattr(t, "definition_hash_version", "v0"),
     "no-tool-hash": lambda s, t: setattr(t, "definition_hash", None),
     "bad-tool-hash": lambda s, t: setattr(t, "definition_hash", "sha256:zz"),
@@ -1076,9 +1077,41 @@ def test_remote_evidence_with_duplicate_tools_is_refused():
     assert _remote_reason(approved, evidence) == ("failed", "ambiguous-approved-tools", False)
 
 
+def _verified_remote_attestation(evidence: AIBOM) -> dict[str, str]:
+    from datetime import UTC
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from nexus_symbiote import attestation
+    from nexus_symbiote.core.hashing import hash_bytes
+    from nexus_symbiote.runtime import key_id
+
+    key = Ed25519PrivateKey.generate()
+    subject = evidence.to_json().encode()
+    statement = attestation.build_statement(
+        subject,
+        name="observation.json",
+        purpose="generated",
+        signed_at=datetime.now(UTC).replace(microsecond=0),
+    )
+    envelope = attestation.sign_statement(statement, [key])
+    raw = envelope.model_dump_json(by_alias=True).encode()
+    public = key.public_key()
+    attestation.verify_attestation(
+        attestation.parse_envelope(raw),
+        subject,
+        trusted_keys={key_id(public): public},
+        purpose="generated",
+    )
+    return {"mcp:tickets": hash_bytes(raw)}
+
+
 def test_recording_remote_evidence_binds_the_full_url_from_then_on():
     approved, evidence, _server, _tool = _remote_case()
-    record_candidate(approved, verify_mcp_servers(approved, transport_evidence=[evidence]))
+    report = verify_mcp_servers(approved, transport_evidence=[evidence])
+    with pytest.raises(ValueError, match="requires verified attestation"):
+        record_candidate(approved, report)
+    record_candidate(approved, report, remote_attestations=_verified_remote_attestation(evidence))
     report = verify_mcp_servers(approved, transport_evidence=[evidence])
     assert report.all_servers_verified
     assert report.results[0].to_dict()["transport_evidence"]["endpoint_binding"] == "full-url"
@@ -1265,12 +1298,16 @@ def test_an_operator_bound_on_evidence_age_refuses_stale_and_future_observations
     from datetime import UTC, datetime, timedelta
 
     day = timedelta(hours=24)
-    approved, evidence, server, _tool = _remote_case()
+    approved, evidence, server, tool = _remote_case()
     old = verify_mcp_servers(approved, transport_evidence=[evidence], max_evidence_age=day)
     assert (old.results[0].status, old.results[0].reason) == (
         "failed",
         "invalid-transport-evidence",
     )
+    _claim(server, "server_declaration", observed_at=datetime.now(UTC))
+    stale_tool = verify_mcp_servers(approved, transport_evidence=[evidence], max_evidence_age=day)
+    assert stale_tool.results[0].reason == "invalid-descriptor"
+    _claim(tool, "tool_definition", observed_at=datetime.now(UTC))
     for when, verified in (
         (datetime.now(UTC) - timedelta(hours=1), True),
         (datetime.now(UTC) + timedelta(hours=1), False),
@@ -1300,7 +1337,7 @@ def test_full_url_binding_can_be_required_and_counts_origin_only_servers():
         "failed",
         "invalid-transport-evidence",
     )
-    record_candidate(approved, loose)
+    record_candidate(approved, loose, remote_attestations=_verified_remote_attestation(evidence))
     bound = verify_mcp_servers(
         approved, transport_evidence=[evidence], require_full_url_binding=True
     )

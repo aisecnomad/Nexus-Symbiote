@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import re
+import stat
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypeVar, cast
 
 import click
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from nexus_symbiote.attestation import MAX_SUBJECT_BYTES
 from nexus_symbiote.runtime_cli import (
@@ -29,7 +32,6 @@ from nexus_symbiote.runtime_cli import (
     _read,
     _refuse_source_overwrite,
 )
-from nexus_symbiote.runtime_cli import _load_trusted_public as _load_trusted_public
 from nexus_symbiote.utils.terminal import echo_line, json_text, write_cli_output
 
 MAX_AGE_DAYS = 36500
@@ -181,6 +183,50 @@ def attest(
     click.echo(json_text(json.dumps(result)))
 
 
+def _load_trusted_public(path: Path) -> Ed25519PublicKey:
+    from cryptography.exceptions import UnsupportedAlgorithm
+    from cryptography.hazmat.primitives import serialization
+
+    from nexus_symbiote.core.hashing import (
+        open_directory_nofollow,
+        open_regular_file,
+        pathname_identity,
+    )
+    from nexus_symbiote.runtime_cli import MAX_KEY_BYTES
+    from nexus_symbiote.utils.crypto import _trusted_ancestor_uids
+
+    uid = getattr(os, "geteuid", lambda: None)()
+    trusted_uids = _trusted_ancestor_uids(uid) if uid is not None else set()
+    parent_fd = open_directory_nofollow(path.parent)
+    try:
+        parent_info = os.fstat(parent_fd)
+    finally:
+        os.close(parent_fd)
+    if (parent_info.st_mode & 0o002) and not (
+        (parent_info.st_mode & stat.S_ISVTX) and (uid is None or parent_info.st_uid in trusted_uids)
+    ):
+        raise _KeyFileError("trusted key directory must not be world-writable")
+    with open_regular_file(path) as stream:
+        info = os.fstat(stream.fileno())
+        raw = stream.read(MAX_KEY_BYTES + 1)
+        if (
+            info.st_nlink != 1
+            or (uid is not None and info.st_uid not in trusted_uids)
+            or (info.st_mode & 0o002)
+            or pathname_identity(path) != (info.st_dev, info.st_ino)
+        ):
+            raise _KeyFileError("trusted key file failed ownership, permission, or link checks")
+    if len(raw) > MAX_KEY_BYTES:
+        raise _InputTooLargeError
+    try:
+        public = serialization.load_pem_public_key(raw)
+    except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+        raise _KeyFileError("public key could not be loaded") from exc
+    if not isinstance(public, Ed25519PublicKey):
+        raise _KeyFileError("only Ed25519 public keys are supported")
+    return public
+
+
 def _subject_bytes(subject: Path, preloaded: bytes | None) -> bytes:
     if preloaded is None:
         return _read(subject, MAX_SUBJECT_BYTES)
@@ -200,7 +246,6 @@ def _verify_core(
     max_age_days: int | None,
     subject_bytes: bytes | None = None,
 ) -> tuple[object, dict[str, object]]:
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
     from nexus_symbiote import attestation
     from nexus_symbiote.runtime import key_id

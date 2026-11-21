@@ -302,42 +302,6 @@ def _load_public(path: Path) -> Ed25519PublicKey:
     return public
 
 
-def _load_trusted_public(path: Path) -> Ed25519PublicKey:
-    from nexus_symbiote.core.hashing import open_directory_nofollow, pathname_identity
-    from nexus_symbiote.utils.crypto import _trusted_ancestor_uids
-
-    uid = getattr(os, "geteuid", lambda: None)()
-    trusted_uids = _trusted_ancestor_uids(uid) if uid is not None else set()
-    parent_fd = open_directory_nofollow(path.parent)
-    try:
-        parent_info = os.fstat(parent_fd)
-    finally:
-        os.close(parent_fd)
-    if (parent_info.st_mode & 0o002) and not (
-        (parent_info.st_mode & stat.S_ISVTX) and (uid is None or parent_info.st_uid in trusted_uids)
-    ):
-        raise _KeyFileError("trusted key directory must not be world-writable")
-    with open_regular_file(path) as stream:
-        info = os.fstat(stream.fileno())
-        raw = stream.read(MAX_KEY_BYTES + 1)
-        if (
-            info.st_nlink != 1
-            or (uid is not None and info.st_uid not in trusted_uids)
-            or (info.st_mode & 0o002)
-            or pathname_identity(path) != (info.st_dev, info.st_ino)
-        ):
-            raise _KeyFileError("trusted key file failed ownership, permission, or link checks")
-    if len(raw) > MAX_KEY_BYTES:
-        raise _InputTooLargeError
-    try:
-        public = serialization.load_pem_public_key(raw)
-    except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
-        raise _KeyFileError("public key could not be loaded") from exc
-    if not isinstance(public, Ed25519PublicKey):
-        raise _KeyFileError("only Ed25519 public keys are supported")
-    return public
-
-
 def _refuse_source_overwrite(output: Path | None, source: Path) -> None:
     from nexus_symbiote.utils.terminal import output_failure
 

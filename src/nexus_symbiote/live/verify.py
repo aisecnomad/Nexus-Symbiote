@@ -493,6 +493,8 @@ def _verify_remote_evidence(
             or tool_claim.assurance != AssuranceLevel.OBSERVED
             or tool_claim.collector != "live-mcp"
             or tool_claim.method != "https-mcp-tools-list"
+            or tool_claim.observed_at is None
+            or not _recent(tool_claim.observed_at, max_age)
             or obs_tool.definition_hash_version != TOOL_DEFINITION_HASH_VERSION
             or fp is None
         ):

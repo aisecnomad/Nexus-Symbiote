@@ -18,6 +18,7 @@ import click
 
 from nexus_symbiote import attestation
 from nexus_symbiote.attestation import MAX_SUBJECT_BYTES
+from nexus_symbiote.attestation_cli import _load_trusted_public
 from nexus_symbiote.core.aibom import AIBOM, NativeFormatError
 from nexus_symbiote.core.enums import AssuranceLevel, SerializationSafety
 from nexus_symbiote.core.hashing import hash_bytes, normalize_digest
@@ -29,7 +30,6 @@ from nexus_symbiote.runtime_cli import (
     _check_key_placement,
     _InputTooLargeError,
     _KeyFileError,
-    _load_trusted_public,
     _read,
     _refuse_source_overwrite,
 )
