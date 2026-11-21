@@ -257,7 +257,7 @@ jobs:
       - name: Enforce drift-regression and benchmark class recall floors
         env:
           PRECISION_REPORT: ${{ runner.temp }}/precision-gate.json
-        run: python scripts/check_precision_gate.py --out "$PRECISION_REPORT"
+        run: python scripts/check_precision_gate.py --fresh --out "$PRECISION_REPORT"
       - name: Run bounded parser fuzz smoke gate
         run: python scripts/fuzz_parsers.py --iterations 64
       - name: Retain per-case security evidence

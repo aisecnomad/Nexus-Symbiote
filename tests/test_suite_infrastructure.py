@@ -294,10 +294,15 @@ def test_each_ci_suite_dumps_tracebacks_only_just_before_its_test_timeout():
 
     ini = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     options = ini["tool"]["pytest"]["ini_options"]
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    workflows = {
+        name: yaml.safe_load((ROOT / ".github/workflows" / name).read_text(encoding="utf-8"))
+        for name in ("ci.yml", "dependencies.yml")
+    }
     checked = 0
-    for job in ("test", "floor", "coverage"):
-        for step in workflow["jobs"][job]["steps"]:
+    suites = [("ci.yml", "test"), ("ci.yml", "floor"), ("ci.yml", "coverage")]
+    suites += [("dependencies.yml", "newest"), ("dependencies.yml", "fuzz")]
+    for name, job in suites:
+        for step in workflows[name]["jobs"][job]["steps"]:
             run = step.get("run", "")
             if "pytest" not in run:
                 continue
@@ -307,7 +312,7 @@ def test_each_ci_suite_dumps_tracebacks_only_just_before_its_test_timeout():
             faulthandler = int(dump.group(1) if dump else options["faulthandler_timeout"])
             assert 0.9 * test_timeout <= faulthandler <= test_timeout, (job, run)
             checked += 1
-    assert checked == 3
+    assert checked == 5
 
 
 def test_the_time_limit_and_the_isolation_hold_in_a_parallel_worker(suite, monkeypatch):

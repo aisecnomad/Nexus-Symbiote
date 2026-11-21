@@ -29,11 +29,12 @@ from click.testing import CliRunner
 from hypothesis import HealthCheck, settings
 
 from nexus_symbiote import limits, modes
+from nexus_symbiote.supply_chain_cli import _HOST_CREDENTIAL_ENV
 
 ISOLATED_PREFIXES = ("NEXUS_SYMBIOTE_", "SYMBIOTE_", "SHADOWSCAN_", "GITHUB_", "RUNNER_")
 ISOLATED_NAMES = frozenset(
     {
-        "GH_TOKEN",
+        *_HOST_CREDENTIAL_ENV,
         "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
         "ACTIONS_ID_TOKEN_REQUEST_URL",
         "ACTIONS_RUNTIME_TOKEN",
