@@ -15,6 +15,7 @@ import click
 from nexus_symbiote import modes
 from nexus_symbiote.core.aibom import AIBOM, NativeFormatError
 from nexus_symbiote.live_cli import review_notice
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES
 from nexus_symbiote.utils.files import create_staging_file
 from nexus_symbiote.utils.terminal import (
     echo_line,
@@ -345,6 +346,12 @@ def register_supply_chain_commands(main: click.Group) -> None:
         ),
     )
     @click.option(
+        "--accept-default-exclude",
+        type=click.Choice(sorted(DEFAULT_EXCLUDES)),
+        multiple=True,
+        help="Accept one default exclusion while retaining the path in the inventory. Repeat as needed.",
+    )
+    @click.option(
         "--accept-default-excludes",
         is_flag=True,
         help=(
@@ -376,6 +383,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
         no_project_policy: bool = False,
         accept_project_policy: bool = False,
         accept_default_excludes: bool = False,
+        accept_default_exclude: tuple[str, ...] = (),
         signature_policy: Path | None = None,
         fail_on_unsigned_discovery: bool = False,
         allow_unsigned_discovery: bool = False,
@@ -430,6 +438,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
                 no_project_policy=no_project_policy,
                 accept_project_policy=accept_project_policy,
                 accept_default_excludes=accept_default_excludes,
+                accept_default_exclude=accept_default_exclude,
             )
             # A project policy may select report-only mode; it cannot authorize
             # promotion of incomplete evidence into an approved baseline.

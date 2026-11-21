@@ -25,6 +25,15 @@ def configuration(tmp_path: Path, **inputs: str):
     return runner.Config.from_env({"GITHUB_WORKSPACE": str(tmp_path), **inputs})
 
 
+def test_action_default_exclusion_acceptance_is_limited_to_git(tmp_path: Path) -> None:
+    action = yaml.safe_load((Path(__file__).parents[1] / "action.yml").read_text())
+    value = action["inputs"]["accept-default-excludes"]["default"]
+    config = configuration(tmp_path, SYMBIOTE_ACCEPT_DEFAULT_EXCLUDES=value)
+    assert config.accept_default_excludes == (".git",)
+    with pytest.raises(runner.InputError, match="only built-in exclusions"):
+        configuration(tmp_path, SYMBIOTE_ACCEPT_DEFAULT_EXCLUDES=".git,custom")
+
+
 @pytest.mark.parametrize("payload", ["$(touch PWNED)", "quote'and\"space", "--scanner=none"])
 def test_path_input_is_one_literal_argument_and_collection_runs_once(tmp_path, payload):
     (tmp_path / payload).mkdir()

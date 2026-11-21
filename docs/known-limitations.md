@@ -64,18 +64,16 @@ A way around a limit that its entry does not describe is worth a
   name. These defaults are listed under `exclusions` in the inventory. An empty
   directory of one of those names is not a coverage gap. A regular file, a symlink
   or a directory that contains anything is a gap (`default collection exclude; not
-  collected`), so the default gates fail until `--accept-default-excludes` is
-  passed to `scan` and to a later `validate --project` or `risk --project`, which
-  collect again. A checkout's `.git` is such a directory, and so is the `.git`
-  `actions/checkout` leaves; the GitHub Action input `accept-default-excludes`
-  defaults to `false`, so an Action run fails completeness until the caller sets
-  it to `true`. Inside a directory whose every file the `prompt` collector reads,
+  collected`). Use `--accept-default-exclude NAME` on `scan` and on later
+  `validate --project` or `risk --project` runs to accept a built-in name.
+  The inventory lists the occupied paths it accepted. The GitHub Action
+  selects only `.git` by default. Inside a directory whose every file the
+  `prompt` collector reads,
   such as a skill, command, rule or subagent directory, that collector records
   its own gap for the skipped name instead of the generic one, and
-  `--accept-default-excludes` does not remove that one. A skill checked out with its own `.git`, including a Git submodule,
-  whose `.git` is a file, or one whose script left a `__pycache__` beside it,
-  fails the gates until that entry is removed or the flag is passed for the
-  collection gap. A file the collectors would otherwise record, such as model
+  accepting default exclusions leaves this agent-directory gap in place. A skill
+  checked out as a Git submodule or with a `__pycache__` beside its script fails
+  coverage until the excluded entry is outside the scan. A file the collectors would otherwise record, such as model
   weights under `venv/weights/` or an instruction file under `node_modules/`, is
   not collected; the gap is what makes that visible. Review a pull request that
   adds tracked files under one of these names before accepting the exclusion.

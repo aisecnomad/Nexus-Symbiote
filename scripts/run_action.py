@@ -176,6 +176,18 @@ def _require_sigstore() -> None:
         ) from None
 
 
+def _default_exclusions(raw: str) -> bool | tuple[str, ...]:
+    from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES
+
+    value = raw.strip().lower()
+    if value in {"true", "false"}:
+        return value == "true"
+    names = tuple(dict.fromkeys(part.strip() for part in value.split(",") if part.strip()))
+    if not set(names) <= DEFAULT_EXCLUDES:
+        raise InputError("accept-default-excludes must name only built-in exclusions")
+    return names
+
+
 @dataclass(frozen=True)
 class Config:
     workspace: Path
@@ -192,7 +204,7 @@ class Config:
     limits: str = ""
     baseline: bytes | None = field(default=None, repr=False)
     allow_unsigned_discovery: bool = False
-    accept_default_excludes: bool = False
+    accept_default_excludes: bool | tuple[str, ...] = False
     fail_on_severity: str = "high"
     binding_key: str = field(default="", repr=False)
     scratch_parent: Path | None = None
@@ -297,9 +309,7 @@ class Config:
             _boolean(
                 env.get("SYMBIOTE_ALLOW_UNSIGNED_DISCOVERY", "false"), "allow-unsigned-discovery"
             ),
-            _boolean(
-                env.get("SYMBIOTE_ACCEPT_DEFAULT_EXCLUDES", "false"), "accept-default-excludes"
-            ),
+            _default_exclusions(env.get("SYMBIOTE_ACCEPT_DEFAULT_EXCLUDES", "false")),
             severity,
             supplied_key,
             scratch_parent,
@@ -594,7 +604,12 @@ def run(
             digest = hashlib.sha256(config.signature_policy).hexdigest()
             out.emit(signature_policy_digest=f"sha256:{digest}")
         unsigned = ["--allow-unsigned-discovery"] if config.allow_unsigned_discovery else []
-        accepted = ["--accept-default-excludes"] if config.accept_default_excludes else []
+        excludes = config.accept_default_excludes
+        accepted = (
+            ["--accept-default-excludes"]
+            if excludes is True
+            else [f"--accept-default-exclude={name}" for name in excludes or ()]
+        )
         args = [
             "scan",
             "--no-project-policy",

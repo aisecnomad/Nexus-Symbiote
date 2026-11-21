@@ -194,6 +194,9 @@ class ScanResult:
     dependencies: list[DependencyEdge] = field(default_factory=list)
     surfaces_scanned: list[str] = field(default_factory=list)
     surfaces_excluded: list[str] = field(default_factory=list)
+    accepted_default_exclusions: list[str] = field(
+        default_factory=lambda: BoundedRecords(noun="accepted default exclusion")
+    )
     scan_failures: list[str] = field(default_factory=list)
     source_report_digest: str | None = None
     source_report_content_digest: str | None = None
@@ -232,7 +235,11 @@ class ScanResult:
                     ]
         self.surfaces_scanned[:] = [relative(record) for record in self.surfaces_scanned]
         # Coverage reasons quote checkout text, such as a server name, and are exported.
-        for records in (self.surfaces_excluded, self.scan_failures):
+        for records in (
+            self.surfaces_excluded,
+            self.scan_failures,
+            self.accepted_default_exclusions,
+        ):
             records[:] = [neutral_text(relative(record)) for record in records]
 
 
@@ -289,14 +296,14 @@ class Scanner(ABC):
 
     name: str = "base"
     _exclude_paths: tuple[str | Path, ...] = ()
-    _accept_default_excludes: bool = False
+    _accept_default_excludes: bool | tuple[str, ...] = False
     _files: ConfinedCollection | None = None
 
     def configure(
         self,
         exclude_paths: Iterable[str | Path] = (),
         *,
-        accept_default_excludes: bool = False,
+        accept_default_excludes: bool | tuple[str, ...] = False,
     ) -> None:
         """Set root-relative or absolute collection exclusions before ``scan``."""
         self._exclude_paths = tuple(exclude_paths)
@@ -312,6 +319,7 @@ class Scanner(ABC):
             result.surfaces_excluded,
             exclude_paths=self._exclude_paths,
             accept_default_excludes=self._accept_default_excludes,
+            accepted_default_exclusions=result.accepted_default_exclusions,
             **bounds,
         ) as files:
             self._files = files

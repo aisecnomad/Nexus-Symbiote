@@ -531,7 +531,8 @@ class ConfinedCollection:
         exclusions: list[str] | None = None,
         *,
         exclude_paths: Iterable[str | Path] = (),
-        accept_default_excludes: bool = False,
+        accept_default_excludes: bool | tuple[str, ...] = False,
+        accepted_default_exclusions: list[str] | None = None,
         max_file_bytes: int | Bound | None = None,
         max_entries: int | Bound | None = None,
         max_depth: int | Bound | None = None,
@@ -583,7 +584,12 @@ class ConfinedCollection:
         self._excluded: set[tuple[str, ...]] = set()
         self._invalid_policy = False
         self._lifted: frozenset[str] = frozenset()
-        self._accept_default_excludes = accept_default_excludes
+        self._accepted_default_names = (
+            DEFAULT_EXCLUDES
+            if accept_default_excludes is True
+            else frozenset(accept_default_excludes or ())
+        )
+        self._accepted_default_exclusions = accepted_default_exclusions
         root_text = str(self.root)
         prefix = root_text.rstrip(os.sep) + os.sep
         for value in exclude_paths:
@@ -1272,16 +1278,20 @@ class ConfinedCollection:
                     # A caller that collects skipped reports the entry itself.
                     if (
                         scope.skipped is None
-                        and not self._accept_default_excludes
                         and _default_excluded(name)
                         and self._default_exclude_occupied(directory_fd, name)
                     ):
-                        reason = (
-                            AGENT_DEFAULT_EXCLUDE_REASON
-                            if _under_agent_configuration_directory(child)
-                            else DEFAULT_EXCLUDE_REASON
-                        )
-                        self._exclusion_log.add(f"{child.as_posix()}: {reason}")
+                        in_agent_config = _under_agent_configuration_directory(child)
+                        if not in_agent_config and fold_name(name) in self._accepted_default_names:
+                            if self._accepted_default_exclusions is not None:
+                                self._accepted_default_exclusions.append(child.as_posix())
+                        else:
+                            reason = (
+                                AGENT_DEFAULT_EXCLUDE_REASON
+                                if in_agent_config
+                                else DEFAULT_EXCLUDE_REASON
+                            )
+                            self._exclusion_log.add(f"{child.as_posix()}: {reason}")
                     continue
                 metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 if (

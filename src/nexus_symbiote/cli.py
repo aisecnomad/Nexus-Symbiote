@@ -49,6 +49,7 @@ from nexus_symbiote.sbom_cli import register_sbom_commands
 from nexus_symbiote.supply_chain_cli import STAGED_INVENTORY, register_supply_chain_commands
 from nexus_symbiote.text_poisoning import apply_text_poisoning_rules
 from nexus_symbiote.trace_cli import register_trace_commands
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES
 from nexus_symbiote.utils.files import write_output_file
 from nexus_symbiote.utils.terminal import (
     echo_line,
@@ -991,6 +992,12 @@ def _render_aibom(
     ),
 )
 @click.option(
+    "--accept-default-exclude",
+    type=click.Choice(sorted(DEFAULT_EXCLUDES)),
+    multiple=True,
+    help="Accept one default exclusion while retaining the path in the inventory. Repeat as needed.",
+)
+@click.option(
     "--accept-default-excludes",
     is_flag=True,
     help=(
@@ -1028,6 +1035,7 @@ def scan(
     no_project_policy: bool = False,
     accept_project_policy: bool = False,
     accept_default_excludes: bool = False,
+    accept_default_exclude: tuple[str, ...] = (),
     check_only: bool = False,
     fail_on_unsigned_discovery: bool = False,
     allow_unsigned_discovery: bool = False,
@@ -1052,7 +1060,6 @@ def scan(
 
     from nexus_symbiote.graph import assemble_repository_agent
     from nexus_symbiote.policy import PolicyError
-    from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES
     from nexus_symbiote.validators.risk import RiskScorer
 
     op_policy, op_digest, op_signers = _resolve_operator_policy(
@@ -1104,6 +1111,7 @@ def scan(
     )
     surfaces_scanned: list[str] = []
     surfaces_excluded: list[str] = []
+    accepted_default_exclusions: set[str] = set()
     scan_failures: list[str] = []
     failures_by: dict[str, list[str]] = {}
     excluded_by: dict[str, list[str]] = {}
@@ -1135,7 +1143,7 @@ def scan(
             if configure:
                 configure(
                     exclude_paths=policy.scan.exclude_paths,
-                    accept_default_excludes=accept_default_excludes,
+                    accept_default_excludes=accept_default_excludes or accept_default_exclude,
                 )
             elif policy.scan.exclude_paths:
                 raise ValueError("scanner does not support configured exclude_paths")
@@ -1155,6 +1163,7 @@ def scan(
             _merge_scan_result(name, result, aibom, collected, scan_failures)
             surfaces_scanned.extend(result.surfaces_scanned)
             surfaces_excluded.extend(result.surfaces_excluded)
+            accepted_default_exclusions.update(result.accepted_default_exclusions)
             scan_failures.extend(result.scan_failures)
             failures_by[name] = scan_failures[failure_count:]
             excluded_by[name] = list(result.surfaces_excluded)
@@ -1241,7 +1250,11 @@ def scan(
         collectors_requested=list(selected),
         collectors_completed=completed,
         exclusions=sorted(
-            {*policy.scan.exclude_paths, *(f"**/{name}" for name in DEFAULT_EXCLUDES)}
+            {
+                *policy.scan.exclude_paths,
+                *(f"**/{name}" for name in DEFAULT_EXCLUDES),
+                *accepted_default_exclusions,
+            }
         ),
         unobserved_surfaces=[
             "runtime",
@@ -1773,6 +1786,12 @@ def verify_discovery(
     ),
 )
 @click.option(
+    "--accept-default-exclude",
+    type=click.Choice(sorted(DEFAULT_EXCLUDES)),
+    multiple=True,
+    help="Accept one default exclusion while retaining the path in the inventory. Repeat as needed.",
+)
+@click.option(
     "--accept-default-excludes",
     is_flag=True,
     help=(
@@ -1822,6 +1841,7 @@ def validate(
     no_project_policy: bool = False,
     accept_project_policy: bool = False,
     accept_default_excludes: bool = False,
+    accept_default_exclude: tuple[str, ...] = (),
     skip_integrity: bool = False,
     json_output: bool = False,
     report_format: str | None = None,
@@ -1897,7 +1917,7 @@ def validate(
                 root,
                 exclude_paths=policy.scan.exclude_paths,
                 signature_policies=signature_policies,
-                accept_default_excludes=accept_default_excludes,
+                accept_default_excludes=accept_default_excludes or accept_default_exclude,
             )
             if root is not None
             else cv.validate(bom)
@@ -2024,6 +2044,12 @@ def validate(
     ),
 )
 @click.option(
+    "--accept-default-exclude",
+    type=click.Choice(sorted(DEFAULT_EXCLUDES)),
+    multiple=True,
+    help="Accept one default exclusion while retaining the path in the inventory. Repeat as needed.",
+)
+@click.option(
     "--accept-default-excludes",
     is_flag=True,
     help=(
@@ -2066,6 +2092,7 @@ def risk(
     no_project_policy: bool = False,
     accept_project_policy: bool = False,
     accept_default_excludes: bool = False,
+    accept_default_exclude: tuple[str, ...] = (),
     fail_on_unsigned_discovery: bool = False,
     allow_unsigned_discovery: bool = False,
     project: Path | None = None,
@@ -2146,7 +2173,7 @@ def risk(
             root,
             exclude_paths=policy.scan.exclude_paths,
             signature_policies=signature_policies,
-            accept_default_excludes=accept_default_excludes,
+            accept_default_excludes=accept_default_excludes or accept_default_exclude,
         )
         discovery: list[str] = []
         if discovery_signature_required(

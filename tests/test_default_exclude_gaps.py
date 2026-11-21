@@ -150,6 +150,26 @@ def test_validate_recollection_sees_the_same_flag(tmp_path: Path) -> None:
     assert "default collection exclude" not in accepted.output
 
 
+def test_git_acceptance_keeps_the_path_and_other_coverage_gaps(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (project / "AGENTS.md").write_text("Keep receipts.\n")
+    runner = CliRunner()
+    scan = ["scan", str(project), "--no-project-policy", "--accept-default-exclude", ".git"]
+    clean = runner.invoke(main, [*scan, "--check"])
+    assert clean.exit_code == 0, clean.output
+
+    (project / "node_modules").mkdir()
+    (project / "node_modules" / "README.md").write_text("Ordinary dependency metadata.\n")
+    output = tmp_path / "record.json"
+    result = runner.invoke(main, [*scan, "-o", str(output)])
+    assert result.exit_code == 1, result.output
+    completeness = json.loads(output.read_text())["metadata"]["completeness"]
+    assert ".git" in completeness["exclusions"]
+    assert completeness["surfaces_excluded"] == [GAP]
+
+
 def test_scanner_configure_threads_the_flag(tmp_path: Path) -> None:
     (tmp_path / "node_modules").mkdir()
     (tmp_path / "node_modules" / "x.json").write_text("{}\n")

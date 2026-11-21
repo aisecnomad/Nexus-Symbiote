@@ -115,11 +115,10 @@ inputs:
     default: "false"
   accept-default-excludes:
     description: >-
-      'true' passes --accept-default-excludes to scan, validate and risk, so a non-empty
-      .git, node_modules, __pycache__, .venv or venv is not a coverage gap. 'false' is the
-      default: actions/checkout leaves a non-empty .git, and that gap fails the completeness
-      and risk gates until this input is 'true'. An empty directory is not a gap either way
-    default: "false"
+      Comma-separated built-in names whose occupied paths are accepted and recorded.
+      Defaults to .git for actions/checkout. 'false' accepts none, and 'true' accepts
+      all built-in names. Other occupied default exclusions remain coverage gaps
+    default: ".git"
   limits:
     description: >-
       Raised collection limits as NAME=VALUE pairs separated by commas, passed to the CLI as
