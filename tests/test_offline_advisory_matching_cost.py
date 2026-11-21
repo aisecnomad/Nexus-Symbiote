@@ -6,7 +6,9 @@ it cannot decide. The reference below is the pairwise matcher this module replac
 37b3cfce (unparsable upper bounds flag a match, and stop parsable ones excluding a version
 in the interval event order puts them in; limits exclude only a version at or above all of
 them; malformed blocks, an unparsable ``introduced`` and an unparsable queried version are
-errors), kept word for word apart from its names as the oracle.
+errors), kept as the oracle. It differs from that matcher in its names and in the three
+rules of #303: a run of consecutive ``introduced`` events owns the bounds after it together,
+and a range of a type OSV does not define, or with no ``introduced``, is an error.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from nexus_symbiote.core.models import RegistryEntryComponent
 from tests.support import scaling_ratio
 
 _SUPPORTED_RANGE_TYPES = frozenset({"ECOSYSTEM", "SEMVER"})
+_UNMATCHED_RANGE_TYPES = frozenset({"GIT"})
 
 # #296 rates the feed's age against the caller's clock. These tests date every record
 # now, so a feed-age error never stands in for the matching behaviour under test.
@@ -66,10 +69,12 @@ def _reference_range_matches(
     below any limit is in range), or past a parsable bound of an interval with none unparsable.
     """
     raw_type = rng.get("type")
+    if isinstance(raw_type, str) and raw_type.upper() in _UNMATCHED_RANGE_TYPES:
+        return False, [], []
     if raw_type is not None and (
         not isinstance(raw_type, str) or raw_type.upper() not in _SUPPORTED_RANGE_TYPES
     ):
-        return False, [], []
+        raise ValueError("OSV range type is not supported")
     events = rng.get("events")
     if not isinstance(events, list):
         raise ValueError("OSV range events are not a list")
@@ -93,6 +98,8 @@ def _reference_range_matches(
         else:
             raise ValueError("OSV range event cannot be parsed")
     intros, fixed_versions, last_affected, limits = found.values()
+    if not has_zero_intro and not intros:
+        raise ValueError("OSV range has no introduced event")
 
     cmp(version, version)
     best_intro: str | None = None
@@ -113,12 +120,18 @@ def _reference_range_matches(
         decided = not open_interval and bound not in unparsed
         return decided and (best_intro is None or cmp(best_intro, bound) <= 0)
 
-    owner: str | None = None  # the introduced an event follows; None before the first
+    run: list[str] = []  # the consecutive introduced events an event follows; empty before any
+    bounded = False  # a fixed or last_affected has followed the run
     open_interval = False  # an unparsable bound may close the version's interval
     for kind, value in ordered:
-        owner = value if kind == "introduced" else owner
-        held = owner is None or cmp(owner, best_intro or "0") == 0
-        open_interval |= held and kind in ("fixed", "last_affected") and value in unparsed
+        if kind == "introduced":
+            run, bounded = ([value], False) if bounded else ([*run, value], False)
+            continue
+        if kind == "limit":
+            continue
+        bounded = True
+        held = not run or any(cmp(owner, best_intro or "0") == 0 for owner in run)
+        open_interval |= held and value in unparsed
     if (
         all(x != "*" and x not in unparsed and cmp(version, x) >= 0 for x in limits or ["*"])
         or any(ends_after_intro(fix) and cmp(fix, version) <= 0 for fix in fixed_versions)
@@ -372,6 +385,8 @@ def test_the_indexed_matcher_reports_what_pairwise_matching_reported(ecosystem):
         "OSV affected versions or ranges are not a list",
         "OSV range events are not a list",
         "OSV range event cannot be parsed",
+        "OSV range has no introduced event",
+        "OSV range type is not supported",
         "OSV range version cannot be compared",
     }
 
@@ -706,3 +721,28 @@ def test_a_range_with_many_events_spends_the_budget_before_it_is_evaluated(tmp_p
     assert report.advisories == []
     assert len(report.errors) == 1
     assert report.complete is False
+
+
+def test_runs_of_introduced_that_own_unparsable_bounds_cost_what_the_budget_charges():
+    """A range is charged the square of its events, so evaluating it may cost no more.
+
+    The shape: one run of ``introduced`` events that owns many unparsable bounds, then a
+    second run the queried versions fall in. Asking each owned bound for each member of
+    its run, at each position, is cubic (a ratio near 64 at 4x) for a quadratic charge.
+    """
+
+    def run(scale: int) -> None:
+        size = 150 * scale
+        events: list[dict[str, str]] = [{"introduced": f"1.{i}"} for i in range(size)]
+        events += [{"fixed": f"junk{i}!"} for i in range(size)]
+        events += [{"introduced": f"2.{i}"} for i in range(size)]
+        budget = offline._MatchBudget(10**9)
+        matcher = offline._PackageMatcher(
+            "PyPI", [(_advisory("GHSA-run"), {"ranges": [{"events": events}]})], budget
+        )
+        for version in ("1.5", "2.5"):
+            found, undecided = _indexed_blocks(matcher, version, budget)
+            assert [record for record, _, _ in found] == ["GHSA-run"]
+            assert undecided == []
+
+    assert scaling_ratio(run) < 32
