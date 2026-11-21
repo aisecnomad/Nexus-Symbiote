@@ -427,6 +427,25 @@ def test_import_sbom_10000_same_name_components_is_linear_time_and_memory(
     assert peak_bytes < 24 * 1024 * 1024
 
 
+@pytest.mark.parametrize(("version", "state"), [("4.2.0", "manifest-only"), ("5.2.0", "locked")])
+def test_nested_npm_lock_uses_the_root_dev_dependency_range(tmp_path, version, state):
+    nested = tmp_path / "service"
+    nested.mkdir()
+    sections = {"dependencies": {"openai": "^4.0.0"}, "devDependencies": {"openai": "^5.0.0"}}
+    manifest = {"packageManager": "npm@11.0.0", **sections}
+    packages = {"": sections, "node_modules/openai": {"version": version}}
+    (nested / "package.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (nested / "package-lock.json").write_text(
+        json.dumps({"lockfileVersion": 3, "packages": packages}), encoding="utf-8"
+    )
+    components, failures = walk_nested_manifests(tmp_path)
+    assert not failures
+    (component,) = components
+    assert component.properties["pinning_state"] == state
+    if state == "locked":
+        assert component.version == version
+
+
 def test_nested_cdx_spdx3_format_validation_and_lockfile_membership(tmp_path: Path) -> None:
     nested_cdx = tmp_path / "nested.cdx.json"
     nested_cdx.write_text(
