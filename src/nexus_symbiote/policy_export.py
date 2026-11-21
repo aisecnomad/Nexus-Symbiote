@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
 _POLICY_FORMATS = frozenset({"cedar", "rego", "json"})
 _UNVERIFIED_SEVERITIES = frozenset({"critical", "error", "unknown"})
+_MAX_POLICY_DIAGNOSTIC_CHARS = 1024
 
 
 def resolve_project_root(value: str | Path, *, label: str) -> Path:
@@ -192,11 +193,16 @@ def corroborate_against_project(
     try:
         policy, _ = resolved_project_policy(root)
     except PolicyError as exc:
+        message = neutralize(f"could not load validation settings for --project: {exc}")
+        if len(message) > _MAX_POLICY_DIAGNOSTIC_CHARS:
+            message = message[: _MAX_POLICY_DIAGNOSTIC_CHARS - 3] + "..."
+        raise click.ClickException(message) from exc
+    if running_in_ci() and (extra_paths := additional_exclusions(policy.scan)):
+        entries = "entry" if len(extra_paths) == 1 else "entries"
         raise click.ClickException(
-            neutralize(f"could not load validation settings for --project: {exc}")
-        ) from exc
-    if running_in_ci() and additional_exclusions(policy.scan):
-        raise click.ClickException("the project policy weakens the built-in gates in CI")
+            "the project policy weakens the built-in gates in CI because "
+            f"scan.exclude_paths contains {len(extra_paths)} additional {entries}"
+        )
     excluded = policy.scan.exclude_paths
     c_report = CompletenessValidator().validate_against_project(
         bom, root, exclude_paths=excluded, signature_policies=sig_policies

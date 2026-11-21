@@ -34,8 +34,9 @@ from nexus_symbiote.instruction_diff import register_instruction_diff_commands
 from nexus_symbiote.inventory_export_cli import register_inventory_export_commands
 from nexus_symbiote.live_cli import register_live_commands
 from nexus_symbiote.minimum_elements_cli import register_minimum_elements_commands
-from nexus_symbiote.policy import Policy, running_in_ci
+from nexus_symbiote.policy import Policy
 from nexus_symbiote.policy import gate_weakenings as _gate_weakenings
+from nexus_symbiote.policy import running_in_ci as _running_in_ci
 from nexus_symbiote.reporting import (
     ReportLine,
     diff_report_lines,
@@ -246,7 +247,7 @@ def _policy_with_source(
         echo_line(
             "WARNING: policy ", path, " weakens the built-in gates: ", "; ".join(weaker), err=True
         )
-    if _gate_weakenings(weaker) and not allow_weakening and running_in_ci():
+    if _gate_weakenings(weaker) and not allow_weakening and _running_in_ci():
         raise click.ClickException(
             "The project policy weakens the built-in gates and this run looks like CI. Pass "
             "--no-project-policy to ignore the checkout's policy, or --accept-project-policy "
@@ -463,7 +464,7 @@ def _unsigned_discovery_failure_reason(
         return None
     if fail_on_unsigned_discovery:
         return "Unsigned ShadowScan discovery evidence (--fail-on-unsigned-discovery)."
-    if running_in_ci():
+    if _running_in_ci():
         echo_line(
             "  In CI, pass --allow-unsigned-discovery to accept unsigned discovery "
             "evidence explicitly.",
