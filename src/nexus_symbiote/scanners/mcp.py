@@ -560,7 +560,7 @@ class _Entries:
     servers: list[tuple[str, Any]]
     problems: dict[str, str]
     unknown: dict[str, str]
-    dropped: tuple[dict[str, Any], ...] = ()
+    dropped: tuple[Any, ...] = ()
 
 
 _INVALID_SERVER = "invalid server configuration"
@@ -1112,7 +1112,12 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     if not name or not value or name.lower() in {"h", "header"}:
         return []
     hits = value_hits(name, value)
-    if following is not None and value.lower() in _ASSIGNMENT_SCHEMES:
+    if (
+        following is not None
+        and credential_name(name)
+        and value.lower() in _ASSIGNMENT_SCHEMES
+        and not (word.startswith("-") and _CLI_FLAG.fullmatch(following.partition("=")[0]))
+    ):
         hits.extend(value_hits(name, f"{value} {following}"))
     return hits
 
@@ -1285,6 +1290,25 @@ def _declared_hits(config: dict[str, Any]) -> PositionHits:
     maps = [m for m in (config.get("headers"), config.get("http_headers")) if isinstance(m, dict)]
     args = args if isinstance(args, list) else []
     return list(_credential_hits(env if isinstance(env, dict) else {}, args, maps, ()))
+
+
+def _malformed_values(node: Any) -> Iterator[str]:
+    """A refused field has no reliable schema. Scrub its literals and any credentials
+    they contain, so repeating one in a valid sibling cannot publish it.
+    """
+    pending = [node]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, str) and not is_reference(item):
+            if len(item) >= MIN_SECRET_LENGTH:
+                yield item
+            yield from _text_credentials(item)
+            yield from _shape_secrets(item)
+            yield from (literal for _, literal in _argument_hits(None, item))
 
 
 def _server_literals(config: dict[str, Any], hits: PositionHits) -> list[str]:
@@ -2865,6 +2889,7 @@ class MCPScanner(Scanner):
         values: list[str] = []
         for _, config in entries:
             if not isinstance(config, dict):
+                values.extend(_malformed_values(config))
                 continue
             values.extend(_shape_credentials(config, shape))
             if cls._server_problem(config, shape) is not None:
@@ -2876,7 +2901,8 @@ class MCPScanner(Scanner):
                     # credential limit and so withhold every sibling from the inventory.
                     declared = {field: item for field, item in config.items() if field != "args"}
                     read = [hit for hit in hits if hit[0] != "argument"]
-                # _server_secrets reads each field only when it has the type it expects.
+                for value in cls._invalid_field_values(declared, shape):
+                    values.extend(_malformed_values(value))
                 values.extend(_server_secrets(declared, Launch(), read))
                 if server_hits is not None:
                     server_hits[id(config)] = hits
@@ -2977,7 +3003,7 @@ class MCPScanner(Scanner):
         entries: dict[str, Any] = {}
         problems: dict[str, str] = {}
         unknown: dict[str, str] = {}
-        dropped: list[dict[str, Any]] = []
+        dropped: list[Any] = []
         experimental = data.get("experimental")
         if (
             dialect.shape == "continuerc"
@@ -3002,9 +3028,7 @@ class MCPScanner(Scanner):
                 repeated: set[str] = set()
                 for index, config in enumerate(servers, 1):
                     name = config.get("name") if isinstance(config, dict) else None
-                    if isinstance(config, dict) and (
-                        not isinstance(name, str) or not name or name in entries or name in repeated
-                    ):
+                    if not isinstance(name, str) or not name or name in entries or name in repeated:
                         dropped.append(config)
                     if isinstance(config, dict) and "uses" in config and name is None:
                         # The slug is not shown: it is the checkout's text, not an identity.
@@ -3040,7 +3064,8 @@ class MCPScanner(Scanner):
                         f"{dialect.path}: MCP server declared under more than one server map"
                     )
                     if isinstance(config, dict):
-                        dropped.append(_normalized_server(dialect.shape, config).config)
+                        config = _normalized_server(dialect.shape, config).config
+                    dropped.append(config)
                     continue
                 if dialect.shape != "map" and isinstance(config, dict):
                     normalized = _normalized_server(dialect.shape, config)
@@ -3080,7 +3105,7 @@ class MCPScanner(Scanner):
         elif commands:
             command, *arguments = commands[0].split()
             # The client replaces a server map entry of the same name.
-            if isinstance(replaced := entries.get("mcp"), dict):
+            if (replaced := entries.get("mcp")) is not None:
                 dropped.append(replaced)
             entries["mcp"] = {"command": command, "args": arguments}
         tools = [
@@ -3106,8 +3131,8 @@ class MCPScanner(Scanner):
         return _Entries(sorted(entries.items()), problems, unknown, tuple(dropped))
 
     @staticmethod
-    def _server_problem(config: dict[str, Any], shape: str) -> str | None:
-        """A type or size problem in a server entry; unknown fields are gaps, not failures."""
+    def _invalid_field_values(config: dict[str, Any], shape: str) -> Iterator[Any]:
+        """Values whose type prevents an interpreted server field from being read."""
         for field, value in config.items():
             if not _interpreted(field, shape):
                 continue
@@ -3132,7 +3157,13 @@ class MCPScanner(Scanner):
             else:
                 continue
             if not valid:
-                return "invalid server configuration"
+                yield value
+
+    @classmethod
+    def _server_problem(cls, config: dict[str, Any], shape: str) -> str | None:
+        """A type or size problem in a server entry; unknown fields are gaps, not failures."""
+        if any(True for _ in cls._invalid_field_values(config, shape)):
+            return "invalid server configuration"
         limits = (
             ("args", MAX_ARGUMENTS, "argument"),
             ("env", MAX_ENVIRONMENT, "environment variable"),
@@ -3809,7 +3840,7 @@ class MCPScanner(Scanner):
         unbound = []
         if command and (re.search(r"[\\/]", command) or launch.wrappers):
             unbound.append("command path")
-        elif command and identity.command != command.strip():
+        elif command and identity.command != command:
             # A redacted command, or one exported case-folded or without its Windows
             # suffix: MCPServer and mcpserver are different files on POSIX.
             unbound.append("command")

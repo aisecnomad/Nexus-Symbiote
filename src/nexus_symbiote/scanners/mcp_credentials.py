@@ -611,22 +611,24 @@ def _token_hits(value: str) -> list[Hit]:
     ]
 
 
-def _private_key(value: str) -> bool:
-    """A private key block whose body is not elided, a PuTTY key, or either in base64."""
+def _private_key(value: str) -> str | None:
+    """Return the unpadded text to redact, unwrapped when the key is base64-encoded."""
     if private_key_block(value):
-        return "..." not in value and "…" not in value
+        return None if "..." in value or "…" in value else value.strip()
     if _putty_key(value):
-        return True
+        return value.strip()
     # base64 and openssl wrap their output at 76 and 64 columns by default.
-    compact = _ASCII_SPACE.sub("", value)
+    compact = _ASCII_SPACE.sub("", value.strip())
     if len(compact) > _ENCODED_LIMIT or _BASE64.fullmatch(compact) is None:
-        return False
+        return None
     try:
         decoded = base64.b64decode(compact + "=" * (-len(compact) % 4))
     except (binascii.Error, ValueError):
-        return False
+        return None
     text = decoded.decode("utf-8", "replace")
-    return private_key_block(text) or '"private_key"' in text or _putty_key(text)
+    if private_key_block(text) or '"private_key"' in text or _putty_key(text):
+        return compact
+    return None
 
 
 def _putty_key(text: str) -> bool:
@@ -804,8 +806,9 @@ def value_hits(name: str, value: str, *, header: bool = False) -> list[Hit]:
     if _PUBLIC_JWT.fullmatch(_strip(value)) and not _JWT_PUBLIC_WORDS.isdisjoint(name_words(name)):
         return []  # A JWT under an anon or public name is a key published by design.
     hits = _token_hits(value)
-    if _private_key(value):
-        hits.append((NAMED_CLASS, value))
+    if (key := _private_key(value)) is not None:
+        # A sibling can repeat the same key without the original field's padding or wrapping.
+        hits.extend((NAMED_CLASS, form) for form in dict.fromkeys((value, value.strip(), key)))
     stripped = _strip(value)
     if not stripped or public_material(stripped):
         return hits
