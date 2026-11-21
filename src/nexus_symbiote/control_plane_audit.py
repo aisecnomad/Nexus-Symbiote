@@ -762,46 +762,29 @@ def _claude_mcp_prefix(server: str) -> str:
 
 def _allows_mcp_server(rules: list[str], prefix: str) -> bool:
     exact = bisect_left(rules, prefix)
-    if exact < len(rules) and rules[exact] == prefix:
+    # A bare rule is parsed at the first double underscore. For ambiguous server
+    # names Claude requires the tool-qualified form, including the whole name.
+    bare_address = "__" not in prefix[5:] and not prefix.endswith("_")
+    if bare_address and exact < len(rules) and rules[exact] == prefix:
         return True
     scoped = f"{prefix}__"
     index = bisect_left(rules, scoped)
     return index < len(rules) and rules[index].startswith(scoped)
 
 
-def _glob_prefixes(rules: list[str], *, tool_names_only: bool) -> list[str]:
-    """Literal prefixes of MCP tool globs, with redundant narrower prefixes removed."""
-    prefixes: set[str] = set()
-    for rule in rules:
-        literal, wildcard, _ = rule.partition("*")
-        if not wildcard or not ("mcp__".startswith(literal) or literal.startswith("mcp__")):
-            continue
-        # After the first star, a tool name can supply any remaining identifier
-        # characters. Qualifiers outside that alphabet require client-specific parsing.
-        tool_glob = re.fullmatch(r"[A-Za-z0-9_*-]+", rule) is not None
-        if tool_glob == tool_names_only:
-            prefixes.add(literal)
-    distinct: list[str] = []
-    for prefix in sorted(prefixes):
-        if not distinct or not prefix.startswith(distinct[-1]):
-            distinct.append(prefix)
-    return distinct
-
-
-def _glob_overlaps_namespace(prefixes: list[str], namespace: str) -> bool:
-    # With redundant prefixes removed, an ancestor or descendant must be adjacent
-    # to the insertion point. Do not compare every permission rule with every server.
-    index = bisect_left(prefixes, namespace)
-    return (index < len(prefixes) and prefixes[index].startswith(namespace)) or (
-        index > 0 and namespace.startswith(prefixes[index - 1])
-    )
+def _claude_mcp_allow(rule: str) -> bool:
+    """Claude accepts MCP allow globs only in the tool part of a literal server address."""
+    if not rule.startswith("mcp__") or any(c.isspace() or c in "()" for c in rule):
+        return False
+    server, separator, tool = rule[5:].partition("__")
+    return bool(server and "*" not in server and (not separator or tool))
 
 
 def _inspect_steering_surfaces(
     files: ConfinedCollection, all_paths: list[str], summary: ControlPlaneAuditSummary
 ) -> None:
     modes: dict[str, list[str]] = {}
-    claude_allows: dict[str, tuple[list[str], list[str], list[str]]] = {}
+    claude_allows: dict[str, list[str]] = {}
     claude_denies: set[str] = set()
     claude_prompting = False
     for s_path, doc in _load_json_docs(files, all_paths, PERMISSION_CONFIG_FILES, summary.gaps):
@@ -811,23 +794,25 @@ def _inspect_steering_surfaces(
         mode = perms.get("defaultMode") or perms.get("mode")
         if mode in ("acceptEdits", "bypassPermissions", "auto"):
             auto_edit_modes.append(f"{s_path}:{mode}")
-        allow = [r.strip() for r in _as_list(perms.get("allow")) if isinstance(r, str)]
+        allow = [r for r in _as_list(perms.get("allow")) if isinstance(r, str)]
+        if host == "claude":
+            # The client does not trim permission rules before matching them.
+            allow = [rule for rule in allow if rule == rule.strip()]
+        else:
+            allow = [rule.strip() for rule in allow]
         if any(
-            rule in {"*", "Edit", "Write"}
-            or (not rule.startswith("mcp__") and "filesystem" in rule)
+            rule in {"Edit", "Write"}
+            or (
+                host != "claude"
+                and (rule == "*" or (not rule.startswith("mcp__") and "filesystem" in rule))
+            )
             for rule in allow
         ):
             auto_edit_modes.append(f"{s_path}:write-allowance")
         if host == "claude":
             claude_prompting |= mode in ("default", "plan")
-            claude_allows[s_path] = (
-                sorted(rule for rule in allow if rule.startswith("mcp__") and "*" not in rule),
-                _glob_prefixes(allow, tool_names_only=True),
-                _glob_prefixes(allow, tool_names_only=False),
-            )
-            claude_denies.update(
-                r.strip() for r in _as_list(perms.get("deny")) if isinstance(r, str)
-            )
+            claude_allows[s_path] = sorted(rule for rule in allow if _claude_mcp_allow(rule))
+            claude_denies.update(r for r in _as_list(perms.get("deny")) if isinstance(r, str))
         if doc.get("approvalPolicy") in ("never", "auto-edit"):
             auto_edit_modes.append(f"{s_path}:{doc['approvalPolicy']}")
 
@@ -851,24 +836,19 @@ def _inspect_steering_surfaces(
                 bool(srv_cfg.get("autoApprove")) or len(_as_list(srv_cfg.get("alwaysAllow"))) > 0
             )
             eff_modes = list(modes.get(host, ()))
-            possible_glob = False
             if host == "claude":
-                namespace = prefix + "__"
-                for source, (rules, tool_globs, other_globs) in claude_allows.items():
-                    if (
-                        _allows_mcp_server(rules, prefix)
-                        or _allows_mcp_server(rules, f"mcp__{srv_name}")
-                        or _glob_overlaps_namespace(tool_globs, namespace)
-                    ):
-                        eff_modes.append(f"{source}:mcp-allowance")
-                    possible_glob |= _glob_overlaps_namespace(other_globs, namespace)
+                eff_modes.extend(
+                    f"{source}:mcp-allowance"
+                    for source, rules in claude_allows.items()
+                    if _allows_mcp_server(rules, prefix)
+                )
             if srv_auto:
                 eff_modes.append(f"{cfg_path}:{srv_name}:alwaysAllow")
             writable = bool(eff_modes) and not deny_covered
             approval_status = "preapproved" if writable else "unverified"
             if deny_covered:
                 approval_status = "denied"
-            elif not writable and host == "claude" and claude_prompting and not possible_glob:
+            elif not writable and host == "claude" and claude_prompting:
                 approval_status = "prompting"
             roots = [
                 a
