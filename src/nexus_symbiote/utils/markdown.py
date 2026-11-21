@@ -189,7 +189,8 @@ def text_outside_code(text: str) -> list[str]:
 
     Each paragraph and heading is one part, with its code spans replaced by a space;
     an HTML block or indented code line is returned as written, and fenced code is left
-    out. A file whose reading this cannot settle is returned whole. A file that opens
+    out. An ambiguous file is returned whole, with an additional reading of import
+    lines at container and inline-code boundaries. A file that opens
     with front matter is read both whole and without it, and the parts of either
     reading are returned.
     """
@@ -208,7 +209,15 @@ def _text_outside_code(text: str) -> list[str]:
             reader.read(line)
         reader.finish()
     except _AmbiguousError:
-        return [text]
+        # A quote marker or a closing code span can put an import at the start of
+        # rendered text even when the raw file has no whitespace before its @.
+        alternatives = []
+        for line in lines:
+            if "@" in line:
+                bare = _CONTAINER_MARKS.sub("", line, count=1).replace("`", " ")
+                if bare != line:
+                    alternatives.append(bare)
+        return [text, *alternatives]
     return reader.parts
 
 

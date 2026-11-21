@@ -510,7 +510,6 @@ _PATH_CHARACTER = r"[\w.~$%+@-]"
 _PUNCTUATION = r"[^\w.~$%+@/\\-]"
 _RUN_SEPARATOR = (
     rf"(?:{_PUNCTUATION}|[-$]++(?={_PUNCTUATION})|<[a-z]++(?:[ \t][^<>\n]{{0,256}}+)?>"
-    r"|(?<![\w=])[A-Za-z_]\w*+=[^\s<>]*+[ \t]"
     rf"|(?<=```)[\w+-]++(?=[ \t]*\n))"
 )
 _RUN = rf"(?<!\w)(?:(?<=\bre-)|(?<!\w-))run{_RUN_SEPARATOR}+_{{0,2}}"
@@ -554,6 +553,8 @@ _LATER_TARGET = re.compile(
 # A sentence ends at `.`, `!` or `?` before whitespace, except after a digit, as in a `1.`
 # list marker, and in `e.g.` and `i.e.`.
 _RUN_VERB = re.compile(_RUN, re.IGNORECASE)
+_ASSIGNMENT_TOKEN = re.compile(r"[^\s<>]++")
+_ASSIGNMENT_START = re.compile(r"(?<![\w=])[A-Za-z_]\w*+=", re.IGNORECASE)
 _SENTENCE_END = re.compile(r"(?<!\d)(?<!\b[eE]\.[gG])(?<!\b[iI]\.[eE])[.!?](?=\s)")
 _COMMAND_SKIP = frozenset(" \t`'\"([*_>-\u201c\u2018$")
 _COMMAND_DELIMITER = frozenset(":;&|\n")
@@ -582,25 +583,49 @@ def _starts_command(text: str, start: int, position: int) -> bool:
 
 
 def _run_starts_later_command(text: str) -> bool:
-    position = 0
-    while (verb := _RUN_VERB.search(text, position)) is not None:
-        end = _SENTENCE_END.search(text, verb.end())
-        stop = len(text) if end is None else end.start()
+    verbs = iter(_RUN_VERB.finditer(text))
+    verb = next(verbs, None)
+    sentence_end = 0
+    while verb is not None:
+        if verb.end() >= sentence_end:
+            end = _SENTENCE_END.search(text, verb.end())
+            sentence_end = len(text) if end is None else end.start()
+        following = next(verbs, None)
+        stop = sentence_end if following is None else min(sentence_end, following.start())
         for target in _LATER_TARGET.finditer(text, verb.end(), stop):
             if _starts_command(text, verb.end(), target.start()):
                 return True
-        position = max(stop, verb.end())
+        verb = following
     return False
 
 
-def _comment_is_instruction(text: str) -> bool:
-    """An imperative, a URL, or a home-directory path inside hidden text."""
+def _instruction_in_text(text: str) -> bool:
     if _HIDDEN_INSTRUCTION.search(text) is not None:
         return True
     reference = _RUN_REFERENCE.search(text)
     if reference is not None and _LATER_TARGET.search(text, reference.end()) is not None:
         return True
     return _run_starts_later_command(text)
+
+
+def _comment_is_instruction(text: str) -> bool:
+    """An imperative, a URL, or a home-directory path inside hidden text."""
+    if _instruction_in_text(text):
+        return True
+    if "=" not in text:
+        return False
+
+    def omit_assignment(token: re.Match[str]) -> str:
+        # Only a horizontal space ends an assignment separator. Scan each word once,
+        # so a long value with many '=' characters cannot repeatedly scan its suffix.
+        if token.end() < len(text) and text[token.end()] in " \t":
+            start = _ASSIGNMENT_START.search(text, token.start(), token.end())
+            if start is not None:
+                return text[token.start() : start.start()]
+        return token.group()
+
+    without_assignments = _ASSIGNMENT_TOKEN.sub(omit_assignment, text)
+    return without_assignments != text and _instruction_in_text(without_assignments)
 
 
 def detect_hidden_markup(content: str, source_name: str) -> list[RiskAssessment]:
