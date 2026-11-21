@@ -461,13 +461,15 @@ class _Declarations:
     ``declared`` holds the identifiers inside import and re-export statements, which
     bind a name or name another module's export and never use a binding of this file.
     ``loaders`` holds ``require`` and every name the file binds to what
-    ``createRequire`` returns.
+    ``createRequire`` returns, and ``creators`` ``createRequire`` and every name the
+    file binds to it.
     """
 
     bindings: dict[tuple[int, str], object]
     gaps: list[tuple[Node, str]]
     declared: set[int]
     loaders: set[str]
+    creators: set[str]
 
 
 def _imported_name(node: Node | None) -> str | None:
@@ -477,9 +479,20 @@ def _imported_name(node: Node | None) -> str | None:
     return _name(node)
 
 
+def _namespace_body(index: _Index, node: Node | None) -> bool:
+    """Whether ``node`` is the body of a ``namespace`` or ``module`` declaration."""
+    owner = index.parent(node)
+    return (
+        node is not None
+        and node.type == "statement_block"
+        and owner is not None
+        and owner.type in {"internal_module", "module"}
+    )
+
+
 def _bind_import(
     statement: Node,
-    root: Node,
+    root: Node | None,
     bind: Callable[[Node | None, str, object, Node], None],
     found: _Declarations,
 ) -> None:
@@ -555,8 +568,38 @@ def _reexport(statement: Node, found: _Declarations) -> None:
             found.gaps.append((spec, _REEXPORTED))
 
 
+def _creators(index: _Index) -> set[str]:
+    """``createRequire`` and the names an import, a destructuring or an alias gives it.
+
+    A name bound to any of them may be one, wherever it is bound, so the set only grows.
+    """
+    creators = {"createRequire"}
+    for node in index.nodes:
+        if node.type == "import_specifier":
+            if _imported_name(node.child_by_field_name("name")) == "createRequire":
+                alias = node.child_by_field_name("alias")
+                if alias is not None:
+                    creators.add(_name(alias))
+        elif node.type == "pair_pattern":
+            if _literal_key(node.child_by_field_name("key")) == "createRequire":
+                creators.update(_pattern_names(node.child_by_field_name("value")))
+        elif node.type in {"variable_declarator", "assignment_expression"}:
+            value = _operand(
+                node.child_by_field_name("value" if node.type == "variable_declarator" else "right")
+            )
+            if value is not None and (
+                (value.type == "identifier" and _name(value) in creators)
+                or _property(value) == "createRequire"
+            ):
+                target = node.child_by_field_name(
+                    "name" if node.type == "variable_declarator" else "left"
+                )
+                creators.update(_pattern_names(target))
+    return creators
+
+
 def _bindings(index: _Index, root: Node) -> _Declarations:
-    found = _Declarations({}, [], set(), {"require"})
+    found = _Declarations({}, [], set(), {"require"}, _creators(index))
     bindings = found.bindings
     followed: set[tuple[int, str]] = set()
 
@@ -579,6 +622,9 @@ def _bindings(index: _Index, root: Node) -> _Declarations:
         at_root = parent is not None and parent.id == root.id
         if node.type == "import_statement" and at_root:
             _bind_import(node, root, bind, found)
+        elif node.type == "import_statement" and _namespace_body(index, parent):
+            # ``import x = require(...)`` loads a module inside a namespace body as well.
+            _bind_import(node, index.scope(parent), bind, found)
         elif node.type == "export_statement" and at_root and node.child_by_field_name("source"):
             _reexport(node, found)
         elif node.type == "variable_declarator":
@@ -587,10 +633,10 @@ def _bindings(index: _Index, root: Node) -> _Declarations:
             scope = index.var_scope(parent) if hoisted else index.scope(parent)
             for declared_name in _pattern_names(target):
                 bind(scope, declared_name, node.id, node)
-            if _creates_require(node.child_by_field_name("value")):
+            if _creates_require(node.child_by_field_name("value"), found.creators):
                 found.loaders.update(_pattern_names(target))
         elif node.type == "assignment_expression":
-            if _creates_require(node.child_by_field_name("right")):
+            if _creates_require(node.child_by_field_name("right"), found.creators):
                 found.loaders.update(_pattern_names(node.child_by_field_name("left")))
         elif node.type in _FUNCTIONS:
             name = node.child_by_field_name("name")
@@ -707,43 +753,48 @@ def _property(member: Node) -> str | None:
     return None
 
 
-def _creates_require(node: Node | None) -> bool:
+def _creates_require(node: Node | None, creators: Collection[str]) -> bool:
     """Whether an expression calls ``createRequire``, which returns a module loader."""
     call = _operand(node)
     if call is None or call.type != "call_expression":
         return False
     function = _operand(call.child_by_field_name("function"))
     if function is not None and function.type == "identifier":
-        return _name(function) == "createRequire"
+        return _name(function) in creators
     return function is not None and _property(function) == "createRequire"
 
 
-def _loader(function: Node | None, loaders: Collection[str]) -> bool:
+def _loader(function: Node | None, loaders: Collection[str], creators: Collection[str]) -> bool:
     """Whether a callee loads a module: ``import``, ``require``, ``module.require`` or a loader
     ``createRequire`` made."""
     callee = _operand(function)
     if callee is not None and callee.type in {"import", "identifier"}:
         return callee.type == "import" or _name(callee) in loaders
-    return callee is not None and (_property(callee) == "require" or _creates_require(callee))
+    return callee is not None and (
+        _property(callee) == "require" or _creates_require(callee, creators)
+    )
 
 
-def _load(call: Node, loaders: Collection[str]) -> tuple[bool, Node | None]:
+def _load(
+    call: Node, loaders: Collection[str], creators: Collection[str]
+) -> tuple[bool, Node | None]:
     """Whether a call loads a module, and the argument that names it, if any.
 
-    The name is the first argument of a direct call, the second of ``call``, and the
-    first element of the array literal ``apply`` passes; for any other call, the
-    first argument is returned for the caller to check.
+    The name is the first argument of a direct call, the second of ``call`` and of
+    ``bind``, whose bound loader is a load wherever it is called, and the first
+    element of the array literal ``apply`` passes; for any other call, the first
+    argument is returned for the caller to check.
     """
     function = _operand(call.child_by_field_name("function"))
     arguments = call.child_by_field_name("arguments")
     # A tagged template passes no specifier a loader accepts.
     listed = arguments is not None and arguments.type == "arguments"
     values = _parts(arguments) if arguments is not None and listed else []
-    if _loader(function, loaders):
+    if _loader(function, loaders, creators):
         return True, values[0] if values else None
     method = None if function is None else _property(function)
-    if function is not None and method in {"call", "apply"}:
-        if _loader(function.child_by_field_name("object"), loaders):
+    if function is not None and method in {"call", "apply", "bind"}:
+        if _loader(function.child_by_field_name("object"), loaders, creators):
             passed = values[1] if len(values) > 1 else None
             if method == "apply":
                 array = passed is not None and passed.type == "array"
@@ -751,6 +802,18 @@ def _load(call: Node, loaders: Collection[str]) -> tuple[bool, Node | None]:
                 passed = elements[0] if elements else None
             return True, passed
     return False, values[0] if values else None
+
+
+def _names_module_elsewhere(call: Node) -> bool:
+    """Whether a call passes a server or client module's name past its first argument."""
+    arguments = call.child_by_field_name("arguments")
+    if arguments is None or arguments.type != "arguments":
+        return False
+    for value in _parts(arguments)[1:]:
+        module = _string_value(value)
+        if module is not None and _module_kind(module) in _LOADED:
+            return True
+    return False
 
 
 def _is_constructor(node: Node, index: _Index) -> bool:
@@ -816,13 +879,15 @@ def _sdk_uses(index: _Index, root: Node, found: _Declarations, resolver: _Resolv
             function = node.child_by_field_name("function")
             if tracked and _identifier(_operand(function, _REFERENCE_WRAPPERS)) == "eval":
                 found.gaps.append((node, _EVALUATED))
-            loads, specifier = _load(node, found.loaders)
+            loads, specifier = _load(node, found.loaders, found.creators)
             module = _string_value(specifier)
             kind = None if module is None else _module_kind(module)
             if loads and module is None:
                 found.gaps.append((node, _COMPUTED_LOAD))
             elif kind in _LOADED:
                 found.gaps.append((node, _LOADED[kind] if loads else _NAMED))
+            elif not loads and _names_module_elsewhere(node):
+                found.gaps.append((node, _NAMED))
             continue
         if (
             node.type not in {"identifier", "shorthand_property_identifier"}
@@ -1089,13 +1154,21 @@ def _collect_source(
         method = _called_method(member)
         if method is not None and method not in {"registerTool", "tool"}:
             continue
-        binding = resolver.lookup(member.child_by_field_name("object"))
+        receiver_node = member.child_by_field_name("object")
         if method is None:
-            if isinstance(binding, tuple):
+            # A computed name may spell either registration method, so a wrapped server
+            # counts, and in a file with a server so does a receiver no binding names.
+            computed = resolver.lookup(_operand(receiver_node))
+            if isinstance(computed, tuple):
                 result.surfaces_excluded.append(
                     f"{location}:{node.start_point.row + 1} (unresolved MCP method name)"
                 )
+            elif servers and computed is None:
+                result.surfaces_excluded.append(
+                    f"{location}:{node.start_point.row + 1} (unresolved MCP registration receiver)"
+                )
             continue
+        binding = resolver.lookup(receiver_node)
         if not isinstance(binding, tuple):
             result.surfaces_excluded.append(
                 f"{location}:{node.start_point.row + 1} (unresolved MCP registration receiver)"

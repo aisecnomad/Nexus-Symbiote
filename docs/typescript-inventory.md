@@ -101,15 +101,17 @@ its gap.
 ```
 
 - A module load of a server module: `require(...)`, `import(...)`,
-  `module.require(...)`, a call of a loader that `createRequire` made, `require.call`
-  and `require.apply`, and TypeScript's `import x = require(...)`. The same for a
+  `module.require(...)`, a call of a loader that `createRequire` made, also under an
+  alias such as `import { createRequire as cr }` or `const { createRequire: cr } =
+  require("module")`, `require.call`, `require.apply` and `require.bind`, and
+  TypeScript's `import x = require(...)`, also inside a `namespace` or `module` body. The same for a
   client module of the SDK is
   `MCP client SDK loaded by require or dynamic import; servers it starts or reaches not inventoried`.
 - A module load of a name the analysis cannot read, such as `require(name)`, a
   concatenation or a template literal with a substitution:
   `require or dynamic import of a module name the analysis cannot read; what it loads not inventoried`.
-- Any other call whose first argument names a server or client module, such as a
-  loader of the file's own:
+- Any other call with an argument, in any position, that names a server or client
+  module, such as a loader of the file's own:
   `MCP SDK module named as a call argument; what the call loads not inventoried`.
 - A re-export of `McpServer`, of the low-level `Server`, of a client transport, of
   the `default` of a server or client module, or of a whole server or client module
@@ -137,8 +139,9 @@ its gap.
   `eval!(code)` or `(eval<any>)(code)`. Comments inside the parentheses or among the arguments of a call
   are skipped, so `(eval /* c */)(code)` is direct and
   `require(/* c */ "@modelcontextprotocol/sdk/server/mcp.js")` loads that module.
-- Dynamic method names, receiver aliases, unsupported constructor bindings and
-  registration ordering.
+- Dynamic method names, including on a server wrapped in parentheses, `!`, `as` or
+  `satisfies`, and in a file with a server, on a receiver no binding names; receiver
+  aliases, unsupported constructor bindings and registration ordering.
 
 These leave no gap:
 

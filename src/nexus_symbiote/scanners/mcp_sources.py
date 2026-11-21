@@ -67,16 +67,17 @@ _SDK_IMPORT = re.compile(
 SOURCE_SEARCH_SKIPPED = frozenset(
     {"tests", "test", "dist", "build", "docs", "benchmarks", "examples"}
 )
-# The launcher and server class names below are markers too, so a file that reaches
-# one through a module of its own project, without naming the SDK, is read.
+# The launcher names below, like the server class names among the tool hints, are
+# markers too, so a file that reaches one through a module of its own project, without
+# naming the SDK, is read.
 _PYTHON_MARKERS = (
     *PYTHON_TOOL_HINTS,
     "MCPClient",
-    "MCPServer",
-    "FastMCP",
     "StdioServerParameters",
     "sse_client",
+    "stdio_client",
     "streamablehttp_client",
+    "streamable_http_client",
     "websocket_client",
 )
 # Imports the tool collector reads from the syntax tree once a marker is present.
@@ -144,7 +145,9 @@ _SERVER_CLASS_ATTRIBUTE = (
 _PYTHON_LAUNCHERS = {
     "StdioServerParameters": (frozenset({"mcp"}), LAUNCHED),
     "sse_client": (frozenset({"mcp"}), REACHED),
+    "stdio_client": (frozenset({"mcp"}), LAUNCHED),
     "streamablehttp_client": (frozenset({"mcp"}), REACHED),
+    "streamable_http_client": (frozenset({"mcp"}), REACHED),
     "websocket_client": (frozenset({"mcp"}), REACHED),
     "MCPServerStdio": (frozenset({"agents", "pydantic_ai"}), LAUNCHED),
     "MCPServerSse": (frozenset({"agents"}), REACHED),
@@ -174,6 +177,11 @@ _SERVER_CLASSES = {
 _CLIENT_MODULES = ("mcp.client", "agents.mcp", "pydantic_ai.mcp", "langchain_mcp_adapters")
 _LOADERS = frozenset({"import_module", "__import__", "resolve_name"})
 _LOADER_MODULES = frozenset({"importlib", "builtins", "pkgutil"})
+# Builtins and attributes that rebind a name or a module attribute without naming it.
+_REBINDING_BUILTINS = frozenset(
+    {"globals", "locals", "vars", "exec", "eval", "setattr", "delattr", "__builtins__"}
+)
+_REBINDING_ATTRIBUTES = frozenset({"modules", "__dict__", "__setattr__", "__builtins__"})
 
 
 class _UnreadableError(ValueError):
@@ -946,12 +954,66 @@ def _named_module(call: ast.Call) -> set[str]:
     return _argument_literals(call, containers=True)
 
 
-def _exempt_call(func: ast.expr, owned: set[str], loggers: set[str]) -> bool:
+def _honest_loggers(nodes: list[ast.AST], loggers: set[str]) -> tuple[bool, set[str]]:
+    """Whether ``logging.getLogger`` can only be the standard library's, and which of the
+    names ``from logging import getLogger`` binds can only be that function.
+
+    Assigning ``getLogger`` a loader, by rebinding a name, ``logging`` itself or one of
+    its attributes, turns a logger name into a module to load. So ``logging`` counts
+    only when every binding of it is ``import logging`` and it is only read for a
+    plain attribute, and an imported name only when no other binding gives it a value.
+    A star import from another module, and builtins or attributes that rebind names or
+    module attributes without naming them, withdraw every exemption.
+    """
+    watched = {"logging", *loggers}
+    rebound: set[str] = set()
+    imported = False
+    reads = attributes = 0
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                honest = bound == "logging" and (not alias.asname or alias.name == "logging")
+                imported = imported or honest
+                if bound in watched and not honest:
+                    rebound.add(bound)
+        elif isinstance(node, ast.ImportFrom):
+            from_logging = not node.level and node.module == "logging"
+            for alias in node.names:
+                if alias.name == "*" and not from_logging:
+                    return False, set()
+                bound = alias.asname or alias.name
+                if bound in watched and not (
+                    bound in loggers and from_logging and alias.name == "getLogger"
+                ):
+                    rebound.add(bound)
+        elif isinstance(node, ast.Name):
+            if node.id in _REBINDING_BUILTINS:
+                return False, set()
+            if node.id in watched and not isinstance(node.ctx, ast.Load):
+                rebound.add(node.id)
+            reads += node.id == "logging" and isinstance(node.ctx, ast.Load)
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _REBINDING_ATTRIBUTES:
+                return False, set()
+            if isinstance(node.value, ast.Name) and node.value.id == "logging":
+                if isinstance(node.ctx, ast.Load) and not node.attr.startswith("__"):
+                    attributes += 1
+                else:
+                    rebound.add("logging")
+        elif not isinstance(node, ast.alias):
+            rebound.update(_bound_names([node]) & watched)
+    honest_module = imported and "logging" not in rebound and reads == attributes
+    return honest_module, loggers - rebound
+
+
+def _exempt_call(func: ast.expr, owned: set[str], loggers: set[str], logging_module: bool) -> bool:
     """A call whose literal arguments name a server or a logger, not a module to load."""
     if isinstance(func, ast.Name):
         return func.id in owned or func.id in loggers
     return (
-        isinstance(func, ast.Attribute)
+        logging_module
+        and isinstance(func, ast.Attribute)
         and func.attr == "getLogger"
         and isinstance(func.value, ast.Name)
         and func.value.id == "logging"
@@ -1048,6 +1110,7 @@ def _python_launches(tree: ast.Module) -> list[str]:
                         if not star:
                             unused.add(alias.asname or name)
     loaders = _loader_aliases(nodes, loaders, bound_names)
+    logging_module, loggers = _honest_loggers(nodes, loggers)
     annotations = _annotation_names(nodes)
     for node in nodes:
         if isinstance(node, ast.Call):
@@ -1062,7 +1125,7 @@ def _python_launches(tree: ast.Module) -> list[str]:
                 modules = _literals_in_expressions(non_attr_args)
                 if node not in annotations:
                     _record_attribute_gap(target, attr, packages, imported, bound_names, gaps)
-            elif _exempt_call(node.func, owned - loaders, loggers - loaders):
+            elif _exempt_call(node.func, owned - loaders, loggers - loaders, logging_module):
                 modules = set()
             else:
                 modules = _named_module(node)

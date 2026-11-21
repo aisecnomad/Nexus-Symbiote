@@ -1583,3 +1583,141 @@ def test_the_documented_gap_lines_are_those_a_scan_of_the_fixture_prints(runner)
     printed = [line for line in result.output.splitlines() if line.startswith("  - excluded:")]
     assert printed == block.group(1).splitlines()
     assert len(printed) == len(list((FIXTURE / "src").iterdir())) - 1
+
+
+@pytest.mark.parametrize(
+    ("source", "gap"),
+    [
+        (
+            "from mcp.client.streamable_http import streamable_http_client\n"
+            "async def main():\n"
+            "    async with streamable_http_client('https://example.invalid/mcp') as s:\n"
+            "        pass\n",
+            REACHED,
+        ),
+        (
+            "from mcp.client.stdio import stdio_client\n"
+            "class Params:\n"
+            "    command = 'npx'\n"
+            "    args = ['-y', 'example-mcp']\n"
+            "async def main():\n"
+            "    async with stdio_client(Params()) as s:\n"
+            "        pass\n",
+            LAUNCHED,
+        ),
+    ],
+    ids=["streamable-http-client", "stdio-client-duck-typed-parameters"],
+)
+def test_python_transport_functions_are_launcher_gaps(tmp_path, source, gap):
+    result = _scan(tmp_path, {"app/client.py": source})
+    assert result.surfaces_excluded == [f"app/client.py: {gap}"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "import logging, importlib\nlogging.getLogger = importlib.import_module\n"
+            "logging.getLogger('mcp.client.stdio')\n",
+            id="attribute-rebound",
+        ),
+        pytest.param(
+            "import importlib as logging\nlogging.getLogger('mcp.client.stdio')\n",
+            id="other-module-as-logging",
+        ),
+        pytest.param(
+            "import logging\nsetattr(logging, 'getLogger', __import__)\n"
+            "logging.getLogger('mcp.client.stdio')\n",
+            id="setattr",
+        ),
+        pytest.param(
+            "import logging\nfrom loaders import *\nlogging.getLogger('mcp.client.stdio')\n",
+            id="star-import",
+        ),
+        pytest.param(
+            "import logging\ndef use(logging):\n    logging.getLogger('mcp.client.stdio')\n",
+            id="parameter",
+        ),
+        pytest.param(
+            "from logging import getLogger\nfrom loaders import load\ngetLogger = load\n"
+            "getLogger('mcp.client.stdio')\n",
+            id="imported-name-rebound",
+        ),
+    ],
+)
+def test_a_logger_that_may_not_be_the_stdlib_one_loses_its_exemption(tmp_path, source):
+    result = _scan(tmp_path, {"app/client.py": source})
+    assert result.surfaces_excluded == [f"app/client.py: {PYTHON_CLIENT_LOADED}"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        f'namespace N {{\n  import mcp = require("{MODULE}");\n'
+        '  const server = new mcp.McpServer({ name: "s", version: "1" });\n'
+        '  server.tool("hidden", async () => ({ content: [] }));\n}\n',
+        f'module N {{\n  import mcp = require("{MODULE}");\n'
+        '  export const server = new mcp.McpServer({ name: "s", version: "1" });\n}\n',
+    ],
+    ids=["namespace", "module"],
+)
+def test_an_import_require_inside_a_namespace_body_is_a_gap(tmp_path, source):
+    result = _scan(tmp_path, {"src/server.ts": source})
+    assert result.surfaces_excluded == [_gap("src/server.ts", 2, LOADED)]
+
+
+@pytest.mark.parametrize(
+    ("name", "source", "line"),
+    [
+        ("server.js", f'const m = require.bind(null, "{MODULE}")();\n', 1),
+        (
+            "server.mjs",
+            'import { createRequire as cr } from "node:module";\n'
+            f'const r = cr(import.meta.url);\nconst m = r.call(null, "{MODULE}");\n',
+            3,
+        ),
+        (
+            "server.cjs",
+            'const { createRequire: cr } = require("node:module");\n'
+            f'const r = cr(__filename);\nconst m = r.apply(null, ["{MODULE}"]);\n',
+            3,
+        ),
+    ],
+    ids=["require-bind", "aliased-createRequire-import", "destructured-createRequire"],
+)
+def test_bound_and_aliased_module_loaders_are_gaps(tmp_path, name, source, line):
+    result = _scan(
+        tmp_path,
+        {
+            f"src/{name}": source + 'const server = new m.McpServer({ name: "s", version: "1" });\n'
+            'server.tool("hidden", async () => ({ content: [] }));\n'
+        },
+    )
+    assert _gap(f"src/{name}", line, LOADED) in result.surfaces_excluded
+    assert _inventory(result) == []
+
+
+def test_an_sdk_module_named_past_the_first_argument_is_a_gap(tmp_path):
+    result = _scan(tmp_path, {"src/server.js": f'const m = load(0, "{MODULE}");\n'})
+    assert result.surfaces_excluded == [_gap("src/server.js", 1, NAMED)]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        '(server)["\\u0074ool"]("hidden", async () => ({ content: [] }));\n',
+        'server!["to" + "ol"]("hidden", async () => ({ content: [] }));\n',
+        '(server as any)["registerT" + "ool"]("hidden", {}, async () => ({ content: [] }));\n',
+    ],
+    ids=["parenthesized-escape", "non-null-concatenation", "as-cast-concatenation"],
+)
+def test_a_computed_method_on_a_wrapped_server_is_a_gap(tmp_path, call):
+    result = _scan(tmp_path, {"src/server.ts": IMPORT + SERVER + TOOL + call})
+    assert _inventory(result) == INVENTORIED
+    assert result.surfaces_excluded == [_gap("src/server.ts", 4, "unresolved MCP method name")]
+
+
+def test_a_computed_method_on_an_unbound_receiver_beside_a_server_is_a_gap(tmp_path):
+    call = 'globalThis.srv["to" + "ol"]("hidden", async () => ({ content: [] }));\n'
+    result = _scan(tmp_path, {"src/server.ts": IMPORT + SERVER + TOOL + call})
+    assert result.surfaces_excluded == [_gap("src/server.ts", 4, RECEIVER)]
