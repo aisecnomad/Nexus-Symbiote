@@ -561,6 +561,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
         is_flag=True,
         help="Explicitly accept unsigned --trace-evidence without --trace-attestation.",
     )
+    @click.option("--deployment-id", help="Operator-selected deployment covered by VEX decisions.")
     def vex(
         aibom_path: Path,
         output: Path | None,
@@ -571,6 +572,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
         trace_attestation: Path | None,
         trusted_keys: tuple[Path, ...],
         allow_unsigned_trace_evidence: bool,
+        deployment_id: str | None,
     ) -> None:
         """Export schema-validated VEX findings with optional decisions, advisories, and trace evidence."""
         from nexus_symbiote.core.hashing import hash_bytes
@@ -634,6 +636,8 @@ def register_supply_chain_commands(main: click.Group) -> None:
                 decisions=loaded_decisions,
                 execution_evidence=loaded_trace,
                 advisories=loaded_advisories,
+                inventory_sha256=inv_sha,
+                deployment_id=deployment_id,
             ).generate_json(bom)
         except (OSError, ValueError, RecursionError) as exc:
             raise click.ClickException(neutralize(exc)) from exc

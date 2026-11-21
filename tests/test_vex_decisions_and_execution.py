@@ -64,7 +64,7 @@ def _sign_trace_file(trace_path: Path, att_path: Path, pub_path: Path) -> None:
 
 
 def test_execution_bound_vex_yields_distinct_outcomes_and_keeps_unobserved_in_triage(tmp_path):
-    """declared_never_loaded clears non-critical dynamic risk, while unobserved stays in_triage."""
+    """Trace observations retain triage for every outcome."""
     bom = _three_component_bom()
     bom.components.append(
         ToolComponent(
@@ -104,10 +104,10 @@ def test_execution_bound_vex_yields_distinct_outcomes_and_keeps_unobserved_in_tr
         "tool:shadowed",
     }
 
-    # 1. Explicit declared_never_loaded on non-critical dynamic finding -> not_affected.
+    # 1. A component absent from these observations stays in triage.
     never = by_comp["tool:never-loaded"]["analysis"]
-    assert never["state"] == "not_affected"
-    assert never["justification"] == "code_not_reachable"
+    assert never["state"] == "in_triage"
+    assert "justification" not in never
 
     # 2. Real trace-diff unobserved -> MUST remain in_triage (absence of spans proves nothing).
     unobs = by_comp["tool:unobserved"]["analysis"]
@@ -233,6 +233,8 @@ decisions:
     state: "not_affected"
     justification: "protected_at_runtime"
     detail: "Blocked by gateway policy"
+    inventory_sha256: "{hash_bytes(bom.to_native_json().encode())}"
+    deployment_id: "prod"
     owner: "secops@example.com"
     expires_at: "2027-01-01T00:00:00Z"
   - id: "{fid_expired}"
@@ -246,13 +248,22 @@ decisions:
     )
     loaded = load_vex_decisions(decisions_file)
     ref_time = datetime(2026, 11, 19, 0, 0, tzinfo=UTC)
-    doc = VEXGenerator(decisions=loaded, reference_time=ref_time).generate(bom)
+    generator = VEXGenerator(decisions=loaded, reference_time=ref_time, deployment_id="prod")
+    doc = generator.generate(bom)
 
     by_comp = {v["affects"][0]["ref"]: v for v in doc["vulnerabilities"]}
     assert by_comp["tool:never-loaded"]["analysis"]["state"] == "not_affected"
     assert by_comp["tool:invoked"]["analysis"]["state"] == "in_triage"
     meta_props = {p["name"]: p["value"] for p in doc["metadata"].get("properties", [])}
     assert meta_props["nexus-symbiote:expiredVexDecisions"] == "1"
+
+    ref_changed = VEXGenerator(decisions=loaded, reference_time=ref_time, deployment_id="staging")
+    wrong_deployment = ref_changed.generate(bom)
+    bom.components[0].hashes["sha256"] = "sha256:" + "a" * 64
+    changed_inventory = generator.generate(bom)
+    for result in (wrong_deployment, changed_inventory):
+        entry = next(v for v in result["vulnerabilities"] if v["id"] == fid_active)
+        assert entry["analysis"]["state"] == "in_triage"
 
     # Conflicting / duplicate (id, component_ref) decisions must be refused.
     dup_file = tmp_path / "dup-decisions.yaml"
@@ -276,6 +287,48 @@ decisions:
     )
     with pytest.raises(VEXDecisionError, match="duplicate VEX decision"):
         load_vex_decisions(dup_file)
+
+
+@pytest.mark.parametrize(
+    ("deployment", "state", "status"),
+    [
+        ("production", "not_affected", "active"),
+        ("staging", "in_triage", "scope-mismatch"),
+        (None, "in_triage", "scope-mismatch"),
+    ],
+)
+def test_vex_cli_scopes_suppression_to_deployment_and_exact_file_bytes(
+    tmp_path, deployment, state, status
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    inventory = project / "inventory.json"
+    # A valid noncanonical serialization distinguishes the file digest from a reserialization.
+    raw = _three_component_bom().to_native_json().encode() + b"\n\n"
+    inventory.write_bytes(raw)
+    ref = "tool:never-loaded"
+    fid = finding_id(ref, "unpinned_tool", "Tool definition is unpinned")
+    decision = {
+        "id": fid,
+        "component_ref": ref,
+        "inventory_sha256": hash_bytes(raw),
+        "deployment_id": "production",
+        "state": "not_affected",
+        "justification": "protected_at_runtime",
+        "detail": "Production policy blocks this tool",
+        "owner": "security",
+        "expires_at": "2099-01-01T00:00:00Z",
+    }
+    decisions = tmp_path / "decisions.yaml"
+    decisions.write_text(json.dumps({"version": 1, "decisions": [decision]}), encoding="utf-8")
+    args = ["vex", str(inventory), "--decisions", str(decisions), "--project-root", str(project)]
+    if deployment is not None:
+        args.extend(["--deployment-id", deployment])
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == 0, result.output
+    entry = next(v for v in json.loads(result.output)["vulnerabilities"] if v["id"] == fid)
+    assert entry["analysis"]["state"] == state
+    assert {"name": "nexus-symbiote:vexDecisionStatus", "value": status} in entry["properties"]
 
 
 def test_vex_confinement_refuses_in_repo_without_project_root_symlinks_and_hardlinks(

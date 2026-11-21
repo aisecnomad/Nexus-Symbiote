@@ -1215,7 +1215,7 @@ nexus-symbiote trifecta [OPTIONS] AIBOM_PATH
 
 ### `vex`
 
-Export schema-validated VEX findings with optional operator decisions, advisories, and trace evidence.
+Export schema-validated VEX findings with optional operator decisions, advisories, and trace evidence. Pass `--deployment-id` to apply matching suppressing decisions as described in [VEX exports](standard-exports.md#vex).
 
 ```text
 nexus-symbiote vex [OPTIONS] AIBOM_PATH
