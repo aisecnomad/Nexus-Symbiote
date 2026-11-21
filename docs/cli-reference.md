@@ -1225,13 +1225,16 @@ nexus-symbiote vex [OPTIONS] AIBOM_PATH
 |---|---|
 | `-o`, `--output` `PATH` | Write the VEX document to this file instead of standard output. |
 | `--allow-partial-advisories` | Export incomplete advisory coverage with its checked, skipped, excluded and error counts and file digest. The report’s coverage limits suppressive advisory decisions. |
-| `--decisions` `PATH` | Operator-owned VEX decisions YAML/JSON stored outside the scanned project and enclosing git trees; expired decisions revert to `in_triage` against wall-clock UTC time. |
+| `--decisions` `PATH` | Operator-owned VEX decisions YAML/JSON stored outside the scanned project and enclosing Git trees. Expiry uses wall-clock UTC time. |
+| `--deployment-id` `TEXT` | Match suppressing decisions to the deployment identifier from trusted operator configuration. |
 | `--project-root` `PATH` | Scanned project root used to refuse policy and trace files stored inside the checkout. |
 | `--advisories` `PATH` | Link matched advisories from a live or offline `advisories` report JSON bound to this AIBOM's SHA-256 into the VEX document. |
 | `--trace-evidence` `PATH` | `trace-diff` or execution-evidence JSON bound to this AIBOM's SHA-256 (`unobserved` and `invoked` stay `in_triage`; critical, KEV, and static-execution findings cannot be suppressed without an expiring operator decision). Requires `--trace-attestation` with `--trusted-key` unless `--allow-unsigned-trace-evidence` is set. |
 | `--trace-attestation` `PATH` | Ed25519 DSSE attestation envelope authenticating `--trace-evidence`. |
-| `--trusted-key` `PATH` | Trusted Ed25519 public key PEM outside the scanned project (repeatable; used with `--trace-attestation`). |
+| `--trusted-key` `PATH` | Trusted Ed25519 public key PEM outside the scanned project (repeatable with `--trace-attestation`). |
 | `--allow-unsigned-trace-evidence` | Explicitly accept unsigned `--trace-evidence` without `--trace-attestation`. |
+
+Decision files and trusted public keys must be regular files owned by the operator or root, with a single link and write access limited to the owner. Their ancestor directories must be trusted and require sticky protection if writable by the group or others.
 
 ### `export-standard`
 

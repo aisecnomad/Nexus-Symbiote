@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -640,3 +640,32 @@ def test_vex_checks_owner_of_writable_filesystem_anchor(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "fstatvfs", lambda fd: SimpleNamespace(f_flag=0))
     with pytest.raises(VEXDecisionError, match="untrusted ancestor"):
         _check_operator_directory(tmp_path / "decisions.json", {0, os.geteuid()})
+
+
+def test_vex_rejects_an_expiry_outside_the_supported_utc_range(tmp_path):
+    path = tmp_path / "decisions.json"
+    expires_at = datetime.max.replace(tzinfo=timezone(-timedelta(hours=1)))
+    decision = {"id": "sample", "state": "in_triage", "expires_at": expires_at.isoformat()}
+    path.write_text(json.dumps({"decisions": [decision]}), encoding="utf-8")
+    with pytest.raises(VEXDecisionError, match="Invalid VEX decisions schema"):
+        load_vex_decisions(path)
+
+
+def test_vex_loads_decisions_below_a_trusted_traverse_only_ancestor(tmp_path, monkeypatch):
+    from nexus_symbiote import vex_decisions
+
+    outer = tmp_path / "operator"
+    inner = outer / "decisions"
+    inner.mkdir(parents=True)
+    path = inner / "sample.json"
+    path.write_text('{"decisions": []}', encoding="utf-8")
+    outer.chmod(0o711)
+    open_directory = vex_decisions.open_directory_nofollow
+
+    def deny_directory_read(directory):
+        if directory == outer:
+            raise PermissionError("The fixture grants directory traversal only")
+        return open_directory(directory)
+
+    monkeypatch.setattr(vex_decisions, "open_directory_nofollow", deny_directory_read)
+    assert load_vex_decisions(path).entries == ()
