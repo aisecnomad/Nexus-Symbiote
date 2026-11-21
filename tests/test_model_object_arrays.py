@@ -439,8 +439,9 @@ def test_a_zip64_locator_inside_the_first_header_is_read(tmp_path: Path, pickled
 
 
 def test_a_locator_outside_the_held_bytes_is_unread() -> None:
-    # The same archive searched without its first bytes: a locator that would lie before
-    # what is held is not decided, whatever the end record names.
+    # A contract of _zip_directory for a caller that holds only the end of an archive:
+    # the scanner keeps every byte it read, so it does not reach this itself. A locator
+    # that would lie before what is held is not decided, whatever the end record names.
     archive = _zip64_in_first_name((b"objects.npy", _npy("'|O'")))
     stream = io.BytesIO(archive)
     stream.seek(len(archive) - 22)
@@ -524,6 +525,122 @@ def test_a_directory_that_runs_past_its_end_record_is_unread(tmp_path: Path, pic
     assert {r: found[r].properties["format_inspection"] for r in relatives} == dict.fromkeys(
         relatives, ZIP_DIRECTORY_UNREAD
     )
+
+
+def _cut_out(members: list[tuple[str, bytes]], prefix: int = 19) -> bytes:
+    """An archive written after ``prefix`` bytes, with absolute offsets, then cut out of
+    that file: every stored offset is ``prefix`` bytes too large. zipfile still lists it."""
+    buffer = io.BytesIO()
+    buffer.write(b"#" * prefix)
+    with zipfile.ZipFile(buffer, "a") as archive:
+        for name, data in members:
+            archive.writestr(name, data)
+    return buffer.getvalue()[prefix:]
+
+
+@pytest.mark.parametrize("dangerous", [True, False], ids=["object-array", "harmless"])
+def test_an_archive_cut_out_of_a_larger_file_keeps_its_rating(
+    tmp_path: Path, dangerous: bool
+) -> None:
+    # A stored directory offset that starts no directory entry is not one that runs past
+    # its end record: zipfile's reading of the archive decides, as it did before.
+    second = _npy("'|O'") if dangerous else _npy("'<f8'")
+    archive = _cut_out([("weights.npy", _npy("'<f8'")), ("meta.npy", second)])
+    with zipfile.ZipFile(io.BytesIO(archive)) as opened:
+        assert opened.namelist() == ["weights.npy", "meta.npy"]
+    expected = (
+        (UNSAFE, ZIP_OBJECT_ARRAY)
+        if dangerous
+        else (SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE)
+    )
+    assert _inspect(tmp_path, archive, "arrays.npz") == expected
+
+
+def test_an_empty_archive_after_another_is_read_as_its_loaders_read_it(tmp_path: Path) -> None:
+    # The last end record names an empty directory, which zipfile and miniz list.
+    archive = _zip([("weights.npy", _npy("'<f8'"))]) + _zip([])
+    with zipfile.ZipFile(io.BytesIO(archive)) as opened:
+        assert opened.namelist() == []
+    assert _inspect(tmp_path, archive, "arrays.npz") == (
+        SerializationSafety.UNKNOWN,
+        ZIP_WITHOUT_PICKLE,
+    )
+
+
+def _saturated_with_record_after_locator(real: tuple[bytes, bytes]) -> bytes:
+    """A classic record with saturated counts names the real directory; the locator, in
+    the last entry's comment, stores the offset of a ZIP64 record kept in the end record's
+    comment that names a decoy. No record lies before the locator, so zipfile without the
+    CVE-2025-8291 fix reads the classic record."""
+    decoy = (b"numbers.npy", _npy("'<f8'"))
+    first_local, real_local = _local(*decoy), _local(*real)
+    decoy_cd = _central(*decoy, 0)
+    decoy_at = len(first_local) + len(real_local)
+    real_at = decoy_at + len(decoy_cd)
+    listed = _central(*decoy, 0)
+    padding = b"x" * 80
+    sized = _central(*real, len(first_local), padding + b"\0" * 20)
+    end_at = real_at + len(listed) + len(sized)
+    locator = struct.pack("<IIQI", 0x07064B50, 0, end_at + 22, 1)
+    real_cd = listed + _central(*real, len(first_local), padding + locator)
+    record = struct.pack("<IQHHIIQQQQ", 0x06064B50, 44, 45, 45, 0, 0, 1, 1, len(decoy_cd), decoy_at)
+    end = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 0xFFFF, 0xFFFF, len(real_cd), real_at, 56)
+    return first_local + real_local + decoy_cd + real_cd + end + record
+
+
+@pytest.mark.parametrize("pickled", [False, True], ids=["array", "pickle"])
+def test_a_saturated_classic_record_is_kept_where_a_reader_falls_back_to_it(
+    tmp_path: Path, pickled: bool
+) -> None:
+    # Only the record after the locator was found, and the saturated classic record was
+    # dropped for it, although a reader that looks before the locator finds no record and
+    # reads the classic one, which lists the real member.
+    real = (b"evil.pkl", _INERT_PICKLE) if pickled else (b"objects.npy", _npy("'|O'"))
+    archive = _saturated_with_record_after_locator(real)
+    expected = (UNSAFE, ZIP_PICKLE_MEMBER if pickled else ZIP_OBJECT_ARRAY)
+    (tmp_path / "models").mkdir()
+    relatives = ["models/archive", "arrays.npz", "model.pt"]
+    for relative in relatives:
+        (tmp_path / relative).write_bytes(archive)
+        assert inspect_model_format(tmp_path / relative) == expected, relative
+
+
+def _saturated_count_with_record_before_locator_only() -> bytes:
+    """65,535 entries, so the classic counts saturate, list archive/data.pkl; a ZIP64
+    record before the locator names a decoy, and the locator's offset holds no record.
+    miniz, which torch.load uses, reads the classic directory and lists data.pkl."""
+    version = (b"archive/version", b"3\n")
+    real = (b"archive/data.pkl", _INERT_PICKLE)
+    head = _local(*version) + _local(*real)
+    filler = _central(b"f", b"", 0)
+    entries = [_central(*version, 0), _central(*real, len(_local(*version)))]
+    real_cd = b"".join(entries) + filler * (0xFFFF - len(entries))
+    real_at = len(head)
+    decoy_cd = _central(*version, 0)
+    decoy_at = real_at + len(real_cd)
+    record_at = decoy_at + len(decoy_cd)
+    record = struct.pack("<IQHHIIQQQQ", 0x06064B50, 44, 45, 45, 0, 0, 1, 1, len(decoy_cd), decoy_at)
+    locator = struct.pack("<IIQI", 0x07064B50, 0, decoy_at, 1)
+    end = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 0xFFFF, 0xFFFF, len(real_cd), real_at, 0)
+    assert record_at + 56 + 20 == len(head + real_cd + decoy_cd + record + locator)
+    return head + real_cd + decoy_cd + record + locator + end
+
+
+def test_a_saturated_count_is_unread_when_the_locator_names_no_record(tmp_path: Path) -> None:
+    # The record before the locator named a decoy, and the saturated classic record was
+    # dropped for it; miniz reads the classic one, whose directory is past the bound.
+    archive = _saturated_count_with_record_before_locator_only()
+    (tmp_path / "models").mkdir()
+    for relative in ["models/archive", "weights.dat"]:
+        (tmp_path / relative).write_bytes(archive)
+        assert inspect_model_format(tmp_path / relative) == (
+            SerializationSafety.UNKNOWN,
+            ZIP_DIRECTORY_UNREAD,
+        ), relative
+    (tmp_path / "model.pt").write_bytes(archive)
+    found = {c.source_path: c for c in ModelScanner().scan(tmp_path).components}
+    assert found["model.pt"].serialization_safety == UNSAFE
+    assert found["weights.dat"].properties["format_inspection"] == ZIP_DIRECTORY_UNREAD
 
 
 def _overlong_name(archive: bytes, extra: int) -> bytes:

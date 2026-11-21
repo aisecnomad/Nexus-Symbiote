@@ -607,27 +607,37 @@ def _zip_directory(
     # (where the directory ends, its size, its stored offset) for each record a reader takes
     records = [(end_record, _little(data, end_record + 12, 4), _little(data, end_record + 16, 4))]
     locator = end_record - 20
+    # Where readers look for a ZIP64 record, and where one was found.
+    looked: set[int] = set()
+    found: set[int] = set()
     if locator >= 0 and data[locator : locator + 4] == b"PK\x06\x07":
         stored = _little(data, locator + 8, 8) - start
         if stored < 0:
             # zipfile reads the record there over the one before the locator, and the
             # tail does not hold it, so what zipfile lists is not decided.
             return None
-        for record in sorted({locator - 56, stored}):
+        looked = {locator - 56, stored}
+        for record in sorted(looked):
             # miniz, which torch.load uses, reads the record at the stored offset anywhere
-            # in the archive, also after the locator, where zipfile refuses the archive.
+            # in the archive, also after the locator, where a patched zipfile refuses it.
             if (
                 record >= 0
                 and record + 56 <= len(data)
                 and data[record : record + 4] == b"PK\x06\x06"
             ):
+                found.add(record)
                 records.append(
                     (record, _little(data, record + 40, 8), _little(data, record + 48, 8))
                 )
-    if len(records) > 1 and (
-        _little(data, end_record + 10, 2) == 0xFFFF or 0xFFFFFFFF in records[0][1:]
+    if (
+        found
+        and found == looked
+        and (_little(data, end_record + 10, 2) == 0xFFFF or 0xFFFFFFFF in records[0][1:])
     ):
-        # Every reader takes a ZIP64 record over a saturated classic one.
+        # Every reader takes a ZIP64 record over a saturated classic one, but only where
+        # it looks: miniz falls back to the classic record when the stored offset holds
+        # none, and zipfile without the CVE-2025-8291 fix when the record before the
+        # locator is missing.
         del records[0]
     readings: dict[tuple[int, int, int], tuple[list[_ZipMember], int]] = {}
     for directory_end, directory_size, directory_offset in records:
@@ -645,11 +655,17 @@ def _zip_directory(
                         or data[begin - start : begin - start + 4] == b"PK\x01\x02"
                     )
                 )
-                or start + directory_end - directory_size < begin <= size - directory_size
+                or (
+                    directory_size > 0
+                    and start + directory_end - directory_size < begin <= size - directory_size
+                    and (begin < start or data[begin - start : begin - start + 4] == b"PK\x01\x02")
+                )
             ):
                 # A directory past the bound, or one that starts but cannot be read,
-                # may list what a decoy the other reading takes does not. One that runs
-                # past its end record no writer produces, and miniz still reads it.
+                # may list what a decoy the other reading takes does not. One that starts
+                # at its stored offset and runs past its end record no writer produces,
+                # and miniz still reads it; a stored offset that starts no entry, as in an
+                # archive cut out of a larger file, is one only zipfile's reading finds.
                 return None
             if members is not None:
                 shift = begin - directory_offset

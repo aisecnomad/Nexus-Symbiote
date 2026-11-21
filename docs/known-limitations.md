@@ -990,16 +990,18 @@ A way around a limit that its entry does not describe is worth a
   central directory of at most 1 MiB, read from the end of the archive, including
   ZIP64, wherever the specification, `zipfile` (which `np.load` uses) or a ZIP64
   locator puts it, also a locator or record inside the first local header or after
-  the locator, so a member that any of them lists counts, and in a file that
+  the locator, and the classic directory a reader falls back to when no ZIP64 record
+  lies where it looks, so a member that any of them lists counts, and in a file that
   starts with an end record, which `np.load` also reads as an archive; and by an
   object-dtype array as any member, read from the member's local
   header and the start of its stored or DEFLATE-compressed data. A longer array
-  header, a longer or malformed directory, a directory whose stored offset and size
-  run past its end record, a ZIP64 locator that points before the
+  header, a longer or malformed directory, a directory that starts at its stored
+  offset and runs past its end record, a ZIP64 locator that points before the
   last 1 MiB of the archive, where `zipfile` from Python 3.13 reads its record first,
   a member compressed by another method,
   such as BZIP2 or LZMA, and a member whose data runs past the next member's local
-  header are rated `unknown`, a high finding. The directory is read with the
+  header are rated `unknown`, a high finding, or `unsafe-code-execution` under a
+  pickle-family name. The directory is read with the
   tolerances of `zipfile` and the specification, and miniz's reading of a ZIP64
   record at the locator's offset (the C++ reader `torch.load` uses); miniz's other
   tolerances are not modelled. A member name with a NUL byte is
