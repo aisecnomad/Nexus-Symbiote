@@ -376,8 +376,6 @@ def register_supply_chain_commands(main: click.Group) -> None:
         the snapshots compared with it under the same policy: pass --no-project-policy
         here when the candidate scan uses it.
         """
-        from nexus_symbiote.policy import PolicyError, default_policy, load_policy_file
-        from nexus_symbiote.signature_policy import SignaturePolicyError, load_signature_policies
         from nexus_symbiote.validators.completeness import (
             carries_discovery_evidence,
             discovery_producer_check,
@@ -408,7 +406,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
             raise output_failure(exc) from exc
         ctx.meta[STAGED_INVENTORY] = True
         try:
-            ctx.invoke(
+            resolved_root, active_policy, sig_policies = ctx.invoke(
                 scan,
                 project_path=project_path,
                 output=str(staged),
@@ -438,22 +436,6 @@ def register_supply_chain_commands(main: click.Group) -> None:
                 heading = "Built-in scan gate failed; a project policy cannot relax it here:"
                 print_lines([(heading, "red"), *gate_reason_lines(document)], err=True)
                 raise click.ClickException("Baseline was not written: static scan gate failed")
-            resolved_root = Path(project_path).resolve()
-            try:
-                if no_project_policy or not accept_project_policy:
-                    active_policy = default_policy()
-                else:
-                    loaded_policy = load_policy_file(resolved_root)
-                    active_policy = (
-                        loaded_policy[0] if loaded_policy is not None else default_policy()
-                    )
-                sig_policies = (
-                    load_signature_policies(signature_policy, project_root=resolved_root)
-                    if signature_policy is not None
-                    else []
-                )
-            except (PolicyError, SignaturePolicyError) as exc:
-                raise click.ClickException(neutralize(exc)) from exc
             producer_verified = False
             if discovery_signature_required(
                 active_policy.validation.require_discovery_signature,

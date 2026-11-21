@@ -441,8 +441,9 @@ def _parse_policy_with_digest(path: Path) -> tuple[Policy, str]:
 
 DEFAULT_POLICY_YAML = """\
 # Nexus SymBiote project policy. Every key is described in docs/policy-reference.md.
-# Malformed or unsupported settings fail closed. Settings that relax the built-in
-# gates are reported as policy_weakened; --no-project-policy ignores this file.
+# Tightening settings apply automatically. An invalid file produces a warning and
+# leaves the governing gates in effect. --accept-project-policy requires a valid
+# file when present and accepts reviewed relaxations. --no-project-policy skips it.
 version: "1.0"  # quote it: an unquoted 1.0 is a number and is refused
 scan:
   # Removing a collector leaves coverage partial, which fails the gates.
@@ -465,7 +466,7 @@ risk:
   #     reason: "Test fixture, never loaded"
   #     owner: "security@example.test"
   #     expires: 2027-01-31
-  suppressions: []
+  suppressions: []  # operator-approved decisions are managed in the operator policy
 validate:
   require_completeness: true
   require_integrity: true

@@ -193,7 +193,8 @@ def _warn_unapplied_project_policy(root: Path, path: Path | None) -> dict[str, s
             "WARNING: a project policy file in ",
             root,
             " was not applied because it is invalid or unsafe to read. "
-            "Use --no-project-policy to ignore it explicitly.",
+            "Pass --accept-project-policy to require a valid policy and see the error, "
+            "or --no-project-policy to ignore it explicitly.",
             err=True,
         )
         return {"reason": "invalid-or-ambiguous"}
@@ -1045,7 +1046,7 @@ def scan(
     allow_unsigned_discovery: bool = False,
     detailed_exit_codes: bool = False,
     legacy_exit_codes: bool = False,
-) -> None:
+) -> tuple[Path, Policy, list[SigstoreArtifactPolicy]] | None:
     """Scan a project and generate an AIBOM."""
     detailed = _apply_exit_code_flags(detailed_exit_codes, legacy_exit_codes)
     _unsigned_discovery_flags(fail_on_unsigned_discovery, allow_unsigned_discovery)
@@ -1300,6 +1301,8 @@ def scan(
     report_requested = report_only or policy.scan.failure_mode == "report-only"
     report_mode = report_requested and not discovery_failures
     staged = _staged_inventory()
+    # Baseline promotion must use exactly what the scanner read from disk.
+    staged_policy = (root, policy, signature_policies) if staged else None
 
     if not check_only:
         if source_report_digest and output_format == "sarif":
@@ -1339,7 +1342,7 @@ def scan(
         print_lines([("Scan gate passed", "green")], err=True)
         if op_digest is not None:
             echo_line("  Policy: ", policy_source, err=True)
-        return
+        return staged_policy
     if report_mode:
         heading = "Scan gate failed (report only: exit status 0)"
     elif report_requested:
@@ -1365,6 +1368,7 @@ def scan(
         echo_line("  Policy: ", policy_source, err=True)
     if not report_mode:
         _gate_exit(detailed, collection_failed=bool(scan_failures))
+    return staged_policy
 
 
 @main.command("import-shadowscan")

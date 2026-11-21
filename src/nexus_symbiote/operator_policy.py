@@ -349,7 +349,7 @@ def narrow_policy(
         effective_assurance = proj_assure
 
     # 3. Risk section: fail_threshold takes min, fail_on_severity takes stricter,
-    # ignore_categories and suppressions take intersection with operator's allowlist.
+    # Category ignores can narrow. Individual reviewed suppressions belong to the operator.
     if project.risk.fail_threshold > operator.risk.fail_threshold:
         clamped.append(f"risk.fail_threshold={operator.risk.fail_threshold!r}")
     effective_fail = min(operator.risk.fail_threshold, project.risk.fail_threshold)
@@ -375,19 +375,14 @@ def narrow_policy(
     ]
 
     op_supp_keys = {
-        (s.component_ref, s.category, s.fingerprint): s for s in operator.risk.suppressions
+        (s.component_ref, s.category, s.fingerprint) for s in operator.risk.suppressions
     }
     proj_supp_keys = {
         (s.component_ref, s.category, s.fingerprint) for s in project.risk.suppressions
     }
-    unapproved_supps = proj_supp_keys - set(op_supp_keys)
+    unapproved_supps = proj_supp_keys - op_supp_keys
     if unapproved_supps:
         clamped.append(f"risk.suppressions (refused {len(unapproved_supps)} checkout suppressions)")
-    effective_suppressions = [
-        decision
-        for key, decision in op_supp_keys.items()
-        if not inherit_unspecified or key in proj_supp_keys
-    ]
 
     narrowed = Policy(
         version="1.0",
@@ -401,7 +396,7 @@ def narrow_policy(
             warn_threshold=effective_warn,
             fail_on_severity=effective_sev,
             ignore_categories=effective_ignored,
-            suppressions=effective_suppressions,
+            suppressions=operator.risk.suppressions,
         ),
         validate=ValidatePolicy(
             require_completeness=req_comp,
