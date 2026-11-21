@@ -18,7 +18,7 @@ def test_a_cycle_in_same_value_evaluation_is_denied(monkeypatch):
     monkeypatch.setattr(
         validation, "_applied_in_place", lambda node, _: [branch] if node is root else [root]
     )
-    assert validation._has_in_place_cycle(root, None)
+    assert validation._in_place_evaluation_exceeds_budget(root, None)
 
 
 def test_recursion_can_follow_child_values():

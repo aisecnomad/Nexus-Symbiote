@@ -24,6 +24,10 @@ MAX_SCHEMA_BYTES = 256 * 1024
 MAX_ARGUMENT_BYTES = 1024 * 1024
 MAX_JSON_DEPTH = 32
 MAX_JSON_NODES = 20_000
+# Each same-value applicator consumes several interpreter frames. Limit the
+# longest path and total expansion before dispatching an output-validated call.
+_MAX_OUTPUT_APPLICATOR_DEPTH = 96
+_MAX_OUTPUT_APPLICATOR_STEPS = 1024
 MAX_SAFE_INTEGER = 2**53 - 1
 # Interpreter start-up and imports get their own budget, so a slow or throttled
 # host does not spend the evaluation budget before the untrusted input arrives.
@@ -34,6 +38,8 @@ WORKER_CPU_SECONDS = 1
 WORKER_MEMORY_BYTES = 256 * 1024 * 1024
 WORKER_SLOTS = 4
 _WORKER_SLOTS = threading.BoundedSemaphore(WORKER_SLOTS)
+_WORKER_AVAILABILITY = threading.Condition()
+_WAITING_OUTPUTS = 0
 OUTPUT_RESERVATIONS = 4
 _OUTPUT_RESERVATIONS = threading.BoundedSemaphore(OUTPUT_RESERVATIONS)
 _OUTPUT_WAIT_SECONDS = WORKER_STARTUP_SECONDS + WORKER_TIMEOUT_SECONDS
@@ -218,11 +224,20 @@ def _validation_request(schema: Any, instance: dict[str, Any] | None) -> bytes:
 
 @contextmanager
 def _validation_slot(*, wait_for_output: bool = False) -> Iterator[None]:
-    acquired = (
-        _WORKER_SLOTS.acquire(timeout=_OUTPUT_WAIT_SECONDS)
-        if wait_for_output
-        else _WORKER_SLOTS.acquire(blocking=False)
-    )
+    global _WAITING_OUTPUTS
+    with _WORKER_AVAILABILITY:
+        if wait_for_output:
+            _WAITING_OUTPUTS += 1
+            try:
+                acquired = _WORKER_AVAILABILITY.wait_for(
+                    lambda: _WORKER_SLOTS.acquire(blocking=False), timeout=_OUTPUT_WAIT_SECONDS
+                )
+            finally:
+                _WAITING_OUTPUTS -= 1
+        else:
+            # Once the tool has run, an arriving input must not displace a
+            # waiting response from a worker released in the meantime.
+            acquired = not _WAITING_OUTPUTS and _WORKER_SLOTS.acquire(blocking=False)
     if not acquired:
         raise ValidationBudgetError(
             "validation worker capacity unavailable", reason="validation-capacity"
@@ -230,7 +245,9 @@ def _validation_slot(*, wait_for_output: bool = False) -> Iterator[None]:
     try:
         yield
     finally:
-        _WORKER_SLOTS.release()
+        with _WORKER_AVAILABILITY:
+            _WORKER_SLOTS.release()
+            _WORKER_AVAILABILITY.notify_all()
 
 
 def _validate(wire: bytes) -> None:
@@ -1022,13 +1039,13 @@ def _ignores_a_keyword(
                 if not isinstance(target, (dict, bool)):
                     return True
                 pending.append(target)
-    if preflight and _has_in_place_cycle(schema, resolver):
+    if preflight and _in_place_evaluation_exceeds_budget(schema, resolver):
         return True
     return dialect == DIALECTS[3] and _contains_meets_unevaluated_items(nodes, resolver)
 
 
-def _has_in_place_cycle(schema: dict[str, Any], resolver: Any) -> bool:
-    """Reject recursion that can revisit a schema without descending into the instance."""
+def _in_place_evaluation_exceeds_budget(schema: dict[str, Any], resolver: Any) -> bool:
+    """Bound the same-value call stack and DAG expansion before dispatch."""
     pending = [schema]
     graph: dict[int, list[int]] = {}
     maps = _SUBSCHEMA_MAPS - {"$defs", "definitions"}
@@ -1052,14 +1069,28 @@ def _has_in_place_cycle(schema: dict[str, Any], resolver: Any) -> bool:
         for child_id in edges:
             incoming[child_id] += 1
     ready = [node_id for node_id, count in incoming.items() if count == 0]
-    visited = 0
+    topological = []
     while ready:
-        visited += 1
-        for child_id in graph[ready.pop()]:
+        current = ready.pop()
+        topological.append(current)
+        for child_id in graph[current]:
             incoming[child_id] -= 1
             if incoming[child_id] == 0:
                 ready.append(child_id)
-    return visited != len(graph)
+    if len(topological) != len(graph):
+        return True
+    depths: dict[int, int] = {}
+    steps: dict[int, int] = {}
+    for current in reversed(topological):
+        children = graph[current]
+        depth = 1 + max((depths[c] for c in children), default=0)
+        # Each reference can evaluate the shared child again. Saturate by
+        # refusing as soon as a subproblem exceeds the budget.
+        work = 1 + sum(steps[c] for c in children)
+        if depth > _MAX_OUTPUT_APPLICATOR_DEPTH or work > _MAX_OUTPUT_APPLICATOR_STEPS:
+            return True
+        depths[current], steps[current] = depth, work
+    return False
 
 
 def _contains_meets_unevaluated_items(nodes: list[dict[str, Any]], resolver: Any) -> bool:
