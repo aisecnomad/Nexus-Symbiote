@@ -1260,6 +1260,10 @@ def scan(
         ),
         unobserved_surfaces=[
             *(f"accepted default exclusion: {name}" for name in sorted(accepted_default_names)),
+            *(
+                f"accepted default exclusion path: {path}"
+                for path in sorted(accepted_default_exclusions)
+            ),
             "runtime",
             "effective-identity",
             "effective-authorization",

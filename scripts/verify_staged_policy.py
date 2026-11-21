@@ -49,6 +49,7 @@ from nexus_symbiote.runtime_cli import (
     _read,
     _working_trees,
 )
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES
 from nexus_symbiote.utils.terminal import safe_line
 from nexus_symbiote.validators.completeness import (
     CompletenessValidator,
@@ -165,7 +166,9 @@ def _line(prefix: str, *values: object) -> str:
     return safe_line(prefix, *values) + "\n"
 
 
-def validation_failures(bom: AIBOM, root: Path, policy: Policy) -> list[str]:
+def validation_failures(
+    bom: AIBOM, root: Path, policy: Policy, *, accept_default_excludes: tuple[str, ...] = ()
+) -> list[str]:
     """Apply the checks of `validate --project`; only a pass verdict yields no failure."""
     validation = policy.validation
     minimum = validation.minimum_assurance_level
@@ -177,7 +180,9 @@ def validation_failures(bom: AIBOM, root: Path, policy: Policy) -> list[str]:
     excluded = policy.scan.exclude_paths
     bound_imports: frozenset[str] = frozenset()
     if validation.require_completeness:
-        c_rep = CompletenessValidator().validate_against_project(bom, root, exclude_paths=excluded)
+        c_rep = CompletenessValidator().validate_against_project(
+            bom, root, exclude_paths=excluded, accept_default_excludes=accept_default_excludes
+        )
         bound_imports = c_rep.bound_imports
         if not c_rep.is_complete:
             failures.append("completeness validation failed under operator policy")
@@ -201,11 +206,9 @@ def validation_failures(bom: AIBOM, root: Path, policy: Policy) -> list[str]:
     return failures
 
 
-def _cli_supports_operator_policy() -> bool:
-    scan_cmd = cli_main.commands.get("scan")
-    if scan_cmd is None:
-        return False
-    return any("--operator-policy" in param.opts for param in scan_cmd.params)
+def _has_option(command: str, option: str) -> bool:
+    subcommand = cli_main.commands.get(command)
+    return subcommand is not None and any(option in param.opts for param in subcommand.params)
 
 
 def run_staged_gate(
@@ -217,9 +220,12 @@ def run_staged_gate(
     trusted_keys: tuple[Path, ...] = (),
     allow_unsigned: bool = False,
     max_age_days: int = DEFAULT_MAX_AGE_DAYS,
+    accept_default_excludes: tuple[str, ...] = (".git",),
 ) -> tuple[int, str]:
     """Verify operator policy placement/attestation in-place and run repository gates."""
     try:
+        if any(name not in DEFAULT_EXCLUDES for name in accept_default_excludes):
+            raise click.UsageError("unknown built-in exclusion")
         if not project_dir.is_dir():
             raise click.UsageError("--project must name an existing directory")
         if allow_unsigned and (attestation_source is not None or trusted_keys):
@@ -299,7 +305,7 @@ def run_staged_gate(
 
     cli_policy_args: list[str] = []
     scan_extra_args: list[str] = []
-    if _cli_supports_operator_policy():
+    if _has_option("scan", "--operator-policy"):
         cli_policy_args.extend(["--operator-policy", str(operator_policy_source)])
         if attestation_source is not None:
             cli_policy_args.extend(["--operator-policy-attestation", str(attestation_source)])
@@ -316,6 +322,10 @@ def run_staged_gate(
         scan_extra_args.append("--no-project-policy")
         for scanner_name in operator_policy.scan.scanners:
             scan_extra_args.extend(["--scanner", scanner_name])
+
+    accept_args = [f"--accept-default-exclude={name}" for name in accept_default_excludes]
+    if _has_option("scan", "--accept-default-exclude"):
+        scan_extra_args.extend(accept_args)
 
     # The checks below collect outside any CLI command, which is where the operator's
     # NEXUS_SYMBIOTE_LIMITS would otherwise be applied.
@@ -350,7 +360,9 @@ def run_staged_gate(
         effective = clamp_operator_floor(operator_policy, project_policy)
         lines = [scan_res.output, f"Policy: operator:{policy_digest}\n"]
 
-        failures = validation_failures(bom, resolved_project, effective)
+        failures = validation_failures(
+            bom, resolved_project, effective, accept_default_excludes=accept_default_excludes
+        )
         lines.extend(_line("Error: ", failure) for failure in failures)
 
         scorer = RiskScorer(
@@ -367,10 +379,13 @@ def run_staged_gate(
         if failures or not passed:
             return 1, "".join(lines)
 
-        if _cli_supports_operator_policy():
+        if _has_option("risk", "--operator-policy"):
+            risk_args = list(cli_policy_args)
+            if _has_option("risk", "--accept-default-exclude"):
+                risk_args.extend(accept_args)
             risk_res = runner.invoke(
                 cli_main,
-                ["risk", str(candidate_bom), "--project", str(project_dir), *cli_policy_args],
+                ["risk", str(candidate_bom), "--project", str(project_dir), *risk_args],
             )
             lines.append(risk_res.output)
             if risk_res.exit_code != 0:
@@ -391,6 +406,21 @@ def run_staged_gate(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", type=Path, required=True, help="Target checkout directory")
+    exclusions = parser.add_mutually_exclusive_group()
+    exclusions.add_argument(
+        "--accept-default-exclude",
+        dest="accept_default_excludes",
+        action="append",
+        choices=sorted(DEFAULT_EXCLUDES),
+        help="Accept this occupied built-in exclusion (repeatable, default: .git)",
+    )
+    exclusions.add_argument(
+        "--no-accept-default-excludes",
+        dest="accept_default_excludes",
+        action="store_const",
+        const=(),
+        help="Report every occupied built-in exclusion",
+    )
     parser.add_argument(
         "--operator-policy",
         type=Path,
@@ -440,6 +470,9 @@ def main(argv: list[str] | None = None) -> int:
         trusted_keys=tuple(args.operator_policy_key),
         allow_unsigned=args.allow_unsigned_operator_policy,
         max_age_days=args.operator_policy_max_age_days,
+        accept_default_excludes=(".git",)
+        if args.accept_default_excludes is None
+        else tuple(args.accept_default_excludes),
     )
     if output:
         print(output, end="" if output.endswith("\n") else "\n")

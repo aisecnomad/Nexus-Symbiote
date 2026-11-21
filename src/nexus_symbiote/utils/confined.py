@@ -788,6 +788,52 @@ class ConfinedCollection:
         finally:
             os.close(child_fd)
 
+    def _is_root_git_metadata(self, directory_fd: int, child: Path) -> bool:
+        """Recognize the checkout's Git marker without resolving a gitdir or a HEAD ref."""
+        if child.parts != (".git",):
+            return False
+        metadata_fd = None
+        try:
+            entry = self._stat_exact_no_follow(directory_fd, ".git")
+            is_directory = stat.S_ISDIR(entry.st_mode)
+            if is_directory:
+                metadata_fd = self._open_dir_part(directory_fd, ".git")
+                parent, name = metadata_fd, "HEAD"
+            elif stat.S_ISREG(entry.st_mode):
+                parent, name = directory_fd, ".git"
+            else:
+                return False
+            if not stat.S_ISREG(self._stat_exact_no_follow(parent, name).st_mode):
+                return False
+            fd = self._open_leaf_no_follow(parent, name)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 4096:
+                    return False
+                data = os.read(fd, info.st_size + 1)
+                if (
+                    len(data) != info.st_size
+                    or descriptor_binding(info) != descriptor_binding(os.fstat(fd))
+                    or not os.path.samestat(info, self._stat_exact_no_follow(parent, name))
+                    or not os.path.samestat(entry, self._stat_exact_no_follow(directory_fd, ".git"))
+                ):
+                    return False
+            finally:
+                os.close(fd)
+        except (OSError, CollectionError):
+            return False
+        finally:
+            if metadata_fd is not None:
+                os.close(metadata_fd)
+        value = data.removesuffix(b"\n").removesuffix(b"\r")
+        if any(char in value for char in (b"\n", b"\r", b"\x00")):
+            return False
+        if is_directory:
+            return (
+                value.startswith(b"ref: refs/") and bool(value[len(b"ref: refs/") :].strip())
+            ) or (len(value) in (40, 64) and all(c in b"0123456789abcdefABCDEF" for c in value))
+        return value.startswith(b"gitdir: ") and bool(value[len(b"gitdir: ") :].strip())
+
     def _has_exact_name(self, directory_fd: int, name: str) -> bool:
         """Whether ``directory_fd`` holds an entry whose exact spelling is ``name``."""
         info = os.fstat(directory_fd)
@@ -1283,7 +1329,14 @@ class ConfinedCollection:
                     ):
                         in_agent_config = _under_agent_configuration_directory(child)
                         canonical = fold_name(name)
-                        if not in_agent_config and canonical in self._accepted_default_names:
+                        if (
+                            not in_agent_config
+                            and canonical in self._accepted_default_names
+                            and (
+                                canonical != ".git"
+                                or self._is_root_git_metadata(directory_fd, child)
+                            )
+                        ):
                             self.accepted_default_names.add(canonical)
                             if self._accepted_default_exclusions is not None:
                                 self._accepted_default_exclusions.append(child.as_posix())

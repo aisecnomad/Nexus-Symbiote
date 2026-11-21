@@ -408,6 +408,16 @@ class CompletenessValidator:
         coverage.unobserved_surfaces.extend(
             f"accepted default exclusion: {name}" for name in sorted(accepted_default_names)
         )
+        # Exclusions also include configured names even on an empty checkout. A path
+        # receipt binds a decision to an occupied entry in this inventory.
+        prior_coverage = bom.metadata.completeness
+        listed = set(prior_coverage.exclusions) if prior_coverage is not None else set()
+        recorded = set(prior_coverage.unobserved_surfaces) if prior_coverage is not None else set()
+        for path in sorted(accepted_default_exclusions):
+            if path not in listed or f"accepted default exclusion path: {path}" not in recorded:
+                report.add_issue(
+                    COVERAGE_CLAIM, f"New or unrecorded accepted default exclusion path: {path}"
+                )
         report.assurance_level = coverage.assurance_level
         report.surfaces_covered = coverage.surfaces_scanned
         report.surfaces_missing = coverage.surfaces_excluded
