@@ -60,6 +60,20 @@ def test_a_project_policy_is_not_applied_unless_accepted(tmp_path: Path) -> None
     assert accepted_meta.get("policy_weakened")
 
 
+def test_unsafe_unused_policy_is_distinguished_from_an_incomplete_lookup(tmp_path: Path) -> None:
+    project = tmp_path / "checkout cannot be listed"
+    project.mkdir()
+    (project / ".nexus-symbiote.yaml").symlink_to("unused.yaml")
+    (project / "AGENTS.md").write_text("Use the configured tools.\n", encoding="utf-8")
+    output = tmp_path / "inventory.json"
+
+    run = CliRunner().invoke(main, ["scan", str(project), "--report-only", "-o", str(output)])
+
+    assert run.exit_code == 0, run.output
+    assert "was not applied because it is invalid or unsafe to read" in run.output
+    assert output.exists()
+
+
 def test_in_ci_a_project_policy_is_still_not_applied_without_the_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

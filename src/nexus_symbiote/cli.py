@@ -186,25 +186,19 @@ _LAST_CLAMPED_SETTINGS: contextvars.ContextVar[tuple[str, ...]] = contextvars.Co
 )
 
 
-def _policy_lookup_incomplete(exc: BaseException) -> bool:
-    """A policy file may exist, but the root could not be listed far enough to say."""
-    text = str(exc)
-    return "entries limit" in text or "cannot be listed" in text
-
-
 def _warn_unapplied_project_policy(root: Path) -> None:
     """Say that a checkout policy exists and was left unused.
 
     Applying it is opt-in. A file that is not a safe regular policy is named only as
     invalid: its error text can quote the checkout.
     """
-    from nexus_symbiote.policy import PolicyError, find_policy_path
+    from nexus_symbiote.policy import PolicyError, PolicyListingError, find_policy_path
 
     try:
         path = find_policy_path(root)
-    except PolicyError as exc:
-        if _policy_lookup_incomplete(exc):
-            raise _failure(exc) from exc
+    except PolicyListingError as exc:
+        raise _failure(exc) from exc
+    except PolicyError:
         echo_line(
             "WARNING: a project policy file in ",
             root,
@@ -345,7 +339,7 @@ def _inventory_policy(
                 "Note: ",
                 unapplied,
                 " was not applied. Without --project the built-in policy is used; "
-                "name a trusted project with --project to apply its policy.",
+                "use --project and --accept-project-policy to apply a trusted project's policy.",
                 err=True,
             )
     return default_policy(), "built-in", []
