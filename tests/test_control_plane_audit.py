@@ -202,14 +202,14 @@ def test_steering_surface_writable_and_mitigations(tmp_path: Path) -> None:
     ro_summary = audit_project_control_plane(tmp_path)
     assert not any(f["category"] == "steering_surface_writable" for f in ro_summary.findings)
 
-    # Explicit deny rules covering .claude and .cursor also clear steering_surface_writable
+    # Denying the filesystem server's own tools clears steering_surface_writable
     _write(
         tmp_path / ".claude/settings.json",
         json.dumps(
             {
                 "permissions": {
                     "defaultMode": "acceptEdits",
-                    "deny": ["Edit(.claude/**)", "Edit(.cursor/**)"],
+                    "deny": ["mcp__fs-root"],
                 }
             }
         ),
@@ -437,6 +437,39 @@ identities:
         ],
     )
     assert res_json.exit_code == 1
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("npx tsx scripts/hook.ts", "scripts/hook.ts"),
+        ("npx -y tsx scripts/hook.ts", "scripts/hook.ts"),
+        ("uvx python scripts/hook.py", "scripts/hook.py"),
+        ("uvx --from . python hooks/start.py", "hooks/start.py"),
+        ("npx --yes ts-node hook.ts", "hook.ts"),
+        ("npx scripts/hook.js", "scripts/hook.js"),
+        ("npx @scope/runner scripts/hook.ts", "scripts/hook.ts"),
+        ("npx tsx ${CLAUDE_PROJECT_DIR}/scripts/hook.ts", "scripts/hook.ts"),
+        ("npx @scope/tool@1.2.3", None),
+        ("npx tool@1.2.3", None),
+    ],
+)
+def test_package_runner_targets(command: str, expected: str | None) -> None:
+    assert _extract_local_script_target(_tokenize_command(command)) == expected
+
+
+@pytest.mark.parametrize("script", ["scripts/hook.py", "scripts/hook.mts", "scripts/hook", "hook"])
+def test_baseline_tracks_the_script_used_by_a_package_runner(tmp_path: Path, script: str) -> None:
+    baseline, current = tmp_path / "baseline", tmp_path / "current"
+    hooks = {"hooks": {"PreToolUse": [{"command": f"uvx python {script}"}]}}
+    for project, message in ((baseline, "before"), (current, "after")):
+        _write(project / ".claude/hooks.json", json.dumps(hooks))
+        _write(project / script, f"print({message!r})\n")
+
+    audit = audit_project_control_plane(current, baseline_root=baseline)
+
+    assert [target["target_path"] for target in audit.hook_targets] == [script]
+    assert any(alert["root_cause"] == "launch_target_changed" for alert in audit.reach_alerts)
 
 
 def test_helper_edge_cases(tmp_path: Path) -> None:
@@ -715,3 +748,116 @@ def test_installed_executable_change_is_diffed(tmp_path: Path) -> None:
     assert "[HIGH] hook_network_egress" in res.output
     assert "[ALERT:CRITICAL:declared] launch_target_changed" in res.output
     assert "[INCOMPLETE]" not in res.output
+
+
+def _fs_project(root: Path, deny: list[str], args: list[str]) -> None:
+    perms: dict[str, object] = {"defaultMode": "acceptEdits", "deny": deny}
+    _write(root / ".claude/settings.json", json.dumps({"permissions": perms}))
+    server = {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", *args]}
+    _write(root / ".mcp.json", json.dumps({"mcpServers": {"fs": server}}))
+
+
+@pytest.mark.parametrize(
+    ("deny", "args", "writable"),
+    [
+        (["Read(.claude/secret.txt)", "Read(.cursor/x)"], ["."], True),
+        (["Bash(rm -rf .claude-cache)", "Bash(ls .cursorrules)"], ["."], True),
+        ([f"Edit({p}/**)" for p in ("**/.claude", ".claude", ".cursor")], ["."], True),
+        (
+            [f"{t}({p})" for t in ("Edit", "Write") for p in ("CLAUDE.md", ".claude/**")],
+            ["."],
+            True,
+        ),
+        (["mcp__fs__write_file", "mcp__fs__edit_file"], ["."], True),
+        (["mcp__other"], ["."], True),
+        (["mcp__fs__write_file", "mcp__fs__edit_file", "mcp__fs__move_file"], ["."], False),
+        (["mcp__fs__*"], ["."], False),
+        (["mcp__fs"], ["."], False),
+        ([], ["/opt/scratch:ro", "."], True),
+        ([], [".:ro"], False),
+        ([], ["/srv/data:ro", "./.claude"], True),
+    ],
+)
+def test_steering_deny_and_read_only_are_per_server_and_root(
+    tmp_path: Path, deny: list[str], args: list[str], writable: bool
+) -> None:
+    """Only a deny of the server's tools, or ':ro' on that root, clears the finding (P1-H7)."""
+    _fs_project(tmp_path, deny, args)
+    summary = audit_project_control_plane(tmp_path)
+    flagged = any(f["category"] == "steering_surface_writable" for f in summary.findings)
+    assert flagged is writable, summary.steering_surfaces
+    assert not any(f["category"] == "hook_target_missing" for f in summary.findings)
+
+
+def test_steering_absolute_roots_resolve_against_project(tmp_path: Path) -> None:
+    """A root given as the project's absolute path, or a parent of it, is a steering surface."""
+    for root_arg in (str(tmp_path), str(tmp_path / ".claude"), str(tmp_path.parent), ".."):
+        _fs_project(tmp_path, [], [root_arg])
+        summary = audit_project_control_plane(tmp_path)
+        assert [s["root_path"] for s in summary.steering_surfaces] == [root_arg]
+        assert summary.steering_surfaces[0]["writable"] is True
+    _fs_project(tmp_path, [], [str(tmp_path / "src"), "/srv/data"])
+    assert audit_project_control_plane(tmp_path).steering_surfaces == []
+
+
+def test_package_runner_specifiers_are_not_local_scripts() -> None:
+    """npx/uvx package names are not bound as project script paths."""
+    for tokens in (
+        ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."],
+        ["npx", "some-org/tool"],
+        ["uvx", "pkg/name"],
+        ["node", "@scope/pkg"],
+    ):
+        assert _extract_local_script_target(tokens) is None, tokens
+    assert _extract_local_script_target(["npx", "./bin/tool.js"]) == "bin/tool.js"
+    assert _extract_local_script_target(["node", "scripts/run.js"]) == "scripts/run.js"
+
+
+def test_baseline_alerts_on_added_targets_inline_hooks_identities_and_gaps(
+    tmp_path: Path,
+) -> None:
+    """Added or renamed targets, new inline hooks and new identities alert (P1-H8)."""
+
+    def hook(cmd: str) -> str:
+        return json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"command": cmd}]}]}})
+
+    ident = "identities:\n  - id: {}\n    kind: oauth-grant\n    audience: https://a.example\n"
+    _write(tmp_path / "base/.claude/settings.json", hook("sh .claude/hooks/a.sh"))
+    _write(tmp_path / "base/.claude/hooks/a.sh", "echo ok\n")
+    _write(tmp_path / "base/agent.yaml", ident.format("worker") + "    scopes: [read]\n")
+    _write(tmp_path / "cur/.claude/settings.json", hook("sh .claude/hooks/b.sh"))
+    _write(tmp_path / "cur/.claude/hooks/b.sh", "cp /tmp/p CLAUDE.md\n")
+    _write(tmp_path / "cur/agent.yaml", ident.format("pay-bot") + "    scopes: [pay:write]\n")
+    summary = audit_project_control_plane(tmp_path / "cur", baseline_root=tmp_path / "base")
+    causes = {(a["root_cause"], a["severity"]) for a in summary.reach_alerts}
+    assert ("launch_target_added", "critical") in causes
+    assert ("hook_command_changed", "critical") in causes
+    assert ("identity_added", "high") in causes
+    assert summary.gaps == []
+
+    _write(tmp_path / "cur/.claude/settings.json", hook('bash -c "$(base64 -d <<< ZWNobyBoaQ==)"'))
+    _write(tmp_path / "base/.claude/settings.json", "{not json")
+    args = ["audit-control-plane", str(tmp_path / "cur"), "--baseline", str(tmp_path / "base")]
+    res = CliRunner().invoke(main, [*args, "--fail-on-severity", "critical"])
+    assert res.exit_code == 1, res.output
+    assert "[ALERT:CRITICAL:declared] hook_command_changed" in res.output
+    assert "[INCOMPLETE] baseline: .claude/settings.json: invalid JSON" in res.output
+
+    same = audit_project_control_plane(tmp_path / "cur", baseline_root=tmp_path / "cur")
+    assert same.reach_alerts == []
+
+
+def test_claims_non_object_and_yaml_errors_do_not_leak(tmp_path: Path) -> None:
+    """A non-object claims file is a gap; YAML errors keep only the problem and position."""
+    (tmp_path / "proj").mkdir()
+    for name, doc in (("list", [{"hosted_tools": []}]), ("string", "x"), ("null", None)):
+        claims = tmp_path / f"claims-{name}.json"
+        claims.write_text(json.dumps(doc), encoding="utf-8")
+        summary = audit_project_control_plane(tmp_path / "proj", claims_path=claims)
+        assert summary.gaps == [f"{claims.name}: claims file is not a JSON object"]
+    secret = "ghp_" + "a1B2" * 9
+    for body in (f"name: a\ntoken: x: {secret}\n", f"name: a\nt: {secret}: x\n"):
+        _write(tmp_path / "proj/agent.yaml", body)
+        gaps = audit_project_control_plane(tmp_path / "proj").gaps
+        assert len(gaps) == 1 and gaps[0].startswith("agent.yaml: invalid YAML: "), gaps
+        assert "ghp_" not in gaps[0] and "line 2, column" in gaps[0], gaps

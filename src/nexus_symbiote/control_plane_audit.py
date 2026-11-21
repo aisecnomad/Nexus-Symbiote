@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -65,6 +66,8 @@ def _as_dict(val: Any) -> dict[str, Any]:
 
 BRIDGE_PACKAGES = _words("mcp-remote supergateway mcp-proxy @modelcontextprotocol/server-proxy")
 RUNTIME_LAUNCHERS = _words("node python python3 sh bash zsh deno bun tsx uvx npx")
+PACKAGE_RUNNERS = _words("npx uvx")
+FS_WRITE_TOOLS = _words("write_file edit_file move_file")
 INSTALLED_BIN_DIRS = _tup("node_modules/.bin/ .venv/bin/ venv/bin/")
 SCRIPT_SUFFIXES = _tup(".sh .py .js .mjs .cjs .ts .rb .pl")
 CODE_EXEC_HOSTED_TOOLS = _words("code_interpreter computer_use bash local_shell code_execution")
@@ -80,7 +83,7 @@ JSONC_FILES = _tup(".vscode/mcp.json")
 PERMISSION_CONFIG_FILES = _tup(".claude/settings.json .claude/settings.local.json .cursor/cli.json")
 _SUMMARY_KEYS = _tup(
     "hook_targets skill_preambles launcher_targets hosted_tools ci_agents framework_agents "
-    "identities steering_surfaces bridged_servers reach_alerts gaps"
+    "identities steering_surfaces bridged_servers hook_commands reach_alerts gaps"
 )
 
 _EGRESS_RE = re.compile(
@@ -113,13 +116,22 @@ def _clean(val: Any) -> str:
     return neutralize(redact_text(raw))
 
 
+def _yaml_error_text(exc: yaml.YAMLError) -> str:
+    # PyYAML's message quotes the offending source line, which can hold a secret.
+    if isinstance(exc, yaml.MarkedYAMLError) and exc.problem_mark is not None:
+        mark = exc.problem_mark
+        problem = redact_text(exc.problem or "syntax error")
+        return f"invalid YAML: {problem} at line {mark.line + 1}, column {mark.column + 1}"
+    return f"invalid YAML ({type(exc).__name__})"
+
+
 def _parse_yaml(text: str) -> dict[str, Any]:
     try:
         for index, _token in enumerate(yaml.scan(text)):
             if index >= 20_000:
                 raise ValueError("YAML exceeds 20,000 tokens")
     except yaml.YAMLError as exc:
-        raise ValueError(str(exc)) from exc
+        raise ValueError(_yaml_error_text(exc)) from exc
     return parse_yaml_mapping(text)
 
 
@@ -199,7 +211,9 @@ def _normalize_rel_candidate(token: str, *, allow_any_file: bool = False) -> str
     return None
 
 
-def _extract_local_script_target(tokens: list[str]) -> str | None:
+def _extract_local_script_target(
+    tokens: list[str], project_paths: frozenset[str] = frozenset()
+) -> str | None:
     if not tokens:
         return None
     first = tokens[0].strip()
@@ -211,7 +225,19 @@ def _extract_local_script_target(tokens: list[str]) -> str | None:
         for arg in tokens[1:]:
             if arg in {"-c", "-e", "-m"}:
                 return None
-            if not arg.startswith("-"):
+            if base in PACKAGE_RUNNERS:
+                # A bare operand may be a package locator. Bind it if the confined
+                # project listing identifies a file, even without a script suffix.
+                local = _normalize_rel_candidate(arg, allow_any_file=True)
+                if local is not None and (path := posixpath.normpath(local)) in project_paths:
+                    return path
+                if not (
+                    arg.startswith("./")
+                    or _PROJECT_DIR_RE.match(arg)
+                    or arg.endswith(SCRIPT_SUFFIXES)
+                ):
+                    continue
+            if not arg.startswith(("-", "@")):
                 cand = _normalize_rel_candidate(arg)
                 if cand is not None:
                     return cand
@@ -246,6 +272,7 @@ class ControlPlaneAuditSummary:
     identities: list[dict[str, Any]] = field(default_factory=list)
     steering_surfaces: list[dict[str, Any]] = field(default_factory=list)
     bridged_servers: list[dict[str, Any]] = field(default_factory=list)
+    hook_commands: list[dict[str, Any]] = field(default_factory=list)
     reach_alerts: list[dict[str, Any]] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
 
@@ -460,11 +487,21 @@ def _iter_hook_commands(doc: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def _inspect_hooks_and_preambles(
-    files: ConfinedCollection, all_paths: list[str], summary: ControlPlaneAuditSummary
+    files: ConfinedCollection,
+    all_paths: list[str],
+    project_paths: frozenset[str],
+    summary: ControlPlaneAuditSummary,
 ) -> None:
     for cfg_path, doc in _load_json_docs(files, all_paths, HOOK_CONFIG_FILES, summary.gaps):
         for event_name, cmd_str in _iter_hook_commands(doc):
-            target = _extract_local_script_target(_tokenize_command(cmd_str))
+            summary.hook_commands.append(
+                _rec(
+                    source_file=cfg_path,
+                    event=event_name,
+                    command_digest=_sha256_hex(cmd_str.encode()),
+                )
+            )
+            target = _extract_local_script_target(_tokenize_command(cmd_str), project_paths)
             if target is not None:
                 rec = _bind_script_target(
                     files,
@@ -507,7 +544,7 @@ def _inspect_hooks_and_preambles(
                 skill_path,
                 skill_ref,
             )
-            target = _extract_local_script_target(_tokenize_command(cmd_body))
+            target = _extract_local_script_target(_tokenize_command(cmd_body), project_paths)
             if target is not None:
                 _bind_script_target(
                     files,
@@ -546,6 +583,7 @@ def _find_bridge_package(tokens: list[str]) -> tuple[str, int] | None:
 def _inspect_mcp_launchers_and_bridges(
     files: ConfinedCollection,
     all_paths: list[str],
+    project_paths: frozenset[str],
     summary: ControlPlaneAuditSummary,
     live_versions: dict[str, str],
 ) -> None:
@@ -667,7 +705,7 @@ def _inspect_mcp_launchers_and_bridges(
                 )
                 continue
 
-            target = _extract_local_script_target(tokens)
+            target = _extract_local_script_target(tokens, project_paths)
             props = {"registry_origin": reg_origin} if reg_origin else {}
             if target is not None:
                 rec = _bind_script_target(
@@ -700,21 +738,33 @@ def _inspect_mcp_launchers_and_bridges(
             )
 
 
-def _covers_steering_path(root_arg: str) -> bool:
+def _covers_steering_path(root_arg: str, project_roots: tuple[str, ...]) -> bool:
     cleaned = root_arg.strip().strip("'\"")
-    if cleaned in {".", "./", ""}:
+    if not cleaned:
         return True
-    if cleaned.startswith("./"):
-        cleaned = cleaned[2:]
-    return any(
-        cleaned == pref or cleaned.startswith(pref + "/") or pref.startswith(cleaned + "/")
-        for pref in STEERING_PREFIXES
-    )
+    # Absolute and parent-relative roots are placed against the audited project root.
+    for project in project_roots:
+        joined = posixpath.normpath(posixpath.join(project, cleaned))
+        if joined == project or project.startswith(joined.rstrip("/") + "/"):
+            return True
+        if joined.startswith(project.rstrip("/") + "/"):
+            rel = joined[len(project.rstrip("/")) + 1 :]
+            if any(
+                rel == pref or rel.startswith(pref + "/") or pref.startswith(rel + "/")
+                for pref in STEERING_PREFIXES
+            ):
+                return True
+    return False
 
 
-def _deny_covers_steering(deny_rules: list[str]) -> bool:
-    low = [r.lower() for r in deny_rules]
-    return any(".claude" in r or "claude.md" in r for r in low) and any(".cursor" in r for r in low)
+def _deny_covers_steering(deny_rules: list[str], server_name: str, reference_server: bool) -> bool:
+    # Claude Code Read/Edit/Write path rules govern its built-in file tools, not an MCP server,
+    # which writes from its own process. Only a deny of the server's tools stops it.
+    prefix = f"mcp__{server_name}"
+    rules = {r.strip() for r in deny_rules}
+    if prefix in rules or f"{prefix}__*" in rules:
+        return True
+    return reference_server and all(f"{prefix}__{tool}" in rules for tool in FS_WRITE_TOOLS)
 
 
 def _inspect_steering_surfaces(
@@ -737,7 +787,7 @@ def _inspect_steering_surfaces(
         if doc.get("approvalPolicy") in {"never", "auto-edit"}:
             auto_edit_modes.append(f"{s_path}:{doc['approvalPolicy']}")
 
-    deny_covered = _deny_covers_steering(deny_rules)
+    project_roots = (files.root.as_posix(), files.root.resolve().as_posix())
 
     for cfg_path, doc in _load_json_docs(files, all_paths, MCP_CONFIG_FILES, summary.gaps):
         for srv_name, srv_cfg in _extract_mcp_servers(doc):
@@ -748,24 +798,27 @@ def _inspect_steering_surfaces(
             joined = " ".join([cmd, *args]).lower()
             if "filesystem" not in srv_name.lower() and "server-filesystem" not in joined:
                 continue
-            read_only = (
-                bool(srv_cfg.get("readOnly"))
-                or "--readonly" in joined
-                or "--read-only" in joined
-                or any(a.endswith(":ro") for a in args)
+            server_read_only = (
+                bool(srv_cfg.get("readOnly")) or "--readonly" in joined or "--read-only" in joined
+            )
+            deny_covered = _deny_covers_steering(
+                deny_rules, srv_name, "server-filesystem" in joined
             )
             srv_auto = (
                 bool(srv_cfg.get("autoApprove")) or len(_as_list(srv_cfg.get("alwaysAllow"))) > 0
             )
             roots = [
-                a.split(":ro")[0]
+                a
                 for a in args
                 if not a.startswith("-")
                 and "server-filesystem" not in a
                 and a not in {"-y", "npx", "uvx"}
             ] or ["."]
-            for r_arg in roots:
-                if not _covers_steering_path(r_arg):
+            for raw_root in roots:
+                # ':ro' marks only the root it is appended to as read-only.
+                r_arg = raw_root.removesuffix(":ro")
+                read_only = server_read_only or raw_root.endswith(":ro")
+                if not _covers_steering_path(r_arg, project_roots):
                     continue
                 eff_modes = list(auto_edit_modes)
                 if srv_auto:
@@ -1245,13 +1298,31 @@ def diff_control_plane_audits(
     base_targets = _target_map(baseline)
     for key, curr_sha in sorted(_target_map(current).items()):
         base_sha = base_targets.get(key)
-        if base_sha is not None and base_sha != curr_sha:
+        if base_sha is None:
+            _emit(
+                "launch_target_added",
+                RiskSeverity.CRITICAL,
+                f"agent-control:{key}",
+                f"Launch target '{key}' (digest {curr_sha[:12]}) is not in the baseline.",
+            )
+        elif base_sha != curr_sha:
             _emit(
                 "launch_target_changed",
                 RiskSeverity.CRITICAL,
                 f"agent-control:{key}",
                 f"Launch target '{key}' digest changed from {base_sha[:12]} to {curr_sha[:12]}.",
             )
+
+    def _hook_keys(s: ControlPlaneAuditSummary) -> set[tuple[str, str, str]]:
+        return {(h["source_file"], h["event"], h["command_digest"]) for h in s.hook_commands}
+
+    for src, event, digest in sorted(_hook_keys(current) - _hook_keys(baseline)):
+        _emit(
+            "hook_command_changed",
+            RiskSeverity.CRITICAL,
+            f"hook-command:{src}:{event}:{digest[:12]}",
+            f"Hook command for '{event}' in {src} (digest {digest[:12]}) is not in the baseline.",
+        )
 
     base_writable = {s["server_name"] for s in baseline.steering_surfaces if s.get("writable")}
     for s in current.steering_surfaces:
@@ -1270,7 +1341,14 @@ def diff_control_plane_audits(
     for i in current.identities:
         pid = i["principal_id"]
         curr_set = set(_as_list(i.get("delegates_to"))) | set(_as_list(i.get("scopes")))
-        if pid in base_id_del and not curr_set.issubset(base_id_del[pid]):
+        if pid not in base_id_del:
+            _emit(
+                "identity_added",
+                RiskSeverity.HIGH,
+                f"agent-control:{pid}",
+                f"Identity '{pid}' is not in the baseline.",
+            )
+        elif not curr_set.issubset(base_id_del[pid]):
             _emit(
                 "delegation_widened",
                 RiskSeverity.HIGH,
@@ -1300,11 +1378,14 @@ def audit_project_control_plane(
             parsed = parse_json_strict(raw_claims)
             if isinstance(parsed, dict):
                 decl_sources.append(("shadowscan:claims", parsed, AssuranceLevel.DECLARED))
+            else:
+                summary.gaps.append(f"{claims_path.name}: claims file is not a JSON object")
         except (OSError, ValueError, RecursionError) as exc:
             summary.gaps.append(f"{claims_path.name}: {neutralize(str(exc))}")
 
     with ConfinedCollection(project_root, summary.gaps) as files:
         all_paths = sorted(p.as_posix() for p in files.iter_files())
+        project_paths = frozenset(all_paths)
         for decl_path in ("agent.yaml", "agent.yml"):
             if decl_path in all_paths:
                 text = _read_confined_text(files, decl_path, summary.gaps)
@@ -1313,14 +1394,18 @@ def audit_project_control_plane(
                         decl_sources.append((decl_path, _parse_yaml(text), AssuranceLevel.DECLARED))
                     except (PolicyError, ValueError, RecursionError) as exc:
                         summary.gaps.append(f"{decl_path}: {neutralize(str(exc))}")
-        _inspect_hooks_and_preambles(files, all_paths, summary)
-        _inspect_mcp_launchers_and_bridges(files, all_paths, summary, live_versions or {})
+        _inspect_hooks_and_preambles(files, all_paths, project_paths, summary)
+        _inspect_mcp_launchers_and_bridges(
+            files, all_paths, project_paths, summary, live_versions or {}
+        )
         _inspect_steering_surfaces(files, all_paths, summary)
         _inspect_workflows_and_claims(files, all_paths, summary, decl_sources)
         _inspect_identities_and_authority(summary, decl_sources)
 
     if baseline_root is not None:
         base_summary = audit_project_control_plane(baseline_root)
+        # An unreadable baseline hides what changed, so its gaps fail the gate too.
+        summary.gaps.extend(f"baseline: {gap}" for gap in base_summary.gaps)
         summary.reach_alerts = diff_control_plane_audits(
             base_summary,
             summary,
