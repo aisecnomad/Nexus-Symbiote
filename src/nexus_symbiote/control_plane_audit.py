@@ -223,8 +223,11 @@ def _extract_local_script_target(tokens: list[str]) -> str | None:
         for arg in tokens[1:]:
             if arg in {"-c", "-e", "-m"}:
                 return None
-            # A package runner takes registry package specifiers, not project paths.
-            if base in PACKAGE_RUNNERS and not arg.startswith("./"):
+            # A bare owner/repo can be a package locator. Recognize explicit
+            # project paths and supported script filenames in a runner's operands.
+            if base in PACKAGE_RUNNERS and not (
+                arg.startswith("./") or _PROJECT_DIR_RE.match(arg) or arg.endswith(SCRIPT_SUFFIXES)
+            ):
                 continue
             if not arg.startswith(("-", "@")):
                 cand = _normalize_rel_candidate(arg)

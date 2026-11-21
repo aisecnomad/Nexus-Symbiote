@@ -439,6 +439,38 @@ identities:
     assert res_json.exit_code == 1
 
 
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("npx tsx scripts/hook.ts", "scripts/hook.ts"),
+        ("npx -y tsx scripts/hook.ts", "scripts/hook.ts"),
+        ("uvx python scripts/hook.py", "scripts/hook.py"),
+        ("uvx --from . python hooks/start.py", "hooks/start.py"),
+        ("npx --yes ts-node hook.ts", "hook.ts"),
+        ("npx scripts/hook.js", "scripts/hook.js"),
+        ("npx @scope/runner scripts/hook.ts", "scripts/hook.ts"),
+        ("npx tsx ${CLAUDE_PROJECT_DIR}/scripts/hook.ts", "scripts/hook.ts"),
+        ("npx @scope/tool@1.2.3", None),
+        ("npx tool@1.2.3", None),
+    ],
+)
+def test_package_runner_targets(command: str, expected: str | None) -> None:
+    assert _extract_local_script_target(_tokenize_command(command)) == expected
+
+
+def test_baseline_tracks_the_script_used_by_a_package_runner(tmp_path: Path) -> None:
+    baseline, current = tmp_path / "baseline", tmp_path / "current"
+    hooks = {"hooks": {"PreToolUse": [{"command": "uvx python scripts/hook.py"}]}}
+    for project, message in ((baseline, "before"), (current, "after")):
+        _write(project / ".claude/hooks.json", json.dumps(hooks))
+        _write(project / "scripts/hook.py", f"print({message!r})\n")
+
+    audit = audit_project_control_plane(current, baseline_root=baseline)
+
+    assert [target["target_path"] for target in audit.hook_targets] == ["scripts/hook.py"]
+    assert any(alert["root_cause"] == "launch_target_changed" for alert in audit.reach_alerts)
+
+
 def test_helper_edge_cases(tmp_path: Path) -> None:
     """Exercise helper and error-handling branches in control_plane_audit."""
     assert _origin_only("not a url") == ""
