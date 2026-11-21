@@ -641,7 +641,7 @@ ranking and the JSON document.
 
 ### `import-sbom`
 
-Import a foreign CycloneDX or SPDX SBOM as DECLARED evidence without picking silent winners. By default component names are hashed (`imported-<16hex>`): keyed HMAC-SHA256 (`hmac-sha256`) when `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` has at least 32 characters, or unsalted SHA-256 (`unsalted-sha256`) otherwise. Local digest matching (`declared_digest_local_match`) checks only non-empty, non-symlink, non-credential artifact files of matching type beneath `--project` and never sets `digest_bound`. The project is always walked, but files are hashed only when the SBOM declares a SHA-256, within the `model-bytes` and `model-total-bytes` limits; a file larger than `model-bytes` is left unbound, warned about and listed in `scan_failures`, while any other limit reached under `--project` ends the import with exit 1. Conflicts are found by purl, and by name within one ecosystem; an entry whose ecosystem is unknown (no purl) is compared with every record of the same name.
+Import a foreign CycloneDX or SPDX SBOM as DECLARED evidence without picking silent winners. By default component names are hashed (`imported-<16hex>`): keyed HMAC-SHA256 (`hmac-sha256`) when `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` has at least 32 characters, or unsalted SHA-256 (`unsalted-sha256`) otherwise. Local digest matching (`declared_digest_local_match`) checks only non-empty, non-symlink, non-credential artifact files of matching type beneath `--project` and never sets `digest_bound`. The project is always walked, but files are hashed only when the SBOM declares a SHA-256, within the `model-bytes` and `model-total-bytes` limits; a file larger than `model-bytes` is left unbound, warned about and listed in `scan_failures`, while any other limit reached under `--project` ends the import with exit 1. Conflicts are found by purl and by name within one ecosystem, including nested manifests collected in the same run. An unknown ecosystem is compared with every record of the same name. An exhausted comparison sample can report an unresolved conflict. Multiple type-compatible local digest matches are marked ambiguous.
 
 ```text
 nexus-symbiote import-sbom [OPTIONS] FOREIGN_BOM_PATH
@@ -653,7 +653,7 @@ nexus-symbiote import-sbom [OPTIONS] FOREIGN_BOM_PATH
 | `--into` `PATH` | Existing native AgentBOM to merge imported SBOM claims into. |
 | `--project` `PATH` | Trusted project root for SHA-256 local file binding, nested manifests, and shape census. |
 | `--reveal-names` | Retain plain component names from the foreign SBOM instead of hashed names. |
-| `--walk-manifests` | Walk nested manifests below `--project` and record manifest-only vs locked pinning state. |
+| `--walk-manifests` | Walk nested manifests below `--project`. A nested npm lock must have an applicable v2 or v3 root record and agree with the effective dependency range. Nested pnpm and Yarn locks supply no lock evidence. Go versions describe requirements and remain manifest-only even with a `go.sum`. |
 | `--census` | Count unread non-control-plane artifact shapes (`*.ipynb`, `n8n/*.json`, `*.tf`, `Chart.yaml`). |
 | `--json-output` | Print a structured JSON summary of imported, bound, and conflicting entries. |
 
@@ -1218,7 +1218,7 @@ nexus-symbiote trifecta [OPTIONS] AIBOM_PATH
 
 ### `vex`
 
-Export schema-validated VEX findings with optional operator decisions, advisories, and trace evidence.
+Export schema-validated VEX findings with optional operator decisions, advisories, and trace evidence. Pass `--deployment-id` to apply matching suppressing decisions as described in [VEX exports](standard-exports.md#vex).
 
 ```text
 nexus-symbiote vex [OPTIONS] AIBOM_PATH

@@ -167,7 +167,7 @@ The exporter validates its output offline against the vendored official OASIS SA
 - Descriptions and details are neutralized like SARIF messages.
 - Findings on components imported from a ShadowScan report are omitted; the metadata property `nexus-symbiote:omittedImportedFindings` counts them.
 
-What it cannot express on its own: a statement is `in_triage` unless an unexpired `--decisions` entry sets its state and justification, or `--trace-evidence` reports that a component was declared but never loaded, which sets `not_affected` (`code_not_reachable`) except for critical findings, KEV-listed advisories and categories such as hook commands or credential exposure; trace evidence never sets `exploitable` or `resolved`. `NEXUS-` identifiers name inventory findings, not entries in any vulnerability database, so tools that apply VEX statements to known vulnerabilities have nothing to apply them to. VEX output states no coverage.
+A statement defaults to `in_triage`. Trace observations annotate findings and advisory matches without changing their state. To set `not_affected`, `resolved`, or `false_positive`, provide an unexpired operator decision naming the vulnerability, component reference, exact input file digest (`inventory_sha256: sha256:<hex>`), and deployment ID. Pass the same deployment ID with `--deployment-id` from trusted configuration. Use a new decision after changing the reviewed inventory. `NEXUS-` identifiers name inventory findings. VEX output states no coverage.
 
 ## Minimum elements
 
