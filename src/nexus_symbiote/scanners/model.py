@@ -556,7 +556,7 @@ class _ZipMember(NamedTuple):
 
 def _zip_directory(
     stream: BinaryIO, consumed: int, size: int, read: bytes = b""
-) -> list[tuple[list[_ZipMember], int]] | None:
+) -> tuple[list[tuple[list[_ZipMember], int]], bool] | None:
     """The members each central directory a ZIP reader can locate lists, and its offset.
 
     Readers locate it differently, so a decoy directory that one reads must not hide the
@@ -569,16 +569,19 @@ def _zip_directory(
     starts there the one right before the locator. miniz, which ``torch.load`` uses,
     reads the record at the locator's offset wherever it lies in the archive, also after
     the locator. Every reading that lists members is returned, with the offset its
-    directory starts at, its members' offsets as that reader moves them.
+    directory starts at, its members' offsets as that reader moves them, and whether
+    some reader's directory was not decided. A directory that cannot be decided does not
+    hide what another reading lists: the caller rates the archive by every reading.
 
     The rest of the stream is read in bounded chunks, keeping only the tail that can
     hold the directory within ``MAX_ZIP_DIRECTORY_BYTES``, the end-of-central-directory
     record with its comment and the ZIP64 records. ``read`` holds the bytes that end at
     ``consumed``, already read from the stream; from offset 0, a small archive is held
-    whole. ``None`` when no directory can be read, when any directory that lies within
-    the archive is beyond that bound or runs past its end record, as it may list what
-    the others do not, when a ZIP64 locator stores an offset before that tail or the
-    locator itself would lie before it, or when the stream ends before ``size``.
+    whole. A directory is not decided when it lies within the archive beyond that bound
+    or runs past its end record, as it may list what the others do not, or when a ZIP64
+    locator stores an offset before that tail. ``None`` when no directory can be read,
+    when the locator itself would lie before that tail, or when the stream ends before
+    ``size``.
     """
     tail: deque[bytes] = deque([read])
     held = len(read)
@@ -610,12 +613,13 @@ def _zip_directory(
     # Where readers look for a ZIP64 record, and where one was found.
     looked: set[int] = set()
     found: set[int] = set()
+    undecided = False
     if locator >= 0 and data[locator : locator + 4] == b"PK\x06\x07":
         stored = _little(data, locator + 8, 8) - start
-        if stored < 0:
-            # zipfile reads the record there over the one before the locator, and the
-            # tail does not hold it, so what zipfile lists is not decided.
-            return None
+        # zipfile reads the record there over the one before the locator; when the
+        # tail does not hold it, what zipfile lists is not decided, but what the other
+        # readings list still counts.
+        undecided = stored < 0
         looked = {locator - 56, stored}
         for record in sorted(looked):
             # miniz, which torch.load uses, reads the record at the stored offset anywhere
@@ -666,14 +670,17 @@ def _zip_directory(
                 # at its stored offset and runs past its end record no writer produces,
                 # and miniz still reads it; a stored offset that starts no entry, as in an
                 # archive cut out of a larger file, is one only zipfile's reading finds.
-                return None
+                undecided = True
+                continue
             if members is not None:
                 shift = begin - directory_offset
                 readings[key] = (
                     [m._replace(offset=m.offset + shift) if m.offset >= 0 else m for m in members],
                     begin,
                 )
-    return list(readings.values()) or None
+    if not readings and not undecided:
+        return None
+    return list(readings.values()), undecided
 
 
 def _directory_members(data: bytes, begin: int, size: int, end: int) -> list[_ZipMember] | None:
@@ -1028,9 +1035,12 @@ def _recognized_code_container(
         kept = header + first
         if _pickle_member(first):
             return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_PICKLE_MEMBER
-    readings = _zip_directory(stream, len(kept), size, kept)
-    if readings is None:
+    directory = _zip_directory(stream, len(kept), size, kept)
+    if directory is None:
         return SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD
+    readings, undecided = directory
+    # A member any reading lists counts, even when another reader's directory is not
+    # decided: a locator or directory that cannot be read must not hide one that can.
     if any(_pickle_member(member.name) for members, _ in readings for member in members):
         return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_PICKLE_MEMBER
     arrays: bool | None = False
@@ -1040,6 +1050,8 @@ def _recognized_code_container(
             return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_OBJECT_ARRAY
         if found is None:
             arrays = None
+    if undecided:
+        return SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD
     return SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE if arrays is False else ZIP_MEMBER_UNREAD
 
 

@@ -1001,7 +1001,9 @@ A way around a limit that its entry does not describe is worth a
   a member compressed by another method,
   such as BZIP2 or LZMA, and a member whose data runs past the next member's local
   header are rated `unknown`, a high finding, or `unsafe-code-execution` under a
-  pickle-family name. The directory is read with the
+  pickle-family name, unless another reading lists a pickle-family member or an
+  object-dtype array, which makes the archive `unsafe-code-execution`. The directory
+  is read with the
   tolerances of `zipfile` and the specification, and miniz's reading of a ZIP64
   record at the locator's offset (the C++ reader `torch.load` uses); miniz's other
   tolerances are not modelled. A member name with a NUL byte is

@@ -527,6 +527,38 @@ def test_a_directory_that_runs_past_its_end_record_is_unread(tmp_path: Path, pic
     )
 
 
+def _locator_naming_offset_zero(real: tuple[bytes, bytes], padding: int) -> bytes:
+    """An ordinary archive whose last directory entry's comment is a ZIP64 locator storing
+    offset 0, where no record lies. zipfile without the CVE-2025-8291 fix finds no record
+    and reads the classic directory, which lists the real member."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("notes.txt", b"\0" * (8 + padding))
+        info = zipfile.ZipInfo(real[0].decode())
+        info.comment = struct.pack("<IIQI", 0x07064B50, 0, 0, 1)
+        archive.writestr(info, real[1])
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize("large", [False, True], ids=["held-whole", "past-the-tail"])
+@pytest.mark.parametrize("pickled", [False, True], ids=["array", "pickle"])
+def test_a_locator_naming_no_held_record_does_not_hide_the_classic_directory(
+    tmp_path: Path, large: bool, pickled: bool
+) -> None:
+    # The locator's offset lay before the bytes held, so the archive was rated as a
+    # directory not read, unknown and high, although the classic directory lists a pickle
+    # or object array: a 20-byte comment let a critical .npz, .keras or .onnx pass.
+    real = (b"evil.pkl", _PICKLE) if pickled else (b"objects.npy", _npy("'|O'"))
+    padding = 2 * model._ZIP_TAIL_BYTES if large else 0
+    archive = _locator_naming_offset_zero(real, padding)
+    expected = (UNSAFE, ZIP_PICKLE_MEMBER if pickled else ZIP_OBJECT_ARRAY)
+    (tmp_path / "models").mkdir()
+    relatives = ["models/archive", "arrays.npz", "model.keras", "model.onnx", "model.pt"]
+    for relative in relatives:
+        (tmp_path / relative).write_bytes(archive)
+        assert inspect_model_format(tmp_path / relative) == expected, relative
+
+
 def _cut_out(members: list[tuple[str, bytes]], prefix: int = 19) -> bytes:
     """An archive written after ``prefix`` bytes, with absolute offsets, then cut out of
     that file: every stored offset is ``prefix`` bytes too large. zipfile still lists it."""
@@ -785,18 +817,18 @@ def test_a_pickle_member_renamed_by_a_unicode_path_field_is_unsafe(
 def test_a_directory_that_starts_but_cannot_be_read_hides_behind_no_decoy(starts: bool) -> None:
     # The end record stores the offset of a harmless decoy; the directory of the same
     # size that ends at the end record starts with an entry signature, but its second
-    # entry is cut short. What it lists is not decided, so nothing is read. A directory
-    # without the signature is one no reader takes, and the decoy is read.
+    # entry is cut short. What it lists is not decided, so the decoy's reading alone does
+    # not rate the archive. A directory without the signature is one no reader takes,
+    # and the decoy is read.
     decoy = _local(b"a.npy", _npy("'<f8'"))
     listed = _central(b"a.npy", _npy("'<f8'"), 0)
     other = (b"PK\x01\x02" if starts else b"\0" * 4) + b"\0" * (len(listed) - 4)
     archive = decoy + listed + other + _end(1, len(listed), len(decoy))
-    readings = model._zip_directory(io.BytesIO(archive), 0, len(archive))
-    if starts:
-        assert readings is None
-    else:
-        assert readings is not None
-        assert [m.name for members, _ in readings for m in members] == [b"a.npy"]
+    directory = model._zip_directory(io.BytesIO(archive), 0, len(archive))
+    assert directory is not None
+    readings, undecided = directory
+    assert [m.name for members, _ in readings for m in members] == [b"a.npy"]
+    assert undecided is starts
 
 
 @pytest.mark.parametrize("comment", [b"", b"saved by np.savez"], ids=["bare", "commented"])
@@ -870,9 +902,11 @@ def test_the_scanner_lists_every_member_zipfile_lists() -> None:
                 listed = {name.encode("cp437") for name in opened.namelist()}
         except (zipfile.BadZipFile, ValueError, OSError, UnicodeError, NotImplementedError):
             continue
-        readings = model._zip_directory(io.BytesIO(archive), 0, len(archive))
-        # No reading at all is rated unknown; a reading that lists members lists them all.
-        if readings is not None:
+        directory = model._zip_directory(io.BytesIO(archive), 0, len(archive))
+        # A directory not decided is rated unknown unless a reading lists a dangerous
+        # member; when every directory is decided, the readings list every member.
+        if directory is not None and not directory[1]:
+            readings = directory[0]
             compared += 1
             # zipfile cuts a name at its first NUL.
             names = {m.name.split(b"\0")[0] for members, _ in readings for m in members}
