@@ -95,6 +95,7 @@ class SBOMImportSummary:
     imported_count: int = 0
     bound_local_count: int = 0
     conflict_count: int = 0
+    unresolved_conflict_count: int = 0
     conflicts: list[str] = field(default_factory=list)
     scan_failures: list[str] = field(default_factory=list)
 
@@ -298,9 +299,14 @@ def _extract_spdx_entries(doc: dict[str, Any]) -> tuple[str, list[dict[str, Any]
             "software_Package": "library",
         }
         for node in graph:
+            if not isinstance(node, dict):
+                continue
+            kind = node.get("type")
+            if kind is not None and not isinstance(kind, str):
+                raise ValueError("unsupported SPDX element type (expected a string)")
             if (
-                isinstance(node, dict)
-                and node.get("type") in type_map
+                isinstance(kind, str)
+                and kind in type_map
                 and isinstance(node.get("name"), str)
                 and node["name"]
             ):
@@ -311,7 +317,7 @@ def _extract_spdx_entries(doc: dict[str, Any]) -> tuple[str, list[dict[str, Any]
                         node["name"],
                         node.get("software_packageVersion"),
                         node.get("software_packageUrl"),
-                        type_map[node["type"]],
+                        type_map[kind],
                         None,
                         sha,
                     )
@@ -354,8 +360,10 @@ def _extract_spdx_entries(doc: dict[str, Any]) -> tuple[str, list[dict[str, Any]
     raise ValueError("unrecognized foreign SBOM format (expected CycloneDX or SPDX JSON)")
 
 
-def _digest_index(project_root: Path | None, wanted: bool) -> tuple[dict[str, str], list[str]]:
-    by_digest: dict[str, str] = {}
+def _digest_index(
+    project_root: Path | None, wanted: bool
+) -> tuple[dict[str, list[str]], list[str]]:
+    by_digest: dict[str, list[str]] = {}
     failures: list[str] = []
     if project_root is None:
         return by_digest, failures
@@ -374,7 +382,7 @@ def _digest_index(project_root: Path | None, wanted: bool) -> tuple[dict[str, st
             if found[1] > cap.value:
                 files._fail(rel_posix, f"exceeds {cap.name}; not hashed, so left unbound")
             elif digest := files.hash_file(rel_posix, max_bytes=cap):
-                by_digest.setdefault(digest, rel_posix)
+                by_digest.setdefault(digest, []).append(rel_posix)
     return by_digest, failures
 
 
@@ -441,6 +449,7 @@ def import_foreign_sbom(
     hashed = any(e["sha256"] for e in entries)
     digest_index, local_failures = _digest_index(project_root, hashed)
     existing_refs = {c.bom_ref for c in bom.components}
+    matches: dict[tuple[str, frozenset[str]], tuple[str | None, bool]] = {}
 
     buckets: dict[str, _IdentityBucket] = {}
     for existing in bom.components:
@@ -516,13 +525,20 @@ def import_foreign_sbom(
         cand_keys = pk + [f"name:{e}:{nm}" for e in (("*",) if eco == "any" else (eco, "any"))]
         rec_keys = pk + [f"name:{e}:{nm}" for e in (eco, "*")]
 
-        cand_file = digest_index.get(sha256_val) if sha256_val else None
         allowed_exts = _KIND_EXT_MAP.get(entry["type"], _PKG_EXTS)
-        bound_target = (
-            cand_file
-            if (cand_file and PurePosixPath(cand_file).suffix.lower() in allowed_exts)
-            else None
-        )
+        bound_target, ambiguous_match = None, False
+        if sha256_val:
+            match_key = (sha256_val, allowed_exts)
+            if match_key not in matches:
+                compatible = (
+                    path
+                    for path in digest_index.get(sha256_val, [])
+                    if PurePosixPath(path).suffix.lower() in allowed_exts
+                )
+                first = next(compatible, None)
+                ambiguous = next(compatible, None) is not None
+                matches[match_key] = (None if ambiguous else first, ambiguous)
+            bound_target, ambiguous_match = matches[match_key]
         if bound_target is not None:
             summary.bound_local_count += 1
 
@@ -579,6 +595,17 @@ def import_foreign_sbom(
                             )
                         )
 
+        elif overflow:
+            summary.unresolved_conflict_count += 1
+            risks.append(
+                RiskAssessment(
+                    severity=RiskSeverity.MEDIUM,
+                    category="source_conflict_unresolved",
+                    detail="Inventory has additional versions or digests beyond the reconciliation sample.",
+                    recommendation="Reconcile the complete supplier and repository component records.",
+                )
+            )
+
         for k in rec_keys:
             bucket = buckets.setdefault(k, _IdentityBucket())
             if clean_ver:
@@ -611,6 +638,9 @@ def import_foreign_sbom(
             props["declared_sha256"] = sha256_val
         if bound_target is not None:
             props["declared_digest_local_match"] = bound_target
+
+        if ambiguous_match:
+            props["declared_digest_local_match_ambiguous"] = True
 
         sup = (
             neutralize(redact_text(entry["supplier"]))[:200]
@@ -691,58 +721,44 @@ def unread_shape_census(project_root: Path) -> list[UnreadShapeCount]:
     return unread_shape_census_with_failures(project_root)[0]
 
 
-def _npm_locked_packages(
-    files: ConfinedCollection, prefix: str, path_set: set[str]
-) -> dict[str, str]:
-    resolved: dict[str, str] = {}
-    for lk in ("package-lock.json", "npm-shrinkwrap.json"):
-        cand = f"{prefix}{lk}"
-        if cand in path_set and (raw := files.read_text(cand, missing_ok=True)):
-            try:
-                doc = parse_json_strict(raw, max_bytes=4 * 1024 * 1024)
-            except ValueError:
-                continue
-            if not isinstance(doc, dict):
-                continue
-            for sec in ("packages", "dependencies"):
-                entries = doc.get(sec)
-                if isinstance(entries, dict):
-                    for k, v in entries.items():
-                        if (
-                            isinstance(k, str)
-                            and isinstance(v, dict)
-                            and isinstance(v.get("version"), str)
-                        ):
-                            if sec == "packages" and "node_modules/" not in k:
-                                continue
-                            pkg_key = k.rsplit("node_modules/", 1)[-1] if sec == "packages" else k
-                            resolved.setdefault(pkg_key, v["version"])
-    if f"{prefix}pnpm-lock.yaml" in path_set and (
-        raw := files.read_text(f"{prefix}pnpm-lock.yaml", missing_ok=True)
+def _npm_lock_packages(
+    files: ConfinedCollection, prefix: str, path_set: set[str], manifest: dict[str, Any]
+) -> dict[str, Any]:
+    # Workspace layouts and multiple package managers can select a different lock.
+    manager = manifest.get("packageManager")
+    if (
+        manifest.get("workspaces")
+        or manifest.get("overrides")
+        or (
+            manager is not None and (not isinstance(manager, str) or not manager.startswith("npm@"))
+        )
+        or (
+            manager is None
+            and any(
+                prefix + name in path_set
+                for name in ("pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb")
+            )
+        )
     ):
-        try:
-            pkgs = parse_yaml_mapping(raw, max_nodes=32768).get("packages")
-            if isinstance(pkgs, dict):
-                for k in pkgs:
-                    if isinstance(k, str) and (at := k.lstrip("/").rfind("@")) > 0:
-                        cleaned = k.lstrip("/")
-                        resolved.setdefault(cleaned[:at], cleaned[at + 1 :].split("(", 1)[0])
-        except PolicyError:
-            pass
-    if f"{prefix}yarn.lock" in path_set and (
-        raw := files.read_text(f"{prefix}yarn.lock", missing_ok=True)
-    ):
-        cur_pkg: str | None = None
-        for line in raw.splitlines():
-            if line and not line[0].isspace() and line.endswith(":"):
-                hdr = line[:-1].split(",", 1)[0].strip().strip('"')
-                at = hdr.rfind("@")
-                cur_pkg = hdr[:at] if at > 0 else None
-            elif cur_pkg and line.strip().startswith("version "):
-                if ver := line.strip().removeprefix("version").strip().strip('"').strip(":"):
-                    resolved.setdefault(cur_pkg, ver)
-                cur_pkg = None
-    return resolved
+        return {}
+    for name in ("npm-shrinkwrap.json", "package-lock.json"):
+        before = files.failures_recorded, files.exclusions_recorded
+        raw = files.read_bytes(prefix + name, missing_ok=True)
+        if raw is None:
+            if (files.failures_recorded, files.exclusions_recorded) != before:
+                return {}
+            continue
+        lock = parse_json_strict(raw, max_bytes=files.max_file_bytes)
+        if (
+            isinstance(lock, dict)
+            and type(lock.get("lockfileVersion")) is int
+            and lock["lockfileVersion"] in (2, 3)
+        ):
+            packages = lock.get("packages")
+            if isinstance(packages, dict):
+                return packages
+        return {}
+    return {}
 
 
 def _toml_locked_packages(
@@ -813,10 +829,14 @@ def _parse_nested_manifest(
     if name == "package.json":
         parsed = parse_json_strict(text)
         if isinstance(parsed, dict):
-            npm_locks = lock_cache.setdefault(
-                (prefix, "npm"), _npm_locked_packages(files, prefix, path_set)
-            )
-            for section in ("dependencies", "devDependencies", "optionalDependencies"):
+            try:
+                npm_locks = _npm_lock_packages(files, prefix, path_set, parsed)
+            except (ValueError, RecursionError):
+                files._fail(rel_posix, "invalid nested npm lockfile")
+                npm_locks = {}
+            declared: dict[str, list[tuple[str, str]]] = {}
+            # npm loads root dependency edges in this order. A later section wins.
+            for section in ("dependencies", "optionalDependencies", "devDependencies"):
                 deps = parsed.get(section)
                 if isinstance(deps, dict):
                     for pkg_name, spec in deps.items():
@@ -825,15 +845,27 @@ def _parse_nested_manifest(
                             and isinstance(spec, str)
                             and _is_ai_package_name(pkg_name)
                         ):
-                            lv = npm_locks.get(pkg_name)
-                            st = (
-                                "locked"
-                                if lv
-                                else (
-                                    "pinned-version" if is_exact_version(spec) else "manifest-only"
-                                )
-                            )
-                            found.append((pkg_name, lv or spec.strip(), "npm", st, {}))
+                            declared.setdefault(pkg_name, []).append((section, spec.strip()))
+            for pkg_name, specs in declared.items():
+                spec = specs[-1][1]
+                record = npm_locks.get("node_modules/" + pkg_name)
+                version = record.get("version") if isinstance(record, dict) else None
+                if (
+                    isinstance(record, dict)
+                    and record.get("link") is not True
+                    and record.get("name", pkg_name) == pkg_name
+                    and _reg.RegistryScanner._npm_spec(spec)[0] == "registry"
+                    and _reg.RegistryScanner._lock_root_agrees(npm_locks, pkg_name, specs)
+                    and isinstance(version, str)
+                    and len(version) <= 128
+                    and _reg._npm_exact(version)
+                    and not _versions_conflict(spec, version)
+                ):
+                    found.append((pkg_name, version, "npm", "locked", {}))
+                elif all(item == spec for _, item in specs) and is_exact_version(spec):
+                    found.append((pkg_name, spec, "npm", "pinned-version", {}))
+                else:
+                    found.append((pkg_name, spec, "npm", "manifest-only", {}))
     elif name.startswith("requirements") and name.endswith(".txt"):
         for logical in _join_continued_lines(text):
             if not logical or logical.startswith("-"):
@@ -896,29 +928,23 @@ def _parse_nested_manifest(
                             (crate, lv or ver, "cargo", "locked" if lv else "manifest-only", {})
                         )
     elif name == "go.mod":
-        if (prefix, "go") not in lock_cache:
-            go_raw = (
-                files.read_text(f"{prefix}go.sum", missing_ok=True)
-                if f"{prefix}go.sum" in path_set
-                else None
-            )
-            lock_cache[(prefix, "go")] = {
-                (p[0], p[1].removesuffix("/go.mod"))
-                for ln in (go_raw or "").splitlines()
-                if len(p := ln.split()) >= 3
-            }
-        go_locks = lock_cache[(prefix, "go")]
-        skip_kw = {"module", "go", "require", "replace", "exclude", "retract", ")"}
+        in_require = False
         for line in text.splitlines():
             parts = line.split("//", 1)[0].strip().split()
-            if len(parts) >= 3 and parts[0] == "require" and parts[1] != "(":
-                mv: tuple[str, str] | None = (parts[1], parts[2])
-            else:
-                mv = (parts[0], parts[1]) if (len(parts) >= 2 and parts[0] not in skip_kw) else None
-            if mv and _is_ai_package_name(mv[0]):
-                found.append(
-                    (mv[0], mv[1], "golang", "locked" if mv in go_locks else "manifest-only", {})
-                )
+            if parts == ["require", "("]:
+                in_require = True
+                continue
+            if parts == [")"]:
+                in_require = False
+                continue
+            if len(parts) == 3 and parts[0] == "require":
+                parts = parts[1:]
+            elif not (in_require and len(parts) == 2):
+                continue
+            module, version = parts
+            if _is_ai_package_name(module):
+                # go.mod records minimum versions; go.sum is a checksum list.
+                found.append((module, version, "golang", "manifest-only", {}))
     elif name in _CONDA_NAMES:
         if len(text.encode("utf-8")) > MAX_MANIFEST_YAML_BYTES:
             raise ValueError("conda manifest exceeds size limit")

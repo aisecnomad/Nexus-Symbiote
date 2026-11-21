@@ -75,6 +75,20 @@ AGENT_REFERENCE_FIELDS = (
 _BLOCKING = frozenset({"critical", "error", "unknown"})
 _SEVERITY_RANK = {"critical": 0, "error": 0, "unknown": 1, "warning": 2, "info": 3}
 NO_LOCAL_SUBJECT = "No local project subject was available to reconcile."
+COLLECTOR_OWNED_PROPERTIES = frozenset(
+    {
+        "collection_mode",
+        "content_hash_withheld",
+        "config_hash",
+        "config_hash_profile",
+        "identity_source",
+        "weight_files",
+    }
+)
+"""Property keys only a collector writes, which validation, integrity, diff and risk read
+as content binding or collection provenance. Suppression fingerprints, integrity and the
+static binding checks trust them, so a supplier may not add one the collector did not."""
+COLLECTOR_OWNED_PREFIXES = ("static_value_binding", "static_config_hash", "static_card_hash")
 
 Basis = Literal[
     "supplied-claims",
@@ -128,6 +142,8 @@ class CompletenessReport:
     local_subjects: int | None = None
     supplier_claims: list[SupplierClaim] = field(default_factory=list)
     bound_imports: frozenset[str] = frozenset()
+    supplier_observed: frozenset[str] = frozenset()
+    """Matched components whose observed composition only supplier additions establish."""
     issues_omitted: int = 0
     supplier_claims_omitted: int = 0
 
@@ -216,6 +232,10 @@ def _verified_fields(component: AnyComponent) -> set[str]:
     ):
         fields.add("signing_status")
     return fields
+
+
+def _collector_owned(key: str) -> bool:
+    return key in COLLECTOR_OWNED_PROPERTIES or key.startswith(COLLECTOR_OWNED_PREFIXES)
 
 
 def _asserts_unestablished_trust(component: AnyComponent) -> bool:
@@ -411,6 +431,7 @@ class CompletenessValidator:
         supplied = {c.bom_ref: c for c in bom.components}
         local_refs = {c.bom_ref for c in expected.components if not is_imported(c)}
         mismatched = False
+        supplier_observed: set[str] = set()
         for actual in expected.components:
             declared = supplied.pop(actual.bom_ref, None)
             if (
@@ -446,7 +467,20 @@ class CompletenessValidator:
                 )
             elif not is_imported(actual):
                 additions = self._supplier_only(declared, actual)
-                if self._asserts_verification(declared, additions):
+                owned = sorted(
+                    claim.detail
+                    for claim in additions
+                    if claim.kind == "property" and _collector_owned(claim.detail)
+                )
+                if _observed_composition(declared) and not _observed_composition(actual):
+                    supplier_observed.add(actual.bom_ref)
+                if owned:
+                    incomplete(
+                        actual.bom_ref,
+                        "Supplied component adds collector-owned properties the local "
+                        f"collection did not record: {actual.bom_ref} ({', '.join(owned)})",
+                    )
+                elif self._asserts_verification(declared, additions):
                     incomplete(actual.bom_ref, _unestablished_trust(actual.bom_ref))
                 else:
                     for claim in (*additions, *self._supplier_findings(declared, actual)):
@@ -459,6 +493,7 @@ class CompletenessValidator:
                 "info",
             )
 
+        report.supplier_observed = frozenset(supplier_observed)
         self._reconcile_relationships(bom, expected, local_refs, supplied, report)
         for extra in supplied.values():
             if is_imported(extra):
@@ -721,7 +756,9 @@ class CompletenessValidator:
 
     @staticmethod
     def _compared_fields(supplied: AnyComponent, local: AnyComponent) -> set[str]:
-        fields = (local.model_fields_set | {"trust_tier", "assurance_level"}) - {
+        # Integrity verifies whatever hashes the record carries, so a digest only the
+        # supplier added would count as verified evidence the collector never recorded.
+        fields = (local.model_fields_set | {"trust_tier", "assurance_level", "hashes"}) - {
             "source_path",
             "risks",
             "claims",
@@ -1121,7 +1158,11 @@ def _observed_composition(component: AnyComponent) -> bool:
 
 
 def assurance_problems(
-    bom: AIBOM, minimum: str, *, imported_claims: frozenset[str] = frozenset()
+    bom: AIBOM,
+    minimum: str,
+    *,
+    imported_claims: frozenset[str] = frozenset(),
+    supplier_observed: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Apply ``validate.minimum_assurance_level`` to the inventory's components.
 
@@ -1131,6 +1172,8 @@ def assurance_problems(
     carries claim provenance. Components that rest only on a supplier's or discovery
     report's declaration, such as hosted model aliases, fail. Imported discovery claims
     that reconciliation bound to the local report are judged as imported claims.
+    Components in ``supplier_observed`` are judged as declared: reconciliation found
+    that only supplier additions, never the local collection, observed them.
     """
     if minimum == "declared":
         return []
@@ -1146,7 +1189,7 @@ def assurance_problems(
             c.properties.get("collection_mode") == IMPORTED_MODE and c.bom_ref in imported_claims
         )
     ]
-    declared = sum(not _observed_composition(c) for c in subjects)
+    declared = sum(c.bom_ref in supplier_observed or not _observed_composition(c) for c in subjects)
     if not bom.metadata.completeness or not subjects or declared:
         noun = "component" if declared == 1 else "components"
         return [f"minimum observed assurance not attained ({declared} declared {noun})"]

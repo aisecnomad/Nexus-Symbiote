@@ -136,6 +136,32 @@ def _drift_summary(report: LiveVerifyReport) -> None:
             echo_line("Drift in server ", result.server_ref, ": ", "; ".join(changes), err=True)
 
 
+# Names only. verify-live starts the launcher with a cleared environment, but the
+# parent still holds these, and --no-isolation or a containment failure is not a
+# sandbox. The source-binding key is not one of them: drift comparison needs it,
+# and it is not a cloud or registry credential.
+_HOST_CREDENTIAL_ENV = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AZURE_CLIENT_SECRET",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "NPM_TOKEN",
+    "NODE_AUTH_TOKEN",
+    "PYPI_TOKEN",
+    "DOCKER_PASSWORD",
+    "KUBECONFIG",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+)
+
+
+def _host_credential_names() -> list[str]:
+    return [name for name in _HOST_CREDENTIAL_ENV if os.environ.get(name)]
+
+
 def register_supply_chain_commands(main: click.Group) -> None:
     @main.command("verify-live")
     @click.argument("aibom_path", type=click.Path(exists=True, dir_okay=False))
@@ -238,7 +264,17 @@ def register_supply_chain_commands(main: click.Group) -> None:
             "where one can be created, which cleanup also kills; the server then fails "
             "with isolation-teardown-failed, unless the launcher runs as root or holds "
             "CAP_SYS_PTRACE or CAP_SYS_ADMIN, which can hide the escape. Never opt out as "
-            "root. Elsewhere cleanup is best effort. This is not a namespace or sandbox."
+            "root. Refused off Linux, where no launcher runs. This is not a namespace or "
+            "sandbox."
+        ),
+    )
+    @click.option(
+        "--allow-host-credentials",
+        is_flag=True,
+        help=(
+            "Run even when host credential environment variables are set. The launcher "
+            "is started with a cleared environment, but this process is not a sandbox: "
+            "--no-isolation and a containment failure leave those credentials on the host."
         ),
     )
     def verify_live(
@@ -256,6 +292,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
         max_evidence_age: int | None,
         require_full_url_binding: bool,
         no_isolation: bool,
+        allow_host_credentials: bool,
     ) -> None:
         """Live: observe independently pinned stdio launchers; optionally emit an unsigned candidate.
 
@@ -274,6 +311,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
         from nexus_symbiote.attestation import Purpose
         from nexus_symbiote.core.hashing import hash_bytes, open_regular_file, parse_json_strict
         from nexus_symbiote.core.models import MCPServerComponent
+        from nexus_symbiote.live import pinned_process
         from nexus_symbiote.live.pinned_process import isolation_off
         from nexus_symbiote.live.verify import record_candidate, verify_mcp_servers
         from nexus_symbiote.policy_export import verify_file_attestation
@@ -282,6 +320,14 @@ def register_supply_chain_commands(main: click.Group) -> None:
             raise click.UsageError("choose a candidate BOM or a JSON verification report")
         if accept_drift and not record:
             raise click.UsageError("--accept-drift applies only to --record")
+        present = _host_credential_names()
+        if present and not allow_host_credentials:
+            raise click.UsageError(
+                "verify-live refuses to run while host credential environment variables "
+                "are set (" + ", ".join(present) + "). Unset them, or pass "
+                "--allow-host-credentials. The launcher is started with a cleared "
+                "environment; this process is still not a sandbox."
+            )
         if (
             transport_evidence_attestations
             or trusted_keys
@@ -385,7 +431,14 @@ def register_supply_chain_commands(main: click.Group) -> None:
                     for server in evidence_bom.components
                     if isinstance(server, MCPServerComponent)
                 )
-        if no_isolation:
+        if no_isolation and not pinned_process.opt_out_supported():
+            # Each server is then refused as isolation-unavailable before it is executed.
+            click.echo(
+                "error: --no-isolation is refused off Linux: cleanup there could not reach "
+                "a process that leaves the launcher's process group, so no launcher runs.",
+                err=True,
+            )
+        elif no_isolation:
             click.echo(
                 "warning: --no-isolation: kernel PID containment is disabled. On Linux the "
                 "launcher runs in its own process group under a wrapper that stays its parent "
@@ -396,7 +449,8 @@ def register_supply_chain_commands(main: click.Group) -> None:
                 "one can be created, which cleanup also kills; the server then fails with "
                 "isolation-teardown-failed, unless the launcher runs as root or holds "
                 "CAP_SYS_PTRACE or CAP_SYS_ADMIN, which can hide the escape. Never opt out as "
-                "root. Elsewhere cleanup is best effort. This is not a namespace or sandbox.",
+                "root. Refused off Linux, where no launcher runs. This is not a namespace or "
+                "sandbox.",
                 err=True,
             )
             if _running_as_root():
@@ -712,7 +766,14 @@ def register_supply_chain_commands(main: click.Group) -> None:
         is_flag=True,
         help="Explicitly accept unsigned --trace-evidence without --trace-attestation.",
     )
+    @click.option("--deployment-id", help="Operator-selected deployment covered by VEX decisions.")
+    @click.option(
+        "--allow-partial-advisories",
+        is_flag=True,
+        help="Include an incomplete advisory report with its coverage and counters.",
+    )
     def vex(
+        allow_partial_advisories: bool,
         aibom_path: Path,
         output: Path | None,
         decisions_path: Path | None,
@@ -722,6 +783,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
         trace_attestation: Path | None,
         trusted_keys: tuple[Path, ...],
         allow_unsigned_trace_evidence: bool,
+        deployment_id: str | None,
     ) -> None:
         """Export schema-validated VEX findings with optional decisions, advisories, and trace evidence."""
         from nexus_symbiote.core.hashing import hash_bytes
@@ -777,14 +839,20 @@ def register_supply_chain_commands(main: click.Group) -> None:
                 else None
             )
             loaded_advisories = (
-                load_advisory_report(advisories_path, expected_inventory_sha256=inv_sha)[0]
+                load_advisory_report(
+                    advisories_path,
+                    expected_inventory_sha256=inv_sha,
+                    allow_partial=allow_partial_advisories,
+                )
                 if advisories_path is not None
                 else None
             )
             text = VEXGenerator(
                 decisions=loaded_decisions,
                 execution_evidence=loaded_trace,
-                advisories=loaded_advisories,
+                advisory_report=loaded_advisories,
+                inventory_sha256=inv_sha,
+                deployment_id=deployment_id,
             ).generate_json(bom)
         except (OSError, ValueError, RecursionError) as exc:
             raise click.ClickException(neutralize(exc)) from exc
