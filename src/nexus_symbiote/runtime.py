@@ -1484,7 +1484,17 @@ class StateStore:
         tenant: str | None = None,
         not_after: datetime | None = None,
         check_time: Callable[[], None] | None = None,
+        now: datetime | None = None,
     ) -> None:
+        # The presented expiry must not choose which rows are deleted. A caller of
+        # record() can name an expiry; the retention watermark is this clock, and an
+        # approval nonce may not claim an expiry further ahead than its lifetime.
+        clock = datetime.now(UTC) if now is None else now
+        if not_after is not None and not_after > clock + MAX_LIFETIMES["approval"]:
+            raise AuthorizationError(
+                "approval expiry is more than 5 minutes ahead",
+                reason="approval-lifetime-exceeds-policy",
+            )
         with self._transaction() as db:
             for scope, serial, value in heads:
                 if scope.startswith("trust:"):
@@ -1524,11 +1534,18 @@ class StateStore:
                         "approval nonce has already been used", reason="approval-replayed"
                     ) from exc
                 if expires is not None:
-                    # A nonce is needed only while its approval can still verify; the
-                    # retention margin also covers gateways whose clocks disagree.
+                    # Keep a used nonce until it is older than the retention window
+                    # measured from this clock, not from the expiry just presented.
+                    # A far-future expiry would otherwise delete another tenant's
+                    # nonce that is still inside the window. The row just inserted
+                    # always survives, so a stale expiry cannot be recorded twice.
+                    # Rows with no expiry stay: SQL does not treat NULL as less than
+                    # the cutoff.
+                    watermark = min(int(clock.timestamp()), expires)
+                    cutoff = watermark - int(NONCE_RETENTION.total_seconds())
                     db.execute(
                         "DELETE FROM tenant_nonces WHERE not_after < ?",
-                        (expires - int(NONCE_RETENTION.total_seconds()),),
+                        (cutoff,),
                     )
             if check_time is not None:
                 # The write lock may have taken longer than the remaining approval lifetime.
@@ -2036,6 +2053,7 @@ class ReferenceGateway(Generic[T]):
             tenant=context.tenant,
             not_after=None if consent is None else consent.not_after,
             check_time=check_time,
+            now=timestamp,
         )
         return call
 

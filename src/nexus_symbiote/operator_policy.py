@@ -116,9 +116,9 @@ def _verify_policy_attestation(
     max_age_days: int | None = 90,
 ) -> tuple[str, ...]:
     from datetime import timedelta
-    from typing import cast
 
     import click
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
     from nexus_symbiote.attestation import AttestationError, parse_envelope, verify_attestation
     from nexus_symbiote.attestation_cli import _load_trusted_public
@@ -145,7 +145,9 @@ def _verify_policy_attestation(
         )
         ring: dict[str, Ed25519PublicKey] = {}
         for key_path in trusted_keys:
-            pub = cast("Ed25519PublicKey", _load_trusted_public(key_path))
+            pub = _load_trusted_public(key_path)
+            if not isinstance(pub, Ed25519PublicKey):
+                raise _KeyFileError("only Ed25519 public keys are supported")
             ring[key_id(pub)] = pub
         parsed_env = parse_envelope(raw_envelope)
     except AttestationError as exc:
