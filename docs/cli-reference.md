@@ -365,6 +365,8 @@ no exact identity or more than 500 packages would be sent. A report keeps at mos
 10,000 advisories per package and 20,000 in total; beyond that, lookups end with an
 error and `coverage` is `partial`.
 
+An offline advisory directory can hold up to 10,000 entries. Every entry counts toward the limit, including files without a `.json` extension.
+
 With `--offline-db`, the answer is only as recent as the files you supply, so the
 command reads the date each feed states about itself and records it under
 `provenance`: `db_newest_record` is the newest `modified` (or, for a record without
