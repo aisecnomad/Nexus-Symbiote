@@ -2050,7 +2050,7 @@ class ReferenceGateway(Generic[T]):
             tenant=context.tenant,
             not_after=None if consent is None else consent.not_after,
             check_time=check_time,
-            now=self.clock(),
+            now=timestamp,
         )
         return call
 
