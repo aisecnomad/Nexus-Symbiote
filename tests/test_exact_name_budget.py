@@ -21,6 +21,12 @@ def _tree(root, count=20):
         (root / f"filler-{index}").touch()
 
 
+def _variant_tree(root, count=20):
+    _tree(root, count)
+    if (root / "CLAUDE.md").read_text() != "instructions":
+        pytest.skip("needs a case-sensitive file system to hold both spellings")
+
+
 @pytest.mark.parametrize("operation", ["read", "metadata", "directory"])
 def test_exact_spelling_fails_closed_before_caching_an_oversized_directory(tmp_path, operation):
     _tree(tmp_path)
@@ -40,7 +46,7 @@ def test_exact_spelling_fails_closed_before_caching_an_oversized_directory(tmp_p
 
 
 def test_cached_exact_names_are_not_charged_again(tmp_path):
-    _tree(tmp_path, count=1)
+    _variant_tree(tmp_path, count=1)
     failures = []
     with ConfinedCollection(tmp_path, failures, max_entries=3) as files:
         assert files.read_text("CLAUDE.md") == "instructions"
@@ -51,7 +57,7 @@ def test_cached_exact_names_are_not_charged_again(tmp_path):
 
 
 def test_exact_name_listing_and_walk_spend_the_same_budget(tmp_path):
-    _tree(tmp_path, count=1)
+    _variant_tree(tmp_path, count=1)
     failures = []
     with ConfinedCollection(tmp_path, failures, max_entries=5) as files:
         assert files.read_text("CLAUDE.md") == "instructions"
@@ -60,7 +66,7 @@ def test_exact_name_listing_and_walk_spend_the_same_budget(tmp_path):
 
 
 def test_changed_directory_cannot_reuse_or_replace_its_bounded_cache(tmp_path):
-    _tree(tmp_path, count=1)
+    _variant_tree(tmp_path, count=1)
     failures = []
     with ConfinedCollection(tmp_path, failures, max_entries=5) as files:
         assert files.read_text("CLAUDE.md") == "instructions"
@@ -76,7 +82,7 @@ def test_changed_directory_cannot_reuse_or_replace_its_bounded_cache(tmp_path):
 def test_same_tick_size_or_nlink_change_invalidates_exact_name_cache(
     tmp_path, monkeypatch, changed_field
 ):
-    _tree(tmp_path, count=1)
+    _variant_tree(tmp_path, count=1)
     failures = []
     real_fstat = os.fstat
     root_identity = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
@@ -151,7 +157,11 @@ def _listed_variant_tree(root: Path) -> None:
     # "1" has no other case, so opening it lists the directory that holds it.
     (root / composed / "1").mkdir(parents=True)
     (root / composed / "1" / "present.json").write_text("{}")
-    (root / decomposed / "1").mkdir(parents=True)
+    try:
+        (root / decomposed / "1").mkdir(parents=True)
+    except FileExistsError:
+        # The file system folds Unicode normalization, as APFS does.
+        pytest.skip("file system rejects the name")
     (root / "bulk").mkdir()
     for index in range(30):
         (root / "bulk" / f"f{index}").write_text("x")
@@ -180,6 +190,7 @@ def test_scan_keeps_what_collectors_found_once_the_entry_budget_is_spent(tmp_pat
         json.dumps({"mcpServers": {"server": {"command": "node", "args": ["x.js"]}}})
     )
     _spent_tree(project)
+    sensitive = not (project / ".MCP.JSON").exists()
     output = tmp_path / "inventory.json"
     result = CliRunner().invoke(
         main,
@@ -189,5 +200,14 @@ def test_scan_keeps_what_collectors_found_once_the_entry_budget_is_spent(tmp_pat
     assert "scanner-input-error" not in result.output
     inventory = json.loads(output.read_text())
     failures = inventory["metadata"]["completeness"]["scan_failures"]
-    assert failures and set(failures) == {f"0bulk: {_SPENT}; raise it with --limit entries=N"}
-    assert "server" in {component["name"] for component in inventory["components"]}
+    spent = {f"0bulk: {_SPENT}; raise it with --limit entries=N"}
+    if sensitive:
+        assert failures and set(failures) == spent
+        assert "server" in {component["name"] for component in inventory["components"]}
+    else:
+        # A case-insensitive file system confirms the exact spelling only by listing the
+        # directory, which the spent budget refuses, so the file is a named failure.
+        assert failures and set(failures) == {
+            *spent,
+            f".mcp.json: {_SPENT}; raise it with --limit entries=N",
+        }

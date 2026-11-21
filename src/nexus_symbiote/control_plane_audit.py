@@ -115,11 +115,11 @@ def _clean(val: Any) -> str:
 
 def _parse_yaml(text: str) -> dict[str, Any]:
     try:
-        for index, _token in enumerate(yaml.scan(text)):
+        for index, _token in enumerate(yaml.scan(text, Loader=yaml.SafeLoader)):
             if index >= 20_000:
                 raise ValueError("YAML exceeds 20,000 tokens")
-    except yaml.YAMLError as exc:
-        raise ValueError(str(exc)) from exc
+    except yaml.YAMLError:
+        raise ValueError("invalid YAML") from None
     return parse_yaml_mapping(text)
 
 
@@ -142,8 +142,8 @@ def _read_confined_bytes(files: ConfinedCollection, rel_path: str, gaps: list[st
         named = rel_path.startswith(INSTALLED_BIN_DIRS)
         raw = files.read_named(rel_path) if named else files.read_bytes(rel_path, missing_ok=True)
         gap = credential_gap(rel_path, files.link_target(rel_path))
-    except (OSError, ValueError) as exc:
-        gaps.append(f"{rel_path}: {neutralize(str(exc))}")
+    except (OSError, ValueError):
+        gaps.append(f"{rel_path}: read refused")
         return None
     if gap is not None:
         gaps.append(f"{rel_path}: {gap}")
@@ -169,8 +169,8 @@ def _load_json_docs(
             continue
         try:
             parsed = parse_json_strict(strip_jsonc(text) if rel_path in JSONC_FILES else text)
-        except (ValueError, RecursionError) as exc:
-            gaps.append(f"{rel_path}: invalid JSON ({neutralize(str(exc))})")
+        except (ValueError, RecursionError):
+            gaps.append(f"{rel_path}: invalid JSON")
             continue
         if isinstance(parsed, dict):
             docs.append((rel_path, parsed))
@@ -592,8 +592,8 @@ def _inspect_mcp_launchers_and_bridges(
                     if cfg_body is not None and norm_cfg is not None:
                         try:
                             sub_doc = parse_json_strict(cfg_body)
-                        except (ValueError, RecursionError) as exc:
-                            summary.gaps.append(f"{norm_cfg}: invalid JSON ({exc})")
+                        except (ValueError, RecursionError):
+                            summary.gaps.append(f"{norm_cfg}: invalid JSON")
                             sub_doc = None
                         if isinstance(sub_doc, dict):
                             for sub_name, _sub_cfg in _extract_mcp_servers(sub_doc):
@@ -883,8 +883,8 @@ def _record_ci_agent(
     if isinstance(mcp_config_raw, str) and mcp_config_raw.strip():
         try:
             mcp_doc = parse_json_strict(mcp_config_raw)
-        except (ValueError, RecursionError) as exc:
-            summary.gaps.append(f"{source_file}: invalid inline mcp_config ({exc})")
+        except (ValueError, RecursionError):
+            summary.gaps.append(f"{source_file}: invalid inline mcp_config")
             mcp_doc = None
         if isinstance(mcp_doc, dict):
             for s_name, s_cfg in _extract_mcp_servers(mcp_doc):
@@ -967,8 +967,8 @@ def _inspect_workflows_and_claims(
             continue
         try:
             doc = _parse_yaml(_ON_KEY_RE.sub(r'\1"on"\2', text))
-        except (PolicyError, ValueError, RecursionError) as exc:
-            summary.gaps.append(f"{wf_path}: {neutralize(str(exc))}")
+        except (PolicyError, ValueError, RecursionError):
+            summary.gaps.append(f"{wf_path}: invalid YAML")
             continue
         on_block = doc.get("on")
         if isinstance(on_block, str):
@@ -1300,8 +1300,8 @@ def audit_project_control_plane(
             parsed = parse_json_strict(raw_claims)
             if isinstance(parsed, dict):
                 decl_sources.append(("shadowscan:claims", parsed, AssuranceLevel.DECLARED))
-        except (OSError, ValueError, RecursionError) as exc:
-            summary.gaps.append(f"{claims_path.name}: {neutralize(str(exc))}")
+        except (OSError, ValueError, RecursionError):
+            summary.gaps.append(f"{claims_path.name}: invalid JSON")
 
     with ConfinedCollection(project_root, summary.gaps) as files:
         all_paths = sorted(p.as_posix() for p in files.iter_files())
@@ -1311,8 +1311,8 @@ def audit_project_control_plane(
                 if text is not None:
                     try:
                         decl_sources.append((decl_path, _parse_yaml(text), AssuranceLevel.DECLARED))
-                    except (PolicyError, ValueError, RecursionError) as exc:
-                        summary.gaps.append(f"{decl_path}: {neutralize(str(exc))}")
+                    except (PolicyError, ValueError, RecursionError):
+                        summary.gaps.append(f"{decl_path}: invalid YAML")
         _inspect_hooks_and_preambles(files, all_paths, summary)
         _inspect_mcp_launchers_and_bridges(files, all_paths, summary, live_versions or {})
         _inspect_steering_surfaces(files, all_paths, summary)

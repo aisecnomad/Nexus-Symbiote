@@ -142,6 +142,23 @@ def _lzma_alone(dictionary: int, header: dict[int, bytes] | None = None) -> byte
     return bytes(data)
 
 
+def _lzma_payload(payload: bytes) -> bytes:
+    """What an LZMA-alone stream decodes to, whichever liblzma this Python links.
+
+    The encoder ends every stream with an end marker. A liblzma before 5.4, such as the
+    one in python.org's macOS build, refuses that marker after a known size, which later
+    releases, and the loaders that link them, accept; the same stream with the size
+    unknown then shows what they read.
+    """
+    try:
+        return lzma.decompress(payload, format=lzma.FORMAT_ALONE)
+    except lzma.LZMAError:
+        if payload[5:13] == b"\xff" * 8:
+            raise
+        unknown_size = payload[:5] + b"\xff" * 8 + payload[13:]
+        return lzma.decompress(unknown_size, format=lzma.FORMAT_ALONE)
+
+
 def _oversized_directory_zip() -> bytes:
     """A torch-style archive whose pickle member sits behind a directory past the bound."""
     buffer = io.BytesIO()
@@ -410,8 +427,7 @@ def test_an_lzma_alone_or_tar_stream_without_its_usual_magic_is_critical(
     # joblib opens any LZMA-alone stream that starts 5d 00, whatever its dictionary, and
     # torch.load's legacy path opens any tar archive tarfile reads, ustar or V7.
     if payload.startswith(b"\x5d\x00"):
-        with lzma.LZMAFile(io.BytesIO(payload)) as stream:
-            assert stream.read() == EVAL_PICKLE
+        assert _lzma_payload(payload) == EVAL_PICKLE
     else:
         with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
             assert {"storages", "pickle"} & set(archive.getnames())
