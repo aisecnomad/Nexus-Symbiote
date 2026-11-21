@@ -150,6 +150,32 @@ def _drift_summary(report: LiveVerifyReport) -> None:
             echo_line("Drift in server ", result.server_ref, ": ", "; ".join(changes), err=True)
 
 
+# Names only. verify-live starts the launcher with a cleared environment, but the
+# parent still holds these, and --no-isolation or a containment failure is not a
+# sandbox. The source-binding key is not one of them: drift comparison needs it,
+# and it is not a cloud or registry credential.
+_HOST_CREDENTIAL_ENV = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AZURE_CLIENT_SECRET",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "NPM_TOKEN",
+    "NODE_AUTH_TOKEN",
+    "PYPI_TOKEN",
+    "DOCKER_PASSWORD",
+    "KUBECONFIG",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+)
+
+
+def _host_credential_names() -> list[str]:
+    return [name for name in _HOST_CREDENTIAL_ENV if os.environ.get(name)]
+
+
 def register_supply_chain_commands(main: click.Group) -> None:
     @main.command("verify-live")
     @click.argument("aibom_path", type=click.Path(exists=True, dir_okay=False))
@@ -202,6 +228,15 @@ def register_supply_chain_commands(main: click.Group) -> None:
             "root. Elsewhere cleanup is best effort. This is not a namespace or sandbox."
         ),
     )
+    @click.option(
+        "--allow-host-credentials",
+        is_flag=True,
+        help=(
+            "Run even when host credential environment variables are set. The launcher "
+            "is started with a cleared environment, but this process is not a sandbox: "
+            "--no-isolation and a containment failure leave those credentials on the host."
+        ),
+    )
     def verify_live(
         aibom_path: str,
         project: str,
@@ -210,6 +245,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
         record: bool,
         accept_drift: bool,
         no_isolation: bool,
+        allow_host_credentials: bool,
     ) -> None:
         """Live: observe independently pinned stdio launchers; optionally emit an unsigned candidate.
 
@@ -229,6 +265,14 @@ def register_supply_chain_commands(main: click.Group) -> None:
             raise click.UsageError("choose a candidate BOM or a JSON verification report")
         if accept_drift and not record:
             raise click.UsageError("--accept-drift applies only to --record")
+        present = _host_credential_names()
+        if present and not allow_host_credentials:
+            raise click.UsageError(
+                "verify-live refuses to run while host credential environment variables "
+                "are set (" + ", ".join(present) + "). Unset them, or pass "
+                "--allow-host-credentials. The launcher is started with a cleared "
+                "environment; this process is still not a sandbox."
+            )
         expected_info = _check_launch_policy(launch_policy, Path(project), Path(aibom_path))
         try:
             with open_regular_file(launch_policy) as stream:
