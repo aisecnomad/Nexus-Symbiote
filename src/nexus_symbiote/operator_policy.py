@@ -274,12 +274,26 @@ def append_step_summary(path: Path, rendered: str) -> None:
         raise output_failure(exc) from exc
 
 
-def narrow_policy(operator: Policy, project: Policy | None) -> tuple[Policy, list[str]]:
+def narrow_policy(
+    operator: Policy, project: Policy | None, *, inherit_unspecified: bool = False
+) -> tuple[Policy, list[str]]:
     """Combine operator and project policies so the project policy can only tighten gates."""
     if project is None:
         return operator, []
 
     clamped: list[str] = []
+    if inherit_unspecified:
+        # A checkout that sets one threshold has made no request about the other
+        # gates. Compare only its explicit settings with the operator's baseline.
+        overrides = {}
+        for name in ("scan", "risk", "validation", "output"):
+            section = getattr(project, name)
+            inherited = getattr(operator, name)
+            updates = {key: getattr(section, key) for key in section.model_fields_set}
+            overrides[name] = inherited.model_copy(update=updates)
+        project = operator.model_copy(update=overrides)
+        if project.output != operator.output:
+            clamped.append("output.default_format (kept operator format)")
 
     # 1. Scan section: project cannot drop operator-required scanners, add exclusions,
     # or relax error mode to report-only.
@@ -294,9 +308,10 @@ def narrow_policy(operator: Policy, project: Policy | None) -> tuple[Policy, lis
     extra_excludes = [p for p in project.scan.exclude_paths if p not in op_excludes]
     if extra_excludes:
         clamped.append("scan.exclude_paths (refused extra project exclusions)")
-    effective_excludes = [
-        p for p in operator.scan.exclude_paths if p in set(project.scan.exclude_paths)
-    ] or list(operator.scan.exclude_paths)
+    project_excludes = set(project.scan.exclude_paths)
+    effective_excludes = [p for p in operator.scan.exclude_paths if p in project_excludes]
+    if not effective_excludes and not inherit_unspecified:
+        effective_excludes = list(operator.scan.exclude_paths)
 
     if operator.scan.failure_mode == "error" and project.scan.failure_mode == "report-only":
         clamped.append("scan.failure_mode=error (clamped project report-only)")
@@ -368,7 +383,11 @@ def narrow_policy(operator: Policy, project: Policy | None) -> tuple[Policy, lis
     unapproved_supps = proj_supp_keys - set(op_supp_keys)
     if unapproved_supps:
         clamped.append(f"risk.suppressions (refused {len(unapproved_supps)} checkout suppressions)")
-    effective_suppressions = list(operator.risk.suppressions)
+    effective_suppressions = [
+        decision
+        for key, decision in op_supp_keys.items()
+        if not inherit_unspecified or key in proj_supp_keys
+    ]
 
     narrowed = Policy(
         version="1.0",

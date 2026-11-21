@@ -339,9 +339,8 @@ def register_supply_chain_commands(main: click.Group) -> None:
         "--accept-project-policy",
         is_flag=True,
         help=(
-            "Apply the checkout's project policy for collection, as scan does. Without this "
-            "flag the built-in policy is used. The staged inventory is still re-gated by "
-            "the built-in policy."
+            "Accept a checkout policy that relaxes collection gates. Tightening-only policies "
+            "apply automatically. The built-in gates still check the staged inventory."
         ),
     )
     @click.option(

@@ -186,35 +186,22 @@ _LAST_CLAMPED_SETTINGS: contextvars.ContextVar[tuple[str, ...]] = contextvars.Co
 )
 
 
-def _warn_unapplied_project_policy(root: Path) -> dict[str, str] | None:
-    """Say that a checkout policy exists and was left unused.
-
-    Applying it is opt-in. A file that is not a safe regular policy is named only as
-    invalid: its error text can quote the checkout.
-    """
-    from nexus_symbiote.policy import PolicyError, PolicyListingError, find_policy_path
-
-    try:
-        path = find_policy_path(root)
-    except PolicyListingError as exc:
-        raise _failure(exc) from exc
-    except PolicyError:
+def _warn_unapplied_project_policy(root: Path, path: Path | None) -> dict[str, str]:
+    """Report a withheld policy without echoing untrusted contents."""
+    if path is None:
         echo_line(
             "WARNING: a project policy file in ",
             root,
-            " was not applied because it is invalid or unsafe to read. Pass "
-            "--accept-project-policy to apply a project policy, or --no-project-policy "
-            "to keep the built-in policy without this warning.",
+            " was not applied because it is invalid or unsafe to read. "
+            "Use --no-project-policy to ignore it explicitly.",
             err=True,
         )
         return {"reason": "invalid-or-ambiguous"}
-    if path is None:
-        return None
     echo_line(
         "WARNING: project policy ",
         path,
         " was not applied. Pass --accept-project-policy to apply it, or "
-        "--no-project-policy to keep the built-in policy without this warning.",
+        "--no-project-policy to ignore it explicitly.",
         err=True,
     )
     return {"file": path.name, "reason": "not-accepted"}
@@ -232,63 +219,63 @@ def _policy_with_source(
 ) -> tuple[Policy, str, list[str], dict[str, str] | None]:
     """Load the governing policy and say where it came from and what it relaxes.
 
-    A project policy is applied only with ``allow_weakening`` (``--accept-project-policy``).
-    Otherwise the built-in policy, or the operator policy alone, is used. CI is not
-    treated as a trust signal.
+    Tightening settings apply automatically. A mixed or relaxing checkout is withheld
+    as a unit unless accepted, and the operator's floor always bounds the result.
     """
     from nexus_symbiote.operator_policy import narrow_policy
     from nexus_symbiote.policy import (
         PolicyError,
+        PolicyListingError,
         default_policy,
         load_policy_file,
         weakened_settings,
     )
 
     _LAST_CLAMPED_SETTINGS.set(())
-    apply_project = allow_weakening and not ignore_project
-    unapplied = (
-        _warn_unapplied_project_policy(root) if not (apply_project or ignore_project) else None
-    )
     if operator is not None and operator_digest is not None:
-        op_label = _format_operator_source(operator_digest, operator_signers)
-        if not apply_project:
-            return operator, op_label, weakened_settings(operator), unapplied
-        try:
-            loaded_proj = load_policy_file(root)
-        except PolicyError as exc:
+        baseline = operator
+        source = _format_operator_source(operator_digest, operator_signers)
+    else:
+        baseline = default_policy()
+        source = "built-in"
+
+    baseline_weaker = weakened_settings(baseline)
+    if ignore_project:
+        return baseline, source, baseline_weaker, None
+    try:
+        loaded = load_policy_file(root)
+    except PolicyListingError as exc:
+        raise _failure(exc) from exc
+    except PolicyError as exc:
+        if allow_weakening:
             raise _failure(exc) from exc
-        if loaded_proj is None:
-            return operator, op_label, weakened_settings(operator), None
-        proj_policy, proj_path, _ = loaded_proj
-        narrowed, clamped = narrow_policy(operator, proj_policy)
+        return baseline, source, baseline_weaker, _warn_unapplied_project_policy(root, None)
+    if loaded is None:
+        return baseline, source, baseline_weaker, None
+    project, path, _ = loaded
+    if operator is not None and operator_digest is not None:
+        narrowed, clamped = narrow_policy(baseline, project, inherit_unspecified=True)
+        if not allow_weakening and clamped:
+            return baseline, source, baseline_weaker, _warn_unapplied_project_policy(root, path)
         _LAST_CLAMPED_SETTINGS.set(tuple(clamped))
         if clamped and warn:
             echo_line(
                 "WARNING: project policy ",
-                proj_path,
+                path,
                 " attempted to relax operator policy; clamped: ",
                 "; ".join(clamped),
                 err=True,
             )
-        return narrowed, op_label, weakened_settings(narrowed), None
+        return narrowed, source, weakened_settings(narrowed), None
 
-    if not apply_project:
-        return default_policy(), "built-in", [], unapplied
-    try:
-        loaded = load_policy_file(root)
-    except PolicyError as exc:
-        raise _failure(exc) from exc
-    if loaded is None:
-        return default_policy(), "built-in", [], None
-    policy, path, _ = loaded
-    weaker = weakened_settings(policy)
+    weaker = weakened_settings(project)
+    if weaker and not allow_weakening:
+        return baseline, source, baseline_weaker, _warn_unapplied_project_policy(root, path)
     if weaker and warn:
-        # The path and the relaxed values come from the checkout, so neither may move
-        # the cursor or start a new line that hides this warning or forges a CI command.
         echo_line(
             "WARNING: policy ", path, " weakens the built-in gates: ", "; ".join(weaker), err=True
         )
-    return policy, f"project:{path}", weaker, None
+    return project, f"project:{path}", weaker, None
 
 
 def _inventory_policy(
@@ -330,7 +317,7 @@ def _inventory_policy(
                 "Note: ",
                 unapplied,
                 " was not applied. Without --project the built-in policy is used; "
-                "use --project and --accept-project-policy to apply a trusted project's policy.",
+                "use --project to evaluate its policy and --accept-project-policy to accept relaxations.",
                 err=True,
             )
             return (
@@ -1020,9 +1007,9 @@ def _render_aibom(
     "--accept-project-policy",
     is_flag=True,
     help=(
-        "Apply the checkout's project policy. Without this flag the built-in policy is "
-        "used and a policy file in the checkout is not applied. --no-project-policy "
-        "selects the built-in policy and suppresses that warning."
+        "Accept a checkout policy that relaxes a gate. Tightening-only policies apply "
+        "automatically. A policy that includes a relaxation is withheld as a unit "
+        "unless accepted. Operator policy always sets the minimum."
     ),
 )
 @click.option(
@@ -1790,9 +1777,9 @@ def verify_discovery(
     "--accept-project-policy",
     is_flag=True,
     help=(
-        "Apply the checkout's project policy. Without this flag the built-in policy is "
-        "used and a policy file in the checkout is not applied. --no-project-policy "
-        "selects the built-in policy and suppresses that warning."
+        "Accept a checkout policy that relaxes a gate. Tightening-only policies apply "
+        "automatically. A policy that includes a relaxation is withheld as a unit "
+        "unless accepted. Operator policy always sets the minimum."
     ),
 )
 @click.option(
@@ -2033,9 +2020,9 @@ def validate(
     "--accept-project-policy",
     is_flag=True,
     help=(
-        "Apply the checkout's project policy. Without this flag the built-in policy is "
-        "used and a policy file in the checkout is not applied. --no-project-policy "
-        "selects the built-in policy and suppresses that warning."
+        "Accept a checkout policy that relaxes a gate. Tightening-only policies apply "
+        "automatically. A policy that includes a relaxation is withheld as a unit "
+        "unless accepted. Operator policy always sets the minimum."
     ),
 )
 @click.option(
@@ -2428,7 +2415,9 @@ def init(force: bool, path: str) -> None:
 
     write_cli_output(target, DEFAULT_POLICY_YAML, overwrite=force)
     echo_line("Created ", target)
-    click.echo("  Apply this file in a trusted checkout with --accept-project-policy.")
+    click.echo(
+        "  Tightening settings apply automatically. Use --accept-project-policy for a reviewed relaxation."
+    )
 
 
 register_runtime_commands(main)

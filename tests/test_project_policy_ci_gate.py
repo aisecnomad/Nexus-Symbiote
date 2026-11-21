@@ -1,11 +1,4 @@
-"""A project policy is applied only when the operator asks for it.
-
-`scan`, `validate` and `risk` ignore `.nexus-symbiote.yaml` unless
-`--accept-project-policy` is passed. `--no-project-policy` selects the built-in
-policy and does not warn that a file was left unused. CI is not a reason to
-apply or refuse the file: an unattended run that forgets the flag keeps the
-built-in gates.
-"""
+"""Tightening checkout policies apply automatically. Relaxations require operator consent."""
 
 from __future__ import annotations
 
@@ -123,7 +116,7 @@ def test_validate_and_risk_ignore_a_project_policy_until_it_is_accepted(
     assert "fail_threshold" in accepted.output
 
 
-def test_a_stricter_project_policy_is_not_applied_without_the_flag(
+def test_a_stricter_project_policy_applies_without_the_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CI", "true")
@@ -131,9 +124,9 @@ def test_a_stricter_project_policy_is_not_applied_without_the_flag(
     output = tmp_path / "out.json"
     run = CliRunner().invoke(main, ["scan", str(project), "--report-only", "-o", str(output)])
     assert run.exit_code == 0, run.output
-    assert NOT_APPLIED in run.output
+    assert NOT_APPLIED not in run.output
     metadata = json.loads(output.read_text())["metadata"]
-    assert metadata.get("policy_source", "built-in") == "built-in"
+    assert metadata["policy_source"].startswith("project:")
     accepted = CliRunner().invoke(
         main,
         [
