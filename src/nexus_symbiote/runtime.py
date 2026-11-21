@@ -1030,6 +1030,38 @@ def _snapshot_scope(snapshot: ApprovedSnapshot) -> str:
     return "snapshot:" + digest([snapshot.tenant, snapshot.deployment_id, snapshot.agent_id])
 
 
+def _refuse_shared_directory(info: os.stat_result) -> None:
+    if info.st_mode & 0o002:
+        raise AuthorizationError(
+            "state database directory cannot be world-writable", reason="state-invalid"
+        )
+    # A member of a group that can write the directory could plant or swap a hot -journal
+    # or -wal that SQLite rolls into the store when it next opens it. In a sticky directory
+    # a planted file stays owned by its creator, which _refuse_planted_companions sees.
+    if info.st_mode & 0o020 and not info.st_mode & stat.S_ISVTX:
+        raise AuthorizationError(
+            "state database directory cannot be group-writable without the sticky bit",
+            reason="state-invalid",
+        )
+
+
+def _refuse_planted_companions(parent_fd: int, name: str, uid: int | None) -> None:
+    for suffix in ("-journal", "-wal", "-shm"):
+        try:
+            info = os.stat(name + suffix, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AuthorizationError(
+                "state database journal cannot be inspected", reason="state-invalid"
+            ) from exc
+        if not stat.S_ISREG(info.st_mode) or (uid is not None and info.st_uid != uid):
+            raise AuthorizationError(
+                "state database journal must be a regular file owned by the current user",
+                reason="state-invalid",
+            )
+
+
 def _secure_existing(path: Path) -> tuple[int, int]:
     from nexus_symbiote.core.hashing import open_directory_nofollow
 
@@ -1053,10 +1085,8 @@ def _secure_existing(path: Path) -> tuple[int, int]:
                 "state database directory must be owned by the current user",
                 reason="state-invalid",
             )
-        if parent_info.st_mode & 0o002:
-            raise AuthorizationError(
-                "state database directory cannot be world-writable", reason="state-invalid"
-            )
+        _refuse_shared_directory(parent_info)
+        _refuse_planted_companions(parent_fd, path.name, uid)
         try:
             info = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError as exc:
@@ -1223,11 +1253,8 @@ class StateStore:
                         "state database directory must be owned by the current user",
                         reason="state-invalid",
                     )
-                if parent_info.st_mode & 0o002:
-                    raise AuthorizationError(
-                        "state database directory cannot be world-writable",
-                        reason="state-invalid",
-                    )
+                _refuse_shared_directory(parent_info)
+                _refuse_planted_companions(parent_fd, path.name, uid)
                 os.close(os.open(path.name, flags, 0o600, dir_fd=parent_fd))
             finally:
                 os.close(parent_fd)
@@ -1290,11 +1317,8 @@ class StateStore:
                     "state database directory must be owned by the current user",
                     reason="state-invalid",
                 )
-            if parent_info.st_mode & 0o002:
-                raise AuthorizationError(
-                    "state database directory cannot be world-writable",
-                    reason="state-invalid",
-                )
+            _refuse_shared_directory(parent_info)
+            _refuse_planted_companions(parent_fd, self.path.name, uid)
             try:
                 info = os.stat(self.path.name, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError as exc:

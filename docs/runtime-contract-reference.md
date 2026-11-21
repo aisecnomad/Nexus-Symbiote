@@ -593,8 +593,12 @@ readiness probe.
 
 `StateStore.initialize(path)` creates a new store: the parent directory with mode
 0700 if it does not exist, and the file with mode 0600, refusing an existing file
-or a symbolic link. `StateStore(path)` opens an existing store. It refuses a
-missing file or a database without a store's tables (`state-missing`), a symbolic
+or a symbolic link. Creating, opening and using a store refuse a parent directory
+that other users can write (world-writable, or group-writable without the sticky
+bit) and a `-journal`, `-wal` or `-shm` file beside it that is a symbolic link, not
+a regular file, or owned by another user, since SQLite would roll a planted hot
+journal into the store (`state-invalid`). `StateStore(path)` opens an existing
+store. It refuses a missing file or a database without a store's tables (`state-missing`), a symbolic
 link or anything but a regular file (`state-invalid`), and a file that is not an
 SQLite database (`state-unavailable`), and it restricts a group- or
 world-accessible file to 0600. A store removed while a gateway runs makes every

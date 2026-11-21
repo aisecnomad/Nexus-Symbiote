@@ -182,7 +182,7 @@ triggers other than `push`, `pull_request`, `workflow_dispatch`, `schedule` and
 `branch_protection_rule` (so `pull_request_target` and `workflow_run` cannot appear),
 missing or writable top-level permissions, jobs without `timeout-minutes`, and
 checkouts that persist credentials, and it checks a file in `.github/workflows` as a
-workflow whatever its name. In `ci.yml` and `release.yml` it rejects `continue-on-error`
+workflow whatever its name. In `ci.yml`, `release.yml` and `codeql.yml` it rejects `continue-on-error`
 on a job, and on a step unless a later step that runs reads that step's outcome (naming
 it in the later step's name does not count), and
 requires each verification job, `Verified CI` and the release attestation check among

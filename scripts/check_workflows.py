@@ -43,7 +43,8 @@ JOB_WRITE_SCOPES: dict[str, dict[str, frozenset[str]]] = {
     },
     "scorecard.yml": {"analysis": frozenset({"security-events", "id-token"})},
 }
-GATING = frozenset({"ci.yml", "release.yml"})
+# codeql.yml holds the analysis code scanning compares on every pull request.
+GATING = frozenset({"ci.yml", "release.yml", "codeql.yml"})
 PIN = re.compile(r"[^@\s]+@[0-9a-f]{40}")
 USES_LINE = re.compile(r"^\s*(?:-\s+)?uses:\s*['\"]?([^\s'\"#]+)['\"]?(?:\s+#\s*(\S+))?")
 VERSION = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
@@ -150,6 +151,13 @@ REQUIRED_COMMANDS: dict[str, dict[str, tuple[str, ...]]] = {
         ),
         "compatibility": ("scripts/check_installed_wheel.py",),
         "verify": ("gh attestation verify",),
+    },
+    "codeql.yml": {
+        "analyze": (
+            "github/codeql-action/init@",
+            "github/codeql-action/analyze@",
+            "scripts/check_codeql_sarif.py",
+        ),
     },
 }
 # A gate job or step runs by default, with success() or with always(). Besides those, the
@@ -1340,10 +1348,12 @@ def _gate_issues(
                         "$GITHUB_PATH ahead of its gates"
                     )
     pinned = REVIEWED_GATE_STEPS.get(path.name, {}).get(name, {})
-    for step in _steps(job):
-        for command, (script, env) in pinned.items():
-            run = step.get("run")
-            if command in str(run) and (run != script or step.get("env") != env):
+    for command, (script, env) in pinned.items():
+        running = [step for step in _steps(job) if command in str(step.get("run"))]
+        if not running:
+            errors.append(f"{path}: {name} no longer runs {command} in its reviewed step")
+        for step in running:
+            if step.get("run") != script or step.get("env") != env:
                 errors.append(f"{path}: {name} runs {command} other than in its reviewed step")
     languages = CODEQL_LANGUAGES.get(path.name, {}).get(name, frozenset())
     if languages:

@@ -110,7 +110,10 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.lock
-          python -m pip install --no-build-isolation --upgrade --upgrade-strategy eager -e '.[all]'
+          # Only the checkout is built from source: a newly floated release that ships no
+          # wheel fails the job instead of running its build code on the runner.
+          python -m pip install --only-binary=:all: --no-build-isolation \
+            --upgrade --upgrade-strategy eager -e '.[all]'
           python -m pip check
           python -m pip freeze --all | tee "$RESOLVED"
       # Tests marked locked_only compare what the hash-locked set resolves or generates

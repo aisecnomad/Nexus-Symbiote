@@ -162,3 +162,62 @@ def test_older_or_forked_heads_are_refused_without_the_write_lock(tmp_path):
                 assert time.monotonic() - started < 5
         finally:
             holder.execute("ROLLBACK")
+
+
+@pytest.mark.parametrize(("mode", "refused"), [(0o770, True), (0o1770, False), (0o750, False)])
+def test_a_directory_other_group_members_can_write_is_refused(tmp_path, mode, refused):
+    # A group member could plant a hot -journal that SQLite rolls into the store.
+    path = tmp_path / "shared" / "state.sqlite"
+    StateStore.initialize(path)
+    path.parent.chmod(mode)
+    try:
+        if not refused:
+            StateStore(path)
+            StateStore.initialize(path.with_name("other.sqlite"))
+            return
+        with pytest.raises(AuthorizationError, match="group-writable") as opening:
+            StateStore(path)
+        with pytest.raises(AuthorizationError, match="group-writable") as creating:
+            StateStore.initialize(path.with_name("other.sqlite"))
+        assert opening.value.reason == creating.value.reason == "state-invalid"
+        assert not path.with_name("other.sqlite").exists()
+    finally:
+        path.parent.chmod(0o700)
+
+
+def foreign_journal(monkeypatch):
+    real = os.stat
+
+    def stat_as_another_user(name, *args, **kwargs):
+        info = real(name, *args, **kwargs)
+        if str(name).endswith("-journal"):
+            fields = list(info[:10])
+            fields[4] = info.st_uid + 1
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(os, "stat", stat_as_another_user)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "foreign"])
+def test_a_planted_journal_beside_the_store_is_refused(tmp_path, monkeypatch, kind):
+    path = tmp_path / "state.sqlite"
+    store = StateStore.initialize(path)
+    journal = tmp_path / "state.sqlite-journal"
+    if kind == "symlink":
+        journal.symlink_to(tmp_path / "elsewhere")
+    else:
+        journal.write_bytes(b"")
+        foreign_journal(monkeypatch)
+    for attempt in (
+        lambda: StateStore(path),
+        lambda: store.record((), "planted-journal-00", tenant="acme", not_after=NOW),
+    ):
+        with pytest.raises(AuthorizationError, match="journal") as refused:
+            attempt()
+        assert refused.value.reason == "state-invalid"
+    journal.unlink()
+    (tmp_path / "fresh.sqlite-journal").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(AuthorizationError, match="journal"):
+        StateStore.initialize(tmp_path / "fresh.sqlite")
+    assert not (tmp_path / "fresh.sqlite").exists()
