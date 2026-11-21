@@ -69,6 +69,7 @@ from nexus_symbiote.scanners.mcp_credentials import (
     NAMED_CLASS,
     SHAPE_CLASS,
     Hit,
+    WrappedKeySearchLimitError,
     assignment_hits,
     credential_name,
     endpoint_hits,
@@ -1108,6 +1109,26 @@ def _scheme_assignment_name(name: str) -> bool:
     )
 
 
+def _following_option(word: str) -> bool:
+    """An option after a bare scheme can also be a dash-prefixed, padded token."""
+    flag, equals, argument = word.partition("=")
+    if not flag.startswith("--") or _CLI_FLAG.fullmatch(flag) is None:
+        return False
+    if equals and argument not in {"", "="}:
+        return True
+    body = flag[2:]
+    # Padding or mixed case and digits distinguish an opaque value from CLI
+    # labels such as --enable-automatic-updates= and common short switches.
+    has_digit = any(c.isdigit() for c in body)
+    opaque = len(body) >= 16 and (
+        argument == "="
+        or (equals and "-" not in body)
+        or (has_digit and not body.islower() and not body.isupper())
+        or (has_digit and re.fullmatch("[a-fA-F0-9]+", body) is not None)
+    )
+    return not opaque
+
+
 def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     """The hits of a ``NAME=value`` word, ``--name=value`` and ``--env=NAME=value`` included.
 
@@ -1130,7 +1151,7 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
         following is not None
         and value.lower() in _ASSIGNMENT_SCHEMES
         and _scheme_assignment_name(name)
-        and not (following.startswith("--") and _CLI_FLAG.fullmatch(following.partition("=")[0]))
+        and not _following_option(following)
         and literal_value(following)
     ):
         hits.extend(value_hits(name, f"{value} {following}"))
@@ -2827,24 +2848,37 @@ class MCPScanner(Scanner):
             values = self._file_secrets(
                 [*entries, *(("", config) for config in read.dropped)], dialect.shape, server_hits
             )
-            values.extend(dict.fromkeys(rewrapped_key_literals(data, values)))
-            # Before either refusal below: a file that is not collected still holds them.
+            # Retain values from refused files when withholding names declared in source.
             if known is not None:
                 known.add(values)
             if key_error is not None and entries:
                 result.scan_failures.append(f"{dialect.path}: {key_error}")
                 continue
-            # Prepared once per file and reused for every server and diagnostic.
-            file_secrets = SecretScrubber(values)
             configs = {id(config): config for config in [*(c for _, c in entries), *read.dropped]}
             for server, hits in server_hits.items():
                 literals.extend(_server_literals(configs[server], hits))
-            if len(file_secrets) > MAX_SECRETS_PER_FILE:
+            unique = set(filter(None, values))
+            if len(unique) <= MAX_SECRETS_PER_FILE:
+                try:
+                    for wrapped in rewrapped_key_literals(data, tuple(unique)):
+                        unique.add(wrapped)
+                        if len(unique) > MAX_SECRETS_PER_FILE:
+                            break
+                except WrappedKeySearchLimitError:
+                    if known is not None:
+                        known.refuse()
+                    result.scan_failures.append(
+                        f"{dialect.path}: wrapped credential comparison limit reached; not collected"
+                    )
+                    continue
+            if len(unique) > MAX_SECRETS_PER_FILE:
                 result.scan_failures.append(
                     f"{dialect.path}: more than {MAX_SECRETS_PER_FILE} credential values in one "
                     "file; not collected"
                 )
                 continue
+            # Wrapped copies contain whitespace and cannot be part of a source name.
+            file_secrets = SecretScrubber(unique)
             collected.append((dialect, data, read, file_secrets, server_hits))
         # A name may repeat a literal of any client file, so every file is read first.
         names = _Names(literals)

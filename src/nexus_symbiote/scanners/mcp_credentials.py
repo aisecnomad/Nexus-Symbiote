@@ -21,7 +21,6 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 from nexus_symbiote.utils.secrets import (
     MIN_SECRET_LENGTH,
     TOKEN_SHAPE,
-    SecretScrubber,
     authorization_header,
     credential_shaped,
     private_key_block,
@@ -306,7 +305,9 @@ _ASSIGNMENT = re.compile(
 _NETRC_WORDS = frozenset({"password", "passwd"})
 _BASE64 = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
 _ENCODED_LIMIT = 65536
-_ASCII_SPACE = re.compile(r"[ \t\n\r\f\v]+")
+_KEY_WRAP = re.compile(r"[\s\u200b]+")
+_KEY_PREFIX_LENGTH = 16
+_WRAP_COMPARISON_FACTOR = 64
 JSON_LIMIT = 65536
 JSON_DEPTH = 8
 
@@ -620,7 +621,7 @@ def _private_key(value: str) -> str | None:
     if _putty_key(value):
         return value.strip()
     # base64 and openssl wrap their output at 76 and 64 columns by default.
-    compact = _ASCII_SPACE.sub("", value.strip())
+    compact = _KEY_WRAP.sub("", value.strip())
     if len(compact) > _ENCODED_LIMIT or _BASE64.fullmatch(compact) is None:
         return None
     try:
@@ -637,17 +638,27 @@ def _putty_key(text: str) -> bool:
     return "PuTTY-User-Key-File-" in text and "Private-Lines:" in text
 
 
+class WrappedKeySearchLimitError(ValueError):
+    """A complete search for alternate wrapping would exceed the per-text work bound."""
+
+
 def rewrapped_key_literals(document: Any, values: Iterable[str]) -> Iterable[str]:
-    """Find copies of an identified encoded key with different line wrapping."""
-    keys = SecretScrubber(
+    """Find differently wrapped copies without comparing every key with every field."""
+    keys = {
         value
         for value in values
         if len(value) <= _ENCODED_LIMIT
         and _BASE64.fullmatch(value)
         and _private_key(value) == value
-    )
+    }
     if not keys:
         return
+    shortest = min(map(len, keys))
+    grouped: dict[str, set[int]] = {}
+    for key in keys:
+        grouped.setdefault(key[:_KEY_PREFIX_LENGTH], set()).add(len(key))
+    lengths = {prefix: sorted(sizes) for prefix, sizes in grouped.items()}
+
     pending = [document]
     while pending:
         node = pending.pop()
@@ -656,15 +667,33 @@ def rewrapped_key_literals(document: Any, values: Iterable[str]) -> Iterable[str
             pending.extend(node.values())
         elif isinstance(node, list):
             pending.extend(node)
-        elif isinstance(node, str) and _ASCII_SPACE.search(node):
-            compact = _ASCII_SPACE.sub("", node)
-            spans = keys.spans(compact)
-            if spans:
-                # Allocate offsets only when a known key actually matches. A compact
-                # offset maps to its original character even with CRLF or mixed widths.
-                offsets = array("I", (i for i, c in enumerate(node) if c not in " \t\n\r\f\v"))
-                for start, end in spans:
-                    yield node[offsets[start] : offsets[end - 1] + 1]
+        elif isinstance(node, str) and len(node) >= shortest and _KEY_WRAP.search(node):
+            compact = _KEY_WRAP.sub("", node)
+            budget = _WRAP_COMPARISON_FACTOR * len(node)
+            offsets = None
+            for start in range(len(compact) - shortest + 1):
+                for size in lengths.get(compact[start : start + _KEY_PREFIX_LENGTH], ()):
+                    end = start + size
+                    if end > len(compact):
+                        break
+                    # Account for slicing and hashing even if the prefix is shared by
+                    # many lengths. Never return a partial set as a complete search.
+                    budget -= size
+                    if budget < 0:
+                        raise WrappedKeySearchLimitError
+                    if compact[start:end] not in keys:
+                        continue
+                    if offsets is None:
+                        offsets = array(
+                            "I",
+                            (i for i, c in enumerate(node) if not (c.isspace() or c == "\u200b")),
+                        )
+                    first, last = offsets[start], offsets[end - 1] + 1
+                    if last - first > size:
+                        budget -= last - first
+                        if budget < 0:
+                            raise WrappedKeySearchLimitError
+                        yield node[first:last]
 
 
 def _json_hits(value: str) -> list[Hit]:
