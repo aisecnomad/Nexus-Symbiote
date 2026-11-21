@@ -6,9 +6,8 @@ producing tool. It names the inventory it describes with a BOM-Link external
 reference, and its components carry the same types, versions, package URLs and
 digests as the CycloneDX inventory export.
 
-A statement is ``in_triage`` unless an unexpired operator decision sets its state, or
-reported trace evidence that a component never loaded sets ``not_affected``; trace
-evidence never sets ``exploitable``. ``NEXUS-`` identifiers match no public database.
+An applicable, unexpired operator decision can change the default ``in_triage`` state.
+Trace outcomes are observations only. ``NEXUS-`` identifiers match no public database.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ from typing import Any
 
 from nexus_symbiote.core.aibom import AIBOM, prepare
 from nexus_symbiote.core.canonical import NAMESPACE, content_digest
+from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.models import ModelComponent
 from nexus_symbiote.generators._common import (
     OMITTED_IMPORTED_FINDINGS,
@@ -31,6 +31,7 @@ from nexus_symbiote.generators.sarif import SEVERITY_ORDER, plain_text
 from nexus_symbiote.generators.validation import require_valid
 from nexus_symbiote.vex_decisions import (
     ExecutionEvidence,
+    LoadedAdvisoryReport,
     LoadedVEXDecisions,
     resolve_reference_time,
 )
@@ -40,17 +41,7 @@ _SERIAL = re.compile(
     r"urn:uuid:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
 _CDX_SEVERITIES = frozenset({"critical", "high", "medium", "low", "info", "none", "unknown"})
-_NON_SUPPRESSIBLE_CATEGORIES = frozenset(
-    {
-        "hook_commands",
-        "settings_environment",
-        "credential_exposure",
-        "serialization_format",
-        "permission_scope",
-        "hidden_content",
-        "trust_remote_code",
-    }
-)
+_SUPPRESSING_STATES = frozenset({"not_affected", "resolved", "false_positive"})
 
 
 def finding_id(component_ref: str, category: str, detail: str) -> str:
@@ -72,9 +63,9 @@ def _resolve_analysis(
     ref_time: datetime | None,
     props: dict[str, str],
     expired_warnings: list[str],
-    severity: str = "unknown",
-    category: str | None = None,
-    in_kev: bool = False,
+    inventory_sha256: str | None,
+    deployment_id: str | None,
+    advisory_complete: bool = True,
 ) -> dict[str, Any]:
     analysis: dict[str, Any] = {"state": "in_triage", "detail": default_detail}
     decision = decisions.lookup(vuln_id, component_ref) if decisions is not None else None
@@ -94,6 +85,18 @@ def _resolve_analysis(
             props["nexus-symbiote:vexDecisionStatus"] = "expired-reverted"
             props["nexus-symbiote:vexDecisionOwner"] = decision.owner
             props["nexus-symbiote:vexDecisionExpiredAt"] = decision.expires_at.isoformat()
+        elif decision.state in _SUPPRESSING_STATES and (
+            not advisory_complete
+            or decision.component_ref != component_ref
+            or decision.inventory_sha256 is None
+            or decision.inventory_sha256 != inventory_sha256
+            or decision.deployment_id is None
+            or decision.deployment_id != deployment_id
+        ):
+            analysis["detail"] = (
+                f"Operator decision is outside the inventory or deployment scope. {default_detail}"
+            )
+            props["nexus-symbiote:vexDecisionStatus"] = "scope-mismatch"
         else:
             analysis["state"] = decision.state
             if decision.justification is not None:
@@ -108,19 +111,11 @@ def _resolve_analysis(
         if outcome is not None:
             props["nexus-symbiote:executionOutcome"] = outcome
         if outcome == "declared-never-loaded":
-            if in_kev or severity == "critical" or category in _NON_SUPPRESSIBLE_CATEGORIES:
-                analysis["detail"] = (
-                    "Execution-bound (reported): declared-never-loaded cannot suppress critical, "
-                    f"KEV, or static-execution findings without an expiring operator decision. {default_detail}"
-                )
-                props["nexus-symbiote:suppressionBlocked"] = "true"
-            else:
-                analysis["state"] = "not_affected"
-                analysis["justification"] = "code_not_reachable"
-                analysis["detail"] = (
-                    "Execution-bound (reported): component was declared but never loaded in "
-                    f"runtime execution evidence. {default_detail}"
-                )
+            analysis["detail"] = (
+                "Execution-bound (reported): component was declared but never loaded in "
+                f"the observed runtime evidence. {default_detail}"
+            )
+            props["nexus-symbiote:suppressionBlocked"] = "true"
         elif outcome == "unobserved":
             analysis["detail"] = (
                 "Execution-bound (reported): unobserved in runtime trace spans; absence of "
@@ -152,12 +147,22 @@ class VEXGenerator(Generator):
         decisions: LoadedVEXDecisions | None = None,
         execution_evidence: ExecutionEvidence | None = None,
         advisories: list[dict[str, Any]] | None = None,
+        advisory_report: LoadedAdvisoryReport | None = None,
         reference_time: datetime | None = None,
+        inventory_sha256: str | None = None,
+        deployment_id: str | None = None,
     ) -> None:
         self._decisions = decisions
         self._execution_evidence = execution_evidence
-        self._advisories = advisories or []
+        if advisory_report is not None and advisories is not None:
+            raise ValueError("Supply one advisory source")
+        self._advisory_report = advisory_report
+        self._advisories = (
+            advisory_report.advisories if advisory_report is not None else advisories or []
+        )
         self._reference_time = reference_time
+        self._inventory_sha256 = inventory_sha256
+        self._deployment_id = deployment_id
 
     def generate(self, bom: AIBOM) -> dict[str, Any]:
         from nexus_symbiote.validators.risk import effective_component_risks
@@ -172,6 +177,13 @@ class VEXGenerator(Generator):
         ref_time = (
             resolve_reference_time(self._reference_time) if self._decisions is not None else None
         )
+        decision_subject = self._inventory_sha256
+        if (
+            decision_subject is None
+            and self._decisions is not None
+            and self._deployment_id is not None
+        ):
+            decision_subject = hash_bytes(bom.to_native_json().encode("utf-8"))
         vulnerabilities: list[dict[str, Any]] = []
         components: list[dict[str, Any]] = []
         included_comp_refs: set[str] = set()
@@ -224,8 +236,8 @@ class VEXGenerator(Generator):
                     ref_time=ref_time,
                     props=props,
                     expired_warnings=expired_warnings,
-                    severity=risk.severity.value,
-                    category=risk.category,
+                    inventory_sha256=decision_subject,
+                    deployment_id=self._deployment_id,
                 )
                 vulnerabilities.append(
                     {
@@ -296,8 +308,10 @@ class VEXGenerator(Generator):
                 ref_time=ref_time,
                 props=props,
                 expired_warnings=expired_warnings,
-                severity=sev,
-                in_kev=in_kev,
+                inventory_sha256=decision_subject,
+                deployment_id=self._deployment_id,
+                advisory_complete=self._advisory_report is None
+                or self._advisory_report.coverage == "complete",
             )
             vulnerabilities.append(
                 {
@@ -317,6 +331,24 @@ class VEXGenerator(Generator):
             )
 
         meta_props: list[dict[str, str]] = []
+        if self._inventory_sha256:
+            meta_props.append(
+                {"name": "nexus-symbiote:inventorySha256", "value": self._inventory_sha256}
+            )
+        if self._deployment_id:
+            meta_props.append({"name": "nexus-symbiote:deployment", "value": self._deployment_id})
+        if (report := self._advisory_report) is not None:
+            for name, report_value in (
+                ("ReportSha256", report.sha256),
+                ("Coverage", report.coverage),
+                ("Checked", report.checked),
+                ("Skipped", report.skipped),
+                ("Excluded", report.excluded),
+                ("Errors", report.errors),
+            ):
+                meta_props.append(
+                    {"name": "nexus-symbiote:advisory" + name, "value": str(report_value)}
+                )
         if omitted:
             meta_props.append({"name": OMITTED_IMPORTED_FINDINGS, "value": str(omitted)})
         if self._decisions is not None:
@@ -328,6 +360,20 @@ class VEXGenerator(Generator):
                 {"name": "nexus-symbiote:expiredVexDecisions", "value": str(len(expired_warnings))}
             )
         if self._execution_evidence is not None:
+            evidence = self._execution_evidence
+            meta_props.append(
+                {
+                    "name": "nexus-symbiote:traceAuthentication",
+                    "value": "attested" if evidence.attested else "unsigned",
+                }
+            )
+            if evidence.attestation_sha256:
+                meta_props.append(
+                    {
+                        "name": "nexus-symbiote:traceAttestationSha256",
+                        "value": evidence.attestation_sha256,
+                    }
+                )
             meta_props.append(
                 {
                     "name": "nexus-symbiote:traceEvidenceSha256",
@@ -339,8 +385,6 @@ class VEXGenerator(Generator):
             "bomFormat": "CycloneDX",
             "specVersion": "1.7",
             "version": bom.metadata.version,
-            "serialNumber": "urn:uuid:"
-            + str(uuid.uuid5(NAMESPACE, "nexus-symbiote-vex:" + serial)),
             "metadata": {
                 "tools": {
                     "components": [
@@ -369,5 +413,8 @@ class VEXGenerator(Generator):
                     "comment": "The inventory whose findings this document lists",
                 }
             ]
+        document["serialNumber"] = "urn:uuid:" + str(
+            uuid.uuid5(NAMESPACE, "nexus-symbiote/vex-content/v2:" + content_digest(document))
+        )
         require_valid(document, "cyclonedx")
         return document
