@@ -1537,9 +1537,12 @@ class StateStore:
                     # Keep a used nonce until it is older than the retention window
                     # measured from this clock, not from the expiry just presented.
                     # A far-future expiry would otherwise delete another tenant's
-                    # nonce that is still inside the window. Rows with no expiry
-                    # stay: SQL does not treat NULL as less than the cutoff.
-                    cutoff = int(clock.timestamp()) - int(NONCE_RETENTION.total_seconds())
+                    # nonce that is still inside the window. The row just inserted
+                    # always survives, so a stale expiry cannot be recorded twice.
+                    # Rows with no expiry stay: SQL does not treat NULL as less than
+                    # the cutoff.
+                    watermark = min(int(clock.timestamp()), expires)
+                    cutoff = watermark - int(NONCE_RETENTION.total_seconds())
                     db.execute(
                         "DELETE FROM tenant_nonces WHERE not_after < ?",
                         (cutoff,),

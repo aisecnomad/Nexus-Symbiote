@@ -6,7 +6,7 @@ import os
 import sqlite3
 import stat
 import time
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -159,6 +159,26 @@ def test_a_presented_expiry_cannot_prune_another_tenants_nonce(tmp_path):
     with sqlite3.connect(tmp_path / "state.sqlite") as db:
         kept = {row[0] for row in db.execute("SELECT nonce FROM tenant_nonces")}
     assert kept == {"other-tenant-nonce", "presented-nonce-000"}
+
+
+@pytest.mark.parametrize(
+    "not_after",
+    [
+        lambda: datetime.now(UTC) - NONCE_RETENTION - timedelta(minutes=1),
+        lambda: NOW + timedelta(minutes=4),
+    ],
+    ids=["stale-expiry", "caller-on-an-old-clock"],
+)
+def test_a_nonce_recorded_without_a_clock_cannot_be_replayed(tmp_path, not_after):
+    # The prune ran from the wall clock after the insert, so an expiry more than the
+    # retention window behind it deleted the row just written and the same nonce was
+    # accepted again.
+    store = StateStore.initialize(tmp_path / "state.sqlite")
+    expiry = not_after()
+    store.record((), "stale-nonce-000000", tenant="acme", not_after=expiry)
+    with pytest.raises(AuthorizationError) as replayed:
+        store.record((), "stale-nonce-000000", tenant="acme", not_after=expiry)
+    assert replayed.value.reason == "approval-replayed"
 
 
 def test_representing_the_recorded_trust_status_takes_no_write_lock(tmp_path):
