@@ -45,6 +45,7 @@ from nexus_symbiote.scanners.prompt import (
     _CODEX_SPELLINGS,
     _DECLARATION_SUFFIXES,
     _FOLDED_NESTED_NAMES,
+    _IMPORT,
     _IMPORTING_NAMES,
     _MAX_IMPORT_DEPTH,
     _MAX_IMPORTS,
@@ -445,14 +446,15 @@ def _extract_block_signals(
             tool_locs.setdefault(tok, []).append(loc)
 
         if kind not in {"fence", "indented"}:
-            at_tokens = _import_tokens(block_text)
+            import_tokens = _IMPORT.findall if kind == "literal" else _import_tokens
+            at_tokens = import_tokens(block_text)
             token_line_map: dict[str, int] = {}
             if at_tokens and len(block_text) > MAX_SHOW_TEXT_CHARS:
                 wanted = {tok.rstrip(_TRAILING) for tok in at_tokens}
                 for l_no, l_text in enumerate(block_text.splitlines()):
                     if "@" not in l_text:
                         continue
-                    for cand in _import_tokens(l_text):
+                    for cand in import_tokens(l_text):
                         c = cand.rstrip(_TRAILING)
                         if c in wanted and c not in token_line_map:
                             token_line_map[c] = l_no
@@ -529,7 +531,10 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
     for name, reading in readings.items():
         all_blocks = tuple(reading)
         prose = tuple(b for b in reading if b[0] not in {"fence", "indented"})
-        for suffix, selected in (("", all_blocks), ("-prose", prose)):
+        # A blank line may end raw HTML and expose an instruction in prose.
+        # Keep the raw HTML signals too, since a host may act on them.
+        inline = tuple(b for b in prose if b[0] in {"paragraph", "heading"})
+        for suffix, selected in (("", all_blocks), ("-prose", prose), ("-inline", inline)):
             if selected not in signals:
                 tool_signals, import_signals, _ = _extract_block_signals(selected)
                 signals[selected] = (tool_signals[0], import_signals[0])
