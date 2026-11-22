@@ -107,7 +107,7 @@ _INLINE_SOURCES = ("data:", "http:", "https:")
 _INLINE_FLAGS = {
     "lua": re.compile(r"-e.*", re.S),
     "rscript": re.compile(r"-e"),
-    "osascript": re.compile(r"-e"),
+    "osascript": re.compile(r"-e.*", re.S),
     "ruby": re.compile(r"-[a-zA-Z]*e|-[acdlnpsSvwyhUW0-9]*e.+", re.S),
     "perl": re.compile(r"-[a-zA-Z]*[eE]|-[acdfgnpsStTuUvwWXhl0-9]*[eE].+", re.S),
     "php": re.compile(
@@ -135,8 +135,10 @@ _SCRIPT_SUFFIX = re.compile(r"(?:-cli)?\.[cm]?js$|\.py$")
 _PYTHON_SPECIAL = re.compile("[cmWX]")
 # Windows' windowed interpreters (pythonw, pyw) and free-threaded builds (python3.13t).
 _PYTHON_NAME = re.compile(r"(?:python|pypy)w?[0-9.]*t?w?(?:d|-dbg)?|pyw?")
+# Version-suffixed interpreter binaries (lua5.4, luajit2.1, ruby3.2, php8.2, perl5.38).
+_VERSIONED_INTERPRETER = re.compile(r"(lua(?:jit)?|ruby|php|perl)[0-9.]*")
 # Standard library modules that run their arguments as Python code.
-_PYTHON_CODE_MODULES = frozenset({"timeit"})
+_PYTHON_CODE_MODULES = frozenset({"timeit", "code", "asyncio", "idlelib"})
 # TypeScript and transpiling Node runners accept node's inline code options.
 _NODE_RUNNERS = frozenset({"tsx", "esno", "babel-node"})
 _TS_NODE = frozenset(
@@ -234,6 +236,7 @@ def known_executable(name: str | None) -> bool:
         or name in _NODE_RUNNERS
         or name in _TS_NODE
         or bool(_PYTHON_NAME.fullmatch(name))
+        or bool(_VERSIONED_INTERPRETER.fullmatch(name))
         or name in {"node", "nodejs"}
     )
 
@@ -1120,7 +1123,13 @@ def _interpreter_family(name: str) -> str | None:
         return "ts-node"
     if _PYTHON_NAME.fullmatch(name):
         return "python"
-    return name if name in _INLINE_FLAGS else None
+    if name in _INLINE_FLAGS:
+        return name
+    versioned = _VERSIONED_INTERPRETER.fullmatch(name)
+    if versioned is not None:
+        base = versioned.group(1)
+        return "lua" if base == "luajit" else base
+    return None
 
 
 def _program_name(word: str) -> str | None:
@@ -1488,7 +1497,10 @@ def _interpreter_reason(
                 if letter == "m":
                     module = letters[position + 1 :] or follows
                     name = module.split(".")[0].replace("_", "-").casefold()
-                    if name in _PYTHON_CODE_MODULES:
+                    mod_args = words[index + (1 if letters[position + 1 :] else 2) :]
+                    if name in _PYTHON_CODE_MODULES or (
+                        name == "pdb" and any(a == "-c" or a.startswith("-c") for a in mod_args)
+                    ):
                         return _inline(family, launch)
                     return f"python -m {name}" if name in _PROGRAM_NAMES else None
                 if letter in {"W", "X"}:
@@ -2952,6 +2964,14 @@ def _python_runner(
             _package_program(package, rest[position + 1 :], launch)
     elif position < len(rest):
         program = rest[position]
+        if any(opt in {"-m", "--module"} for opt, _ in options):
+            module_root = program.split(".")[0].replace("_", "-").casefold()
+            if module_root in _PYTHON_CODE_MODULES or (
+                module_root == "pdb"
+                and any(a == "-c" or a.startswith("-c") for a in rest[position + 1 :])
+            ):
+                launch.fail(_inline("python", launch))
+                return None
         if "://" in program or program == "-":
             # uv run downloads and runs a script named by URL, or reads one from stdin; both
             # are recorded as a URL source, standard input as one without an origin.
@@ -3144,8 +3164,9 @@ def _mount_fields(spec: str) -> dict[str, str]:
 
 _VOLUME_VARIABLE = re.compile(
     r"\$\{(?:(?P<client>env|input|config|command|workspaceFolder|extensionInstallFolder):[^{}:]+"
-    r"|[A-Za-z_][A-Za-z0-9_]*:-(?P<default>[^{}]*))\}"
+    r"|[A-Za-z_][A-Za-z0-9_]*(?::?-(?P<default>[^{}]*))?)\}"
 )
+_UNRESOLVED_VOLUME_VAR = re.compile(r"\$\{[^{}]*:[^{}]*\}")
 
 
 def _volume_source_end(spec: str) -> int:
@@ -3293,7 +3314,7 @@ def _container_context(options: list[tuple[str, str | None]], launch: Launch) ->
         elif option == "--device":
             launch.mark("devices")
         elif option == "--security-opt" and re.search(
-            r"unconfined|disable|no-new-privileges[:=]false", text
+            r"unconfined|disable|no-new-privileges[:=](?:false|0|f)\b", text
         ):
             launch.mark("security_options_disabled")
         elif option == "--security-opt" and re.match(r"seccomp[:=]", text):
@@ -3320,14 +3341,18 @@ def _container_context(options: list[tuple[str, str | None]], launch: Launch) ->
             # The engine runs a string health check with /bin/sh -c inside the container.
             launch.mark("container_command")
         elif option in {"-v", "--volume", "--mount"} and value:
-            if (
-                option != "--mount"
-                and value.startswith("${")
-                and ":" in value.partition("}")[0]
-                and _VOLUME_VARIABLE.match(value) is None
+            if option != "--mount" and any(
+                _VOLUME_VARIABLE.fullmatch(match.group()) is None
+                for match in _UNRESOLVED_VOLUME_VAR.finditer(value)
             ):
                 launch.fail("container volume source substitution is unresolved")
             sources = _host_sources(value, mount=option == "--mount")
+            if option == "--mount" and any(
+                _VOLUME_VARIABLE.fullmatch(match.group()) is None
+                for src in sources
+                for match in _UNRESOLVED_VOLUME_VAR.finditer(src)
+            ):
+                launch.fail("container volume source substitution is unresolved")
             if sources:
                 launch.mark("host_mounts")
             for flag in dict.fromkeys(_host_source_flag(source) for source in sources):
@@ -3349,8 +3374,8 @@ def _container_context(options: list[tuple[str, str | None]], launch: Launch) ->
 
 
 _CONTAINER_SCRIPT_RUNNERS = re.compile(
-    r"node(?:js)?|python[0-9.]*|deno|bun|ruby|perl|php|(?:ba|da|z|k|mk)?sh|ash|env|java"
-    r"|npm|pnpm|yarn|uv|tsx|ts-node|make|tini|dumb-init|timeout|nice"
+    r"node(?:js)?|(?:python|pypy)w?[0-9.]*t?w?(?:d|-dbg)?|pyw?|deno|bun|ruby|perl|php"
+    r"|(?:ba|da|z|k|mk)?sh|ash|env|java|npm|pnpm|yarn|uv|tsx|ts-node|make|tini|dumb-init|timeout|nice"
 )
 # Programs that run the command in their arguments; the words after them are still read.
 _CONTAINER_WRAPPERS = _set("env tini dumb-init timeout nice")
@@ -3453,7 +3478,7 @@ def _mounted_command(options: list[tuple[str, str | None]], words: list[str]) ->
         )
     ):
         return True
-    if program.startswith("python") and mounted("."):
+    if _PYTHON_NAME.fullmatch(program) and mounted("."):
         # -I and -P keep the working directory off sys.path, but a module run with them can
         # still load it: pdb and cProfile run the file they are given, and uvicorn, gunicorn
         # or fastmcp import the app from the working directory. Any -m counts.
@@ -3555,18 +3580,39 @@ _DENO_SOURCES = frozenset({"--import-map", "--cert"})
 _DENO_TASK_VALUES = frozenset({"-c", "--config", "--cwd", "-f", "--filter", "-L", "--log-level"})
 
 
-def _deno_task_eval(rest: list[str]) -> int | None:
+def _deno_task_eval(rest: list[str], launch: Launch | None = None) -> int | None:
     """The index of deno task's own --eval, among its options before the task word.
 
     Deno hands every word after the task name to the task, so an --eval there belongs
-    to the program the task runs.
+    to the program the task runs. When ``launch`` is given, explicit configuration and
+    working-directory options before the task word are also recorded.
     """
     index = 1
+    eval_index: int | None = None
     while index < len(rest) and rest[index].startswith("-") and rest[index] != "--":
-        if rest[index] == "--eval":
-            return index
-        index += 2 if rest[index] in _DENO_TASK_VALUES else 1
-    return None
+        word = rest[index]
+        flag, equals, value = word.partition("=")
+        if word == "--eval":
+            if eval_index is None:
+                eval_index = index
+            index += 1
+            continue
+        if flag in {"-c", "--config", "--no-config", "--cwd"}:
+            if flag != "--no-config" and not equals and index + 1 < len(rest):
+                value = rest[index + 1]
+                index += 2
+            else:
+                index += 1
+            if launch is not None:
+                launch.fail("explicit Deno configuration selection is not collected")
+                if flag == "--cwd":
+                    launch.relocated = launch.relocated or _moves(value or "")
+                elif flag != "--no-config":
+                    directory = re.split(r"[\\/]", value or "")[:-1]
+                    launch.relocated = launch.relocated or _moves("/".join(directory))
+            continue
+        index += 2 if word in _DENO_TASK_VALUES else 1
+    return eval_index
 
 
 def _deno(name: str, rest: list[str], launch: Launch) -> None:
@@ -3580,6 +3626,7 @@ def _deno(name: str, rest: list[str], launch: Launch) -> None:
             # deno task --eval runs the task name as a command line in its task shell.
             _shell_subcommand([*rest[1:flag], *rest[flag + 1 :]], launch)
         _local_subcommand(rest[1:], launch)
+        _deno_task_eval(rest, launch)
         return
     elif rest[:1] in (["eval"], ["repl"]):
         launch.fail(_inline("deno", launch))

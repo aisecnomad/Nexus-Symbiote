@@ -352,7 +352,7 @@ def _conda_requirement(raw: str) -> tuple[_CondaTerms, bool] | None:
     if not raw.strip() or len(raw) > 128:
         return None
     text = raw.strip()
-    build = re.fullmatch(r"(={1,2}[0-9][^=,|]*)=([A-Za-z0-9_.+*?-]+)", text)
+    build = re.fullmatch(r"(={0,2}[0-9][^=,|]*)=([A-Za-z0-9_.+*?-]+)", text)
     if build is None:
         build = re.fullmatch(r"([0-9]\S*)\s+([A-Za-z0-9_.+*?-]+)", text)
     if build:
@@ -1476,13 +1476,23 @@ def unread_shape_census(project_root: Path) -> list[UnreadShapeCount]:
 
 
 def _npm_lock_packages(
-    files: ConfinedCollection, prefix: str, path_set: set[str], manifest: dict[str, Any]
+    files: ConfinedCollection,
+    prefix: str,
+    rel_posix: str,
+    path_set: set[str],
+    manifest: dict[str, Any],
 ) -> dict[str, Any]:
-    # Workspace layouts and multiple package managers can select a different lock.
+    # Workspace layouts, .npmrc overrides, and multiple package managers can select a different lock.
     manager = manifest.get("packageManager")
     if (
         manifest.get("workspaces")
         or manifest.get("overrides")
+        or prefix + ".npmrc" in path_set
+        or _enclosing_manifest(
+            rel_posix,
+            path_set,
+            ("package.json", "package-lock.json", "npm-shrinkwrap.json", ".npmrc"),
+        )
         or (
             manager is not None and (not isinstance(manager, str) or not manager.startswith("npm@"))
         )
@@ -1558,13 +1568,20 @@ def _direct_toml_lock(
         return {}
     resolved = {}
     for dep in deps:
+        dep_version: str | None = None
         if uv and isinstance(dep, dict) and dep.keys() == {"name"} and isinstance(dep["name"], str):
             name = _norm_pkg(dep["name"])
         elif not uv and isinstance(dep, str):
-            name = dep
+            parts = dep.split()
+            if not parts:
+                continue
+            name = parts[0]
+            dep_version = parts[1] if len(parts) >= 2 else None
         else:
             continue
         candidates = by_name.get(name, [])
+        if dep_version is not None:
+            candidates = [c for c in candidates if c.get("version") == dep_version]
         if len(candidates) != 1:
             continue
         entry = candidates[0]
@@ -1592,7 +1609,8 @@ def _cargo_lock_agrees(spec: str | None, version: str) -> bool:
     ):
         return False
     if spec.startswith("="):
-        return spec[1:] == version
+        exact = spec[1:]
+        return version == exact if exact.count(".") == 2 else version.startswith(exact + ".")
     return not _versions_conflict(spec if spec[0] in "^~" else "^" + spec, version)
 
 
@@ -1603,7 +1621,31 @@ def _npm_lock_agrees(spec: str, version: str) -> bool:
         return re.fullmatch(
             r"v?[0-9]+\.[0-9]+\.[0-9]+", version
         ) is not None and version.removeprefix("v").startswith(expected)
-    return not _versions_conflict(spec, version)
+    return _satisfies_nested_requirement("npm", spec, version) is True
+
+
+def _valid_nested_npm_record(record: Any, pkg_name: str, version: Any) -> bool:
+    if (
+        not isinstance(record, dict)
+        or record.get("link") is True
+        or record.get("inBundle") is True
+        or record.get("name", pkg_name) != pkg_name
+        or not isinstance(version, str)
+        or len(version) > 128
+        or not _reg._npm_exact(version)
+    ):
+        return False
+    integrity = record.get("integrity")
+    if integrity is not None and not _reg.RegistryScanner._validate_sri_integrity(integrity):
+        return False
+    resolved = record.get("resolved")
+    if resolved is not None:
+        parsed_url = _reg.RegistryScanner._https_resolution(resolved)
+        if parsed_url is None or not _reg.RegistryScanner._tarball_matches(
+            parsed_url[0], parsed_url[1], pkg_name, version
+        ):
+            return False
+    return True
 
 
 def _join_continued_lines(text: str) -> list[str]:
@@ -1662,7 +1704,7 @@ def _parse_nested_manifest(
         parsed = parse_json_strict(text)
         if isinstance(parsed, dict):
             try:
-                npm_locks = _npm_lock_packages(files, prefix, path_set, parsed)
+                npm_locks = _npm_lock_packages(files, prefix, rel_posix, path_set, parsed)
             except (ValueError, RecursionError):
                 files._fail(rel_posix, "invalid nested npm lockfile")
                 npm_locks = {}
@@ -1682,19 +1724,22 @@ def _parse_nested_manifest(
                 spec = specs[-1][1]
                 record = npm_locks.get("node_modules/" + pkg_name)
                 version = record.get("version") if isinstance(record, dict) else None
+                all_registry = all(
+                    _reg.RegistryScanner._npm_spec(item)[0] == "registry" for _, item in specs
+                )
                 if (
-                    isinstance(record, dict)
-                    and record.get("link") is not True
-                    and record.get("name", pkg_name) == pkg_name
-                    and _reg.RegistryScanner._npm_spec(spec)[0] == "registry"
-                    and _reg.RegistryScanner._lock_root_agrees(npm_locks, pkg_name, specs)
+                    all_registry
+                    and _valid_nested_npm_record(record, pkg_name, version)
                     and isinstance(version, str)
-                    and len(version) <= 128
-                    and _reg._npm_exact(version)
+                    and _reg.RegistryScanner._lock_root_agrees(npm_locks, pkg_name, specs)
                     and _npm_lock_agrees(spec, version)
                 ):
                     found.append((pkg_name, version, "npm", "locked", {}))
-                elif all(item == spec for _, item in specs) and _reg._npm_exact(spec):
+                elif (
+                    all_registry
+                    and all(item == spec for _, item in specs)
+                    and _reg._npm_exact(spec)
+                ):
                     found.append((pkg_name, spec, "npm", "pinned-version", {}))
                 else:
                     found.append((pkg_name, spec, "npm", "manifest-only", {}))
@@ -1836,10 +1881,27 @@ def _parse_nested_manifest(
                 found.append((img, None, "oci", st, {}))
 
     out: list[RegistryEntryComponent] = []
+    seen_records: set[tuple[str, str | None, str, str, tuple[tuple[str, str], ...]]] = set()
+    used_refs: set[str] = set()
     for pkg_name, spec, ecosystem, pin_state, hashes in found:
         clean_ver = spec.lstrip("=") if spec and spec.startswith("==") else spec
+        dedup_key = (pkg_name, clean_ver, ecosystem, pin_state, tuple(sorted(hashes.items())))
+        if dedup_key in seen_records:
+            continue
+        seen_records.add(dedup_key)
         exact = is_exact_version(clean_ver) or pin_state == "digest-pinned"
         ref_id = hashlib.sha256(f"{rel_posix}:{ecosystem}:{pkg_name}".encode()).hexdigest()[:16]
+        bom_ref = f"registry:nested:{ref_id}"
+        if bom_ref in used_refs:
+            salt = hashlib.sha256(
+                f"{rel_posix}:{ecosystem}:{pkg_name}:{clean_ver or ''}:{pin_state}".encode()
+            ).hexdigest()[:8]
+            bom_ref = f"registry:nested:{ref_id}:{salt}"
+            suffix_idx = 2
+            while bom_ref in used_refs:
+                bom_ref = f"registry:nested:{ref_id}:{salt}:{suffix_idx}"
+                suffix_idx += 1
+        used_refs.add(bom_ref)
         nested_props: dict[str, Any] = {
             "manifest_path": rel_posix,
             "pinning_state": pin_state,
@@ -1863,7 +1925,7 @@ def _parse_nested_manifest(
         ver_out = neutralize(redact_text(clean_ver))[:128] if clean_ver else None
         out.append(
             RegistryEntryComponent(
-                bom_ref=f"registry:nested:{ref_id}",
+                bom_ref=bom_ref,
                 name=neutralize(redact_text(pkg_name))[:200],
                 version=ver_out,
                 registry_type=ecosystem,
