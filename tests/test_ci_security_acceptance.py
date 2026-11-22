@@ -275,6 +275,7 @@ def sarif(score="7.5"):
                 },
                 "results": [{"ruleId": "py/example"}],
                 "versionControlProvenance": [{"revisionId": "a" * 40}],
+                "invocations": [{"executionSuccessful": True}],
             }
         ],
     }
@@ -308,6 +309,9 @@ def test_codeql_policy_accepts_no_high_security_findings_and_standard_extension_
         "no-runs",
         "unknown-rule",
         "failed-invocation",
+        "no-invocations",
+        "empty-invocations",
+        "empty-provenance",
         "no-severity",
         "invalid-severity",
     ],
@@ -325,12 +329,26 @@ def test_codeql_policy_denies_ambiguous_incomplete_or_wrong_revision_evidence(ch
         run["results"][0]["ruleId"] = "py/unknown"
     elif change == "failed-invocation":
         run["invocations"] = [{"executionSuccessful": False}]
+    elif change == "no-invocations":
+        del run["invocations"]
+    elif change == "empty-invocations":
+        run["invocations"] = []
+    elif change == "empty-provenance":
+        run["versionControlProvenance"] = []
     elif change == "no-severity":
         del run["tool"]["driver"]["rules"][0]["properties"]["security-severity"]
     else:
         run["tool"]["driver"]["rules"][0]["properties"]["security-severity"] = "NaN"
     with pytest.raises(ValueError):
         codeql.evaluate(document, "a" * 40)
+
+
+def test_codeql_policy_accepts_a_run_without_source_provenance():
+    # The CodeQL CLI does not write versionControlProvenance by default; the CLI entry point
+    # binds the analysis to the checkout instead.
+    document = sarif("6.9")
+    del document["runs"][0]["versionControlProvenance"]
+    assert codeql.evaluate(document, "a" * 40)["passed"]
 
 
 def test_codeql_cli_denies_a_pr_head_sha_when_checkout_is_the_merge_commit(monkeypatch, tmp_path):

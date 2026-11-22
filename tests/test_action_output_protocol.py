@@ -26,6 +26,7 @@ SPEC.loader.exec_module(runner)
 
 DECLARED = (
     "aibom_path",
+    "aibom_digest",
     "sarif_path",
     "risk_score",
     "passed",
@@ -68,13 +69,19 @@ def stub(
     validate: tuple[int, dict[str, Any]] = (0, {"passed": True}),
     risk: tuple[int, dict[str, Any]] = (0, {"overall_score": 0, "passed": True}),
     diff: tuple[int, dict[str, Any]] = (0, {"has_changes": False, "security_alerts": []}),
+    verify_attestation: tuple[int, dict[str, Any]] = (0, {"attestation_verified": True}),
 ) -> Command:
     def command(args: list[str]) -> subprocess.CompletedProcess[str]:
         calls.append(args)
         if args[0] == "scan":
             Path(args[args.index("--output") + 1]).write_text(native)
             return subprocess.CompletedProcess(args, scan[0], HOSTILE, scan[1])
-        code, document = {"validate": validate, "risk": risk, "diff": diff}[args[0]]
+        code, document = {
+            "validate": validate,
+            "risk": risk,
+            "diff": diff,
+            "verify-attestation": verify_attestation,
+        }[args[0]]
         return subprocess.CompletedProcess(args, code, json.dumps(document), HOSTILE)
 
     return command
@@ -540,3 +547,198 @@ def test_job_environment_cannot_replace_the_trust_root_or_the_mode(tmp_path, mon
     assert "NEXUS_SYMBIOTE_MODE" in runner.WITHHELD_ENV
     # The operator's binding key is an input the Action documents; it stays.
     assert seen[0]["NEXUS_SYMBIOTE_SOURCE_BINDING_KEY"] == "k" * 40
+
+
+def test_reviewed_baseline_attestation_verifies_before_diff_and_emits_aibom_digest(tmp_path):
+    import hashlib
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    baseline = _baseline(tmp_path)
+    att = tmp_path / "caller" / "reviewed.att.json"
+    att.write_text('{"payloadType":"application/vnd.in-toto+json","payload":"","signatures":[]}')
+    key = tmp_path / "caller" / "key.pub"
+    key.write_text("-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA\n-----END PUBLIC KEY-----\n")
+
+    with pytest.raises(ValueError, match="requires reviewed-baseline"):
+        configuration(
+            workspace,
+            SYMBIOTE_REVIEWED_BASELINE_ATTESTATION=str(att),
+            SYMBIOTE_TRUSTED_KEYS=str(key),
+        )
+    with pytest.raises(ValueError, match="requires trusted-keys"):
+        configuration(
+            workspace,
+            SYMBIOTE_REVIEWED_BASELINE=str(baseline),
+            SYMBIOTE_REVIEWED_BASELINE_ATTESTATION=str(att),
+            SYMBIOTE_SOURCE_BINDING_KEY="k" * 32,
+        )
+    with pytest.raises(ValueError, match="requires reviewed-baseline-attestation"):
+        configuration(
+            workspace,
+            SYMBIOTE_REVIEWED_BASELINE=str(baseline),
+            SYMBIOTE_TRUSTED_KEYS=str(key),
+            SYMBIOTE_SOURCE_BINDING_KEY="k" * 32,
+        )
+
+    config = configuration(
+        workspace,
+        SYMBIOTE_REVIEWED_BASELINE=str(baseline),
+        SYMBIOTE_REVIEWED_BASELINE_ATTESTATION=str(att),
+        SYMBIOTE_TRUSTED_KEYS=str(key),
+        SYMBIOTE_SOURCE_BINDING_KEY="k" * 32,
+    )
+    calls: list[list[str]] = []
+    outputs = tmp_path / "out"
+    assert runner.run(config, command=stub(calls), outputs=outputs) == 0
+    assert [c[0] for c in calls] == ["scan", "validate", "risk", "verify-attestation", "diff"]
+    values = published(outputs)
+    expected_digest = hashlib.sha256(b"{}").hexdigest()
+    assert values["aibom_digest"] == f"sha256:{expected_digest}"
+    assert values["drift_passed"] == "true"
+
+    # When verify-attestation fails, diff does not run and drift gate fails closed.
+    failed_calls: list[list[str]] = []
+    failed_outputs = tmp_path / "failed_out"
+    assert (
+        runner.run(
+            config,
+            command=stub(failed_calls, verify_attestation=(1, {})),
+            outputs=failed_outputs,
+        )
+        == 1
+    )
+    assert [c[0] for c in failed_calls] == ["scan", "validate", "risk", "verify-attestation"]
+    failed_values = published(failed_outputs)
+    assert failed_values["drift_passed"] == "false"
+    assert json.loads(failed_values["gates"])["drift"] == "failed"
+
+
+def test_validate_and_risk_require_attestation_gate(tmp_path):
+    from click.testing import CliRunner
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from nexus_symbiote.cli import main
+
+    cli_runner = CliRunner()
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "agent.yaml").write_text("name: Demo\ninstructions: [CLAUDE.md]\n")
+    (project / "CLAUDE.md").write_text("Follow instructions.\n")
+    bom = tmp_path / "bom.json"
+    assert cli_runner.invoke(main, ["scan", str(project), "-o", str(bom)]).exit_code == 0
+
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir(mode=0o700)
+    priv = Ed25519PrivateKey.generate()
+    priv_path = key_dir / "signer.key"
+    priv_path.write_bytes(
+        priv.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    priv_path.chmod(0o600)
+    pub_path = key_dir / "signer.pub"
+    pub_path.write_bytes(
+        priv.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    pub_path.chmod(0o600)
+    env_path = tmp_path / "bom.att.json"
+    assert (
+        cli_runner.invoke(
+            main,
+            [
+                "attest",
+                str(bom),
+                "--key",
+                str(priv_path),
+                "--purpose",
+                "reviewed",
+                "--out",
+                str(env_path),
+            ],
+        ).exit_code
+        == 0
+    )
+
+    for cmd in ("validate", "risk"):
+        ok = cli_runner.invoke(
+            main,
+            [
+                cmd,
+                str(bom),
+                "--project",
+                str(project),
+                "--require-attestation",
+                str(env_path),
+                "--trusted-key",
+                str(pub_path),
+                "--json-output",
+            ],
+        )
+        assert ok.exit_code == 0, ok.output
+        doc = json.loads(ok.stdout)
+        assert doc["passed"] is True
+        assert doc["attestation"]["verified"] is True
+        assert doc["attestation"]["purpose"] == "reviewed"
+
+        bad_purpose = cli_runner.invoke(
+            main,
+            [
+                cmd,
+                str(bom),
+                "--project",
+                str(project),
+                "--require-attestation",
+                str(env_path),
+                "--trusted-key",
+                str(pub_path),
+                "--attestation-purpose",
+                "generated",
+                "--json-output",
+            ],
+        )
+        assert bad_purpose.exit_code == 1
+        bad_doc = json.loads(bad_purpose.stdout)
+        assert bad_doc["passed"] is False
+        assert bad_doc["attestation"]["verified"] is False
+        assert bad_doc["attestation"]["reason"] == "purpose-mismatch"
+
+        orphan = cli_runner.invoke(main, [cmd, str(bom), "--attestation-purpose", "reviewed"])
+        assert orphan.exit_code == 2
+        assert "--attestation-purpose requires --require-attestation" in orphan.output
+
+        planted_key = project / "planted.pub"
+        planted_key.write_bytes(pub_path.read_bytes())
+        planted_key.chmod(0o600)
+        misplaced = cli_runner.invoke(
+            main,
+            [
+                cmd,
+                str(bom),
+                "--project",
+                str(project),
+                "--require-attestation",
+                str(env_path),
+                "--trusted-key",
+                str(planted_key),
+            ],
+            env={"NEXUS_SYMBIOTE_SOURCE_BINDING_KEY": "k" * 32},
+        )
+        assert misplaced.exit_code == 2
+        assert "must lie outside" in misplaced.output
+
+    action_doc = yaml.safe_load((ROOT / "action.yml").read_text(encoding="utf-8"))
+    attest_step = next(
+        s
+        for s in action_doc["runs"]["steps"]
+        if s.get("name") == "Attest exported AIBOM provenance"
+    )
+    assert "success()" in attest_step["if"]
+    assert "always()" not in attest_step["if"]

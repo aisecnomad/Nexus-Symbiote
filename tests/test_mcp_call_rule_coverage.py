@@ -12,9 +12,9 @@ from tests.test_steering_mcp_names import _surfaces
         ("filesystem", "mcp__filesystem__*(*)", False),
         ("filesystem", "mcp__filesystem__*", True),
         ("filesystem", "mcp__filesystem", True),
-        ("my__srv", "mcp__my__srv", False),
+        ("my__srv", "mcp__my__srv", True),
         ("my__srv", "mcp__my", True),
-        ("__filesystem", "mcp____filesystem", False),
+        ("__filesystem", "mcp____filesystem", True),
     ],
 )
 def test_a_whole_server_denial_must_be_valid_for_every_tool(tmp_path, name, rule, denied):

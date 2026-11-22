@@ -56,22 +56,27 @@ A way around a limit that its entry does not describe is worth a
 - **Exclusions are gaps.** A path you exclude with `scan.exclude_paths` is recorded
   as a coverage gap, so excluding a file that fails collection turns the failure
   into a gap; the default gates still fail.
-- **Default exclusions match by name.** Any path component named `.git`,
-  `node_modules`, `__pycache__`, `.venv` or `venv` is skipped, and so is one whose
-  name differs from these only by case, Unicode normalization, ignored format
-  characters or trailing dots and spaces, such as `Venv` or `NODE_MODULES`, which
-  case-insensitive file systems treat as the same name. These defaults are
-  listed under `exclusions` in the inventory but are not a gap, except inside a
-  directory whose every file the `prompt` collector reads, such as a skill, command,
-  rule or subagent directory. There such an entry, such as `.claude/skills/venv`,
-  `.claude/skills/Venv` or `.claude/agents/node_modules`, is a coverage gap that
-  names it, so the default gates fail. A skill checked out with its own `.git`,
-  including a Git submodule, whose `.git` is a file, or one whose script left a
-  `__pycache__` beside it, fails them until that entry is removed.
-  Outside those directories the skip is silent, so a file the collectors would
-  otherwise record, such as model weights under `venv/weights/` or an instruction
-  file under `node_modules/`, produces no component, finding or drift alert. Review
-  a pull request that adds tracked files under one of these names.
+- **Default exclusions match by name, and a non-empty one is a gap.** Any path
+  component named `.git`, `node_modules`, `__pycache__`, `.venv` or `venv` is
+  skipped, and so is one whose name differs from these only by case, Unicode
+  normalization, ignored format characters or trailing dots and spaces, such as
+  `Venv` or `NODE_MODULES`, which case-insensitive file systems treat as the same
+  name. These defaults are listed under `exclusions` in the inventory. An empty
+  directory of one of those names is not a coverage gap. A regular file, a symlink
+  or a directory that contains anything is a gap (`default collection exclude; not
+  collected`). Use `--accept-default-exclude NAME` on `scan` and on later
+  `validate --project` or `risk --project` runs to accept a built-in name.
+  The inventory lists the occupied paths it accepted. The GitHub Action
+  selects only `.git` by default. Inside a directory whose every file the
+  `prompt` collector reads,
+  such as a skill, command, rule or subagent directory, that collector records
+  its own gap for the skipped name instead of the generic one, and
+  accepting default exclusions leaves this agent-directory gap in place. A skill
+  checked out as a Git submodule or with a `__pycache__` beside its script fails
+  coverage until the excluded entry is outside the scan. A file the collectors would otherwise record, such as model
+  weights under `venv/weights/` or an instruction file under `node_modules/`, is
+  not collected; the gap is what makes that visible. Review a pull request that
+  adds tracked files under one of these names before accepting the exclusion.
 - **Case variants.** When a fixed path such as `CLAUDE.md`, `.mcp.json`,
   `.claude/settings.json` or a model directory's configuration, tokenizer or chat
   template file or `additional_chat_templates` directory is absent, a file or
@@ -244,7 +249,28 @@ A way around a limit that its entry does not describe is worth a
   or `cmd` may rewrite it (quoting removed, `@` prefixes dropped, expansions empty
   or at their default, brace lists expanded, patterns matched against runner
   names), but it can miss a launch in a form it does not know, and a prose
-  argument that only reads like a launch is a gap too.
+  argument that only reads like a launch is a gap too. `pythonw`, `pyw` and
+  free-threaded names such as `python3.13t` are Python; `python -m timeit` is inline
+  code; `-` (standard input) is inline code for node, python, ruby, perl, php,
+  `bun`, `bun run`, `pwsh -File` and `pwsh -Command`.
+- **PowerShell parameters are read from a table.** `pwsh` uses its own switch and value-parameter table. Windows PowerShell
+  (`powershell` or `powershell.exe`) uses the supported 5.1 subset. Modern-only options
+  such as `-CustomPipeName` and `-WorkingDirectory` are gaps on 5.1. Use `-InputFormat` or `-OutputFormat` there. The
+  aliases `-if` and `-of` also leave a 5.1 launch unresolved. The `pwsh` table
+  matches each name from the shortest prefix pwsh 7's command-line parser accepts (`-config`,
+  `-cus`, `-settings`). A shorter word, which pwsh reads as the script path, a
+  parameter outside the table, and a prefix that may name parameters of different
+  kinds (`-co`, `-in`) are gaps, because a value may hide where `-Command` starts.
+  So are `-Version` and `-PSConsoleFile`, which pwsh 7 and Windows PowerShell 5.1
+  read differently. `-CommandWithArgs`, `-cwa` and the platform-specific
+  `-RemoveWorkingDirectoryTrailingCharacter` also leave the launch unresolved. So do `-ConfigurationName`, `-ConfigurationFile` and
+  `-SettingsFile`, which select a configuration that can run code first. The
+  prefixes were taken from pwsh 7's source, not checked against Windows PowerShell
+  5.1. `-Param:value` is not split.
+- **env is read as GNU env reads it.** Any word with `=` after a non-empty name is an
+  assignment (`BASH_FUNC_sh%%=...`, `npm_config_script-shell=...`), and its variable is
+  rated as a declared `env` entry is. At most four `-S` or `--split-string` values are
+  read in one launch; more is a gap.
 - **Text a shell reads again must read as written.** An `sh -c`, `bash -c`,
   `zsh -c` or `fish -c` script, a command line, `env -S`, `wsl` without `-e`,
   `eval`, `pwsh -Command`, the command word of `npx -p` or `npm exec --package`
@@ -313,7 +339,14 @@ A way around a limit that its entry does not describe is worth a
   rated by their written source: a mount through a link, a client variable other than `${userHome}`,
   `${env:HOME}`, `${env:USERPROFILE}`, `${workspaceFolder}` and `$PWD`, and a
   credential directory other than `.ssh`, `.aws`, `.gnupg`, `.kube`, `.docker`,
-  `.config`, `.azure` and `.gcloud` are only `host_mounts`. Variables in an
+  `.config`, `.azure` and `.gcloud` are only `host_mounts`. A `-v` source is rated
+  as cut at the first colon outside a client variable such as `${env:X}` and as cut
+  at the first colon, as an engine cuts a variable the client left unexpanded, and
+  a variable in it as one path component and, when it can be empty, as empty. The
+  scanner also checks the literal default in `${NAME:-value}`. Resolved workspace
+  and extension-installation directories are nonempty. Other unrecognized leading
+  substitutions with an embedded colon produce a coverage gap. For example,
+  `/${env:X}/..:/host` is a host root mount. Variables in an
   `--env-file`, a `--health-cmd` and a seccomp profile file are a medium finding
   without being read, and `podman --env-host` is not rated. An `--entrypoint` is a
   medium finding only beside a host mount. An image command is a medium
@@ -989,15 +1022,25 @@ A way around a limit that its entry does not describe is worth a
   archive is recognized by a pickle-family member in its first local header or in a
   central directory of at most 1 MiB, read from the end of the archive, including
   ZIP64, wherever the specification, `zipfile` (which `np.load` uses) or a ZIP64
-  locator puts it, so a member that any of them lists counts, and in a file that
+  locator puts it, also a locator or record inside the first local header or after
+  the locator, and the classic directory a reader falls back to when no ZIP64 record
+  lies where it looks, so a member that any of them lists counts, and in a file that
   starts with an end record, which `np.load` also reads as an archive; and by an
   object-dtype array as any member, read from the member's local
   header and the start of its stored or DEFLATE-compressed data. A longer array
-  header, a longer or malformed directory, a member compressed by another method,
+  header, a longer or malformed directory, a directory that starts at its stored
+  offset and runs past its end record, a ZIP64 locator that points before the
+  last 1 MiB of the archive, where `zipfile` from Python 3.13 reads its record first,
+  a member compressed by another method,
   such as BZIP2 or LZMA, and a member whose data runs past the next member's local
-  header are rated `unknown`, a high finding. The directory is read with the
-  tolerances of `zipfile` and the specification; another reader's, such as the C++
-  reader `torch.load` uses, are not modelled. A member name with a NUL byte is
+  header are rated `unknown`, a high finding, or `unsafe-code-execution` under a
+  pickle-family name, unless another reading lists a pickle-family member or an
+  object-dtype array, which makes the archive `unsafe-code-execution`. The directory
+  is read with the
+  tolerances of `zipfile` and the specification, and miniz's reading of a ZIP64
+  record at the locator's offset and its search for the end record (the C++ reader
+  `torch.load` uses); miniz's other
+  tolerances are not modelled. A member name with a NUL byte is
   matched both whole and as `zipfile` cuts it at the NUL, and a member is also
   matched by the name a version-1 Info-ZIP Unicode Path field (0x7075) with a
   matching CRC gives it, as `zipfile` from Python 3.12 lists it. A pickle hidden otherwise under
@@ -1007,8 +1050,9 @@ A way around a limit that its entry does not describe is worth a
   templates are checked for potential Python-internals access patterns, not evaluated;
   a match does not establish a sandbox escape or execution. Computed names can evade
   the heuristic: some constructions of dunder names, such as `dict(__class__=1)|first`
-  or `("_"*2) ~ "class" ~ ("_"*2)`, are not found, although direct attribute access such
-  as `obj.__class__` is. Without other unsafe evidence, a SafeTensors model beside an
+  or `"_Template" ~ "Reference__context"`, are not found, although direct attribute
+  access such as `obj.__class__` or `self._TemplateReference__context`, and an
+  underscore string repeated with `*`, as in `("_"*2) ~ "class" ~ ("_"*2)`, are. Without other unsafe evidence, a SafeTensors model beside an
   unrecognized template keeps its `safe` serialization rating; that rating does not
   establish that the template is safe to render. A template file larger
   than the `file-bytes` limit is digested but not checked, and is a coverage gap.
@@ -1470,7 +1514,35 @@ is a failure; everything below is neither a gap nor a failure.
 - **Rewordings are missed.** Cyrillic homoglyphs, HTML entities, `[//]: #` comments,
   "note for automated auditors" and override phrasings outside the rules give no
   finding. Invisible characters are removed before matching, so text that uses them
-  as word separators reads as one word. JSON keys are not scanned, only values.
+  as word separators reads as one word. In a `.json` source, keys are not scanned,
+  only values.
+- **Escapes are decoded where a host decodes them.** In a `.jsonc`, `.yaml`, `.yml`
+  or `.toml` source, and in the YAML front matter of a Markdown file, the rules also
+  read every string and key the file decodes to, so `"\u0049gnore all previous
+  instructions"` matches as the text it spells. Such a match is located by JSON
+  pointer, as in a `.json` source, unless the raw text already gave the same
+  component the same rule. YAML of at most 20,000 parser events and 64 nested flow
+  collections, and TOML within the dotted-key bound, each up to 65,536 characters,
+  are parsed; YAML keeps an escape in a plain or single-quoted scalar as text, so
+  it is not decoded there. YAML or TOML past those bounds, and a file that does not
+  parse, have every backslash escape, line continuation and YAML `''` decoded by
+  pattern, in literal strings and comments too, which can only add findings; a match
+  there is located at its byte offset in the file. Decoded Markdown front matter
+  uses YAML and starts with at least three dashes, with optional leading whitespace.
+  Tagged fences, TOML fences, and blocks without a closing delimiter receive the raw
+  text checks only.
+- When a server and tool share a name, declaration position and recorded MCP relationships
+  identify the owner. Each unresolved declaration carries its own file-level risk. A library
+  caller without a repository agent can collect an explicit ownership diagnostic. With no
+  diagnostics list, a source component carries the risk marked as unresolved.
+- **Hidden markup is reported as hidden markup.** When the `prompt` collector rates
+  a Markdown file's hidden markup high, the rules skip the text of each HTML comment,
+  closed processing instruction and `#` reference definition in it, which
+  `hidden_markup` reports. A `<!--`, `<?` or definition inside a fenced code block or
+  code span is shown as written and is not skipped; fences and spans are found as
+  generously as any reader finds them, inside block quotes and list items too, so a
+  real comment that a stray fence or backtick seems to enclose is matched as
+  visible text. An unclosed `<!--` is skipped only to the next blank line.
 - **Prohibitions are recognized narrowly.** `TP-CRED-002` treats a credential read as
   a prohibition when `never`, `not`, `cannot`, "refuse to" or "decline to" comes
   right before the verb, with only adverbs (`ever`, `just`, `simply`, `directly`,
@@ -2104,11 +2176,11 @@ is a failure; everything below is neither a gap nor a failure.
 - **Some servers cannot be observed.** A server that offers none of the supported
   protocol revisions, or only one without `initialize`, is reported as refused. A
   stream the server closes before its reply ends the observation as incomplete.
-  `verify-live` observes stdio servers only: observe remote servers with
+  `verify-live` starts stdio servers only and checks remote ones only through attested evidence: observe them with
   `discover-mcp --record` and compare with `diff`. A WebSocket server is reported as
   `unsupported-transport`.
 - **The endpoint digest is unkeyed.** The `discover-mcp` report and `--record`
-  inventories show the origin and `observed_endpoint_hash`, an unsalted SHA-256 of the
+  inventories and the `verify-live` report show the origin and `observed_endpoint_hash`, an unsalted SHA-256 of the
   full URL. A reader can recover a short or guessable path token by hashing candidate
   URLs; a high-entropy API key is not practical to recover this way. Keep reports from
   servers with low-entropy path secrets as private as the URL.
@@ -2182,6 +2254,7 @@ is a failure; everything below is neither a gap nor a failure.
   routed through `invoke`. The operator builds the authentication, description,
   scope and execution adapters and must close every other path to the tools; see
   [security boundary](runtime-assurance.md#security-boundary).
+- A group-writable sticky SQLite state directory (1770) trusts every group member. A member who can create a SQLite companion can roll back state and make a used approval usable again. Use a dedicated service-owned 0700 state directory when members are outside that trust boundary. Stop all gateways and preserve the database and its companions together during migration or recovery.
 - **Superseded snapshots stay usable until retired.** Snapshots, trust statuses and
   the companion BOM must come from an operator-controlled channel. A superseded
   snapshot stays valid on a state store until a newer one is registered or

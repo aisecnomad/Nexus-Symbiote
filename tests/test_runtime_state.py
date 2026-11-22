@@ -6,11 +6,17 @@ import os
 import sqlite3
 import stat
 import time
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from nexus_symbiote.runtime import AuthorizationError, StateStore, TrustStatus, digest
+from nexus_symbiote.runtime import (
+    NONCE_RETENTION,
+    AuthorizationError,
+    StateStore,
+    TrustStatus,
+    digest,
+)
 from tests.test_runtime_authorization import NOW, fixture, invoke
 
 
@@ -93,16 +99,86 @@ def test_opening_restricts_a_group_readable_store(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
-def test_expired_nonces_are_pruned_after_the_retention_period(tmp_path):
+def test_expired_nonces_are_pruned_from_the_store_clock(tmp_path):
     store = StateStore.initialize(tmp_path / "state.sqlite")
-    store.record((), "early-nonce-000000", tenant="acme", not_after=NOW)
-    store.record((), "recent-nonce-00000", tenant="acme", not_after=NOW + timedelta(days=6))
+    clock = NOW
+    store.record(
+        (),
+        "early-nonce-000000",
+        tenant="acme",
+        not_after=clock - NONCE_RETENTION - timedelta(seconds=1),
+        now=clock,
+    )
+    store.record(
+        (),
+        "recent-nonce-00000",
+        tenant="acme",
+        not_after=clock - NONCE_RETENTION + timedelta(days=1),
+        now=clock,
+    )
     with sqlite3.connect(tmp_path / "state.sqlite") as db:
         db.execute("INSERT INTO tenant_nonces(tenant, nonce) VALUES ('acme', 'legacy-row-0000000')")
-    store.record((), "later-nonce-000000", tenant="acme", not_after=NOW + timedelta(days=8))
+    store.record(
+        (),
+        "later-nonce-000000",
+        tenant="acme",
+        not_after=clock + timedelta(minutes=5),
+        now=clock,
+    )
     with sqlite3.connect(tmp_path / "state.sqlite") as db:
         kept = {row[0] for row in db.execute("SELECT nonce FROM tenant_nonces")}
     assert kept == {"recent-nonce-00000", "legacy-row-0000000", "later-nonce-000000"}
+
+
+def test_a_presented_expiry_cannot_prune_another_tenants_nonce(tmp_path):
+    store = StateStore.initialize(tmp_path / "state.sqlite")
+    clock = NOW
+    store.record(
+        (),
+        "other-tenant-nonce",
+        tenant="other",
+        not_after=clock - timedelta(days=1),
+        now=clock,
+    )
+    store.record(
+        (),
+        "presented-nonce-000",
+        tenant="acme",
+        not_after=clock + timedelta(minutes=5),
+        now=clock,
+    )
+    with pytest.raises(AuthorizationError, match="5 minutes ahead") as refused:
+        store.record(
+            (),
+            "future-nonce-00000",
+            tenant="acme",
+            not_after=clock + timedelta(minutes=6),
+            now=clock,
+        )
+    assert refused.value.reason == "approval-lifetime-exceeds-policy"
+    with sqlite3.connect(tmp_path / "state.sqlite") as db:
+        kept = {row[0] for row in db.execute("SELECT nonce FROM tenant_nonces")}
+    assert kept == {"other-tenant-nonce", "presented-nonce-000"}
+
+
+@pytest.mark.parametrize(
+    "not_after",
+    [
+        lambda: datetime.now(UTC) - NONCE_RETENTION - timedelta(minutes=1),
+        lambda: NOW + timedelta(minutes=4),
+    ],
+    ids=["stale-expiry", "caller-on-an-old-clock"],
+)
+def test_a_nonce_recorded_without_a_clock_cannot_be_replayed(tmp_path, not_after):
+    # The prune ran from the wall clock after the insert, so an expiry more than the
+    # retention window behind it deleted the row just written and the same nonce was
+    # accepted again.
+    store = StateStore.initialize(tmp_path / "state.sqlite")
+    expiry = not_after()
+    store.record((), "stale-nonce-000000", tenant="acme", not_after=expiry)
+    with pytest.raises(AuthorizationError) as replayed:
+        store.record((), "stale-nonce-000000", tenant="acme", not_after=expiry)
+    assert replayed.value.reason == "approval-replayed"
 
 
 def test_representing_the_recorded_trust_status_takes_no_write_lock(tmp_path):
@@ -162,3 +238,62 @@ def test_older_or_forked_heads_are_refused_without_the_write_lock(tmp_path):
                 assert time.monotonic() - started < 5
         finally:
             holder.execute("ROLLBACK")
+
+
+@pytest.mark.parametrize(("mode", "refused"), [(0o770, True), (0o1770, False), (0o750, False)])
+def test_a_directory_other_group_members_can_write_is_refused(tmp_path, mode, refused):
+    # A group member could plant a hot -journal that SQLite rolls into the store.
+    path = tmp_path / "shared" / "state.sqlite"
+    StateStore.initialize(path)
+    path.parent.chmod(mode)
+    try:
+        if not refused:
+            StateStore(path)
+            StateStore.initialize(path.with_name("other.sqlite"))
+            return
+        with pytest.raises(AuthorizationError, match="group-writable") as opening:
+            StateStore(path)
+        with pytest.raises(AuthorizationError, match="group-writable") as creating:
+            StateStore.initialize(path.with_name("other.sqlite"))
+        assert opening.value.reason == creating.value.reason == "state-invalid"
+        assert not path.with_name("other.sqlite").exists()
+    finally:
+        path.parent.chmod(0o700)
+
+
+def foreign_journal(monkeypatch):
+    real = os.stat
+
+    def stat_as_another_user(name, *args, **kwargs):
+        info = real(name, *args, **kwargs)
+        if str(name).endswith("-journal"):
+            fields = list(info[:10])
+            fields[4] = info.st_uid + 1
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(os, "stat", stat_as_another_user)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "foreign"])
+def test_a_planted_journal_beside_the_store_is_refused(tmp_path, monkeypatch, kind):
+    path = tmp_path / "state.sqlite"
+    store = StateStore.initialize(path)
+    journal = tmp_path / "state.sqlite-journal"
+    if kind == "symlink":
+        journal.symlink_to(tmp_path / "elsewhere")
+    else:
+        journal.write_bytes(b"")
+        foreign_journal(monkeypatch)
+    for attempt in (
+        lambda: StateStore(path),
+        lambda: store.record((), "planted-journal-00", tenant="acme", not_after=NOW),
+    ):
+        with pytest.raises(AuthorizationError, match="journal") as refused:
+            attempt()
+        assert refused.value.reason == "state-invalid"
+    journal.unlink()
+    (tmp_path / "fresh.sqlite-journal").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(AuthorizationError, match="journal"):
+        StateStore.initialize(tmp_path / "fresh.sqlite")
+    assert not (tmp_path / "fresh.sqlite").exists()

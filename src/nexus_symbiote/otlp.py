@@ -66,6 +66,9 @@ IDENTIFIERS = frozenset(
         "network.transport",
         "server.address",
         "server.port",
+        "spiffe.id",
+        "peer.identity",
+        "gen_ai.tool.definition_hash",
     }
 )
 SERVICE_NAME = "service.name"
@@ -498,12 +501,19 @@ class TraceReader:
         return values, content, semantic
 
     def _identifier(self, key: str, value: Mapping[str, Any]) -> Identifier:
-        result = _port(value) if key == "server.port" else self._text(value.get("stringValue"))
+        result = (
+            _port(value)
+            if key == "server.port"
+            else self._text(
+                value.get("stringValue"),
+                allow_spiffe=key in ("spiffe.id", "peer.identity"),
+            )
+        )
         if isinstance(result, Unreadable):
             self.unreadable[result.reason] += 1
         return result
 
-    def _text(self, value: object) -> Identifier:
+    def _text(self, value: object, *, allow_spiffe: bool = False) -> Identifier:
         if not isinstance(value, str):
             return Unreadable("invalid")
         if len(value) > MAX_IDENTIFIER_CHARS:
@@ -511,4 +521,10 @@ class TraceReader:
         text = value.strip(_TRIM)
         if not text:
             return Unreadable("invalid")
+        if (
+            allow_spiffe
+            and re.fullmatch(r"spiffe://[a-z0-9._-]+(?:/[A-Za-z0-9._-]+)+", text)
+            and not _credential_shaped(text.removeprefix("spiffe://"))
+        ):
+            return text
         return Unreadable("withheld") if _credential_shaped(text) else text

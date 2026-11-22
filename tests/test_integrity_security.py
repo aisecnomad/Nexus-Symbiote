@@ -808,3 +808,107 @@ def test_imported_model_and_tool_claims_are_judged_as_imported_after_reconciliat
     model.serialization_safety = SerializationSafety.UNSAFE_CODE_EXECUTION
     target.write_text(forged.to_json())
     assert runner.invoke(main, args).exit_code == 1
+
+
+def test_mcp_plus_instruction_file_passes_validate_project_while_mcp_only_remains_unknown(
+    tmp_path,
+):
+    from click.testing import CliRunner
+
+    from nexus_symbiote.cli import main
+
+    project = tmp_path / "project"
+    project.mkdir()
+    server = {"command": "npx", "args": ["-y", "pinned-mcp@1.2.3"]}
+    (project / ".mcp.json").write_text(json.dumps({"mcpServers": {"pinned": server}}))
+    runner = CliRunner()
+    binding_env = {"NEXUS_SYMBIOTE_SOURCE_BINDING_KEY": "k" * 32}
+    mcp_only_bom = tmp_path / "mcp-only.json"
+    assert (
+        runner.invoke(
+            main,
+            ["scan", "--report-only", "--no-project-policy", str(project), "-o", str(mcp_only_bom)],
+            env=binding_env,
+        ).exit_code
+        == 0
+    )
+    mcp_only_val = runner.invoke(
+        main,
+        [
+            "validate",
+            str(mcp_only_bom),
+            "--project",
+            str(project),
+            "--no-project-policy",
+            "--json-output",
+        ],
+        env=binding_env,
+    )
+    assert mcp_only_val.exit_code == 1
+    assert json.loads(mcp_only_val.stdout)["integrity"]["status"] == "unknown"
+
+    # Adding an instruction file provides verifiable static artifact hash evidence and
+    # allows validate --project to pass, matching docs/known-limitations.md.
+    (project / "CLAUDE.md").write_text("Follow the repository instructions.\n")
+    with_prompt_bom = tmp_path / "with-prompt.json"
+    assert (
+        runner.invoke(
+            main,
+            [
+                "scan",
+                "--report-only",
+                "--no-project-policy",
+                str(project),
+                "-o",
+                str(with_prompt_bom),
+            ],
+            env=binding_env,
+        ).exit_code
+        == 0
+    )
+    with_prompt_val = runner.invoke(
+        main,
+        [
+            "validate",
+            str(with_prompt_bom),
+            "--project",
+            str(project),
+            "--no-project-policy",
+            "--json-output",
+        ],
+        env=binding_env,
+    )
+    assert with_prompt_val.exit_code == 0, with_prompt_val.output
+    report = json.loads(with_prompt_val.stdout)["integrity"]
+    assert report["status"] == "pass"
+    assert report["hashes_verified"] == 1
+
+
+@pytest.mark.parametrize("filename", ["model.h5", "model.tflite", "model.mlmodel", "model.pte"])
+def test_operator_digest_pin_does_not_bypass_format_unverified_on_non_safetensors_models(
+    tmp_path, filename
+):
+    from nexus_symbiote.utils.crypto import DigestPinPolicy
+
+    project = tmp_path / "project"
+    project.mkdir()
+    artifact = project / filename
+    payload = b"non-inspected-weights-payload-bytes"
+    artifact.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    comp = ModelComponent(
+        bom_ref=f"model:{filename}",
+        name=filename,
+        source_path=filename,
+        hashes={"sha256": f"sha256:{digest}"},
+        serialization_safety=SerializationSafety.UNKNOWN,
+    )
+    unpinned = IntegrityValidator().validate(AIBOM(components=[comp]), project)
+    assert unpinned.status == "unknown"
+
+    pinned = IntegrityValidator(
+        [DigestPinPolicy(artifact_path=artifact, expected_sha256=digest)]
+    ).validate(AIBOM(components=[comp]), project)
+    assert pinned.status == "unknown"
+    assert not pinned.is_valid
+    assert any(issue.category == "format_unverified" for issue in pinned.issues)

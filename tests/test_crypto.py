@@ -336,3 +336,186 @@ def test_a_bundle_over_the_byte_limit_is_refused_before_sigstore_is_imported(tmp
     assert result.error == "Sigstore bundle exceeds byte limit"
     bundle.write_bytes(oversized[:-1])
     assert verify_sigstore_bundle(artifact, bundle, identity, issuer).error == SIGSTORE_MISSING
+
+
+def test_rekor_checkpoint_witness_and_oms_dsse_verification(
+    tmp_path, local_signed_bundle, monkeypatch
+):
+    import base64
+    from types import SimpleNamespace
+
+    from sigstore.models import Bundle
+    from sigstore.verify import Verifier
+
+    from nexus_symbiote.core import AIBOM
+    from nexus_symbiote.scanners.model import OMS_DSSE_METHOD, ModelScanner
+    from nexus_symbiote.utils.crypto import SigstoreArtifactPolicy, verify_sigstore_digest
+    from nexus_symbiote.validators.integrity import IntegrityValidator
+
+    artifact, bundle_path, identity, issuer = local_signed_bundle
+    root_bytes = bytes.fromhex("ab" * 32)
+    root_b64 = base64.b64encode(root_bytes).decode("ascii")
+    valid_envelope = (
+        f"rekor.sigstore.dev - 1\n1000\n{root_b64}\n\n— rekor.sigstore.dev wNI9ajBFAiEAtest\n"
+    )
+    bundle = Bundle.from_json("{}")
+    bundle.log_entry._inner.inclusion_proof = SimpleNamespace(
+        log_index=42,
+        tree_size=1000,
+        root_hash=root_bytes,
+        checkpoint=SimpleNamespace(envelope=valid_envelope),
+    )
+
+    ok = verify_sigstore_bundle(
+        artifact,
+        bundle_path,
+        identity,
+        issuer,
+        rekor_root_hash=f"sha256:{root_bytes.hex()}",
+        minimum_rekor_tree_size=1000,
+    )
+    assert ok.verified
+    assert ok.details["rekor_log_index"] == 42
+    assert ok.details["rekor_tree_size"] == 1000
+    assert ok.details["rekor_root_hash"] == f"sha256:{root_bytes.hex()}"
+    assert ok.details["rekor_checkpoint_origin"] == "rekor.sigstore.dev - 1"
+
+    # Bit-62 shifted tree_size or log_index forgery against signed checkpoint note is rejected.
+    for forged_index, forged_size in (((1 << 62) | 42, 1000), (42, (1 << 62) | 1000)):
+        bundle.log_entry._inner.inclusion_proof = SimpleNamespace(
+            log_index=forged_index,
+            tree_size=forged_size,
+            root_hash=root_bytes,
+            checkpoint=SimpleNamespace(envelope=valid_envelope),
+        )
+        forged = verify_sigstore_bundle(
+            artifact,
+            bundle_path,
+            identity,
+            issuer,
+            minimum_rekor_tree_size=1000,
+        )
+        assert not forged.verified
+        assert "does not match signed checkpoint" in (forged.error or "")
+
+    bundle.log_entry._inner.inclusion_proof = SimpleNamespace(
+        log_index=42,
+        tree_size=1000,
+        root_hash=root_bytes,
+        checkpoint=SimpleNamespace(envelope=valid_envelope),
+    )
+    bad_root = verify_sigstore_bundle(
+        artifact,
+        bundle_path,
+        identity,
+        issuer,
+        rekor_root_hash="sha256:" + "cd" * 32,
+    )
+    assert not bad_root.verified
+    assert "root hash" in (bad_root.error or "")
+
+    bad_size = verify_sigstore_bundle(
+        artifact,
+        bundle_path,
+        identity,
+        issuer,
+        minimum_rekor_tree_size=1001,
+    )
+    assert not bad_size.verified
+    assert "tree size" in (bad_size.error or "")
+
+    # OpenSSF Model Signing v1.0 DSSE statement verification: subject[].digest is a manifest
+    # root digest (never matched as a weight file digest), and per-file digests live in
+    # predicate.resources[].
+    project = tmp_path / "oms_project"
+    project.mkdir()
+    weight = project / "model.safetensors"
+    header = b'{"x":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}    '
+    weight.write_bytes(len(header).to_bytes(8, "little") + header + b"abcd")
+    weight_hex = hashlib.sha256(weight.read_bytes()).hexdigest()
+
+    dsse_bundle_bytes = json.dumps(
+        {
+            "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "verificationMaterial": {},
+            "dsseEnvelope": {"payload": "", "payloadType": "application/vnd.in-toto+json"},
+        }
+    ).encode("utf-8")
+    oms_bundle_path = tmp_path / "oms.bundle.json"
+    oms_bundle_path.write_bytes(dsse_bundle_bytes)
+    statement = {
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [{"name": "manifest", "digest": {"sha256": "11" * 32}}],
+        "predicateType": "https://model_signing/signature/v1.0",
+        "predicate": {
+            "resources": [
+                {"name": "model.safetensors", "algorithm": "sha256", "digest": weight_hex}
+            ]
+        },
+    }
+    monkeypatch.setattr(
+        Verifier,
+        "verify_dsse",
+        lambda self, b, p: (
+            "application/vnd.in-toto+json",
+            json.dumps(statement).encode("utf-8"),
+        ),
+    )
+
+    policy = SigstoreArtifactPolicy(
+        weight,
+        oms_bundle_path,
+        identity,
+        issuer,
+        allow_oms_dsse=True,
+        rekor_root_hash=f"sha256:{root_bytes.hex()}",
+        minimum_rekor_tree_size=500,
+    )
+    scan_res = ModelScanner([policy]).scan(project)
+    assert len(scan_res.components) == 1
+    comp = scan_res.components[0]
+    assert comp.signing_status == "sigstore-signed"
+    assert comp.claims["signing_status"].method == OMS_DSSE_METHOD
+    val_report = IntegrityValidator([policy]).validate(AIBOM(components=[comp]), project)
+    assert val_report.is_valid
+    assert val_report.signatures_verified == 1
+
+    # Missing predicate.resources (even when subject[].digest equals weight_hex) or
+    # concatenated 64-byte digest must fail closed.
+    for bad_stmt in (
+        {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": "model.safetensors", "digest": {"sha256": weight_hex}}],
+            "predicateType": "https://model_signing/signature/v1.0",
+            "predicate": {},
+        },
+        {
+            **statement,
+            "predicate": {
+                "resources": [
+                    {
+                        "name": "model.safetensors",
+                        "algorithm": "sha256",
+                        "digest": weight_hex + weight_hex,
+                    }
+                ]
+            },
+        },
+    ):
+        monkeypatch.setattr(
+            Verifier,
+            "verify_dsse",
+            lambda self, b, p, s=bad_stmt: (
+                "application/vnd.in-toto+json",
+                json.dumps(s).encode("utf-8"),
+            ),
+        )
+        rejected = verify_sigstore_digest(
+            weight_hex,
+            dsse_bundle_bytes,
+            identity,
+            issuer,
+            allow_oms_dsse=True,
+            artifact_name="model.safetensors",
+        )
+        assert not rejected.verified

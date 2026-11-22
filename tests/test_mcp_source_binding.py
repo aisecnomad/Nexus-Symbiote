@@ -14,6 +14,7 @@ from nexus_symbiote.core.hashing import hash_tool_definition
 from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolComponent
 from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV, MCPScanner
 from nexus_symbiote.validators.completeness import CompletenessValidator
+from tests.support import scaling_ratio
 
 KEY = "k" * 40
 
@@ -1075,12 +1076,114 @@ def test_yarn_environment_file_leaves_the_registry_unresolved(tmp_path):
     assert ".env.yarn:environment=[unresolved]" in server.properties["package_sources"]
 
 
-@pytest.mark.parametrize("command", ["npx", "bunx"])
-def test_token_shaped_environment_names_are_not_source_labels(tmp_path, command):
+@pytest.mark.parametrize(
+    "command,label", [("npx", "env:npm_config_[other]"), ("bunx", "env:[redacted]")]
+)
+def test_token_shaped_environment_names_are_not_source_labels(tmp_path, command, label):
     token = "ghp_" + "Zx8Yw6Vu4Ts2Rq0Po8Nm6Lk4Jh2Gf0Ed8Cb6"
     env = {f"npm_config_@{token}:registry": "https://npm.attacker.test/"}
     server = _server(tmp_path, {**PINNED_NPX, "command": command, "env": env})
-    assert server.properties["package_sources"] == ["env:[redacted]=https://npm.attacker.test"]
+    # npm's resolver view names a scope no launched package has as [other].
+    assert server.properties["package_sources"] == [f"{label}=https://npm.attacker.test"]
+
+
+LOWER_TOKEN = "ghp_" + "zx8yw6vu4ts2rq0po8nm6lk4jh2gf0ed8cb6"
+HEX_SECRET = "a1b2c3d4e5f60718293a4b5c6d7e8f90"  # noqa: S105 - a fixture, not a credential
+
+
+@pytest.mark.parametrize(
+    "config,files,secret",
+    [
+        (
+            {"command": "npx", "args": [f"--@{LOWER_TOKEN}:registry=https://r.test/", "s@1.2.3"]},
+            {},
+            LOWER_TOKEN,
+        ),
+        (
+            {
+                "command": "npx",
+                "args": [f"--@{HEX_SECRET}:registry=https://r.test/", "s@1.2.3"],
+                "env": {"NPM_TOKEN": HEX_SECRET},
+            },
+            {},
+            HEX_SECRET,
+        ),
+        (
+            {
+                "command": "npx",
+                "args": ["-y", "s@1.2.3"],
+                "env": {
+                    "NPM_TOKEN": HEX_SECRET,
+                    f"npm_config_@{HEX_SECRET}:registry": "https://r.test/",
+                },
+            },
+            {},
+            HEX_SECRET,
+        ),
+        (
+            {"command": "npx", "args": ["-y", "s@1.2.3"]},
+            {
+                ".npmrc": f"@{HEX_SECRET}:registry=https://r.test/\n//r.test/:_authToken={HEX_SECRET}\n"
+            },
+            HEX_SECRET,
+        ),
+    ],
+)
+def test_a_scope_no_launched_package_has_is_not_exported(tmp_path, config, files, secret):
+    server = _with_files(tmp_path, config, files)
+    exported = server.model_dump_json()
+    assert secret not in exported
+    assert any(
+        "[other]" in label
+        for label in [
+            *server.properties.get("package_sources", []),
+            *server.properties.get("resolver_settings", []),
+        ]
+    )
+
+
+def test_a_launched_package_scope_is_still_named(tmp_path):
+    config = {"command": "npx", "args": ["--@acme:registry=https://r.test/", "@acme/s@1.2.3"]}
+    server = _server(tmp_path, config)
+    assert server.properties["package_sources"] == ["--@acme:registry=https://r.test"]
+    server = _with_files(tmp_path, PINNED_NPX, {".npmrc": "@acme:registry=https://r.test/\n"})
+    assert server.properties["resolver_settings"] == [".npmrc:@acme:registry"]
+
+
+def test_a_launched_scope_that_is_a_server_secret_is_withheld(tmp_path):
+    # Not token-shaped: only the scrubbed-label guards keep the scope out of the labels.
+    secret = "zq7xk3mw9pv2"  # noqa: S105 - a fixture, not a credential
+    config = {
+        "command": "npx",
+        "args": ["-y", f"--@{secret}:registry=https://o.test/", f"@{secret}/s@1.2.3"],
+        "env": {"NPM_TOKEN": secret},
+    }
+    server = _with_files(tmp_path, config, {".npmrc": f"@{secret}:registry=https://r.test/\n"})
+    assert secret not in server.model_dump_json()
+    assert server.properties["resolver_settings"] == ["[redacted]"]
+    assert server.properties["package_sources"] == [
+        "[redacted]=https://o.test",
+        "[redacted]=https://r.test",
+    ]
+
+
+def test_scoped_registry_labels_stay_linear_in_packages_times_settings(tmp_path):
+    projects = {}
+    for scale in (1, 8):
+        project = tmp_path / str(scale)
+        project.mkdir()
+        packages = [word for i in range(50 * scale) for word in ("-p", f"@s{i}/p@1.0.0")]
+        config = {"command": "npx", "args": ["-y", *packages, "p"]}
+        (project / ".mcp.json").write_text(json.dumps({"mcpServers": {"db": config}}))
+        settings = "".join(f"@z{i}:registry=https://r.test/\n" for i in range(800 * scale))
+        (project / ".npmrc").write_text(settings)
+        projects[scale] = project
+
+    def run(scale: int) -> None:
+        MCPScanner().scan(projects[scale])
+
+    # Checking each scoped setting against every launched package grows 64 times.
+    assert scaling_ratio(run, factor=8) < 16
 
 
 @pytest.mark.parametrize("variable", ["YARN_YARN_PATH", "YARN_PLUGINS"])

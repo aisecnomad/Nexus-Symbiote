@@ -7,7 +7,7 @@
 |---|---|
 | `none` (default) | Builds, tests and attests a release candidate. Uploads nothing to a package index. |
 | `testpypi` | The same candidate, then uploads it to [TestPyPI](https://test.pypi.org/p/nexus-symbiote) as a rehearsal. |
-| `pypi` | The same candidate, then uploads it to [PyPI](https://pypi.org/p/nexus-symbiote). Refused until the release commit has been on `main` for 24 hours and its signed tag exists. |
+| `pypi` | The same candidate, then uploads it to [PyPI](https://pypi.org/p/nexus-symbiote) and pushes its [container image](container-image.md) to `ghcr.io`. Refused until the release commit has been on `main` for 24 hours and its signed tag exists. |
 
 A second input, `soak_override`, stays empty. To publish an urgent security fix before the
 24 hours are up, give the reason there; the run log records it.
@@ -119,7 +119,9 @@ as described below.
      expected_sha="$(awk -v file="dist/$wheel" \
        '$2 == file { n++; print $1 } END { if (n != 1) exit 1 }' "$run_checksums")"
      [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
-     (cd "$wheel_dir" && printf '%s  %s\n' "$expected_sha" "$wheel" | sha256sum --strict -c -)
+     check=(sha256sum --strict -c -)
+     command -v sha256sum >/dev/null || check=(shasum -a 256 --strict -c -)  # macOS
+     (cd "$wheel_dir" && printf '%s  %s\n' "$expected_sha" "$wheel" | "${check[@]}")
      "$rehearsal/bin/python" -m pip install --index-url https://pypi.org/simple/ "$wheel_dir/$wheel"
      "$rehearsal/bin/nexus-symbiote" --version
    )
@@ -171,7 +173,14 @@ as described below.
    [repository controls](repository-controls.md#apply-the-outstanding-controls)) for
    the release commit. Review the artifacts of this exact run at the approval gate.
    For an urgent security fix, set `soak_override` to the reason instead of waiting;
-   say so in the release notes.
+   say so in the release notes. Once the upload has succeeded, the `image` job waits for
+   a second approval of the `pypi` environment: check the published files first. It
+   builds the image from the run's wheel, runs it without the network, pushes it to
+   `ghcr.io/<owner>/<repository>` (lowercased) under the version, and the shell-free
+   `image-attest` job attests the pushed digest; `image-verify` then checks that
+   attestation as step 6 does. After the first release, check the package's visibility:
+   depending on the account's settings a new `ghcr.io` package can start private, and
+   only a public one can be pulled and verified by others.
 6. Verify the published files against this run's checksums and provenance. Constrain
    the signer, ref, commit and runner, not only the repository:
 
@@ -182,6 +191,10 @@ as described below.
      --source-ref refs/heads/main --source-digest <release commit SHA> \
      --deny-self-hosted-runners
    ```
+
+   For the image, take the digest from the `image` job's summary and verify it the
+   same way, as `oci://ghcr.io/aisecnomad/nexus-symbiote@<digest>` (see
+   [container image](container-image.md#verify-and-run-a-published-image)).
 
    Do not claim publication succeeded until the package index and the source revision
    agree.
@@ -220,6 +233,8 @@ as described below.
      --source-ref refs/heads/main --source-digest <release commit SHA> \
      --deny-self-hosted-runners
    ```
+
+   Name the image digest in the notes.
 8. Update the records that describe the release, in one documentation pull request:
    the changelog heading's date (the day of the PyPI upload, in UTC), `date-released`
    in `CITATION.cff`, the dated rows of the
@@ -243,6 +258,9 @@ as described below.
   run: `publish` downloads that run's `release-distributions` artifact again instead
   of rebuilding. If the index still refuses the retry, leave the version incomplete
   and publish the next patch version.
+- Image failure after the PyPI upload: the upload stands. Use **Re-run failed jobs** on
+  the same run; the image job builds again from that run's wheel, the version's tag
+  moves to the new digest, and `image-attest` attests that digest.
 - Burned TestPyPI version: PyPI can still take the version, but the published bytes
   would not be the rehearsed ones. Prefer bumping and rehearsing again.
 - Name rejected at upload time: the publish job fails before any file lands. Choose a
@@ -350,7 +368,10 @@ precise acceptance policy and its knowledge limits in
 metadata only. A separate attest job holds OIDC and attestation-write permissions,
 and only the environment-gated publish job can upload, through the trusted
 publisher configured for its environment. Neither of those jobs checks out or runs
-project source or any shell step. Every job that receives artifacts downloads them
+project source or any shell step. On a `pypi` run, the image job, gated by the same
+environment, holds a token that can write packages but no OIDC; the image-attest job holds
+OIDC and attestation-write permissions for the digest that job pushed, and runs no
+shell either. Every job that receives artifacts downloads them
 by ID with `digest-mismatch: error`, so a corrupted transfer stops the run.
 
 **Attestation verification.** After attestation, a separate verification job with
