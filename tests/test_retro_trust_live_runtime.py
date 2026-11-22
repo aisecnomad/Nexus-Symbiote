@@ -502,7 +502,7 @@ def test_session_never_swallows_pinned_process_error_when_pre_call_exception_occ
         raise ValueError("pre-call descriptor rejection")
 
     with pytest.raises(AuthorizationError, match="orphan survived") as caught, session:
-        session.describe("server:mail", "ok")
+        session.describe("server:mail", "send")
         fail_before_call()
     assert isinstance(caught.value.__cause__, PinnedProcessError)
     assert isinstance(caught.value.__context__, ValueError)
@@ -1013,3 +1013,91 @@ def test_single_value_multiplicity_covers_applicator_combinations_and_caps(
     # Path-state budget overflow fails closed.
     monkeypatch.setattr(validation, "_MAX_PATH_STATES", 1)
     assert validation._evaluate(dialects, combined_obj, None) == validation._SCHEMA
+
+
+def _tag_sharing_union(variants: int) -> dict[str, object]:
+    tag = {"type": "object", "properties": {"name": {"type": "string"}}}
+    defs: dict[str, object] = {"Tag": tag}
+    for index in range(variants):
+        defs[f"V{index}"] = {
+            "type": "object",
+            "properties": {
+                "kind": {"const": f"k{index}"},
+                "tags": {"type": "array", "items": {"$ref": "#/$defs/Tag"}},
+            },
+            "required": ["kind"],
+        }
+    return {
+        "$defs": defs,
+        "oneOf": [{"$ref": f"#/$defs/V{index}"} for index in range(variants)],
+    }
+
+
+def test_output_schema_preflight_admits_definitions_shared_by_a_few_branches(
+    dialects: object,
+) -> None:
+    """A pydantic discriminated union whose variants share ``list[Tag]`` is ordinary."""
+    from nexus_symbiote import runtime_validation as validation
+
+    assert validation._evaluate(dialects, _tag_sharing_union(2), None) == validation._VALID
+    assert validation._evaluate(dialects, _tag_sharing_union(12), None) == validation._VALID
+    item = {"type": "object", "properties": {"id": {"type": "string"}}}
+    shared_map = {
+        "$defs": {"Item": item},
+        "allOf": [
+            {
+                "properties": {
+                    "a": {"type": "object", "additionalProperties": {"$ref": "#/$defs/Item"}}
+                }
+            },
+            {
+                "properties": {
+                    "b": {"type": "object", "additionalProperties": {"$ref": "#/$defs/Item"}}
+                }
+            },
+        ],
+    }
+    assert validation._evaluate(dialects, shared_map, None) == validation._VALID
+    refined = {
+        "$defs": {
+            "Row": item,
+            "Base": {"properties": {"rows": {"type": "array", "items": {"$ref": "#/$defs/Row"}}}},
+        },
+        "allOf": [
+            {"$ref": "#/$defs/Base"},
+            {"properties": {"rows": {"type": "array", "items": {"$ref": "#/$defs/Row"}}}},
+        ],
+    }
+    assert validation._evaluate(dialects, refined, None) == validation._VALID
+
+
+@pytest.mark.usefixtures("nonisolated_pinned_fixtures")
+def test_session_lets_an_interrupt_through_with_the_teardown_failure_noted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    terminate = session_module.terminate_process_group
+
+    def fail_teardown(proc: subprocess.Popen[bytes]) -> bool:
+        terminate(proc)
+        raise PinnedProcessError("isolation-teardown-failed", "orphan survived")
+
+    monkeypatch.setattr(session_module, "terminate_process_group", fail_teardown)
+    path, pin, _log = make_launcher(tmp_path, "ok")
+    session = PinnedStdioSession(command=str(path), sha256=pin, server_id="server:mail")
+    with pytest.raises(KeyboardInterrupt) as caught, session:
+        session.describe("server:mail", "send")
+        raise KeyboardInterrupt
+    assert any("orphan survived" in note for note in getattr(caught.value, "__notes__", []))
+
+
+def test_teardown_reasons_are_documented_reason_codes() -> None:
+    from nexus_symbiote.runtime import REASONS
+
+    assert {"isolation-unavailable", "isolation-teardown-failed"} <= REASONS.keys()
+    table = Path("docs/runtime-contract-reference.md").read_text(encoding="utf-8")
+    assert "| `isolation-teardown-failed` |" in table
+
+
+def test_a_parent_segment_in_a_trust_anchor_path_gets_its_own_message(tmp_path: Path) -> None:
+    error = crypto_mod._trust_anchor_error(tmp_path / ".." / tmp_path.name, None)
+    assert error is not None and "'..'" in error

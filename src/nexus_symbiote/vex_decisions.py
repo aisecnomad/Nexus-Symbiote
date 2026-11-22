@@ -255,6 +255,8 @@ def _check_operator_directory(path: Path, trusted: set[int]) -> None:
     )
     if failure is not None:
         reason, _ancestor = failure
+        if reason == "parent_segment":
+            raise VEXDecisionError("Operator material must use a path without parent traversal")
         if reason == "uninspectable":
             raise VEXDecisionError("Cannot safely read operator material ancestor")
         raise VEXDecisionError("Operator material has a writable or untrusted ancestor")

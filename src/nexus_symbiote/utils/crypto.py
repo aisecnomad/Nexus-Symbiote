@@ -358,11 +358,12 @@ def _check_trusted_ancestors(
     """Inspect ``directory`` and its ancestors up to the root for symlink, owner, or write risks.
 
     Returns ``None`` when every checked ancestor is safe, or ``(reason, failing_path)`` where
-    ``reason`` is one of ``"uninspectable"``, ``"symlink"``, ``"not_dir"``, ``"untrusted_owner"``,
-    or ``"writable"``.
+    ``reason`` is one of ``"parent_segment"``, ``"uninspectable"``, ``"symlink"``,
+    ``"not_dir"``, ``"untrusted_owner"`` or ``"writable"``.
     """
     if ".." in directory.parts or (anchor_path is not None and ".." in anchor_path.parts):
-        return "uninspectable", directory
+        # Normalizing would judge the collapsed path, not the directories the walk passes.
+        return "parent_segment", directory
     abs_dir = _absolute_through_root_links(directory)
     chain = (abs_dir, *abs_dir.parents) if include_self else tuple(abs_dir.parents)
     walk = tuple(reversed(chain)) if verify_fd else chain
@@ -427,6 +428,8 @@ def _ancestor_error(directory: Path, *, dir_what: str, remedy: str) -> str | Non
     if failure is None:
         return None
     reason, ancestor = failure
+    if reason == "parent_segment":
+        return f"{dir_what} {ancestor} must not contain a '..' segment"
     if reason == "uninspectable":
         return f"{dir_what} {ancestor} cannot be inspected"
     if reason == "symlink":
@@ -469,6 +472,8 @@ def _trust_anchor_error(path: Path, info: os.stat_result | None) -> str | None:
     if failure is None:
         return None
     reason, _ancestor = failure
+    if reason == "parent_segment":
+        return "must be given without a '..' segment; name it from a directory above it"
     if reason == "uninspectable":
         return "must lie in directories that can be inspected"
     return (

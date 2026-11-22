@@ -31,6 +31,7 @@ _MAX_OUTPUT_APPLICATOR_DEPTH = 160
 _MAX_OUTPUT_APPLICATOR_STEPS = 1024
 _MAX_OUTPUT_UNION_STEPS = 4096
 _MAX_OUTPUT_REPEATED_STEPS = 32768
+_MIN_SHARED_MULTIPLICITY = 32
 MAX_SAFE_INTEGER = 2**53 - 1
 # Interpreter start-up and imports get their own budget, so a slow or throttled
 # host does not spend the evaluation budget before the untrusted input arrives.
@@ -1290,7 +1291,16 @@ def _collection_work_exceeds_budget(
             count = counts.get(current, 0)
             if not count:
                 continue
-            dup = min(step_cap, max(1, max_dup.get(current, 1)))
+            multiplicity = max(1, max_dup.get(current, 1))
+            # A value reaches a shared definition once per in-place path, so its
+            # multiplicity stays within the schema's own size unless paths compound:
+            # a chain of allOf arms that doubles per level reaches 2**depth from a
+            # few dozen nodes. The raw count is not capped; a shared definition
+            # multiplies the visits of every element, and a bound on the product
+            # refused ordinary unions whose variants share a list.
+            if multiplicity > max(_MIN_SHARED_MULTIPLICITY, len(order)):
+                return True
+            dup = min(step_cap, multiplicity)
             node = nodes[current]
             # Only schemas that abort collection validation on a non-conforming
             # value can bound repetitions by a conforming value's node footprint.
@@ -1300,8 +1310,6 @@ def _collection_work_exceeds_budget(
                 MAX_JSON_NODES if current in fallible else MAX_JSON_NODES // footprint[current]
             )
             count = min(count, distinct_limit * dup)
-            if count > _MAX_OUTPUT_REPEATED_STEPS:
-                return True
             costly = work[current] > 32 or (current in nested and branching[current])
             if costly and count * work[current] > _MAX_OUTPUT_REPEATED_STEPS:
                 return True

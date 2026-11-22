@@ -364,6 +364,11 @@ class PinnedStdioSession:
                 else "launcher cleanup did not complete; the tool may still be running"
             ) from teardown
         if isinstance(teardown, PinnedProcessError):
+            if exc is not None and not isinstance(exc, Exception):
+                # An interrupt or an exit is not replaced by an error a caller's loop
+                # catches; the teardown failure rides along as a note.
+                exc.add_note(f"launcher teardown failed: {teardown}")
+                return
             raise AuthorizationError(str(teardown), reason=teardown.reason) from teardown
         if exc is not None:
             return
