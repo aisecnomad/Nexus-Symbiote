@@ -115,6 +115,28 @@ def _root_relative(source_path: str | None, relative: Callable[[str], str]) -> s
     return path.as_posix()
 
 
+def _yaml_flow_depth_exceeded(text: str, *, limit: int = 64) -> bool:
+    """Linear-time bracket depth guard so yaml.scan cannot blow Python recursion stack."""
+    from nexus_symbiote import policy as policy_mod
+
+    checker = getattr(policy_mod, "check_yaml_flow_depth", None)
+    if callable(checker):
+        try:
+            checker(text, max_depth=limit)
+            return False
+        except ValueError:
+            return True
+    depth = 0
+    for ch in text:
+        if ch in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif ch in "]}":
+            depth = max(0, depth - 1)
+    return False
+
+
 def _parse_manifest(text: str, problems: list[str]) -> AgentDeclaration | None:
     from nexus_symbiote.policy import parse_yaml_mapping
 
@@ -124,6 +146,8 @@ def _parse_manifest(text: str, problems: list[str]) -> AgentDeclaration | None:
         problems.append(f"{MANIFEST}: YAML parser unavailable")
         return None
     try:
+        if _yaml_flow_depth_exceeded(text):
+            raise ValueError("unsupported YAML nesting depth")
         # The manifest comes from the checkout: refuse YAML graphs and unbounded documents.
         for index, token in enumerate(yaml.scan(text)):
             if index >= MAX_MANIFEST_YAML_TOKENS or isinstance(
@@ -212,7 +236,15 @@ def _manifest_dependencies(
     """Bind declared instructions and local models to collected records before changing the BOM."""
     from nexus_symbiote import limits
     from nexus_symbiote.scanners.base import project_relative
-    from nexus_symbiote.scanners.prompt import detect_invisible_characters
+    from nexus_symbiote.scanners.credential_files import credential_gap, credential_shaped
+    from nexus_symbiote.scanners.prompt import (
+        _ESCAPED_FORMATS,
+        _escaped_text,
+        _markup,
+        detect_hidden_markup,
+        detect_invisible_characters,
+    )
+    from nexus_symbiote.utils.terminal import neutralize
 
     in_root = project_relative(files.root)
     collected_text: dict[str, list[AnyComponent]] = {}
@@ -236,18 +268,28 @@ def _manifest_dependencies(
             continue
         if not _readable_entry(files, path, locator, problems):
             continue
+        rel = path.as_posix()
+        linked = None if credential_shaped(rel) else files.in_root_target(path)
+        cred_reason = credential_gap(rel, None if linked is None else linked.as_posix())
+        if cred_reason is not None:
+            problems.append(f"{locator}: {cred_reason}; not read")
+            continue
         raw = files.read_bytes(path)
         if raw is None:
             problems.append(f"{locator}: the declared instruction could not be collected safely")
             continue
+        followed = files.link_target(path)
+        if followed is not None and credential_shaped(followed):
+            problems.append(f"{locator}: file changed during collection")
+            continue
         digest = hash_bytes(raw)
-        records = collected_text.get(path.as_posix(), [])
+        records = collected_text.get(rel, [])
         if records:
             # The collector already inventoried this file, with its own checks.
             mismatches = {
                 reason
                 for record in records
-                if (reason := _collection_mismatch(record, path.as_posix(), raw)) is not None
+                if (reason := _collection_mismatch(record, rel, raw)) is not None
             }
             problems.extend(f"{locator}: {reason}" for reason in sorted(mismatches))
             continue
@@ -256,21 +298,43 @@ def _manifest_dependencies(
         except UnicodeDecodeError:
             problems.append(f"{locator}: declared instruction is not UTF-8 text")
             continue
-        ref = "prompt:manifest:" + hashlib.sha256(path.as_posix().encode()).hexdigest()[:24]
+        markup = _markup(rel)
+        decoded = (
+            _escaped_text(rel, text, [])
+            if markup or path.suffix.lower() in _ESCAPED_FORMATS
+            else None
+        )
+        risks: list[RiskAssessment] = []
+        if len(raw) > 50_000:
+            risks.append(
+                RiskAssessment(
+                    severity=RiskSeverity.MEDIUM,
+                    category="prompt_size",
+                    detail=(
+                        f"'{neutralize(rel)}' is {len(raw):,} bytes — "
+                        "large prompts increase injection surface."
+                    ),
+                    recommendation="Review for unnecessary content.",
+                )
+            )
+        risks.extend(detect_invisible_characters(text, rel, decoded=decoded))
+        if markup:
+            risks.extend(detect_hidden_markup(text, rel))
+        ref = "prompt:manifest:" + hashlib.sha256(rel.encode()).hexdigest()[:24]
         additions.append(
             PromptComponent(
                 bom_ref=ref,
                 name=path.name,
-                source_path=path.as_posix(),
+                source_path=rel,
                 content_hash=digest,
                 assurance_level=AssuranceLevel.OBSERVED,
-                risks=detect_invisible_characters(text, path.as_posix()),
+                risks=risks,
                 claims={
                     "content_hash": ClaimEvidence(
                         assurance=AssuranceLevel.OBSERVED,
                         method="confined-file-sha256",
                         scope="repository",
-                        locator=path.as_posix(),
+                        locator=rel,
                         observed_at=bom.metadata.timestamp,
                     )
                 },
@@ -736,9 +800,12 @@ def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
         {auth.principal for ref in reach for auth in getattr(nodes[ref], "authorizations", [])}
     )
     credential_names = sorted(
-        var
-        for var, holders in env_index.items()
-        if len(holders) > 1 and not holders.isdisjoint(reach)
+        (
+            var
+            for var, holders in env_index.items()
+            if len(holders) > 1 and not holders.isdisjoint(reach)
+        ),
+        key=lambda var: (component_ref not in env_index[var], var),
     )
     shared_credentials: dict[str, list[str]] = {}
     omitted_holders: dict[str, int] = {}

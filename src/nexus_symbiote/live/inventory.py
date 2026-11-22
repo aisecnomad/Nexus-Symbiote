@@ -27,6 +27,7 @@ from nexus_symbiote.core.models import (
     ClaimEvidence,
     CompletenessClaim,
     MCPServerComponent,
+    RiskAssessment,
     ToolComponent,
 )
 from nexus_symbiote.live.verify import observed_server_properties, observed_tool_properties
@@ -104,6 +105,7 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
                 ),
                 trust_tier=TrustTier.THIRD_PARTY_UNSIGNED,
                 assurance_level=AssuranceLevel.OBSERVED,
+                risks=[RiskAssessment.model_validate(item) for item in observed.text_risks],
                 claims={
                     "tool_definition": claim.model_copy(
                         update={"method": "https-mcp-tools-list", "scope": "served-descriptor"}
@@ -122,6 +124,9 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
         "server_info": result.server_info,
         "capabilities": result.server_capabilities,
     }
+    server_risks: list[RiskAssessment] = [
+        RiskAssessment.model_validate(item) for item in result.server_text_risks
+    ]
     if result.instructions_hash is not None:
         shown["instructions"] = result.instructions
         shown["instructions_hash"] = result.instructions_hash
@@ -141,6 +146,8 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
                 ),
                 key=lambda entry: (entry["identity"], entry["digest"]),
             )
+            for item in items:
+                server_risks.extend(RiskAssessment.model_validate(r) for r in item.text_risks)
     server_info = result.server_info or {}
     version = server_info.get("version")
     server = MCPServerComponent(
@@ -156,6 +163,7 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
         ),
         trust_tier=TrustTier.THIRD_PARTY_UNSIGNED,
         assurance_level=AssuranceLevel.OBSERVED,
+        risks=server_risks,
         claims={"server_declaration": claim},
         properties={
             "collection_mode": "live-observation",

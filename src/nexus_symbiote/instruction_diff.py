@@ -57,6 +57,7 @@ from nexus_symbiote.scanners.prompt import (
     _hidden_counts,
     _import_tokens,
     _line_separator_counts,
+    _prompt_candidate,
     _resolve_import,
 )
 from nexus_symbiote.utils.confined import ConfinedCollection, fold_name
@@ -162,6 +163,11 @@ class InstructionChange:
         return payload
 
 
+_RULE_DIRECTORIES = frozenset(
+    d for d, kind in INSTRUCTION_DIRECTORIES.items() if kind == "rules-file"
+)
+
+
 @dataclass(frozen=True)
 class _ParsedInstruction:
     rel_path: str
@@ -177,6 +183,7 @@ class _ParsedInstruction:
     imports: tuple[frozenset[str], dict[str, list[tuple[int, int]]]]
     refs: tuple[frozenset[str], dict[str, list[tuple[int, int]]]]
     signal_readings: dict[str, tuple[frozenset[str], frozenset[str]]]
+    always_apply_false: bool = False
 
 
 def _mask_multiline_pem_spans(content: str, *, start_in_pem: bool = False) -> tuple[str, bool]:
@@ -334,28 +341,65 @@ def _parse_frontmatter_payload(language: str, raw: str) -> dict[str, Any]:
 
 def _parse_frontmatter(
     rel_path: str, content: str, failures: list[str]
-) -> tuple[dict[str, Any], str]:
+) -> tuple[list[dict[str, Any]], str]:
     if not _uses_frontmatter(rel_path):
-        return {}, content
+        return [], content
     candidates = front_matter_candidates(content)
     if not candidates:
-        return {}, content
+        return [], content
     language, raw_fm, body = candidates[0]
+    metas: list[dict[str, Any]] = []
+    primary_ok = False
     if not raw_fm.strip():
-        return {}, body
-    try:
-        parsed = _parse_frontmatter_payload(language, raw_fm)
-    except (PolicyError, ValueError, yaml.YAMLError, RecursionError):
-        if len(candidates) == 2:
-            alt_lang, alt_raw, alt_body = candidates[1]
+        primary_ok = True
+    else:
+        try:
+            metas.append(_parse_frontmatter_payload(language, raw_fm))
+            primary_ok = True
+        except (PolicyError, ValueError, yaml.YAMLError, RecursionError):
+            pass
+    if len(candidates) == 2:
+        alt_lang, alt_raw, alt_body = candidates[1]
+        if alt_raw.strip():
             try:
-                return _parse_frontmatter_payload(alt_lang, alt_raw), alt_body
+                metas.append(_parse_frontmatter_payload(alt_lang, alt_raw))
+                if not primary_ok:
+                    return metas, alt_body
             except (PolicyError, ValueError, yaml.YAMLError, RecursionError):
-                pass
+                if primary_ok:
+                    alt_fallback = _fallback_frontmatter_fields(alt_raw)
+                    if alt_fallback:
+                        metas.append(alt_fallback)
+    if not primary_ok:
         label = language.upper() if language in {"toml", "json"} else "YAML"
         failures.append(f"{rel_path}: invalid {label} front matter")
-        return _fallback_frontmatter_fields(raw_fm), body
-    return parsed, body
+        metas.append(_fallback_frontmatter_fields(raw_fm))
+    return metas, body
+
+
+_IGNORED_SIGNAL_FRONTMATTER_KEYS = frozenset(
+    {*_POLICY_FRONTMATTER_KEYS, *_TOOL_FRONTMATTER_KEYS, "globs", "applyTo", "paths", "alwaysApply"}
+)
+
+
+def _frontmatter_text_leaves(metas: list[dict[str, Any]]) -> list[str]:
+    """Collect string leaves from non-policy frontmatter keys so URLs/paths/markup are diffed."""
+    leaves: list[str] = []
+    pending: list[object] = []
+    for meta in metas:
+        for key, value in meta.items():
+            if key not in _IGNORED_SIGNAL_FRONTMATTER_KEYS:
+                pending.append(value)
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            if item.strip():
+                leaves.append(item)
+        elif isinstance(item, Mapping):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return leaves
 
 
 def _frontmatter_grants(meta: Mapping[str, Any]) -> frozenset[str]:
@@ -514,12 +558,23 @@ def _hidden_unicode_map(content: str) -> dict[str, int]:
 
 
 def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _ParsedInstruction:
-    meta, body = _parse_frontmatter(rel_path, content, failures)
+    metas, body = _parse_frontmatter(rel_path, content, failures)
     globs: set[str] = set()
-    for key in ("globs", "applyTo", "paths"):
-        globs.update(_glob_list(meta.get(key)))
-    always_apply = str(meta.get("alwaysApply")).strip().lower() == "true"
-    fm_grants = _frontmatter_grants(meta)
+    always_apply = False
+    always_apply_false = False
+    fm_grants_set: set[str] = set()
+    for meta in metas:
+        for key in ("globs", "applyTo", "paths"):
+            globs.update(_glob_list(meta.get(key)))
+        raw_aa = meta.get("alwaysApply")
+        if raw_aa is not None:
+            aa_norm = str(raw_aa).strip().lower()
+            if aa_norm == "true":
+                always_apply = True
+            elif aa_norm == "false":
+                always_apply_false = True
+        fm_grants_set.update(_frontmatter_grants(meta))
+    fm_grants = frozenset(fm_grants_set)
 
     readings = commonmark_block_readings(body)
     hidden = hidden_text(body)
@@ -534,20 +589,28 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
                 tuple((Counter(hidden.definitions) | Counter(dash_hidden.definitions)).elements()),
                 tuple((Counter(hidden.html) | Counter(dash_hidden.html)).elements()),
             )
+    fm_leaves = _frontmatter_text_leaves(metas)
     blocks = (
         tuple(readings["common"])
         if len(readings) == 1 and "common" in readings
         else tuple(dict.fromkeys(block for reading in readings.values() for block in reading))
     )
     comments: list[str] = []
-    pos = 0
-    while (start := body.find("<!--", pos)) != -1:
-        end = body.find("-->", start + 4)
-        stop = len(body) if end == -1 else end + 3
-        comments.append(body[start:stop])
-        pos = stop
+    for text_part in (body, *fm_leaves):
+        pos = 0
+        while (start := text_part.find("<!--", pos)) != -1:
+            end = text_part.find("-->", start + 4)
+            stop = len(text_part) if end == -1 else end + 3
+            comments.append(text_part[start:stop])
+            pos = stop
     hidden_sigs = Counter([*comments, *hidden.definitions, *hidden.html])
     inline_tools, imports, refs = _extract_block_signals(blocks)
+    if fm_leaves:
+        fm_blocks = tuple(("paragraph", leaf) for leaf in fm_leaves)
+        fm_tools, fm_imports, fm_refs = _extract_block_signals(fm_blocks)
+        inline_tools = (inline_tools[0] | fm_tools[0], inline_tools[1])
+        imports = (imports[0] | fm_imports[0], imports[1])
+        refs = (refs[0] | fm_refs[0], refs[1])
     # The same path can be prose under one dialect and a fenced example under
     # another. Keep the evidence for each reading comparable across revisions.
     signals = {(blocks): (inline_tools[0], imports[0])}
@@ -569,7 +632,7 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
         rel_path=rel_path,
         content=content,
         globs=frozenset(globs),
-        path_scoped=bool(_glob_list(meta.get("paths"))),
+        path_scoped=bool(globs),
         always_apply=always_apply,
         frontmatter_grants=fm_grants,
         blocks=blocks,
@@ -579,6 +642,7 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
         imports=imports,
         refs=refs,
         signal_readings=signal_readings,
+        always_apply_false=always_apply_false and not always_apply,
     )
 
 
@@ -669,7 +733,7 @@ def _read_confined_tree(root: Path) -> tuple[dict[str, _ParsedInstruction], list
             if PurePosixPath(rel_path).name in _IMPORTING_NAMES:
                 importers.append(rel_path)
 
-        # 2. Nested instruction files anywhere in the tree
+        # 2. Nested instruction files and prompt templates anywhere in the tree
         for path in sorted(files.iter_files()):
             relative = path.as_posix()
             nested = path.name in NESTED_INSTRUCTION_NAMES
@@ -677,18 +741,20 @@ def _read_confined_tree(root: Path) -> tuple[dict[str, _ParsedInstruction], list
                 canonical = _FOLDED_NESTED_NAMES.get(fold_name(path.name))
                 if canonical is not None:
                     variants.append((path, path.with_name(canonical)))
+            prompt_template = _prompt_candidate(path)
             if (
-                not nested
-                or len(path.parts) < 2
+                ((not nested or len(path.parts) < 2) and not prompt_template)
                 or relative in INSTRUCTION_FILES
                 or relative in records
             ):
                 continue
-            text = _read_confined_file(relative, files, failures, excluded, fail_on_credential=True)
+            text = _read_confined_file(
+                relative, files, failures, excluded, fail_on_credential=not prompt_template
+            )
             if text is None:
                 continue
             _add_record(relative, text)
-            if path.name in _IMPORTING_NAMES:
+            if nested and path.name in _IMPORTING_NAMES:
                 importers.append(relative)
 
         # 3. Rule, prompt, steering, output-style, and subagent directories
@@ -848,6 +914,8 @@ def _read_confined_tree(root: Path) -> tuple[dict[str, _ParsedInstruction], list
 def _glob_covered_by(candidate: str, existing: frozenset[str]) -> bool:
     if candidate in existing:
         return True
+    if ".." in PurePosixPath(candidate).parts:
+        return False
     if any(pat in {"*", "**", "**/*"} for pat in existing):
         return True
     for pat in existing:
@@ -954,7 +1022,12 @@ def diff_instruction_trees(
 
         # 1. scope_widened
         if base is None:
-            if head.always_apply or any(g in {"*", "**", "**/*"} for g in head.globs):
+            in_rule_dir = any(rel_path.startswith(d + "/") for d in _RULE_DIRECTORIES)
+            if (
+                head.always_apply
+                or any(g in {"*", "**", "**/*"} for g in head.globs)
+                or (in_rule_dir and not head.path_scoped and not head.always_apply_false)
+            ):
                 changes.append(
                     InstructionChange(
                         change_class=InstructionChangeClass.SCOPE_WIDENED,

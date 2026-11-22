@@ -1121,6 +1121,9 @@ class A2AScanner(Scanner):
                     recommendation=f"Set {SOURCE_BINDING_KEY_ENV} during collection to detect changes to these values.",
                 )
             )
+        from nexus_symbiote.scanners.prompt import definition_text_risks
+
+        risks.extend(definition_text_risks(data, f"{rel_path}: A2A agent '{shown}'"))
         return A2AServerComponent(
             bom_ref=bom_ref,
             name=name,

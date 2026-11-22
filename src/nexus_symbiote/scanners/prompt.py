@@ -1480,7 +1480,9 @@ class PromptScanner(Scanner):
             text,
             decoded=(
                 _escaped_text(rel_path, text, result.surfaces_excluded)
-                if escapes or _markup(rel_path)
+                if escapes
+                or _markup(rel_path)
+                or PurePosixPath(rel_path).suffix.lower() in _ESCAPED_FORMATS
                 else None
             ),
         )
@@ -1844,8 +1846,12 @@ class PromptScanner(Scanner):
                 *_line_separator_risks(stream.line_separators, relative),
             ]
         markup = declaration and path.suffix.lower() in _MARKUP_SUFFIXES
-        # A host reads a skill's front matter, such as its description, decoded.
-        decoded = _escaped_text(relative, text, result.surfaces_excluded) if markup else None
+        # A host reads a skill's front matter or structured JSON/YAML/TOML declarations decoded.
+        decoded = (
+            _escaped_text(relative, text, result.surfaces_excluded)
+            if markup or path.suffix.lower() in _ESCAPED_FORMATS
+            else None
+        )
         risks = detect_invisible_characters(text, relative, decoded=decoded)
         if markup:
             risks.extend(detect_hidden_markup(text, relative))

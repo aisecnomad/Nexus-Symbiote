@@ -23,7 +23,12 @@ from nexus_symbiote.core.hashing import (
     normalize_digest,
     tool_definition_extensions,
 )
-from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolComponent
+from nexus_symbiote.core.models import (
+    ClaimEvidence,
+    MCPServerComponent,
+    RiskAssessment,
+    ToolComponent,
+)
 from nexus_symbiote.graph import validate_graph
 from nexus_symbiote.live import pinned_process, stdio
 from nexus_symbiote.live.stdio import (
@@ -43,7 +48,12 @@ from nexus_symbiote.scanners.live_mcp import (
     check_server_hello,
     declaration_hash,
 )
+from nexus_symbiote.scanners.prompt import definition_text_risks
 from nexus_symbiote.utils.secrets import redact_text
+
+_TEXT_RISK_CATEGORIES = frozenset(
+    {"bidi_override", "invisible_characters", "tag_characters", "line_separators"}
+)
 
 # Fixed, nonsecret explanations; reports never carry exception text or server data.
 REASONS: dict[str, str] = {
@@ -135,6 +145,7 @@ class LiveToolFinding:
     observed_hash: str | None = field(default=None, repr=False)
     unprofiled_fields: tuple[str, ...] = ()
     remote_claim: ClaimEvidence | None = field(default=None, repr=False)
+    text_risks: tuple[RiskAssessment, ...] = field(default=(), repr=False)
 
 
 @dataclass
@@ -153,6 +164,7 @@ class ServerVerifyResult:
     declaration_hash: str | None = None
     declaration_status: str | None = None  # "match" | "changed" | "new"
     declaration: dict[str, Any] | None = field(default=None, repr=False)
+    declaration_text_risks: tuple[RiskAssessment, ...] = field(default=(), repr=False)
     identity_hash: str | None = None
     identity_status: str | None = None  # "match" | "changed" | "unrecorded"
     transport_evidence: dict[str, str] | None = None
@@ -315,6 +327,7 @@ class _Declaration:
     instructions: str | None
     lists: dict[str, dict[str, str] | None]
     identity: str
+    text_risks: list[RiskAssessment] = field(default_factory=list)
 
 
 def _declaration(observation: PinnedObservation) -> _Declaration:
@@ -333,6 +346,9 @@ def _declaration(observation: PinnedObservation) -> _Declaration:
         identity,
     )
     if instructions is not None:
+        declaration.text_risks.extend(
+            definition_text_risks({"instructions": instructions}, "served server instructions")
+        )
         declaration.shown["instructions"] = redact_text(instructions)
         declaration.shown["instructions_hash"] = hash_canonical({"instructions": instructions})
     for key, identity, items in (
@@ -347,6 +363,9 @@ def _declaration(observation: PinnedObservation) -> _Declaration:
         for raw in items:
             item = check_listed_item(raw, identity)
             digests[item.identity] = item.digest
+            declaration.text_risks.extend(
+                RiskAssessment.model_validate(risk) for risk in item.text_risks
+            )
             shown.append(
                 {
                     "identity": redact_text(item.identity),
@@ -561,6 +580,9 @@ def _verify_remote_evidence(
         for key in _SHOWN_DECLARATION_KEYS
         if f"observed_{key}" in observed_server.properties
     }
+    result.declaration_text_risks = tuple(
+        risk for risk in observed_server.risks if risk.category in _TEXT_RISK_CATEGORIES
+    )
     recorded = server.properties.get("observed_declaration_hash")
     if recorded is not None:
         result.declaration_status = "match" if recorded == decl_hash else "changed"
@@ -611,6 +633,9 @@ def _verify_remote_evidence(
                     scope="served-descriptor",
                     collector="live-mcp",
                     observed_at=obs_tool.claims["tool_definition"].observed_at,
+                ),
+                text_risks=tuple(
+                    risk for risk in obs_tool.risks if risk.category in _TEXT_RISK_CATEGORIES
                 ),
             )
         )
@@ -764,6 +789,7 @@ def verify_mcp_servers(
             resource_templates=declared.lists["resource_templates"],
         )
         result.declaration = declared.shown
+        result.declaration_text_risks = tuple(declared.text_risks)
         recorded = server.properties.get("observed_declaration_hash")
         if recorded is not None:
             result.declaration_status = (
@@ -814,6 +840,7 @@ def verify_mcp_servers(
                     display_differs=item.display_differs,
                     observed_hash=item.observed_hash,
                     unprofiled_fields=item.unprofiled_fields,
+                    text_risks=item.text_risks,
                 )
             )
         for old in approved:
@@ -930,6 +957,8 @@ def record_candidate(
                     display_differs=finding.display_differs,
                 )
             )
+            tool.risks = [risk for risk in tool.risks if risk.category not in _TEXT_RISK_CATEGORIES]
+            tool.risks.extend(risk.model_copy(deep=True) for risk in finding.text_risks)
             tool.assurance_level = AssuranceLevel.OBSERVED
             if finding.remote_claim is not None:
                 tool.claims["tool_definition"] = finding.remote_claim.model_copy(
@@ -960,6 +989,12 @@ def record_candidate(
                 observed_server_properties(
                     result.declaration or {}, result.declaration_hash, result.identity_hash
                 )
+            )
+            server.risks = [
+                risk for risk in server.risks if risk.category not in _TEXT_RISK_CATEGORIES
+            ]
+            server.risks.extend(
+                risk.model_copy(deep=True) for risk in result.declaration_text_risks
             )
             if result.transport_evidence:
                 # Later evidence then binds the full URL, not only the origin.
