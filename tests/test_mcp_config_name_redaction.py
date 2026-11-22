@@ -176,9 +176,14 @@ def test_no_export_carries_a_token_shaped_name(tmp_path, fmt):
 
 @pytest.mark.parametrize(
     ("command", "args"),
-    [("bunx", ["pkg@1.2.3"]), ("deno", ["run", "npm:pkg@1.2.3"]), ("npx", ["-y", "pkg@1.2.3"])],
+    [
+        ("bunx", ["@acme/pkg@1.2.3"]),
+        ("deno", ["run", "npm:@acme/pkg@1.2.3"]),
+        ("npx", ["-y", "@acme/pkg@1.2.3"]),
+    ],
 )
 def test_a_scoped_registry_variable_names_only_a_plain_scope(tmp_path, command, args):
+    # Only the launched package's scope is named; any other scope may be a secret.
     name = "npm_config_@corp S3cr3t-Value_With Spaces!!\x1b:registry"
     env = {name: "https://x.example", "npm_config_@acme:registry": "https://y.example"}
     record = _server(tmp_path, {"command": command, "args": args, "env": env})

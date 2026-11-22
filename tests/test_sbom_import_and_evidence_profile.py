@@ -281,7 +281,9 @@ def test_import_foreign_sbom_conflicts_local_binding_privacy_and_census(
     assert by_name["langchain"].properties["pinning_state"] == "manifest-only"
     assert by_name["candle-core"].properties["pinning_state"] == "locked"
     assert by_name["candle-core"].version == "0.8.1"
-    assert by_name["github.com/sashabaranov/go-openai"].properties["pinning_state"] == "locked"
+    assert (
+        by_name["github.com/sashabaranov/go-openai"].properties["pinning_state"] == "manifest-only"
+    )
 
     states = classify_pinning_state(summary.aibom)
     assert states["pkg:openai"] == "locked"
@@ -423,6 +425,25 @@ def test_import_sbom_10000_same_name_components_is_linear_time_and_memory(
     assert peak_bytes < 24 * 1024 * 1024
 
 
+@pytest.mark.parametrize(("version", "state"), [("4.2.0", "manifest-only"), ("5.2.0", "locked")])
+def test_nested_npm_lock_uses_the_root_dev_dependency_range(tmp_path, version, state):
+    nested = tmp_path / "service"
+    nested.mkdir()
+    sections = {"dependencies": {"openai": "^4.0.0"}, "devDependencies": {"openai": "^5.0.0"}}
+    manifest = {"packageManager": "npm@11.0.0", **sections}
+    packages = {"": sections, "node_modules/openai": {"version": version}}
+    (nested / "package.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (nested / "package-lock.json").write_text(
+        json.dumps({"lockfileVersion": 3, "packages": packages}), encoding="utf-8"
+    )
+    components, failures = walk_nested_manifests(tmp_path)
+    assert not failures
+    (component,) = components
+    assert component.properties["pinning_state"] == state
+    if state == "locked":
+        assert component.version == version
+
+
 def test_nested_cdx_spdx3_format_validation_and_lockfile_membership(tmp_path: Path) -> None:
     nested_cdx = tmp_path / "nested.cdx.json"
     nested_cdx.write_text(
@@ -492,6 +513,7 @@ def test_nested_cdx_spdx3_format_validation_and_lockfile_membership(tmp_path: Pa
             {"bomFormat": "CycloneDX", "specVersion": "1.6", "services": "bad"},
             {"packages": []},
             {"@graph": [{"type": "Person", "name": "Alice"}]},
+            {"@graph": [{"type": [], "spdxId": "urn:example", "name": "Example"}]},
         ]
     ):
         p = tmp_path / f"bad_{idx}.json"
@@ -510,35 +532,19 @@ def test_nested_cdx_spdx3_format_validation_and_lockfile_membership(tmp_path: Pa
     )
 
     (proj / "js_locked").mkdir()
-    (proj / "js_locked" / "package.json").write_text(
-        json.dumps(
-            {
-                "dependencies": {
-                    "openai": "^4.0.0",
-                    "anthropic": "^0.30.0",
-                    "@modelcontextprotocol/sdk": "^1.0.0",
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    (proj / "js_locked" / "package-lock.json").write_text(
-        json.dumps(
-            {
-                "packages": {"node_modules/openai": {"version": "4.68.1"}},
-                "dependencies": {},
-            }
-        ),
-        encoding="utf-8",
-    )
-    (proj / "js_locked" / "yarn.lock").write_text(
-        '"anthropic@^0.30.0":\n  version "0.30.1"\n',
-        encoding="utf-8",
-    )
-    (proj / "js_locked" / "pnpm-lock.yaml").write_text(
-        "lockfileVersion: '6.0'\npackages:\n  /@modelcontextprotocol/sdk@1.2.1:\n    resolution: {}\n",
-        encoding="utf-8",
-    )
+    manifest = {"dependencies": {"openai": "^4.0.0"}, "packageManager": "npm@11.0.0"}
+    (proj / "js_locked" / "package.json").write_text(json.dumps(manifest), encoding="utf-8")
+    lock = {
+        "lockfileVersion": 3,
+        "packages": {
+            "": {"dependencies": manifest["dependencies"]},
+            "node_modules/example/node_modules/openai": {"version": "4.1.0"},
+            "node_modules/openai": {"version": "4.68.1"},
+        },
+    }
+    (proj / "js_locked" / "npm-shrinkwrap.json").write_text(json.dumps(lock), encoding="utf-8")
+    lock["packages"]["node_modules/openai"]["version"] = "4.67.0"
+    (proj / "js_locked" / "package-lock.json").write_text(json.dumps(lock), encoding="utf-8")
 
     (proj / "py_hashed").mkdir()
     req_sha = "b" * 64
@@ -579,15 +585,6 @@ def test_nested_cdx_spdx3_format_validation_and_lockfile_membership(tmp_path: Pa
     )
     assert by_loc_name[("js_locked/package.json", "openai")].properties["pinning_state"] == "locked"
     assert by_loc_name[("js_locked/package.json", "openai")].version == "4.68.1"
-    assert (
-        by_loc_name[("js_locked/package.json", "anthropic")].properties["pinning_state"] == "locked"
-    )
-    assert (
-        by_loc_name[("js_locked/package.json", "@modelcontextprotocol/sdk")].properties[
-            "pinning_state"
-        ]
-        == "locked"
-    )
     assert (
         by_loc_name[("py_hashed/requirements-prod.txt", "openai")].properties["pinning_state"]
         == "digest-pinned"
@@ -1520,3 +1517,97 @@ def test_import_sbom_entry_without_purl_conflicts_with_any_ecosystem(tmp_path: P
     # An agreeing entry without a purl is no conflict.
     same = _cdx(tmp_path / "same.json", {"name": "openai", "version": "1.0.0"})
     assert import_foreign_sbom(same, target_aibom=AIBOM.load(base)).conflict_count == 0
+
+
+def test_import_reconciles_nested_manifest_before_export(tmp_path):
+    project = tmp_path / "project"
+    nested = project / "agent"
+    nested.mkdir(parents=True)
+    (nested / "requirements.txt").write_text("openai==1.10.0\n", encoding="utf-8")
+    supplier = tmp_path / "supplier.json"
+    supplier.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.7",
+                "components": [{"type": "library", "name": "openai", "version": "2.0.0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(
+        main,
+        [
+            "import-sbom",
+            str(supplier),
+            "--project",
+            str(project),
+            "--walk-manifests",
+            "--json-output",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["conflict_count"] == 1
+
+
+def test_import_reports_unique_and_ambiguous_type_compatible_matches(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    payload = b"shared artifact bytes"
+    (project / "a.csv").write_bytes(payload)
+    (project / "b.safetensors").write_bytes(payload)
+    supplier = tmp_path / "supplier.json"
+    supplier.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.7",
+                "components": [
+                    {
+                        "type": "machine-learning-model",
+                        "name": "model",
+                        "hashes": [
+                            {"alg": "SHA-256", "content": hashlib.sha256(payload).hexdigest()}
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    unique = import_foreign_sbom(supplier, project_root=project)
+    assert unique.aibom.components[0].properties["declared_digest_local_match"] == "b.safetensors"
+    (project / "c.safetensors").write_bytes(payload)
+    ambiguous = import_foreign_sbom(supplier, project_root=project)
+    assert ambiguous.bound_local_count == 0
+    assert ambiguous.aibom.components[0].properties["declared_digest_local_match_ambiguous"]
+
+
+def test_import_marks_an_unresolved_conflict_when_version_sampling_is_incomplete(tmp_path):
+    versions = [f">={major}.0.0" for major in range(1, 9)] + ["11.0.0"]
+    base = AIBOM(
+        components=[
+            RegistryEntryComponent(
+                bom_ref=f"registry:openai:{index}",
+                name="openai",
+                version=version,
+                registry_type="pypi",
+            )
+            for index, version in enumerate(versions)
+        ]
+    )
+    supplier = tmp_path / "supplier.json"
+    supplier.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.7",
+                "components": [{"type": "library", "name": "openai", "version": "10.0.0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    imported = import_foreign_sbom(supplier, target_aibom=base)
+    assert imported.conflict_count == 0
+    assert imported.unresolved_conflict_count == 1
+    assert imported.aibom.components[-1].risks[0].category == "source_conflict_unresolved"

@@ -48,6 +48,18 @@ TypeScript forms in full.
 
 ## Coding-agent settings
 
+A hook can select PowerShell through a variable or glob. When the program name
+offers no PowerShell hint, `-enc` and longer prefixes of `-EncodedCommand` are
+critical. The shorter `-e`, `-ec` and `-en` forms require a base64 operand that
+has recognizable UTF-16LE text structure. Evidence includes a byte-order mark
+with content, a quoted string, a command-like prefix, or sufficient ASCII text.
+Ordinary search arguments such as
+`$GREP -e Makefile` and a value computed by the shell stay medium.
+
+Shell assignment prefixes end at the first command word. After a wrapper such
+as `command` or `nohup`, an assignment-shaped word can name the program.
+`env` consumes its own assignment operands.
+
 For Claude Code, `ide_agents` records the permission mode (`bypassPermissions` is a high finding, `acceptEdits` medium), blanket grants in its allow list, how many allow, ask and deny rules and hook handlers it declares, and findings for hook commands, the `statusLine` and `fileSuggestion` commands, the credential helpers `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh` and `otelHeadersHelper` (each command rated as a hook command is), `env` variables that redirect the API endpoint or load code (by name only), MCP auto-approval, plugins and additional directories. It does not record the rules, commands or `env` values themselves. For Codex it records the approval and sandbox settings, for Cursor its hook commands, and for Cursor, Windsurf, Cline and Codex an `agent.permissionMode` key in their JSON settings. The MCP servers that Codex and Gemini CLI settings declare are inventoried by the `mcp` collector.
 
 Every settings file `ide_agents` recognizes is bound by a digest of its redacted form, so a changed value is a high `diff` alert. A change only to a value the redaction removes, such as a token, an `env` value, a credential helper command or a URL path on the same host, changes the digest only with `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`; without it the record carries a low `completeness` finding, so `diff` raises a medium alert on every comparison that its values are unbound, without naming one, while a host glued to such a URL after a shell operator or another URL scheme still alerts. Without the key, a URL whose host URL parsers read differently, such as one with a backslash in its authority, is a collection failure. See [source binding](verification-source-binding.md#ide-agent-settings); [instructions and IDE settings](known-limitations.md#instructions-and-ide-settings) lists what this leaves out.
