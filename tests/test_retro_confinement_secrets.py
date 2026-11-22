@@ -114,6 +114,39 @@ def test_a2a_regular_card_under_dot_aws_is_withheld(tmp_path: Path) -> None:
     assert any(".aws/.well-known/agent.json" in entry for entry in result.surfaces_excluded)
 
 
+@pytest.mark.parametrize("store_dir", [".secrets", ".credentials", ".config/gh"])
+def test_a2a_well_known_under_dotted_or_xdg_store_remains_withheld(
+    tmp_path: Path, store_dir: str
+) -> None:
+    card_dir = tmp_path / store_dir / ".well-known"
+    card_dir.mkdir(parents=True)
+    (card_dir / "agent-card.json").write_text(
+        '{"name": "a", "url": "https://a.example", "skills": []}', encoding="utf-8"
+    )
+    result = A2AScanner().scan(tmp_path)
+    assert not result.components
+    assert any(
+        f"{store_dir}/.well-known/agent-card.json" in entry for entry in result.surfaces_excluded
+    )
+
+
+def test_a2a_well_known_symlink_into_secrets_remains_withheld(tmp_path: Path) -> None:
+    secret_dir = tmp_path / "secrets"
+    secret_dir.mkdir()
+    (secret_dir / "creds.json").write_text(
+        '{"name": "a", "url": "https://a.example", "skills": []}', encoding="utf-8"
+    )
+    card_dir = tmp_path / "services" / "credentials" / ".well-known"
+    card_dir.mkdir(parents=True)
+    (card_dir / "agent-card.json").symlink_to("../../../secrets/creds.json")
+    result = A2AScanner().scan(tmp_path)
+    assert not result.components
+    assert any(
+        "services/credentials/.well-known/agent-card.json" in entry
+        for entry in result.surfaces_excluded
+    )
+
+
 # --- R-HIGH-04: source_binding.py whatwg_form & rag.py ---
 
 
@@ -427,11 +460,18 @@ def test_rag_and_base_yaml_parsers_reject_flow_nesting_dos_in_linear_time(tmp_pa
 
 
 def test_toml_loads_rejects_deep_bracket_and_brace_nesting_before_tomllib() -> None:
-    deep_array = "a = " + "[" * 70 + "]" * 70 + "\n"
+    from nexus_symbiote.utils.toml import _MAX_BRACKET_DEPTH
+
+    at_limit_array = "a = " + "[" * _MAX_BRACKET_DEPTH + "1" + "]" * _MAX_BRACKET_DEPTH + "\n"
+    assert toml_loads(at_limit_array) is not None
+
+    deep_array = "a = " + "[" * (_MAX_BRACKET_DEPTH + 1) + "]" * (_MAX_BRACKET_DEPTH + 1) + "\n"
     with pytest.raises(TOMLBoundsError):
         toml_loads(deep_array)
 
-    deep_table = "a = " + "{x = " * 70 + "1" + "}" * 70 + "\n"
+    deep_table = (
+        "a = " + "{x = " * (_MAX_BRACKET_DEPTH + 1) + "1" + "}" * (_MAX_BRACKET_DEPTH + 1) + "\n"
+    )
     with pytest.raises(TOMLBoundsError):
         toml_loads(deep_table)
 

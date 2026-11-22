@@ -983,7 +983,12 @@ class ConfinedCollection:
             raise
 
     def read_bytes(
-        self, path: str | Path, *, missing_ok: bool = False, variants_read: Collection[str] = ()
+        self,
+        path: str | Path,
+        *,
+        missing_ok: bool = False,
+        variants_read: Collection[str] = (),
+        report_coexisting_variants: bool = True,
     ) -> bytes | None:
         """Read a confined regular file, through at most one in-root symlink.
 
@@ -993,7 +998,9 @@ class ConfinedCollection:
         ``missing_ok`` an absent file is not a failure, and any case or normalisation
         variant of its name — whether the exact spelling is absent or coexists beside
         it — is reported as a failure unless the caller reads it separately and names
-        it in ``variants_read``: case-insensitive file systems collide on both.
+        it in ``variants_read`` (or defers coexisting-variant reporting via
+        ``report_coexisting_variants=False`` to report every un-inventoried variant
+        after walking the tree): case-insensitive file systems collide on both.
         """
         relative: Path | str = str(path)
         try:
@@ -1032,7 +1039,12 @@ class ConfinedCollection:
                 data = b"".join(chunks)
             finally:
                 os.close(fd)
-            if missing_ok and not self._lifted and isinstance(relative, Path):
+            if (
+                missing_ok
+                and report_coexisting_variants
+                and not self._lifted
+                and isinstance(relative, Path)
+            ):
                 self._report_case_variants(relative, variants_read)
             return data
         except FileNotFoundError:

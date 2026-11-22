@@ -150,17 +150,42 @@ def link_gap(target: str | None, *, colang_rail: str | None = None) -> str | Non
     return None
 
 
+def _in_dot_or_xdg_credential_store(directories: tuple[str, ...]) -> bool:
+    return any(
+        part.casefold() in _DOT_CREDENTIAL_STORES
+        or (part.startswith(".") and part.casefold().lstrip(".") in _CREDENTIAL_DIRECTORIES)
+        for part in directories
+    ) or _has_xdg_credential_store(directories)
+
+
 def withheld(
-    files: ConfinedCollection, path: str, excluded: list[str], *, colang_source: bool = False
+    files: ConfinedCollection,
+    path: str,
+    excluded: list[str],
+    *,
+    colang_source: bool = False,
+    allow_service_parent: bool = False,
 ) -> bool:
     """Record credential-name refusals for RAG, guardrail and A2A inputs.
 
-    Known collector files use their own names. The NeMo collector can designate a
-    Colang rail as a program. A same-name link preserves that role for the target.
+    Known collector files use their own names; regular files inside credential
+    directories and stores are also withheld unless ``allow_service_parent`` is set
+    for an explicit ``.well-known`` A2A discovery card beneath a plain service
+    directory (dotted and XDG credential stores remain withheld even then).
+    The NeMo collector can designate a Colang rail as a program. A same-name link
+    preserves that role for the target.
     """
     relative = PurePosixPath(path)
     reason: str | None
-    if credential_shaped(path, colang_source=colang_source):
+    direct_credential = (
+        (
+            credential_shaped(relative.name, colang_source=colang_source)
+            or _in_dot_or_xdg_credential_store(relative.parts[:-1])
+        )
+        if allow_service_parent
+        else credential_shaped(path, colang_source=colang_source)
+    )
+    if direct_credential:
         reason = "its name says it holds credentials"
     else:
         linked = files.in_root_target(path)

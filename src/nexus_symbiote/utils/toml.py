@@ -11,7 +11,7 @@ from typing import Any
 # and recurses on nested inline tables and arrays. Fixed bounds keep pre-parse
 # verification strictly linear in the bounded source size.
 _MAX_DOTTED_KEY = 16
-_MAX_BRACKET_DEPTH = 64
+_MAX_BRACKET_DEPTH = 128
 
 
 class TOMLBoundsError(ValueError):
