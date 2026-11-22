@@ -85,7 +85,8 @@ RUNNER_VALUE_OPTIONS = _words(
     "-p --package --from --with --with-editable --with-requirements --python"
 )
 SCRIPT_VALUE_OPTIONS = _words(
-    "--tsconfig --env-file -X -W --output-dir --config --db-path --credentials --tls-key"
+    "--tsconfig --env-file -X -W --output-dir --config --db-path --credentials --tls-key --title"
+    " --rcfile --init-file --redirect-warnings --report-dir --diagnostic-dir --icu-data-dir"
 )
 NODE_SCRIPT_SWITCHES = _words("--inspect --inspect-brk --experimental-strip-types")
 PRELOAD_OPTIONS = _words("-r --require --import --loader --experimental-loader --preload")
@@ -590,38 +591,25 @@ def _split_token_segments(tokens: list[str]) -> list[list[str]]:
 _OPERATOR_CHARS = ";|&()\n><"
 _MASKED_OPERATORS = {ch: chr(0xE000 + i) for i, ch in enumerate(_OPERATOR_CHARS)}
 _UNMASK_OPERATORS = str.maketrans({v: k for k, v in _MASKED_OPERATORS.items()})
-
-
-def _mask_quoted_operators(text: str) -> str:
-    """Hide operator characters that quotes or a backslash make literal from the lexer."""
-    out: list[str] = []
-    quote, escaped = "", False
-    for ch in text:
-        if escaped or quote:
-            out.append(_MASKED_OPERATORS.get(ch, ch))
-            if escaped:
-                escaped = False
-            elif ch == quote:
-                quote = ""
-            elif ch == "\\" and quote == '"':
-                escaped = True
-            continue
-        if ch == "\\":
-            escaped = True
-        elif ch in "'\"":
-            quote = ch
-        out.append(ch)
-    return "".join(out)
+_MASK_TABLE = str.maketrans(_MASKED_OPERATORS)
+_RESERVED = frozenset(_MASKED_OPERATORS.values())
+# Quoted or backslash-escaped operator characters are literal; they are masked from the lexer.
+_QUOTED_RE = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"|\\.", re.S)
 
 
 def _split_shell_commands(command: str) -> list[list[str]]:
     """Split a shell command string into individual command token segments."""
-    # A private-use character in the input would unmask as an operator, so it is dropped.
-    text = command.strip().translate(dict.fromkeys(range(0xE000, 0xE000 + len(_OPERATOR_CHARS))))
+    text = command.strip()
+    # A command that already holds a mask character is lexed unmasked; the caller records it.
+    masked = _RESERVED.isdisjoint(text)
     if not text:
         return []
     try:
-        lexer = shlex.shlex(_mask_quoted_operators(text), posix=True, punctuation_chars=";|&()\n><")
+        lexer = shlex.shlex(
+            _QUOTED_RE.sub(lambda m: m[0].translate(_MASK_TABLE), text) if masked else text,
+            posix=True,
+            punctuation_chars=";|&()\n><",
+        )
         lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         lexer.commenters = ""
@@ -629,7 +617,11 @@ def _split_shell_commands(command: str) -> list[list[str]]:
     except ValueError:
         raw_tokens = text.split()
     segments = _split_token_segments(raw_tokens)
-    return [[tok.translate(_UNMASK_OPERATORS) for tok in seg] for seg in segments]
+    return (
+        [[tok.translate(_UNMASK_OPERATORS) for tok in seg] for seg in segments]
+        if masked
+        else segments
+    )
 
 
 _SIMPLE_WRAPPERS: dict[str, tuple[frozenset[str], int]] = {
@@ -920,6 +912,10 @@ def _audit_command_segments(
     evidence: _RunnerEvidence | None = None,
 ) -> tuple[str | None, list[str]]:
     runner_evidence = evidence or _RunnerEvidence(checkout=checkout)
+    if any(not _RESERVED.isdisjoint(tok) for segment in segments for tok in segment):
+        gaps.append(
+            f"{source_file}: {role} command holds a private-use character the audit reserves"
+        )
     primaries: list[str] = []
     for segment in segments:
         found = _extract_single_target(segment, checkout.paths, checkout.files, runner_evidence)
@@ -1495,7 +1491,7 @@ def _audit_mcp_server(
                 summary.edge(srv_ref, sub_ref, "delegates-to", norm_cfg)
                 if exp_key in seen_expansions:
                     continue
-                if expansion_budget[0] >= _MAX_BRIDGE_EXPANSIONS:
+                if expansion_budget[0] >= _MAX_BRIDGE_EXPANSIONS or len(seen_expansions) >= 1024:
                     _add_gap(
                         summary.gaps,
                         f"{norm_cfg}: MCP bridge expansion limit ({_MAX_BRIDGE_EXPANSIONS}) reached",
