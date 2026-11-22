@@ -406,7 +406,12 @@ def manifest_digest(entries: Iterable[tuple[str, str]]) -> str:
 
 
 def _recognized_pickle(
-    stream: BinaryIO, prefix: bytes, size: int, *, by_content: bool = False
+    stream: BinaryIO,
+    prefix: bytes,
+    size: int,
+    *,
+    by_content: bool = False,
+    sample_bytes: int = MAX_PICKLE_INSPECTION_BYTES,
 ) -> tuple[SerializationSafety, str] | None:
     """Rate what ``pickle.load`` does with a pickle sample, without loading objects.
 
@@ -438,14 +443,28 @@ def _recognized_pickle(
     """
     if not prefix or prefix[0] not in _OPCODE_BYTES:
         return None
-    sample = prefix + stream.read(max(0, min(size, MAX_PICKLE_INSPECTION_BYTES) - len(prefix)))
+    sample = prefix + stream.read(max(0, min(size, sample_bytes) - len(prefix)))
     binary = len(prefix) >= 2 and prefix[0] == 0x80 and 2 <= prefix[1] <= 5
     shaped = binary or prefix[0] in _TEXT_PICKLE_START
     worst = _pickle_shape(sample, binary) if shaped and not by_content else None
     for flavor in pickle_load.FLAVORS:
         if worst is not None and worst[0] is SerializationSafety.UNSAFE_CODE_EXECUTION:
             break
-        worst = _worse(worst, _pickle_loads(sample, size, flavor, by_content=by_content))
+        worst = _worse(
+            worst,
+            _pickle_loads(
+                sample,
+                size,
+                flavor,
+                by_content=by_content,
+                # A wider sample gets an opcode per byte, so only its end bounds the walk.
+                opcodes=(
+                    MAX_PICKLE_OPCODES
+                    if sample_bytes == MAX_PICKLE_INSPECTION_BYTES
+                    else len(sample)
+                ),
+            ),
+        )
     return worst
 
 
@@ -478,7 +497,12 @@ def _recognized(binary: bool) -> tuple[SerializationSafety, str]:
 
 
 def _pickle_loads(
-    sample: bytes, size: int, flavor: pickle_load.Flavor, *, by_content: bool
+    sample: bytes,
+    size: int,
+    flavor: pickle_load.Flavor,
+    *,
+    by_content: bool,
+    opcodes: int = MAX_PICKLE_OPCODES,
 ) -> tuple[SerializationSafety, str] | None:
     """Rate the pickles one unpickler reads from ``sample`` in a loop.
 
@@ -486,7 +510,7 @@ def _pickle_loads(
     nothing the first did not, and paths that meet again, as the two resumes after a
     STOP inside a frame can, would otherwise double the walks after them.
     """
-    budget = pickle_load.Budget(MAX_PICKLE_OPCODES, MAX_PICKLE_MARKS)
+    budget = pickle_load.Budget(opcodes, MAX_PICKLE_MARKS)
     pending = [0]
     visited: set[int] = set()
     worst: tuple[SerializationSafety, str] | None = None
@@ -1015,6 +1039,29 @@ def _object_dtype_string(text: str) -> bool:
     )
 
 
+def _safetensors_polyglot(
+    stream: BinaryIO, prefix: bytes, size: int, length: int, budget: InspectionBudget
+) -> tuple[SerializationSafety, str] | None:
+    """How ``pickle.load`` reads a file whose SafeTensors header validated.
+
+    The header length's low byte can be a pickle opcode, so the same bytes may also be a
+    pickle that runs code. A walk stopped by the default bounds decides nothing, and a
+    call padded past them would otherwise be rated safe, so an undecided walk is repeated
+    over the whole header and the start of the data region, one opcode per byte. Benign
+    headers almost never need that second walk; it is charged to the scan's shared
+    inspection budget so many padded headers cannot add up to a long scan.
+    """
+    if prefix[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
+        return _recognized_code_container(stream, prefix, size, budget, by_content=True)
+    wide = 8 + length + MAX_PICKLE_INSPECTION_BYTES
+    tail = stream.read(max(0, min(size, wide) - len(prefix)))
+    first = _recognized_pickle(io.BytesIO(tail), prefix, size, by_content=True)
+    if first is None or first[1] not in _CONTENT_UNREAD:
+        return first
+    budget.charge(len(prefix) + len(tail), "SafeTensors header pickle walk exceeds the budget")
+    return _recognized_pickle(io.BytesIO(tail), prefix, size, by_content=True, sample_bytes=wide)
+
+
 def _recognized_code_container(
     stream: BinaryIO, prefix: bytes, size: int, budget: InspectionBudget, *, by_content: bool
 ) -> tuple[SerializationSafety, str] | None:
@@ -1142,18 +1189,19 @@ def inspect_model_format(
                         "Malformed or unsupported SafeTensors structure",
                     )
                 replay = _PrefixedStream(bytes(capture.captured), opened)
-                polyglot = _recognized_code_container(
-                    cast(BinaryIO, replay),
-                    prefix,
-                    size,
-                    budget or InspectionBudget(),
-                    by_content=True,
+                polyglot = _safetensors_polyglot(
+                    cast(BinaryIO, replay), prefix, size, length, budget or InspectionBudget()
                 )
-                if (
-                    polyglot is not None
-                    and polyglot[0] is SerializationSafety.UNSAFE_CODE_EXECUTION
+                if polyglot is not None and (
+                    polyglot[0] is SerializationSafety.UNSAFE_CODE_EXECUTION
+                    or polyglot[1] in _CONTENT_UNREAD
                 ):
-                    return polyglot
+                    return polyglot[0], (
+                        polyglot[1]
+                        if polyglot[0] is SerializationSafety.UNSAFE_CODE_EXECUTION
+                        else "SafeTensors header also reads as a pickle the inspection "
+                        "bounds left undecided"
+                    )
                 return (
                     SerializationSafety.SAFE,
                     "Bounded SafeTensors header, shapes and offsets checked",

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import pickle
 import struct
 import sys
@@ -28,7 +29,7 @@ from nexus_symbiote.scanners.model import (
     inspect_model_format,
     observe_model_artifact,
 )
-from nexus_symbiote.utils.model_formats import template_escape_markers
+from nexus_symbiote.utils.model_formats import InspectionBudget, template_escape_markers
 from nexus_symbiote.utils.pickle_load import Budget, load_segment
 from tests.support import scaling_ratio
 
@@ -306,6 +307,49 @@ def test_valid_safetensors_and_executable_pickle_polyglot_is_rated_critical(
         obs = observe_model_artifact(path, stream=stream)
     assert obs.safety is SerializationSafety.UNSAFE_CODE_EXECUTION
     assert obs.digest == f"sha256:{hashlib.sha256(polyglot).hexdigest()}"
+
+
+def _padded_polyglot(opcodes: int) -> bytes:
+    """A SafeTensors file whose bytes, read by pickle.load, call os.getpid after ``opcodes``.
+
+    The header length's low byte is LONG1 (0x8a), which skips into a metadata string;
+    'N0' pairs then pad the walk past the inspection bounds before the call in the data.
+    """
+    payload = b"cos\ngetpid\n)R."
+    nn = 0x60
+    target = nn * 256 + 0x8A
+    tensors = {"t": {"dtype": "U8", "shape": [len(payload)], "data_offsets": [0, len(payload)]}}
+    head = json.dumps(tensors, separators=(",", ":"))[:-1] + ',"__metadata__":{"k":"'
+    filler = "A" * (nn - 6 - len(head))
+    closing, spaces = '"}}', 60
+    room = target - len(head) - len(filler) - 2 - len(closing) - spaces
+    pairs = (opcodes - 1) // 2
+    left = room - 2 * pairs
+    body = ("U~" + "A" * 0x7E) * (left // 128) + "N" * (left % 128) + "N0" * pairs
+    text = head + filler + body + "U" + chr(len(closing) + spaces) + closing + " " * spaces
+    assert len(text) == target
+    return struct.pack("<Q", target) + text.encode() + payload
+
+
+@pytest.mark.parametrize("opcodes", [1_000, 4_200])
+def test_a_polyglot_padded_past_the_pickle_bounds_is_rated_critical(
+    tmp_path: Path, opcodes: int
+) -> None:
+    data = _padded_polyglot(opcodes)
+    assert pickle.loads(data) > 0  # noqa: S301 - inert os.getpid()
+    path = tmp_path / "model.safetensors"
+    path.write_bytes(data)
+    safety, _ = inspect_model_format(path)
+    assert safety is SerializationSafety.UNSAFE_CODE_EXECUTION
+
+
+def test_the_wide_polyglot_walk_is_charged_to_the_shared_budget(tmp_path: Path) -> None:
+    path = tmp_path / "model.safetensors"
+    path.write_bytes(_padded_polyglot(4_200))
+    budget = InspectionBudget(1_000)
+    safety, _ = inspect_model_format(path, budget=budget)
+    # The spent budget refuses the second walk: the file is unknown, never safe.
+    assert safety is SerializationSafety.UNKNOWN
 
 
 def test_prefixed_stream_read_all_and_zero_preserve_bytes() -> None:
