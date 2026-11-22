@@ -126,7 +126,10 @@ def test_known_card_below_credentials_directory_keeps_interface_origin(tmp_path:
     result = A2AScanner().scan(tmp_path)
     assert not result.scan_failures and not result.surfaces_excluded
     [server] = [c for c in result.components if "additional_interface_origins" in c.properties]
-    assert "https://service.example.test" in server.properties["additional_interface_origins"]
+    assert server.properties["additional_interface_origins"] == [
+        "[redacted]",
+        "https://service.example.test",
+    ]
     assert not any(r.category == "transport_security" for r in server.risks)
 
 
