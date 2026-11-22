@@ -499,6 +499,10 @@ def _unescaped(match: re.Match[str]) -> str:
         return match.group()
 
 
+_RAW_OPEN = re.compile(r"\{%[+-]?\s*raw\s*-?%\}")
+_RAW_CLOSE = re.compile(r"\{%[+-]?\s*endraw\s*-?%\}")
+
+
 def _joined_literal_marker(text: str) -> bool:
     """Find dunder names made by joining constant Jinja string literals.
 
@@ -510,11 +514,19 @@ def _joined_literal_marker(text: str) -> bool:
     """
     position = 0
     size = len(text)
-    inside = False
+    close: str | None = None
     while position < size:
-        if not inside:
-            if text.startswith(("{{", "{%"), position):
-                inside = True
+        if close is None:
+            if text.startswith("{%", position):
+                raw_open = _RAW_OPEN.match(text, position)
+                if raw_open is not None:
+                    raw_close = _RAW_CLOSE.search(text, raw_open.end())
+                    position = size if raw_close is None else raw_close.end()
+                    continue
+                close = "%}"
+                position += 2
+            elif text.startswith("{{", position):
+                close = "}}"
                 position += 2
             elif text.startswith("{#", position):
                 end = text.find("#}", position + 2)
@@ -522,8 +534,8 @@ def _joined_literal_marker(text: str) -> bool:
             else:
                 position += 1
             continue
-        if text.startswith(("}}", "%}"), position):
-            inside = False
+        if text.startswith(close, position):
+            close = None
             position += 2
             continue
         if text[position] not in "\"'":
