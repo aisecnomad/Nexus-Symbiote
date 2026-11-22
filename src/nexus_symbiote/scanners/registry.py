@@ -362,7 +362,15 @@ def _index_origin(value: object) -> str | None:
     if "%" in netloc or not _INDEX_HOST.fullmatch(host):
         return None
     candidate = f"{parts.scheme}://{host}" + (f":{port}" if port is not None else "")
-    return None if redact_url(candidate) == "[redacted-url]" else candidate
+    return None if _sensitive_origin(candidate) else candidate
+
+
+def _sensitive_origin(origin: str | None) -> bool:
+    """Whether a registry origin URL itself carries a credential or token shape."""
+    return origin is not None and (
+        redact_url(origin) == "[redacted-url]"
+        or holds_token_shape(origin, require_sk_boundary=True)
+    )
 
 
 def _url_origin(url: str) -> str:
@@ -467,7 +475,11 @@ def _plain_pnpm_peers(suffix: str) -> bool:
         if match is None:
             return False
         depth, index = depth + 1, match.end()
-    return depth == 0 and redact_text(suffix) == suffix
+    return (
+        depth == 0
+        and redact_text(suffix) == suffix
+        and not holds_token_shape(suffix, require_sk_boundary=True)
+    )
 
 
 _PNPM_PATCH_HASH = re.compile(r"\s*patch_hash")
@@ -953,6 +965,7 @@ class _Resolution(NamedTuple):
     # that names this package and version, so the declared range is resolved.
     resolved: bool
     consistent: bool
+    sensitive_origin: bool = False
 
 
 _YARN_LINES = 100_000
@@ -1953,6 +1966,7 @@ class RegistryScanner(Scanner):
             and not sensitive_version
             and resolution is not None
             and resolution.consistent
+            and not resolution.sensitive_origin
         ):
             package_url = self._npm_purl(package, resolution.version, resolution.origin)
         elif (
@@ -1968,13 +1982,19 @@ class RegistryScanner(Scanner):
             # Only without a lock record: one that was not taken, a lockfile that was
             # not read and an override each leave the version the spec names in doubt.
             package_url = self._npm_purl(package, version_range, None)
+        withhold_origin = (
+            sensitive_name
+            or sensitive_version
+            or name != package
+            or (resolution is not None and resolution.sensitive_origin)
+        )
         return RegistryEntryComponent(
             bom_ref=f"registry:npm/{reference_text(key_name)}",
             name=name,
             version=REDACTED if sensitive_version else version or None,
             package_url=package_url,
             registry_type="npm",
-            registry_uri=resolution.origin if resolution else None,
+            registry_uri=None if withhold_origin else (resolution.origin if resolution else None),
             source_path=source,
             trust_tier=TrustTier.UNKNOWN,
             assurance_level=AssuranceLevel.DECLARED,
@@ -2135,7 +2155,9 @@ class RegistryScanner(Scanner):
         if integrity is not None and not self._validate_sri_integrity(integrity):
             result.scan_failures.append(f"{lock_name}: invalid selected package integrity")
             return None
-        name = redact_text(package)
+        shown_name, sensitive_name = _identifier(package)
+        name = shown_name if sensitive_name else redact_text(package)
+        sensitive_origin = _sensitive_origin(origin)
         risks: list[RiskAssessment] = []
         if not consistent:
             risks.append(
@@ -2147,15 +2169,22 @@ class RegistryScanner(Scanner):
                     "Regenerate the lockfile from the registry and review the change.",
                 )
             )
-        risks.extend(self._npm_record_risks(name, integrity is not None, origin))
+        risks.extend(
+            self._npm_record_risks(
+                name, integrity is not None, REDACTED if sensitive_origin else origin
+            )
+        )
+        if sensitive_origin:
+            risks.append(_identifier_risk(f"npm package '{name}'", "registry origin"))
         return _Resolution(
             version=version,
-            origin=origin,
+            origin=None if sensitive_origin else origin,
             integrity=integrity,
             locator=locator,
             risks=risks,
             resolved=integrity is not None and consistent,
             consistent=consistent,
+            sensitive_origin=sensitive_origin,
         )
 
     @staticmethod
@@ -2297,7 +2326,11 @@ class RegistryScanner(Scanner):
         if integrity is not None and not self._validate_sri_integrity(integrity):
             result.scan_failures.append(f"{lock_name}: invalid selected package integrity")
             return
-        shown = redact_text(component.name)
+        shown_name, sensitive_comp = _identifier(component.name)
+        shown = shown_name if sensitive_comp else redact_text(component.name)
+        sensitive_origin = _sensitive_origin(origin)
+        if sensitive_origin:
+            component.risks.append(_identifier_risk(f"npm package '{shown}'", "registry origin"))
         if not consistent:
             component.risks.append(
                 _risk(
@@ -2309,20 +2342,23 @@ class RegistryScanner(Scanner):
                 )
             )
         digest_recorded = integrity is not None or checksum_recorded
-        component.risks.extend(self._npm_record_risks(shown, digest_recorded, origin))
+        component.risks.extend(
+            self._npm_record_risks(shown, digest_recorded, REDACTED if sensitive_origin else origin)
+        )
         if not bind_identity:
             # A registry record can expose an independent integrity or origin problem
             # even when its source does not match the one the package manager selected.
             return
         if digest_recorded and consistent:
             component.risks = [r for r in component.risks if r.category != "version_pinning"]
+        withhold_identity = sensitive or sensitive_origin or sensitive_comp
         component.version = REDACTED if sensitive else version
         component.package_url = (
             self._npm_purl(component.name, version, origin)
-            if consistent and not sensitive
+            if consistent and not withhold_identity
             else None
         )
-        component.registry_uri = None if sensitive else origin
+        component.registry_uri = None if withhold_identity else origin
         component.source_path = lock_name
         component.assurance_level = AssuranceLevel.DECLARED
         component.properties.update(
@@ -4583,7 +4619,8 @@ class RegistryScanner(Scanner):
         redacted = False
         if unresolved:
             # Kept as written, with the gap that says why it is not the image pulled.
-            name = redact_text(raw)
+            shown, redacted = _identifier(raw)
+            name = shown if redacted else redact_text(raw)
             has_digest = "@" in raw and _PULLED_DIGEST.fullmatch(raw.rpartition("@")[2]) is not None
             has_tag = ":" in raw.rsplit("/", 1)[-1] and not raw.endswith(":latest")
         else:
