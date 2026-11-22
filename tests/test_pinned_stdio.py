@@ -206,7 +206,7 @@ def test_silent_peer_and_repeated_pagination_are_bounded(tmp_path, monkeypatch):
     assert not verify_mcp_servers(
         inventory(), trusted_launchers=launcher(tmp_path, "import time; time.sleep(30)")
     ).complete
-    assert time.monotonic() - start < 3
+    assert time.monotonic() - start < 3  # deadline check: DEADLINE_SECONDS timeout
     repeated = SERVER.replace("TOOLS", repr([TOOL])).replace(
         'result = {"tools": tools}', 'result = {"tools": tools, "nextCursor":"same"}'
     )

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import io
 import json
-import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -50,6 +50,7 @@ from nexus_symbiote.spdx_profiles import (
     resolve_automation_mapping,
     spdx_autonomy_presence,
 )
+from tests.support import scaling_ratio
 
 
 def _rich_aibom() -> AIBOM:
@@ -703,27 +704,33 @@ def test_iso_22989_automation_table_and_linear_scaling(tmp_path: Path) -> None:
         assert mapped is not None and mapped.spdx_autonomy_presence == "yes"
 
     # Medium #8: Verify CycloneDX projection 3 scales linearly on 1,500 models + 1,500 edges.
-    comps = [
-        DataSourceComponent(bom_ref="ds:0", name="ds-0", assurance_level=AssuranceLevel.DECLARED)
-    ]
-    edges: list[DependencyEdge] = []
-    for idx in range(1500):
-        ref = f"model:{idx}"
-        comps.append(
-            ModelComponent(
-                bom_ref=ref,
-                name=f"m-{idx}",
-                model_type="transformer",
-                assurance_level=AssuranceLevel.OBSERVED,
+    def _build_bom(count: int) -> AIBOM:
+        comps: list[Any] = [
+            DataSourceComponent(
+                bom_ref="ds:0", name="ds-0", assurance_level=AssuranceLevel.DECLARED
             )
-        )
-        edges.append(DependencyEdge(source_ref=ref, target_ref="ds:0", relationship="trained-on"))
-    large_bom = AIBOM(components=comps, dependencies=edges)
-    start = time.monotonic()
-    doc = CycloneDXGenerator(projection_version=3, spec_version="1.7")._projection(large_bom)
-    elapsed = time.monotonic() - start
+        ]
+        edges: list[DependencyEdge] = []
+        for idx in range(count):
+            ref = f"model:{idx}"
+            comps.append(
+                ModelComponent(
+                    bom_ref=ref,
+                    name=f"m-{idx}",
+                    model_type="transformer",
+                    assurance_level=AssuranceLevel.OBSERVED,
+                )
+            )
+            edges.append(
+                DependencyEdge(source_ref=ref, target_ref="ds:0", relationship="trained-on")
+            )
+        return AIBOM(components=comps, dependencies=edges)
+
+    boms = {scale: _build_bom(375 * scale) for scale in (1, 4)}
+    generator = CycloneDXGenerator(projection_version=3, spec_version="1.7")
+    doc = generator._projection(boms[4])
     assert len(doc["components"]) == 1501
-    assert elapsed < 3.0, f"CycloneDX projection 3 took {elapsed:.2f}s (expected linear < 3.0s)"
+    assert scaling_ratio(lambda scale: generator._projection(boms[scale])) < 10
 
     # Verify CLI roundtrip with --agent-yaml and --author on SPDX v4.
     (tmp_path / "agent.yaml").write_text(

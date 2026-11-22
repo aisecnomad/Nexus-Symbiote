@@ -554,9 +554,8 @@ def test_model_scanner_second_zip_pickle_member_jinja2_and_nested_custom_code(
 
 
 def test_ide_agents_subshell_grants_dont_ask_and_codex_full_access(tmp_path: Path) -> None:
-    import time
-
     from nexus_symbiote.scanners.ide_agents import _SUBSHELL_SPECIFIER
+    from tests.support import scaling_ratio
 
     assert "shell commands" in _broad_grants(["Bash(sh -c *)"])
     assert "shell commands" in _broad_grants(["Bash(sh -c evil\nid)"])
@@ -572,9 +571,9 @@ def test_ide_agents_subshell_grants_dont_ask_and_codex_full_access(tmp_path: Pat
     assert _broad_grants(["Bash(sh scripts/check.sh)"]) == []
     assert _broad_grants(["Bash(sh" + " " * 32000 + "a\nb)"]) == []
 
-    t0 = time.perf_counter()
-    assert _SUBSHELL_SPECIFIER.search("/a" * 5000 + "/env") is None
-    assert time.perf_counter() - t0 < 0.05
+    samples = {scale: "/a" * (1_250 * scale) + "/env" for scale in (1, 4)}
+    assert _SUBSHELL_SPECIFIER.search(samples[4]) is None
+    assert scaling_ratio(lambda scale: _SUBSHELL_SPECIFIER.search(samples[scale])) < 10
 
     assert _starting_mode_risk("claude-code", "dontAsk") is None
     for med_mode in ("auto", "never"):
