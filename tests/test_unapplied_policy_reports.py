@@ -167,3 +167,23 @@ def test_explicit_checkout_removal_of_operator_exclusions_is_a_tightening(tmp_pa
         project, operator=operator, operator_digest="fixture"
     )
     assert effective.scan.exclude_paths == [] and unused is None
+
+
+def test_relaxation_only_checkout_under_operator_policy_still_records_clamped_settings(tmp_path):
+    from nexus_symbiote.cli import _LAST_CLAMPED_SETTINGS, _policy_with_source
+    from nexus_symbiote.policy import Policy
+
+    project = _project(
+        tmp_path / "project",
+        "risk: {fail_threshold: 999}\nscan: {failure_mode: report-only}\n",
+    )
+    operator = Policy.model_validate({"risk": {"fail_threshold": 20}})
+    effective, source, _, unused = _policy_with_source(
+        project, operator=operator, operator_digest="fixture"
+    )
+    assert effective == operator
+    assert source.startswith("operator:")
+    assert unused is not None
+    clamped = _LAST_CLAMPED_SETTINGS.get()
+    assert any("fail_threshold" in entry for entry in clamped)
+    assert any("failure_mode" in entry for entry in clamped)

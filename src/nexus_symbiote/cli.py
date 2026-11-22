@@ -244,10 +244,10 @@ def _policy_with_source(
     weaker = weakened_settings(project)
     if has_operator or (weaker and not allow_weakening):
         narrowed, clamped = narrow_policy(baseline, project, inherit_unspecified=True)
+        _LAST_CLAMPED_SETTINGS.set(tuple(clamped))
         if not allow_weakening and (clamped or not has_operator):
             if narrowed == baseline:
                 return baseline, source, baseline_weaker, _warn_unapplied_project_policy(path)
-            _LAST_CLAMPED_SETTINGS.set(tuple(clamped))
             echo_line(
                 "WARNING: project policy ",
                 path,
