@@ -61,18 +61,124 @@ commands. The structural recommendation at the end addresses that.
 
 Each of these files is also held by open pull request #380. The commits are small and
 self-contained so that #380's fixer can take them, or #380 can land first and this branch
-merges forward.
+merges forward. The cross-check found that #380's head `ea55d1f3` already fixes the
+suppression finding by its own route, so `1e830999` is redundant once #380 lands; its
+regression test is still worth keeping. The other three are on no open head.
 
 ## Ranked findings still open
 
 Severity and confidence are this review's. "PR status" is the result of running the lane's
 probe against each open head (see [cross-check](#cross-check-against-the-open-pull-requests)).
 
-<!-- OPEN -->
+| # | Severity | Finding | Where | Introduced, or claimed and missed | PR status |
+| --- | --- | --- | --- | --- | --- |
+| 1 | High | A filesystem server root of `${HOME}`, `~`, `${workspaceFolder}` or a symlink to `.claude` is not a steering surface, so the critical finding never fires | `control_plane_audit.py` `_covers_steering_path` | #288; missed by #312, #330 | Fixed on #377 `99c4b054` |
+| 2 | High | Hook targets behind `VAR=`, `cd &&`, `exec`, `bash -c`, `;` or a pipe are never resolved and record no gap; a baseline diff misses a swapped script | `control_plane_audit.py` `_extract_local_script_target` | #288; missed by #330 | #377 adds shell splitting; re-run lane M `probe_cp2` P2/P3 on its head before merge |
+| 3 | High | Skill and command preambles: only the line-start form in `SKILL.md`; `.claude/commands/*.md` is never scanned | `control_plane_audit.py` `_PREAMBLE_RE` | #288 | Partial on #377 (inline form in skills); commands directory open |
+| 4 | High | Front-matter grants and hooks in subagents, commands and skills are never rated; `frontmatter_tools` is unwired | `settings_precedence.py` | #277; missed by #320 | Not fixed by #382 |
+| 5 | High | A plugin's `hooks` given as a path, and marketplace-nested plugins, are not read | `ide_agents.py` plugin reader | #130; missed by #320 | Not fixed by #382 |
+| 6 | High | Glob prefixes `Bash(ba*)`, `Bash(pyth*)` grant a shell with no oversight gap | `settings_precedence.py`, `ide_agents.py` | #277, #130; missed by #226/#251 | Not fixed by #382 (only `sh*`, `python*`) |
+| 7 | High | Code-built MCP launchers and servers under `build`, `dist`, `docs`, `examples`, `tests`, `test`, `benchmarks` at any depth are skipped with no gap (A2A and prompts use the same set) | `mcp_sources.py` `SOURCE_SEARCH_SKIPPED`, `a2a.py` | #128, #130, #263 | Not fixed by any open PR |
+| 8 | High | A2A 0.3 field `additional_interfaces` is ignored, so a plaintext alternative interface drops the transport finding | `a2a.py` | #126 | Not fixed by any open PR |
+| 9 | High | A runner given as a path into the checkout (`./npx`, `bin/uvx`, `./docker`) is recorded as a pinned registry package | `mcp_launch.py` `_classify` | #130; missed by #329 | Not fixed by #383 |
+| 10 | High | `uv.lock` wheel and sdist URLs and hashes are never checked; an artifact from any host is reported as `pkg:pypi` from pypi.org | `registry.py` `_resolve_python_lockfiles` | #128; missed by #149 | Not fixed by #378 or #383 |
+| 11 | High | Escaped hidden characters in Gemini TOML commands and `.github/prompts/*.prompt.yml` are not decoded | `prompt.py` | #263, #318 | Fixed on #381 `3c738ad7` |
+| 12 | High | C0/C1 controls (NUL, ESC, NEL) are not reported or stripped; a NUL also makes the file binary in PR review | `prompt.py` `_hidden_counts`, `text_poisoning.py` | #130, #291 | Not fixed by #378 or #381 |
+| 13 | High | The `@path` import tokenizer uses Python `\s` (U+0085, U+001C–1F) and no escaped space; the import is never inventoried and no gap is recorded (host regex assumed) | `prompt.py` `_IMPORT` | #130 | Not fixed |
+| 14 | High | `diff-instructions` ignores Copilot `mcp-servers` front matter and a `mode` change (schema assumed) | `instruction_diff.py` | #276 | Not fixed by #381 |
+| 15 | High | `validate --project` without the binding key passes while launch values, env values and imported content differ | `completeness.py` `validate_against_project` | #203 fixed `diff` only | Not fixed by #380 |
+| 16 | High | A reviewed suppression on a configuration record survives any configuration change | `validators/risk.py` | #133 | Fixed on #380 `ea55d1f3`, and on this branch `1e830999` |
+| 17 | High | Deny rule coverage: a bare deny clears `my__filesystem` (Antigravity R-CRIT-02, confirmed, rated High) | `control_plane_audit.py` | #312, #330 | Not fixed by #377 |
+| 18 | Medium | Hook-script classifier misses `ssh`, `scp`, `Invoke-WebRequest`, writes to `.mcp.json` or `.claude/hooks`, and `"behavior":"allow"` output | `control_plane_audit.py` | #288 | Partial on #377 (`fetch("…")` only) |
+| 19 | Medium | Trifecta legs come only from a fixed tool-name list; `browser_navigate`, `read_text_file`, `slack_post_message` give nothing and no unassessed count | `trifecta.py` | #272 | Not fixed by #382 |
+| 20 | Medium | CycloneDX projection-3 `services[].endpoints` copies supplied endpoint URLs verbatim (userinfo, query tokens, `javascript:`, `file:`) | `cyclonedx.py` `_services` | #279; missed by #347 | Not fixed by #380 |
+| 21 | Medium | Offline OSV matching misses PEP 440 local builds (`torch==2.0.0+cu118`) for listed versions and `last_affected` | `offline_advisories.py` | #273, #306 | Not fixed by #380 |
+| 22 | Medium | Root-level npm declarations compare ranges with PEP 440 instead of node-semver | `sbom_import.py` | #280, #332; missed by #353 | Partial on #383 (lock check fixed, root not) |
+| 23 | Medium | An unqualified supplier purl against a private-index lock raises no conflict | `sbom_import.py` `_provenance_disagrees` | #332 | Not fixed by #383 |
+| 24 | Medium | Node lock versions outside the declared range are accepted (npm, pnpm, Yarn 1) | `registry.py` | #128, #130 | Not fixed |
+| 25 | Medium | Dockerfile `COPY --from=<image>` and `RUN --mount=from=<image>` are ignored | `registry.py` | #126 | Not fixed |
+| 26 | Medium | `project.dynamic` dependencies and `setup.py` give a positive "no AI dependencies" | `registry.py` | #52 | Not fixed |
+| 27 | Medium | A cleartext index in requirements, pip.conf or .npmrc is Low; in `uv.lock` it is High | `registry.py` `_redirect` | #126, #130 | Not fixed |
+| 28 | Medium | A duplicated `source`/`src` key in `docker run --mount` silences the host-root mount | `mcp_launch.py` `_host_source` | #130; missed by #329 | Not fixed by #383 |
+| 29 | Medium | `infisical run --command` is not read (semantics assumed); podman `--cap-add` comma lists are not split | `mcp_launch.py` | #130 | Not fixed by #383 |
+| 30 | Medium | MCP client APIs in the SDK (`ClientSessionGroup`, `SseServerParameters`), fastmcp `Client`, mcp_use and others start servers with no gap | `mcp_sources.py` | #138, #149, #203 | Not fixed |
+| 31 | Medium | `_launch_words` runs shlex with no length cap (quadratic; its twin is capped) | `mcp.py` | #226, #255 | Not fixed |
+| 32 | Medium | Credentials in refused, duplicate, replaced or normalised-away servers print through a sibling (13 shapes) | `mcp.py` `_file_secrets` | #226, #247, #301 | Partial on #327 (2 shapes remain); #384 no longer carries scrubbing |
+| 33 | Medium | A credential in a JSON-valued env or header over 64 KiB or depth 8 raises nothing and no gap | `mcp_credentials.py` `_json_hits` | #255 | Not fixed |
+| 34 | Medium | Continue `apiKey`/`requestOptions.headers` and Codex `experimental_bearer_token` get a gap but no `credential_exposure` | `mcp.py` | #301 vs #255 | Not fixed |
+| 35 | Medium | A code-built tool with a wrapped callee `(server.tool as any)(…)` is dropped with no gap | `ts_tools.py` | #84; missed by #149 | Not fixed by #381 |
+| 36 | Medium | LangChain `langchain.agents.tool`, `crewai_tools.tool`, `create_agent`/`create_react_agent` tools, smolagents base tools give no tool and no gap | `python_tools.py` | #128, #319 | Not fixed by #381 |
+| 37 | Medium | Hook handlers of type `http`, `prompt`, `agent` are counted but never rated (schema assumed) | `ide_agents.py` | #226 | Not fixed by #382 |
+| 38 | Medium | The settings layer merge drops committed findings | `ide_agents.py` | #81, #130 | Partial on #382 (findings kept, counts still zeroed) |
+| 39 | Medium | The two rule classifiers drift (`mcp__x` vs `mcp__x__*`, `Bash(bash)`) | `ide_agents.py`, `settings_precedence.py` | #277 | Partial on #382 |
+| 40 | Medium | Codex profiles and `notify`, Gemini hooks and `tools.allowed`, Cursor `cli.json` are digested but not rated | `ide_agents.py` | #130, #226 | Not fixed by #382 |
+| 41 | Medium | The hook ladder rates `npx -y`, `uvx`, `docker run`, non-http schemes and `ssh`/`nc` Medium | `ide_agents.py` | #226 | Not fixed by #382 |
+| 42 | Medium | Brace-group fetch-and-execute `{ curl …; } | bash` is High, not Critical (Muse verification, new) | `ide_agents.py` | #251, #375 | Not fixed by #382 |
+| 43 | Medium | A vendor credential in `.claude/settings.json` `env` gets no finding; the same value in `.mcp.json` is High (Muse verification, new) | `ide_agents.py` | #255 | Not fixed by #382 |
+| 44 | Medium | A computed PowerShell word with a computed payload (`$p -ec $b`) is Medium; it was Critical on the closed #341/#343 branch | `ide_agents.py` `_computed_powershell` | #320 narrowed it | Not fixed; patch verified on a copy (9,969 hook tests pass) |
+| 45 | Medium | `diff-instructions` does not read prompt templates | `instruction_diff.py` | #276 | Fixed on #381 |
+| 46 | Medium | `diff-instructions` compares hidden Unicode in raw text only | `instruction_diff.py` | #276 | Partial on #381 |
+| 47 | Medium | A new always-loaded instruction file, or a removed guardrail file, is not a change | `instruction_diff.py` | #276 | Not fixed by #381 |
+| 48 | Medium | TP-SIDENOTE-004 is O(P×N), about 17 s per MB per tool | `text_poisoning.py` | #291 | Not fixed by #381 |
+| 49 | Medium | Lost with closed #261: skill and hook scripts that pipe a download into a shell are not reported | `prompt.py` | #261 closed unmerged | Not fixed |
+| 50 | Medium | A SafeTensors polyglot whose pickle call sits past the 4,096-opcode or 64 KiB walk is rated safe (#376 item left as a design decision); lane E's wider-sample fix gives 0 of 3,000 benign false positives | `model.py` | #376 | Not fixed; patch offered to #385 |
+| 51 | Medium | The shared model inspection budget is hard-coded, so earlier files turn a later GGUF's critical template finding into high unknown | `model_formats.py` | #130 | Not fixed |
+| 52 | Medium | `--no-isolation`: the launcher can write the verifier's memory and read its environment as the same uid | `live/pinned_process.py` | #203, #228, #231 | Not fixed by #379 |
+| 53 | Medium | Draft-04 `enum` reaches jsonschema's quadratic `uniqueItems`; a server still verifies past the deadline | `live_mcp.py`, `live/verify.py` | #130, #202 | Fixed on #381 (with a false refusal of valid enums) |
+| 54 | Medium | Served descriptors never run the text-poisoning rules | `live/inventory.py`, `live/verify.py` | #130 | Partial on #381 (hidden characters only) |
+| 55 | Medium | The trace redactor runs on every distinct identifier; about one hour of runner time within the documented bounds | `otlp.py` | #138 | Not fixed |
+
+Lows (49) and Infos are listed per lane in the session's lane reports and summarised on the
+ledger. The ones worth a quick change are: `trace-diff` and `import-shadowscan` ignoring
+`--detailed-exit-codes`; three emitted risk categories (`source_conflict`,
+`source_conflict_unresolved`, `declaration_conflict`) missing from the SARIF rule catalog;
+`diff` printing "No changes detected." while its gate fails; an int64 schema bound
+dropping a whole MCP server under RFC 8785's integer domain; and confined reads following a
+hard link out of the root.
+
+Several tests are load-sensitive under `pytest -n 8` and passed alone:
+`test_prompt_imports::test_scan_memory_grows_with_the_files_not_with_the_paths_they_reference`,
+`test_pinned_process_isolation::test_the_wrapper_and_a_launcher_that_watches_its_parent_end_with_a_crashed_client`,
+`test_typescript_analysis_bounds::test_a_source_over_a_budget_is_refused_for_that_budget_on_a_stalled_machine`
+(its parse budget counts wall time while the machine is busy) and
+`test_scan_of_collected_payload_files_finishes`.
 
 ## Cross-check against the open pull requests
 
-<!-- CROSSCHECK -->
+Every High and Medium above was re-run against the open heads #327 `2d5d9085`, #377
+`99c4b054`, #378 `0267f41d`, #379 `f8508052`, #380 `ea55d1f3`, #381 `3c738ad7`, #382
+`6cd15bd4`, #383 `9fc40f71`, #384 `4e2459b5` and #385 `73b4fbe2`, by running the lane's
+probe on each tree. Seven are fixed outright on a head and eight in part; the status column
+above records which. Three side effects of the open heads:
+
+- #381 refuses a valid 1,000-member object `enum` with no dialect. That fails closed but
+  rejects valid servers.
+- #384's head (`4e2459b5`, reduced to F-370-1) no longer carries the #255 scrubbing its
+  title names; its leak probes give the same result as `main`.
+- #382 brings `bash.exe` into agreement in both rule classifiers, but `Bash(bash)`,
+  `mcp__github` and `Bash(/)` still drift.
+
+## Recommendations
+
+1. **Land the four branch commits or their equivalents.** The uv-sources lock fix, the
+   precision-gate registration and the trace ambiguous-match fix are not on any open head.
+2. **Close the twin-path class structurally, not per finding.** Most findings above are a
+   second code path that kept the old behaviour. Three changes would stop the pattern:
+   one shared decoded-text view for the prompt collector, the instruction diff gate and the
+   text-poisoning rules; one rule classifier exported from `settings_precedence.py` for both
+   uses; and one tokenizer for shell-split launch values with a single bound.
+3. **Make unknown fail closed by default in the collectors that still allowlist.** The
+   source search skip set, the MCP client API table, the framework roots and the
+   per-host settings keys all treat "not recognised" as "nothing there". Each should record
+   a gap for anything it skipped, so a new form shows up as a gap instead of silence.
+4. **Require the binding key for `validate --project` when the collection redacts.** `diff`
+   already treats unbound values as an alert; `validate` and `risk --project` should too.
+5. **Add a lock regeneration job.** A network-limited, token-less `pull_request` job that
+   runs `check_locks.py --regenerate` and `git diff --exit-code` closes the forged `# via`
+   and extra-hash findings, which the offline check cannot see.
+6. **Stabilise the load-sensitive tests** listed above before the next merge batch, since
+   each one has already cost a re-run today.
+
 
 
 
@@ -202,5 +308,8 @@ Three closed integration branches keep most but not all of their source lines: #
 
 ## Lost hardening
 
-<!-- LOST -->
+All 43 hunks that the closed integration branches #341, #343 and #372 carry beyond their
+member pull requests were checked by running probes on `main` and on each branch tree: 30
+are on `main` in a stricter form, 12 in an equivalent form, and one is partly lost (row 44
+above: a computed PowerShell payload). Nothing else from those branches needs reviving.
 
