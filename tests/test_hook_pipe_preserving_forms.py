@@ -196,3 +196,41 @@ def test_a_bypass_form_fails_the_default_gate_through_the_scanner(tmp_path):
 def test_group_tracking_stays_linear(make):
     texts = {scale: make(1_000 * scale) for scale in (1, 4)}
     assert scaling_ratio(lambda scale: ide_agents._command_severity(texts[scale])) < 10
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # GNU getopt_long and sudo take any unambiguous prefix of a long option, so the
+        # option's value is not the command (`--sig KILL` is `--signal KILL`).
+        _FETCH + "sudo --sh",
+        _FETCH + "sudo --she",
+        _FETCH + "timeout --sig KILL 5 sh",
+        _FETCH + "timeout --kill 1 5 sh",
+        _FETCH + "nice --adj 5 sh",
+        _FETCH + "stdbuf --out L sh",
+        _FETCH + "chroot --users root / sh",
+        _FETCH + "env --uns X sh",
+        _FETCH + "env --ch / sh",
+        _FETCH + "flock --time 1 ./l sh",
+        _FETCH + "script -q --comm=sh /dev/null",
+        # With no `-c`, script runs the user's shell on its standard input.
+        _FETCH + "script -q /dev/null",
+    ],
+)
+def test_abbreviated_long_options_do_not_hide_the_shell(command):
+    assert ide_agents._command_severity(command) is RiskSeverity.CRITICAL
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        _FETCH + "timeout 5 cat",
+        _FETCH + "nice --adj 5 cat",
+        _FETCH + "sudo --list",
+        _FETCH + "env --uns X cat",
+        _FETCH + 'script -q -c "echo hi" /dev/null',
+    ],
+)
+def test_abbreviated_long_options_before_a_non_shell_are_not_critical(command):
+    assert ide_agents._command_severity(command) is not RiskSeverity.CRITICAL

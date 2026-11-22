@@ -806,7 +806,9 @@ _BASE64_DECODE = re.compile(
 )
 # `sudo -s`, `-i`, alone or in a bundle such as `-Es`, or their long forms; the letters
 # before the flag's leave it out for the same reason.
-_SUDO_SHELL_FLAG = re.compile(r"--(?:shell|login)|-[A-Za-hj-rt-z]*[si][A-Za-z]*")
+# sudo takes any unambiguous prefix of a long option: `--sh` is `--shell`; `--login`
+# has none, since `--login-class` shares every shorter one.
+_SUDO_SHELL_FLAG = re.compile(r"--sh(?:e(?:ll?)?)?|--login|-[A-Za-hj-rt-z]*[si][A-Za-z]*")
 _SCRIPT_FLAG = re.compile(r"(?i)-c(?:ommand(?:withargs)?)?\Z|-[A-Za-z]*c\Z")
 # An interpreter's flag that takes its program as the next argument: `-e`, `-E`, `-p`,
 # `-r` (PHP only: node and ruby load a module with it) and the long `--eval` and
@@ -1423,6 +1425,9 @@ def _assignment_end(words: list[str], index: int) -> int:
     return index + 1
 
 
+_ENV_LONG_VALUES = frozenset({"--unset", "--chdir", "--split-string"})
+
+
 def _skip_env(words: list[str], index: int) -> int:
     while index < len(words):
         word = _decode_word(words[index], drop_ifs=True)
@@ -1435,10 +1440,14 @@ def _skip_env(words: list[str], index: int) -> int:
         if word in {"-u", "-C", "-S"}:
             index += 2
             continue
-        if word.startswith(("--unset=", "--chdir=", "--split-string=")):
+        if (
+            word.startswith("--")
+            and "=" in word
+            and _long_value_option(word.partition("=")[0], _ENV_LONG_VALUES)
+        ):
             index += 1
             continue
-        if word in {"--unset", "--chdir", "--split-string"}:
+        if _long_value_option(word, _ENV_LONG_VALUES):
             index += 2
             continue
         if word.startswith("-"):
@@ -1539,6 +1548,21 @@ _WRAPPERS: dict[str, tuple[frozenset[str], int]] = {
 }
 
 
+def _long_value_option(word: str, with_value: frozenset[str]) -> bool:
+    """Whether ``word`` is GNU getopt_long's abbreviation of a value-taking long option.
+
+    getopt_long takes any unambiguous prefix, so `timeout --sig KILL 5 sh` gives `--signal`
+    the value `KILL`. A prefix that another option shares is refused by the program, so
+    reading it as the value option can only over-rate.
+    """
+    return (
+        word.startswith("--")
+        and len(word) > 2
+        and "=" not in word
+        and any(option.startswith(word) for option in with_value if option.startswith("--"))
+    )
+
+
 def _skip_wrapper(words: list[str], index: int, name: str) -> int:
     with_value, operands = _WRAPPERS[name]
     while index < len(words):
@@ -1548,7 +1572,7 @@ def _skip_wrapper(words: list[str], index: int, name: str) -> int:
             break
         if not word.startswith("-") or word == "-":
             break
-        index += 2 if word in with_value else 1
+        index += 2 if word in with_value or _long_value_option(word, with_value) else 1
     return index + operands
 
 
@@ -1580,11 +1604,18 @@ def _option_command(words: list[str], index: int, runner: str) -> int | None:
     user = False
     while index < len(words):
         word = _decode_word(words[index], drop_ifs=True)
-        if word in {"-c", "--command"} or (
-            len(word) > 2 and word[0] == "-" and word[-1] == "c" and set(word[1:-1]) <= set(bundled)
+        if (
+            word in {"-c", "--command"}
+            or _long_value_option(word, frozenset({"--command"}))
+            or (
+                len(word) > 2
+                and word[0] == "-"
+                and word[-1] == "c"
+                and set(word[1:-1]) <= set(bundled)
+            )
         ):
             return index + 1
-        attached = re.match(rf"--command=|-[{bundled}]*c(?=.)", word)
+        attached = re.match(rf"--co(?:m(?:m(?:a(?:nd?)?)?)?)?=|-[{bundled}]*c(?=.)", word)
         if attached is not None:
             words[index] = word[attached.end() :]
             return index
@@ -1888,8 +1919,9 @@ def _segment_executes(segment: str) -> bool:
     if index is None:
         return _sudo_shell(words)
     names = _name_variants(words[index])
-    # `su` or `runuser` left as the command has no `-c`: it runs the user's shell on stdin.
-    if names & (_SHELL_NAMES | _IEX_NAMES | {"su", "runuser"}):
+    # `su`, `runuser` or `script` left as the command has no `-c`: each runs the user's
+    # shell on standard input.
+    if names & (_SHELL_NAMES | _IEX_NAMES | {"su", "runuser", "script"}):
         return True
     interpreter = next(iter(sorted(names & _STDIN_INTERPRETERS.keys())), None)
     # An output redirection's words, as in `python3 2>/dev/null`, are not the program,
