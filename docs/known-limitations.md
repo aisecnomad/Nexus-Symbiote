@@ -1231,7 +1231,13 @@ A way around a limit that its entry does not describe is worth a
   other.
 - **Skill front matter is not interpreted.** Every file in the skill and command
   directories, apart from files named as holding credentials, is bound by digest,
-  but settings such as `allowed-tools` are not read. A skill declaration (`.md`,
+  but settings such as `allowed-tools` are not read. Of skill front matter, only
+  `hooks` is read, by `ide_agents`, in `.claude/skills/*/SKILL.md`, as it is in
+  subagents' `.claude/agents/*.md`. `hooks` in the front matter of a command file (`.claude/commands/*.md`), of a
+  plugin's own skills, and under a subdirectory's `.claude` that holds no settings
+  file are not read; a plugin's subagents ignore hooks. `audit-control-plane` does
+  not list front-matter or plugin hook files as hook targets, and the `hooks` of a
+  plugin entry in `marketplace.json` are not followed to their files. A skill declaration (`.md`,
   `.mdc`, `.markdown`, `.txt`, `.yaml`, `.yml`, `.json`, `.toml`) above the
   `file-bytes` limit is a failure; a larger script or other resource is streamed and
   digested.

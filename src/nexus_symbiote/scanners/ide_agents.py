@@ -25,6 +25,7 @@ import base64
 import binascii
 import fnmatch
 import os
+import posixpath
 import re
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -38,6 +39,7 @@ from nexus_symbiote.core.models import (
     RiskAssessment,
     VerifiedExtensionComponent,
 )
+from nexus_symbiote.policy import PolicyError, parse_yaml_mapping
 from nexus_symbiote.scanners.base import Scanner, ScanResult
 from nexus_symbiote.scanners.credential_files import credential_gap
 from nexus_symbiote.scanners.mcp import (
@@ -47,6 +49,7 @@ from nexus_symbiote.scanners.mcp import (
 )
 from nexus_symbiote.scanners.source_binding import BindingError, value_binding
 from nexus_symbiote.settings_precedence import (
+    MAX_FRONTMATTER_YAML_NODES,
     evaluate_tool_oversight,
     extract_bounded_deny_rules,
     extract_bounded_sandbox_domains,
@@ -54,6 +57,7 @@ from nexus_symbiote.settings_precedence import (
 )
 from nexus_symbiote.utils.confined import ConfinedCollection, fold_name
 from nexus_symbiote.utils.jsonc import strip_jsonc
+from nexus_symbiote.utils.markdown import front_matter_candidates
 from nexus_symbiote.utils.secrets import REDACTED, redact_keyed_text, redact_text
 from nexus_symbiote.utils.terminal import neutralize
 from nexus_symbiote.utils.toml import loads as load_toml
@@ -146,6 +150,10 @@ _FOLDED_SETTINGS_NAMES = {
 # plugin's hook configuration only when one of them is present.
 CLAUDE_PLUGIN_MANIFESTS = [".claude-plugin/plugin.json", ".claude-plugin/marketplace.json"]
 CLAUDE_PLUGIN_HOOKS = "hooks/hooks.json"
+CLAUDE_PLUGIN_MANIFEST = ".claude-plugin/plugin.json"
+# Claude Code registers the hooks in a project subagent's or skill's front matter while
+# that component runs; a skill's even under `claude -p` in an untrusted folder.
+_FRONT_MATTER_HOOK_DIRECTORIES = ((".claude/agents", None), (".claude/skills", "SKILL.md"))
 # The `agent.permissionMode` key read for these hosts is a project convention that
 # vendor documentation does not describe; the files are read for it, and digested.
 _AGENT_MODE_SETTINGS = {
@@ -3520,16 +3528,33 @@ class IDEAgentScanner(Scanner):
             data = self._read_mapping(Path(relative), result)
             if data is not None:
                 plugins[relative] = data
+        # Hook files hold hook configuration only, and are read whole.
+        hook_files = {CLAUDE_PLUGIN_HOOKS}
         if plugins:
-            hooks_file = self._read_mapping(Path(CLAUDE_PLUGIN_HOOKS), result)
-            if hooks_file is not None:
-                plugins[CLAUDE_PLUGIN_HOOKS] = hooks_file
+            declared_files = plugins.get(CLAUDE_PLUGIN_MANIFEST, {}).get("hooks")
+            for relative in [CLAUDE_PLUGIN_HOOKS, *self._plugin_hook_paths(declared_files, result)]:
+                if relative in plugins or relative in documents:
+                    continue
+                hooks_file = self._read_mapping(Path(relative), result)
+                if hooks_file is None:
+                    if relative != CLAUDE_PLUGIN_HOOKS:
+                        result.scan_failures.append(
+                            f"{CLAUDE_PLUGIN_MANIFEST}: hooks file {neutralize(relative)} not read"
+                        )
+                    continue
+                plugins[relative] = hooks_file
+                hook_files.add(relative)
                 hooks = _declared_hooks(hooks_file.get("hooks"))
                 if hooks:
-                    properties.setdefault("declared_hooks", {})[CLAUDE_PLUGIN_HOOKS] = hooks
+                    properties.setdefault("declared_hooks", {})[relative] = hooks
             properties["plugin_manifests"] = sorted(plugins)
         # Only settings files merge into the permission summary; every file is bound.
         documents.update(plugins)
+        for relative, hooks in self._front_matter_hooks(result, base).items():
+            documents[relative] = {"hooks": hooks}
+            declared_hooks = _declared_hooks(hooks)
+            if declared_hooks:
+                properties.setdefault("declared_hooks", {})[relative] = declared_hooks
         if not documents:
             return None
         declared_permissions = merged.get("permissions")
@@ -3585,13 +3610,13 @@ class IDEAgentScanner(Scanner):
         auto_run: set[str] = set()
         helper_severity = RiskSeverity.MEDIUM
         for relative, data in documents.items():
-            body = data if relative == CLAUDE_PLUGIN_HOOKS else data.get("hooks")
+            body = data if relative in hook_files else data.get("hooks")
             try:
                 hook_commands += _hook_commands(body)
                 hook_severity = _worse(hook_severity, _hook_command_severity(body))
             except ValueError:
                 result.scan_failures.append(f"{relative}: settings cannot be canonicalized")
-            if relative == CLAUDE_PLUGIN_HOOKS:
+            if relative in hook_files:
                 continue
             for key in _AUTO_RUN_SETTINGS:
                 setting = data.get(key)
@@ -3630,7 +3655,7 @@ class IDEAgentScanner(Scanner):
                 )
             )
         environment_risk = _environment_risk(
-            {key: value for key, value in documents.items() if key != CLAUDE_PLUGIN_HOOKS}
+            {key: value for key, value in documents.items() if key not in hook_files}
         )
         if environment_risk is not None:
             risks.append(environment_risk)
@@ -3696,6 +3721,70 @@ class IDEAgentScanner(Scanner):
                     )
                 )
         return merged
+
+    @staticmethod
+    def _plugin_hook_paths(declared: object, result: ScanResult) -> list[str]:
+        """The hook files a plugin manifest's `hooks` names: a `./` path or a list that
+        holds them, beside inline hook objects. Each must stay inside the plugin root."""
+        entries = [declared] if isinstance(declared, str) else declared
+        paths: list[str] = []
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, str):
+                continue
+            relative = posixpath.normpath(entry.removeprefix("./"))
+            if not entry.startswith("./") or relative == ".." or relative.startswith("../"):
+                result.scan_failures.append(
+                    f"{CLAUDE_PLUGIN_MANIFEST}: hooks path {neutralize(entry)} is not a"
+                    " ./ path inside the plugin root; not read"
+                )
+                continue
+            paths.append(relative)
+        return paths
+
+    def _front_matter_hooks(self, result: ScanResult, base: str) -> dict[str, Any]:
+        """The `hooks` each project subagent and skill declares in its YAML front matter.
+
+        Both readings of front matter that `...` may close are taken. A front matter that
+        does not parse is a gap when it may name `hooks`: it holds the word, or an escape
+        that a quoted YAML key could spell it with.
+        """
+        files = self._files
+        if files is None:
+            raise RuntimeError("_front_matter_hooks called outside a _collection context")
+        prefix = f"{base}/" if base else ""
+        found: dict[str, Any] = {}
+        for directory, name in _FRONT_MATTER_HOOK_DIRECTORIES:
+            if not files.is_directory(prefix + directory):
+                continue
+            for path in sorted(files.iter_files(prefix + directory)):
+                if (path.name != name) if name else (path.suffix != ".md"):
+                    continue
+                relative = path.as_posix()
+                target = files.in_root_target(path)
+                followed = target.as_posix() if target is not None and target != path else None
+                # A file named as holding credentials is not read.
+                if credential_gap(relative, followed) is not None:
+                    continue
+                text = files.read_text(relative, missing_ok=True)
+                readings: list[Any] = []
+                for language, raw, _ in front_matter_candidates(text or ""):
+                    try:
+                        if language not in {"", "yaml", "yml"}:
+                            raise ValueError("not YAML")
+                        meta = parse_yaml_mapping(raw, max_nodes=MAX_FRONTMATTER_YAML_NODES)
+                    except (PolicyError, ValueError, TypeError, RecursionError, MemoryError):
+                        if "hooks" in raw or "\\" in raw:
+                            result.scan_failures.append(
+                                f"{neutralize(relative)}: front matter that may declare hooks"
+                                " not read"
+                            )
+                        continue
+                    hooks = meta.get("hooks")
+                    if hooks is not None and hooks not in readings:
+                        readings.append(hooks)
+                if readings:
+                    found[relative] = readings[0] if len(readings) == 1 else readings
+        return found
 
     @staticmethod
     def _bind_settings(
