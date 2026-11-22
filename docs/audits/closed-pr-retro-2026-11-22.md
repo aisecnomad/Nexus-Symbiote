@@ -37,7 +37,7 @@ wrong.
 
 No Critical finding survived reproduction. **19 High and 39 Medium findings reproduce on
 `main` at `e03f980e`**, most of them sibling forms of a class that a merged pull request
-claimed to close. Four are fixed on this branch with regression tests (below). The rest are
+claimed to close. Five are fixed on this branch with regression tests (below). The rest are
 either already fixed on an open pull request head, recorded in the table with that head, or
 open with a recommended fix. Three earlier reviews were checked independently: of the
 Medium-or-higher findings re-run, Muse's batches gave 23 confirmed, 4 partial and 1 refuted,
@@ -57,6 +57,7 @@ commands. The structural recommendation at the end addresses that.
 | `eba4b73b` | `make lock` applied the checkout's `[tool.uv.sources]` despite `--no-config`, so a pull request could route one dependency to an index it names; the lock showed an ordinary pin and the offline check passed. Reproduced with uv 0.11.32 against a loopback index | High | `scripts/check_locks.py` (`regenerate`, `check`) | `test_regeneration_ignores_package_sources_from_the_checkout`, `test_uv_settings_in_pyproject_fail_the_lock_check` (3 cases) |
 | `a010e6c6` | The precision gate (`--fresh`) and the parser fuzz smoke gate were not required commands, so dropping them or scoring from a committed file kept every check green (#302) | Medium | `scripts/check_workflows.py` (`REQUIRED_COMMANDS`) | two new `test_a_gate_job_hollowed_out_under_its_name_is_rejected` cases, `test_a_precision_gate_scored_from_a_committed_file_is_rejected` |
 | `10307006` | `trace-diff` checked reported definition hashes and SPIFFE IDs only for a single candidate; with two servers sharing a tool name, a foreign or unreadable hash passed with exit 0 (#281). Reproduced on `main` and on #380's head | High | `trace_evidence.py` (`reconcile`, `_gate`, `_findings`) | `test_an_ambiguous_tool_reporting_a_hash_no_candidate_declares_fails_the_gate` (2), `test_an_ambiguous_agent_reporting_a_foreign_spiffe_id_fails_the_gate`, positive control `test_an_ambiguous_tool_reporting_one_candidates_hash_passes` |
+| `0de28359` | A SafeTensors polyglot whose pickle call sits past the walk's 4,096-opcode or 64 KiB bounds was rated safe while `pickle.load` ran it (#376 left it as a design decision). The undecided walk is repeated over the header plus 64 KiB, charged to the shared inspection budget; 0 of 3,000 benign headers change rating | Medium | `scanners/model.py` (`_safetensors_polyglot`) | `test_a_polyglot_padded_past_the_pickle_bounds_is_rated_critical[4200]`, `test_the_wide_polyglot_walk_is_charged_to_the_shared_budget` |
 | `1e830999` | A suppression on an MCP, IDE, RAG or A2A record bound no content, so it kept matching after the configuration changed (#133). **Breaking:** such suppressions go stale once | High | `validators/risk.py` (`component_content_digest`) | `test_a_suppression_on_an_mcp_server_does_not_follow_a_changed_configuration` |
 
 Each of these files is also held by open pull request #380. The commits are small and
@@ -121,7 +122,7 @@ probe against each open head (see [cross-check](#cross-check-against-the-open-pu
 | 47 | Medium | A new always-loaded instruction file, or a removed guardrail file, is not a change | `instruction_diff.py` | #276 | Not fixed by #381 |
 | 48 | Medium | TP-SIDENOTE-004 is O(P×N), about 17 s per MB per tool | `text_poisoning.py` | #291 | Not fixed by #381 |
 | 49 | Medium | Lost with closed #261: skill and hook scripts that pipe a download into a shell are not reported | `prompt.py` | #261 closed unmerged | Not fixed |
-| 50 | Medium | A SafeTensors polyglot whose pickle call sits past the 4,096-opcode or 64 KiB walk is rated safe (#376 item left as a design decision); lane E's wider-sample fix gives 0 of 3,000 benign false positives | `model.py` | #376 | Not fixed; patch offered to #385 |
+| 50 | Medium | A SafeTensors polyglot whose pickle call sits past the 4,096-opcode or 64 KiB walk is rated safe (#376 item left as a design decision); lane E's wider-sample fix gives 0 of 3,000 benign false positives | `model.py` | #376 | Fixed on this branch `0de28359` (#385 merged without it) |
 | 51 | Medium | The shared model inspection budget is hard-coded, so earlier files turn a later GGUF's critical template finding into high unknown | `model_formats.py` | #130 | Not fixed |
 | 52 | Medium | `--no-isolation`: the launcher can write the verifier's memory and read its environment as the same uid | `live/pinned_process.py` | #203, #228, #231 | Not fixed by #379 |
 | 53 | Medium | Draft-04 `enum` reaches jsonschema's quadratic `uniqueItems`; a server still verifies past the deadline | `live_mcp.py`, `live/verify.py` | #130, #202 | Fixed on #381 (with a false refusal of valid enums) |
@@ -160,8 +161,9 @@ above records which. Three side effects of the open heads:
 
 ## Recommendations
 
-1. **Land the four branch commits or their equivalents.** The uv-sources lock fix, the
-   precision-gate registration and the trace ambiguous-match fix are not on any open head.
+1. **Land the branch commits or their equivalents.** The uv-sources lock fix, the
+   precision-gate registration, the trace ambiguous-match fix and the SafeTensors polyglot
+   fix are not on any open head.
 2. **Close the twin-path class structurally, not per finding.** Most findings above are a
    second code path that kept the old behaviour. Three changes would stop the pattern:
    one shared decoded-text view for the prompt collector, the instruction diff gate and the
