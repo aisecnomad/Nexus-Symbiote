@@ -418,7 +418,7 @@ def test_check_yaml_flow_depth_blocks_deep_flow_and_allows_safe_constructs() -> 
     deep = "[" * (MAX_YAML_FLOW_DEPTH + 1) + "]" * (MAX_YAML_FLOW_DEPTH + 1)
     for bypass in (
         f"? foo |\n : {deep}\n",
-        f"a: foo |\n  {deep}\n",
+        f"a: foo |\nb: {deep}\n",
         f"a: |2\n {deep}\n",
         f"  a: |2\n   {deep}\n",
         f"- a: |2\n   {deep}\n",
@@ -567,6 +567,9 @@ def test_check_yaml_flow_depth_blocks_mid_scalar_quotes_and_unicode_linebreaks()
         f"# comment\x85{deep}",
         f"a: |\n  hi\u2028b: {deep}",
         f"a: |\n  hi\u2029b: {deep}",
+        f'a: foo\n  "not a quote\nb: {deep}\nc: "ok"\n',
+        f"a: foo\n  'not a quote\nb: {deep}\n",
+        f'[foo\n  "not a quote, {deep}]\n',
     ):
         with pytest.raises(PolicyError, match="flow nesting"):
             check_yaml_flow_depth(bypass)

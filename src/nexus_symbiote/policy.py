@@ -363,210 +363,32 @@ def _integer_or_text(loader: Any, node: Any) -> Any:
 
 
 MAX_YAML_FLOW_DEPTH = 64
-_YAML_FLOW_SPECIAL = re.compile(r"""[\[\]{}"'#\r\n\x85\u2028\u2029]""")
-_YAML_DQ_STOP = re.compile(r'["\\]')
-_YAML_LINE_BREAK = re.compile(r"\r\n|[\r\n\x85\u2028\u2029]")
-_YAML_WS_OR_BR = frozenset(" \t\r\n\x85\u2028\u2029")
-_YAML_BLOCK_IND_RE = re.compile(r"^[|>](?:(?P<d1>[1-9])[+-]?|[+-](?P<d2>[1-9])?)?$")
-_YAML_PROP_RE = re.compile(r"^(?:&|!)[^\s\[\]{},]+$")
-
-
-def _split_last_ws(text: str) -> tuple[str, str]:
-    idx = len(text) - 1
-    while idx >= 0 and text[idx] not in " \t":
-        idx -= 1
-    return text[: idx + 1].rstrip(" \t"), text[idx + 1 :]
-
-
-def _can_start_quote(text: str, start: int, depth: int, last_json_token_end: int) -> bool:
-    """Whether a ``"`` or ``'`` at ``start`` can open a YAML quoted scalar."""
-    if start == 0:
-        return True
-    prev = text[start - 1]
-    if prev in _YAML_WS_OR_BR or prev == "\ufeff":
-        return True
-    if depth <= 0:
-        return False
-    if prev in "[{,":
-        return True
-    if prev == ":":
-        # In flow context PyYAML treats ':' without trailing space as a value
-        # indicator only immediately after a JSON-like key (quoted scalar or flow).
-        idx = start - 2
-        while idx >= 0 and text[idx] in " \t":
-            idx -= 1
-        return idx + 1 == last_json_token_end
-    return False
-
-
-def _advance_line_start(text: str, span_start: int, span_end: int, line_start: int) -> int:
-    last_end = line_start
-    for br in _YAML_LINE_BREAK.finditer(text, span_start, span_end):
-        last_end = br.end()
-    return last_end
-
-
-def _parse_block_scalar_header(raw_line: str) -> tuple[int, int | None] | None:
-    """Return ``(parent_indent, explicit_content_indent)`` if ``raw_line`` opens a YAML block scalar.
-
-    Matches only valid YAML block-scalar header positions (root, document start ``---``,
-    mapping value ``:``, or block sequence/key indicators ``-``/``?``, with optional
-    ``&anchor``/``!tag`` properties) in O(len(raw_line)) time without regex backtracking.
-    """
-    trimmed = raw_line.rstrip(" \t")
-    if not trimmed:
-        return None
-    prefix, token = _split_last_ws(trimmed)
-    ind = _YAML_BLOCK_IND_RE.fullmatch(token)
-    if ind is None:
-        return None
-    digit = ind.group("d1") or ind.group("d2")
-    explicit = int(digit) if digit else None
-    while prefix:
-        rest, last = _split_last_ws(prefix)
-        if _YAML_PROP_RE.fullmatch(last):
-            prefix = rest
-            continue
-        break
-    if not prefix or prefix == "---":
-        return (-1, explicit)
-    if prefix.endswith(":"):
-        pos = 0
-        end = len(raw_line)
-        while pos < end and raw_line[pos] == " ":
-            pos += 1
-        while pos + 1 < end and raw_line[pos] in "-?" and raw_line[pos + 1] in " \t":
-            pos += 1
-            while pos < end and raw_line[pos] == " ":
-                pos += 1
-        return (pos, None if explicit is None else pos + explicit)
-    parts = prefix.split()
-    if all(part in {"-", "?"} for part in parts):
-        last_col = len(prefix) - 1
-        return (last_col, None if explicit is None else last_col + explicit)
-    return None
 
 
 def check_yaml_flow_depth(text: str, *, max_depth: int = MAX_YAML_FLOW_DEPTH) -> None:
-    """Reject deeply nested YAML flow collections in one linear pass before PyYAML scans.
+    """Reject deeply nested YAML flow collections before PyYAML parses or scans unboundedly.
 
     PyYAML's scanner tracks flow simple keys in time quadratic in flow nesting depth,
     so a few kilobytes of nested ``[`` or ``{`` can stall ``yaml.scan`` before a token
-    budget trips. Strings, comments, and indented block scalars are skipped so ordinary
-    literal brackets never trigger false positives.
+    budget trips. Subclassing ``yaml.SafeLoader`` to enforce ``max_depth`` directly inside
+    ``fetch_flow_collection_start`` matches PyYAML's exact grammar (quotes, multiline plain
+    scalars, comments, Unicode line breaks, and block scalars) without parser differentials.
     """
-    depth = 0
-    pos = 0
-    length = len(text)
-    line_start = 0
-    last_json_token_end = -1
-    block_indent: int | None = None
-    block_content_indent: int | None = None
-    block_max_empty = 0
+    if text.count("[") + text.count("{") <= max_depth:
+        return
+    import yaml
 
-    while pos < length:
-        if block_indent is not None:
-            br = _YAML_LINE_BREAK.search(text, pos)
-            line_end = length if br is None else br.start()
-            next_pos = length if br is None else br.end()
-            line = text[pos:line_end]
-            stripped = line.lstrip(" ")
-            indent = len(line) - len(stripped)
-            if not stripped:
-                if block_content_indent is None:
-                    block_max_empty = max(block_max_empty, indent)
-                pos = next_pos
-                line_start = pos
-                continue
-            is_doc_marker = indent == 0 and (
-                line in {"---", "..."} or line.startswith(("--- ", "---\t", "... ", "...\t"))
-            )
-            if is_doc_marker:
-                block_indent = None
-                block_content_indent = None
-                block_max_empty = 0
-            elif block_content_indent is not None:
-                if indent >= block_content_indent:
-                    pos = next_pos
-                    line_start = pos
-                    continue
-                block_indent = None
-                block_content_indent = None
-                block_max_empty = 0
-            elif indent > block_indent and indent >= block_max_empty:
-                block_content_indent = indent
-                pos = next_pos
-                line_start = pos
-                continue
-            else:
-                block_indent = None
-                block_content_indent = None
-                block_max_empty = 0
-
-        found = _YAML_FLOW_SPECIAL.search(text, pos)
-        if found is None:
-            return
-        ch = found.group()
-        start = found.start()
-        pos = found.end()
-        if ch in "\r\n\x85\u2028\u2029":
-            if depth == 0:
-                header = _parse_block_scalar_header(text[line_start:start])
-                if header is not None:
-                    block_indent, block_content_indent = header
-                    block_max_empty = 0
-            if ch == "\r" and pos < length and text[pos] == "\n":
-                pos += 1
-            line_start = pos
-        elif ch == "#":
-            if start == 0 or text[start - 1] in _YAML_WS_OR_BR:
-                br = _YAML_LINE_BREAK.search(text, pos)
-                if depth == 0:
-                    header = _parse_block_scalar_header(text[line_start:start])
-                    if header is not None:
-                        block_indent, block_content_indent = header
-                        block_max_empty = 0
-                if br is None:
-                    return
-                pos = br.end()
-                line_start = pos
-        elif ch == '"':
-            if not _can_start_quote(text, start, depth, last_json_token_end):
-                continue
-            quote_start = pos
-            while pos < length:
-                stop = _YAML_DQ_STOP.search(text, pos)
-                if stop is None:
-                    return
-                if stop.group() == "\\":
-                    pos = stop.end() + 1
-                else:
-                    pos = stop.end()
-                    last_json_token_end = pos
-                    line_start = _advance_line_start(text, quote_start, pos, line_start)
-                    break
-        elif ch == "'":
-            if not _can_start_quote(text, start, depth, last_json_token_end):
-                continue
-            quote_start = pos
-            while pos < length:
-                nxt = text.find("'", pos)
-                if nxt < 0:
-                    return
-                if nxt + 1 < length and text[nxt + 1] == "'":
-                    pos = nxt + 2
-                else:
-                    pos = nxt + 1
-                    last_json_token_end = pos
-                    line_start = _advance_line_start(text, quote_start, pos, line_start)
-                    break
-        elif ch in "[{":
-            depth += 1
-            if depth > max_depth:
+    class _BoundedFlowScanner(yaml.SafeLoader):
+        def fetch_flow_collection_start(self, token_class: Any) -> None:
+            if self.flow_level >= max_depth:
                 raise PolicyError(f"YAML flow nesting exceeds depth limit ({max_depth})")
-        elif depth > 0:
-            depth -= 1
-            last_json_token_end = pos
+            super().fetch_flow_collection_start(token_class)
+
+    try:
+        for _ in yaml.scan(text, Loader=_BoundedFlowScanner):
+            pass
+    except yaml.YAMLError:
+        return
 
 
 def _contains_lone_surrogate(value: str) -> bool:
