@@ -163,36 +163,54 @@ def _identity(path: Path) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
 
-def _verify_outside_checkout(
-    target: Path, untrusted_roots: tuple[Path, ...], *, label: str
-) -> None:
+def _inspect_outside_untrusted(
+    targets: tuple[Path, ...], untrusted_inputs: tuple[Path, ...]
+) -> tuple[str | None, bool]:
+    """Check that ``targets`` are single-link files outside ``untrusted_inputs`` and git trees.
+
+    Returns ``(failure_kind, has_dir_inputs)`` where ``failure_kind`` is ``None``,
+    ``"inside"``, ``"hardlink"``, or ``"inspect"``.
+    """
     try:
-        resolved_roots = [p.resolve() for p in untrusted_roots]
+        resolved_inputs = [path.resolve() for path in untrusted_inputs]
+        dir_inputs = [p for p in resolved_inputs if p.is_dir()]
         search_starts = [
-            *(p if p.is_dir() else p.parent for p in resolved_roots),
+            *(p if p.is_dir() else p.parent for p in resolved_inputs),
             Path.cwd().resolve(),
         ]
         trees = _working_trees(search_starts)
-        forbidden_dirs = [
-            *trees,
-            *(p for p in resolved_roots if p.is_dir() and p not in trees),
-        ]
-        forbidden_ids = {_identity(d) for d in forbidden_dirs}
-        resolved_target = target.resolve()
-        ancestor_ids = {_identity(parent) for parent in resolved_target.parents}
-        if any(resolved_target.is_relative_to(d) for d in forbidden_dirs) or bool(
-            ancestor_ids & forbidden_ids
-        ):
-            raise click.UsageError(
-                f"{label} must lie outside the target checkout and every git working tree "
-                "that holds the checkout or the current directory"
-            )
-        if os.stat(resolved_target).st_nlink != 1:
-            raise click.UsageError(f"{label} must not have multiple hard links")
-    except click.UsageError:
-        raise
+        untrusted_dirs = [*trees, *(d for d in dir_inputs if d not in trees)]
+        untrusted_ids = {_identity(d) for d in untrusted_dirs}
+        for target in targets:
+            resolved = target.resolve()
+            # Device and inode also find the tree directory itself under a name the path
+            # text misses, such as a case variant or a bind mount of the tree. A mount of
+            # a directory or file inside a tree gives the key another location: not found.
+            ancestors = {_identity(parent) for parent in resolved.parents}
+            if any(resolved.is_relative_to(d) for d in untrusted_dirs) or bool(
+                ancestors & untrusted_ids
+            ):
+                return "inside", bool(dir_inputs)
+            if os.stat(resolved).st_nlink != 1:
+                return "hardlink", bool(dir_inputs)
     except (OSError, RuntimeError):
-        raise click.UsageError(f"{label} cannot be inspected safely") from None
+        return "inspect", False
+    return None, False
+
+
+def _verify_outside_checkout(
+    target: Path, untrusted_roots: tuple[Path, ...], *, label: str
+) -> None:
+    failure, _has_dirs = _inspect_outside_untrusted((target,), untrusted_roots)
+    if failure == "inside":
+        raise click.UsageError(
+            f"{label} must lie outside the target checkout and every git working tree "
+            "that holds the checkout or the current directory"
+        )
+    if failure == "hardlink":
+        raise click.UsageError(f"{label} must not have multiple hard links")
+    if failure == "inspect":
+        raise click.UsageError(f"{label} cannot be inspected safely")
 
 
 def _check_key_placement(
@@ -203,40 +221,25 @@ def _check_key_placement(
     This catches misplacement, such as a key committed beside the contracts or inside
     the project directory it is to judge; it does not authenticate the key.
     """
-    try:
-        resolved_inputs = [path.resolve() for path in inputs]
-        dir_inputs = [p for p in resolved_inputs if p.is_dir()]
-        search_starts = [
-            *(p if p.is_dir() else p.parent for p in resolved_inputs),
-            Path.cwd().resolve(),
-        ]
-        trees = _working_trees(search_starts)
-        untrusted_dirs = [*trees, *(d for d in dir_inputs if d not in trees)]
-        untrusted = {_identity(d) for d in untrusted_dirs}
-        for key in keys:
-            resolved = key.resolve()
-            # Device and inode also find the tree directory itself under a name the path
-            # text misses, such as a case variant or a bind mount of the tree. A mount of
-            # a directory or file inside a tree gives the key another location: not found.
-            ancestors = {_identity(parent) for parent in resolved.parents}
-            if any(resolved.is_relative_to(d) for d in untrusted_dirs) or ancestors & untrusted:
-                location = (
-                    f"{option} must lie outside the target checkout and every git working tree"
-                    if dir_inputs
-                    else f"a {option} file must lie outside every git working tree"
-                )
-                raise click.UsageError(
-                    f"{location} that holds "
-                    f"{holders} or the current directory, and outside {holders}; "
-                    "this catches misplacement, it does not authenticate the key"
-                )
-            if os.stat(resolved).st_nlink != 1:
-                raise click.UsageError(
-                    f"a {option} file must not have other hard links: another name for it "
-                    "could lie inside such a working tree"
-                )
-    except (OSError, RuntimeError):
-        raise click.UsageError(f"the location of a {option} file cannot be inspected") from None
+    failure, has_dirs = _inspect_outside_untrusted(keys, inputs)
+    if failure == "inside":
+        location = (
+            f"{option} must lie outside the target checkout and every git working tree"
+            if has_dirs
+            else f"a {option} file must lie outside every git working tree"
+        )
+        raise click.UsageError(
+            f"{location} that holds "
+            f"{holders} or the current directory, and outside {holders}; "
+            "this catches misplacement, it does not authenticate the key"
+        )
+    if failure == "hardlink":
+        raise click.UsageError(
+            f"a {option} file must not have other hard links: another name for it "
+            "could lie inside such a working tree"
+        )
+    if failure == "inspect":
+        raise click.UsageError(f"the location of a {option} file cannot be inspected")
 
 
 def _check_rings(

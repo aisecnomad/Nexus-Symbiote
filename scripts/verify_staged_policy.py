@@ -31,13 +31,11 @@ from nexus_symbiote.attestation_cli import _load_trusted_public
 from nexus_symbiote.cli import main as cli_main
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.graph import validate_graph
+from nexus_symbiote.operator_policy import narrow_policy
 from nexus_symbiote.policy import (
-    DEFAULT_WARN_THRESHOLD,
     MAX_POLICY_YAML_NODES,
     Policy,
     PolicyError,
-    RiskPolicy,
-    ValidatePolicy,
     load_policy,
     parse_yaml_mapping,
 )
@@ -67,63 +65,12 @@ POLICY_PURPOSE: Final = "policy"
 ALLOW_UNSIGNED_FLAG: Final = "--allow-unsigned-operator-policy"
 MAX_AGE_FLAG: Final = "--operator-policy-max-age-days"
 DEFAULT_MAX_AGE_DAYS: Final = 90
-_SEVERITY_STRICTNESS: dict[str, int] = {
-    "none": 0,
-    "critical": 1,
-    "high": 2,
-    "medium": 3,
-    "low": 4,
-    "info": 5,
-}
-_ASSURANCE_STRICTNESS: dict[str, int] = {"declared": 0, "observed": 1, "verified": 2}
 
 
 def clamp_operator_floor(operator_policy: Policy, project_policy: Policy | None) -> Policy:
     """Combine operator and checkout policies so the checkout can only tighten controls."""
-    if project_policy is None:
-        return operator_policy
-
-    op_r, pr_r = operator_policy.risk, project_policy.risk
-    fail_threshold = min(op_r.fail_threshold, pr_r.fail_threshold)
-    warn_threshold = min(
-        op_r.warn_threshold, pr_r.warn_threshold, fail_threshold, DEFAULT_WARN_THRESHOLD
-    )
-    fail_on_severity = (
-        pr_r.fail_on_severity
-        if _SEVERITY_STRICTNESS[pr_r.fail_on_severity] > _SEVERITY_STRICTNESS[op_r.fail_on_severity]
-        else op_r.fail_on_severity
-    )
-    allowed_ignored = set(op_r.ignore_categories)
-    ignore_categories = [c for c in pr_r.ignore_categories if c in allowed_ignored]
-
-    op_v, pr_v = operator_policy.validation, project_policy.validation
-    min_assurance = (
-        pr_v.minimum_assurance_level
-        if _ASSURANCE_STRICTNESS[pr_v.minimum_assurance_level]
-        > _ASSURANCE_STRICTNESS[op_v.minimum_assurance_level]
-        else op_v.minimum_assurance_level
-    )
-
-    return Policy(
-        version="1.0",
-        scan=operator_policy.scan,
-        risk=RiskPolicy(
-            fail_threshold=fail_threshold,
-            warn_threshold=warn_threshold,
-            ignore_categories=ignore_categories,
-            fail_on_severity=fail_on_severity,
-            suppressions=list(op_r.suppressions),
-        ),
-        validate=ValidatePolicy(
-            require_completeness=op_v.require_completeness or pr_v.require_completeness,
-            require_integrity=op_v.require_integrity or pr_v.require_integrity,
-            minimum_assurance_level=min_assurance,
-            require_discovery_signature=(
-                op_v.require_discovery_signature or pr_v.require_discovery_signature
-            ),
-        ),
-        output=operator_policy.output,
-    )
+    narrowed, _clamped = narrow_policy(operator_policy, project_policy)
+    return narrowed
 
 
 def _line(prefix: str, *values: object) -> str:

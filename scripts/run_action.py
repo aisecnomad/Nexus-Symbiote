@@ -223,6 +223,7 @@ class Config:
     baseline_attestation: bytes | None = field(default=None, repr=False)
     trusted_verifiers: tuple[Path, ...] = field(default=(), repr=False)
     attest: bool = False
+    trusted_verifier_contents: tuple[bytes, ...] = field(default=(), repr=False)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Config:
@@ -271,7 +272,9 @@ class Config:
             _require_sigstore()
         reviewed = env.get("SYMBIOTE_REVIEWED_BASELINE", "")
         baseline = (
-            _caller_owned(workspace, reviewed, "reviewed-baseline", MAX_BASELINE_BYTES)
+            _caller_owned(
+                workspace, reviewed, "reviewed-baseline", MAX_BASELINE_BYTES, trust_anchor=True
+            )
             if reviewed
             else None
         )
@@ -290,6 +293,7 @@ class Config:
             raise InputError("reviewed-baseline-attestation requires trusted-keys")
         baseline_attestation: bytes | None = None
         trusted_verifiers: tuple[Path, ...] = ()
+        trusted_verifier_contents: tuple[bytes, ...] = ()
         if raw_attestation:
             from nexus_symbiote.attestation import MAX_ENVELOPE_BYTES
             from nexus_symbiote.runtime_cli import MAX_KEY_BYTES
@@ -299,9 +303,14 @@ class Config:
                 raw_attestation,
                 "reviewed-baseline-attestation",
                 MAX_ENVELOPE_BYTES,
+                trust_anchor=True,
             )
-            for verifier_rel in raw_verifiers:
-                _caller_owned(workspace, verifier_rel, "trusted-keys", MAX_KEY_BYTES)
+            trusted_verifier_contents = tuple(
+                _caller_owned(
+                    workspace, verifier_rel, "trusted-keys", MAX_KEY_BYTES, trust_anchor=True
+                )
+                for verifier_rel in raw_verifiers
+            )
             trusted_verifiers = tuple(Path(verifier_rel) for verifier_rel in raw_verifiers)
         from nexus_symbiote.scanners.mcp import (
             _MIN_SOURCE_BINDING_KEY_LENGTH,
@@ -362,11 +371,12 @@ class Config:
             baseline_attestation,
             trusted_verifiers,
             attest,
+            trusted_verifier_contents,
         )
 
 
 def _scratch_parent(config: Config) -> Path | None:
-    if config.signature_policy is None:
+    if config.signature_policy is None and getattr(config, "baseline_attestation", None) is None:
         return config.scratch_parent
 
     from nexus_symbiote.signature_policy import _repository_roots
@@ -388,8 +398,13 @@ def _scratch_parent(config: Config) -> Path | None:
             continue
         if _trust_anchor_error(directory, None) is None and os.access(directory, os.W_OK | os.X_OK):
             return directory
+    owner_input = (
+        "signature-policy"
+        if config.signature_policy is not None
+        else "reviewed-baseline-attestation"
+    )
     raise ActionError(
-        "signature-policy needs a writable temporary directory with trusted ancestors outside the project and its repositories"
+        f"{owner_input} needs a writable temporary directory with trusted ancestors outside the project and its repositories"
     )
 
 
@@ -875,8 +890,16 @@ def run(
                 envelope = scratch / "reviewed-baseline.att.json"
                 envelope.write_bytes(config.baseline_attestation)
                 verifier_args: list[str] = []
-                for verifier_path in config.trusted_verifiers:
-                    verifier_args.extend(["--trusted-key", str(verifier_path)])
+                if config.trusted_verifier_contents:
+                    for key_bytes in config.trusted_verifier_contents:
+                        with tempfile.NamedTemporaryFile(
+                            dir=scratch, prefix="trusted-key-", suffix=".pem", delete=False
+                        ) as snapshot:
+                            snapshot.write(key_bytes)
+                        verifier_args.extend(["--trusted-key", snapshot.name])
+                else:
+                    for verifier_path in config.trusted_verifiers:
+                        verifier_args.extend(["--trusted-key", str(verifier_path)])
                 verified_att = command(
                     [
                         "verify-attestation",

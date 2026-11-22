@@ -10,7 +10,7 @@ import os
 import secrets
 import stat
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -346,23 +346,93 @@ def _absolute_through_root_links(path: Path) -> Path:
     return absolute
 
 
-def _ancestor_error(directory: Path, *, dir_what: str, remedy: str) -> str | None:
-    """Reject non-sticky world-writable or foreign non-root ancestors above an unpinned root."""
-    uid = _current_uid()
-    trusted_uids = _trusted_ancestor_uids(uid) if uid is not None else set()
+def _check_trusted_ancestors(
+    directory: Path,
+    trusted_uids: set[int] | None,
+    *,
+    include_self: bool = True,
+    verify_fd: bool = True,
+    open_dir: Callable[[Path], int] = open_directory_nofollow,
+    anchor_path: Path | None = None,
+) -> tuple[str, Path] | None:
+    """Inspect ``directory`` and its ancestors up to the root for symlink, owner, or write risks.
+
+    Returns ``None`` when every checked ancestor is safe, or ``(reason, failing_path)`` where
+    ``reason`` is one of ``"uninspectable"``, ``"symlink"``, ``"not_dir"``, ``"untrusted_owner"``,
+    or ``"writable"``.
+    """
     abs_dir = _absolute_through_root_links(directory)
-    for ancestor in abs_dir.parents:
+    abs_subject = _absolute_through_root_links(anchor_path) if anchor_path is not None else abs_dir
+    chain = (abs_dir, *abs_dir.parents) if include_self else tuple(abs_dir.parents)
+    walk = tuple(reversed(chain)) if verify_fd else chain
+    for ancestor in walk:
         try:
-            info = os.lstat(ancestor)
+            linfo = os.lstat(ancestor)
         except OSError:
-            return f"{dir_what} {ancestor} cannot be inspected"
-        if stat.S_ISLNK(info.st_mode):
-            return f"{dir_what} {ancestor} must not be a symlink"
-        if uid is not None and info.st_uid not in trusted_uids:
-            return f"{dir_what} {ancestor} is not owned by the current user"
-        if (info.st_mode & 0o002) and not (info.st_mode & stat.S_ISVTX):
-            return f"{dir_what} {ancestor} is world-writable without sticky protection; {remedy}"
+            return "uninspectable", ancestor
+        if stat.S_ISLNK(linfo.st_mode):
+            return "symlink", ancestor
+        if not stat.S_ISDIR(linfo.st_mode):
+            return "not_dir", ancestor
+        is_mount_anchor = ancestor == Path(abs_subject.anchor) and len(abs_subject.parts) > 2
+        if not verify_fd:
+            info = linfo
+            owner_trusted = trusted_uids is None or info.st_uid in trusted_uids
+        else:
+            if (
+                trusted_uids is not None
+                and not is_mount_anchor
+                and linfo.st_uid not in trusted_uids
+            ):
+                return "untrusted_owner", ancestor
+            if (linfo.st_mode & 0o022) and not (linfo.st_mode & stat.S_ISVTX):
+                return "writable", ancestor
+            try:
+                fd = open_dir(ancestor)
+            except PermissionError:
+                # Earlier ancestors passed trust checks; a traverse-only entry can
+                # still be inspected without following it or opening it for reading.
+                info = linfo
+                owner_trusted = trusted_uids is None or info.st_uid in trusted_uids
+            except OSError:
+                return "uninspectable", ancestor
+            else:
+                try:
+                    info = os.fstat(fd)
+                    owner_trusted = trusted_uids is None or info.st_uid in trusted_uids
+                    if not owner_trusted and is_mount_anchor:
+                        # An unprivileged writer cannot rename a direct mount under
+                        # a read-only namespace root with an unmapped UID.
+                        owner_trusted = bool(os.fstatvfs(fd).f_flag & os.ST_RDONLY) and (
+                            os.stat(abs_subject.parts[1], dir_fd=fd, follow_symlinks=False).st_dev
+                            != info.st_dev
+                        )
+                except OSError:
+                    return "uninspectable", ancestor
+                finally:
+                    os.close(fd)
+        if not owner_trusted:
+            return "untrusted_owner", ancestor
+        if (info.st_mode & 0o022) and not (info.st_mode & stat.S_ISVTX):
+            return "writable", ancestor
     return None
+
+
+def _ancestor_error(directory: Path, *, dir_what: str, remedy: str) -> str | None:
+    """Reject non-sticky group/world-writable or foreign non-root ancestors above an unpinned root."""
+    uid = _current_uid()
+    trusted_uids = _trusted_ancestor_uids(uid) if uid is not None else None
+    failure = _check_trusted_ancestors(directory, trusted_uids, include_self=False, verify_fd=False)
+    if failure is None:
+        return None
+    reason, ancestor = failure
+    if reason == "uninspectable":
+        return f"{dir_what} {ancestor} cannot be inspected"
+    if reason == "symlink":
+        return f"{dir_what} {ancestor} must not be a symlink"
+    if reason in {"not_dir", "untrusted_owner"}:
+        return f"{dir_what} {ancestor} is not owned by the current user"
+    return f"{dir_what} {ancestor} is group- or world-writable without sticky protection; {remedy}"
 
 
 def _trust_anchor_error(path: Path, info: os.stat_result | None) -> str | None:
@@ -387,22 +457,23 @@ def _trust_anchor_error(path: Path, info: os.stat_result | None) -> str | None:
             return "must be owned by the current user or root"
         if info.st_mode & 0o022:
             return "must not be group- or world-writable"
-    directory = _absolute_through_root_links(path if info is None else path.parent)
-    for ancestor in (directory, *directory.parents):
-        try:
-            entry = os.lstat(ancestor)
-        except OSError:
-            return "must lie in directories that can be inspected"
-        if (
-            not stat.S_ISDIR(entry.st_mode)
-            or entry.st_uid not in trusted_uids
-            or (entry.st_mode & 0o022 and not entry.st_mode & stat.S_ISVTX)
-        ):
-            return (
-                "must lie in directories, up to the file system root, that are owned by "
-                "the current user or root and are not group- or world-writable unless sticky"
-            )
-    return None
+    directory = path if info is None else path.parent
+    failure = _check_trusted_ancestors(
+        directory,
+        trusted_uids,
+        include_self=True,
+        verify_fd=True,
+        anchor_path=path,
+    )
+    if failure is None:
+        return None
+    reason, _ancestor = failure
+    if reason == "uninspectable":
+        return "must lie in directories that can be inspected"
+    return (
+        "must lie in directories, up to the file system root, that are owned by "
+        "the current user or root and are not group- or world-writable unless sticky"
+    )
 
 
 def _sigstore_cache_targets_dir() -> Path:
@@ -996,7 +1067,10 @@ def _verify_oms_statement(
         parsed_resources.append((clean_name, res_hex))
 
     if artifact_name is not None:
-        target = _clean_oms_resource_name(PurePosixPath(artifact_name).as_posix().lstrip("./"))
+        normalized = artifact_name
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        target = _clean_oms_resource_name(normalized)
         if target is None:
             return "Artifact name is invalid for OpenSSF Model Signing resource matching"
         exact = [res_hex for res_name, res_hex in parsed_resources if res_name == target]
@@ -1165,6 +1239,7 @@ def verify_sigstore_bundle(
     allow_oms_dsse: bool = False,
     rekor_root_hash: str | None = None,
     minimum_rekor_tree_size: int | None = None,
+    artifact_name: str | None = None,
 ) -> VerificationResult:
     """Verify an exact local artifact under an explicitly selected signer policy."""
     if (
@@ -1190,11 +1265,25 @@ def verify_sigstore_bundle(
             )
         extra_kwargs: dict[str, Any] = {}
         if allow_oms_dsse or rekor_root_hash is not None or minimum_rekor_tree_size is not None:
+            resolved_name = artifact_name
+            if allow_oms_dsse and resolved_name is None:
+                artifact_p = Path(artifact_path)
+                bundle_dir = Path(bundle_path).parent
+                try:
+                    resolved_name = (
+                        artifact_p.resolve().relative_to(bundle_dir.resolve()).as_posix()
+                    )
+                except (OSError, ValueError):
+                    resolved_name = (
+                        artifact_p.as_posix()
+                        if not artifact_p.is_absolute() and ".." not in artifact_p.parts
+                        else artifact_p.name
+                    )
             extra_kwargs = {
                 "allow_oms_dsse": allow_oms_dsse,
                 "rekor_root_hash": rekor_root_hash,
                 "minimum_rekor_tree_size": minimum_rekor_tree_size,
-                **({"artifact_name": Path(artifact_path).name} if allow_oms_dsse else {}),
+                **({"artifact_name": resolved_name} if allow_oms_dsse else {}),
             }
         return verify_sigstore_digest(
             digest,

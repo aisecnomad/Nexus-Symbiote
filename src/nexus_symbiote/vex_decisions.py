@@ -17,7 +17,6 @@ from __future__ import annotations
 import hmac
 import os
 import re
-import stat
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -241,36 +240,24 @@ def _ensure_outside_project(
 def _check_operator_directory(path: Path, trusted: set[int]) -> None:
     # Walk top down. A writable directory is safe for traversal only if its
     # trusted owner enforces sticky protection on the next, also checked entry.
+    from nexus_symbiote.utils.crypto import _check_trusted_ancestors
+
     absolute = path.absolute()
     if ".." in absolute.parts:
         raise VEXDecisionError("Operator material must use a path without parent traversal")
-    for directory in reversed(absolute.parents):
-        try:
-            fd = open_directory_nofollow(directory)
-        except PermissionError:
-            # Earlier ancestors passed the trust checks. A traverse-only entry can
-            # still be inspected without following it or opening it for reading.
-            info = directory.lstat()
-            owner_trusted = stat.S_ISDIR(info.st_mode) and info.st_uid in trusted
-        else:
-            try:
-                info = os.fstat(fd)
-                owner_trusted = info.st_uid in trusted
-                if (
-                    not owner_trusted
-                    and directory == Path(absolute.anchor)
-                    and len(absolute.parts) > 2
-                ):
-                    # An unprivileged writer cannot rename a direct mount under
-                    # a read-only namespace root with an unmapped UID.
-                    owner_trusted = bool(os.fstatvfs(fd).f_flag & os.ST_RDONLY) and (
-                        os.stat(absolute.parts[1], dir_fd=fd, follow_symlinks=False).st_dev
-                        != info.st_dev
-                    )
-            finally:
-                os.close(fd)
-        if not owner_trusted or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
-            raise VEXDecisionError("Operator material has a writable or untrusted ancestor")
+    failure = _check_trusted_ancestors(
+        absolute.parent,
+        trusted,
+        include_self=True,
+        verify_fd=True,
+        open_dir=open_directory_nofollow,
+        anchor_path=absolute,
+    )
+    if failure is not None:
+        reason, _ancestor = failure
+        if reason == "uninspectable":
+            raise VEXDecisionError("Cannot safely read operator material ancestor")
+        raise VEXDecisionError("Operator material has a writable or untrusted ancestor")
 
 
 def _read_regular_bytes(

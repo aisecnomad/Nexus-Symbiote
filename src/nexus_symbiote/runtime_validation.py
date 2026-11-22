@@ -1269,24 +1269,71 @@ def _collection_work_exceeds_budget(
 
     # Keep each level separate. A recursive reference through a child advances
     # one level, while all in-place callers are processed before their targets.
+    # Track per-value duplication by container slot (property key, tuple index,
+    # or wildcard None) so exponential allOf -> properties -> $ref DAGs cannot
+    # hide behind distinct-value node footprints, while disjoint properties on
+    # one object sharing a $ref do not inflate per-value duplication.
     counts = {root: 1}
+    # Maps node id -> (wildcard_dup, repeated_slot_dups, max_unique_slot_dup)
+    slot_dups: dict[int, tuple[int, dict[str | int, int], int]] = {root: (1, {}, 0)}
     nested: set[int] = set()
     fallible: set[int] = set()
+    step_cap = _MAX_OUTPUT_REPEATED_STEPS + 1
+
+    key_counts: dict[str | int, int] = {}
+    for node in nodes.values():
+        props = node.get("properties")
+        if isinstance(props, dict):
+            for key in props:
+                key_counts[key] = key_counts.get(key, 0) + 1
+        for kw in ("prefixItems", "items"):
+            val = node.get(kw)
+            if isinstance(val, list):
+                for idx in range(len(val)):
+                    key_counts[idx] = key_counts.get(idx, 0) + 1
+    repeated_slots = frozenset(k for k, c in key_counts.items() if c > 1)
+
+    def _merge_slot(
+        store: dict[int, tuple[int, dict[str | int, int], int]],
+        target: int,
+        wild_add: int,
+        named_add: dict[str | int, int],
+        unique_add: int,
+    ) -> None:
+        cur_w, cur_n, cur_u = store.get(target, (0, {}, 0))
+        new_w = min(step_cap, cur_w + wild_add)
+        new_u = min(step_cap, max(cur_u, unique_add))
+        if named_add:
+            merged_n = dict(cur_n)
+            for k, v in named_add.items():
+                merged_n[k] = min(step_cap, merged_n.get(k, 0) + v)
+        else:
+            merged_n = cur_n
+        store[target] = (new_w, merged_n, new_u)
+
     for _ in range(MAX_JSON_DEPTH + 1):
         following: dict[int, int] = {}
+        following_slots: dict[int, tuple[int, dict[str | int, int], int]] = {}
         nested_following: set[int] = set()
         fallible_following: set[int] = set()
         for current in order:
             count = counts.get(current, 0)
             if not count:
                 continue
+            cur_w, cur_n, cur_u = slot_dups.get(current, (1, {}, 0))
+            max_named = max(cur_n.values(), default=0)
+            dup = min(step_cap, max(1, cur_w + max(max_named, cur_u)))
             node = nodes[current]
             # Only schemas that abort collection validation on a non-conforming
             # value can bound repetitions by a conforming value's node footprint.
             # Branches under contains/anyOf/oneOf/not/if can fail repeatedly on
             # single-node values without stopping collection evaluation.
-            limit = MAX_JSON_NODES if current in fallible else MAX_JSON_NODES // footprint[current]
-            count = min(count, limit)
+            distinct_limit = (
+                MAX_JSON_NODES if current in fallible else MAX_JSON_NODES // footprint[current]
+            )
+            count = min(count, distinct_limit * dup)
+            if count > _MAX_OUTPUT_REPEATED_STEPS:
+                return True
             costly = work[current] > 32 or (current in nested and branching[current])
             if costly and count * work[current] > _MAX_OUTPUT_REPEATED_STEPS:
                 return True
@@ -1299,7 +1346,8 @@ def _collection_work_exceeds_budget(
                     if isinstance(arm, dict):
                         fallible_children.add(id(arm))
             for child in graph[current]:
-                counts[child] = max(counts.get(child, 0), count)
+                counts[child] = min(step_cap, counts.get(child, 0) + count)
+                _merge_slot(slot_dups, child, cur_w, cur_n, cur_u)
                 if current in nested:
                     nested.add(child)
                 if current in fallible or child in fallible_children:
@@ -1326,11 +1374,14 @@ def _collection_work_exceeds_budget(
                     or keyword in ("prefixItems", "items")
                     and isinstance(value, list)
                 ):
-                    choices = value.values() if isinstance(value, dict) else value[:items]
+                    if isinstance(value, dict):
+                        entries_iter: list[tuple[str | int | None, Any]] = list(value.items())
+                    else:
+                        entries_iter = list(enumerate(value[:items]))
                     cardinality = 1
                     costs = [
                         work[id(x)]
-                        for x in choices
+                        for _, x in entries_iter
                         if isinstance(x, dict) and (branching[id(x)] or work[id(x)] > 32)
                     ]
                     if isinstance(value, dict) and len(costs) > properties:
@@ -1338,9 +1389,10 @@ def _collection_work_exceeds_budget(
                         del costs[properties:]
                     fixed_costs.extend(costs)
                 elif keyword == "patternProperties":
-                    choices, cardinality = value.values(), properties
+                    entries_iter = [(None, part) for part in value.values()]
+                    cardinality = properties
                     matching_work = sum(
-                        work[id(part)] for part in choices if isinstance(part, dict)
+                        work[id(part)] for _, part in entries_iter if isinstance(part, dict)
                     )
                     if (
                         len(value) > 1
@@ -1349,15 +1401,23 @@ def _collection_work_exceeds_budget(
                     ):
                         return True
                 elif keyword in ("items", "contains", "additionalItems", "unevaluatedItems"):
-                    choices, cardinality = [value], items
+                    entries_iter, cardinality = [(None, value)], items
                 elif keyword in ("additionalProperties", "unevaluatedProperties", "propertyNames"):
-                    choices, cardinality = [value], properties
+                    entries_iter, cardinality = [(None, value)], properties
                 else:
                     continue
-                for part in choices:
+                for slot_key, part in entries_iter:
                     if isinstance(part, dict):
                         child = id(part)
-                        following[child] = max(following.get(child, 0), count * cardinality)
+                        following[child] = min(
+                            step_cap, following.get(child, 0) + count * cardinality
+                        )
+                        if slot_key is None:
+                            _merge_slot(following_slots, child, dup, {}, 0)
+                        elif slot_key in repeated_slots:
+                            _merge_slot(following_slots, child, 0, {slot_key: dup}, 0)
+                        else:
+                            _merge_slot(following_slots, child, 0, {}, dup)
                         if (
                             current in nested
                             or keyword == "contains"
@@ -1369,10 +1429,18 @@ def _collection_work_exceeds_budget(
             if len(fixed_costs) > 1 and count * sum(fixed_costs) > _MAX_OUTPUT_REPEATED_STEPS:
                 return True
         if not following or (
-            following == counts and nested_following == nested and fallible_following == fallible
+            following == counts
+            and following_slots == slot_dups
+            and nested_following == nested
+            and fallible_following == fallible
         ):
             break
-        counts, nested, fallible = following, nested_following, fallible_following
+        counts, slot_dups, nested, fallible = (
+            following,
+            following_slots,
+            nested_following,
+            fallible_following,
+        )
     return False
 
 

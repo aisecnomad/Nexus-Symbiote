@@ -358,10 +358,10 @@ class PinnedStdioSession:
                 if isinstance(teardown, PinnedProcessError)
                 else "launcher cleanup did not complete; the tool may still be running"
             ) from teardown
-        if exc is not None:
-            return
         if isinstance(teardown, PinnedProcessError):
             raise AuthorizationError(str(teardown)) from teardown
+        if exc is not None:
+            return
         raise teardown
 
 
