@@ -2583,6 +2583,7 @@ def _computed_powershell(segment: str) -> int | None:
 _BASE64_PAYLOAD = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
 
 
+_ASCII_TEXT_RUN = re.compile(r"[\t\r\n -~]{8,}")
 _TEXT_PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,}[ \t\r\n]")
 _BASE64_SPACING = str.maketrans("", "", " \t\r\n")
 
@@ -2610,6 +2611,10 @@ def _encoded_payload(word: str) -> bool:
         if end_quote >= 1 and text[1:end_quote].isprintable():
             return True
     if _TEXT_PREFIX.match(text.lstrip()):
+        return True
+    # A multilingual comment or string elsewhere in the operand cannot
+    # dilute a whole run of UTF-16 text. Whitespace alone supplies no evidence.
+    if any(run.group().strip() for run in _ASCII_TEXT_RUN.finditer(text)):
         return True
     graphic = sum("!" <= char <= "~" for char in text)
     ordinary = graphic + sum(char in " \t\r\n" for char in text)
