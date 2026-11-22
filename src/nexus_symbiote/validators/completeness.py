@@ -83,19 +83,12 @@ COLLECTOR_OWNED_PROPERTIES = frozenset(
         "config_hash",
         "config_hash_profile",
         "content_hash_withheld",
-        "displayed_descriptor_differs",
         "identity_source",
         "imports_digest",
         "lockfile_integrity",
         "lockfile_record",
         "lockfile_sha256",
         "named_format",
-        "observed_declaration_hash",
-        "observed_declaration_hash_profile",
-        "observed_descriptor_hash",
-        "observed_endpoint_hash",
-        "observed_identity_hash",
-        "observed_identity_hash_profile",
         "pinning_state",
         "rail_files",
         "requirement_hashes",
@@ -107,7 +100,11 @@ COLLECTOR_OWNED_PROPERTIES = frozenset(
 )
 """Property keys only a collector writes, which validation, integrity, diff and risk read
 as content binding or collection provenance. Suppression fingerprints, integrity and the
-static binding checks trust them, so a supplier may not add one the collector did not."""
+static binding checks trust them, so a supplier may not add one the collector did not.
+The ``observed_*`` and ``displayed_descriptor_differs`` keys that ``verify-live --record``
+and ``discover-mcp --record`` write are not here: no validator trusts them, only the next
+live verification reads them as its drift baseline, and a static collection never records
+them, so owning them would block every recorded inventory."""
 COLLECTOR_OWNED_PREFIXES = ("static_value_binding", "static_config_hash", "static_card_hash")
 
 Basis = Literal[

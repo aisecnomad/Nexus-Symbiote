@@ -116,7 +116,11 @@ _WRAPPED_SCHEME_TYPES = {
     "mtls_security_scheme": "mutualTLS",
 }
 # Legacy scheme and client method names that declare no authentication.
-_ANONYMOUS = frozenset({"none", "noauth", "no-auth", "anonymous", "public", "unauthenticated"})
+ANONYMOUS_AUTH_METHODS = frozenset(
+    {"", "none", "noauth", "no-auth", "no_auth", "anonymous", "public", "unauthenticated"}
+)
+"""Authentication method names that grant no authentication; shared with the CycloneDX export."""
+_ANONYMOUS = ANONYMOUS_AUTH_METHODS
 _MAX_ENTRIES = 1000
 _MAX_DEPTH = 8
 _MAX_NAME = 256

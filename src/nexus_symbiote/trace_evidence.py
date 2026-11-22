@@ -555,26 +555,83 @@ def _is_mismatched(entry: Mapping[str, Any]) -> bool:
     )
 
 
-def _apply_runtime_checks(
-    entry: dict[str, Any], item: _Item, candidates: Sequence[AnyComponent]
-) -> None:
+@dataclass(frozen=True)
+class _RuntimeSummary:
+    """What the runtime checks read from a candidate list, computed once per list.
+
+    An ambiguous item's candidates are the index's own lists, which many items share, so
+    summarizing each list once keeps a lookup's cost independent of the inventory's size.
+    """
+
+    identities: frozenset[str]
+    every_identity_declared: bool
+    tool_count: int
+    every_tool_hashed: bool
+    tool_hashes: frozenset[str]
+
+
+def _summarize_runtime(candidates: Sequence[AnyComponent]) -> _RuntimeSummary:
+    identities: set[str] = set()
+    every_identity_declared = True
+    tool_count = 0
+    every_tool_hashed = True
+    tool_hashes: set[str] = set()
+    for comp in candidates:
+        declared = _trimmed(getattr(comp, "workload_identity", None))
+        if declared is None:
+            every_identity_declared = False
+        else:
+            identities.add(declared)
+        if isinstance(comp, ToolComponent):
+            tool_count += 1
+            if not comp.definition_hash:
+                every_tool_hashed = False
+            else:
+                norm = _normalized_sha256(comp.definition_hash)
+                if norm:
+                    tool_hashes.add(norm)
+    return _RuntimeSummary(
+        frozenset(identities),
+        every_identity_declared,
+        tool_count,
+        every_tool_hashed,
+        frozenset(tool_hashes),
+    )
+
+
+def _merge_runtime(summaries: Iterable[_RuntimeSummary]) -> _RuntimeSummary:
+    identities: set[str] = set()
+    every_identity_declared = True
+    tool_count = 0
+    every_tool_hashed = True
+    tool_hashes: set[str] = set()
+    for summary in summaries:
+        identities |= summary.identities
+        every_identity_declared = every_identity_declared and summary.every_identity_declared
+        tool_count += summary.tool_count
+        every_tool_hashed = every_tool_hashed and summary.every_tool_hashed
+        tool_hashes |= summary.tool_hashes
+    return _RuntimeSummary(
+        frozenset(identities),
+        every_identity_declared,
+        tool_count,
+        every_tool_hashed,
+        frozenset(tool_hashes),
+    )
+
+
+def _apply_runtime_checks(entry: dict[str, Any], item: _Item, summary: _RuntimeSummary) -> None:
     """Attach workload-identity and tool-definition-hash match checks for candidate components."""
     if item.workload_identities or item.unreadable_workload_identities:
         entry["reported_workload_identities"] = sorted(item.workload_identities)
         if item.unreadable_workload_identities:
             entry["unreadable_workload_identities"] = item.unreadable_workload_identities
             entry["workload_identity_matched"] = False
+        elif summary.every_identity_declared:
+            entry["workload_identity_matched"] = item.workload_identities <= summary.identities
         else:
-            declared_per_cand = [
-                _trimmed(getattr(comp, "workload_identity", None)) for comp in candidates
-            ]
-            declared_list = [cid for cid in declared_per_cand if cid is not None]
-            if len(declared_list) == len(declared_per_cand):
-                entry["workload_identity_matched"] = item.workload_identities <= set(declared_list)
-            else:
-                entry["workload_identity_matched"] = None
-    tools = [comp for comp in candidates if isinstance(comp, ToolComponent)]
-    if (item.definition_hashes or item.unreadable_definition_hashes) and tools:
+            entry["workload_identity_matched"] = None
+    if (item.definition_hashes or item.unreadable_definition_hashes) and summary.tool_count:
         entry["reported_definition_hashes"] = sorted(item.definition_hashes)
         reported_norm = {_normalized_sha256(h) for h in item.definition_hashes}
         if item.unreadable_definition_hashes:
@@ -582,14 +639,9 @@ def _apply_runtime_checks(
             entry["definition_hash_matched"] = False
         elif None in reported_norm:
             entry["definition_hash_matched"] = False
-        elif all(tool.definition_hash for tool in tools):
-            valid_declared = {
-                norm
-                for tool in tools
-                if tool.definition_hash and (norm := _normalized_sha256(tool.definition_hash))
-            }
+        elif summary.every_tool_hashed:
             entry["definition_hash_matched"] = (
-                bool(valid_declared) and reported_norm <= valid_declared
+                bool(summary.tool_hashes) and reported_norm <= summary.tool_hashes
             )
         else:
             entry["definition_hash_matched"] = None
@@ -610,6 +662,7 @@ def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str
     result: dict[str, list[dict[str, Any]]] = {name: [] for name in _RECONCILIATION}
     mentioned: set[str] = set()
     marked: set[int] = set()
+    summaries: dict[int, _RuntimeSummary] = {}
     for item in observations.items.values():
         identity = _identity(item.kind, item.values)
         if "unreadable" in identity:
@@ -630,7 +683,7 @@ def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str
             }
             if item.caller_identities:
                 matched_entry["caller_workload_identities"] = sorted(item.caller_identities)
-            _apply_runtime_checks(matched_entry, item, (component,))
+            _apply_runtime_checks(matched_entry, item, _summarize_runtime((component,)))
             result["matched"].append(matched_entry)
             server = getattr(component, "mcp_server_ref", None)
             if isinstance(server, str):
@@ -649,8 +702,13 @@ def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str
                 or item.definition_hashes
                 or item.unreadable_definition_hashes
             ):
-                all_candidates = [comp for found, _basis in parts for comp in found]
-                _apply_runtime_checks(ambiguous_entry, item, all_candidates)
+                part_summaries: list[_RuntimeSummary] = []
+                for found, _basis in parts:
+                    summary = summaries.get(id(found))
+                    if summary is None:
+                        summary = summaries[id(found)] = _summarize_runtime(found)
+                    part_summaries.append(summary)
+                _apply_runtime_checks(ambiguous_entry, item, _merge_runtime(part_summaries))
             result["ambiguous"].append(ambiguous_entry)
         elif item.kind in GATING_KINDS:
             result["undeclared"].append({**identity, "span_count": item.spans})

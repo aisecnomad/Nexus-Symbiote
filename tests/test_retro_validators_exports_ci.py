@@ -6,6 +6,7 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from packaging.version import Version
 
@@ -44,6 +45,19 @@ from nexus_symbiote.vex_decisions import (
     VEXDecisionEntry,
 )
 from scripts import check_locks, check_workflows
+from tests.support import scaling_ratio
+
+LIVE_OBSERVATION_KEYS = frozenset(
+    {
+        "observed_declaration_hash",
+        "observed_declaration_hash_profile",
+        "observed_identity_hash",
+        "observed_identity_hash_profile",
+        "observed_descriptor_hash",
+        "observed_endpoint_hash",
+        "displayed_descriptor_differs",
+    }
+)
 
 # --- R-HIGH-21: component_content_digest across MCP/IDE/A2A/RAG components ---
 
@@ -349,18 +363,15 @@ def test_collector_owned_properties_rejects_supplier_forged_metadata(tmp_path: P
         "lockfile_integrity",
         "pinning_state",
         "artifact_verified",
-        "observed_declaration_hash",
-        "observed_declaration_hash_profile",
-        "observed_identity_hash",
-        "observed_identity_hash_profile",
         "settings_hashes",
         "source_values_bound",
-        "observed_descriptor_hash",
-        "displayed_descriptor_differs",
         "rail_files",
         "config_file_hash",
     }
     assert expected_keys <= COLLECTOR_OWNED_PROPERTIES
+    # Live observations are written by `verify-live --record`, never by a static
+    # collection, so owning them would block every recorded inventory.
+    assert not (LIVE_OBSERVATION_KEYS & COLLECTOR_OWNED_PROPERTIES)
 
     project = tmp_path / "proj"
     project.mkdir()
@@ -419,7 +430,7 @@ def test_cyclonedx_services_filters_anonymous_auth_and_avoids_bom_ref_collisions
     doc = CycloneDXGenerator(projection_version=3).generate(bom)
     by_name = {svc["name"]: svc for svc in doc["services"]}
     assert by_name["anon-client"]["authenticated"] is False
-    assert "authenticated" not in by_name["empty-client"]
+    assert by_name["empty-client"]["authenticated"] is False
     assert by_name["oauth-client"]["authenticated"] is True
     assert by_name["srv"]["bom-ref"] == "service:srv:2"
     all_refs = [c["bom-ref"] for c in doc["components"]] + [s["bom-ref"] for s in doc["services"]]
@@ -821,8 +832,8 @@ def test_collector_owned_includes_remaining_provenance_keys_and_differ_ascii_lin
         "settings_hashes_profile",
         "requirement_hashes",
         "imports_digest",
-        "observed_endpoint_hash",
     } <= COLLECTOR_OWNED_PROPERTIES
+    assert "observed_endpoint_hash" not in COLLECTOR_OWNED_PROPERTIES
 
     path = ("claims", CITED_EVIDENCE_CLAIM, "locator")
     assert _semantic_value("CLAUDE.md:42", path) == "CLAUDE.md"
@@ -832,3 +843,103 @@ def test_collector_owned_includes_remaining_provenance_keys_and_differ_ascii_lin
     gen = SARIFGenerator(root=Path("/repo"))
     assert gen._uri(Path("sub/file.py")) == "sub/file.py"
     assert gen._uri("..\\escape.py") is None
+
+
+def test_recorded_live_observations_do_not_block_validate_against_project(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from nexus_symbiote.cli import main
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"srv": {"command": "node", "args": ["server.js"]}}}),
+        encoding="utf-8",
+    )
+    (project / "server.js").write_text("// server\n", encoding="utf-8")
+    bom_path = tmp_path / "bom.json"
+    res = CliRunner().invoke(
+        main, ["scan", "--report-only", "--no-project-policy", str(project), "-o", str(bom_path)]
+    )
+    assert res.exit_code == 0, res.output
+    bom = AIBOM.load(bom_path)
+    baseline = CompletenessValidator().validate_against_project(bom, project)
+    server = next(c for c in bom.components if isinstance(c, MCPServerComponent))
+    # What `verify-live --record` writes onto the recorded server.
+    server.properties.update(
+        {
+            "observed_declaration_hash": "sha256:" + "a" * 64,
+            "observed_declaration_hash_profile": "mcp-declaration-v1",
+            "observed_identity_hash": "sha256:" + "b" * 64,
+            "observed_identity_hash_profile": "mcp-identity-v1",
+            "observed_endpoint_hash": "sha256:" + "c" * 64,
+        }
+    )
+    report = CompletenessValidator().validate_against_project(bom, project)
+    assert not any("collector-owned properties" in issue.description for issue in report.issues)
+    assert report.is_complete is baseline.is_complete
+
+
+def test_ambiguous_runtime_checks_scale_linearly_with_shared_candidates(tmp_path: Path) -> None:
+    """M items over one shared N-candidate list cost O(N + M), not O(N * M)."""
+
+    def span(index: int) -> dict[str, Any]:
+        return {
+            "name": "chat m",
+            "startTimeUnixNano": "1700000000000000000",
+            "endTimeUnixNano": "1700000000100000000",
+            "attributes": [
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "m"}},
+                {"key": "gen_ai.provider.name", "value": {"stringValue": f"p{index}"}},
+                {"key": "spiffe.id", "value": {"stringValue": f"spiffe://trust.example/w{index}"}},
+            ],
+        }
+
+    def run(scale: int) -> None:
+        size = 250 * scale
+        bom = AIBOM(
+            components=[
+                ModelComponent(bom_ref=f"model:{i}", name="m", model_type="hosted")
+                for i in range(size)
+            ]
+        )
+        bom_path = tmp_path / f"aibom-{scale}.json"
+        bom.save(bom_path)
+        trace_file = tmp_path / f"trace-{scale}.json"
+        trace_file.write_text(
+            json.dumps(
+                {
+                    "resourceSpans": [
+                        {
+                            "resource": {"attributes": []},
+                            "scopeSpans": [{"spans": [span(i) for i in range(size)]}],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        doc = collect(bom_path, [trace_file], fail_on="undeclared")
+        assert len(doc["reconciliation"]["ambiguous"]) == size
+        assert doc["reconciliation"]["ambiguous"][0]["workload_identity_matched"] is None
+
+    assert scaling_ratio(run) < 10
+
+
+def test_cyclonedx_anonymous_methods_match_the_a2a_collector() -> None:
+    from nexus_symbiote.scanners.a2a import ANONYMOUS_AUTH_METHODS
+
+    assert {"no_auth", "", "none"} <= ANONYMOUS_AUTH_METHODS
+    bom = AIBOM(
+        components=[
+            A2AClientComponent(
+                bom_ref="a2a-under",
+                name="underscore-client",
+                agent_card_url="https://u.example.test/.well-known/agent.json",
+                authentication_methods=["no_auth", ""],
+            ),
+        ]
+    )
+    doc = CycloneDXGenerator(projection_version=3).generate(bom)
+    assert doc["services"][0]["authenticated"] is False
