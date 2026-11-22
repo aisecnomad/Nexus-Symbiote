@@ -25,6 +25,15 @@ def configuration(tmp_path: Path, **inputs: str):
     return runner.Config.from_env({"GITHUB_WORKSPACE": str(tmp_path), **inputs})
 
 
+def test_action_default_exclusion_acceptance_is_limited_to_git(tmp_path: Path) -> None:
+    action = yaml.safe_load((Path(__file__).parents[1] / "action.yml").read_text())
+    value = action["inputs"]["accept-default-excludes"]["default"]
+    config = configuration(tmp_path, SYMBIOTE_ACCEPT_DEFAULT_EXCLUDES=value)
+    assert config.accept_default_excludes == ("root:.git",)
+    with pytest.raises(runner.InputError, match="only built-in exclusions"):
+        configuration(tmp_path, SYMBIOTE_ACCEPT_DEFAULT_EXCLUDES=".git,custom")
+
+
 @pytest.mark.parametrize("payload", ["$(touch PWNED)", "quote'and\"space", "--scanner=none"])
 def test_path_input_is_one_literal_argument_and_collection_runs_once(tmp_path, payload):
     (tmp_path / payload).mkdir()
@@ -208,12 +217,14 @@ def test_workflow_pins_structure_and_release_privilege_separation():
     assert set(jobs["publish"]["needs"]) == {"build", "attest", "verify"}
     assert jobs["publish"]["permissions"] == {"id-token": "write"}
     assert "id-token" not in jobs["verify"]["permissions"]
-    for name in ["compatibility", "attest", "verify", "publish"]:
+    for name in ["compatibility", "attest", "verify", "publish", "image"]:
         downloads = [s for s in jobs[name]["steps"] if "download-artifact" in s.get("uses", "")]
         assert downloads
         assert all(s["with"]["digest-mismatch"] == "error" for s in downloads)
-    for name in ["attest", "publish"]:
+    for name in ["attest", "publish", "image-attest"]:
         assert all("run" not in step for step in jobs[name]["steps"])
+    for name in jobs.keys() - {"attest", "publish", "image-attest"}:
+        assert "id-token" not in jobs[name].get("permissions", {})
 
 
 def test_release_floating_dependencies_cannot_replace_attestation_or_publication_inputs():

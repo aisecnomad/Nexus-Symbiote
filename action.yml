@@ -131,6 +131,13 @@ inputs:
       warning. With 'false', such evidence fails the completeness and risk gates in CI, unless
       signature-policy names the report and verifies its producer
     default: "false"
+  accept-default-excludes:
+    description: >-
+      Comma-separated built-in names whose occupied paths are accepted and recorded.
+      Defaults to root:.git for the checkout's root Git metadata. Explicit .git also
+      accepts regular nested Git metadata files. 'false' accepts none, and 'true'
+      accepts all built-in names. Other occupied default exclusions remain coverage gaps
+    default: "root:.git"
   limits:
     description: >-
       Raised collection limits as NAME=VALUE pairs separated by commas, passed to the CLI as
@@ -231,6 +238,7 @@ runs:
         SYMBIOTE_SIGNATURE_POLICY: ${{ inputs.signature-policy }}
         SYMBIOTE_LIMITS: ${{ inputs.limits }}
         SYMBIOTE_ALLOW_UNSIGNED_DISCOVERY: ${{ inputs.allow-unsigned-discovery }}
+        SYMBIOTE_ACCEPT_DEFAULT_EXCLUDES: ${{ inputs.accept-default-excludes }}
       run: '"$SYMBIOTE_ACTION_PYTHON" -I "$SYMBIOTE_ACTION_PATH/scripts/run_action.py"'
     - name: Upload SARIF
       if: always() && inputs.sarif-upload == 'true' && steps.scan.outputs.sarif_path != ''

@@ -24,7 +24,12 @@ from urllib.parse import urlsplit
 
 from nexus_symbiote.core.aibom import AIBOM, MAX_NATIVE_BYTES
 from nexus_symbiote.core.content_digest import INVENTORY_CONTENT_PROFILE, inventory_content_digest
-from nexus_symbiote.core.hashing import hash_bytes, hash_canonical, parse_json_strict
+from nexus_symbiote.core.hashing import (
+    hash_bytes,
+    hash_canonical,
+    normalize_digest,
+    parse_json_strict,
+)
 from nexus_symbiote.core.identifiers import name_key, recorded_name_key
 from nexus_symbiote.core.models import (
     AgentComponent,
@@ -133,6 +138,11 @@ class _Item:
     operations: set[str] = field(default_factory=set)
     services: set[str] = field(default_factory=set)
     details: set[str] = field(default_factory=set)
+    workload_identities: set[str] = field(default_factory=set)
+    caller_identities: set[str] = field(default_factory=set)
+    definition_hashes: set[str] = field(default_factory=set)
+    unreadable_workload_identities: int = 0
+    unreadable_definition_hashes: int = 0
 
 
 def _enum_name(value: Identifier, members: frozenset[str]) -> str:
@@ -280,6 +290,26 @@ class Observations:
         if isinstance(detail, str) and detail not in item.details:
             self._record(span)
             item.details.add(detail)
+        # A CLIENT or PRODUCER span names the component it calls: its own (and its
+        # resource's) spiffe.id is the caller's, reported apart, and only peer.identity
+        # is compared as the callee's. An unreadable identity gates on every kind.
+        client, own = span.kind in (3, 4), span.attributes.get("spiffe.id")
+        for w_id, seen in (
+            (span.attributes.get("peer.identity") if client else own, item.workload_identities),
+            (own if client else None, item.caller_identities),
+        ):
+            if isinstance(w_id, Unreadable):
+                item.unreadable_workload_identities += 1
+            elif isinstance(w_id, str) and w_id not in seen:
+                self._record(span)
+                seen.add(w_id)
+        if kind == "tool":
+            t_hash = span.attributes.get("gen_ai.tool.definition_hash")
+            if isinstance(t_hash, Unreadable):
+                item.unreadable_definition_hashes += 1
+            elif isinstance(t_hash, str) and t_hash not in item.definition_hashes:
+                self._record(span)
+                item.definition_hashes.add(t_hash)
         if span.start is not None:
             item.first = span.start if item.first is None else min(item.first, span.start)
             item.last = span.start if item.last is None else max(item.last, span.start)
@@ -510,6 +540,21 @@ def _order(entry: Mapping[str, Any]) -> tuple[str, str]:
     return str(entry["kind"]), json.dumps(entry, sort_keys=True)
 
 
+def _normalized_sha256(value: str) -> str | None:
+    try:
+        alg, dig = normalize_digest(value.strip(_TRIM), "sha256")
+    except ValueError:
+        return None
+    return f"{alg}:{dig}"
+
+
+def _is_mismatched(entry: Mapping[str, Any]) -> bool:
+    return (
+        entry.get("workload_identity_matched") is False
+        or entry.get("definition_hash_matched") is False
+    )
+
+
 def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str, Any]]]:
     """Sort every observed item into one reconciliation list, and list unmentioned declarations.
 
@@ -536,9 +581,49 @@ def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str
         count = sum(len(found) for found, _basis in parts)
         if count == 1:
             component, basis = next((found[0], basis) for found, basis in parts if found)
-            result["matched"].append(
-                {**identity, "inventory_ref": component.bom_ref, "basis": basis}
-            )
+            matched_entry: dict[str, Any] = {
+                **identity,
+                "inventory_ref": component.bom_ref,
+                "basis": basis,
+            }
+            if item.caller_identities:
+                matched_entry["caller_workload_identities"] = sorted(item.caller_identities)
+            if item.workload_identities or item.unreadable_workload_identities:
+                declared_id = _trimmed(getattr(component, "workload_identity", None))
+                matched_entry["reported_workload_identities"] = sorted(item.workload_identities)
+                if item.unreadable_workload_identities:
+                    matched_entry["unreadable_workload_identities"] = (
+                        item.unreadable_workload_identities
+                    )
+                    matched_entry["workload_identity_matched"] = False
+                elif declared_id:
+                    matched_entry["workload_identity_matched"] = item.workload_identities == {
+                        declared_id
+                    }
+                else:
+                    matched_entry["workload_identity_matched"] = None
+            if (item.definition_hashes or item.unreadable_definition_hashes) and isinstance(
+                component, ToolComponent
+            ):
+                matched_entry["reported_definition_hashes"] = sorted(item.definition_hashes)
+                reported_norm = {_normalized_sha256(h) for h in item.definition_hashes}
+                if item.unreadable_definition_hashes:
+                    matched_entry["unreadable_definition_hashes"] = (
+                        item.unreadable_definition_hashes
+                    )
+                    matched_entry["definition_hash_matched"] = False
+                elif None in reported_norm:
+                    matched_entry["definition_hash_matched"] = False
+                elif component.definition_hash:
+                    declared_hash = _normalized_sha256(component.definition_hash)
+                    matched_entry["definition_hash_matched"] = (
+                        declared_hash is not None and reported_norm == {declared_hash}
+                    )
+                else:
+                    matched_entry["definition_hash_matched"] = None
+            if _is_mismatched(matched_entry):
+                matched_entry["span_count"] = item.spans
+            result["matched"].append(matched_entry)
             server = getattr(component, "mcp_server_ref", None)
             if isinstance(server, str):
                 mentioned.add(server)
@@ -574,6 +659,10 @@ def _observed(observations: Observations) -> list[dict[str, Any]]:
         }
         if item.kind in _DETAILS:
             entry[_DETAILS[item.kind]] = sorted(item.details)
+        if item.workload_identities:
+            entry["workload_identities"] = sorted(item.workload_identities)
+        if item.definition_hashes:
+            entry["definition_hashes"] = sorted(item.definition_hashes)
         entries.append(entry)
     return sorted(entries, key=_order)
 
@@ -615,6 +704,7 @@ def _gate(
         unidentified = sum(
             1 for entry in reconciliation["unidentified"] if entry["kind"] in GATING_KINDS
         )
+        mismatched = sum(1 for entry in reconciliation["matched"] if _is_mismatched(entry))
         if undeclared:
             reasons.append(
                 f"{undeclared} reported tool, model, agent or MCP endpoint "
@@ -625,6 +715,11 @@ def _gate(
                 f"{unidentified} reported tool, model, agent or MCP endpoint "
                 f"{'item has' if unidentified == 1 else 'items have'} an identifier that could "
                 "not be read, so it cannot be compared with the inventory"
+            )
+        if mismatched:
+            reasons.append(
+                f"{mismatched} matched {'item reports' if mismatched == 1 else 'items report'} a "
+                "conflicting or unreadable workload identity or tool definition hash"
             )
         unclassified = coverage["spans_unclassified"]
         if unclassified:
@@ -849,10 +944,13 @@ def _findings(document: Mapping[str, Any]) -> Iterable[tuple[str, dict[str, Any]
     for entry in reconciliation["unidentified"]:
         if entry["kind"] in GATING_KINDS:
             yield "unidentified", entry
+    for entry in reconciliation["matched"]:
+        if _is_mismatched(entry):
+            yield "mismatched", entry
 
 
 def sarif_document(document: Mapping[str, Any], anchor: str) -> dict[str, Any]:
-    """SARIF 2.1.0 results for undeclared and unidentified runtime use, anchored at ``anchor``.
+    """SARIF 2.1.0 results for undeclared, unidentified and mismatched runtime use, anchored at ``anchor``.
 
     Unobserved declarations are not findings and are not emitted. Text taken from the
     traces is neutralized as the inventory's SARIF export neutralizes inventory text.
@@ -878,6 +976,11 @@ def sarif_document(document: Mapping[str, Any], anchor: str) -> dict[str, Any]:
         ).split(":", 1)[1]
         if status == "undeclared":
             message = f"The traces report {describe(entry)}, which the inventory does not declare."
+        elif status == "mismatched":
+            message = (
+                f"The traces report {describe(entry)} with a conflicting or unreadable "
+                "workload identity or tool definition hash."
+            )
         else:
             message = (
                 f"The traces report {describe(entry)}; it cannot be compared with the "

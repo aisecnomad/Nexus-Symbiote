@@ -1794,7 +1794,7 @@ class RegistryScanner(Scanner):
                     ]
                 )
                 found.extend(
-                    (f"{name}:{_setting_name(key, set())}", settings[key])
+                    (f"{name}:{_setting_name(key, set(), selected=True)}", settings[key])
                     for key in selected
                     if not _DEFAULT_NPM_REGISTRY.fullmatch(settings[key])
                 )

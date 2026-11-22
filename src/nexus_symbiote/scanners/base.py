@@ -194,6 +194,9 @@ class ScanResult:
     dependencies: list[DependencyEdge] = field(default_factory=list)
     surfaces_scanned: list[str] = field(default_factory=list)
     surfaces_excluded: list[str] = field(default_factory=list)
+    accepted_default_exclusions: list[str] = field(
+        default_factory=lambda: BoundedRecords(noun="accepted default exclusion", bind_omitted=True)
+    )
     scan_failures: list[str] = field(default_factory=list)
     source_report_digest: str | None = None
     source_report_content_digest: str | None = None
@@ -205,6 +208,7 @@ class ScanResult:
     source_unmapped_count: int = 0
     source_unmapped_indexes: list[int] = field(default_factory=list)
     discovery_verification: DiscoveryVerification | None = None
+    accepted_default_names: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if not isinstance(self.scan_failures, BoundedRecords):
@@ -232,7 +236,11 @@ class ScanResult:
                     ]
         self.surfaces_scanned[:] = [relative(record) for record in self.surfaces_scanned]
         # Coverage reasons quote checkout text, such as a server name, and are exported.
-        for records in (self.surfaces_excluded, self.scan_failures):
+        for records in (
+            self.surfaces_excluded,
+            self.scan_failures,
+            self.accepted_default_exclusions,
+        ):
             records[:] = [neutral_text(relative(record)) for record in records]
 
 
@@ -289,11 +297,18 @@ class Scanner(ABC):
 
     name: str = "base"
     _exclude_paths: tuple[str | Path, ...] = ()
+    _accept_default_excludes: bool | tuple[str, ...] = False
     _files: ConfinedCollection | None = None
 
-    def configure(self, exclude_paths: Iterable[str | Path] = ()) -> None:
+    def configure(
+        self,
+        exclude_paths: Iterable[str | Path] = (),
+        *,
+        accept_default_excludes: bool | tuple[str, ...] = False,
+    ) -> None:
         """Set root-relative or absolute collection exclusions before ``scan``."""
         self._exclude_paths = tuple(exclude_paths)
+        self._accept_default_excludes = accept_default_excludes
 
     @contextmanager
     def _collection(
@@ -304,12 +319,15 @@ class Scanner(ABC):
             result.scan_failures,
             result.surfaces_excluded,
             exclude_paths=self._exclude_paths,
+            accept_default_excludes=self._accept_default_excludes,
+            accepted_default_exclusions=result.accepted_default_exclusions,
             **bounds,
         ) as files:
             self._files = files
             try:
                 yield files
             finally:
+                result.accepted_default_names.update(files.accepted_default_names)
                 self._files = None
 
     @abstractmethod

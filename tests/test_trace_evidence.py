@@ -1817,3 +1817,220 @@ def test_sarif_warns_when_github_would_drop_results(tmp_path, monkeypatch):
             "text": "This run has 2 results; GitHub code scanning keeps at most 1 per run."
         },
     } in notifications
+
+
+def test_spiffe_workload_identity_and_tool_definition_hash_correlation(tmp_path):
+    from click.testing import CliRunner
+
+    from nexus_symbiote.cli import main
+
+    tool_hash = "sha256:" + "ab" * 32
+    components = [
+        ToolComponent(
+            bom_ref="tool:search",
+            name="search",
+            definition_hash=tool_hash,
+        ),
+        AgentComponent(
+            bom_ref="agent:support",
+            name="support",
+            workload_identity="spiffe://example.org/ns/prod/sa/support-agent",
+            properties={"identity_source": "agent.yaml"},
+        ),
+    ]
+    spans = [
+        otlp_span(
+            {
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.name": "search",
+                "gen_ai.tool.definition_hash": "AB" * 32,
+                "spiffe.id": "spiffe://example.org/ns/prod/sa/support-agent",
+            }
+        ),
+        otlp_span(
+            {
+                "gen_ai.operation.name": "invoke_agent",
+                "gen_ai.agent.name": "support",
+                "spiffe.id": "spiffe://example.org/ns/prod/sa/support-agent",
+            }
+        ),
+    ]
+    evidence = _evidence(tmp_path, components, *spans)
+    matched = {e["inventory_ref"]: e for e in evidence["reconciliation"]["matched"]}
+    assert matched["tool:search"]["definition_hash_matched"] is True
+    assert matched["tool:search"]["reported_definition_hashes"] == ["AB" * 32]
+    assert "span_count" not in matched["tool:search"]
+    assert matched["agent:support"]["workload_identity_matched"] is True
+    assert matched["agent:support"]["reported_workload_identities"] == [
+        "spiffe://example.org/ns/prod/sa/support-agent"
+    ]
+    assert evidence["gate"]["passed"] is True
+
+    # Conflicting or unreadable spiffe.id / definition_hash sets *_matched=False, fails gate,
+    # lists Mismatched in summary, and emits SARIF results.
+    conflict_spans = [
+        *spans,
+        otlp_span(
+            {
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.name": "search",
+                "gen_ai.tool.definition_hash": "sha256:" + "cd" * 32,
+            }
+        ),
+        otlp_span(
+            {
+                "gen_ai.operation.name": "invoke_agent",
+                "gen_ai.agent.name": "support",
+                "spiffe.id": "spiffe://evil.example/ns/prod/sa/rogue",
+            }
+        ),
+    ]
+    inv_path = _inventory(tmp_path, *components)
+    trace_path = _trace(tmp_path, otlp_export(*conflict_spans), "conflict-trace.json")
+    sarif_out = tmp_path / "conflict.sarif"
+    cli = CliRunner().invoke(
+        main, ["trace-diff", str(inv_path), str(trace_path), "--sarif", str(sarif_out)]
+    )
+    assert cli.exit_code == 1
+    assert "Mismatched:" in cli.output
+    assert "conflicting or unreadable workload identity or tool definition hash" in cli.output
+    sarif = json.loads(sarif_out.read_text(encoding="utf-8"))
+    assert validate_sarif(sarif) == []
+    statuses = [r["properties"]["status"] for r in sarif["runs"][0]["results"]]
+    assert statuses == ["mismatched", "mismatched"]
+
+    # Unreadable gen_ai.tool.definition_hash, malformed hex, or credential-shaped spiffe.id
+    # fails closed; unrecorded inventory identity/hash reports None without failing the gate.
+    unreadable_ev = _evidence(
+        tmp_path,
+        components,
+        otlp_span(
+            {
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.name": "search",
+                "gen_ai.tool.definition_hash": {"intValue": "99"},
+            }
+        ),
+        otlp_span(
+            {
+                "gen_ai.operation.name": "invoke_agent",
+                "gen_ai.agent.name": "support",
+                "spiffe.id": "spiffe://example.org/token/sk-ant-api03-" + "a" * 95,
+            }
+        ),
+    )
+    unreadable_matched = {e["inventory_ref"]: e for e in unreadable_ev["reconciliation"]["matched"]}
+    assert unreadable_matched["tool:search"]["definition_hash_matched"] is False
+    assert unreadable_matched["agent:support"]["workload_identity_matched"] is False
+    assert unreadable_ev["gate"]["passed"] is False
+
+    bad_hex_ev = _evidence(
+        tmp_path,
+        components,
+        otlp_span(
+            {
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.name": "search",
+                "gen_ai.tool.definition_hash": "not-a-valid-sha256",
+            }
+        ),
+    )
+    bad_hex_matched = {e["inventory_ref"]: e for e in bad_hex_ev["reconciliation"]["matched"]}
+    assert bad_hex_matched["tool:search"]["definition_hash_matched"] is False
+    assert bad_hex_ev["gate"]["passed"] is False
+
+    unpinned_components = [
+        ToolComponent(bom_ref="tool:plain", name="plain"),
+        AgentComponent(
+            bom_ref="agent:plain",
+            name="plain",
+            properties={"identity_source": "agent.yaml"},
+        ),
+    ]
+    unpinned_ev = _evidence(
+        tmp_path,
+        unpinned_components,
+        otlp_span(
+            {
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.name": "plain",
+                "gen_ai.tool.definition_hash": "ab" * 32,
+            }
+        ),
+        otlp_span(
+            {
+                "gen_ai.operation.name": "invoke_agent",
+                "gen_ai.agent.name": "plain",
+                "peer.identity": "spiffe://example.org/ns/prod/sa/plain",
+            },
+            kind=3,
+        ),
+    )
+    unpinned_matched = {e["inventory_ref"]: e for e in unpinned_ev["reconciliation"]["matched"]}
+    assert unpinned_matched["tool:plain"]["definition_hash_matched"] is None
+    assert unpinned_matched["agent:plain"]["workload_identity_matched"] is None
+    assert unpinned_ev["gate"]["passed"] is True
+
+
+def test_a_caller_span_does_not_lend_its_identity_to_the_agent_it_invokes(tmp_path):
+    declared = "spiffe://example.org/sa/support"
+    agent = AgentComponent(
+        bom_ref="agent:support",
+        name="support",
+        workload_identity=declared,
+        properties={"identity_source": "agent.yaml"},
+    )
+    own = {"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": "support"}
+    document = otlp_export(otlp_span({**own, "spiffe.id": declared}, kind=2))
+    caller = otlp_export(
+        otlp_span(own, kind=3),
+        resource={"service.name": "orchestrator", "spiffe.id": "spiffe://example.org/sa/orch"},
+    )
+    document["resourceSpans"] += caller["resourceSpans"]
+    evidence = collect(_inventory(tmp_path, agent), [_trace(tmp_path, document)])
+    [entry] = evidence["reconciliation"]["matched"]
+    assert entry["reported_workload_identities"] == [declared]
+    assert entry["workload_identity_matched"] is True
+    assert evidence["gate"]["passed"] is True
+
+    mtls = {**own, "spiffe.id": declared, "peer.identity": "spiffe://example.org/sa/orch"}
+    server_side = _evidence(tmp_path, [agent], otlp_span(mtls, kind=2))
+    assert server_side["reconciliation"]["matched"][0]["workload_identity_matched"] is True
+    callee = _evidence(
+        tmp_path,
+        [agent],
+        otlp_span({**own, "peer.identity": "spiffe://x.example/sa/rogue"}, kind=3),
+    )
+    assert callee["reconciliation"]["matched"][0]["workload_identity_matched"] is False
+    assert callee["gate"]["passed"] is False
+
+
+@pytest.mark.parametrize("kind", [0, 1, 2, 5, 9])
+def test_a_span_the_agent_emits_is_gated_on_its_own_identity(tmp_path, kind):
+    agent = _agent("agent:support", "support").model_copy(
+        update={"workload_identity": "spiffe://example.org/sa/support"}
+    )
+    own = {"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": "support"}
+    rogue = {**own, "spiffe.id": "spiffe://example.org/sa/rogue"}
+    evidence = _evidence(tmp_path, [agent], otlp_span(rogue, kind=kind))
+    assert evidence["reconciliation"]["matched"][0]["workload_identity_matched"] is False
+    assert evidence["gate"]["passed"] is False
+
+
+@pytest.mark.parametrize("kind", [3, 4])
+def test_a_caller_span_reports_its_own_identity_and_gates_an_unreadable_one(tmp_path, kind):
+    agent = _agent("agent:support", "support").model_copy(
+        update={"workload_identity": "spiffe://example.org/sa/support"}
+    )
+    own = {"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": "support"}
+    caller = otlp_export(
+        otlp_span(own, kind=kind), resource={"spiffe.id": "spiffe://example.org/sa/rogue"}
+    )
+    evidence = collect(_inventory(tmp_path, agent), [_trace(tmp_path, caller)])
+    [entry] = evidence["reconciliation"]["matched"]
+    assert entry["caller_workload_identities"] == ["spiffe://example.org/sa/rogue"]
+    assert "workload_identity_matched" not in entry
+    secret = "spiffe://example.org/token/sk-ant-api03-" + "a" * 95
+    hidden = _evidence(tmp_path, [agent], otlp_span({**own, "spiffe.id": secret}, kind=kind))
+    assert hidden["reconciliation"]["matched"][0]["workload_identity_matched"] is False
+    assert hidden["gate"]["passed"] is False

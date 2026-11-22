@@ -127,7 +127,10 @@ def test_losing_verification_alerts() -> None:
     lost = "high:ShadowScan discovery evidence is no longer signature-verified."
     assert _verification_changes(_claim(verified), _claim(unverified)) == [lost]
     assert _verification_changes(_claim(verified), _claim(None)) == [lost]
-    gained = "info:ShadowScan discovery evidence is now signature-verified."
+    gained = (
+        "info:ShadowScan discovery evidence is now signature-verified (signer "
+        "https://example.test/signer, issuer https://issuer.example.test)."
+    )
     assert _verification_changes(_claim(None), _claim(verified)) == [gained]
     resigned = verified.model_copy(update={"signer_identity": "https://example.test/other"})
     assert _verification_changes(_claim(verified), _claim(resigned)) == [
