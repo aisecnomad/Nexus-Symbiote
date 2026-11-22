@@ -6,6 +6,7 @@ Notable changes to Nexus SymBiote, newest release first. Within a release, secur
 
 ### Security
 
+- **Breaking.** A suppression on an MCP server, IDE settings, RAG or A2A record is bound to the collector-owned digests of its configuration. Before, these records had no content digest, so a suppression reviewed for one package or settings file kept matching after the configuration changed. Existing suppressions on such records become stale once and need re-review.
 - `trace-diff` compares the workload identity and tool definition hash an ambiguous item reports. A tool name two servers share, or two agents with one name, used to pass any reported hash or SPIFFE ID; the gate now fails unless a candidate declares exactly what the trace reports.
 - `make lock` resolves with `--no-sources`, and the offline lock check rejects a `[tool.uv]` table. `uv --no-config` still applied `[tool.uv.sources]`, so a pull request could route one dependency to an index it named and the lock check passed.
 - The workflow checker requires the precision gate (with `--fresh`) and the parser fuzz smoke gate in the security-regressions job, so they cannot be dropped or scored from a committed file with every check green.

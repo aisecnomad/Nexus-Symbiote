@@ -574,3 +574,28 @@ def test_a_fingerprint_is_the_documented_digest_with_content_null_when_absent(co
     preimage = json.dumps({**fields, "content": content}, sort_keys=True, separators=(",", ":"))
     expected = "sha256:" + hashlib.sha256(preimage.encode("ascii")).hexdigest()
     assert finding_fingerprint("config:a", "c", RiskSeverity.HIGH, "d", content) == expected
+
+
+def _mcp_project(tmp_path: Path, name: str, package: str) -> tuple[Path, Path, dict]:
+    project = tmp_path / name
+    project.mkdir()
+    server = {"command": "npx", "args": ["-y", package, "/srv/data"]}
+    (project / ".mcp.json").write_text(json.dumps({"mcpServers": {"fs": server}}))
+    inventory = tmp_path / f"{name}.json"
+    args = ["scan", str(project), "--no-project-policy", "--report-only", "-o", str(inventory)]
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == 0, result.output
+    return project, inventory, json.loads(inventory.read_text())
+
+
+def test_a_suppression_on_an_mcp_server_does_not_follow_a_changed_configuration(tmp_path):
+    # A static MCP record carries no content hash. The fingerprint must still change when
+    # the configuration the reviewer accepted changes, or the suppression outlives it.
+    first = _mcp_project(tmp_path, "a", "@modelcontextprotocol/server-filesystem")
+    second = _mcp_project(tmp_path, "b", "some-other-server")
+    (ref_a,) = [c["bom_ref"] for c in first[2]["components"] if c["name"] == "fs"]
+    (ref_b,) = [c["bom_ref"] for c in second[2]["components"] if c["name"] == "fs"]
+    assert ref_a == ref_b
+    reviewed = _fingerprint(first[1], first[0], ref_a, "version_pinning")
+    assert _fingerprint(first[1], first[0], ref_a, "version_pinning") == reviewed
+    assert _fingerprint(second[1], second[0], ref_b, "version_pinning") != reviewed

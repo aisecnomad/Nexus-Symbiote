@@ -105,7 +105,33 @@ def component_content_digest(component: ComponentBase) -> str | None:
         # supplied text, and a binding it carried would outlive a change of the bytes.
         binding = component.properties.get("static_value_binding")
         return binding if isinstance(binding, str) and binding else None
-    return component.hashes.get("sha256") or None
+    if digest := component.hashes.get("sha256"):
+        return digest
+    return _configuration_digest(component)
+
+
+# Collector-owned digests of a configuration record (see validators.completeness): an
+# MCP, IDE, RAG or A2A record has no content hash, and without these a suppression
+# reviewed for one configuration would keep matching after the configuration changed.
+_CONFIGURATION_DIGEST_PROPERTIES = (
+    "static_value_binding",
+    "static_config_hash",
+    "static_card_hash",
+    "config_hash",
+    "settings_hashes",
+)
+
+
+def _configuration_digest(component: ComponentBase) -> str | None:
+    recorded = {
+        name: value
+        for name in _CONFIGURATION_DIGEST_PROPERTIES
+        if (value := component.properties.get(name)) not in (None, "", {}, [])
+    }
+    if not recorded:
+        return None
+    encoded = json.dumps(recorded, sort_keys=True, separators=(",", ":"), default=str)
+    return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def content_unbound(component: ComponentBase) -> bool:
