@@ -1391,7 +1391,12 @@ A way around a limit that its entry does not describe is worth a
   (`read x < <(curl x); eval "$x"`), assigned inside another assignment's first word, or
   assigned a substitution that does not start with the downloader or `base64`
   (`x=$(echo y | base64 -d)`) is not followed, and only `echo`, `printf` and `cat` pass
-  one on to a pipe (`tee <<< "$x" | sh` is not read). A download
+  one on to a pipe (`tee <<< "$x" | sh` is not read). A PowerShell grouped download
+  given to `iex` is matched as text where a command starts, after a separator, a group
+  or a quote, so `echo "iex (irm URL)"` is critical; a downloader object held in a variable
+  (`$wc = New-Object Net.WebClient; iex $wc.DownloadString(URL)`), a script block run
+  by `Invoke-Command -ScriptBlock`, and `irm URL | iex` inside a `-Command` string
+  (`pwsh -c "irm URL | iex"`) stay high. A download
   unpacked and then run, as by
   `curl x | tar -xz; sh install.sh`, is medium, because the archive's members are not
   known. A file a downloader's `-o`

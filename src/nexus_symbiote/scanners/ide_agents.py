@@ -2711,7 +2711,11 @@ def _fetch_exec(command: str) -> bool:
     A command or process substitution that itself downloads is the same shape
     without a pipe, as is saving the download and running that file later.
     """
-    if _runs_fetch(command) or _encoded_powershell(command):
+    if (
+        _runs_fetch(command)
+        or _encoded_powershell(command)
+        or _POWERSHELL_CRADLE.search(command) is not None
+    ):
         return True
     held = _held_downloads(command)
     # Every reference to a variable a download was assigned to is read as that download,
@@ -2730,6 +2734,21 @@ def _fetch_exec(command: str) -> bool:
 # command is read once, and an assignment nested in that first word is not read.
 _SUBSTITUTION_ASSIGNMENT = re.compile(
     r"(?<![\w-])([A-Za-z_]\w*)=[\"']?(\$\(|`)[ \t]*([^ \t\n)|&;`]*)"
+)
+# PowerShell runs a grouped download it is given as a script: `iex (irm URL)`,
+# `iex(iwr URL).Content`, `IEX (New-Object Net.WebClient).DownloadString(URL)` and
+# `& ([scriptblock]::Create((irm URL)))`, as `irm URL | iex` does. It counts where a
+# command starts, after a separator, a group or a quote, so a `pwsh -c "iex (irm URL)"`
+# script counts. Each blank or parenthesis run is crossed once, so the search is linear.
+_POWERSHELL_CRADLE = re.compile(
+    r"(?:^|[;|&({\n\"'])[ \t]*(?:(?:iex|invoke-expression)(?:[ \t]+-c[a-z]*)?"
+    r"|[&.][ \t]*\([ \t]*\[(?:system\.management\.automation\.)?scriptblock\]::create)"
+    r"[ \t]*\([ \t(]*"
+    r"(?:(?:curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod)(?:\.exe)?(?![\w.-])"
+    r"|(?:new-object[ \t]+(?:-typename[ \t]+)?['\"]?(?:system\.)?net\.webclient['\"]?[ \t]*\)"
+    r"|\[(?:system\.)?net\.webclient\]::new\(\)[ \t]*\)?)"
+    r"[ \t]*\.download(?:string|data)[ \t]*\()",
+    re.IGNORECASE,
 )
 _SUBSTITUTION_WORD = re.compile(r"(\$\(|<\(|`)[ \t]*([^ \t\n)|&;`]*)")
 _VARIABLE_REFERENCE = re.compile(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)")
