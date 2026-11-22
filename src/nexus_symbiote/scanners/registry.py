@@ -2463,50 +2463,35 @@ class RegistryScanner(Scanner):
         return selections
 
     @staticmethod
-    def _yaml_flow_depth_exceeded(text: str, max_depth: int = 64) -> bool:
-        """Linear-time check for deeply nested YAML flow collections before yaml.scan()."""
-        depth = 0
-        in_single = False
-        in_double = False
-        escape = False
-        in_comment = False
-        i = 0
-        n = len(text)
-        while i < n:
-            ch = text[i]
-            if in_comment:
-                if ch in ("\n", "\r"):
-                    in_comment = False
-            elif in_single:
-                if ch == "'":
-                    if i + 1 < n and text[i + 1] == "'":
-                        i += 1
-                    else:
-                        in_single = False
-            elif in_double:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_double = False
-            elif ch == "'" and (
-                i == 0 or text[i - 1] in (" ", "\t", "\n", "\r", ":", ",", "[", "{", "-", "?")
-            ):
-                in_single = True
-            elif ch == '"' and (
-                i == 0 or text[i - 1] in (" ", "\t", "\n", "\r", ":", ",", "[", "{", "-", "?")
-            ):
-                in_double = True
-            elif ch == "#" and (i == 0 or text[i - 1] in (" ", "\t", "\n", "\r")):
-                in_comment = True
-            elif ch in "[{":
-                depth += 1
-                if depth > max_depth:
-                    return True
-            elif ch in "]}" and depth > 0:
-                depth -= 1
-            i += 1
+    def _bounded_yaml_loader(max_depth: int = 64) -> type[Any]:
+        """PyYAML SafeLoader subclass enforcing a strict flow-collection depth cap."""
+        import yaml
+
+        class _BoundedFlowLoader(yaml.SafeLoader):
+            def fetch_flow_collection_start(self, token_class: Any) -> None:
+                if self.flow_level >= max_depth:
+                    raise ValueError(f"YAML flow nesting exceeds depth limit ({max_depth})")
+                super().fetch_flow_collection_start(token_class)
+
+        return _BoundedFlowLoader
+
+    @classmethod
+    def _yaml_flow_depth_exceeded(cls, text: str, max_depth: int = 64) -> bool:
+        """Check for deeply nested YAML flow collections using PyYAML's own scanner."""
+        if text.count("[") + text.count("{") <= max_depth:
+            return False
+        try:
+            import yaml
+        except ImportError:
+            return False
+        loader = cls._bounded_yaml_loader(max_depth=max_depth)
+        try:
+            for _ in yaml.scan(text, Loader=loader):
+                pass
+        except ValueError:
+            return True
+        except yaml.YAMLError:
+            return False
         return False
 
     def _resolve_pnpm_lockfile(
@@ -2531,9 +2516,8 @@ class RegistryScanner(Scanner):
 
         try:
             text = lock_bytes.decode("utf-8")
-            if self._yaml_flow_depth_exceeded(text):
-                raise ValueError("YAML flow nesting exceeds limit")
-            for index, token in enumerate(yaml.scan(text)):
+            loader = self._bounded_yaml_loader()
+            for index, token in enumerate(yaml.scan(text, Loader=loader)):
                 if index >= _MAX_PNPM_LOCK_TOKENS or isinstance(
                     token, (yaml.AliasToken, yaml.AnchorToken, yaml.TagToken)
                 ):
@@ -3104,10 +3088,9 @@ class RegistryScanner(Scanner):
             yaml.DocumentEndToken,
         )
         try:
-            if self._yaml_flow_depth_exceeded(text):
-                raise ValueError("YAML flow nesting exceeds limit")
+            loader = self._bounded_yaml_loader()
             empty = True
-            for index, token in enumerate(yaml.scan(text)):
+            for index, token in enumerate(yaml.scan(text, Loader=loader)):
                 if index >= _MAX_PNPM_LOCK_TOKENS or isinstance(
                     token, (yaml.AliasToken, yaml.AnchorToken, yaml.TagToken)
                 ):
@@ -4800,12 +4783,11 @@ class RegistryScanner(Scanner):
         except ImportError:
             return None
         try:
-            if cls._yaml_flow_depth_exceeded(text):
-                return None
-            for index, _ in enumerate(yaml.scan(text, Loader=yaml.SafeLoader)):
+            loader = cls._bounded_yaml_loader()
+            for index, _ in enumerate(yaml.scan(text, Loader=loader)):
                 if index >= cls._COMPOSE_TOKENS:
                     return None
-            root = yaml.compose(text, Loader=yaml.SafeLoader)
+            root = yaml.compose(text, Loader=loader)
             if root is None:
                 return [], [], []
             return _ComposeWalk(cls._COMPOSE_STEPS).images(root)

@@ -1610,7 +1610,7 @@ def _cargo_lock_agrees(spec: str | None, version: str) -> bool:
         return False
     if spec.startswith("="):
         exact = spec[1:]
-        return version == exact if exact.count(".") == 2 else version.startswith(exact + ".")
+        return version == exact or (exact.count(".") < 2 and version.startswith(exact + "."))
     return not _versions_conflict(spec if spec[0] in "^~" else "^" + spec, version)
 
 

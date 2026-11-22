@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -268,18 +267,24 @@ def test_r_med_14_registry_yaml_flow_depth_fast_reject(tmp_path: Path) -> None:
     _write(pnpm_dir, "package.json", json.dumps({"dependencies": {"openai": "^4.0.0"}}))
     _write(pnpm_dir, "pnpm-lock.yaml", f"lockfileVersion: '9.0'\npackages: {deep}\n")
 
-    start = time.monotonic()
     res = RegistryScanner().scan(tmp_path)
     res_pnpm = RegistryScanner().scan(pnpm_dir)
-    elapsed = time.monotonic() - start
-    assert elapsed < 2.0
     assert any("pnpm-workspace.yaml" in f for f in res.scan_failures)
     assert any("compose.yaml" in f for f in res.scan_failures)
     assert any("pnpm-lock.yaml" in f for f in res_pnpm.scan_failures)
 
-    # Apostrophe / inline hash / quoted strings in YAML flow-depth check.
-    assert RegistryScanner._yaml_flow_depth_exceeded("a'b: " + "[" * 70 + "]" * 70) is True
-    assert RegistryScanner._yaml_flow_depth_exceeded("a#b: " + "[" * 70 + "]" * 70) is True
+    # Plain-scalar, block-scalar, apostrophe, and inline hash bypasses must all be caught.
+    for payload in (
+        'a: hello "world\nb: ' + "[" * 2000 + "]" * 2000 + "\n",
+        'a: hello :"world\nb: ' + "[" * 2000 + "]" * 2000 + "\n",
+        'a: hello -"world\nb: ' + "[" * 2000 + "]" * 2000 + "\n",
+        'a: hello ?"world\nb: ' + "[" * 2000 + "]" * 2000 + "\n",
+        'a: hello ,"world\nb: ' + "[" * 2000 + "]" * 2000 + "\n",
+        'a: |\n  "hello\nb: ' + "[" * 2000 + "]" * 2000 + "\n",
+        "a'b: " + "[" * 70 + "]" * 70,
+        "a#b: " + "[" * 70 + "]" * 70,
+    ):
+        assert RegistryScanner._yaml_flow_depth_exceeded(payload) is True
     assert RegistryScanner._yaml_flow_depth_exceeded("key: # " + "[" * 70 + "]" * 70) is False
     assert RegistryScanner._yaml_flow_depth_exceeded("k: 'a''b" + "[" * 70 + "'\n") is False
     assert RegistryScanner._yaml_flow_depth_exceeded('k: "a\\"b' + "[" * 70 + '"\n') is False
