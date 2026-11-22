@@ -36,6 +36,8 @@ from nexus_symbiote.inventory_export_cli import register_inventory_export_comman
 from nexus_symbiote.live_cli import register_live_commands
 from nexus_symbiote.minimum_elements_cli import register_minimum_elements_commands
 from nexus_symbiote.policy import Policy
+from nexus_symbiote.policy import gate_weakenings as _gate_weakenings
+from nexus_symbiote.policy import running_in_ci as _running_in_ci
 from nexus_symbiote.reporting import (
     ReportLine,
     diff_report_lines,
@@ -204,6 +206,7 @@ def _policy_with_source(
         PolicyError,
         default_policy,
         load_policy_file,
+        resolved_project_policy,
         weakened_settings,
     )
 
@@ -234,12 +237,11 @@ def _policy_with_source(
     if ignore_project:
         return default_policy(), "built-in", []
     try:
-        loaded = load_policy_file(root)
+        policy, path = resolved_project_policy(root)
     except PolicyError as exc:
         raise _failure(exc) from exc
-    if loaded is None:
-        return default_policy(), "built-in", []
-    policy, path, _ = loaded
+    if path is None:
+        return policy, "built-in", []
     weaker = weakened_settings(policy)
     if weaker and warn:
         # The path and the relaxed values come from the checkout, so neither may move
@@ -254,16 +256,6 @@ def _policy_with_source(
             "to accept it explicitly."
         )
     return policy, f"project:{path}", weaker
-
-
-# Relaxations that change what a command reports, not whether its gate passes; they
-# are recorded and warned about like every other, but CI need not accept them.
-_REPORT_ONLY_WEAKENING_PREFIXES = ("output.",)
-
-
-def _gate_weakenings(weaker: list[str]) -> list[str]:
-    """Every relaxation but those that change only what is reported (``output.*``)."""
-    return [entry for entry in weaker if not entry.startswith(_REPORT_ONLY_WEAKENING_PREFIXES)]
 
 
 def _inventory_policy(
@@ -413,31 +405,6 @@ def _require_binding_key() -> None:
             f"{SOURCE_BINDING_KEY_ENV} must contain at least "
             f"{_MIN_SOURCE_BINDING_KEY_LENGTH} characters"
         )
-
-
-_CI_ENVIRONMENT_VARIABLES = (
-    "CI",
-    "GITHUB_ACTIONS",
-    "GITLAB_CI",
-    "CIRCLECI",
-    "TF_BUILD",
-    "JENKINS_URL",
-    "BUILDKITE",
-    "DRONE",
-    "TRAVIS",
-)
-
-
-def _running_in_ci() -> bool:
-    """True when a well-known CI variable says this run is automated.
-
-    ``CI`` is the de-facto standard set by GitHub Actions, GitLab CI and
-    CircleCI; the rest are provider-specific markers. An empty value, ``0``
-    or ``false`` does not count as CI.
-    """
-    return any(
-        os.environ.get(name) not in (None, "", "0", "false") for name in _CI_ENVIRONMENT_VARIABLES
-    )
 
 
 def _unsigned_discovery_flags(fail_on_unsigned_discovery: bool, allow: bool) -> None:
