@@ -35,14 +35,16 @@ ALLOWED_TRIGGERS = frozenset(
 )
 READ_ONLY = frozenset({"read", "none"})
 # The only jobs that may hold a write scope, and which: uploading code-scanning results,
-# signing attestations and trusted publishing. A token that could push, comment, approve or
-# publish anywhere else fails the check.
+# signing attestations, trusted publishing and pushing the release image. A token that could
+# push, comment, approve or publish anywhere else fails the check.
 JOB_WRITE_SCOPES: dict[str, dict[str, frozenset[str]]] = {
     "ci.yml": {"codeql": frozenset({"security-events"})},
     "codeql.yml": {"analyze": frozenset({"security-events"})},
     "release.yml": {
         "attest": frozenset({"id-token", "attestations"}),
         "publish": frozenset({"id-token"}),
+        "image": frozenset({"packages"}),
+        "image-attest": frozenset({"id-token", "attestations"}),
     },
     "scorecard.yml": {"analysis": frozenset({"security-events", "id-token"})},
 }
@@ -66,6 +68,7 @@ ACTION_FLOORS = {
 CI_JOBS = frozenset(
     {
         "test",
+        "macos",
         "floor",
         "coverage",
         "quality",
@@ -83,6 +86,7 @@ CI_JOBS = frozenset(
 REQUIRED_COMMANDS: dict[str, dict[str, tuple[str, ...]]] = {
     "ci.yml": {
         "test": ("requirements-ci.lock", "python -m pytest", "--strict-skips"),
+        "macos": ("requirements-ci.lock", "python -m pytest", "--strict-skips"),
         "floor": ("requirements-floor.lock", "python -m pytest", "--strict-skips"),
         "coverage": (
             "--cov=nexus_symbiote",
@@ -154,6 +158,7 @@ REQUIRED_COMMANDS: dict[str, dict[str, tuple[str, ...]]] = {
         ),
         "compatibility": ("scripts/check_installed_wheel.py",),
         "verify": ("gh attestation verify",),
+        "image-verify": ("gh attestation verify",),
     },
     "codeql.yml": {
         "analyze": (
@@ -163,6 +168,9 @@ REQUIRED_COMMANDS: dict[str, dict[str, tuple[str, ...]]] = {
         ),
     },
 }
+# Jobs whose runner is what they verify: the macOS suite moved to another runner keeps its
+# name and its commands but no longer tests macOS.
+REQUIRED_RUNNERS: dict[str, dict[str, str]] = {"ci.yml": {"macos": "macos-"}}
 # A gate job or step runs by default, with success() or with always(). Besides those, the
 # release build runs only from main, and its repository-controls preflight only for a run
 # that publishes, as the publish job does; neither condition may skip any other gate.
@@ -1645,6 +1653,9 @@ def _workflow_issues(path: Path, document: dict[Any, Any]) -> list[str]:
         timeout = job.get("timeout-minutes")
         if type(timeout) is not int or timeout <= 0:
             errors.append(f"{path}: {name} must set timeout-minutes")
+        runner = REQUIRED_RUNNERS.get(path.name, {}).get(str(name))
+        if runner is not None and not str(job.get("runs-on")).startswith(runner):
+            errors.append(f"{path}: {name} must run on a {runner} runner")
         granted = _write_scopes(job.get("permissions"))
         writable = JOB_WRITE_SCOPES.get(path.name, {}).get(str(name), frozenset())
         if granted is None or granted - writable:
