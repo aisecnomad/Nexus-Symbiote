@@ -2380,9 +2380,11 @@ _POWERSHELL_PARAMETERS = (
     ("help", "h", "switch"),
     ("?", "?", "switch"),
 )
+# Use the documented format names on Windows PowerShell 5.1. The separate
+# -if and -of spellings are verified only for the modern parser.
 _WINDOWS_POWERSHELL_NAMES = _set(
     "command file encodedcommand ec encodedarguments ea executionpolicy ep configurationname "
-    "inputformat if outputformat of windowstyle noprofile nologo noninteractive noexit "
+    "inputformat outputformat windowstyle noprofile nologo noninteractive noexit "
     "mta sta help ?"
 )
 _WINDOWS_POWERSHELL_PARAMETERS = tuple(
