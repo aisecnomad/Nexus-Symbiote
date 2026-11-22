@@ -384,7 +384,11 @@ def _canonical_https_origin(url: str | None) -> tuple[str, str, int] | None:
 
 
 def _named_endpoint_hash(url: str | None) -> str | None:
-    """discover-mcp's digest of an endpoint that names a path; "" if discover-mcp refuses it."""
+    """discover-mcp's digest of an endpoint that names a path; ``None`` for a bare origin.
+
+    ``""``, which matches no evidence, for a URL discover-mcp refuses: any query (even an
+    empty one on the root), dot segments, characters clients encode, or an unreadable URL.
+    """
     from urllib.parse import urlsplit
 
     from nexus_symbiote.scanners.live_mcp import _endpoint
