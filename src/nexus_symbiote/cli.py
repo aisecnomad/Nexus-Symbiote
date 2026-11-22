@@ -186,18 +186,8 @@ _LAST_CLAMPED_SETTINGS: contextvars.ContextVar[tuple[str, ...]] = contextvars.Co
 )
 
 
-def _warn_unapplied_project_policy(root: Path, path: Path | None) -> dict[str, str]:
-    """Report a withheld policy without echoing untrusted contents."""
-    if path is None:
-        echo_line(
-            "WARNING: a project policy file in ",
-            root,
-            " was not applied because it is invalid or unsafe to read. "
-            "Pass --accept-project-policy to require a valid policy and see the error, "
-            "or --no-project-policy to ignore it explicitly.",
-            err=True,
-        )
-        return {"reason": "invalid-or-ambiguous"}
+def _warn_unapplied_project_policy(path: Path) -> dict[str, str]:
+    """Report a withheld relaxation without echoing untrusted contents."""
     echo_line(
         "WARNING: project policy ",
         path,
@@ -226,7 +216,6 @@ def _policy_with_source(
     from nexus_symbiote.operator_policy import narrow_policy
     from nexus_symbiote.policy import (
         PolicyError,
-        PolicyListingError,
         default_policy,
         load_policy_file,
         weakened_settings,
@@ -245,12 +234,8 @@ def _policy_with_source(
         return baseline, source, baseline_weaker, None
     try:
         loaded = load_policy_file(root)
-    except PolicyListingError as exc:
-        raise _failure(exc) from exc
     except PolicyError as exc:
-        if allow_weakening:
-            raise _failure(exc) from exc
-        return baseline, source, baseline_weaker, _warn_unapplied_project_policy(root, None)
+        raise _failure(exc) from exc
     if loaded is None:
         return baseline, source, baseline_weaker, None
     project, path, _ = loaded
@@ -260,7 +245,7 @@ def _policy_with_source(
         narrowed, clamped = narrow_policy(baseline, project, inherit_unspecified=True)
         if not allow_weakening and (clamped or not has_operator):
             if narrowed == baseline:
-                return baseline, source, baseline_weaker, _warn_unapplied_project_policy(root, path)
+                return baseline, source, baseline_weaker, _warn_unapplied_project_policy(path)
             _LAST_CLAMPED_SETTINGS.set(tuple(clamped))
             echo_line(
                 "WARNING: project policy ",
