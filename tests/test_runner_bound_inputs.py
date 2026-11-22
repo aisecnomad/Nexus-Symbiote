@@ -58,7 +58,7 @@ def test_a_changed_preload_is_bound_alongside_the_entry_script(tmp_path, surface
         ["npx", "-p./directory", "entry"],
         ["npx", "file:./directory"],
         ["npx", "."],
-        ["npx", "tsx", "--import", "sample-module", "./app.ts"],
+        ["npx", "tsx", "--import", "../outside.mjs", "./app.ts"],
     ],
 )
 def test_unestablished_entry_or_preload_is_a_coverage_gap(tmp_path, argv):
