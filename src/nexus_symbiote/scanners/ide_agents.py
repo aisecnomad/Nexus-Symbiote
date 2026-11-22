@@ -1227,24 +1227,12 @@ def _assignment_end(words: list[str], index: int) -> int:
     return index + 1
 
 
-def _assignment(word: str) -> bool:
-    if not word or word.startswith("-") or "=" not in word:
-        return False
-    name, _, _value = word.partition("=")
-    return bool(name) and all(char.isalnum() or char in "_." for char in name)
-
-
 def _skip_env(words: list[str], index: int) -> int:
     while index < len(words):
         word = _decode_word(words[index], drop_ifs=True)
         if word == "--":
             index += 1
-            while index < len(words):
-                operand = _decode_word(words[index], drop_ifs=True)
-                if not (_assignment(operand) or _SHELL_ASSIGNMENT.match(operand)):
-                    break
-                index += 1
-            return index
+            break
         if word in {"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}:
             index += 1
             continue
@@ -1257,14 +1245,17 @@ def _skip_env(words: list[str], index: int) -> int:
         if word in {"--unset", "--chdir", "--split-string"}:
             index += 2
             continue
-        if _assignment(word):
-            index += 1
-            continue
-        return index
+        if word.startswith("-"):
+            return index
+        break
+    # env splits assignments at the first equals sign; they are argv data,
+    # not shell assignments. Option parsing ends at the first operand.
+    while index < len(words) and _decode_word(words[index], drop_ifs=True).find("=") > 0:
+        index += 1
     return index
 
 
-def _skip_sudo(words: list[str], index: int) -> int:
+def _skip_sudo(words: list[str], index: int, *, assignments: bool) -> int:
     arg_options = {
         "-u",
         "-g",
@@ -1303,7 +1294,7 @@ def _skip_sudo(words: list[str], index: int) -> int:
             bundle = re.match(r"-([A-Za-z]*?)([ughpUCDRTrta])", word)
             index += 2 if bundle is not None and bundle.end() == len(word) else 1
             continue
-        if _assignment(word):
+        if assignments and word.find("=") > 0:
             index += 1
             continue
         return index
@@ -1458,7 +1449,7 @@ def _executable_index(words: list[str]) -> int | None:
             index = _skip_wrapper(words, index + 1, wrapper)
             continue
         if names & {"sudo", "doas"}:
-            index = _skip_sudo(words, index + 1)
+            index = _skip_sudo(words, index + 1, assignments="sudo" in names)
             continue
         runner = next(iter(sorted(names & _COMMAND_OPTION_RUNNERS.keys())), None)
         if runner is not None:
@@ -2447,6 +2438,23 @@ def _output_substitution_executes(segment: str) -> bool:
 
 def _encoded_powershell(command: str) -> bool:
     """Whether a segment passes PowerShell an encoded command as its own parameter."""
+    if _encoded_in_segments(command):
+        return True
+    if "\n" not in command or _ENCODED_COMMAND.search(command) is None:
+        return False
+    # Quoted newlines can belong to one base64 argument. Preserve the existing
+    # segment reading and check that additional reading only when it differs.
+    parts: list[str] = []
+    last = 0
+    for start, end in _shell_word_spans(command):
+        word = command[start:end]
+        if "\n" in word:
+            parts.extend((command[last:start], word.replace("\n", " ")))
+            last = end
+    return bool(parts) and _encoded_in_segments("".join((*parts, command[last:])))
+
+
+def _encoded_in_segments(command: str) -> bool:
     start = 0
     for boundary in _SEGMENT_BOUNDARY.finditer(command):
         if _encoded_segment(command[start : boundary.start()]):
@@ -2556,8 +2564,10 @@ def _computed_powershell(segment: str) -> int | None:
     # `[^][]` keeps the scan linear on a run of `[`.
     literal = re.sub(r"\[[^][]*\]", "", stem)
     if re.search(r"[a-z]{2}", literal) is None and not any(
-        len(flag.group().lstrip("\"'‘’“”\\^`-/–—―")) > 2 or _encoded_payload(segment, flag.end())
-        for flag in _ENCODED_COMMAND.finditer(segment, spans[index][1])
+        len(flag.group().lstrip("\"'‘’“”\\^`-/–—―")) > 2
+        or (position + 1 < len(words) and _encoded_payload(words[position + 1]))
+        for position in range(index + 1, len(words))
+        if (flag := _ENCODED_COMMAND.match(segment, spans[position][0])) is not None
     ):
         return None
     # A longer pattern is mostly bracket expressions; it is not matched, so as not to
@@ -2573,27 +2583,24 @@ def _computed_powershell(segment: str) -> int | None:
 _BASE64_PAYLOAD = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
 
 
-def _encoded_payload(segment: str, end: int) -> bool:
-    """Whether a short ambiguous switch is followed by evidence of UTF-16LE script text."""
-    argument = _ARGUMENT.search(segment, end)
-    if argument is None:
-        return False
-    encoded = _decode_word(argument.group(), drop_ifs=True)
+_BASE64_SPACING = str.maketrans("", "", " \t\r\n")
+
+
+def _encoded_payload(word: str) -> bool:
+    """Whether a computed program's ambiguous short switch has UTF-16LE text evidence."""
+    encoded = _decode_word(word, drop_ifs=True).translate(_BASE64_SPACING)
     if not _BASE64_PAYLOAD.fullmatch(encoded):
         return False
     try:
-        text = base64.b64decode(encoded, validate=True).decode("utf-16-le")
-    except (binascii.Error, UnicodeDecodeError):
+        text = base64.b64decode(encoded, validate=True).decode("utf-16-le", errors="replace")
+    except binascii.Error:
         return False
-    # Ordinary option operands can also be valid base64, sometimes decoding to
-    # unrelated Unicode letters. A BOM or ASCII syntax distinguishes script text.
-    has_bom = text.startswith("\ufeff")
-    text = text.removeprefix("\ufeff")
-    return (
-        bool(text)
-        and (has_bom or any(char.isascii() for char in text))
-        and all(char.isprintable() or char in "\t\n\r" for char in text)
-    )
+    # The host replaces invalid code units. A control or replacement in a string
+    # or comment does not erase the text evidence elsewhere in the same operand.
+    # An ASCII graphic or a leading BOM distinguishes it from ordinary base64-shaped words.
+    if text.startswith("\ufeff"):
+        return len(text) > 1
+    return any("!" <= char <= "~" for char in text)
 
 
 def _parameter_name(token: str) -> str | None:
