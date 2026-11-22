@@ -1140,15 +1140,8 @@ def _explicit_header(previous: str | None, word: str) -> bool:
     )
 
 
-def _scheme_assignment_name(name: str, *, variable: bool = True) -> bool:
-    words = name_words(name)
-    if not words or words[-1] in _SCHEME_DESCRIPTORS:
-        return False
-    # CLI flags such as --auth=token, --authentication=bearer, and --auth-header=bearer
-    # select an authentication mode or header rather than binding a credential in the next arg.
-    if not variable and (words[-1] == "header" or tuple(words) in {("auth",), ("authentication",)}):
-        return False
-    auth = {
+_SCHEME_AUTH_WORDS = frozenset(
+    {
         "auth",
         "authorization",
         "authentication",
@@ -1159,10 +1152,25 @@ def _scheme_assignment_name(name: str, *, variable: bool = True) -> bool:
         "conn",
         "session",
     }
+)
+
+
+def _scheme_assignment_name(name: str, *, variable: bool = True) -> bool:
+    words = name_words(name)
+    if not words or words[-1] in _SCHEME_DESCRIPTORS:
+        return False
+    # CLI flags such as --auth=token, --authentication=bearer, and --auth-header=bearer
+    # select an authentication mode or header rather than binding a credential in the next arg.
+    if not variable and (
+        words[-1] == "header"
+        or words[-1] in _PUBLIC_TOKEN_SELECTORS
+        or tuple(words) in {("auth",), ("authentication",)}
+    ):
+        return False
     return (
         credential_name(name)
-        or words[-1] in auth
-        or (words[-1] == "header" and not auth.isdisjoint(words[:-1]))
+        or words[-1] in _SCHEME_AUTH_WORDS
+        or (words[-1] == "header" and not _SCHEME_AUTH_WORDS.isdisjoint(words[:-1]))
     )
 
 
@@ -1269,7 +1277,15 @@ def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = Fa
     if following is None or value.lower() not in _ASSIGNMENT_SCHEMES:
         return hits
     words = name_words(name)
-    if not variable and value.lower() == "token" and words and words[-1] in _PUBLIC_TOKEN_SELECTORS:
+    if (
+        not variable
+        and value.lower() == "token"
+        and words
+        and words[-1] in _PUBLIC_TOKEN_SELECTORS
+        and not credential_name(name)
+        and not any(credential_name(word) for word in words[:-1])
+        and _SCHEME_AUTH_WORDS.isdisjoint(words[:-1])
+    ):
         return hits
     if in_set:
         # cmd's SET takes the rest of the assignment, including a literal

@@ -23,6 +23,10 @@ from tests.test_mcp_scheme_context import exports, has_exposure
         ("--env=API_TOKEN=Bearer", "k9X2mP7qR4=true"),
         ("--auth=token", "--ProductionApiSecretBearerTokenValue"),
         ("--auth=token", "--cobalt-falcon-harbor-quartz-velvet-cipher"),
+        ("--token-source=token", "ZqSEx7Wv3Lp9Rk2Tm5Yn"),
+        ("--token-format=token", "ProductionApiSecretBearerTokenValue"),
+        ("--auth-source=token", "ZqSEx7Wv3Lp9Rk2Tm5Yn"),
+        ("--oauth-profile=token", "--cobalt-falcon-harbor-quartz-velvet-cipher"),
     ],
 )
 def test_scheme_operand_credentials_stay_redacted(
