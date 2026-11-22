@@ -1834,7 +1834,10 @@ class RegistryScanner(Scanner):
         result: ScanResult,
     ) -> RegistryEntryComponent:
         spec = specs[-1][1]
-        name = redact_text(package)
+        shown_name, sensitive_name = _identifier(package)
+        name = shown_name if sensitive_name else redact_text(package)
+        shown_key, sensitive_key = _identifier(key)
+        key_name = shown_key if sensitive_key else redact_text(key)
         sensitive_specs = {
             value for _, value in specs if holds_token_shape(value, require_sk_boundary=True)
         }
@@ -1854,7 +1857,7 @@ class RegistryScanner(Scanner):
         }
         if kind == "alias":
             # npm installs the package under the key, which the code imports.
-            properties["npm_alias"] = redact_text(key)
+            properties["npm_alias"] = key_name
         if len({value for _, value in specs}) > 1:
             properties["declarations"] = sorted(
                 f"{section}: {recorded_specs[value]}" for section, value in specs
@@ -1867,7 +1870,7 @@ class RegistryScanner(Scanner):
         if lock is not None and record is not None:
             lock_name, _, lock_digest = lock
             # The key as the inventory records the name or alias it installs: redacted.
-            locator = f"{lock_name}#/packages/" + _pointer_token("node_modules/" + redact_text(key))
+            locator = f"{lock_name}#/packages/" + _pointer_token("node_modules/" + key_name)
             if registry and not self._lock_root_agrees(lock[1], key, specs):
                 # npm ci refuses a lockfile resolved for other specs, and npm install
                 # resolves again: the record is not what installs.
@@ -1901,6 +1904,8 @@ class RegistryScanner(Scanner):
                 # A record that was not taken binds nothing; the failure or gap says why.
                 del properties["lockfile_sha256"], properties["lockfile_record"]
         risks = list(resolution.risks) if resolution else []
+        if sensitive_name or sensitive_key:
+            risks.append(_identifier_risk(f"npm package '{name}'", "name or alias"))
         if sensitive_specs or sensitive_version:
             risks.append(_identifier_risk(f"npm package '{name}'", "version"))
         if kind == "alias":
@@ -1908,7 +1913,7 @@ class RegistryScanner(Scanner):
                 _risk(
                     RiskSeverity.LOW,
                     "package_alias",
-                    f"npm dependency '{redact_text(key)}' installs '{name}' under another name.",
+                    f"npm dependency '{key_name}' installs '{name}' under another name.",
                     "Check that the aliased package is the one the code expects to import.",
                 )
             )
@@ -1943,14 +1948,16 @@ class RegistryScanner(Scanner):
         # A name the redaction changed is exported as the marker; no package URL may
         # spell it out.
         if (
-            name == package
+            not sensitive_name
+            and name == package
             and not sensitive_version
             and resolution is not None
             and resolution.consistent
         ):
             package_url = self._npm_purl(package, resolution.version, resolution.origin)
         elif (
-            name == package
+            not sensitive_name
+            and name == package
             and not sensitive_version
             and registry
             and record is None
@@ -1962,7 +1969,7 @@ class RegistryScanner(Scanner):
             # not read and an override each leave the version the spec names in doubt.
             package_url = self._npm_purl(package, version_range, None)
         return RegistryEntryComponent(
-            bom_ref=f"registry:npm/{reference_text(redact_text(key))}",
+            bom_ref=f"registry:npm/{reference_text(key_name)}",
             name=name,
             version=REDACTED if sensitive_version else version or None,
             package_url=package_url,

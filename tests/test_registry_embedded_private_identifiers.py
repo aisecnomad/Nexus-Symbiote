@@ -34,7 +34,9 @@ def test_private_shapes_are_withheld_at_each_identifier_boundary(shape, prefix):
     assert removed and value not in shown
 
 
-@pytest.mark.parametrize("kind", ["image", "name", "extra", "marker", "version"])
+@pytest.mark.parametrize(
+    "kind", ["image", "name", "extra", "marker", "version", "npm_name", "npm_alias"]
+)
 @pytest.mark.parametrize("shape", ["hex", "svcacct", "admin", "lower"])
 def test_public_registry_scan_withholds_embedded_values(tmp_path, kind, shape):
     project = tmp_path / "project"
@@ -51,6 +53,14 @@ def test_public_registry_scan_withholds_embedded_values(tmp_path, kind, shape):
         (project / "package.json").write_text(json.dumps({"dependencies": {"openai": version}}))
         (project / "yarn.lock").write_text(
             f'# yarn lockfile v1\n\n"openai@{version}":\n  version "{version}"\n'
+        )
+    elif kind == "npm_name":
+        (project / "package.json").write_text(
+            json.dumps({"dependencies": {f"langchain-{label}": "1.0.0"}})
+        )
+    elif kind == "npm_alias":
+        (project / "package.json").write_text(
+            json.dumps({"dependencies": {label: "npm:openai@1.0.0"}})
         )
     else:
         requirement = {
