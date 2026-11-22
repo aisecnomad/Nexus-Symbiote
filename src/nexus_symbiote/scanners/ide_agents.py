@@ -2583,6 +2583,7 @@ def _computed_powershell(segment: str) -> int | None:
 _BASE64_PAYLOAD = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
 
 
+_TEXT_PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,}[ \t\r\n]")
 _BASE64_SPACING = str.maketrans("", "", " \t\r\n")
 
 
@@ -2595,12 +2596,24 @@ def _encoded_payload(word: str) -> bool:
         text = base64.b64decode(encoded, validate=True).decode("utf-16-le", errors="replace")
     except binascii.Error:
         return False
-    # The host replaces invalid code units. A control or replacement in a string
-    # or comment does not erase the text evidence elsewhere in the same operand.
-    # An ASCII graphic or a leading BOM distinguishes it from ordinary base64-shaped words.
+    # A UTF-16 byte-order mark or a quoted string can be mostly non-ASCII.
+    # For an unmarked operand, a single printable unit in unrelated binary
+    # data is weak evidence. Count ordinary text and shell whitespace together.
     if text.startswith("\ufeff"):
         return len(text) > 1
-    return any("!" <= char <= "~" for char in text)
+    if not text:
+        return False
+    if len(text) == 1:
+        return "!" <= text <= "~"
+    if text[0] in {"'", '"'}:
+        end_quote = text.find(text[0], 1)
+        if end_quote >= 1 and text[1:end_quote].isprintable():
+            return True
+    if _TEXT_PREFIX.match(text.lstrip()):
+        return True
+    graphic = sum("!" <= char <= "~" for char in text)
+    ordinary = graphic + sum(char in " \t\r\n" for char in text)
+    return graphic > 0 and ordinary >= 2 and ordinary * 2 >= len(text)
 
 
 def _parameter_name(token: str) -> str | None:
