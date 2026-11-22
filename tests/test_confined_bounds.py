@@ -600,7 +600,7 @@ def test_an_exclusion_outside_the_root_fails_the_scan_gate(tmp_path, monkeypatch
     (tmp_path / ".mcp.json").write_text('{"mcpServers": {"a": {"command": "x"}}}')
 
     class Escaping(MCPScanner):
-        def configure(self, exclude_paths=()):
+        def configure(self, exclude_paths=(), *, accept_default_excludes=False):
             super().configure([*exclude_paths, "../outside"])
 
     monkeypatch.setattr("nexus_symbiote.cli._get_scanners", lambda: {"mcp": Escaping})

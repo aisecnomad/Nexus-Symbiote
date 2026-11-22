@@ -16,6 +16,7 @@ from nexus_symbiote import modes
 from nexus_symbiote.core.aibom import AIBOM, NativeFormatError
 from nexus_symbiote.live_cli import review_notice
 from nexus_symbiote.runtime_cli import _refuse_source_overwrite as _refuse_source_overwrite
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDE_ACCEPTANCE
 from nexus_symbiote.utils.files import create_staging_file
 from nexus_symbiote.utils.terminal import (
     echo_line,
@@ -550,6 +551,21 @@ def register_supply_chain_commands(main: click.Group) -> None:
         ),
     )
     @click.option(
+        "--accept-default-exclude",
+        type=click.Choice(sorted(DEFAULT_EXCLUDE_ACCEPTANCE)),
+        multiple=True,
+        help="Accept one default exclusion while retaining the path in the inventory. Repeat as needed.",
+    )
+    @click.option(
+        "--accept-default-excludes",
+        is_flag=True,
+        help=(
+            "Do not record a coverage gap for a non-empty default-excluded name, as scan does. "
+            "The staged inventory is still re-gated by the built-in policy, which fails on "
+            "that gap unless this flag is passed."
+        ),
+    )
+    @click.option(
         "--signature-policy",
         type=click.Path(exists=True, dir_okay=False, path_type=Path),
         help="Explicit operator signer policy JSON, kept outside the project, as for scan.",
@@ -571,6 +587,8 @@ def register_supply_chain_commands(main: click.Group) -> None:
         baseline_path: Path,
         no_project_policy: bool = False,
         accept_project_policy: bool = False,
+        accept_default_excludes: bool = False,
+        accept_default_exclude: tuple[str, ...] = (),
         signature_policy: Path | None = None,
         fail_on_unsigned_discovery: bool = False,
         allow_unsigned_discovery: bool = False,
@@ -624,6 +642,8 @@ def register_supply_chain_commands(main: click.Group) -> None:
                 signature_policy=signature_policy,
                 no_project_policy=no_project_policy,
                 accept_project_policy=accept_project_policy,
+                accept_default_excludes=accept_default_excludes,
+                accept_default_exclude=accept_default_exclude,
             )
             # A project policy may select report-only mode; it cannot authorize
             # promotion of incomplete evidence into an approved baseline.

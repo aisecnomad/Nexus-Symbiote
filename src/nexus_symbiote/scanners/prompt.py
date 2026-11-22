@@ -22,6 +22,7 @@ from nexus_symbiote.core.models import (
     RiskAssessment,
     SkillPackageComponent,
 )
+from nexus_symbiote.scanner_catalog import INSTRUCTION_DIRECTORIES, SKILL_DIRECTORIES
 from nexus_symbiote.scanners.base import Scanner, ScanResult
 from nexus_symbiote.scanners.credential_files import MARKDOWN_SUFFIXES as _MARKUP_SUFFIXES
 from nexus_symbiote.scanners.credential_files import credential_gap as _credential_gap
@@ -684,20 +685,6 @@ _FOLDED_NESTED_NAMES = {fold_name(name): name for name in NESTED_INSTRUCTION_NAM
 # Subagent definitions and rule or prompt directories. Every file in them is inventoried
 # by digest, and each directory is walked on its own, so a directory symlink out of one
 # is followed. `.clinerules` is either a single rules file or a directory of them.
-INSTRUCTION_DIRECTORIES: dict[str, str] = {
-    ".clinerules": "rules-file",
-    ".claude/rules": "rules-file",
-    ".cursor/rules": "rules-file",
-    ".windsurf/rules": "rules-file",
-    ".roo/rules": "rules-file",
-    ".kiro/steering": "rules-file",
-    ".github/instructions": "instruction",
-    ".github/prompts": "instruction",
-    ".claude/output-styles": "instruction",
-    ".claude/agents": "subagent",
-    ".github/agents": "subagent",
-}
-
 _INSTRUCTION_DIRECTORY_PARTS = tuple(
     PurePosixPath(directory).parts for directory in INSTRUCTION_DIRECTORIES
 )
@@ -720,21 +707,6 @@ PROMPT_TEMPLATE_TYPE = "template"
 # the same names.
 PROMPT_SEARCH_SKIPPED = frozenset({*SOURCE_SEARCH_SKIPPED, "node_modules", "vendor"})
 
-SKILL_DIRECTORIES = [
-    ".claude/skills",
-    ".claude/commands",
-    "skills",
-    ".agents/skills",
-    ".github/skills",
-    ".cursor/skills",
-    ".gemini/skills",
-    ".cursor/commands",
-    ".gemini/commands",
-    # The scripts hooks conventionally run: settings bind only the program word that
-    # names one, so the script itself is bound here.
-    ".claude/hooks",
-    ".cursor/hooks",
-]
 # No agent reads these as instructions: every file is a resource, checked only for
 # hidden characters.
 _RESOURCE_DIRECTORIES = frozenset({".claude/hooks", ".cursor/hooks"})
@@ -1201,19 +1173,18 @@ class _ImportListing:
         return hash_bytes(b"".join(sorted(leaves[target] for target in targets)))
 
 
-def _report_skipped(skipped: list[Path], reported: set[Path], result: ScanResult) -> None:
+def _report_skipped(skipped: list[Path], reported: set[Path], files: ConfinedCollection) -> None:
     """A coverage gap for each entry that a walk of an agent configuration directory
     skipped because its name, such as ``venv`` or ``node_modules``, is excluded by
     default. A host reads such a skill or subagent file like any other, so it is not
-    a dependency tree to leave out silently. Each path is reported once.
+    a dependency tree to leave out silently. Each path is reported once. A generic
+    collection gap for the same path, including one recorded through a directory
+    symlink's target, is replaced by this one.
     """
     for path in skipped:
         if path not in reported:
             reported.add(path)
-            result.surfaces_excluded.append(
-                f"{path.as_posix()}: default-excluded name inside an agent configuration "
-                "directory; not collected"
-            )
+            files.report_agent_default_exclude(path)
 
 
 class PromptScanner(Scanner):
@@ -1317,7 +1288,7 @@ class PromptScanner(Scanner):
                     if component is not None:
                         recorded[relative] = component
                         texts[relative] = content.decode("utf-8")
-                _report_skipped(skipped, reported, result)
+                _report_skipped(skipped, reported, files)
 
             skill_listing = self._list_skills(files)
             walked.update(path.as_posix() for _, paths, _ in skill_listing for path in paths)
@@ -1730,7 +1701,7 @@ class PromptScanner(Scanner):
                         risks=risks,
                     )
                 )
-            _report_skipped(skipped, reported, result)
+            _report_skipped(skipped, reported, files)
         if not seen and not result.scan_failures and not result.surfaces_excluded:
             result.surfaces_scanned.append("skills (no skill or command files found)")
 

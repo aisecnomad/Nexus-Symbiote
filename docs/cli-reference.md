@@ -304,10 +304,13 @@ directory above the policy are owned by root or by you.
 ## Pre-commit hooks
 
 The repository ships two [pre-commit](https://pre-commit.com) hooks. Both run
-`nexus-symbiote scan . --no-project-policy --check`: they collect the working tree and
+`nexus-symbiote scan . --no-project-policy --accept-default-exclude root:.git --check`. They collect the working tree and
 apply the scan gate with the built-in policy, write nothing into the tree, and ignore
 the checkout's `.nexus-symbiote.yaml`, so a change cannot relax the gate it is checked
-under. `nexus-symbiote-risk` is kept as the same gate so that existing configurations
+under. Both accept Git metadata. Other occupied default exclusions still fail the gate.
+
+Coverage records preserve accepted path identities with reversible percent encoding where needed. If a path list reaches its display limit, the coverage record binds the remaining paths by digest.
+`nexus-symbiote-risk` is kept as the same gate so that existing configurations
 keep working; configure one of the two.
 
 ```yaml
@@ -431,6 +434,8 @@ nexus-symbiote baseline [OPTIONS] [PROJECT_PATH]
 | Option | Description |
 |---|---|
 | `-o`, `--baseline-path` `PATH` | Where to write the unsigned baseline (default: .nexus-symbiote-baseline.json, in the working directory, not the project). |
+| `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. `root:.git` accepts the checkout marker. Explicit `.git` also accepts regular nested Git metadata files without following their pointers. |
+| `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`), as `scan` does. The staged inventory is still re-gated, so this flag is what keeps that gap out of the baseline. An empty directory does not. |
 | `--no-project-policy` | Use built-in policy without reading configuration from the target, as scan does. |
 | `--accept-project-policy` | In CI, accept a project policy that weakens the built-in gates explicitly; without it such a policy fails the command there (exit 1). Interactive runs only warn. |
 | `--signature-policy` `FILE` | Explicit operator signer policy JSON, kept outside the project, as for scan; also verifies any merged ShadowScan discovery report. |
@@ -749,6 +754,8 @@ nexus-symbiote risk [OPTIONS] AIBOM_PATH
 | `--project` `DIRECTORY` | Reconcile the supplied BOM against this project's static evidence before scoring; a failed reconciliation reports an unknown risk level and a null score. The only source of a project policy: without it the built-in policy applies |
 | `--signature-policy` `FILE` | Explicit operator signer policy for model recollection; requires --project |
 | `--fail-on-severity` `critical\|high\|medium\|low\|info\|none` | Fail on any finding at or above this severity (default: from policy, built-in critical); none disables it. |
+| `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. `root:.git` accepts the checkout marker. Explicit `.git` also accepts regular nested Git metadata files without following their pointers. |
+| `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`). Without this flag such an entry makes coverage partial. An empty directory does not. |
 | `--no-project-policy` | Use built-in policy without reading configuration from the target. |
 | `--accept-project-policy` | In CI, accept a project policy that weakens the built-in gates explicitly; without it such a policy fails the command there (exit 1). Interactive runs only warn. |
 | `--require-discovery-signature` | Require the operator signature policy to verify any ShadowScan report the inventory records or the project contains, whatever the project policy says; requires --project. JSON output reports the result as `discovery_producer` |
@@ -918,6 +925,8 @@ nexus-symbiote scan [OPTIONS] [PROJECT_PATH]
 | `--report-only` | Emit findings and collection failures without a CI failure. With `--check`, unverified discovery evidence and a failed producer check still exit 1. |
 | `--check` | Collect and apply the scan gate without writing an inventory. Cannot be combined with `-o`. |
 | `--signature-policy` `PATH` | Explicit operator signer policy JSON |
+| `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. `root:.git` accepts the checkout marker. Explicit `.git` also accepts regular nested Git metadata files without following their pointers. |
+| `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`). Without this flag such an entry makes coverage partial. An empty directory does not. |
 | `--no-project-policy` | Use built-in policy without reading configuration from the target. |
 | `--accept-project-policy` | In CI, accept a project policy that weakens the built-in gates explicitly; without it such a policy fails the command there (exit 1). Interactive runs only warn. |
 | `--fail-on-unsigned-discovery` | With `--check`, exit with status 1 when ShadowScan discovery evidence is unverified. |
@@ -1017,6 +1026,8 @@ nexus-symbiote validate [OPTIONS] AIBOM_PATH
 |---|---|
 | `--project` `DIRECTORY` | Project root for cross-validation. The only source of a project policy: without it the built-in policy applies |
 | `--signature-policy` `PATH` | Explicit operator signer policy JSON; requires --project |
+| `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. `root:.git` accepts the checkout marker. Explicit `.git` also accepts regular nested Git metadata files without following their pointers. |
+| `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`). Without this flag such an entry makes coverage partial. An empty directory does not. |
 | `--no-project-policy` | Use built-in policy without reading configuration from the target. |
 | `--accept-project-policy` | In CI, accept a project policy that weakens the built-in gates explicitly; without it such a policy fails the command there (exit 1). Interactive runs only warn. |
 | `--skip-integrity` | Check completeness only and report integrity as skipped, for a repository whose models cannot be signed yet. The skip is printed and recorded in `--json-output`. |
@@ -1152,7 +1163,7 @@ nexus-symbiote verify-live [OPTIONS] AIBOM_PATH
 | `--transport-evidence-attestation` `FILE` | DSSE inventory attestation envelope matching each `--transport-evidence` file in order (repeatable). |
 | `--trusted-key` `FILE` | Trusted Ed25519 public key PEM for `--transport-evidence-attestation`; must lie outside `--project` and every repository enclosing `--project`, the inventory or the evidence (repeatable). |
 | `--transport-evidence-purpose` `generated\|reviewed` | Expected attestation purpose for `--transport-evidence-attestation` (default: `generated`). |
-| `--require-transport-evidence` | Fail closed when any remote MCP server in the inventory lacks verified `--transport-evidence` instead of skipping it as not verifiable here. Evidence verifies only a server whose inventory endpoint is the observed `https` origin. An endpoint that names a path must be the URL observed, compared as `discover-mcp` records it, and one with a query matches no evidence; otherwise, until `--record` stores its full-URL digest, the binding is origin-only (`transport_evidence.endpoint_binding` in the report). |
+| `--require-transport-evidence` | Fail closed when any remote MCP server in the inventory lacks verified `--transport-evidence` instead of skipping it as not verifiable here. Evidence verifies only a server whose inventory endpoint is the observed `https` origin. An endpoint that names a path must be the URL observed, compared as `discover-mcp` records it, and one with a query, dot segments or a path character or escape that clients rewrite matches no evidence; otherwise, until `--record` stores its full-URL digest, the binding is origin-only (`transport_evidence.endpoint_binding` in the report). |
 | `--max-evidence-age` `HOURS` | Refuse `--transport-evidence` observed more than this many hours ago. Evidence dated in the future is always refused. |
 | `--require-full-url-binding` | Refuse `--transport-evidence` for a server whose inventory endpoint names no path and records no `observed_endpoint_hash`. It compares the evidence with the path the inventory endpoint names or the digest the inventory records, not with the URL in the project's configuration, so an inventory that names or records another URL satisfies it. Text output names each origin-only server; JSON counts them in `origin_bound_servers`. |
 | `--no-isolation` | Explicitly allow execution without a PID namespace; printed as a warning. On Linux the launcher runs in its own process group under a wrapper that stays its parent as a child subreaper and ignores the signals it can, and cleanup kills the wrapper's whole tree, including a `clone(CLONE_PARENT)` child that has called `setsid` and what a launcher that already exited left behind. A launcher that kills its wrapper with SIGKILL can escape, except from a cgroup v2 child where one can be created, which cleanup also kills; the server then fails with `isolation-teardown-failed`, unless the launcher runs as root or holds `CAP_SYS_PTRACE` or `CAP_SYS_ADMIN`, which can hide the escape. Never opt out as root; doing so prints a second warning. Refused off Linux: it prints that it is refused, and every server fails with `isolation-unavailable` before its launcher executes. This is not a namespace or sandbox. |
