@@ -34,17 +34,52 @@ def _write(root: Path, rel: str, content: str) -> Path:
 
 
 def test_r_high_13_container_volume_substitutions() -> None:
-    # Non-leading unresolved ${...:...} substitutions fail closed.
-    for vol in ("/${X:=/}:/host", "/var/run/${X:=/}docker.sock:/s"):
+    # Non-leading, non-colon, and nested unresolved substitutions fail closed.
+    for vol in (
+        "/${X:=/}:/host",
+        "/var/run/${X:=/}docker.sock:/s",
+        "/${X=/}:/host",
+        "/${X+/}:/host",
+        "/${X?/}:/host",
+        "/${X:-${Y:-/}}:/host",
+    ):
         res = analyze("docker", ["run", "-v", vol, "alpine@sha256:" + "a" * 64])
         assert res.unknown is not None
         assert "unresolved" in res.unknown
 
-    mount_res = analyze(
-        "docker",
-        ["run", "--mount", "type=bind,source=/${X:=/},target=/host", "alpine@sha256:" + "a" * 64],
-    )
-    assert mount_res.unknown is not None
+    for mount_spec in (
+        "type=bind,source=/${X:=/},target=/host",
+        "type=bind,source=/${X=/},target=/host",
+        "type=bind,source=/${X:-${Y:-/}},target=/host",
+    ):
+        mount_res = analyze(
+            "docker",
+            ["run", "--mount", mount_spec, "alpine@sha256:" + "a" * 64],
+        )
+        assert mount_res.unknown is not None
+
+    # Container mounted script detection includes versioned lua/ruby/php/perl runners.
+    for runner, script in (
+        ("lua5.4", "server.lua"),
+        ("luajit2.1", "server.lua"),
+        ("ruby3.2", "server.rb"),
+        ("php8.2", "server.php"),
+        ("perl5.38", "server.pl"),
+    ):
+        c_res = analyze(
+            "docker",
+            [
+                "run",
+                "-v",
+                "./app:/work",
+                "-w",
+                "/work",
+                "alpine@sha256:" + "a" * 64,
+                runner,
+                script,
+            ],
+        )
+        assert c_res.context.get("code_loading_option"), (runner, script)
 
     # Plain ${EMPTY} and ${X-/} expand to host root / socket mount flags.
     root_empty = analyze("docker", ["run", "-v", "/${EMPTY}/:/host", "alpine@sha256:" + "a" * 64])

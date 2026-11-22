@@ -3166,7 +3166,16 @@ _VOLUME_VARIABLE = re.compile(
     r"\$\{(?:(?P<client>env|input|config|command|workspaceFolder|extensionInstallFolder):[^{}:]+"
     r"|[A-Za-z_][A-Za-z0-9_]*(?::?-(?P<default>[^{}]*))?)\}"
 )
-_UNRESOLVED_VOLUME_VAR = re.compile(r"\$\{[^{}]*:[^{}]*\}")
+_ANY_VOLUME_VAR = re.compile(r"\$\{[^{}]*\}")
+
+
+def _has_unresolved_volume_var(text: str) -> bool:
+    if "${" not in text:
+        return False
+    matches = list(_ANY_VOLUME_VAR.finditer(text))
+    if len(matches) != text.count("${"):
+        return True
+    return any(_VOLUME_VARIABLE.fullmatch(match.group()) is None for match in matches)
 
 
 def _volume_source_end(spec: str) -> int:
@@ -3341,17 +3350,10 @@ def _container_context(options: list[tuple[str, str | None]], launch: Launch) ->
             # The engine runs a string health check with /bin/sh -c inside the container.
             launch.mark("container_command")
         elif option in {"-v", "--volume", "--mount"} and value:
-            if option != "--mount" and any(
-                _VOLUME_VARIABLE.fullmatch(match.group()) is None
-                for match in _UNRESOLVED_VOLUME_VAR.finditer(value)
-            ):
+            if option != "--mount" and _has_unresolved_volume_var(value):
                 launch.fail("container volume source substitution is unresolved")
             sources = _host_sources(value, mount=option == "--mount")
-            if option == "--mount" and any(
-                _VOLUME_VARIABLE.fullmatch(match.group()) is None
-                for src in sources
-                for match in _UNRESOLVED_VOLUME_VAR.finditer(src)
-            ):
+            if option == "--mount" and any(_has_unresolved_volume_var(src) for src in sources):
                 launch.fail("container volume source substitution is unresolved")
             if sources:
                 launch.mark("host_mounts")
@@ -3374,7 +3376,8 @@ def _container_context(options: list[tuple[str, str | None]], launch: Launch) ->
 
 
 _CONTAINER_SCRIPT_RUNNERS = re.compile(
-    r"node(?:js)?|(?:python|pypy)w?[0-9.]*t?w?(?:d|-dbg)?|pyw?|deno|bun|ruby|perl|php"
+    r"node(?:js)?|(?:python|pypy)w?[0-9.]*t?w?(?:d|-dbg)?|pyw?|deno|bun"
+    r"|(?:lua(?:jit)?|ruby|perl|php)[0-9.]*"
     r"|(?:ba|da|z|k|mk)?sh|ash|env|java|npm|pnpm|yarn|uv|tsx|ts-node|make|tini|dumb-init|timeout|nice"
 )
 # Programs that run the command in their arguments; the words after them are still read.
@@ -3390,7 +3393,7 @@ _CONTAINER_PACKAGE_RUNNERS = _set("npm pnpm yarn bun uv")
 _CONTAINER_PACKAGE_SCRIPTS = _set("run run-script start test")
 # A file the image runs as its command; a mounted data or configuration file is not code.
 _CONTAINER_SCRIPT_SUFFIX = re.compile(
-    r".+\.(?:sh|bash|zsh|js|mjs|cjs|ts|mts|cts|py|rb|pl|php|jar)", re.IGNORECASE
+    r".+\.(?:sh|bash|zsh|js|mjs|cjs|ts|mts|cts|py|rb|pl|php|lua|jar)", re.IGNORECASE
 )
 # Interpreter options whose separate value is a setting, never a file.
 _CONTAINER_SETTING_OPTIONS = frozenset({"-X", "-W"})
