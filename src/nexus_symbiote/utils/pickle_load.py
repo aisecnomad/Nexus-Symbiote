@@ -95,6 +95,16 @@ VERSION_DIFFERENCES: dict[str, str] = {
         " read as latin-1, which decodes any byte, and READONLY_BUFFER takes it as"
         " the bytes that 'bytes' leaves."
     ),
+    "int-digits": (
+        "Not a version but a loader setting: int() and PyLong_FromString refuse a"
+        " decimal literal longer than the process's int_max_str_digits (4,300 by"
+        " default, 640 at least, 0 for none: PYTHONINTMAXSTRDIGITS, -X"
+        " int_max_str_digits, sys.set_int_max_str_digits). INT, LONG, GET and PUT"
+        " text is read as a loader with no limit reads it, whatever limit the scan"
+        " runs under. Past 640 significant digits, an INT or LONG value stands for a"
+        " number past every bound, which is all a walk reads of it, and a GET or PUT"
+        " index keys the memo by its sign and significant digits."
+    ),
 }
 # Differences that change no step here: find_class resolves a dotted name through
 # _getattribute / get_dotted_path in 3.14, without the '<locals>' check of 3.11-3.13,
@@ -311,6 +321,7 @@ _STRTOL = {
     10: re.compile(rb"[ \t\n\v\f\r]*[+-]?[0-9]+"),
 }
 _LONG_MIN, _LONG_MAX = -(2**63), 2**63 - 1
+_LONG_DIGITS = 22  # octal digits of 2**64; no C long needs more in base 8 or 10
 
 
 def _c_int(data: bytes, base: int) -> int | None:
@@ -325,18 +336,92 @@ def _c_int(data: bytes, base: int) -> int | None:
         if base == 0 and digits[1:2] in (b"x", b"X"):
             value = int(digits[2:], 16)
         else:
-            value = int(digits, 8 if base == 0 and digits[:1] == b"0" else 10)
+            # strtol takes any run of leading zeros, but int() refuses a decimal literal
+            # longer than sys.get_int_max_str_digits(): 4,301 zeros load in the C
+            # unpickler and must not end the walk. More significant digits than any C
+            # long holds overflow strtol, so PyLong_FromString (_py_int) decides.
+            significant = digits.lstrip(b"0") or b"0"
+            if len(significant) > _LONG_DIGITS:
+                value = _LONG_MAX + 1
+            else:
+                value = int(significant, 8 if base == 0 and digits[:1] == b"0" else 10)
         value = -value if signed[:1] == b"-" else value
     if text[end : end + 1] in (b"", b"\n") and _LONG_MIN <= value <= _LONG_MAX:
         return value
     return _py_int(text, base)
 
 
+_DIGIT_FLOOR = 640  # the lowest int_max_str_digits CPython accepts
+_BEYOND = 10**_DIGIT_FLOOR  # above every memo index, byte, length and C long
+
+
+def _decimal_literal(data: bytes, base: int) -> tuple[bool, bytes] | None:
+    """A decimal literal as int() reads one, as its sign and significant digits.
+
+    ASCII whitespace around, a sign, digits with single underscores between them, and in
+    base 0 no leading zero unless all are. Base 0's 0x, 0o and 0b literals have
+    power-of-two bases, which no digit limit applies to, so int() decides those.
+    """
+    if base not in (0, 10):
+        return None
+    text = data.strip(b" \t\n\v\f\r")
+    sign = text[:1] if text[:1] in (b"+", b"-") else b""
+    body = text[len(sign) :]
+    digits = body.replace(b"_", b"")
+    if (
+        not digits.isdigit()
+        or body[:1] == b"_"
+        or body[-1:] == b"_"
+        or b"__" in body
+        or (base == 0 and digits[:1] == b"0" and digits.strip(b"0"))
+    ):
+        return None  # not a literal: refused under any limit
+    significant = digits.lstrip(b"0") or b"0"
+    return sign == b"-" and significant != b"0", significant
+
+
 def _py_int(data: bytes, base: int) -> int | None:
+    """``int(data, base)`` as a loader with no ``int_max_str_digits`` limit reads it."""
     try:
         return int(data, base)
     except ValueError:
+        pass
+    literal = _decimal_literal(data, base)
+    if literal is None:
         return None
+    negative, significant = literal
+    # An INT or LONG value is read only for its sign, whether it is zero and whether it
+    # fits a bound (a byte, an index, a C long), so a literal past the floor stands for
+    # one past every bound: no conversion, which C-flavour walks would repeat at each
+    # frame end. A memo index is keyed by _memo_key instead.
+    value = _BEYOND if len(significant) > _DIGIT_FLOOR else int(significant)
+    return -value if negative else value
+
+
+MemoKey = int | tuple[bool, bytes]
+
+
+def _memo_key(data: bytes) -> MemoKey | None:
+    """GET and PUT text as both unpicklers key the memo, with no digit limit.
+
+    Both read it in base 10 (pickle.py int(), _pickle.c PyLong_FromString). Up to the
+    floor the key is the exact integer; past it, the sign and the significant digits,
+    which name the same integer however it is written, so two different indexes never
+    share a key. No int() is tried first: a long index costs no conversion on any walk.
+    """
+    literal = _decimal_literal(data, 10)
+    if literal is None:
+        return None
+    negative, significant = literal
+    if len(significant) > _DIGIT_FLOOR:
+        return negative, significant
+    value = int(significant)
+    return -value if negative else value
+
+
+def _digit_limited(data: bytes) -> bool:
+    """Whether some loader's ``int_max_str_digits`` can refuse this INT, LONG or memo text."""
+    return len(data) - len(data.translate(None, b"0123456789")) > _DIGIT_FLOOR
 
 
 _C_FLOAT = re.compile(
@@ -373,7 +458,7 @@ class _Machine:
         self.budget = budget
         self.stack: list[object] = []
         self.marks: list[int] = []
-        self.memo: dict[int, object] = {}
+        self.memo: dict[MemoKey, object] = {}
         self.resolved = False
         self.named = False
         self.differs: set[str] = set()
@@ -622,6 +707,8 @@ class _Machine:
         old, new = parse(data, 0), parse(data, 10)
         if old != new:
             self.differs.add("int-base")
+        if _digit_limited(data):
+            self.differs.add("int-digits")
         value = old if old is not None else new
         if value is None:
             raise _LoadError  # invalid literal for int()
@@ -1018,16 +1105,19 @@ class _Machine:
         self.budget.marks -= 1
         self.marks.append(len(self.stack))
 
-    def _memo_index(self) -> int:
+    def _memo_index(self) -> MemoKey:
         data = self.line(_numeric_text)
         if self.c:
             data = data.split(b"\x00", 1)[0]  # PyLong_FromString reads a C string
-        value = _py_int(data, 10)
-        if value is None or (self.c and value > _LONG_MAX):
+        key = _memo_key(data)
+        # A key past the floor is past LONG_MAX (or below LONG_MIN): PyLong_AsSsize_t fails.
+        if key is None or (self.c and (isinstance(key, tuple) or key > _LONG_MAX)):
             raise _LoadError
-        return value
+        if _digit_limited(data):
+            self.differs.add("int-digits")
+        return key
 
-    def _get(self, index: int) -> None:
+    def _get(self, index: MemoKey) -> None:
         if index not in self.memo:
             raise _LoadError  # Memo value not found
         self.push(self.memo[index])
@@ -1041,8 +1131,8 @@ class _Machine:
     def op_long_binget(self) -> None:
         self._get(self.number(4, "<I"))
 
-    def _put(self, index: int) -> None:
-        if index < 0:
+    def _put(self, index: MemoKey) -> None:
+        if index[0] if isinstance(index, tuple) else index < 0:
             raise _LoadError  # negative PUT argument
         self.memo[index] = self.top()
 
