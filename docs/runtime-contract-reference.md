@@ -597,7 +597,7 @@ the gateway does not emit a second denial or an execution-outcome record.
 `allow_shared_keys`, `clock` and `state` above, without adapters, and returns a
 gateway whose only use is `register_snapshot`; `invoke` on it is refused with
 `configuration-invalid`. `approval_keys` is optional and only checked, so the
-gateways' scope map can be reused.
+gateways' scope map can be reused. The `--signer-scopes` file is an operator trust input. Keep it outside the repositories holding the snapshot, trust status or state and outside the current repository. Provision it as a singly linked regular file with the same owner and directory protections as the trusted verification keys.
 
 `bind_adapters(describe=..., execute=..., prepare=...)` returns a gateway with
 the same policy and state. The optional `prepare` callback receives the verified

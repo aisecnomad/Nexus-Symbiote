@@ -57,14 +57,17 @@ nexus-symbiote crosswalk AIBOM_PATH [--framework NAME ...] [--format json|markdo
 ```
 
 `crosswalk` reads a native inventory and takes its findings exactly as `risk` scores
-them under the built-in policy: no project policy is read, so no finding is suppressed
-or ignored, and the findings that `risk` adds from a model's recorded fields are
-included. For each selected framework edition (every edition, or each one that a
-`--framework` names), it lists every entry that a finding references, with those
-findings, and then the categories whose findings reference no entry of the selected
-editions. It runs offline and is a report, not a gate: exit status 0 means only that
-the report was written. An inventory that cannot be read, or a report that cannot be
-written, ends it with exit status 1.
+them under the built-in policy. Project risk settings cannot suppress or ignore a
+finding. Evidence packs requested with `--project` read that project's scan exclusions
+and discovery-signature requirement for corroboration. The report includes findings
+that `risk` derives from a model's recorded fields. For each selected framework edition,
+it lists the entries referenced by findings and the findings for each entry. It then
+lists the categories with no references to those editions. All editions are included
+by default. Pass `--framework` to select an edition.
+
+The command runs offline. Exit status 0 means the report was written. Reading the
+inventory, corroborating a requested evidence pack, or writing the report can fail
+with exit status 1.
 
 JSON, the default, is a document with `format` `nexus-symbiote/crosswalk/v1` and
 sorted keys:

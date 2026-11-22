@@ -1896,6 +1896,17 @@ is a failure; everything below is neither a gap nor a failure.
 
 ## Signatures
 
+- On POSIX, operator-supplied signature policies, verification keys and the
+  `runtime register --signer-scopes` map require protected ownership and modes
+  throughout their directory ancestry. A 002 umask can produce a 0664 file or
+  0775 directory. A read-only file on a 2775 Kubernetes `fsGroup` volume can
+  still be replaced by another group member. Remove group write from paths you
+  control or provision the inputs in a private directory. Use a 022 umask for
+  new files. In Action container jobs, provision the original signer policy and
+  trusted keys in a directory owned by the container account or root when the
+  host owns `runner.temp`. The Action skips checkout directories when choosing
+  a trusted location for its private snapshot.
+
 - **The CLI checks the cache before trusting it.** Offline verification uses the trusted root
   that sigstore-python caches in `$XDG_CACHE_HOME/sigstore-python` when
   `XDG_CACHE_HOME` is set, and otherwise in `~/.cache/sigstore-python` on Linux or
@@ -1939,9 +1950,11 @@ is a failure; everything below is neither a gap nor a failure.
 - **The trusted-key placement check is a heuristic.** It refuses a key inside a git
   working tree that holds the subject, the envelope or the current directory, also
   under another name for that tree directory, and a key file with other hard links.
-  It does not authenticate a key, check its owner or permissions, recognize a
-  checkout without a `.git` entry, or follow a key copied or mounted out of the
-  checkout, such as one reached through `docker run -v "$PWD/keys:/keys"`.
+  It does not authenticate a key, recognize a checkout without a `.git` entry
+  unless that checkout is the project an operator policy is checked against, or
+  follow a key copied or mounted out of the checkout, such as one reached through
+  `docker run -v "$PWD/keys:/keys"`. The owner and mode checks on the key and the
+  directories above it say only that no other user can replace it.
 - **Verification and use are separate reads.** Run `verify-attestation` and `diff`
   where the change under review cannot write between the two.
 - **The verifying build must read the inventory's format.** An attestation of a
@@ -2282,8 +2295,10 @@ is a failure; everything below is neither a gap nor a failure.
 - **The runtime key placement check is a heuristic.** `runtime verify` and
   `runtime register` refuse a public key inside a git working tree that holds an input
   file or the current directory, and a key file with other hard links, as
-  `verify-attestation` does. The check does not authenticate a key or check its owner,
-  and a key copied or mounted out of the checkout is accepted; a registrar given such a
+  `verify-attestation` does, and a key file that another user could replace, by the
+  [trusted keys](inventory-attestation.md#trusted-keys) ownership rule. The check does
+  not authenticate a key, and a key copied or mounted out of the checkout is accepted;
+  a registrar given such a
   key can still record an attacker's serial, which only deleting rows undoes. Python
   callers of `ReferenceGateway` pass key objects and get no placement check. The
   hard-link rule does not look at where the other names are, so a key in a store that

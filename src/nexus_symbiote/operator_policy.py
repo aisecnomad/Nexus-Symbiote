@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from xml.sax.saxutils import escape as xml_escape
 
-from nexus_symbiote.core.hashing import open_directory_nofollow, open_regular_file
+from nexus_symbiote.core.hashing import gate_input_files, open_directory_nofollow, open_regular_file
 from nexus_symbiote.policy import (
     MAX_POLICY_YAML_NODES,
     Policy,
@@ -53,9 +53,12 @@ class LoadedOperatorPolicy:
     signers: tuple[str, ...] = ()
 
 
-def _read_confined_operator_policy(policy_path: Path, root: Path | None) -> tuple[bytes, str]:
+def _read_confined_operator_policy(
+    policy_path: Path, root: Path | None, *, attestation: bool = False
+) -> tuple[bytes, str]:
+    label = "Operator policy attestation" if attestation else "Operator policy"
     inside_msg = (
-        "Operator policy must be provisioned outside the scanned project and outside "
+        f"{label} must be provisioned outside the scanned project and outside "
         "every repository that holds it"
     )
     untrusted: list[Path] = []
@@ -67,40 +70,49 @@ def _read_confined_operator_policy(policy_path: Path, root: Path | None) -> tupl
     if any(resolved_policy.is_relative_to(directory) for directory in untrusted):
         raise OperatorPolicyError(inside_msg)
 
-    from nexus_symbiote.utils.crypto import _trusted_ancestor_uids
+    from nexus_symbiote.utils.crypto import _trust_anchor_error, _trusted_ancestor_uids
 
     uid = getattr(os, "geteuid", lambda: None)()
     trusted_uids = _trusted_ancestor_uids(uid) if uid is not None else set()
     try:
-        parent_fd = open_directory_nofollow(policy_path.parent)
-        try:
-            parent_info = os.fstat(parent_fd)
-        finally:
-            os.close(parent_fd)
         with open_regular_file(policy_path) as stream:
             info = os.fstat(stream.fileno())
             if info.st_size > MAX_OPERATOR_POLICY_BYTES:
-                raise OperatorPolicyError("Operator policy exceeds the 1 MiB byte limit")
+                raise OperatorPolicyError(f"{label} exceeds the 1 MiB byte limit")
             if info.st_nlink != 1:
-                raise OperatorPolicyError("Operator policy must not have other hard links")
+                raise OperatorPolicyError(f"{label} must not have other hard links")
             if uid is not None and info.st_uid not in trusted_uids:
-                raise OperatorPolicyError("Operator policy must be owned by the current user")
-            parent_world_writable = bool(parent_info.st_mode & 0o002) and not (
-                bool(parent_info.st_mode & stat.S_ISVTX)
-                and (uid is None or parent_info.st_uid in trusted_uids)
-            )
-            if (info.st_mode & 0o002) or parent_world_writable:
-                raise OperatorPolicyError(
-                    "Operator policy and its directory must not be world-writable"
+                raise OperatorPolicyError(f"{label} must be owned by the current user")
+            if info.st_mode & stat.S_IWOTH:
+                raise OperatorPolicyError(f"{label} and its directory must not be world-writable")
+            if attestation:
+                # The envelope is signed evidence. The key and the exact policy bytes
+                # are checked independently, so keep the envelope's placement rules.
+                parent_fd = open_directory_nofollow(policy_path.parent)
+                try:
+                    parent = os.fstat(parent_fd)
+                finally:
+                    os.close(parent_fd)
+                sticky = bool(parent.st_mode & stat.S_ISVTX) and (
+                    uid is None or parent.st_uid in trusted_uids
                 )
+                if parent.st_mode & stat.S_IWOTH and not sticky:
+                    raise OperatorPolicyError(f"{label} directory must not be world-writable")
+            elif (reason := _trust_anchor_error(policy_path, info)) is not None:
+                raise OperatorPolicyError(f"{label} {reason}")
             raw = stream.read(MAX_OPERATOR_POLICY_BYTES + 1)
             if len(raw) > MAX_OPERATOR_POLICY_BYTES:
-                raise OperatorPolicyError("Operator policy exceeds the 1 MiB byte limit")
+                raise OperatorPolicyError(f"{label} exceeds the 1 MiB byte limit")
             ancestors = {_identity(parent) for parent in Path(os.path.abspath(policy_path)).parents}
     except OperatorPolicyError:
         raise
     except OSError as exc:
-        raise OperatorPolicyError("Selected operator policy cannot be safely read") from exc
+        message = (
+            "Operator policy attestation cannot be safely read"
+            if attestation
+            else "Selected operator policy cannot be safely read"
+        )
+        raise OperatorPolicyError(message) from exc
 
     if untrusted:
         try:
@@ -143,19 +155,18 @@ def _verify_policy_attestation(
         )
     if max_age_days is not None and max_age_days < 0:
         raise OperatorPolicyError("--operator-policy-max-age-days must be >= 0")
-    raw_envelope, _ = _read_confined_operator_policy(envelope_path, root)
+    raw_envelope, _ = _read_confined_operator_policy(envelope_path, root, attestation=True)
     try:
-        if root is not None:
-            for key_path in trusted_keys:
-                _verify_outside_checkout(key_path, (root,), label="--operator-policy-key")
         _check_key_placement(
             trusted_keys,
-            (policy_path, envelope_path),
+            (policy_path, envelope_path, *(() if root is None else (root,))),
             option="--operator-policy-key",
-            holders="OPERATOR_POLICY, ENVELOPE",
+            holders="PROJECT, OPERATOR_POLICY, ENVELOPE",
         )
         ring: dict[str, Ed25519PublicKey] = {}
         for key_path in trusted_keys:
+            if root is not None:
+                _verify_outside_checkout(key_path, (root,), label="--operator-policy-key")
             pub = _load_trusted_public(key_path)
             if not isinstance(pub, Ed25519PublicKey):
                 raise _KeyFileError("only Ed25519 public keys are supported")
@@ -243,9 +254,29 @@ def load_operator_policy(
     return LoadedOperatorPolicy(policy=parsed, digest=policy_digest, signers=signers)
 
 
-def append_step_summary(path: Path, rendered: str) -> None:
+def _inside_project_directory(parent: int, project: Path) -> bool:
+    """Compare the opened output directory and its parents to the checked project by inode."""
+    root = project.stat()
+    directory = os.dup(parent)
+    try:
+        while True:
+            current = os.fstat(directory)
+            if os.path.samestat(current, root):
+                return True
+            above = os.open("..", os.O_RDONLY | os.O_DIRECTORY, dir_fd=directory)
+            os.close(directory)
+            directory = above
+            if os.path.samestat(current, os.fstat(directory)):
+                return False
+    finally:
+        os.close(directory)
+
+
+def append_step_summary(path: Path, rendered: str, *, project: Path | None = None) -> None:
     """Append Markdown to an explicitly selected regular file without following symlinks."""
     import errno as _errno
+
+    import click
 
     from nexus_symbiote.utils.files import OutputRefusedError, _parent, _relative
     from nexus_symbiote.utils.terminal import output_failure, refuse_dash_output
@@ -259,13 +290,32 @@ def append_step_summary(path: Path, rendered: str) -> None:
             raise OSError("Secure output requires descriptor-relative no-symlink file operations")
         flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
         with _parent(root, relative, create_parents=False) as parent:
-            fd = os.open(relative.name, flags, 0o600, dir_fd=parent)
+            inputs = gate_input_files.get()
+            # Library callers without a record of the gate's reads retain the
+            # conservative create-only behavior inside the checked project.
+            create_only = (
+                inputs is None
+                and project is not None
+                and _inside_project_directory(parent, project)
+            )
+            if create_only:
+                flags |= os.O_EXCL
+            try:
+                fd = os.open(relative.name, flags, 0o600, dir_fd=parent)
+            except FileExistsError as exc:
+                if create_only:
+                    raise click.UsageError(
+                        "--step-summary must use a new file inside the checked project"
+                    ) from exc
+                raise
             try:
                 info = os.fstat(fd)
                 if not stat.S_ISREG(info.st_mode):
                     raise OutputRefusedError(_errno.EINVAL, "output must be a regular file")
                 if info.st_nlink != 1:
                     raise OutputRefusedError(_errno.EINVAL, "output must have only one hard link")
+                if inputs is not None and (info.st_dev, info.st_ino) in inputs:
+                    raise click.UsageError("--step-summary must not name a file this command reads")
                 prefix = b""
                 if info.st_size > 0:
                     last_byte = os.pread(fd, 1, info.st_size - 1)
@@ -302,9 +352,14 @@ def narrow_policy(operator: Policy, project: Policy | None) -> tuple[Policy, lis
     extra_excludes = [p for p in project.scan.exclude_paths if p not in op_excludes]
     if extra_excludes:
         clamped.append("scan.exclude_paths (refused extra project exclusions)")
-    effective_excludes = [
-        p for p in operator.scan.exclude_paths if p in set(project.scan.exclude_paths)
-    ] or list(operator.scan.exclude_paths)
+    # Excluding fewer paths only widens collection, so a project may narrow to none; one
+    # that does not set the list keeps the operator's.
+    if "exclude_paths" in project.scan.model_fields_set:
+        effective_excludes = [
+            p for p in operator.scan.exclude_paths if p in set(project.scan.exclude_paths)
+        ]
+    else:
+        effective_excludes = list(operator.scan.exclude_paths)
 
     if operator.scan.failure_mode == "error" and project.scan.failure_mode == "report-only":
         clamped.append("scan.failure_mode=error (clamped project report-only)")
@@ -423,12 +478,20 @@ def _gate_reasons(document: dict[str, Any]) -> list[str]:
             if isinstance(issues, list) and issues:
                 for issue in issues[:10]:
                     if isinstance(issue, dict):
-                        detail = issue.get("detail") or issue.get("message") or str(issue)
+                        detail = (
+                            issue.get("description")
+                            or issue.get("detail")
+                            or issue.get("message")
+                            or str(issue)
+                        )
                         reasons.append(f"{section_name}: {detail}")
                     else:
                         reasons.append(f"{section_name}: {issue}")
             else:
                 reasons.append(f"{section_name}: {section.get('status')}")
+    producer = document.get("discovery_producer")
+    if isinstance(producer, dict) and isinstance(producer.get("problems"), list):
+        reasons.extend(f"discovery_producer: {problem}" for problem in producer["problems"][:10])
     if document.get("unsigned_discovery"):
         reasons.append(str(document["unsigned_discovery"]))
     alerts = document.get("security_alerts")
