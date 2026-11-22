@@ -238,8 +238,12 @@ def test_isolation_teardown_failure_is_not_swallowed_by_a_pre_call_error(tmp_pat
     _teardown_fails(monkeypatch, ended)
     path, pin, _log = launcher(tmp_path, "ok")
     session = PinnedStdioSession(command=str(path), sha256=pin, server_id="server:mail")
-    with pytest.raises(AuthorizationError, match="the namespace did not end") as caught, session:
+
+    def fail_before_call() -> None:
         raise LookupError("caller's own failure")
+
+    with pytest.raises(AuthorizationError, match="the namespace did not end") as caught, session:
+        fail_before_call()
     assert isinstance(caught.value.__cause__, PinnedProcessError)
     assert isinstance(caught.value.__context__, LookupError)
     assert [proc.returncode is not None for proc in ended] == [True]

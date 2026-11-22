@@ -484,6 +484,7 @@ def test_teardown_verifiable_removed_and_cgroup_kill_runs_after_wrapper_check(
 # --- R-MED-17: PinnedStdioSession.__exit__ never swallows PinnedProcessError ---
 
 
+@pytest.mark.usefixtures("nonisolated_pinned_fixtures")
 def test_session_never_swallows_pinned_process_error_when_pre_call_exception_occurs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -497,9 +498,12 @@ def test_session_never_swallows_pinned_process_error_when_pre_call_exception_occ
     path, pin, _log = make_launcher(tmp_path, "ok")
     session = PinnedStdioSession(command=str(path), sha256=pin, server_id="server:mail")
 
+    def fail_before_call() -> None:
+        raise ValueError("pre-call descriptor rejection")
+
     with pytest.raises(AuthorizationError, match="orphan survived") as caught, session:
         session.describe("server:mail", "ok")
-        raise ValueError("pre-call descriptor rejection")
+        fail_before_call()
     assert isinstance(caught.value.__cause__, PinnedProcessError)
     assert isinstance(caught.value.__context__, ValueError)
 
@@ -552,7 +556,52 @@ def test_output_schema_preflight_rejects_allof_properties_ref_dag_blowup(dialect
     blowup_req = {"$defs": defs_req, "$ref": "#/$defs/L0"}
     assert validation._evaluate(dialects, blowup_req, None) == validation._SCHEMA
 
-    # Shallow benign allOf -> properties -> $ref and array of objects sharing a $ref stay admitted.
+    # 16-level 2-way allOf -> UNIQUE property name per level -> $ref DAG: each p{i} appears
+    # once in the schema, yet in-place allOf reconvergence duplicates the same value 2^16 times.
+    defs_unique: dict[str, object] = {"Leaf": {"type": "integer"}}
+    for level in range(16):
+        nxt = f"#/$defs/L{level + 1}" if level + 1 < 16 else "#/$defs/Leaf"
+        defs_unique[f"L{level}"] = {
+            "type": "object",
+            "allOf": [{"$ref": f"#/$defs/M{level}"}, {"$ref": f"#/$defs/M{level}"}],
+        }
+        defs_unique[f"M{level}"] = {
+            "type": "object",
+            "properties": {f"p{level}": {"$ref": nxt}},
+            "required": [f"p{level}"],
+        }
+    blowup_unique_prop = {"$defs": defs_unique, "$ref": "#/$defs/L0"}
+    assert validation._evaluate(dialects, blowup_unique_prop, None) == validation._SCHEMA
+
+    # 16-level 2-way allOf -> unique prefixItems index per level -> $ref DAG: same blowup on arrays.
+    defs_tuple: dict[str, object] = {"Leaf": {"type": "integer"}}
+    for level in range(16):
+        nxt = f"#/$defs/L{level + 1}" if level + 1 < 16 else "#/$defs/Leaf"
+        defs_tuple[f"L{level}"] = {
+            "type": "array",
+            "allOf": [{"$ref": f"#/$defs/M{level}"}, {"$ref": f"#/$defs/M{level}"}],
+        }
+        defs_tuple[f"M{level}"] = {
+            "type": "array",
+            "prefixItems": [*([{"type": "null"}] * level), {"$ref": nxt}],
+            "minItems": level + 1,
+        }
+    blowup_tuple = {"$defs": defs_tuple, "$ref": "#/$defs/L0"}
+    assert validation._evaluate(dialects, blowup_tuple, None) == validation._SCHEMA
+
+    # 16-level 2-way allOf -> array items wildcard blowup is also rejected.
+    defs_arr: dict[str, object] = {"Leaf": {"type": "integer"}}
+    for level in range(16):
+        nxt = f"#/$defs/L{level + 1}" if level + 1 < 16 else "#/$defs/Leaf"
+        defs_arr[f"L{level}"] = {
+            "type": "array",
+            "allOf": [{"items": {"$ref": nxt}}, {"items": {"$ref": nxt}}],
+        }
+    blowup_arr_wild = {"$defs": defs_arr, "$ref": "#/$defs/L0"}
+    assert validation._evaluate(dialects, blowup_arr_wild, None) == validation._SCHEMA
+
+    # Shallow benign allOf -> properties -> $ref, recursive json-value, and array of objects
+    # sharing a $ref (even with a non-reconverging allOf leaf) stay admitted.
     benign = {
         "$defs": {
             "Leaf": {"type": "string"},
@@ -570,7 +619,7 @@ def test_output_schema_preflight_rejects_allof_properties_ref_dag_blowup(dialect
     assert validation._evaluate(dialects, benign, {"a": "ok", "b": "ok"}) == validation._VALID
 
     shared_ref_array = {
-        "$defs": {"Label": {"type": "string"}},
+        "$defs": {"Label": {"allOf": [{"type": "string"}, {"minLength": 1}]}},
         "type": "array",
         "items": {
             "type": "object",
@@ -588,3 +637,10 @@ def test_output_schema_preflight_rejects_allof_properties_ref_dag_blowup(dialect
         )
         == validation._VALID
     )
+
+    benign_tuple = {
+        "type": "array",
+        "prefixItems": [{"type": "string"}, {"type": "integer"}],
+    }
+    assert validation._evaluate(dialects, benign_tuple, None) == validation._VALID
+    assert validation._evaluate(dialects, benign_tuple, ["ok", 1]) == validation._VALID

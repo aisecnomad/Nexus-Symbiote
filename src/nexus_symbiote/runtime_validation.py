@@ -1269,60 +1269,85 @@ def _collection_work_exceeds_budget(
 
     # Keep each level separate. A recursive reference through a child advances
     # one level, while all in-place callers are processed before their targets.
-    # Track per-value duplication by container slot (property key, tuple index,
-    # or wildcard None) so exponential allOf -> properties -> $ref DAGs cannot
-    # hide behind distinct-value node footprints, while disjoint properties on
-    # one object sharing a $ref do not inflate per-value duplication.
+    # Track per-value duplication separately for object vs array parent slots
+    # (a single JSON value cannot simultaneously be an object property and an
+    # array element) and preserve exact slot keys whenever a key repeats across
+    # containers or enters an in-place branching subgraph (allOf/anyOf/oneOf).
     counts = {root: 1}
-    # Maps node id -> (wildcard_dup, repeated_slot_dups, max_unique_slot_dup)
-    slot_dups: dict[int, tuple[int, dict[str | int, int], int]] = {root: (1, {}, 0)}
+    # Maps node id -> (obj_wild, obj_named, obj_unique, arr_wild, arr_named, arr_unique)
+    slot_dups: dict[int, tuple[int, dict[str, int], int, int, dict[int, int], int]] = {
+        root: (1, {}, 0, 0, {}, 0)
+    }
     nested: set[int] = set()
     fallible: set[int] = set()
     step_cap = _MAX_OUTPUT_REPEATED_STEPS + 1
 
-    key_counts: dict[str | int, int] = {}
+    has_in_place_branch: dict[int, bool] = {}
+    for current in reversed(order):
+        children = graph[current]
+        has_in_place_branch[current] = len(children) > 1 or any(
+            has_in_place_branch[c] for c in children
+        )
+
+    obj_key_counts: dict[str, int] = {}
+    arr_key_counts: dict[int, int] = {}
     for node in nodes.values():
         props = node.get("properties")
         if isinstance(props, dict):
             for key in props:
-                key_counts[key] = key_counts.get(key, 0) + 1
+                obj_key_counts[key] = obj_key_counts.get(key, 0) + 1
         for kw in ("prefixItems", "items"):
             val = node.get(kw)
             if isinstance(val, list):
                 for idx in range(len(val)):
-                    key_counts[idx] = key_counts.get(idx, 0) + 1
-    repeated_slots = frozenset(k for k, c in key_counts.items() if c > 1)
+                    arr_key_counts[idx] = arr_key_counts.get(idx, 0) + 1
+    repeated_obj_slots = frozenset(k for k, c in obj_key_counts.items() if c > 1)
+    repeated_arr_slots = frozenset(k for k, c in arr_key_counts.items() if c > 1)
 
     def _merge_slot(
-        store: dict[int, tuple[int, dict[str | int, int], int]],
+        store: dict[int, tuple[int, dict[str, int], int, int, dict[int, int], int]],
         target: int,
-        wild_add: int,
-        named_add: dict[str | int, int],
-        unique_add: int,
+        obj_w: int,
+        obj_n: dict[str, int],
+        obj_u: int,
+        arr_w: int,
+        arr_n: dict[int, int],
+        arr_u: int,
     ) -> None:
-        cur_w, cur_n, cur_u = store.get(target, (0, {}, 0))
-        new_w = min(step_cap, cur_w + wild_add)
-        new_u = min(step_cap, max(cur_u, unique_add))
-        if named_add:
-            merged_n = dict(cur_n)
-            for k, v in named_add.items():
-                merged_n[k] = min(step_cap, merged_n.get(k, 0) + v)
+        cur_ow, cur_on, cur_ou, cur_aw, cur_an, cur_au = store.get(target, (0, {}, 0, 0, {}, 0))
+        new_ow = min(step_cap, cur_ow + obj_w)
+        new_ou = min(step_cap, max(cur_ou, obj_u))
+        if obj_n:
+            merged_on = dict(cur_on)
+            for k, v in obj_n.items():
+                merged_on[k] = min(step_cap, merged_on.get(k, 0) + v)
         else:
-            merged_n = cur_n
-        store[target] = (new_w, merged_n, new_u)
+            merged_on = cur_on
+        new_aw = min(step_cap, cur_aw + arr_w)
+        new_au = min(step_cap, max(cur_au, arr_u))
+        if arr_n:
+            merged_an = dict(cur_an)
+            for idx_k, v in arr_n.items():
+                merged_an[idx_k] = min(step_cap, merged_an.get(idx_k, 0) + v)
+        else:
+            merged_an = cur_an
+        store[target] = (new_ow, merged_on, new_ou, new_aw, merged_an, new_au)
 
     for _ in range(MAX_JSON_DEPTH + 1):
         following: dict[int, int] = {}
-        following_slots: dict[int, tuple[int, dict[str | int, int], int]] = {}
+        following_slots: dict[int, tuple[int, dict[str, int], int, int, dict[int, int], int]] = {}
         nested_following: set[int] = set()
         fallible_following: set[int] = set()
         for current in order:
             count = counts.get(current, 0)
             if not count:
                 continue
-            cur_w, cur_n, cur_u = slot_dups.get(current, (1, {}, 0))
-            max_named = max(cur_n.values(), default=0)
-            dup = min(step_cap, max(1, cur_w + max(max_named, cur_u)))
+            cur_ow, cur_on, cur_ou, cur_aw, cur_an, cur_au = slot_dups.get(
+                current, (1, {}, 0, 0, {}, 0)
+            )
+            obj_dup = cur_ow + max(max(cur_on.values(), default=0), cur_ou)
+            arr_dup = cur_aw + max(max(cur_an.values(), default=0), cur_au)
+            dup = min(step_cap, max(1, obj_dup, arr_dup))
             node = nodes[current]
             # Only schemas that abort collection validation on a non-conforming
             # value can bound repetitions by a conforming value's node footprint.
@@ -1347,7 +1372,7 @@ def _collection_work_exceeds_budget(
                         fallible_children.add(id(arm))
             for child in graph[current]:
                 counts[child] = min(step_cap, counts.get(child, 0) + count)
-                _merge_slot(slot_dups, child, cur_w, cur_n, cur_u)
+                _merge_slot(slot_dups, child, cur_ow, cur_on, cur_ou, cur_aw, cur_an, cur_au)
                 if current in nested:
                     nested.add(child)
                 if current in fallible or child in fallible_children:
@@ -1369,6 +1394,7 @@ def _collection_work_exceeds_budget(
 
             fixed_costs: list[int] = []
             for keyword, value in node.items():
+                is_array_kw = False
                 if (
                     keyword == "properties"
                     or keyword in ("prefixItems", "items")
@@ -1377,6 +1403,7 @@ def _collection_work_exceeds_budget(
                     if isinstance(value, dict):
                         entries_iter: list[tuple[str | int | None, Any]] = list(value.items())
                     else:
+                        is_array_kw = True
                         entries_iter = list(enumerate(value[:items]))
                     cardinality = 1
                     costs = [
@@ -1401,6 +1428,7 @@ def _collection_work_exceeds_budget(
                     ):
                         return True
                 elif keyword in ("items", "contains", "additionalItems", "unevaluatedItems"):
+                    is_array_kw = True
                     entries_iter, cardinality = [(None, value)], items
                 elif keyword in ("additionalProperties", "unevaluatedProperties", "propertyNames"):
                     entries_iter, cardinality = [(None, value)], properties
@@ -1412,12 +1440,24 @@ def _collection_work_exceeds_budget(
                         following[child] = min(
                             step_cap, following.get(child, 0) + count * cardinality
                         )
-                        if slot_key is None:
-                            _merge_slot(following_slots, child, dup, {}, 0)
-                        elif slot_key in repeated_slots:
-                            _merge_slot(following_slots, child, 0, {slot_key: dup}, 0)
+                        if is_array_kw:
+                            if slot_key is None:
+                                _merge_slot(following_slots, child, 0, {}, 0, dup, {}, 0)
+                            elif isinstance(slot_key, int) and (
+                                slot_key in repeated_arr_slots or has_in_place_branch[child]
+                            ):
+                                _merge_slot(following_slots, child, 0, {}, 0, 0, {slot_key: dup}, 0)
+                            else:
+                                _merge_slot(following_slots, child, 0, {}, 0, 0, {}, dup)
                         else:
-                            _merge_slot(following_slots, child, 0, {}, dup)
+                            if slot_key is None:
+                                _merge_slot(following_slots, child, dup, {}, 0, 0, {}, 0)
+                            elif isinstance(slot_key, str) and (
+                                slot_key in repeated_obj_slots or has_in_place_branch[child]
+                            ):
+                                _merge_slot(following_slots, child, 0, {slot_key: dup}, 0, 0, {}, 0)
+                            else:
+                                _merge_slot(following_slots, child, 0, {}, dup, 0, {}, 0)
                         if (
                             current in nested
                             or keyword == "contains"
