@@ -66,7 +66,9 @@ _AUTH = re.compile(r"(?i)\b(Bearer|Basic|Token|Bot|ApiKey|Api-Key)(\s++)([A-Za-z
 # After an Authorization or Proxy-Authorization header name the scheme's value is a
 # credential whatever its shape; the shape checks only tell prose from credentials.
 # Searched in a bounded window before each scheme, so the cost per match is constant.
-_AUTHORIZATION_HEADER = re.compile(r"(?i)authorization[\"']?\s{0,8}[:=]\s{0,8}[\"']?$")
+_AUTHORIZATION_HEADER = re.compile(
+    r"(?i)authorization(?:\\*+[\"'])?\s{0,8}[:=]\s{0,8}(?:\\*+[\"'])?$"
+)
 _AUTHORIZATION_LOOKBACK = 40
 # A prose word after a scheme ("Bearer authentication") is shorter than this; a value
 # this long after Bearer, Token, Bot, ApiKey or Api-Key is redacted whatever its shape.
@@ -173,7 +175,7 @@ def holds_token_shape(text: str, *, require_sk_boundary: bool = False) -> bool:
 # A header value with no scheme is redacted when it looks like a credential; after
 # Negotiate or NTLM, which the scheme rule above does not know, whatever its shape.
 _RAW_AUTH_HEADER = re.compile(
-    r"(?i)(\b(?:proxy-)?authorization[\"']?\s{0,8}[:=]\s{0,8}[\"']?)"
+    r"(?i)(\b(?:proxy-)?authorization(?:\\*+[\"'])?\s{0,8}[:=]\s{0,8}(?:\\*+[\"'])?)"
     r"(?:(negotiate|ntlm)([ \t]++)([A-Za-z0-9_+/=.~-]++)|([A-Za-z0-9_+/=.~:-]{8,}+))"
 )
 _AUTH_SCHEMES = frozenset(
@@ -202,14 +204,16 @@ def _is_auth_scheme(value: str, span: Span) -> bool:
 _COOKIE_HEADER = re.compile(
     r"(?i)(\b(?:set-)?cookie(?:\\*+[\"'])?\s{0,8}[:=]\s{0,8})"
     r"(?:\"((?:[^\"\\\r\n]++|\\.)*+)\""
-    r"|\\\"((?:[^\"\\\r\n]++|\\\\|\\[^\"\\\r\n])*+)\\\""
+    r"|\\\"((?:[^\"\\\r\n]++|\\\\\\\\|\\\\\\\"|\\\\[^\"\\\r\n]|\\[^\"\\\r\n])*+)\\\""
     r"|'((?:[^'\\\r\n]++|\\.)*+)'"
     r"|([^\r\n]++))"
 )
 _COOKIE_PAIR = re.compile(
     r"([A-Za-z0-9_.-]{1,64}=)"
     r"(\"(?:[^\"\\\r\n]++|\\.)*+\""
-    r"|\\\"(?:[^\"\\\r\n]++|\\\\|\\[^\"\\\r\n])*+\\\""
+    r"|\\\\\\\"(?:[^\"\\\r\n]++|\\\\\\\\|\\\\[^\"\\\r\n]|\\[^\"\\\r\n])*+\\\\\\\""
+    r"|\\\"(?:[^\"\\\r\n]++|\\\\\\\\|\\\\\\\"|\\\\[^\"\\\r\n]|\\[^\"\\\r\n])*+\\\""
+    r"|\\'(?:[^'\\\r\n]++|\\\\|\\[^'\\\r\n])*+\\'"
     r"|'(?:[^'\\\r\n]++|\\.)*+'"
     r"|(?:[^\s;,\"'\\]++|\\(?![\"']))++)"
 )
@@ -624,7 +628,12 @@ def _cookie_pair_secret(match: re.Match[str]) -> bool:
     name_eq, val = match.groups()
     if name_eq[:-1].lower() in _COOKIE_ATTRS:
         return False
-    if val.startswith('\\"') and val.endswith('\\"') and len(val) >= 4:
+    if val.startswith('\\\\\\"') and val.endswith('\\\\\\"') and len(val) >= 8:
+        inner = val[4:-4]
+    elif len(val) >= 4 and (
+        (val.startswith('\\"') and val.endswith('\\"'))
+        or (val.startswith("\\'") and val.endswith("\\'"))
+    ):
         inner = val[2:-2]
     elif len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
         inner = val[1:-1]
@@ -829,17 +838,22 @@ def _escaped_quote_span(text: str, start: int, limit: int) -> Span | None:
     newline = text.find("\n", pos, max_end)
     stop = max_end if newline < 0 else newline
     search = pos
+    fallback_end: int | None = None
     while search < stop:
         close = text.find(quote, search, stop)
         if close < 0:
-            return None
+            break
         back = close - 1
         while back >= pos and text[back] == "\\":
             back -= 1
-        if close - 1 - back == slash_count:
-            return start, close + 1
+        run = close - 1 - back
+        if run >= slash_count and (run - slash_count) % 2 == 0:
+            if slash_count != 1 or (run - 1) % 4 == 0:
+                return start, close + 1
+            if fallback_end is None:
+                fallback_end = close + 1
         search = close + 1
-    return None
+    return (start, fallback_end) if fallback_end is not None else None
 
 
 def _value_span(

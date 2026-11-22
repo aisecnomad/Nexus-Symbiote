@@ -554,3 +554,136 @@ def test_write_output_file_and_staging_work_under_traverse_only_ancestor(tmp_pat
             write_output_file(child / "no_opath.json", "nope")
     finally:
         locked.chmod(0o700)
+
+
+def test_check_yaml_flow_depth_blocks_mid_scalar_quotes_and_unicode_linebreaks() -> None:
+    deep = "[" * (MAX_YAML_FLOW_DEPTH + 10)
+    for bypass in (
+        f"a: don't\nb: {deep}",
+        f'a: foo"bar\nb: {deep}',
+        f"a: {{x:'y, z: {deep}",
+        f"a: {{x\":'y, z: {deep}",
+        f"# comment\u2028{deep}",
+        f"# comment\x85{deep}",
+        f"a: |\n  hi\u2028b: {deep}",
+        f"a: |\n  hi\u2029b: {deep}",
+    ):
+        with pytest.raises(PolicyError, match="flow nesting"):
+            check_yaml_flow_depth(bypass)
+
+    # Legitimate apostrophes, JSON-like flow keys, BOM quotes, and multi-line quoted keys stay allowed.
+    for benign in (
+        f"a: don't\nb: '{deep}'\n",
+        f"a: {{\"x\":'{deep}'}}\n",
+        f'a: {{"x" :"{deep}"}}\n',
+        f"a: {{[1]:'{deep}'}}\n",
+        f"\ufeff'{deep}'\n",
+        f'"{deep}"\n',
+        f"['{deep}','{deep}']\n",
+        f'"k1\nk2": |\n  {deep}\n',
+    ):
+        check_yaml_flow_depth(benign)
+
+
+def test_secrets_redacts_double_json_cookies_auth_and_trailing_backslashes() -> None:
+    double_cookie = json.dumps(json.dumps({"Cookie": 'session="SecretCookie123"; Path=/'}))
+    redacted_cookie = redact_text(double_cookie)
+    assert "SecretCookie123" not in redacted_cookie
+    assert "Path=/" in redacted_cookie
+
+    esc_single_cookie = r"Cookie: session=\'SingleEscSecret99\'; Path=/"
+    redacted_single = redact_text(esc_single_cookie)
+    assert "SingleEscSecret99" not in redacted_single
+    assert "Path=/" in redacted_single
+
+    double_pw_bs = json.dumps(json.dumps({"password": "my secret value\\"}))
+    assert "secret value" not in redact_text(double_pw_bs)
+
+    raw_esc_pw_bs = r"password=\"my secret value\\\""
+    assert "secret value" not in redact_text(raw_esc_pw_bs)
+
+    double_pw_inner_q = json.dumps(json.dumps({"password": 'my "secret" value', "user": "alice"}))
+    redacted_inner = redact_text(double_pw_inner_q)
+    assert "secret" not in redacted_inner
+    assert "alice" in redacted_inner
+
+    double_bearer = json.dumps(json.dumps({"Authorization": "Bearer supersecretval"}))
+    assert "supersecretval" not in redact_text(double_bearer)
+
+    double_nego = json.dumps(json.dumps({"Authorization": "Negotiate YIIsecretToken99"}))
+    assert "YIIsecretToken99" not in redact_text(double_nego)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("re\tdis://evil.example:6379", "redis://evil.example:6379"),
+        ("\x01redis://evil.example:6379", "redis://evil.example:6379"),
+        ("ld\tap://evil.example:389", "ldap://evil.example:389"),
+        ("git+ht\ttp://evil.example/repo", "git+http://evil.example/repo"),
+        ("fi\tle:///etc/passwd", "file:///etc/passwd"),
+        ("fi\tle:/etc/passwd", "file:/etc/passwd"),
+        ("C:/Windows/System32", "C:/Windows/System32"),
+    ],
+)
+def test_whatwg_form_normalizes_non_special_schemes_too(raw: str, expected: str) -> None:
+    assert whatwg_form(raw) == expected
+
+
+def test_rag_detects_obfuscated_cleartext_redis_url(tmp_path: Path) -> None:
+    (tmp_path / "rag_config.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "name": "cache",
+                        "type": "vector-store",
+                        "vector_store": {"endpoint": "re\tdis://cache.evil.example:6379"},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = RAGScanner().scan(tmp_path)
+    assert len(result.components) == 1
+    comp = result.components[0]
+    assert comp.properties["endpoint_origins"] == ["redis://cache.evil.example:6379"]
+    assert any(r.category == "data_integrity" for r in comp.risks)
+
+
+def test_rag_colang_fold_variants_dedup_and_withheld_order(tmp_path: Path) -> None:
+    nemo = tmp_path / "nemo"
+    nemo.mkdir()
+    (nemo / "config.yml").write_text("rails: {}\n", encoding="utf-8")
+    (nemo / "config.yaml").write_text("rails: {}\n", encoding="utf-8")
+    (nemo / "MAIN.CO").write_text("define flow a\n", encoding="utf-8")
+    (nemo / "trailing.co.").write_text("define flow b\n", encoding="utf-8")
+    (nemo / "Guardrails.co").write_text("define flow ok\n", encoding="utf-8")
+
+    result = RAGScanner().scan(tmp_path)
+    main_failures = [f for f in result.scan_failures if "nemo/MAIN.CO" in f]
+    trailing_failures = [f for f in result.scan_failures if "nemo/trailing.co." in f]
+    assert len(main_failures) == 1
+    assert len(trailing_failures) == 1
+    assert any("Guardrails.co" in c.properties.get("rail_files", {}) for c in result.components)
+
+    # Withheld config.yml must not emit spurious sibling rail failures.
+    secret_dir = tmp_path / "secrets"
+    secret_dir.mkdir()
+    (secret_dir / "config.yml").write_text("rails: {}\n", encoding="utf-8")
+    (secret_dir / "BAD.CO").write_text("define flow bad\n", encoding="utf-8")
+    res_withheld = RAGScanner().scan(tmp_path)
+    assert not any("secrets/BAD.CO" in f for f in res_withheld.scan_failures)
+    assert any("secrets/config.yml" in e for e in res_withheld.surfaces_excluded)
+
+
+def test_registry_toml_reports_exact_nesting_depth_bounds_error(tmp_path: Path) -> None:
+    from nexus_symbiote.scanners.registry import RegistryScanner
+    from nexus_symbiote.utils.toml import _MAX_BRACKET_DEPTH
+
+    deep = "a = " + "[" * (_MAX_BRACKET_DEPTH + 2) + "1" + "]" * (_MAX_BRACKET_DEPTH + 2) + "\n"
+    (tmp_path / "pyproject.toml").write_text(deep, encoding="utf-8")
+    result = RegistryScanner().scan(tmp_path)
+    assert any("TOML nesting exceeds the depth limit" in f for f in result.scan_failures)
+    assert not any("dotted key exceeds" in f for f in result.scan_failures)

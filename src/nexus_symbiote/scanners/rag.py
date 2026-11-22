@@ -397,7 +397,7 @@ class RAGScanner(Scanner):
                     self._config_variant(path, files, result)
                 elif fold_name(path.name) in _FOLDED_GUARDRAIL_NAMES:
                     guardrails.append(path)
-                elif path.suffix.lower() == NEMO_RAIL_SUFFIX:
+                elif Path(fold_name(path.name)).suffix == NEMO_RAIL_SUFFIX:
                     rails.setdefault(path.parent, []).append(path)
                 elif path.name in ENV_FILES and len(path.parts) == 1:
                     raw = files.read_bytes(path)
@@ -434,6 +434,7 @@ class RAGScanner(Scanner):
         is not read or digested; the record binds the directory's other files.
         """
         components = []
+        reported_rail_variants: set[Path] = set()
         for path in sorted(candidates):
             canonical = _FOLDED_GUARDRAIL_NAMES[fold_name(path.name)]
             siblings = sorted(rails.get(path.parent, ())) if canonical in NEMO_CONFIG_NAMES else []
@@ -451,14 +452,26 @@ class RAGScanner(Scanner):
                     f"{relative}: more than {_MAX_ENTRIES} Colang files beside the configuration"
                 )
                 continue
+            if withheld(files, relative, result.surfaces_excluded):
+                continue
+            valid_siblings: list[Path] = []
             for rail in siblings:
-                if rail.suffix != NEMO_RAIL_SUFFIX:
+                if rail.suffix == NEMO_RAIL_SUFFIX and fold_name(rail.name) == rail.name.casefold():
+                    valid_siblings.append(rail)
+                    continue
+                if rail not in reported_rail_variants:
+                    reported_rail_variants.add(rail)
+                    canonical_rail = (
+                        rail.with_suffix(NEMO_RAIL_SUFFIX)
+                        if rail.suffix.lower() == NEMO_RAIL_SUFFIX
+                        else rail.with_name(fold_name(rail.name))
+                    )
                     result.scan_failures.append(
                         f"{rail.as_posix()}: case variant of "
-                        f"{rail.with_suffix(NEMO_RAIL_SUFFIX).as_posix()} is the active file on "
+                        f"{canonical_rail.as_posix()} is the active file on "
                         "case-insensitive file systems and is not inventoried"
                     )
-            siblings = [rail for rail in siblings if rail.suffix == NEMO_RAIL_SUFFIX]
+            siblings = valid_siblings
             if canonical in NEMO_CONFIG_NAMES and not siblings:
                 continue
             siblings = [
@@ -468,8 +481,6 @@ class RAGScanner(Scanner):
                     files, rail.as_posix(), result.surfaces_excluded, colang_source=True
                 )
             ]
-            if withheld(files, relative, result.surfaces_excluded):
-                continue
             raw = files.read_bytes(path)
             if raw is None or self._relinked(path, files, result):
                 continue

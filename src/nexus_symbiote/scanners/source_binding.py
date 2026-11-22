@@ -25,6 +25,7 @@ _HOSTNAME = re.compile(r"[\w.-]+|[0-9a-f:.]+", re.ASCII)
 # A2A 1.0 gRPC interfaces give a "hostname:port" address without a scheme.
 _HOST_PORT = re.compile(r"(?:(?:[\w-]+\.)+[\w-]+|localhost|\[[0-9a-f:.]+\]):\d{1,5}", re.I)
 _SPECIAL_SCHEME = re.compile(r"(ftp|https?|wss?):", re.I)
+_ANY_URL_SCHEME = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://|file:/", re.I)
 _WHATWG_C0_SPACE = "".join(chr(code) for code in range(0x21))
 _URL_ASCII_WHITESPACE = str.maketrans("", "", "\t\r\n")
 
@@ -84,14 +85,15 @@ def whatwg_form(url: str) -> str:
     """``url`` with "//" before the authority of a special scheme, as WHATWG parsers read it.
 
     WHATWG basic URL parsing strips leading and trailing C0 controls/spaces and removes
-    all ASCII tabs and newlines before matching a scheme, then skips any run of "/" and
+    all ASCII tabs and newlines before matching any scheme, then skips any run of "/" and
     "\\" after a special scheme such as ``http:``. Without this normalisation, forms like
-    ``ht\\ttp://host/x``, ``http:host/x`` or ``http:\\\\host`` diverge from ``urlsplit``.
+    ``ht\\ttp://host/x``, ``re\\tdis://host``, ``http:host/x`` or ``http:\\\\host``
+    diverge from ``urlsplit``.
     """
     cleaned = url.strip(_WHATWG_C0_SPACE).translate(_URL_ASCII_WHITESPACE)
     match = _SPECIAL_SCHEME.match(cleaned)
     if match is None:
-        return url
+        return cleaned if _ANY_URL_SCHEME.match(cleaned) else url
     after = cleaned[match.end() :]
     if after.startswith("//") and len(after) > 2 and after[2] not in "/\\":
         return cleaned
