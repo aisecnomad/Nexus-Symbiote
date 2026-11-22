@@ -322,19 +322,44 @@ def _conflict_risk(field_name: str, component_name: str, locator: str) -> RiskAs
     )
 
 
+def _compatible_declared_names(
+    entries: object,
+    kind: ComponentType,
+    by_key: dict[tuple[ComponentType, str], AnyComponent],
+    owner: str | None,
+) -> set[str]:
+    if not isinstance(entries, list):
+        return set()
+    names: set[str] = set()
+    conflicts: set[str] = set()
+    for entry in entries[:200]:
+        if not isinstance(entry, dict) or not (name := _clean_text(entry.get("name"), max_len=200)):
+            continue
+        names.add(name)
+        holder = by_key.get((kind, name))
+        if holder is not None:
+            version = _clean_text(entry.get("version"), max_len=128)
+            supplier = _clean_text(entry.get("supplier"), max_len=200) or owner
+            if (holder.version and version and holder.version != version) or (
+                holder.supplier and supplier and holder.supplier != supplier
+            ):
+                conflicts.add(name)
+    return names - conflicts
+
+
 def _type_conflict(
     holder: AnyComponent | None,
     declared: str,
     locator: str,
     notices: list[str],
     *,
-    declaration_refs: set[str],
+    shared_names: set[str],
 ) -> bool:
     """Whether a collected component of another type holds the declared name.
 
     The declaration is then a conflict on the holder and is not applied.
     """
-    if holder is None or holder.bom_ref in declaration_refs:
+    if holder is None or holder.name in shared_names:
         return False
     holder.risks.append(_conflict_risk("component_type", holder.name, locator))
     notices.append(f"{holder.bom_ref}: {declared} name conflict with {locator}")
@@ -516,9 +541,11 @@ def apply_agent_yaml_declarations(
     by_key: dict[tuple[ComponentType, str], AnyComponent] = {
         (c.component_type, c.name): c for c in aibom.components
     }
-    declaration_refs: set[str] = set()
-
     raw_datasets = parsed.get("datasets")
+    raw_models = parsed.get("models")
+    shared_names = _compatible_declared_names(
+        raw_datasets, ComponentType.DATA_SOURCE, by_key, owner
+    ) & _compatible_declared_names(raw_models, ComponentType.MODEL, by_key, owner)
     dataset_refs_by_name: dict[str, str] = {}
     dataset_declarations: dict[str, dict[str, Any]] = {}
     if isinstance(raw_datasets, list):
@@ -534,7 +561,7 @@ def apply_agent_yaml_declarations(
                 "dataset",
                 locator,
                 notices,
-                declaration_refs=declaration_refs,
+                shared_names=shared_names,
             ):
                 continue
             if _repeat_declaration(
@@ -585,7 +612,6 @@ def apply_agent_yaml_declarations(
                 )
                 aibom.components.append(ds_comp)
                 by_key[(ComponentType.DATA_SOURCE, ds_name)] = ds_comp
-                declaration_refs.add(ds_comp.bom_ref)
                 if ds_ver:
                     _record_claim(ds_comp, "version", locator)
                 if ds_sup:
@@ -610,7 +636,6 @@ def apply_agent_yaml_declarations(
             _record_claim(ds_comp, "dataset", locator)
             dataset_refs_by_name[ds_name] = ds_comp.bom_ref
 
-    raw_models = parsed.get("models")
     model_declarations: dict[str, dict[str, Any]] = {}
     edge_keys: set[tuple[str, str, str]] = {
         (e.source_ref, e.target_ref, e.relationship) for e in aibom.dependencies
@@ -628,7 +653,7 @@ def apply_agent_yaml_declarations(
                 "model",
                 locator,
                 notices,
-                declaration_refs=declaration_refs,
+                shared_names=shared_names,
             ):
                 continue
             if _repeat_declaration(model_declarations, m_name, entry, existing, locator, notices):
@@ -661,7 +686,6 @@ def apply_agent_yaml_declarations(
                 )
                 aibom.components.append(m_comp)
                 by_key[(ComponentType.MODEL, m_name)] = m_comp
-                declaration_refs.add(m_comp.bom_ref)
                 if m_ver:
                     _record_claim(m_comp, "version", locator)
                 if m_sup:
