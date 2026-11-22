@@ -127,10 +127,11 @@ def component_content_digest(component: ComponentBase) -> str | None:
     if sha:
         return sha
     if isinstance(component, _PROPERTY_BOUND_COMPONENT_TYPES):
+        present: dict[str, Any] = {}
         for prop_key in _COMPONENT_BINDING_PROPERTIES:
             bound = component.properties.get(prop_key)
             if isinstance(bound, str) and bound:
-                return bound
+                present[prop_key] = bound
         settings_hashes = component.properties.get("settings_hashes")
         if (
             isinstance(settings_hashes, dict)
@@ -140,7 +141,15 @@ def component_content_digest(component: ComponentBase) -> str | None:
                 for k, v in settings_hashes.items()
             )
         ):
-            payload = json.dumps(settings_hashes, sort_keys=True, separators=(",", ":"))
+            present["settings_hashes"] = settings_hashes
+        if len(present) == 1:
+            only = next(iter(present.values()))
+            if isinstance(only, str):
+                return only
+            payload = json.dumps(only, sort_keys=True, separators=(",", ":"))
+            return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        if present:
+            payload = json.dumps(present, sort_keys=True, separators=(",", ":"))
             return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return None
 

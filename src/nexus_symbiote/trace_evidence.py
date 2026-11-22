@@ -568,9 +568,9 @@ def _apply_runtime_checks(
             declared_per_cand = [
                 _trimmed(getattr(comp, "workload_identity", None)) for comp in candidates
             ]
-            if all(declared_per_cand):
-                declared_ids = {cid for cid in declared_per_cand if cid is not None}
-                entry["workload_identity_matched"] = item.workload_identities <= declared_ids
+            declared_list = [cid for cid in declared_per_cand if cid is not None]
+            if len(declared_list) == len(declared_per_cand):
+                entry["workload_identity_matched"] = item.workload_identities <= set(declared_list)
             else:
                 entry["workload_identity_matched"] = None
     tools = [comp for comp in candidates if isinstance(comp, ToolComponent)]

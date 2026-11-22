@@ -770,19 +770,65 @@ def test_check_workflows_blocks_new_gate_env_vars_and_keeps_coverage_json() -> N
         "COVERAGE_RCFILE",
         "COVERAGE_FILE",
         "COVERAGE_PROCESS_START",
+        "COVERAGE_PROCESS_CONFIG",
+        "COVERAGE_FORCE_CONFIG",
         "COVERAGE_CORE",
         "COVERAGE_RUN",
         "COVERAGE_DEBUG",
+        "COV_CORE_CONFIG",
+        "COV_CORE_DATAFILE",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
         "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
         "VIRTUAL_ENV",
         "MYPYPATH",
         "NODE_OPTIONS",
         "NODE_PATH",
     ):
-        assert var in check_workflows.UNSAFE_GATE_ENV
-    for prefix in ("PIP_", "UV_", "MYPY_", "RUFF_"):
+        assert check_workflows._unsafe_gate_env(var), var
+    for prefix in ("PIP_", "UV_", "MYPY_", "RUFF_", "COVERAGE_", "COV_CORE_", "DYLD_"):
         assert prefix in check_workflows.UNSAFE_GATE_ENV_PREFIXES
-    assert "COVERAGE_JSON" not in check_workflows.UNSAFE_GATE_ENV
-    assert not any("COVERAGE_JSON".startswith(p) for p in check_workflows.UNSAFE_GATE_ENV_PREFIXES)
+    assert not check_workflows._unsafe_gate_env("COVERAGE_JSON")
     # Real repo workflows still pass cleanly.
     assert check_workflows.check(Path(".github/workflows/ci.yml")) == []
+
+
+def test_component_content_digest_combines_co_present_bindings() -> None:
+    mcp_a = MCPServerComponent(
+        bom_ref="mcp:combo",
+        name="srv",
+        properties={
+            "static_value_binding": "hmac-sha256:" + "1" * 64,
+            "static_config_hash": "sha256:" + "a" * 64,
+        },
+    )
+    mcp_b = mcp_a.model_copy(
+        update={
+            "properties": {
+                "static_value_binding": "hmac-sha256:" + "1" * 64,
+                "static_config_hash": "sha256:" + "b" * 64,
+            }
+        }
+    )
+    digest_a = component_content_digest(mcp_a)
+    digest_b = component_content_digest(mcp_b)
+    assert digest_a is not None and digest_a.startswith("sha256:")
+    assert digest_b is not None and digest_a != digest_b
+
+
+def test_collector_owned_includes_remaining_provenance_keys_and_differ_ascii_line_anchor() -> None:
+    assert {
+        "settings_hashes_profile",
+        "requirement_hashes",
+        "imports_digest",
+        "observed_endpoint_hash",
+    } <= COLLECTOR_OWNED_PROPERTIES
+
+    path = ("claims", CITED_EVIDENCE_CLAIM, "locator")
+    assert _semantic_value("CLAUDE.md:42", path) == "CLAUDE.md"
+    assert _semantic_value("CLAUDE.md:42\n", path) == "CLAUDE.md:42\n"
+    assert _semantic_value("CLAUDE.md:\u0661\u0662\u0663", path) == "CLAUDE.md:\u0661\u0662\u0663"
+
+    gen = SARIFGenerator(root=Path("/repo"))
+    assert gen._uri(Path("sub/file.py")) == "sub/file.py"
+    assert gen._uri("..\\escape.py") is None

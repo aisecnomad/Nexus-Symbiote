@@ -311,7 +311,8 @@ def _unreachable(lock: Lock, declared: Collection[str]) -> list[str]:
     declared in pyproject.toml and uv says so, or when a reachable pin of this lock is named
     as its parent; a `-c` constraint is no reason to install anything. Reachability is
     evaluated per individual pin so an unreferenced duplicate entry for an already-reachable
-    package is still caught.
+    package is still caught; a forged `# via` comment naming another reachable package is
+    caught only by regenerating the lockfile.
     """
     pin_entries = [
         (name, idx, pin) for name, pins in lock.pins.items() for idx, pin in enumerate(pins)
