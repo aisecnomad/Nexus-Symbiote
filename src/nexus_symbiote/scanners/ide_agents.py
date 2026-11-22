@@ -930,8 +930,19 @@ def _command_pipelines(command: str, *, piped_groups: bool = False) -> list[list
             end += 1
         return command[position:end]
 
+    # A count of the open groups a pipe feeds keeps each separator O(1); scanning the
+    # stack instead made `{ { { ...; ...; ...` quadratic.
+    fed = [0]
+
     def piped() -> bool:
-        return any(feeds for _, feeds in groups)
+        return fed[0] > 0
+
+    def push(closer: str, feeds: bool) -> None:
+        groups.append((closer, feeds))
+        fed[0] += feeds
+
+    def pop() -> None:
+        fed[0] -= groups.pop()[1]
 
     def flush_segment() -> None:
         segments.append("".join(buf))
@@ -951,21 +962,21 @@ def _command_pipelines(command: str, *, piped_groups: bool = False) -> list[list
         nxt = command[index + 1] if index + 1 < length else ""
         if piped_groups:
             if char == "$" and nxt == "(" or char in "<>" and nxt == "(":
-                groups.append((")", False))
+                push(")", False)
                 buf.append(command[index : index + 2])
                 index += 2
                 continue
             if char == ")" and groups and groups[-1][0] == ")":
-                groups.pop()
+                pop()
             elif char == "(" and nxt != "(" and at_command_start():
-                groups.append((")", bool(segments) or piped()))
+                push(")", bool(segments) or piped())
             elif at_command_start() and (index == 0 or command[index - 1] in " \t\r\n;&|({"):
                 word = word_at(index)
                 if word == "{" or word in _GROUP_KEYWORDS:
                     closer = "}" if word == "{" else _GROUP_KEYWORDS[word]
-                    groups.append((closer, bool(segments) or piped()))
+                    push(closer, bool(segments) or piped())
                 elif groups and word == groups[-1][0] and word in _GROUP_ENDS | {"}"}:
-                    groups.pop()
+                    pop()
         if (
             piped_groups
             and piped()

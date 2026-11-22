@@ -190,8 +190,10 @@ def test_a_bypass_form_fails_the_default_gate_through_the_scanner(tmp_path):
         lambda n: _FETCH + "{ " + "true; " * n + "sh; }",
         lambda n: _FETCH + "if " * n + "sh",
         lambda n: _FETCH + "$(" * n + "sh",
+        # No pipe feeds these groups, so every separator asks whether one does.
+        lambda n: "{ " * n + "true; " * n,
     ],
-    ids=["nested-braces", "group-commands", "nested-ifs", "substitutions"],
+    ids=["nested-braces", "group-commands", "nested-ifs", "substitutions", "unfed-groups"],
 )
 def test_group_tracking_stays_linear(make):
     texts = {scale: make(1_000 * scale) for scale in (1, 4)}
