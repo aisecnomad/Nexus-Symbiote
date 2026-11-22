@@ -95,10 +95,11 @@ _CONSUMED_HEADERS = frozenset(
 # whole branch, required lists included, before it reports the first error.
 # Longer unsortable arrays under those keywords are refused before checking.
 _UNIQUE_ITEMS_PAIRWISE_LIMIT = 64
-# A path every client sends as written: RFC 3986 path characters, and upper-case escapes of
-# bytes that are not unreserved. WHATWG clients encode " < > ` { }; urllib3 and requests
-# also encode | ^ [ ], re-encode a stray "%", upper-case escapes, and requests decodes an
-# escaped unreserved byte. An observation of any other path is not what those clients reach.
+# A path the common clients send as written: RFC 3986 path characters, and upper-case escapes
+# of bytes that are not unreserved, not starting "//". WHATWG clients encode " < > ` { };
+# urllib3 and requests also encode | ^ [ ], re-encode a stray "%" and upper-case escapes;
+# requests decodes an escaped unreserved byte and some releases strip a leading "//". An
+# observation of any other path is not what those clients reach.
 _SENT_AS_WRITTEN_PATH = re.compile(r"(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/]|%[0-9A-F]{2})*")
 _ESCAPED_UNRESERVED = re.compile(r"%(?:2[DE]|3[0-9]|4[1-9A-F]|5[0-9AF]|6[1-9A-F]|7[0-9AE])")
 # Keywords whose values the 2020-12 metaschema checks as subschemas. It checks
@@ -347,7 +348,11 @@ def _endpoint(value: str, *, origin_only: bool = False) -> tuple[str, str, int, 
         raise DiscoveryError("invalid endpoint") from exc
     if any(unquote(part) in (".", "..") for part in parsed.path.split("/")):
         raise DiscoveryError("endpoint dot segments refused")
-    if not _SENT_AS_WRITTEN_PATH.fullmatch(parsed.path) or _ESCAPED_UNRESERVED.search(parsed.path):
+    if (
+        parsed.path.startswith("//")
+        or not _SENT_AS_WRITTEN_PATH.fullmatch(parsed.path)
+        or _ESCAPED_UNRESERVED.search(parsed.path)
+    ):
         raise DiscoveryError("endpoint path characters or escapes that clients rewrite refused")
     if host.endswith(".") or not 1 <= port <= 65535:
         raise DiscoveryError("invalid endpoint authority")

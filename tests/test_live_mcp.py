@@ -846,11 +846,15 @@ def test_a_bearer_credential_in_the_endpoint_is_refused_before_any_request(endpo
             ("https://fixture.example" + path, NOT_SENT_AS_WRITTEN)
             for path in [
                 "/m%7bcp",
-                "/m%41cp",
                 "/v1%2e0/mcp",
                 "/v1%2E0/mcp",
                 "/%7Euser/mcp",
-                "/%5Fmcp",
+                "//mcp",
+                "///mcp",
+                "//evil.example/mcp",
+                # One escape from each edge of each unreserved range: - . 0-9 A-Z _ a-z ~
+                *("/m%" + h + "cp" for h in ("2D", "2E", "30", "39", "41", "4F", "50", "5A")),
+                *("/m%" + h + "cp" for h in ("5F", "61", "6F", "70", "7A", "7E")),
             ]
         ),
         ("https://fixture.example/a/../m{cp", NOT_DOTS),
@@ -876,6 +880,9 @@ def test_endpoint_encoding_and_authority_checks_fail_before_any_request(endpoint
         "/~team/m!$&'()*+,;=:@cp",
         "/m%7Bcp%7D",
         "/a%2Fb/m%22cp",
+        "/a//b/mcp",
+        # The neighbours of each unreserved range are reserved, so their escapes are kept.
+        *("/m%" + h + "cp" for h in ("2C", "2F", "3A", "40", "5B", "5E", "60", "7B", "7F")),
     ],
 )
 def test_a_path_without_a_dot_segment_is_observed_as_written(path):
