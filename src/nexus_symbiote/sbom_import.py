@@ -116,6 +116,7 @@ class _IdentityBucket:
     provenance_ids: set[str] = field(default_factory=set)
     has_unspecified_provenance: bool = False
     has_unknown_qualifiers: bool = False
+    has_ambiguous_provenance: bool = False
 
 
 def _norm_pkg(name: str) -> str:
@@ -350,18 +351,21 @@ def _conda_requirement(raw: str) -> tuple[_CondaTerms, bool] | None:
         return None
     text = raw.strip()
     build = re.fullmatch(r"(={1,2}[0-9][^=,|]*)=([A-Za-z0-9_.+*?-]+)", text)
+    if build is None:
+        build = re.fullmatch(r"([0-9]\S*)\s+([A-Za-z0-9_.+*?-]+)", text)
     if build:
         text = build[1]
     comparisons: list[tuple[str, Version]] = []
     for term in text.split(","):
-        match = re.fullmatch(r"(<=|>=|==|!=|=|<|>)\s*([0-9]\S*)", term.strip())
+        match = re.fullmatch(r"(<=|>=|==|!=|=|<|>)?\s*([0-9]\S*)", term.strip())
         if match is None:
             return None
-        operation, literal = match.groups()
-        if operation == "=" or literal.endswith(".*"):
+        operation, literal = match[1] or "==", match[2]
+        if operation == "=" or literal.endswith("*"):
             if operation not in {"=", "==", "!="}:
                 return None
-            literal = literal.removesuffix(".*")
+            if literal.endswith("*"):
+                literal = literal[:-1].removesuffix(".")
             if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", literal):
                 return None
             operation = "not-prefix" if operation == "!=" else "prefix"
@@ -640,22 +644,45 @@ class _PurlIdentity:
     unknown_qualifiers: bool
     version: str | None = None
 
+    @property
+    def ambiguous(self) -> bool:
+        return self.unknown_qualifiers and not self.qualified
 
-def _purl_identity(purl: str | None) -> _PurlIdentity | None:
+
+def _purl_identity(purl: str | None, *, lock_origin: str | None = None) -> _PurlIdentity | None:
     if not purl:
         return None
+    path, _, query = purl.partition("#")[0].partition("?")
+    keys: set[str] = set()
+    ambiguous = False
+    if query:
+        for field in query.split("&"):
+            key, equals, value = field.partition("=")
+            key = key.strip().lower()
+            if not key or not equals or not value.strip() or key in keys:
+                ambiguous = True
+                break
+            keys.add(key)
     try:
-        package = PackageURL.from_string(purl)
+        package = PackageURL.from_string(path if ambiguous else purl)
     except ValueError:
-        # Preserve the legacy lexical identity for PURLs the parser cannot read.
-        stem = purl.partition("@")[0].partition("?")[0].partition("#")[0].lower()
-        return _PurlIdentity(stem, stem, False, False)
+        ambiguous = True
+        try:
+            package = PackageURL.from_string(path)
+        except ValueError:
+            parent, separator, name = path.rpartition("/")
+            stem = (parent + separator + name.partition("@")[0]).lower()
+            return _PurlIdentity(stem, stem, False, True)
+    stem = PackageURL(type=package.type, namespace=package.namespace, name=package.name).to_string()
+    if ambiguous:
+        return _PurlIdentity(stem, stem, False, True, package.version)
     qualifiers = {
         name: _repository_identity(value) if name == "repository_url" else value
         for name, value in (package.qualifiers or {}).items()
         if name not in _PURL_METADATA_QUALIFIERS
     }
-    stem = PackageURL(type=package.type, namespace=package.namespace, name=package.name).to_string()
+    if lock_origin and package.type in {"npm", "pypi"}:
+        qualifiers.setdefault("repository_url", _repository_identity(lock_origin))
     identity = PackageURL(
         type=package.type, namespace=package.namespace, name=package.name, qualifiers=qualifiers
     ).to_string()
@@ -773,6 +800,7 @@ def _record_provenance(buckets: dict[str, _IdentityBucket], record: _Provenance 
     bucket = buckets.setdefault(base, _IdentityBucket())
     if qualified is None:
         bucket.has_unspecified_provenance = True
+        bucket.has_ambiguous_provenance |= unknown
     elif len(bucket.provenance_ids) < 2:
         # Two distinct values suffice to detect disagreement with any qualifier.
         bucket.provenance_ids.add(qualified)
@@ -788,6 +816,8 @@ def _provenance_disagrees(
     bucket = buckets.get(base)
     if bucket is None:
         return False
+    if bucket.has_ambiguous_provenance or (qualified is None and unknown):
+        return True
     if qualified is None:
         return bucket.has_unknown_qualifiers
     return any(peer != qualified for peer in bucket.provenance_ids) or (
@@ -872,8 +902,15 @@ def import_foreign_sbom(
     context = _identity_binding(key, "context-v4")
     incomplete_identity = False
     for existing in bom.components:
+        lock_origin = (
+            existing.registry_uri
+            if isinstance(existing, RegistryEntryComponent)
+            and existing.properties.get("collection_mode") == "lockfile-resolution-claim"
+            else None
+        )
         purl = _purl_identity(
-            existing.package_url if isinstance(existing, RegistryEntryComponent) else None
+            existing.package_url if isinstance(existing, RegistryEntryComponent) else None,
+            lock_origin=lock_origin,
         )
         provenance = _purl_provenance(purl, key)
         keys_for_existing = _identity_tokens(
@@ -973,7 +1010,9 @@ def import_foreign_sbom(
         else:
             nm_hex = hashlib.sha256(raw_name.strip().encode()).hexdigest()[:16]
             shown_name, hash_mode = f"imported-{nm_hex}", "unsalted-sha256"
-        display_purl = _display_purl(entry["purl"]) if reveal_names else None
+        display_purl = (
+            _display_purl(entry["purl"]) if reveal_names and purl and not purl.ambiguous else None
+        )
         clean_purl = _clean_str(display_purl)[:512] if display_purl else None
         sha256_val: str | None = entry["sha256"]
         eco = _ENTRY_ECO_MAP.get(entry["type"]) or _purl_eco(entry["purl"]) or "any"
