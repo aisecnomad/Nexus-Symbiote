@@ -81,7 +81,7 @@ _CREDENTIAL_PUNCTUATION = frozenset("._~+/=-")
 # REGION_ASIAPACIFICSOUTHEAST1 would read as one. The AI-vendor prefixes also open
 # ordinary names (pplx-7b-online, fw_config_loader), so each needs a body of at
 # least 20 characters in the vendor's own alphabet.
-_DISTINCT_SHAPES = (
+_OTHER_DISTINCT_SHAPES = (
     r"gh[oprsu]_[A-Za-z0-9]{36,}+|github_pat_\w{22,}+|glpat-[\w-]{20,}+"
     r"|xox[abeoprs]-[\w-]{10,}+|[rs]k_(?:live|test)_[A-Za-z0-9]{16,}+"
     r"|(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])|AIza[\w-]{35}|ya29\.[\w-]{20,}+"
@@ -100,8 +100,12 @@ _DISTINCT_SHAPES = (
     # stamp that is not a lower-case word, and an HMAC: not plugin.module.Class names.
     r"|(?<![A-Za-z0-9])[MNO](?=[A-Za-z0-9]{0,26}[0-9])[A-Za-z0-9]{23,27}"
     r"\.(?![A-Za-z][a-z]{5}\.)[\w-]{6}\.[\w-]{27,38}(?![\w-])"
-    r"|sk-ant-[\w-]{20,}+"
 )
+_SK_BODY = (
+    r"(?:or-v1|lf|proj|svcacct|admin)-[A-Za-z0-9_-]{20,}+"
+    r"|ant-[\w-]{20,}+|[A-Za-z0-9]{32,}+"
+)
+_DISTINCT_SHAPES = rf"{_OTHER_DISTINCT_SHAPES}|sk-(?:{_SK_BODY})"
 # A JWT can fail only at its first dot, so it starts only at a word boundary: started
 # after every "_" its first segment would be rescanned once per position.
 _JWT = r"eyJ[\w-]{8,}+\.[\w-]{8,}+(?:\.[\w-]++)?"
@@ -116,15 +120,26 @@ _NAMED_TOKEN = re.compile(rf"(?<![\w-]){_JWT}|(?<![A-Za-z0-9])(?:{_DISTINCT_SHAP
 # The same shapes with no boundary before them: a credential glued to a prefix, as in
 # "prod-sk-ant-...", "1ghp_..." or "xAKIA...". The sk- form also needs two digits, so a
 # plain name such as disk-management-service-v2 does not read as one.
-_EMBEDDED_TOKEN = re.compile(rf"(?:AKIA|ASIA)[A-Z0-9]{{16}}|(?:{_DISTINCT_SHAPES})")
+_EMBEDDED_TOKEN = re.compile(rf"(?:AKIA|ASIA)[A-Z0-9]{{16}}|(?:{_OTHER_DISTINCT_SHAPES})")
+_EMBEDDED_SK = re.compile(rf"sk-(?:{_SK_BODY})")
+_DISTINCT_SK_BODY = re.compile(_SK_BODY)
 _TOKEN_SEGMENT = re.compile(r"[\w-]++")
+# A complete public package word can end in the two letters of the key prefix.
+# Treat that lexical component as a unit. A specific provider marker with an
+# opaque body still supplies independent evidence, even after one of these words.
+_REGISTRY_SK_START = re.compile(
+    r"(?P<word>(?<![A-Za-z0-9])(?i:desk|disk|dusk|flask|husk|kiosk|mask|multitask|risk|task|tusk)-)|sk-"
+)
+_PROVIDER_SK_BODY = re.compile(
+    r"(?:(?:or-v1|lf)-[A-Za-z0-9_-]{20}|ant-[\w-]{20}|(?:proj|svcacct|admin)-[A-Za-z0-9]{20})"
+)
 _DECIMAL_DIGIT = re.compile(r"\d")
 _JWT_PAYLOAD_START = re.compile(r"\.[\w-]{8}")
 
 
-def holds_token_shape(text: str) -> bool:
-    """Whether a credential shape occurs anywhere in ``text``, also glued to other text."""
-    if _EMBEDDED_TOKEN.search(text) is not None:
+def holds_token_shape(text: str, *, require_sk_boundary: bool = False) -> bool:
+    """Find token shapes, optionally distinguishing a generic sk- prefix from a word suffix."""
+    if _EMBEDDED_TOKEN.search(text) or (not require_sk_boundary and _EMBEDDED_SK.search(text)):
         return True
     if "sk-" not in text and "eyJ" not in text:
         return False
@@ -132,7 +147,19 @@ def holds_token_shape(text: str) -> bool:
     # can tell us anything new about the remaining length and digit count.
     for segment in _TOKEN_SEGMENT.finditer(text):
         start, end = segment.span()
-        key = text.find("sk-", start, end)
+        if require_sk_boundary:
+            key = -1
+            for match in _REGISTRY_SK_START.finditer(text, start, end):
+                if match.lastgroup == "word":
+                    if _PROVIDER_SK_BODY.match(text, match.end(), end):
+                        return True
+                    continue
+                if _DISTINCT_SK_BODY.match(text, match.end(), end):
+                    return True
+                if key < 0:
+                    key = match.start()
+        else:
+            key = text.find("sk-", start, end)
         if key >= 0 and end - key >= 23:
             first = _DECIMAL_DIGIT.search(text, key + 3, end)
             if first is not None and _DECIMAL_DIGIT.search(text, first.end(), end) is not None:
