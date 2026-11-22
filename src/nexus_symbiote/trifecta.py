@@ -385,11 +385,33 @@ _IDE_GRANT_LEGS: dict[str, frozenset[str]] = {
 # An approval record gates its component only when it covers every action or all egress.
 _GATING_ACTIONS = frozenset({"*", "egress"})
 _READ_ACTIONS = frozenset({"read", "query", "list", "search", "get"})
-_NAMED_RESOURCE_SCOPE = re.compile(r"[\w-]+(?:/[\w.?*-]+)*/?")
-_TABLE_SCOPE = re.compile(r"table:[^\W\d][\w-]*(?:\.[^\W\d][\w-]*)*")
+_DATA_NAME = r"[^\W\d][\w-]*"
+_TABLE_NAME = re.compile(rf"{_DATA_NAME}(?:\.{_DATA_NAME})*")
+_KB_NAME = re.compile(rf"(?P<root>{_DATA_NAME})(?:/[\w.?*-]+)*/?")
 _S3_BUCKET_SCOPE = re.compile(
     r"arn:(?:aws|aws-cn|aws-us-gov):s3:::"
     r"(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])(?:/[\w.?*-]+)*/?"
+)
+_DYNAMODB_SCOPE = re.compile(
+    r"arn:(?:aws|aws-cn|aws-us-gov):dynamodb:[a-z]{2}(?:-[a-z0-9]+)+-[1-9][0-9]*:"
+    r"[0-9]{12}:table/[A-Za-z0-9_.-]{3,255}(?:/index/[A-Za-z0-9_.-]{3,255})?"
+)
+_HOST_SUFFIXES = frozenset(
+    [
+        "arpa",
+        "com",
+        "edu",
+        "example",
+        "gov",
+        "int",
+        "internal",
+        "invalid",
+        "local",
+        "mil",
+        "net",
+        "org",
+        "test",
+    ]
 )
 _UNBOUNDED_OR_NETWORK_NAMES = frozenset(
     [
@@ -672,27 +694,30 @@ def _independent_read(record: AuthorizationRecord) -> bool:
     """A named read can coexist with egress approval. A network or unbounded grant cannot."""
     if record.action.strip().casefold() not in _READ_ACTIONS or not record.resource_scope:
         return False
-    scope = unicodedata.normalize("NFKC", record.resource_scope)
+    scope = record.resource_scope
     if {".", ".."}.intersection(scope.split("/")):
         return False
-    if _TABLE_SCOPE.fullmatch(scope):
-        return True
+    # A bare identifier, host, or slash namespace cannot establish what a tool
+    # reads. Only an explicit data type or a resource-specific ARN supplies it.
+    kind, colon, value = scope.partition(":")
+    if not colon or not kind.isascii():
+        return False
+    if kind.lower() == "table" and _TABLE_NAME.fullmatch(value):
+        parts = [canonical_tool_name(part) for part in value.split(".")]
+        if len(parts) > 1 and parts[-1] in _HOST_SUFFIXES:
+            return False
+        return all(
+            part not in _UNBOUNDED_OR_NETWORK_NAMES or (part == "public" and i < len(parts) - 1)
+            for i, part in enumerate(parts)
+        )
+    if kind.lower() == "kb":
+        kb = _KB_NAME.fullmatch(value)
+        return kb is not None and canonical_tool_name(kb["root"]) not in _UNBOUNDED_OR_NETWORK_NAMES
     bucket = _S3_BUCKET_SCOPE.fullmatch(scope)
     if bucket is not None:
         name = bucket["bucket"]
         return ".." not in name and re.fullmatch(r"\d+(?:\.\d+){3}", name) is None
-    if _NAMED_RESOURCE_SCOPE.fullmatch(scope) is None:
-        return False
-    name = canonical_tool_name(scope.partition("/")[0])
-    words = (part.rstrip("0123456789") for part in name.split("_"))
-    if not _UNBOUNDED_OR_NETWORK_NAMES.isdisjoint(words):
-        return False
-    compact = name.replace("_", "")
-    if re.fullmatch(r"0x[0-9a-f]+|[0-9a-f]{1,8}", compact) and any(
-        char.isdecimal() for char in compact
-    ):
-        return False
-    return any(char.isalpha() for char in name)
+    return _DYNAMODB_SCOPE.fullmatch(scope) is not None
 
 
 def _unexpired(record: AuthorizationRecord, now: datetime) -> bool:
