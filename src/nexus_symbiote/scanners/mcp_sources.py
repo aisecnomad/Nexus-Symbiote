@@ -39,6 +39,7 @@ from nexus_symbiote.scanners.python_tools import (
     _AGENT_FACTORIES,
     _DECORATOR_IMPORTS,
     _FACTORIES,
+    _SDK_IMPORT_ROOTS,
     PYTHON_TOOL_HINTS,
     _annotation_names,
     _ProjectImports,
@@ -1144,6 +1145,40 @@ def _python_launches(tree: ast.Module, project_imports: _ProjectImports) -> list
     return sorted(gaps)
 
 
+def _plain_flat_module(path: Path, source: _Source, node_limit: int) -> bool:
+    """Whether this file provably cannot provide submodules when imported by its stem.
+
+    A sibling SDK-named file can run as a module before a dotted import finishes.
+    Missing, unreadable or unclassified evidence must keep that ambiguity visible.
+    """
+    try:
+        tree = parse_python(_python_text(source.head))
+    except (_UnreadableError, SyntaxError, ValueError, RecursionError):
+        return False
+    if next(islice(ast.walk(tree), node_limit, None), None) is not None:
+        return False
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Pass) or (
+            isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+        ):
+            continue
+        if (
+            isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Constant)
+            and all(isinstance(t, ast.Name) and not t.id.startswith("__") for t in stmt.targets)
+        ):
+            continue
+        # As a flat top-level module this import raises before any later code
+        # can install a submodule. As a package member it can use the real SDK.
+        return (
+            isinstance(stmt, ast.ImportFrom)
+            and not stmt.level
+            and stmt.module is not None
+            and stmt.module.startswith(path.stem + ".")
+        )
+    return True
+
+
 def _outcome(result: ScanResult) -> tuple[int, int, int]:
     return (
         len(result.components),
@@ -1174,6 +1209,7 @@ def collect_source_references(
     clients = [_Kind(_script_source(suffix), _client_candidate) for suffix in _CLIENT_SUFFIXES]
     kinds = (servers, python, *clients)
     python_paths = frozenset(path for path in sources if path.suffix == ".py")
+    plain_modules: set[Path] = set()
     eligible = [path for path in sources if any(kind.eligible(path) for kind in kinds)]
     # Root files first, as before, so what a lowered budget reads stays predictable.
     eligible.sort(key=lambda path: len(path.parts) > 1)
@@ -1198,6 +1234,15 @@ def collect_source_references(
                 if files.bytes_exhausted:
                     break
                 continue
+            if (
+                path.suffix == ".py"
+                and path.stem in _SDK_IMPORT_ROOTS
+                and path.parent / "__init__.py" in python_paths
+                and source.complete
+                and source.size <= settings.syntax_bytes
+                and _plain_flat_module(path, source, python_nodes.value)
+            ):
+                plain_modules.add(path)
             candidate = False
             for kind in kinds:
                 if not kind.eligible(path):
@@ -1227,6 +1272,7 @@ def collect_source_references(
         collect_typescript_source(path, content, result, known)
         if _outcome(result) != before:
             surfaces.append(path.as_posix())
+    flat_modules = frozenset(plain_modules)
     for path, content in python.selected:
         location = path.as_posix()
         before = _outcome(result)
@@ -1246,10 +1292,7 @@ def collect_source_references(
             if len(nodes) > python_nodes.value:
                 fail(path, python_nodes.exceeded())
                 continue
-            roots: tuple[Path, ...] = (Path(), Path("src"))
-            if path.parent / "__init__.py" not in python_paths and path.parent not in roots:
-                roots = (*roots, path.parent)
-            project_imports = _ProjectImports(python_paths, roots)
+            project_imports = _ProjectImports(python_paths, path.parent, flat_modules)
             collect_python_tools(
                 tree, nodes, text, path, result, known, project_imports=project_imports
             )

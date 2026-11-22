@@ -32,27 +32,39 @@ def _names(words: str) -> frozenset[str]:
 
 
 class _ProjectImports(NamedTuple):
-    """Python modules found by the confined source walk on common import paths."""
+    """Possible Python search roots and the files found by the confined walk."""
 
     sources: frozenset[Path]
-    roots: tuple[Path, ...]
+    entry_dir: Path
+    plain_modules: frozenset[Path]
+
+    def _module_at(self, root: Path, relative: Path) -> bool:
+        return (
+            root / relative.with_suffix(".py") in self.sources
+            or root / relative / "__init__.py" in self.sources
+        ) and all(root / p / "__init__.py" in self.sources for p in relative.parents if p.parts)
 
     def has_module(self, module: str) -> bool:
+        # A local exemption requires a regular module in every plausible first
+        # search root: the checkout for -m, the entry directory for a script,
+        # and the source root for a module installed from a src layout.
         relative = Path(*module.split("."))
-        for root in self.roots:
-            if not (
-                root / relative.with_suffix(".py") in self.sources
-                or root / relative / "__init__.py" in self.sources
-            ):
-                continue
-            # A namespace portion does not take precedence over an installed
-            # regular package of the same name.
-            if all(root / p / "__init__.py" in self.sources for p in relative.parents if p.parts):
-                return True
-        return False
+        return (
+            self._module_at(Path(), relative)
+            and self._module_at(self.entry_dir, relative)
+            and (self.entry_dir.parts[:1] != ("src",) or self._module_at(Path("src"), relative))
+        )
 
     def shadows(self, module: str) -> bool:
-        return self.has_module(module.partition(".")[0])
+        # One plausible checkout binding is enough to withhold SDK provenance.
+        name, dotted, _ = module.partition(".")
+        for root in (Path(), Path("src"), self.entry_dir):
+            if root / name / "__init__.py" in self.sources:
+                return True
+            flat = root / (name + ".py")
+            if flat in self.sources and (not dotted or flat not in self.plain_modules):
+                return True
+        return False
 
 
 _FACTORIES = {
@@ -1263,6 +1275,24 @@ _SDK_TYPES = (
 )
 
 
+# Concrete SDK context parameters used by its public examples. They are safe as
+# direct arguments of the real Context generic, not operands of arbitrary code.
+_CONTEXT_ARGUMENTS = frozenset(
+    {
+        ("mcp", "ServerSession"),
+        ("mcp.server.session", "ServerSession"),
+        ("mcp.shared.context", "RequestContext"),
+        ("mcp.types", "Request"),
+        ("mcp.types", "ServerRequest"),
+        ("starlette.requests", "Request"),
+    }
+)
+_SDK_IMPORT_ROOTS = frozenset(
+    module.partition(".")[0]
+    for module, _ in _SDK_TYPES | _CONTEXT_ARGUMENTS | set(_DECORATOR_IMPORTS)
+)
+
+
 class _TypeSyntax:
     """Which parts of annotations Python evaluates only as types.
 
@@ -1283,13 +1313,19 @@ class _TypeSyntax:
         )
         self._sdk_generics = _SDK_GENERICS & self._sdk_types
         self._optional_types = (_FACTORIES | _SDK_GENERICS) & self._sdk_types
+        self._context_arguments = {
+            identity
+            for identity in _CONTEXT_ARGUMENTS
+            if project_imports is None or not project_imports.shadows(identity[0])
+        }
+        known_classes = self._sdk_types | self._context_arguments
         bindings = _bindings(nodes)
         imported: dict[str, list[tuple[str, str]]] = {}
         for node in nodes:
             if isinstance(node, ast.ImportFrom) and not node.level and node.module is not None:
                 for alias in node.names:
                     identity = (node.module, alias.name)
-                    if identity in self._sdk_types:
+                    if identity in known_classes:
                         imported.setdefault(alias.asname or alias.name, []).append(identity)
         self._classes = {
             name: paths[0]
@@ -1350,6 +1386,21 @@ class _TypeSyntax:
             stack.pop()
         return known[node]
 
+    def _sdk_subscript(self, annotation: ast.Subscript) -> bool:
+        generic = self._sdk_type(annotation.value)
+        if generic is None or generic not in self._sdk_generics:
+            return False
+        if self.pure(annotation.slice):
+            return True
+        if generic[1] != "Context":
+            return False
+        arguments = (
+            annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
+        )
+        return all(
+            self.pure(arg) or self._sdk_type(arg) in self._context_arguments for arg in arguments
+        )
+
     def parts(self, annotations: Sequence[ast.expr]) -> set[ast.AST]:
         """The names, attributes of names and string constants used only as types."""
         pending = list(annotations)
@@ -1379,10 +1430,7 @@ class _TypeSyntax:
                 pending += annotation.elts
             elif isinstance(annotation, ast.Subscript) and (
                 _generic(annotation.value, self._names, self._roots)
-                or (
-                    self._sdk_type(annotation.value) in self._sdk_generics
-                    and self.pure(annotation.slice)
-                )
+                or self._sdk_subscript(annotation)
             ):
                 found.update(_chain(annotation.value) or ())
                 pending.append(annotation.slice)
