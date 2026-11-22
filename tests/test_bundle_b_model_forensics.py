@@ -229,7 +229,7 @@ def test_safetensors_valid_and_malformed_non_pickle_preserve_verdicts(tmp_path: 
         # its "}}" and the apostrophe after it is text, not the start of a string.
         b'{{ ("x") ~ "y" }} Don\'t {{ a["_" ~ "_class_" ~ "_"] }}',
         b"{{ ('<|' + message['role'] + '|>') + '\\n' }} Don't "
-        b'{{ cycler["_" ~ "_init_" ~ "_"]["_" ~ "_globals_" ~ "_"] }}',
+        + b'{{ cycler["_" ~ "_init_" ~ "_"]["_" ~ "_globals_" ~ "_"] }}',
         # Jinja2 3.x ends this raw block at "+%}", 2.x only at the later "{% endraw %}",
         # which makes the payload a live tag: both readings are checked.
         b'{% raw %}X{% endraw +%}{# {% endraw %}{{ a["_" ~ "_class_" ~ "_"] }} #}',
