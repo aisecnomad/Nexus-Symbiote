@@ -49,7 +49,10 @@ def test_minimum_observed_assurance_is_attainable_for_measured_inventories(tmp_p
     prompt = next(c for c in AIBOM.load(target).components if c.bom_ref == "prompt:CLAUDE.md")
     assert prompt.assurance_level.value == "observed"
     (project / ".nexus-symbiote.yaml").write_text("validate: {minimum_assurance_level: observed}\n")
-    result = CliRunner().invoke(main, ["validate", str(target), "--project", str(project)])
+    result = CliRunner().invoke(
+        main,
+        ["validate", str(target), "--project", str(project), "--accept-project-policy"],
+    )
     assert result.exit_code == 0, result.output
     # A hosted-model alias is only a declaration; no collector observed or measured it.
     (project / "agent.yaml").write_text(
@@ -57,7 +60,10 @@ def test_minimum_observed_assurance_is_attainable_for_measured_inventories(tmp_p
         "models: {chat: {provider: example, requested_ref: latest}}\n"
     )
     _scan(project, target)
-    result = CliRunner().invoke(main, ["validate", str(target), "--project", str(project)])
+    result = CliRunner().invoke(
+        main,
+        ["validate", str(target), "--project", str(project), "--accept-project-policy"],
+    )
     assert result.exit_code == 1
     assert "minimum observed assurance not attained (1 declared component)" in result.output
 
@@ -69,7 +75,14 @@ def test_risk_json_records_the_effective_gate_and_its_origin(tmp_path):
     (project / ".nexus-symbiote.yaml").write_text("risk: {warn_threshold: 10}\n")
     target = tmp_path / "bom.json"
     _scan(project, target)
-    args = ["risk", str(target), "--project", str(project), "--json-output"]
+    args = [
+        "risk",
+        str(target),
+        "--project",
+        str(project),
+        "--accept-project-policy",
+        "--json-output",
+    ]
     payload = json.loads(CliRunner().invoke(main, args).stdout)
     assert payload["gate"] == {
         "fail_threshold": 50.0,
@@ -116,7 +129,14 @@ def test_a_derived_warning_threshold_is_not_attributed_to_the_project_policy(
     (project / ".nexus-symbiote.yaml").write_text(policy)
     target = tmp_path / "bom.json"
     _scan(project, target)
-    args = ["risk", str(target), "--project", str(project), "--json-output"]
+    args = [
+        "risk",
+        str(target),
+        "--project",
+        str(project),
+        "--accept-project-policy",
+        "--json-output",
+    ]
     gate = json.loads(CliRunner().invoke(main, args).stdout)["gate"]
     assert gate["fail_threshold_source"] == fail_source
     assert gate["warn_threshold"] == warn_threshold

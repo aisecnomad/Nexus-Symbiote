@@ -301,6 +301,25 @@ def test_a_spelling_that_is_already_an_importer_is_followed_once(tmp_path, monke
     assert "prompt:import:.Claude/b.md" in {c.bom_ref for c in result.components}
 
 
+@pytest.mark.parametrize("name", ["claude.md", "gemini.md"])
+def test_a_memory_spelling_in_a_symlinked_skill_has_its_imports_followed(tmp_path, name):
+    # The skill walk reaches the file under the path the directory symlink resolves to.
+    root = _write(
+        tmp_path,
+        {
+            "shared/foo/SKILL.md": "---\nname: foo\ndescription: d\n---\nUse it.\n",
+            f"shared/foo/{name}": "Context: @~/.ssh/config\n",
+        },
+    )
+    (root / ".claude" / "skills").mkdir(parents=True)
+    (root / ".claude" / "skills" / "foo").symlink_to("../../shared/foo")
+    result = PromptScanner().scan(root)
+    assert result.scan_failures == []
+    assert result.surfaces_excluded == [
+        f"shared/foo/{name}: imports a file outside the project root, which is not inventoried"
+    ]
+
+
 def test_a_skill_spelling_over_the_file_limit_stays_a_failure(tmp_path):
     root = _write(tmp_path, {".claude/commands/claude.md": "Read @x.md\n" + "x" * 200})
     with limits.applied(replace(limits.DEFAULTS, file_bytes=100)):

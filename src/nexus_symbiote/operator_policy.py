@@ -332,12 +332,27 @@ def append_step_summary(path: Path, rendered: str, *, project: Path | None = Non
         raise output_failure(exc) from exc
 
 
-def narrow_policy(operator: Policy, project: Policy | None) -> tuple[Policy, list[str]]:
+def narrow_policy(
+    operator: Policy, project: Policy | None, *, inherit_unspecified: bool = False
+) -> tuple[Policy, list[str]]:
     """Combine operator and project policies so the project policy can only tighten gates."""
     if project is None:
         return operator, []
 
     clamped: list[str] = []
+    explicit_excludes = "exclude_paths" in project.scan.model_fields_set
+    if inherit_unspecified:
+        # A checkout that sets one threshold has made no request about the other
+        # gates. Compare only its explicit settings with the operator's baseline.
+        overrides = {}
+        for name in ("scan", "risk", "validation", "output"):
+            section = getattr(project, name)
+            inherited = getattr(operator, name)
+            updates = {key: getattr(section, key) for key in section.model_fields_set}
+            overrides[name] = inherited.model_copy(update=updates)
+        project = operator.model_copy(update=overrides)
+        if project.output != operator.output:
+            clamped.append("output.default_format (kept operator format)")
 
     # 1. Scan section: project cannot drop operator-required scanners, add exclusions,
     # or relax error mode to report-only.
@@ -354,7 +369,7 @@ def narrow_policy(operator: Policy, project: Policy | None) -> tuple[Policy, lis
         clamped.append("scan.exclude_paths (refused extra project exclusions)")
     # Excluding fewer paths only widens collection, so a project may narrow to none; one
     # that does not set the list keeps the operator's.
-    if "exclude_paths" in project.scan.model_fields_set:
+    if inherit_unspecified or explicit_excludes:
         effective_excludes = [
             p for p in operator.scan.exclude_paths if p in set(project.scan.exclude_paths)
         ]
@@ -397,7 +412,7 @@ def narrow_policy(operator: Policy, project: Policy | None) -> tuple[Policy, lis
         effective_assurance = proj_assure
 
     # 3. Risk section: fail_threshold takes min, fail_on_severity takes stricter,
-    # ignore_categories and suppressions take intersection with operator's allowlist.
+    # Category ignores can narrow. Individual reviewed suppressions belong to the operator.
     if project.risk.fail_threshold > operator.risk.fail_threshold:
         clamped.append(f"risk.fail_threshold={operator.risk.fail_threshold!r}")
     effective_fail = min(operator.risk.fail_threshold, project.risk.fail_threshold)
@@ -423,15 +438,14 @@ def narrow_policy(operator: Policy, project: Policy | None) -> tuple[Policy, lis
     ]
 
     op_supp_keys = {
-        (s.component_ref, s.category, s.fingerprint): s for s in operator.risk.suppressions
+        (s.component_ref, s.category, s.fingerprint) for s in operator.risk.suppressions
     }
     proj_supp_keys = {
         (s.component_ref, s.category, s.fingerprint) for s in project.risk.suppressions
     }
-    unapproved_supps = proj_supp_keys - set(op_supp_keys)
+    unapproved_supps = proj_supp_keys - op_supp_keys
     if unapproved_supps:
         clamped.append(f"risk.suppressions (refused {len(unapproved_supps)} checkout suppressions)")
-    effective_suppressions = list(operator.risk.suppressions)
 
     narrowed = Policy(
         version="1.0",
@@ -445,7 +459,7 @@ def narrow_policy(operator: Policy, project: Policy | None) -> tuple[Policy, lis
             warn_threshold=effective_warn,
             fail_on_severity=effective_sev,
             ignore_categories=effective_ignored,
-            suppressions=effective_suppressions,
+            suppressions=operator.risk.suppressions,
         ),
         validate=ValidatePolicy(
             require_completeness=req_comp,

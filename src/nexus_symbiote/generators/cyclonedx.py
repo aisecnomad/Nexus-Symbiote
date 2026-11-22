@@ -7,6 +7,7 @@ namespaces. docs/standard-exports.md describes the mapping and the property name
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from referencing.exceptions import Unresolvable
@@ -154,7 +155,13 @@ class CycloneDXGenerator(Generator):
             require_valid(document, "cyclonedx")
         return document
 
-    def _projection(self, aibom: AIBOM, native: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _projection(
+        self,
+        aibom: AIBOM,
+        native: dict[str, Any] | None = None,
+        *,
+        legacy_locations: bool = False,
+    ) -> dict[str, Any]:
         prepare(aibom)
         native = native_document(aibom) if native is None else native
         components = native_components(native)
@@ -187,6 +194,7 @@ class CycloneDXGenerator(Generator):
                     subject=subject,
                     comp_by_ref=comp_by_ref,
                     outgoing_edges=outgoing_by_source.get(c.bom_ref, ()),
+                    legacy_locations=legacy_locations,
                 )
                 for c in sorted(aibom.components, key=lambda c: c.bom_ref)
                 if c is not subject
@@ -338,18 +346,18 @@ class CycloneDXGenerator(Generator):
         else:
             require_valid(document, "cyclonedx")
         recovered, native = recover_native(properties)
+        candidates: Iterable[dict[str, Any]]
         if projection == PROJECTION:
             candidates = [
                 cls(projection_version=2, spec_version="1.7")._projection(recovered, native)
             ]
-        elif projection == PROJECTION_V3_17:
-            candidates = [
-                cls(projection_version=3, spec_version="1.7")._projection(recovered, native)
-            ]
-        elif projection == PROJECTION_V3_16:
-            candidates = [
-                cls(projection_version=3, spec_version="1.6")._projection(recovered, native)
-            ]
+        elif projection in {PROJECTION_V3_17, PROJECTION_V3_16}:
+            version = "1.7" if projection == PROJECTION_V3_17 else "1.6"
+            exporter = cls(projection_version=3, spec_version=version)
+            candidates = (
+                exporter._projection(recovered, native, legacy_locations=legacy)
+                for legacy in (False, True)
+            )
         elif projection is None:
             candidates = [
                 _legacy.cyclonedx_projection(recovered, native, historical=historical)
@@ -464,9 +472,11 @@ class CycloneDXGenerator(Generator):
         subject: AnyComponent | None = None,
         comp_by_ref: dict[str, AnyComponent] | None = None,
         outgoing_edges: Any = (),
+        legacy_locations: bool = False,
     ) -> dict[str, Any]:
         from nexus_symbiote.spdx_profiles import (
             _clean_url,
+            _projected_download_location,
             clean_license_identifier,
             spdx_license_expression,
             spdx_license_ids,
@@ -496,9 +506,12 @@ class CycloneDXGenerator(Generator):
                     result["licenses"] = [{"license": {"id": expr} | ack}]
                 else:
                     result["licenses"] = [{"expression": expr} | ack]
-            # An observed URI may carry a query token; the same cleaning applies.
-            observed_dl = _clean_url(getattr(comp, "source_uri", None))
-            dl = observed_dl or comp.properties.get("declared_download_location")
+            # An observed URI may carry a query token, and a supplied inventory any declared
+            # value, such as javascript: or a credentialed URL; the same cleaning applies.
+            observed_dl = _clean_url(getattr(comp, "source_uri", None), legacy=legacy_locations)
+            dl = observed_dl or _projected_download_location(
+                comp.properties.get("declared_download_location"), legacy=legacy_locations
+            )
             if isinstance(dl, str) and _is_uri(dl):
                 ref = {"type": "distribution", "url": dl}
                 result["externalReferences"] = [

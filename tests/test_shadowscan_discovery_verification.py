@@ -234,16 +234,20 @@ def test_unsigned_import_fails_in_ci_unless_explicitly_allowed(tmp_path, monkeyp
 def test_validate_warns_interactively_and_fails_in_ci(tmp_path, monkeypatch):
     _clear_ci(monkeypatch)
     project, bom = _project(tmp_path)
-    interactive = CliRunner().invoke(main, ["validate", str(bom), "--project", str(project)])
+    interactive = CliRunner().invoke(
+        main,
+        ["validate", str(bom), "--project", str(project), "--accept-project-policy"],
+    )
     assert interactive.exit_code == 0, interactive.output
     assert "UNVERIFIED" in interactive.output
 
     monkeypatch.setenv("CI", "true")
-    # The lenient project policy is itself refused in CI unless accepted explicitly;
-    # accepting it leaves the discovery gate to decide.
+    # Without --accept-project-policy the lenient file is not applied, so the
+    # built-in integrity gate fails and the warning names the flag.
     refused = CliRunner().invoke(main, ["validate", str(bom), "--project", str(project)])
     assert refused.exit_code == 1
     assert "--accept-project-policy" in refused.output
+    assert "looks like CI" not in refused.output
     accept = ["--project", str(project), "--accept-project-policy"]
     ci = CliRunner().invoke(main, ["validate", str(bom), *accept])
     assert ci.exit_code == 1
@@ -256,7 +260,15 @@ def test_validate_warns_interactively_and_fails_in_ci(tmp_path, monkeypatch):
 
     _clear_ci(monkeypatch)
     allowed = CliRunner().invoke(
-        main, ["validate", str(bom), "--project", str(project), "--allow-unsigned-discovery"]
+        main,
+        [
+            "validate",
+            str(bom),
+            "--project",
+            str(project),
+            "--accept-project-policy",
+            "--allow-unsigned-discovery",
+        ],
     )
     assert allowed.exit_code == 0, allowed.output
     assert "UNVERIFIED" in allowed.output
@@ -573,7 +585,7 @@ def test_project_report_only_policy_cannot_cancel_fail_on_unsigned_discovery(tmp
     _clear_ci(monkeypatch)
     project, _ = _project(tmp_path)
     (project / ".nexus-symbiote.yaml").write_text(LENIENT + "scan: {failure_mode: report-only}\n")
-    result = _scan_check(project, "--fail-on-unsigned-discovery")
+    result = _scan_check(project, "--accept-project-policy", "--fail-on-unsigned-discovery")
     assert result.exit_code == 1, result.output
     assert "report only: exit status 0" not in result.output
 
@@ -584,7 +596,7 @@ def test_scan_report_only_does_not_relax_a_failed_producer_check(tmp_path, monke
     (project / ".nexus-symbiote.yaml").write_text(
         "validate: {require_integrity: false, require_discovery_signature: true}\n"
     )
-    result = _scan_check(project, "--report-only")
+    result = _scan_check(project, "--accept-project-policy", "--report-only")
     assert result.exit_code == 1, result.output
     assert "report only: exit status 0" not in result.output
 

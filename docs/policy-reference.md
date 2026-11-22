@@ -13,15 +13,17 @@ A project policy selects collectors and sets the thresholds of the `scan`, `vali
 
 ## Where the policy comes from
 
-| Command | Policy read from | Ignored with |
+| Command | Checkout policy location | Ignore checkout policy |
 | --- | --- | --- |
 | `scan PATH` | `PATH/.nexus-symbiote.yaml` or `PATH/.nexus-symbiote.yml` | `--no-project-policy` |
-| `validate`, `risk` | the directory named with `--project`; without `--project`, the built-in policy | `--no-project-policy` |
-| `baseline` | the scanned directory for collection, but the staged inventory is re-gated with the built-in risk policy | |
+| `validate`, `risk` | The directory supplied with `--project` | `--no-project-policy` |
+| `baseline` | The scanned directory for collection. The staged inventory is checked against the built-in risk policy. | `--no-project-policy` |
 
-A policy file in a parent directory, or beside an inventory file, is never applied; `validate` and `risk` name such a file on stderr when they did not apply it. When both `.nexus-symbiote.yaml` and `.nexus-symbiote.yml` exist, a command that reads the project policy refuses to run until one is removed, because either could silently shadow the other; `init` refuses too, and `init --force` overwrites the one file that exists. A symbolic link, a non-regular file or a file over 1 MiB is refused.
+The CLI applies each checkout setting that tightens the governing policy, including in a mixed file. If a setting weakens a gate or changes the output format, the CLI withholds that change and warns on standard error. After reviewing the file, pass `--accept-project-policy` to apply it. A signed operator policy still bounds the result. Omitted settings inherit the operator's values. Use `--no-project-policy` to skip the checkout file entirely. The GitHub Action selects this mode explicitly. CI environment variables have no effect on these choices.
 
-The built-in policy is what you get with no file, or with `--no-project-policy`. Use `--no-project-policy` whenever the checkout must not choose your gates, for example for a pull request from an untrusted fork. The GitHub Action always passes it. When a CI variable such as `CI` or `GITHUB_ACTIONS` is set, `scan`, `validate` and `risk` refuse a project policy that weakens a gate (exit 1) unless `--no-project-policy` ignores it or `--accept-project-policy` accepts it explicitly, as unsigned discovery evidence needs `--allow-unsigned-discovery`; outside CI they warn. Every relaxation that `policy_weakened` lists is refused except an `output` setting, which changes what is reported and is only listed and warned about. The refusal does not ask whether the relaxation could change a gate's outcome: a policy that only raises `risk.warn_threshold`, which moves the risk label and the warning but no gate, is refused too.
+Only a policy in the named project root governs the command. Without `--project`, `validate` and `risk` can name a nearby file in a warning. A malformed, ambiguous or unreadable checkout policy stops the command, including with `--accept-project-policy`. The default exit status is 1. The `scan`, `validate` and `risk` commands return 4 with `--detailed-exit-codes`. This includes an empty file, an unsupported key and a misspelled setting such as `fail_on_severity: High`. Both policy names, a symlink, an oversized file or a listing that reaches the entry limit also cause an error. Click rejects an unreadable project root with exit status 2. Pass `--no-project-policy` to skip the checkout file. `init` requires a single unambiguous target.
+
+When `risk` or `validate` leaves a policy unused, its JSON contains `policy_unapplied` with a `reason` of `not-accepted`, `relaxations-not-accepted` or `project-not-specified`. A file name is included when the CLI can safely identify it. Explicitly ignoring policy suppresses this field and the warning. An applied relaxation appears in `policy_weakened`. A checkout that requests a stricter assurance level and a higher risk threshold gets the stricter assurance level automatically. The threshold stays at its governing value unless the operator accepts the relaxation.
 
 ## File format
 

@@ -51,6 +51,10 @@ class PolicyError(ValueError):
     """An existing policy cannot be interpreted without weakening its meaning."""
 
 
+class PolicyListingError(PolicyError):
+    """The project root could not be fully listed to locate its policy."""
+
+
 class PolicySection(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
@@ -221,13 +225,15 @@ def find_policy_path(project_root: Path) -> Path | None:
         with os.scandir(current) as stream:
             for item in stream:
                 if len(entries) >= entry_bound.value:
-                    raise PolicyError(f"project root {current}: {entry_bound.exceeded()}")
+                    raise PolicyListingError(f"project root {current}: {entry_bound.exceeded()}")
                 entries.append(item.name)
     except (FileNotFoundError, NotADirectoryError):
         return None
     except OSError as exc:
         # A directory that cannot be listed may hold a policy, so it is not "no policy".
-        raise PolicyError(f"project root {current} cannot be listed: {exc.strerror}") from None
+        raise PolicyListingError(
+            f"project root {current} cannot be listed: {exc.strerror}"
+        ) from None
     folded_targets = {fold_name(name): name for name in POLICY_FILE_NAMES}
     found: list[Path] = []
     variants: list[tuple[str, str]] = []
@@ -471,8 +477,9 @@ def _parse_policy_with_digest(path: Path) -> tuple[Policy, str]:
 
 DEFAULT_POLICY_YAML = """\
 # Nexus SymBiote project policy. Every key is described in docs/policy-reference.md.
-# Malformed or unsupported settings fail closed. Settings that relax the built-in
-# gates are reported as policy_weakened; --no-project-policy ignores this file.
+# Tightening settings apply automatically. An invalid file stops the command.
+# --accept-project-policy accepts reviewed relaxations within the operator policy.
+# --no-project-policy ignores the checkout policy.
 version: "1.0"  # quote it: an unquoted 1.0 is a number and is refused
 scan:
   # Removing a collector leaves coverage partial, which fails the gates.
@@ -485,7 +492,7 @@ risk:
   fail_threshold: 50.0  # aggregate score; lowering it is stricter
   warn_threshold: 25.0  # must not exceed fail_threshold
   fail_on_severity: "critical"  # critical, high, medium, low, info or none
-  ignore_categories: []  # whole categories, everywhere; prefer suppressions
+  # ignore_categories: []  # uncomment to require every category, including operator-approved ignores
   # Accept one reviewed finding, with a reason, owner and expiry. Copy component_ref,
   # category and fingerprint from `risk --json-output`; a changed finding no longer matches.
   # suppressions:
@@ -495,7 +502,7 @@ risk:
   #     reason: "Test fixture, never loaded"
   #     owner: "security@example.test"
   #     expires: 2027-01-31
-  suppressions: []
+  suppressions: []  # operator-approved decisions are managed in the operator policy
 validate:
   require_completeness: true
   require_integrity: true

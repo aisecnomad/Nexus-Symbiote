@@ -323,12 +323,14 @@ class _WalkScope:
         links: list[Path] | None,
         unlisted: _Unlisted,
         skipped: list[Path] | None = None,
+        observed_excludes: list[Path] | None = None,
     ) -> None:
         self.top = top
         self.walked = {top}
         self.links = links
         self.unlisted = unlisted
         self.skipped = skipped
+        self.observed_excludes = observed_excludes
 
     def covers(self, target: Path) -> bool:
         """Whether the walk reaches ``target`` already, under its own name."""
@@ -1058,13 +1060,18 @@ class ConfinedCollection:
 
     @contextmanager
     def open_regular(
-        self, path: str | Path, *, max_bytes: int | Bound | None = None
+        self,
+        path: str | Path,
+        *,
+        max_bytes: int | Bound | None = None,
+        expected_link_target: Path | None = None,
     ) -> Iterator[BinaryIO]:
         """Yield a confined regular stream or raise OSError after recording failure.
 
         ``max_bytes`` bounds the artifact size and bytes read; reads require an
         explicit chunk size (at most four MiB). Collection-wide budget still
         applies. The trusted consumer must not bypass read() with fileno().
+        An expected root-relative target permits one confined symlink to that target.
         """
         named: Path | str = str(path)
         limit = self._file_bound if max_bytes is None else _bound(max_bytes, "file-bytes")
@@ -1076,12 +1083,16 @@ class ConfinedCollection:
                 raise CollectionError(reason)
             if not relative.parts:
                 raise CollectionError("expected a regular file")
-            parent = self._open_parent(relative)
+            if expected_link_target is None:
+                fd, opened = self._open_no_follow(relative), relative
+            else:
+                fd, opened = self._open_file(relative)
             try:
-                fd = self._open_leaf_no_follow(parent, relative.name)
-            finally:
-                os.close(parent)
-            try:
+                if expected_link_target is not None and (
+                    opened == relative or opened != expected_link_target
+                ):
+                    reason = "stream refused (symlink target changed)"
+                    raise CollectionError(reason)
                 before = stat_input_file(fd)
                 if not stat.S_ISREG(before.st_mode):
                     raise CollectionError("nonregular file")
@@ -1100,8 +1111,8 @@ class ConfinedCollection:
         try:
             yield cast(BinaryIO, stream)
             after = os.fstat(fd)
-            if descriptor_binding(before) != descriptor_binding(after) or not self._resolves_to(
-                relative, after
+            if descriptor_binding(before) != descriptor_binding(after) or not (
+                self._resolves_to(opened, after) and self._same_link(relative, opened)
             ):
                 self._fail(relative, "file changed during collection")
                 raise OSError("artifact changed during collection")
@@ -1246,8 +1257,11 @@ class ConfinedCollection:
         *,
         directory_links: list[Path] | None = None,
         skipped: list[Path] | None = None,
+        observed_excludes: list[Path] | None = None,
     ) -> Iterator[Path]:
         """Yield root-relative file paths, never through more than one symlink.
+
+        ``observed_excludes`` collects excluded paths without changing who reports them.
 
         A ``directory`` reached through one in-root symlink is walked under its
         target's name. Inside a walk that did not start through a symlink, a symlink
@@ -1298,7 +1312,7 @@ class ConfinedCollection:
         # count before and after a walk sees every walk that met a failure. Once the
         # entry budget is spent, a later walk lists nothing and records nothing: the
         # one failure that spent it names where collection stopped.
-        scope = _WalkScope(walked, directory_links, _Unlisted(), skipped)
+        scope = _WalkScope(walked, directory_links, _Unlisted(), skipped, observed_excludes)
         try:
             yield from self._walk(
                 fd, walked, 0, self._entry_budget, scope, followed=walked != relative
@@ -1343,6 +1357,8 @@ class ConfinedCollection:
                     continue
                 child = relative / name
                 if self.excluded(child):
+                    if scope.observed_excludes is not None:
+                        scope.observed_excludes.append(child)
                     if scope.skipped is not None and _default_excluded(name):
                         scope.skipped.append(child)
                     # A caller that collects skipped reports the entry itself.

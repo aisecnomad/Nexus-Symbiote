@@ -22,6 +22,7 @@ import codecs
 import functools
 import io
 import re
+import sys
 import tokenize
 import unicodedata
 import warnings
@@ -40,7 +41,10 @@ from nexus_symbiote.scanners.python_tools import (
     _DECORATOR_IMPORTS,
     _FACTORIES,
     PYTHON_TOOL_HINTS,
+    SDK_IMPORT_ROOTS,
     _annotation_names,
+    _PassiveModule,
+    _ProjectImports,
     collect_python_tools,
 )
 from nexus_symbiote.scanners.ts_tools import (
@@ -67,16 +71,17 @@ _SDK_IMPORT = re.compile(
 SOURCE_SEARCH_SKIPPED = frozenset(
     {"tests", "test", "dist", "build", "docs", "benchmarks", "examples"}
 )
-# The launcher and server class names below are markers too, so a file that reaches
-# one through a module of its own project, without naming the SDK, is read.
+# The launcher names below, like the server class names among the tool hints, are
+# markers too, so a file that reaches one through a module of its own project, without
+# naming the SDK, is read.
 _PYTHON_MARKERS = (
     *PYTHON_TOOL_HINTS,
     "MCPClient",
-    "MCPServer",
-    "FastMCP",
     "StdioServerParameters",
     "sse_client",
+    "stdio_client",
     "streamablehttp_client",
+    "streamable_http_client",
     "websocket_client",
 )
 # Imports the tool collector reads from the syntax tree once a marker is present.
@@ -144,7 +149,9 @@ _SERVER_CLASS_ATTRIBUTE = (
 _PYTHON_LAUNCHERS = {
     "StdioServerParameters": (frozenset({"mcp"}), LAUNCHED),
     "sse_client": (frozenset({"mcp"}), REACHED),
+    "stdio_client": (frozenset({"mcp"}), LAUNCHED),
     "streamablehttp_client": (frozenset({"mcp"}), REACHED),
+    "streamable_http_client": (frozenset({"mcp"}), REACHED),
     "websocket_client": (frozenset({"mcp"}), REACHED),
     "MCPServerStdio": (frozenset({"agents", "pydantic_ai"}), LAUNCHED),
     "MCPServerSse": (frozenset({"agents"}), REACHED),
@@ -174,6 +181,11 @@ _SERVER_CLASSES = {
 _CLIENT_MODULES = ("mcp.client", "agents.mcp", "pydantic_ai.mcp", "langchain_mcp_adapters")
 _LOADERS = frozenset({"import_module", "__import__", "resolve_name"})
 _LOADER_MODULES = frozenset({"importlib", "builtins", "pkgutil"})
+# Builtins and attributes that rebind a name or a module attribute without naming it.
+_REBINDING_BUILTINS = frozenset(
+    {"globals", "locals", "vars", "exec", "eval", "setattr", "delattr", "__builtins__"}
+)
+_REBINDING_ATTRIBUTES = frozenset({"modules", "__dict__", "__setattr__", "__builtins__"})
 
 
 class _UnreadableError(ValueError):
@@ -946,12 +958,72 @@ def _named_module(call: ast.Call) -> set[str]:
     return _argument_literals(call, containers=True)
 
 
-def _exempt_call(func: ast.expr, owned: set[str], loggers: set[str]) -> bool:
+def _honest_loggers(
+    nodes: list[ast.AST], loggers: set[str], *, project_imports: _ProjectImports | None = None
+) -> tuple[bool, set[str]]:
+    """Whether ``logging.getLogger`` can only be the standard library's, and which of the
+    names ``from logging import getLogger`` binds can only be that function.
+
+    Assigning ``getLogger`` a loader, by rebinding a name, ``logging`` itself or one of
+    its attributes, turns a logger name into a module to load. So ``logging`` counts
+    only when every binding of it is ``import logging`` and it is only read for a
+    plain attribute, and an imported name only when no other binding gives it a value.
+    A star import from another module, and builtins or attributes that rebind names or
+    module attributes without naming them, withdraw every exemption.
+    """
+    if project_imports is not None and (
+        not project_imports.stdlib_search_clear or project_imports.shadows("logging")
+    ):
+        return False, set()
+    watched = {"logging", *loggers}
+    rebound: set[str] = set()
+    imported = False
+    reads = attributes = 0
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                honest = bound == "logging" and (not alias.asname or alias.name == "logging")
+                imported = imported or honest
+                if bound in watched and not honest:
+                    rebound.add(bound)
+        elif isinstance(node, ast.ImportFrom):
+            from_logging = not node.level and node.module == "logging"
+            for alias in node.names:
+                if alias.name == "*" and not from_logging:
+                    return False, set()
+                bound = alias.asname or alias.name
+                if bound in watched and not (
+                    bound in loggers and from_logging and alias.name == "getLogger"
+                ):
+                    rebound.add(bound)
+        elif isinstance(node, ast.Name):
+            if node.id in _REBINDING_BUILTINS:
+                return False, set()
+            if node.id in watched and not isinstance(node.ctx, ast.Load):
+                rebound.add(node.id)
+            reads += node.id == "logging" and isinstance(node.ctx, ast.Load)
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _REBINDING_ATTRIBUTES:
+                return False, set()
+            if isinstance(node.value, ast.Name) and node.value.id == "logging":
+                if isinstance(node.ctx, ast.Load) and not node.attr.startswith("__"):
+                    attributes += 1
+                else:
+                    rebound.add("logging")
+        elif not isinstance(node, ast.alias):
+            rebound.update(_bound_names([node]) & watched)
+    honest_module = imported and "logging" not in rebound and reads == attributes
+    return honest_module, loggers - rebound
+
+
+def _exempt_call(func: ast.expr, owned: set[str], loggers: set[str], logging_module: bool) -> bool:
     """A call whose literal arguments name a server or a logger, not a module to load."""
     if isinstance(func, ast.Name):
         return func.id in owned or func.id in loggers
     return (
-        isinstance(func, ast.Attribute)
+        logging_module
+        and isinstance(func, ast.Attribute)
         and func.attr == "getLogger"
         and isinstance(func.value, ast.Name)
         and func.value.id == "logging"
@@ -989,7 +1061,7 @@ def _record_attribute_gap(
         gaps.add(_SERVER_CLASS_ATTRIBUTE)
 
 
-def _python_launches(tree: ast.Module) -> list[str]:
+def _python_launches(tree: ast.Module, project_imports: _ProjectImports) -> list[str]:
     """Gaps for MCP servers a file starts or reaches, or loads through a dynamic import.
 
     A launcher class or function counts wherever it is used other than as a type in an
@@ -1048,7 +1120,8 @@ def _python_launches(tree: ast.Module) -> list[str]:
                         if not star:
                             unused.add(alias.asname or name)
     loaders = _loader_aliases(nodes, loaders, bound_names)
-    annotations = _annotation_names(nodes)
+    logging_module, loggers = _honest_loggers(nodes, loggers, project_imports=project_imports)
+    annotations = _annotation_names(nodes, project_imports=project_imports)
     for node in nodes:
         if isinstance(node, ast.Call):
             func_getattr = _unshadowed_getattr(node.func, bound_names)
@@ -1062,7 +1135,7 @@ def _python_launches(tree: ast.Module) -> list[str]:
                 modules = _literals_in_expressions(non_attr_args)
                 if node not in annotations:
                     _record_attribute_gap(target, attr, packages, imported, bound_names, gaps)
-            elif _exempt_call(node.func, owned - loaders, loggers - loaders):
+            elif _exempt_call(node.func, owned - loaders, loggers - loaders, logging_module):
                 modules = set()
             else:
                 modules = _named_module(node)
@@ -1080,6 +1153,97 @@ def _python_launches(tree: ast.Module) -> list[str]:
     return sorted(gaps)
 
 
+# These imports are common before a tool declaration. Without a local stdlib
+# candidate, importing them only binds their names in a passive helper.
+_PASSIVE_HEADER_MODULES = frozenset(
+    {"collections.abc", "dataclasses", "functools", "logging", "os", "pathlib", "typing"}
+)
+
+
+def _plain_module_names(path: Path, source: _Source, node_limit: int) -> _PassiveModule | None:
+    """Names a passive SDK-named package helper can supply at import time."""
+    try:
+        tree = parse_python(_python_text(source.head))
+    except (_UnreadableError, SyntaxError, ValueError, RecursionError):
+        return None
+    if next(islice(ast.walk(tree), node_limit, None), None) is not None:
+        return None
+    names: set[str] = set()
+    imports_stdlib = False
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Pass) or (
+            isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+        ):
+            continue
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Constant):
+            for target in stmt.targets:
+                if not isinstance(target, ast.Name) or target.id.startswith("__"):
+                    return None
+                names.add(target.id)
+            continue
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and not stmt.name.startswith(
+            "__"
+        ):
+            args = stmt.args
+            if (
+                stmt.decorator_list
+                or stmt.returns
+                or getattr(stmt, "type_params", None)
+                or args.defaults
+                or any(v is not None for v in args.kw_defaults)
+                or any(
+                    arg.annotation
+                    for arg in (
+                        *args.posonlyargs,
+                        *args.args,
+                        *args.kwonlyargs,
+                        args.vararg,
+                        args.kwarg,
+                    )
+                    if arg
+                )
+            ):
+                return None
+            names.add(stmt.name)
+            continue
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)) and any(
+            alias.name.startswith("__") or (alias.asname or "").startswith("__")
+            for alias in stmt.names
+        ):
+            return None
+        if isinstance(stmt, ast.Import) and all(
+            alias.name in _PASSIVE_HEADER_MODULES for alias in stmt.names
+        ):
+            names.update(alias.asname or alias.name.split(".")[0] for alias in stmt.names)
+            imports_stdlib = True
+            continue
+        if isinstance(stmt, ast.ImportFrom) and not stmt.level and stmt.module:
+            if stmt.module in _PASSIVE_HEADER_MODULES and all(
+                alias.name != "*" for alias in stmt.names
+            ):
+                names.update(alias.asname or alias.name for alias in stmt.names)
+                imports_stdlib = True
+                continue
+            if stmt.module == "__future__" and all(
+                alias.name == "annotations" and not alias.asname for alias in stmt.names
+            ):
+                names.add("annotations")
+                imports_stdlib = True
+                continue
+            # When this flat helper is imported as the top-level name, an
+            # absent self-import stops execution before subsequent statements.
+            if path.name != "__init__.py" and (
+                stmt.module.startswith(path.stem + ".")
+                or (
+                    stmt.module == path.stem
+                    and any(alias.name != "*" and alias.name not in names for alias in stmt.names)
+                )
+            ):
+                return _PassiveModule(frozenset(names), imports_stdlib)
+        return None
+    return _PassiveModule(frozenset(names), imports_stdlib)
+
+
 def _outcome(result: ScanResult) -> tuple[int, int, int]:
     return (
         len(result.components),
@@ -1094,6 +1258,9 @@ def collect_source_references(
     sources: Sequence[Path],
     budget: SourceBudget,
     known: KnownValues | None = None,
+    *,
+    unvisited: Sequence[Path] = (),
+    walk_complete: bool = True,
 ) -> None:
     """Inventory MCP servers, MCP clients and agent tools declared in source.
 
@@ -1109,6 +1276,46 @@ def collect_source_references(
     python = _Kind(_python_source, _python_candidate)
     clients = [_Kind(_script_source(suffix), _client_candidate) for suffix in _CLIENT_SUFFIXES]
     kinds = (servers, python, *clients)
+    python_paths = frozenset(path for path in sources if path.suffix == ".py")
+    plain_modules: dict[Path, _PassiveModule] = {}
+    # Include non-Python files and nested directories as possible import
+    # entries. An extension module or namespace directory keeps its ambiguity.
+    entries = frozenset(
+        entry
+        for source_path in sources
+        if not SDK_IMPORT_ROOTS.isdisjoint(source_path.parts[:-1])
+        for entry in (
+            source_path.with_name(source_path.name.split(".", 1)[0] or source_path.name),
+            *source_path.parents,
+        )
+        if entry.parent.name in SDK_IMPORT_ROOTS
+    )
+    # A package link, alternate loader, or excluded local bytecode cache makes
+    # the selected source uncertain. Never open a binary or enter a skipped cache.
+    uncertain: set[Path] = set()
+    cache_parents = {p.parent for p in unvisited if p.name.casefold() == "__pycache__"}
+    for path in unvisited:
+        uncertain.update(p for p in (path, *path.parents) if p.name in SDK_IMPORT_ROOTS)
+    for path in sources:
+        stem, dot, suffix = path.name.partition(".")
+        if not stem or not dot or suffix == "py":
+            continue
+        owner = path.parent if stem == "__init__" else path.with_name(stem)
+        if owner.name in SDK_IMPORT_ROOTS and (
+            path.suffix.casefold() in {".so", ".pyd", ".pyc"}
+            or owner.with_suffix(".py") in python_paths
+            or owner / "__init__.py" in python_paths
+        ):
+            uncertain.add(owner)
+    uncertain_modules = frozenset(uncertain)
+    # A standard module (or one of its own imports) can also resolve to the
+    # checkout. Index candidate roots once and check them for each entry file.
+    stdlib_roots: set[Path] = set()
+    for path in (*sources, *unvisited):
+        if path.name.partition(".")[0] in sys.stdlib_module_names:
+            stdlib_roots.add(path.parent)
+        if not sys.stdlib_module_names.isdisjoint(path.parts[:-1]):
+            stdlib_roots.update(p.parent for p in path.parents if p.name in sys.stdlib_module_names)
     eligible = [path for path in sources if any(kind.eligible(path) for kind in kinds)]
     # Root files first, as before, so what a lowered budget reads stays predictable.
     eligible.sort(key=lambda path: len(path.parts) > 1)
@@ -1133,6 +1340,21 @@ def collect_source_references(
                 if files.bytes_exhausted:
                     break
                 continue
+            owner = path.parent if path.name == "__init__.py" else path.with_suffix("")
+            if (
+                path.suffix == ".py"
+                and owner.name in SDK_IMPORT_ROOTS
+                and owner.parent / "__init__.py" in python_paths
+                and walk_complete
+                and owner not in uncertain_modules
+                and path.parent not in cache_parents
+                and files.link_target(path) is None
+                and source.complete
+                and source.size <= settings.syntax_bytes
+            ):
+                names = _plain_module_names(path, source, python_nodes.value)
+                if names is not None:
+                    plain_modules[path] = names
             candidate = False
             for kind in kinds:
                 if not kind.eligible(path):
@@ -1181,14 +1403,26 @@ def collect_source_references(
             if len(nodes) > python_nodes.value:
                 fail(path, python_nodes.exceeded())
                 continue
-            collect_python_tools(tree, nodes, text, path, result, known)
+            project_imports = _ProjectImports(
+                python_paths,
+                path.parent,
+                plain_modules,
+                entries,
+                uncertain_modules,
+                stdlib_roots.isdisjoint((Path(), Path("src"), path.parent)),
+            )
+            collect_python_tools(
+                tree, nodes, text, path, result, known, project_imports=project_imports
+            )
             client = _python_client(tree)
             if client:
                 detected.append(location)
             gap = _hidden_import(text, tree)
             if gap is not None:
                 result.surfaces_excluded.append(f"{location}: {gap}")
-            result.surfaces_excluded.extend(f"{location}: {gap}" for gap in _python_launches(tree))
+            result.surfaces_excluded.extend(
+                f"{location}: {gap}" for gap in _python_launches(tree, project_imports)
+            )
         if _outcome(result) != before or client:
             surfaces.append(location)
     for path, content in (selected for kind in clients for selected in kind.selected):

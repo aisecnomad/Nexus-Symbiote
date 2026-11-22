@@ -155,7 +155,15 @@ def test_policy_exclusions_reach_scanner(tmp_path, monkeypatch):
         "scan: {scanners: [mcp], exclude_paths: [vendor]}"
     )
     result = CliRunner().invoke(
-        main, ["scan", "--report-only", str(tmp_path), "-o", str(tmp_path / "bom.json")]
+        main,
+        [
+            "scan",
+            "--report-only",
+            "--accept-project-policy",
+            str(tmp_path),
+            "-o",
+            str(tmp_path / "bom.json"),
+        ],
     )
     assert result.exit_code == 0, result.output
     assert seen == ["vendor"]
@@ -164,7 +172,10 @@ def test_policy_exclusions_reach_scanner(tmp_path, monkeypatch):
 def test_malformed_policy_is_error_even_report_only(tmp_path):
     (tmp_path / ".nexus-symbiote.yaml").write_text("output: {default_format: invalid}")
     out = tmp_path / "bom.json"
-    result = CliRunner().invoke(main, ["scan", str(tmp_path), "--report-only", "-o", str(out)])
+    result = CliRunner().invoke(
+        main,
+        ["scan", str(tmp_path), "--report-only", "--accept-project-policy", "-o", str(out)],
+    )
     assert result.exit_code != 0 and not out.exists()
     assert "invalid policy" in result.output
 
@@ -209,7 +220,14 @@ def test_risk_policy_ignored_categories_and_warning_are_honored(tmp_path):
         "classifier.pkl",
         policy="risk: {ignore_categories: [serialization_format], warn_threshold: 1}",
     )
-    args = ["risk", str(inventory), "--project", str(project), "--json-output"]
+    args = [
+        "risk",
+        str(inventory),
+        "--project",
+        str(project),
+        "--accept-project-policy",
+        "--json-output",
+    ]
     result = CliRunner().invoke(main, args)
     assert result.exit_code == 0, result.output
     data = json.loads(result.stdout)
@@ -226,14 +244,18 @@ def test_validation_settings_are_not_ignored(tmp_path):
     (tmp_path / ".nexus-symbiote.yaml").write_text(
         "validate: {require_completeness: false, require_integrity: false}"
     )
-    result = CliRunner().invoke(main, ["validate", str(path), "--project", str(tmp_path)])
+    result = CliRunner().invoke(
+        main, ["validate", str(path), "--project", str(tmp_path), "--accept-project-policy"]
+    )
     assert result.exit_code == 0
     assert result.output.count("SKIPPED by explicit policy") == 2
     (tmp_path / ".nexus-symbiote.yaml").write_text(
         "validate: {require_completeness: false, require_integrity: false, "
         "minimum_assurance_level: observed}"
     )
-    result = CliRunner().invoke(main, ["validate", str(path), "--project", str(tmp_path)])
+    result = CliRunner().invoke(
+        main, ["validate", str(path), "--project", str(tmp_path), "--accept-project-policy"]
+    )
     assert result.exit_code != 0
     assert "minimum observed assurance not attained" in result.output
 
@@ -398,13 +420,27 @@ def test_policy_source_and_relaxations_are_visible(tmp_path):
     builtin = runner.invoke(main, ["risk", str(out), "--no-project-policy", "--json-output"])
     assert json.loads(builtin.output)["policy_source"] == "built-in"
     (project / ".nexus-symbiote.yaml").write_text("risk: {fail_on_severity: none}\n")
-    relaxed = runner.invoke(main, ["risk", str(out), "--project", str(project), "--json-output"])
+    relaxed = runner.invoke(
+        main,
+        [
+            "risk",
+            str(out),
+            "--project",
+            str(project),
+            "--accept-project-policy",
+            "--json-output",
+        ],
+    )
     payload = json.loads(relaxed.stdout)
     assert payload["policy_source"].startswith("project:")
     assert payload["policy_weakened"] == ["risk.fail_on_severity=none"]
-    human = runner.invoke(main, ["risk", str(out), "--project", str(project)])
+    human = runner.invoke(
+        main, ["risk", str(out), "--project", str(project), "--accept-project-policy"]
+    )
     assert "weakens the built-in gates: risk.fail_on_severity=none" in human.output
-    shown = runner.invoke(main, ["validate", str(out), "--project", str(project)])
+    shown = runner.invoke(
+        main, ["validate", str(out), "--project", str(project), "--accept-project-policy"]
+    )
     assert "Policy: project:" in shown.output
 
 
@@ -421,7 +457,7 @@ def test_policy_relaxation_report_is_exact_and_cannot_rewrite_the_warning(tmp_pa
     policy_file.write_text(
         f'risk: {{fail_threshold: 50.000001, ignore_categories: ["{hostile}"]}}\n'
     )
-    args = ["risk", str(out), "--project", str(project)]
+    args = ["risk", str(out), "--project", str(project), "--accept-project-policy"]
     report = json.loads(runner.invoke(main, [*args, "--json-output"]).stdout)
     assert report["policy_source"] == f"project:{policy_file}"
     assert report["policy_weakened"] == [
@@ -434,7 +470,10 @@ def test_policy_relaxation_report_is_exact_and_cannot_rewrite_the_warning(tmp_pa
     (warning,) = [line for line in stderr.splitlines() if "weakens the built-in gates" in line]
     assert warning.startswith(f"WARNING: policy {policy_file} weakens")
     assert warning.endswith("::notice::forged")
-    shown = runner.invoke(main, ["validate", str(out), "--project", str(project)])
+    shown = runner.invoke(
+        main,
+        ["validate", str(out), "--project", str(project), "--accept-project-policy"],
+    )
     assert f"Policy: project:{policy_file}" in shown.output
 
 
@@ -522,7 +561,15 @@ def test_project_policy_applies_through_project_and_is_named_otherwise(tmp_path)
     assert unnamed.exit_code == 0, unnamed.output
     assert str(project / ".nexus-symbiote.yaml") in unnamed.stderr
     named = runner.invoke(
-        main, ["risk", str(inventory), "--project", str(project), "--json-output"]
+        main,
+        [
+            "risk",
+            str(inventory),
+            "--project",
+            str(project),
+            "--accept-project-policy",
+            "--json-output",
+        ],
     )
     assert named.exit_code == 1
     assert json.loads(named.stdout)["gate_reasons"] == ["finding at or above high"]

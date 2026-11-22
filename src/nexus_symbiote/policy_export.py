@@ -197,10 +197,11 @@ def corroborate_against_project(
         if len(message) > _MAX_POLICY_DIAGNOSTIC_CHARS:
             message = message[: _MAX_POLICY_DIAGNOSTIC_CHARS - 3] + "..."
         raise click.ClickException(message) from exc
-    if running_in_ci() and (extra_paths := additional_exclusions(policy.scan)):
+    if extra_paths := additional_exclusions(policy.scan):
         entries = "entry" if len(extra_paths) == 1 else "entries"
+        where = " in CI" if running_in_ci() else ""
         raise click.ClickException(
-            "the project policy weakens the built-in gates in CI because "
+            f"the project policy weakens the built-in gates{where} because "
             f"scan.exclude_paths contains {len(extra_paths)} additional {entries}"
         )
     excluded = policy.scan.exclude_paths

@@ -10,11 +10,13 @@ from nexus_symbiote.core import models as m
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.enums import AssuranceLevel, RiskSeverity
 from nexus_symbiote.utils.terminal import neutralize
+from nexus_symbiote.validators.risk import effective_component_risks
 
 if TYPE_CHECKING:
     from nexus_symbiote.utils.crypto import SignaturePolicySet
+    from nexus_symbiote.validators.integrity import IntegrityReport
 
-EVIDENCE_PROFILE_SCHEMA: Final[str] = "nexus-symbiote/evidence-profile/v1"
+EVIDENCE_PROFILE_SCHEMA: Final[str] = "nexus-symbiote/evidence-profile/v2"
 _SEVERITY_RANK: Final[dict[RiskSeverity, int]] = {
     s: i for i, s in enumerate(reversed(list(RiskSeverity)), 1)
 }
@@ -70,14 +72,10 @@ def _is_pinned(comp: m.AnyComponent) -> bool:
     return is_exact_version(comp.version)
 
 
-def _is_digest_bound(comp: m.AnyComponent) -> bool:
-    if (
-        comp.assurance_level == AssuranceLevel.DECLARED
-        and "imported_source_format" in comp.properties
-    ):
-        return False
+def _has_recorded_digest(comp: m.AnyComponent) -> bool:
     return bool(
         any(isinstance(v, str) and v for v in comp.hashes.values())
+        or isinstance(comp.properties.get("declared_sha256"), str)
         or (isinstance(comp, m.ToolComponent) and comp.definition_hash)
         or (isinstance(comp, m.MCPServerComponent) and comp.schema_hash)
         or (isinstance(comp, m.PromptComponent) and comp.content_hash)
@@ -88,33 +86,25 @@ def _is_digest_bound(comp: m.AnyComponent) -> bool:
     )
 
 
-def _verified_signed_refs(
+def _verify_model_policy(
     aibom: AIBOM, root: Path | None, pol: SignaturePolicySet | None
-) -> frozenset[str]:
+) -> IntegrityReport | None:
     if root is None or pol is None or not (len(pol) or len(pol.digest_pins)):
-        return frozenset()
+        return None
     from nexus_symbiote.validators.integrity import IntegrityValidator
 
     res_root = root.resolve()
     covered = {e.artifact_path.resolve() for e in (*pol, *pol.digest_pins)}
     dirs = {p.parent for p in covered}
-    verified: set[str] = set()
-    for comp in aibom.components:
+    candidates: list[m.AnyComponent] = []
+    for comp in sorted(aibom.components, key=lambda c: c.bom_ref):
         if not isinstance(comp, m.ModelComponent) or not comp.source_path:
             continue
-        tgt = (res_root / comp.source_path).resolve()
-        if tgt not in covered and not (comp.properties.get("weight_files") and tgt.parent in dirs):
-            continue
-        rep = IntegrityValidator(pol, require_model_signatures=True).validate(
-            AIBOM(components=[comp]), project_root=res_root
-        )
-        if (
-            rep.issues_omitted == 0
-            and (rep.signatures_verified + rep.hashes_verified) > 0
-            and not any(i.component_ref == comp.bom_ref for i in rep.issues)
-        ):
-            verified.add(comp.bom_ref)
-    return frozenset(verified)
+        # Eligibility uses the recorded path. The validator confines the actual reads.
+        target = res_root / comp.source_path
+        if target in covered or (comp.properties.get("weight_files") and target.parent in dirs):
+            candidates.append(comp)
+    return IntegrityValidator(pol).validate(AIBOM(components=candidates), project_root=res_root)
 
 
 def build_evidence_profile(
@@ -126,26 +116,32 @@ def build_evidence_profile(
 ) -> dict[str, Any]:
     """Compute a deterministic per-component evidence profile without a scalar TrustScore."""
     matched = runtime_matched_refs or set()
-    has_pol = signature_policies is not None and bool(
-        len(signature_policies) or len(signature_policies.digest_pins)
-    )
-    verified_refs = _verified_signed_refs(aibom, project_root, signature_policies)
+    report = _verify_model_policy(aibom, project_root, signature_policies)
+    verified = report.model_policy_evidence if report else {}
     entries: list[dict[str, Any]] = []
     for comp in sorted(aibom.components, key=lambda c: c.bom_ref):
-        obs = comp.assurance_level in {AssuranceLevel.OBSERVED, AssuranceLevel.VERIFIED}
-        rep = comp.bom_ref in matched or any(
-            cl.assurance.value == "reported" or cl.method.startswith("otlp")
-            for cl in comp.claims.values()
-        )
+        proof = verified.get(comp.bom_ref)
         ev = {
             "pinned": _is_pinned(comp),
-            "digest_bound": _is_digest_bound(comp),
-            "signed_under_policy": comp.bom_ref in verified_refs,
-            "observed_by_collector": obs,
-            "reported_at_runtime": rep,
+            "digest_recorded": _has_recorded_digest(comp),
+            "digest_bound": proof is not None,
+            "digest_pinned_under_policy": bool(
+                proof and proof.digest_pins_verified == proof.weight_files
+            ),
+            "signed_under_policy": bool(proof and proof.signatures_verified == proof.weight_files),
+            "runtime_matched": comp.bom_ref in matched,
         }
-        raw_risks = getattr(comp, "risks", None)
-        risks = list(raw_risks) if isinstance(raw_risks, list) else []
+        claims = {
+            "collector_observation": comp.assurance_level
+            in {AssuranceLevel.OBSERVED, AssuranceLevel.VERIFIED},
+            "runtime_observation": any(
+                cl.assurance.value == "reported" or cl.method.startswith("otlp")
+                for cl in comp.claims.values()
+            ),
+        }
+        risks = effective_component_risks(comp)
+        observed = report.model_behavior_risks.get(comp.bom_ref, {}) if report else {}
+        additional = set(observed.values()).difference(r.category for r in risks)
         hi = (
             max(risks, key=lambda r: _SEVERITY_RANK.get(r.severity, 0)).severity.value
             if risks
@@ -157,16 +153,25 @@ def build_evidence_profile(
             "component_type": comp.component_type.value,
             "assurance_level": comp.assurance_level.value,
             "evidence": ev,
-            "finding_count": len(risks),
-            "highest_finding_severity": hi,
+            "inventory_claims": claims,
+            "finding_count": len(risks) + len(additional),
+            "highest_finding_severity": RiskSeverity.CRITICAL.value if observed else hi,
             "missing_evidence": [k for k, v in ev.items() if not v],
         }
+        if observed:
+            entry["integrity_findings"] = [
+                {"category": category, "severity": RiskSeverity.CRITICAL.value}
+                for category in sorted(observed)
+            ]
         if isinstance(comp, m.ModelComponent) and comp.signing_status:
             entry["declared_signing_status"] = neutralize(comp.signing_status)
         entries.append(entry)
     return {
         "schema": EVIDENCE_PROFILE_SCHEMA,
-        "policy_verified": project_root is not None and has_pol,
+        "policy_loaded": report is not None,
+        "policy_verified": bool(
+            report and verified and not report.issues and not report.issues_omitted
+        ),
         "component_count": len(entries),
         "components": entries,
     }

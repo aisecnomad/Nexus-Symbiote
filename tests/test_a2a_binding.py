@@ -1192,3 +1192,19 @@ def test_plaintext_alternative_interfaces_fail_the_transport_check(tmp_path):
     # A 1.0 gRPC host:port interface declares no cleartext scheme and is not flagged.
     clean = _server(tmp_path / "c", dict(CARD_1_0))
     assert not any(r.category == "transport_security" for r in clean.risks)
+
+
+@pytest.mark.parametrize("url", ["http:agents.example.net/a2a", "http:\\\\agents.example.net/a2a"])
+def test_an_alternative_interface_without_slashes_is_read_as_whatwg_parsers_read_it(tmp_path, url):
+    # WHATWG clients connect to http:host/x as http://host/x, in clear text.
+    card = dict(CARD_1_0)
+    card["supportedInterfaces"] = [
+        CARD_1_0["supportedInterfaces"][0],
+        {"url": url, "protocolBinding": "JSONRPC"},
+    ]
+    server = _server(tmp_path, card)
+    assert [r.severity for r in server.risks if r.category == "transport_security"] == ["high"]
+    assert server.properties["supported_interface_origins"] == [
+        "https://agents.example.com",
+        "http://agents.example.net",
+    ]

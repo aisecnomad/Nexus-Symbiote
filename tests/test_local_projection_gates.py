@@ -82,7 +82,7 @@ def test_project_risk_requires_reconciliation_even_when_validation_is_disabled(t
     assert original.exit_code == 0 and json.loads(original.output)["overall_score"] == 0
     (project / ".nexus-symbiote.yaml").write_text("validate:\n  require_completeness: false\n")
     (project / "AGENTS.md").write_text("Different instructions.")
-    altered = runner.invoke(main, args)
+    altered = runner.invoke(main, [*args, "--accept-project-policy"])
     assert altered.exit_code == 1 and json.loads(altered.output)["overall_score"] is None
 
 

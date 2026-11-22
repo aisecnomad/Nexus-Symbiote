@@ -107,14 +107,26 @@ def unknown_coverage_gate(project: Path, scratch: Path) -> bool:
 
 
 def policy_rejected(project: Path, scratch: Path) -> bool:
-    """The checkout's policy is refused before anything is collected or written.
+    """An accepted checkout policy that is invalid is refused before anything is written.
 
-    A scan that merely fails its gate still writes the inventory; a rejected policy
-    stops it first, so a fixture that also fails the gate cannot pass this check.
+    A project policy is not applied unless ``--accept-project-policy`` is passed.
+    When it is, a malformed policy stops the scan before an inventory is written.
+    A scan that merely fails its gate still writes the inventory, so a fixture that
+    also fails the gate cannot pass this check.
     """
     output = scratch / "policy.json"
     output.unlink(missing_ok=True)
-    result = CliRunner().invoke(main, ["scan", str(project), "--report-only", "-o", str(output)])
+    result = CliRunner().invoke(
+        main,
+        [
+            "scan",
+            str(project),
+            "--accept-project-policy",
+            "--report-only",
+            "-o",
+            str(output),
+        ],
+    )
     return result.exit_code != 0 and not output.exists() and "policy" in result.output.lower()
 
 

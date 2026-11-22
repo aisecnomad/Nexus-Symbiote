@@ -15,11 +15,82 @@ from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolComponent
 from nexus_symbiote.scanners.base import KnownValues, ScanResult, declared_server_name
 
-PYTHON_TOOL_HINTS = ("mcp", "langchain", "crewai", "function_tool", "smolagents", "pydantic_ai")
+PYTHON_TOOL_HINTS = (
+    "mcp",
+    "FastMCP",
+    "MCPServer",
+    "langchain",
+    "crewai",
+    "function_tool",
+    "smolagents",
+    "pydantic_ai",
+)
 
 
 def _names(words: str) -> frozenset[str]:
     return frozenset(words.split())
+
+
+class _PassiveModule(NamedTuple):
+    names: frozenset[str]
+    imports_stdlib: bool
+
+
+class _ProjectImports(NamedTuple):
+    """Possible Python search roots and the files found by the confined walk."""
+
+    sources: frozenset[Path]
+    entry_dir: Path
+    plain_modules: dict[Path, _PassiveModule]
+    entries: frozenset[Path]
+    uncertain_modules: frozenset[Path]
+    stdlib_search_clear: bool
+
+    def _passive_names(self, path: Path) -> frozenset[str] | None:
+        module = self.plain_modules.get(path)
+        if module is None or (module.imports_stdlib and not self.stdlib_search_clear):
+            return None
+        return module.names
+
+    def _module_at(self, root: Path, relative: Path) -> bool:
+        return (
+            root / relative.with_suffix(".py") in self.sources
+            or root / relative / "__init__.py" in self.sources
+        ) and all(root / p / "__init__.py" in self.sources for p in relative.parents if p.parts)
+
+    def has_module(self, module: str) -> bool:
+        # A local exemption requires a regular module in every plausible first
+        # search root: the checkout for -m, the entry directory for a script,
+        # and the source root for a module installed from a src layout.
+        relative = Path(*module.split("."))
+        return (
+            self._module_at(Path(), relative)
+            and self._module_at(self.entry_dir, relative)
+            and (self.entry_dir.parts[:1] != ("src",) or self._module_at(Path("src"), relative))
+        )
+
+    def shadows(self, module: str, member: str | None = None) -> bool:
+        # Any unresolved first search root withholds SDK provenance. A passive
+        # sibling can only supply its own names or an existing package child.
+        name, dot, rest = module.partition(".")
+        for root in (Path(), Path("src"), self.entry_dir):
+            package = root / name
+            if package in self.uncertain_modules:
+                return True
+            init = package / "__init__.py"
+            if init in self.sources:
+                names = self._passive_names(init)
+                child = rest.partition(".")[0] if dot else member
+                if names is None or child is None or package / child in self.entries:
+                    return True
+                if not dot and member in names:
+                    return True
+            flat = root / (name + ".py")
+            if flat in self.sources:
+                names = self._passive_names(flat)
+                if names is None or (not dot and (member is None or member in names)):
+                    return True
+        return False
 
 
 _FACTORIES = {
@@ -30,11 +101,6 @@ _FACTORIES = {
     ("fastmcp", "FastMCP"),
     ("fastmcp.server", "FastMCP"),
     ("fastmcp.server.server", "FastMCP"),
-}
-_LOW_LEVEL = {
-    ("mcp.server", "Server"),
-    ("mcp.server.lowlevel", "Server"),
-    ("mcp.server.lowlevel.server", "Server"),
 }
 # How a recognised server's name may be used without the server escaping the
 # collector. A data attribute's value does not hold the server.
@@ -288,14 +354,48 @@ _DECORATOR_IMPORTS = {
     ("agents.tool", "function_tool"): "openai-agents",
     ("smolagents", "tool"): "smolagents",
     ("smolagents.tools", "tool"): "smolagents",
+    ("langchain_core.tools.convert", "tool"): "langchain",
+    ("crewai.tools.base_tool", "tool"): "crewai",
 }
 
 _AGENT_FACTORIES = {
     ("pydantic_ai", "Agent"): "pydantic-ai",
     ("pydantic_ai.agent", "Agent"): "pydantic-ai",
 }
-# Agent constructor keywords that carry tools, or could.
-_AGENT_REGISTERING_KEYWORDS = frozenset({"tools", "toolsets", "builtin_tools", "mcp_servers"})
+# The packages, or the tool packages, of the frameworks whose tools are collected, and
+# the MCP client modules among them, which the source collector reads instead.
+_FRAMEWORK_ROOTS = (
+    "agents",
+    "pydantic_ai",
+    "langchain_core.tools",
+    "langchain.tools",
+    "crewai.tools",
+    "smolagents",
+)
+_FRAMEWORK_CLIENTS = ("agents.mcp", "pydantic_ai.mcp")
+_NON_REGISTERING_IMPORTS = frozenset(
+    {
+        ("agents", "ToolCallItem"),
+        ("agents", "ToolCallOutputItem"),
+        ("agents", "custom_span"),
+        ("agents", "gen_trace_id"),
+        ("agents", "set_default_openai_client"),
+        ("agents", "set_default_openai_key"),
+        ("agents", "set_tracing_disabled"),
+        ("agents", "trace"),
+        ("agents.items", "ToolCallItem"),
+        ("agents.tracing", "trace"),
+        ("langchain_core.tools", "InjectedToolCallId"),
+        ("langchain_core.tools", "ToolException"),
+        ("pydantic_ai", "capture_run_messages"),
+        ("pydantic_ai.messages", "ToolCallPart"),
+    }
+)
+# Agent constructor keywords that carry tools, or could; a prepare function can add,
+# rename or drop the tool definitions of each step.
+_AGENT_REGISTERING_KEYWORDS = frozenset(
+    {"tools", "toolsets", "builtin_tools", "mcp_servers", "prepare_tools", "prepare_output_tools"}
+)
 # How a recognised agent's name may be used without the agent escaping, as for a
 # server: a run's result holds the agent only where reflection reaches it.
 _AGENT_DATA = _names("name")
@@ -502,29 +602,30 @@ def _collect_sdk_decorators(
     for stmt in tree.body:
         if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        for deco in stmt.decorator_list:
-            if isinstance(deco, ast.Name) and deco.id in valid:
-                import_line, framework = valid[deco.id]
-                if import_line >= stmt.lineno:
-                    unsupported = True
-                    continue
-                handled.add(deco)
-                _record_sdk_decorator(
-                    deco, stmt.name, framework, path, source_digest, seen_refs, result
+        registrations = [
+            target if isinstance(target, ast.Name) and target.id in valid else None
+            for target in (
+                deco.func if isinstance(deco, ast.Call) else deco for deco in stmt.decorator_list
+            )
+        ]
+        unwrapped = _unwrapped([target is not None for target in registrations])
+        for index, deco in enumerate(stmt.decorator_list):
+            target = registrations[index]
+            if target is None:
+                continue
+            import_line, framework = valid[target.id]
+            if import_line >= stmt.lineno:
+                unsupported = True
+                continue
+            handled.add(target)
+            if not unwrapped[index]:
+                result.surfaces_excluded.append(
+                    f"{path.as_posix()}:{deco.lineno}: unresolved Python SDK tool name"
                 )
-            elif (
-                isinstance(deco, ast.Call)
-                and isinstance(deco.func, ast.Name)
-                and deco.func.id in valid
-            ):
-                import_line, framework = valid[deco.func.id]
-                if import_line >= stmt.lineno:
-                    unsupported = True
-                    continue
-                handled.add(deco.func)
-                _record_sdk_decorator(
-                    deco, stmt.name, framework, path, source_digest, seen_refs, result
-                )
+                continue
+            _record_sdk_decorator(
+                deco, stmt.name, framework, path, source_digest, seen_refs, result
+            )
     load_uses = {
         node
         for node in nodes
@@ -541,6 +642,7 @@ def _collect_agent_decorators(
     nodes: list[ast.AST],
     parents: dict[ast.AST, ast.AST],
     parsed: _ParsedAnnotations,
+    annotations: set[ast.AST],
     agent_factories: dict[str, tuple[ast.ImportFrom, str]],
     bindings: Counter[str],
     path: Path,
@@ -615,48 +717,36 @@ def _collect_agent_decorators(
             handled.add(call)
             agents[target.id] = (stmt.lineno, framework)
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for deco in stmt.decorator_list:
-                if (
-                    isinstance(deco, ast.Attribute)
-                    and deco.attr in {"tool", "tool_plain"}
-                    and isinstance(deco.value, ast.Name)
-                    and deco.value.id in agents
-                ):
-                    decl_line, framework = agents[deco.value.id]
-                    if decl_line >= stmt.lineno:
-                        continue
-                    handled.add(deco)
-                    _record_sdk_decorator(
-                        deco,
-                        stmt.name,
-                        framework,
-                        path,
-                        source_digest,
-                        seen_refs,
-                        result,
-                        deco.value.id,
+            registrations = [
+                target
+                if isinstance(target, ast.Attribute)
+                and target.attr in {"tool", "tool_plain"}
+                and isinstance(target.value, ast.Name)
+                and target.value.id in agents
+                else None
+                for target in (
+                    deco.func if isinstance(deco, ast.Call) else deco
+                    for deco in stmt.decorator_list
+                )
+            ]
+            unwrapped = _unwrapped([target is not None for target in registrations])
+            for index, deco in enumerate(stmt.decorator_list):
+                registration = registrations[index]
+                if registration is None or not isinstance(registration.value, ast.Name):
+                    continue
+                owner = registration.value.id
+                decl_line, framework = agents[owner]
+                if decl_line >= stmt.lineno:
+                    continue
+                handled.add(registration)
+                if not unwrapped[index]:
+                    result.surfaces_excluded.append(
+                        f"{path.as_posix()}:{deco.lineno}: unresolved Python SDK tool name"
                     )
-                elif (
-                    isinstance(deco, ast.Call)
-                    and isinstance(deco.func, ast.Attribute)
-                    and deco.func.attr in {"tool", "tool_plain"}
-                    and isinstance(deco.func.value, ast.Name)
-                    and deco.func.value.id in agents
-                ):
-                    decl_line, framework = agents[deco.func.value.id]
-                    if decl_line >= stmt.lineno:
-                        continue
-                    handled.add(deco.func)
-                    _record_sdk_decorator(
-                        deco,
-                        stmt.name,
-                        framework,
-                        path,
-                        source_digest,
-                        seen_refs,
-                        result,
-                        deco.func.value.id,
-                    )
+                    continue
+                _record_sdk_decorator(
+                    deco, stmt.name, framework, path, source_digest, seen_refs, result, owner
+                )
     candidates: set[ast.AST] = set(calls)
     candidates.update(
         node
@@ -677,7 +767,6 @@ def _collect_agent_decorators(
         if isinstance(node, ast.withitem) and node.optional_vars is None
     )
     factory_calls = {call.func for call in calls}
-    annotations = _annotation_names(nodes, parsed.roots)
     escaped = any(
         isinstance(node, ast.Name)
         and isinstance(node.ctx, ast.Load)
@@ -706,10 +795,80 @@ def _collect_agent_decorators(
         )
 
 
+_LOW_LEVEL_MODULE = "mcp.server.lowlevel"
+
+
+def _low_level_step(state: str | None, attr: str) -> str | None:
+    """Where an attribute of ``mcp``, ``mcp.server`` or the low-level module leads."""
+    if state == "mcp" and attr == "server":
+        return "mcp.server"
+    if state == "mcp.server" and attr in {"lowlevel", "Server"}:
+        return _LOW_LEVEL_MODULE
+    return _LOW_LEVEL_MODULE if state == _LOW_LEVEL_MODULE else None
+
+
+def _low_level_state(module: str) -> str | None:
+    if module == _LOW_LEVEL_MODULE or module.startswith(f"{_LOW_LEVEL_MODULE}."):
+        return _LOW_LEVEL_MODULE
+    return module if module in {"mcp", "mcp.server"} else None
+
+
+def _reaches_low_level(nodes: list[ast.AST]) -> bool:
+    """Whether the file imports the low-level server or reaches it as an attribute.
+
+    Any import of the low-level module, of ``Server``, ``lowlevel`` or ``*`` from
+    ``mcp.server``, and any attribute path from a name bound to ``mcp`` or
+    ``mcp.server`` to ``lowlevel`` or ``Server`` counts. Each attribute is decided once,
+    children before parents, so the work stays linear in the nodes.
+    """
+    bound: dict[str, set[str]] = {}
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if _low_level_state(a.name) == _LOW_LEVEL_MODULE:
+                    return True
+                module = a.name if a.asname else a.name.split(".")[0]
+                state = _low_level_state(module)
+                if state is not None:
+                    bound.setdefault(a.asname or module, set()).add(state)
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            for a in node.names:
+                state = _low_level_step(_low_level_state(node.module), a.name)
+                if state == _LOW_LEVEL_MODULE or (a.name == "*" and node.module == "mcp.server"):
+                    return True
+                if state is not None:
+                    bound.setdefault(a.asname or a.name, set()).add(state)
+    if not bound:
+        return False
+    states: dict[ast.AST, set[str]] = {}
+    for node in reversed(nodes):
+        if isinstance(node, ast.Name):
+            if (name_states := bound.get(node.id)) is not None:
+                states[node] = name_states
+        elif (access := _attribute_access(node)) is not None:
+            if (parent_states := states.get(access[0])) is not None:
+                next_states: set[str] = set()
+                for state in parent_states:
+                    stepped = _low_level_step(state, access[1])
+                    if stepped == _LOW_LEVEL_MODULE:
+                        return True
+                    if stepped is not None:
+                        next_states.add(stepped)
+                if next_states:
+                    states[node] = next_states
+    return False
+
+
 def _report_import_scope(
-    imports: list[ast.ImportFrom], nodes: list[ast.AST], path: Path, result: ScanResult
+    imports: list[ast.ImportFrom],
+    nodes: list[ast.AST],
+    annotations: set[ast.AST],
+    path: Path,
+    result: ScanResult,
+    *,
+    project_imports: _ProjectImports | None,
 ) -> None:
-    if any((stmt.module, a.name) in _LOW_LEVEL for stmt in imports for a in stmt.names):
+    if _reaches_low_level(nodes):
         result.surfaces_excluded.append(
             f"{path.as_posix()}: low-level MCP server tool list uncollected"
         )
@@ -722,17 +881,74 @@ def _report_import_scope(
         stmt.module in modules and any(a.name == "*" for a in stmt.names) for stmt in imports
     ):
         result.surfaces_excluded.append(f"{path.as_posix()}: unresolved Python MCP factory import")
-    sdk_modules = {module for module, _ in _DECORATOR_IMPORTS} | {
-        module for module, _ in _AGENT_FACTORIES
-    }
+    # Isolated and installed entry points may skip the checkout even when a
+    # regular package of the same name is present beside this file.
     qualified_sdk_import = any(
-        isinstance(node, ast.Import) and any(a.name in sdk_modules for a in node.names)
+        isinstance(node, ast.Import) and any(_framework_module(a.name, None) for a in node.names)
         for node in nodes
     )
-    if qualified_sdk_import or any(
-        stmt.module in sdk_modules and any(a.name == "*" for a in stmt.names) for stmt in imports
+    if qualified_sdk_import or _unrecognized_framework_import(
+        imports, nodes, annotations, project_imports
     ):
         result.surfaces_excluded.append(f"{path.as_posix()}: unresolved Python SDK tool import")
+
+
+def _under(module: str, roots: Sequence[str]) -> bool:
+    return any(module == root or module.startswith(f"{root}.") for root in roots)
+
+
+def _framework_module(module: str, project_imports: _ProjectImports | None) -> bool:
+    if _under(module, ("agents",)) and project_imports and project_imports.has_module(module):
+        return False
+    return _under(module, _FRAMEWORK_ROOTS) and not _under(module, _FRAMEWORK_CLIENTS)
+
+
+def _unrecognized_framework_import(
+    imports: list[ast.ImportFrom],
+    nodes: list[ast.AST],
+    annotations: set[ast.AST],
+    project_imports: _ProjectImports | None,
+) -> bool:
+    """Whether the file imports from a framework something that can carry tools unseen.
+
+    A star import counts, and so does any name the collector does not read tools from
+    that is a submodule or function, either of which can reach the tool decorator, or a
+    tool or toolset class, unless it is used only as a type in annotations. Names an
+    exact module exports by name, a framework's ``mcp`` client module included, are
+    the collector's or the source collector's to read.
+    """
+    found: set[str] = set()
+    for stmt in imports:
+        module = stmt.module
+        if module is None or not _framework_module(module, project_imports):
+            continue
+        for a in stmt.names:
+            if (module, a.name) in _DECORATOR_IMPORTS or (module, a.name) in _AGENT_FACTORIES:
+                continue
+            if (module, a.name) in _NON_REGISTERING_IMPORTS and (
+                project_imports is None or not project_imports.shadows(module, a.name)
+            ):
+                continue
+            if a.name == "*":
+                return True
+            if a.name == "mcp" and module in _FRAMEWORK_ROOTS:
+                continue
+            if not a.name[0].isupper() or "tool" in a.name.lower():
+                found.add(a.asname or a.name)
+    if not found:
+        return False
+    typed = {
+        node.id
+        for node in nodes
+        if isinstance(node, ast.Name) and node.id in found and node in annotations
+    }
+    return any(
+        isinstance(node, ast.Name)
+        and node.id in found
+        and isinstance(node.ctx, ast.Load)
+        and node not in annotations
+        for node in nodes
+    ) or bool(found - typed)
 
 
 def _factory_calls_and_rebinds(
@@ -828,6 +1044,20 @@ def _tool_decorator(deco: ast.expr) -> tuple[str, ast.Call | ast.Attribute] | No
     return None
 
 
+def _unwrapped(registers: list[bool]) -> list[bool]:
+    """For each decorator, whether every decorator below it registers a tool too.
+
+    Decorators apply from the bottom up, so one below a registration hands it whatever
+    function it returns, under whatever name and signature it gives.
+    """
+    unwrapped = [True] * len(registers)
+    below = True
+    for index in range(len(registers) - 1, -1, -1):
+        unwrapped[index] = below
+        below = below and registers[index]
+    return unwrapped
+
+
 def _record_decorated_tools(
     stmt: ast.FunctionDef | ast.AsyncFunctionDef,
     servers: dict[str, MCPServerComponent],
@@ -836,7 +1066,13 @@ def _record_decorated_tools(
     source_digest: str,
     result: ScanResult,
 ) -> None:
-    for deco in stmt.decorator_list:
+    unwrapped = _unwrapped(
+        [
+            (found := _tool_decorator(deco)) is not None and found[0] in servers
+            for deco in stmt.decorator_list
+        ]
+    )
+    for index, deco in enumerate(stmt.decorator_list):
         found = _tool_decorator(deco)
         if found is None or found[0] not in servers:
             continue
@@ -844,6 +1080,11 @@ def _record_decorated_tools(
         attribute = node.func if isinstance(node, ast.Call) else node
         if isinstance(attribute, ast.Attribute):
             handled.update((attribute, attribute.value))
+        if not unwrapped[index]:
+            result.surfaces_excluded.append(
+                f"{path.as_posix()}:{deco.lineno}: unresolved Python MCP tool name"
+            )
+            continue
         _record_decorator(node, stmt.name, servers[receiver], path, source_digest, result)
 
 
@@ -1044,16 +1285,214 @@ def _generic(node: ast.expr, names: set[str], roots: dict[str, str]) -> bool:
     return module in _TYPING_MODULES
 
 
-def _annotation_names(nodes: list[ast.AST], extra_roots: Sequence[ast.expr] = ()) -> set[ast.AST]:
+# Built-in classes an annotation may name or combine with ``|`` as types, while the
+# file leaves the name to the builtin.
+_TYPE_BUILTINS = _names(
+    "bool bytearray bytes complex dict float frozenset int list memoryview object set str tuple"
+    " type"
+)
+# Named SDK types with specific annotation semantics. Other imports from these
+# packages still need analysis when operators such as subscription evaluate them.
+_SDK_GENERICS = frozenset(
+    {
+        ("agents", "RunContextWrapper"),
+        ("agents.run_context", "RunContextWrapper"),
+        ("fastmcp", "Context"),
+        ("fastmcp.server", "Context"),
+        ("fastmcp.server.context", "Context"),
+        ("mcp.server.fastmcp", "Context"),
+        ("mcp.server.fastmcp.server", "Context"),
+        ("mcp.server.mcpserver", "Context"),
+        ("pydantic_ai", "RunContext"),
+        ("pydantic_ai.tools", "RunContext"),
+    }
+)
+_SDK_TYPES = (
+    _SDK_GENERICS | _FACTORIES | {("agents", "Agent"), ("agents.agent", "Agent"), *_AGENT_FACTORIES}
+)
+
+
+# Concrete SDK context parameters used by its public examples. They are safe as
+# direct arguments of the real Context generic, not operands of arbitrary code.
+_CONTEXT_ARGUMENTS = frozenset(
+    {
+        ("mcp", "ServerSession"),
+        ("mcp.server.session", "ServerSession"),
+        ("mcp.shared.context", "RequestContext"),
+        ("mcp.types", "Request"),
+        ("mcp.types", "ServerRequest"),
+        ("starlette.requests", "Request"),
+    }
+)
+SDK_IMPORT_ROOTS = frozenset(
+    module.partition(".")[0]
+    for module, _ in _SDK_TYPES | _CONTEXT_ARGUMENTS | set(_DECORATOR_IMPORTS)
+)
+
+
+class _TypeSyntax:
+    """Which parts of annotations Python evaluates only as types.
+
+    Evaluating ``A | B`` hands each operand to the other's ``__or__`` or ``__ror__``,
+    and FastMCP and ``typing.get_type_hints`` evaluate annotations whatever the
+    ``__future__`` import says. Plain builtin and typing expressions are checked
+    recursively. Optional server types are recognized separately. Combining
+    SDK objects, or passing a server class to an SDK subscript, remains visible
+    to registration analysis. Purity is cached per node.
+    """
+
+    def __init__(self, nodes: list[ast.AST], project_imports: _ProjectImports | None) -> None:
+        self._names, self._roots = _typing_generics(nodes)
+        self._sdk_types = frozenset(
+            identity
+            for identity in _SDK_TYPES
+            if project_imports is None or not project_imports.shadows(*identity)
+        )
+        self._sdk_generics = _SDK_GENERICS & self._sdk_types
+        self._optional_types = (_FACTORIES | _SDK_GENERICS) & self._sdk_types
+        self._context_arguments = {
+            identity
+            for identity in _CONTEXT_ARGUMENTS
+            if project_imports is None or not project_imports.shadows(*identity)
+        }
+        known_classes = self._sdk_types | self._context_arguments
+        bindings = _bindings(nodes)
+        imported: dict[str, list[tuple[str, str]]] = {}
+        for node in nodes:
+            if isinstance(node, ast.ImportFrom) and not node.level and node.module is not None:
+                for alias in node.names:
+                    identity = (node.module, alias.name)
+                    if identity in known_classes:
+                        imported.setdefault(alias.asname or alias.name, []).append(identity)
+        self._classes = {
+            name: paths[0]
+            for name, paths in imported.items()
+            if bindings[name] == len(paths) and len(set(paths)) == 1
+        }
+        self._builtins = {name for name in _TYPE_BUILTINS if not bindings[name]}
+        self._pure: dict[ast.AST, bool] = {}
+
+    def _sdk_type(self, node: ast.expr) -> tuple[str, str] | None:
+        attributes: list[str] = []
+        while isinstance(node, ast.Attribute):
+            attributes.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return None
+        if not attributes:
+            return self._classes.get(node.id)
+        module = self._roots.get(node.id)
+        if module is None:
+            return None
+        return ".".join((module, *reversed(attributes[1:]))), attributes[0]
+
+    def _children(self, node: ast.AST) -> list[ast.AST] | None:
+        """The parts whose purity decides ``node``'s, or None when it is not pure."""
+        if isinstance(node, ast.Constant):
+            return []
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            if isinstance(node, ast.Name) and node.id in self._builtins:
+                return []
+            return [] if _generic(node, self._names, self._roots) else None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            return [node.left, node.right]
+        if isinstance(node, ast.Subscript):
+            return [node.slice] if _generic(node.value, self._names, self._roots) else None
+        if isinstance(node, (ast.Tuple, ast.List)):
+            return list(node.elts)
+        return None
+
+    def pure(self, node: ast.AST) -> bool:
+        known = self._pure
+        stack = [node]
+        while stack:
+            item = stack[-1]
+            if item in known:
+                stack.pop()
+                continue
+            children = self._children(item)
+            if children is None:
+                known[item] = False
+                stack.pop()
+                continue
+            missing = [child for child in children if child not in known]
+            if missing:
+                stack.extend(missing)
+                continue
+            known[item] = all(known[child] for child in children)
+            stack.pop()
+        return known[node]
+
+    def _sdk_subscript(self, annotation: ast.Subscript) -> bool:
+        generic = self._sdk_type(annotation.value)
+        if generic is None or generic not in self._sdk_generics:
+            return False
+        if self.pure(annotation.slice):
+            return True
+        if generic[1] != "Context":
+            return False
+        arguments = (
+            annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
+        )
+        return all(
+            self.pure(arg) or self._sdk_type(arg) in self._context_arguments for arg in arguments
+        )
+
+    def parts(self, annotations: Sequence[ast.expr]) -> set[ast.AST]:
+        """The names, attributes of names and string constants used only as types."""
+        pending = list(annotations)
+        found: set[ast.AST] = set()
+        while pending:
+            annotation = pending.pop()
+            chain = _chain(annotation)
+            if chain is not None:
+                found.update(chain)
+            elif isinstance(annotation, ast.Constant):
+                found.add(annotation)
+            elif isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+                # A union of two SDK values can invoke SDK-defined operators.
+                # A simple optional SDK annotation retains its type-only use.
+                optional_sdk_type = any(
+                    (
+                        self._sdk_type(value) in self._optional_types
+                        or (isinstance(value, ast.Subscript) and self._sdk_subscript(value))
+                    )
+                    and isinstance(other, ast.Constant)
+                    and other.value is None
+                    for value, other in (
+                        (annotation.left, annotation.right),
+                        (annotation.right, annotation.left),
+                    )
+                )
+                if self.pure(annotation) or optional_sdk_type:
+                    pending += (annotation.left, annotation.right)
+            elif isinstance(annotation, (ast.Tuple, ast.List)):
+                pending += annotation.elts
+            elif isinstance(annotation, ast.Subscript) and (
+                _generic(annotation.value, self._names, self._roots)
+                or self._sdk_subscript(annotation)
+            ):
+                found.update(_chain(annotation.value) or ())
+                pending.append(annotation.slice)
+        return found
+
+
+def _annotation_names(
+    nodes: list[ast.AST],
+    extra_roots: Sequence[ast.expr] = (),
+    *,
+    project_imports: _ProjectImports | None = None,
+) -> set[ast.AST]:
     """Names, and attributes of names, that annotations use only as types.
 
     Annotations are evaluated, at definition time or later, so only these parts are
-    set aside: the whole annotation, a member of a ``|`` union, and an argument of a
-    generic of ``typing``, ``typing_extensions`` or ``collections.abc``, such as
-    ``Optional[...]``, or of a built-in generic such as ``list[...]``. A call, any
-    other subscript and every other expression in an annotation is analyzed as code.
+    set aside: the whole annotation, a member of a ``|`` union of pure type syntax
+    (see ``_TypeSyntax``), and an argument of a generic of ``typing``,
+    ``typing_extensions`` or ``collections.abc``, such as ``Optional[...]``, of a
+    built-in generic such as ``list[...]``, or of a recognized SDK generic with only
+    plain type arguments. A call, a walrus, any other
+    subscript or union and every other expression in an annotation is analyzed as code.
     """
-    names, roots = _typing_generics(nodes)
     pending: list[ast.expr] = list(extra_roots)
     for node in nodes:
         if isinstance(node, ast.arg) and node.annotation is not None:
@@ -1062,20 +1501,7 @@ def _annotation_names(nodes: list[ast.AST], extra_roots: Sequence[ast.expr] = ()
             pending.append(node.returns)
         elif isinstance(node, ast.AnnAssign):
             pending.append(node.annotation)
-    found: set[ast.AST] = set()
-    while pending:
-        annotation = pending.pop()
-        chain = _chain(annotation)
-        if chain is not None:
-            found.update(chain)
-        elif isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
-            pending += (annotation.left, annotation.right)
-        elif isinstance(annotation, (ast.Tuple, ast.List)):
-            pending += annotation.elts
-        elif isinstance(annotation, ast.Subscript) and _generic(annotation.value, names, roots):
-            found.update(_chain(annotation.value) or ())
-            pending.append(annotation.slice)
-    return found
+    return _TypeSyntax(nodes, project_imports).parts(pending)
 
 
 class _ParsedAnnotations(NamedTuple):
@@ -1230,6 +1656,7 @@ def _has_unsupported_registration(
     nodes: list[ast.AST],
     parents: dict[ast.AST, ast.AST],
     parsed: _ParsedAnnotations,
+    annotations: set[ast.AST],
     sdk_import: bool,
     calls: set[ast.Call],
     handled: set[ast.AST],
@@ -1249,11 +1676,7 @@ def _has_unsupported_registration(
         return True
     factory_calls = {call.func for call in calls}
     # A server named in an annotation is exposed through __annotations__.
-    safe = {
-        node
-        for node in _annotation_names(nodes, parsed.roots)
-        if not (isinstance(node, ast.Name) and node.id in servers)
-    }
+    safe = {node for node in annotations if not (isinstance(node, ast.Name) and node.id in servers)}
     safe |= _safe_receivers(
         nodes, parents, servers, _SERVER_DATA, _SERVER_CALLS, _SERVER_DECORATORS
     )
@@ -1583,6 +2006,7 @@ def _context_bindings(
     roots: set[str],
     rooted: _RootedAt,
     scopes: dict[ast.AST, ast.AST | None],
+    project_imports: _ProjectImports | None,
 ) -> tuple[set[tuple[ast.AST | None, str]], bool]:
     """Parameters typed as an SDK context and names bound to ``get_context()``, by scope.
 
@@ -1604,6 +2028,8 @@ def _context_bindings(
         if isinstance(node, (ast.Global, ast.Nonlocal))
         for name in node.names
     }
+    syntax = _TypeSyntax(nodes, project_imports)
+    parsed_roots = set(parsed.roots)
     annotations: set[ast.AST] = set()
     bound: set[tuple[ast.AST | None, str]] = set()
     for node in nodes:
@@ -1618,8 +2044,12 @@ def _context_bindings(
                 if arg.annotation is None:
                     continue
                 extra = parsed.by_arg.get(arg, ())
-                annotations.update(ast.walk(arg.annotation))
-                annotations.update(extra)
+                annotations |= syntax.parts(
+                    [
+                        arg.annotation,
+                        *(n for n in extra if n in parsed_roots and isinstance(n, ast.expr)),
+                    ]
+                )
                 if _names_context(arg.annotation, extra, types, roots, rooted):
                     bound.add((node, arg.arg))
     escaped = False
@@ -1723,6 +2153,7 @@ def _report_context_handles(
     bindings: Counter[str],
     path: Path,
     result: ScanResult,
+    project_imports: _ProjectImports | None,
 ) -> None:
     """A server reached through a request context can be given tools from any handler.
 
@@ -1774,7 +2205,7 @@ def _report_context_handles(
             break
     if not handle and sdk_import:
         scopes = _scopes(parents)
-        bound, handle = _context_bindings(parsed, roots, rooted, scopes)
+        bound, handle = _context_bindings(parsed, roots, rooted, scopes, project_imports)
         names = {name for _, name in bound}
         resolved: dict[tuple[ast.AST | None, str], bool] = {}
         handle = handle or any(
@@ -1791,7 +2222,11 @@ def _report_context_handles(
 
 
 def _report_unused_factories(
-    nodes: list[ast.AST], factories: dict[str, ast.ImportFrom], path: Path, result: ScanResult
+    nodes: list[ast.AST],
+    annotations: set[ast.AST],
+    factories: dict[str, ast.ImportFrom],
+    path: Path,
+    result: ScanResult,
 ) -> None:
     """A server class imported and not used other than as a type in an annotation is
     passed on.
@@ -1801,7 +2236,6 @@ def _report_unused_factories(
     """
     if not factories:
         return
-    annotations = _annotation_names(nodes)
     used = {
         node.id
         for node in nodes
@@ -1821,6 +2255,8 @@ def collect_python_tools(
     path: Path,
     result: ScanResult,
     known: KnownValues | None = None,
+    *,
+    project_imports: _ProjectImports | None = None,
 ) -> None:
     """Support direct SDK imports, module constructors and top-level decorators.
 
@@ -1831,21 +2267,43 @@ def collect_python_tools(
     if not any(hint in source for hint in PYTHON_TOOL_HINTS):
         return
     imports = [node for node in nodes if isinstance(node, ast.ImportFrom) and not node.level]
+    candidates = [
+        stmt
+        for stmt in imports
+        if any(
+            (stmt.module, alias.name) in _SDK_TYPES
+            or (stmt.module, alias.name) in _DECORATOR_IMPORTS
+            for alias in stmt.names
+        )
+    ]
+    resolved = [
+        stmt
+        for stmt in candidates
+        if stmt.module is not None
+        and (
+            project_imports is None
+            or all(not project_imports.shadows(stmt.module, alias.name) for alias in stmt.names)
+        )
+    ]
+    if len(resolved) != len(candidates):
+        result.surfaces_excluded.append(
+            f"{path.as_posix()}: Python SDK import may resolve to checkout code"
+        )
     factories = {
         a.asname or a.name: stmt
-        for stmt in imports
+        for stmt in resolved
         for a in stmt.names
         if (stmt.module, a.name) in _FACTORIES
     }
     decorators = {
         a.asname or a.name: (stmt, _DECORATOR_IMPORTS[(stmt.module, a.name)])
-        for stmt in imports
+        for stmt in resolved
         for a in stmt.names
         if stmt.module is not None and (stmt.module, a.name) in _DECORATOR_IMPORTS
     }
     agent_factories = {
         a.asname or a.name: (stmt, _AGENT_FACTORIES[(stmt.module, a.name)])
-        for stmt in imports
+        for stmt in resolved
         for a in stmt.names
         if stmt.module is not None and (stmt.module, a.name) in _AGENT_FACTORIES
     }
@@ -1853,9 +2311,10 @@ def collect_python_tools(
     parents = {child: node for node in nodes for child in ast.iter_child_nodes(node)}
     sdk_import = _imports_mcp_sdk(nodes)
     parsed = _parse_string_annotations(nodes, parents)
-    _report_import_scope(imports, nodes, path, result)
-    _report_context_handles(parsed, sdk_import, bindings, path, result)
-    _report_unused_factories(nodes, factories, path, result)
+    annotations = _annotation_names(nodes, parsed.roots, project_imports=project_imports)
+    _report_import_scope(imports, nodes, annotations, path, result, project_imports=project_imports)
+    _report_context_handles(parsed, sdk_import, bindings, path, result, project_imports)
+    _report_unused_factories(nodes, annotations, factories, path, result)
     if not factories and not decorators and not agent_factories:
         _report_imported_receivers(tree, path, result)
         if sdk_import and (
@@ -1886,6 +2345,7 @@ def collect_python_tools(
             nodes,
             parents,
             parsed,
+            annotations,
             agent_factories,
             bindings,
             path,
@@ -1935,7 +2395,17 @@ def collect_python_tools(
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             _record_decorated_tools(stmt, servers, handled, path, source_digest, result)
     if _has_unsupported_registration(
-        tree, nodes, parents, parsed, sdk_import, calls, handled, servers, factories, bindings
+        tree,
+        nodes,
+        parents,
+        parsed,
+        annotations,
+        sdk_import,
+        calls,
+        handled,
+        servers,
+        factories,
+        bindings,
     ) or _imported_receivers(tree):
         result.surfaces_excluded.append(
             f"{path.as_posix()}: unsupported Python MCP binding or dynamic registration"

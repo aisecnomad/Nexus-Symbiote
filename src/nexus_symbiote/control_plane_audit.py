@@ -7,7 +7,9 @@ import json
 import posixpath
 import re
 import shlex
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -83,7 +85,6 @@ NODE_SCRIPT_SWITCHES = _words("--inspect --inspect-brk --experimental-strip-type
 PRELOAD_OPTIONS = _words("-r --require --import --loader --experimental-loader")
 SCRIPT_ARGUMENT_OPTIONS = SCRIPT_VALUE_OPTIONS | PRELOAD_OPTIONS
 SCRIPT_SWITCHES = _words("--watch --quiet --verbose --no-warnings --no-deprecation -u -B")
-FS_WRITE_TOOLS = _words("write_file edit_file move_file")
 INSTALLED_BIN_DIRS = _tup("node_modules/.bin/ .venv/bin/ venv/bin/")
 SCRIPT_SUFFIXES = _tup(".sh .py .js .mjs .cjs .jsx .ts .mts .cts .tsx .rb .pl")
 CODE_EXEC_HOSTED_TOOLS = _words("code_interpreter computer_use bash local_shell code_execution")
@@ -198,6 +199,8 @@ def _load_json_docs(
             continue
         if isinstance(parsed, dict):
             docs.append((rel_path, parsed))
+        else:
+            gaps.append(f"{rel_path}: configuration must be a JSON object")
     return docs
 
 
@@ -995,38 +998,152 @@ def _steering_host(path: str) -> str:
     return path.split("/", 1)[0]
 
 
-def _deny_covers_steering(deny_rules: list[str], server_name: str, reference_server: bool) -> bool:
-    # Claude Code Read/Edit/Write path rules govern its built-in file tools, not an MCP server,
-    # which writes from its own process. Only a deny of the server's tools stops it.
-    prefix = f"mcp__{server_name}"
-    rules = {r.strip() for r in deny_rules}
-    if prefix in rules or f"{prefix}__*" in rules:
+def _claude_mcp_prefix(server: str) -> str:
+    # The client replaces each non-identifier UTF-16 code unit when naming tools.
+    normalized = re.sub(
+        r"[^a-zA-Z0-9_-]", lambda match: "__" if ord(match[0]) > 0xFFFF else "_", server
+    )
+    if server.startswith("claude.ai "):
+        normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return "mcp__" + normalized
+
+
+def _allows_mcp_server(rules: list[str], prefix: str) -> bool:
+    exact = bisect_left(rules, prefix)
+    # A bare rule is parsed at the first double underscore. For ambiguous server
+    # names Claude requires the tool-qualified form, including the whole name.
+    bare_address = "__" not in prefix[5:] and not prefix.endswith("_")
+    if bare_address and exact < len(rules) and rules[exact] == prefix:
         return True
-    return reference_server and all(f"{prefix}__{tool}" in rules for tool in FS_WRITE_TOOLS)
+    scoped = f"{prefix}__"
+    index = bisect_right(rules, scoped)  # A tool-qualified address needs a nonempty tool.
+    return index < len(rules) and rules[index].startswith(scoped)
+
+
+def _claude_unconditional_rule(rule: str) -> str | None:
+    if "(" not in rule and ")" not in rule:
+        return rule
+    # Only a tool name that failed MCP namespace parsing can use the client's
+    # literal-name fallback. An ordinary MCP call rule with parentheses is invalid.
+    if rule.endswith("(*)"):
+        literal = rule[:-3]
+        mcp_namespace = literal.startswith("mcp__") and literal[5:].partition("__")[0]
+        if not mcp_namespace and "(" not in literal and ")" not in literal:
+            return literal
+    return None
+
+
+def _claude_mcp_allow(rule: str) -> str | None:
+    """Return the client's unconditional MCP rule, preserving literal tool names."""
+    normalized = _claude_unconditional_rule(rule)
+    if normalized is None:
+        return None
+    rule = normalized
+    if not rule.startswith("mcp__") or any(c.isspace() for c in rule):
+        return None
+    server, separator, tool = rule[5:].partition("__")
+    if not server:
+        # A leading delimiter makes the client's namespace parser fall back to
+        # exact full-tool equality. Such a name cannot authorize a wildcard.
+        return rule if separator and tool and "*" not in tool else None
+    return rule if "*" not in server and (not separator or tool) else None
+
+
+def _claude_deny_rule(rule: str) -> str | None:
+    literal = _claude_unconditional_rule(rule)
+    if not literal or not re.fullmatch(r"[a-zA-Z0-9_*-]+", literal):
+        return None
+    if "_" not in literal and literal[0].islower():
+        return None
+    return re.sub(r"\*+", "*", literal)
+
+
+_CLAUDE_DENY_GLOB_WORK = 4_000_000
+
+
+class _ClaudeServerDenies:
+    """Look up exact namespaces and prefix globs before considering general globs."""
+
+    def __init__(self, rules: set[str]) -> None:
+        self.rules = rules
+        self.prefixes: list[str] = []
+        self.globs: list[str] = []
+        for rule in sorted(rules):
+            if not rule.endswith("*"):
+                continue
+            prefix = rule[:-1]
+            if "*" in prefix:
+                self.globs.append(rule)
+            elif not self.prefixes or not prefix.startswith(self.prefixes[-1]):
+                self.prefixes.append(prefix)
+        # A project controls both the glob set and the number of servers.
+        self.remaining_glob_work = _CLAUDE_DENY_GLOB_WORK
+
+    def covers(self, server: str) -> bool:
+        address = server + "__"
+        parsed_server = address[5:].partition("__")[0]
+        if server in self.rules or (parsed_server and "mcp__" + parsed_server in self.rules):
+            return True
+        index = bisect_right(self.prefixes, address) - 1
+        if index >= 0 and address.startswith(self.prefixes[index]):
+            return True
+        for glob in self.globs:
+            work = len(glob) * len(address)
+            if self.remaining_glob_work < work:
+                self.remaining_glob_work = -1
+                return False
+            self.remaining_glob_work -= work
+            # A terminal star can consume every possible tool suffix if the
+            # pattern already matches the fixed namespace through its delimiter.
+            if fnmatchcase(address, glob):
+                return True
+        return False
 
 
 def _inspect_steering_surfaces(
     files: ConfinedCollection, all_paths: list[str], summary: ControlPlaneAuditSummary
 ) -> None:
-    auto_edit_modes: list[str] = []
-    deny_rules: list[str] = []
-
+    modes: dict[str, list[str]] = {}
+    claude_allows: dict[str, list[str]] = {}
+    claude_denies: set[str] = set()
+    claude_prompting = False
     for s_path, doc in _load_json_docs(files, all_paths, PERMISSION_CONFIG_FILES, summary.gaps):
+        host = _steering_host(s_path)
+        auto_edit_modes = modes.setdefault(host, [])
         perms = _as_dict(doc.get("permissions"))
-        mode = str(perms.get("defaultMode") or perms.get("mode") or "")
-        if mode in {"acceptEdits", "bypassPermissions", "auto"}:
+        mode = perms.get("defaultMode") or perms.get("mode")
+        if mode in ("acceptEdits", "bypassPermissions", "auto"):
             auto_edit_modes.append(f"{s_path}:{mode}")
-        for item in _as_list(perms.get("allow")):
-            s_item = str(item)
-            if s_item in {"*", "Edit", "Write"} or "filesystem" in s_item:
-                auto_edit_modes.append(f"{s_path}:allow:{s_item}")
-        # A Claude Code deny rule governs only the servers Claude Code itself launches.
-        if _steering_host(s_path) == "claude":
-            deny_rules.extend(str(x) for x in _as_list(perms.get("deny")))
-        if doc.get("approvalPolicy") in {"never", "auto-edit"}:
+        allow = [r for r in _as_list(perms.get("allow")) if isinstance(r, str)]
+        if host == "claude":
+            # The client does not trim permission rules before matching them.
+            allow = [rule for rule in allow if rule == rule.strip()]
+        else:
+            allow = [rule.strip() for rule in allow]
+        if any(
+            rule in {"Edit", "Write"}
+            or (
+                host != "claude"
+                and (rule == "*" or (not rule.startswith("mcp__") and "filesystem" in rule))
+            )
+            for rule in allow
+        ):
+            auto_edit_modes.append(f"{s_path}:write-allowance")
+        if host == "claude":
+            claude_prompting |= mode in ("default", "plan")
+            claude_allows[s_path] = sorted(
+                normalized for rule in allow if (normalized := _claude_mcp_allow(rule)) is not None
+            )
+            claude_denies.update(
+                normalized
+                for rule in _as_list(perms.get("deny"))
+                if isinstance(rule, str) and (normalized := _claude_deny_rule(rule)) is not None
+            )
+        if doc.get("approvalPolicy") in ("never", "auto-edit"):
             auto_edit_modes.append(f"{s_path}:{doc['approvalPolicy']}")
 
     project_roots = (files.root.as_posix(), files.root.resolve().as_posix())
+    server_denies = _ClaudeServerDenies(claude_denies)
 
     for cfg_path, doc in _load_json_docs(files, all_paths, MCP_CONFIG_FILES, summary.gaps):
         for srv_name, srv_cfg in _extract_mcp_servers(doc):
@@ -1037,15 +1154,29 @@ def _inspect_steering_surfaces(
             joined = " ".join([cmd, *args]).lower()
             if "filesystem" not in srv_name.lower() and "server-filesystem" not in joined:
                 continue
-            server_read_only = (
-                bool(srv_cfg.get("readOnly")) or "--readonly" in joined or "--read-only" in joined
-            )
-            deny_covered = _steering_host(cfg_path) == "claude" and _deny_covers_steering(
-                deny_rules, srv_name, "server-filesystem" in joined
-            )
+            host = _steering_host(cfg_path)
+            prefix = _claude_mcp_prefix(srv_name)
+            # A future or custom server can publish additional write tools. Only the
+            # owning client's deny of the whole server covers this open-ended surface.
+            deny_covered = host == "claude" and server_denies.covers(prefix)
             srv_auto = (
                 bool(srv_cfg.get("autoApprove")) or len(_as_list(srv_cfg.get("alwaysAllow"))) > 0
             )
+            eff_modes = list(modes.get(host, ()))
+            if host == "claude":
+                eff_modes.extend(
+                    f"{source}:mcp-allowance"
+                    for source, rules in claude_allows.items()
+                    if _allows_mcp_server(rules, prefix)
+                )
+            if srv_auto:
+                eff_modes.append(f"{cfg_path}:{srv_name}:alwaysAllow")
+            writable = bool(eff_modes) and not deny_covered
+            approval_status = "preapproved" if writable else "unverified"
+            if deny_covered:
+                approval_status = "denied"
+            elif not writable and host == "claude" and claude_prompting:
+                approval_status = "prompting"
             roots = [
                 a
                 for a in args
@@ -1054,21 +1185,18 @@ def _inspect_steering_surfaces(
                 and a not in {"-y", "npx", "uvx"}
             ] or ["."]
             for raw_root in roots:
-                # ':ro' marks only the root it is appended to as read-only.
+                # MCP stdio has no standard readOnly field or CLI switch. Positional
+                # launcher text is not an access-control decision by a filesystem.
                 r_arg = raw_root.removesuffix(":ro")
-                read_only = server_read_only or raw_root.endswith(":ro")
                 if not _covers_steering_path(r_arg, project_roots):
                     continue
-                eff_modes = list(auto_edit_modes)
-                if srv_auto:
-                    eff_modes.append(f"{cfg_path}:{srv_name}:alwaysAllow")
-                writable = bool(eff_modes) and not read_only and not deny_covered
                 summary.steering_surfaces.append(
                     _rec(
                         server_name=srv_name,
                         root_path=r_arg,
                         permission_modes=eff_modes,
-                        read_only=read_only,
+                        approval_status=approval_status,
+                        read_only=False,
                         deny_covered=deny_covered,
                         writable=writable,
                         source_file=cfg_path,
@@ -1082,6 +1210,18 @@ def _inspect_steering_surfaces(
                         cfg_path,
                         srv_name,
                     )
+                elif approval_status == "unverified":
+                    summary.flag(
+                        "steering_surface_unverified",
+                        RiskSeverity.MEDIUM,
+                        f"Write approval for filesystem server '{srv_name}' rooted at '{r_arg}' "
+                        "could not be established from the declaring client's configuration.",
+                        cfg_path,
+                        srv_name,
+                    )
+
+    if server_denies.remaining_glob_work < 0:
+        summary.gaps.append("Claude deny rules: namespace wildcard comparison limit reached")
 
 
 def _record_hosted_tool(
@@ -1613,14 +1753,24 @@ def audit_project_control_plane(
     if claims_path is not None:
         try:
             with open_regular_file(claims_path) as stream:
-                raw_claims = stream.read(4_194_304).decode("utf-8", errors="replace")
-            parsed = parse_json_strict(raw_claims)
-            if isinstance(parsed, dict):
-                decl_sources.append(("shadowscan:claims", parsed, AssuranceLevel.DECLARED))
+                raw_claims = stream.read(4_194_304 + 1)
+            if len(raw_claims) > 4_194_304:
+                raise ValueError("claims exceed byte budget")
+            parsed = parse_json_strict(raw_claims.decode("utf-8"), max_bytes=4_194_304)
+            if not isinstance(parsed, dict):
+                summary.gaps.append(
+                    f"{neutralize(claims_path.name)}: claims file is not a JSON object"
+                )
             else:
-                summary.gaps.append(f"{claims_path.name}: claims file is not a JSON object")
+                for section in ("hosted_tools", "ci_agents", "agent_constructors", "identities"):
+                    if section in parsed and (
+                        not isinstance(parsed[section], list)
+                        or not all(isinstance(item, dict) for item in parsed[section])
+                    ):
+                        summary.gaps.append(f"claims: invalid {section} collection")
+                decl_sources.append(("shadowscan:claims", parsed, AssuranceLevel.DECLARED))
         except (OSError, ValueError, RecursionError):
-            summary.gaps.append(f"{claims_path.name}: invalid JSON")
+            summary.gaps.append(f"{neutralize(claims_path.name)}: invalid JSON")
 
     with ConfinedCollection(project_root, summary.gaps) as files:
         all_paths = sorted(p.as_posix() for p in files.iter_files())

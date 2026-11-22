@@ -184,7 +184,16 @@ def test_nothing_in_the_checkout_can_set_a_limit(tmp_path):
     assert result.exit_code == 1
     assert "entries limit of 5 exceeded" in result.output
     result = runner.invoke(
-        main, ["--limit", "entries=500", "scan", str(project), "-o", str(output)]
+        main,
+        [
+            "--limit",
+            "entries=500",
+            "scan",
+            str(project),
+            "--accept-project-policy",
+            "-o",
+            str(output),
+        ],
     )
     assert result.exit_code == 1
     assert "invalid policy" in result.output

@@ -1704,6 +1704,8 @@ class ModelPackage:
     weight_files: tuple[tuple[Path, str | None], ...]
     complete: bool
     budget_exhausted: bool = False
+    trust_remote_code: bool | None = None
+    loading_config_complete: bool = True
 
 
 def memoized(verify: Verify, results: dict[tuple[Any, ...], VerificationResult]) -> Verify:
@@ -1750,6 +1752,50 @@ def memoized(verify: Verify, results: dict[tuple[Any, ...], VerificationResult])
     return cached
 
 
+def _read_model_configs(
+    files: ConfinedCollection,
+    tree: ModelTree,
+    model_dir: Path,
+    read: Callable[[ConfinedCollection, Path], bytes | None],
+) -> tuple[list[tuple[Path, dict[str, Any]]], list[tuple[Path, str]]]:
+    """Read this directory's model configs under the caller's shared byte budget."""
+    configs: list[tuple[Path, dict[str, Any]]] = []
+    config_files: list[tuple[Path, str]] = []
+    for name in MODEL_CONFIG_FILES:
+        path = model_dir / name
+        if path not in tree.paths:
+            _report_variants(files, path)
+            continue
+        raw = read(files, path)
+        if raw is None:
+            continue
+        if (followed := files.link_target(path)) is not None and credential_shaped(followed):
+            # The symlink was replaced after the check above.
+            files._fail(path, "file changed during collection")
+            continue
+        config_files.append((path, hash_bytes(raw)))
+        try:
+            data = _json_document(raw)
+        except (ValueError, RecursionError):
+            files._fail(path, "invalid JSON or duplicate keys")
+            continue
+        if not isinstance(data, dict):
+            files._fail(path, "model configuration must be an object")
+            continue
+        configs.append((path, _checked_config(files, path, data)))
+
+    return configs, config_files
+
+
+def _remote_code_setting(configs: list[tuple[Path, dict[str, Any]]]) -> bool | None:
+    values = [
+        data["trust_remote_code"]
+        for _, data in configs
+        if isinstance(data.get("trust_remote_code"), bool)
+    ]
+    return any(values) if values else None
+
+
 class ModelPackages:
     """Re-observe model files and their bound weight files beneath one root, as a scan does.
 
@@ -1778,6 +1824,7 @@ class ModelPackages:
         self._observations: dict[Path, ModelArtifactObservation | None] = {}
         self._digests: dict[Path, str | None] = {}
         self._packages: dict[Path, ModelPackage] = {}
+        self._loading_configs: dict[Path, tuple[bool | None, bool]] = {}
 
     def observe(self, path: Path) -> ModelPackage:
         """Observe root-relative ``path`` and every weight file a loader reads with it."""
@@ -1805,6 +1852,15 @@ class ModelPackages:
                 self._bindings,
             ):
                 weights.append((companion, self._hash(files, companion)))
+            weight_reads_complete = not failures
+            if directory not in self._loading_configs:
+                before = files.failures_recorded
+                configs, _ = _read_model_configs(files, tree, directory, self._read_loading_config)
+                self._loading_configs[directory] = (
+                    _remote_code_setting(configs),
+                    files.failures_recorded == before,
+                )
+        remote_code, config_complete = self._loading_configs[directory]
         self.covered.update(weight for weight, _ in weights)
         read = {weight for weight, _ in weights}.union(indexes)
         exhausted = bool(read & self._refused or read & self._bindings.refused)
@@ -1815,12 +1871,22 @@ class ModelPackages:
             and indexed
             and listed
             and not exhausted
-            and not failures
+            and weight_reads_complete
             and all(digest for _, digest in weights),
             exhausted,
+            remote_code,
+            config_complete,
         )
         self._packages[path] = package
         return package
+
+    def _read_loading_config(self, files: ConfinedCollection, path: Path) -> bytes | None:
+        linked = files.in_root_target(path)
+        reason = credential_gap(path.as_posix(), None if linked is None else linked.as_posix())
+        if reason:
+            files._fail(path, reason)
+            return None
+        return self._read(files, path, expected_link_target=linked if linked != path else None)
 
     def observation(self, path: Path) -> ModelArtifactObservation | None:
         """The observation of root-relative ``path``, made now unless already made."""
@@ -1868,9 +1934,11 @@ class ModelPackages:
             self._observations[path] = observation
         return self._observations[path]
 
-    def _read(self, files: ConfinedCollection, path: Path) -> bytes | None:
+    def _read(
+        self, files: ConfinedCollection, path: Path, *, expected_link_target: Path | None = None
+    ) -> bytes | None:
         try:
-            with files.open_regular(path) as stream:
+            with files.open_regular(path, expected_link_target=expected_link_target) as stream:
                 self._charge(files, path, stream)
                 content = bytearray()
                 while chunk := stream.read(65536):
@@ -2372,36 +2440,15 @@ class ModelScanner(Scanner):
 
     def _directory_context(self, files: ConfinedCollection, model_dir: Path) -> _DirectoryContext:
         tree = self._tree
-        configs: list[tuple[Path, dict[str, Any]]] = []
-        config_files: list[tuple[Path, str]] = []
-        for name in MODEL_CONFIG_FILES:
-            path = model_dir / name
-            if path not in tree.paths:
-                _report_variants(files, path)
-                continue
-            if self._credential_file(files, path):
-                continue
-            self._read.add(path)
-            raw = files.read_bytes(path)
-            if raw is None:
-                continue
-            if (followed := files.link_target(path)) is not None and credential_shaped(followed):
-                # The symlink was replaced after the check above.
-                files._fail(path, "file changed during collection")
-                continue
-            config_files.append((path, hash_bytes(raw)))
-            try:
-                data = _json_document(raw)
-            except (ValueError, RecursionError):
-                files._fail(path, "invalid JSON or duplicate keys")
-                continue
-            if not isinstance(data, dict):
-                files._fail(path, "model configuration must be an object")
-                continue
-            configs.append((path, _checked_config(files, path, data)))
 
+        def read_config(files: ConfinedCollection, path: Path) -> bytes | None:
+            if self._credential_file(files, path):
+                return None
+            self._read.add(path)
+            return files.read_bytes(path)
+
+        configs, config_files = _read_model_configs(files, tree, model_dir, read_config)
         merged: dict[str, Any] = {}
-        remote: list[bool] = []
         templates: list[tuple[str, str]] = []
         escapes: list[str] = []
         declared_in: list[str] = []
@@ -2416,8 +2463,6 @@ class ModelScanner(Scanner):
                 merged.setdefault("quant_method", nested["quant_method"])
             if data.get("adapter_config"):
                 merged.setdefault("adapter_config", True)
-            if isinstance(data.get("trust_remote_code"), bool):
-                remote.append(data["trust_remote_code"])
             declared, found = _code_references(data)
             if declared:
                 declared_in.append(path.as_posix())
@@ -2492,7 +2537,7 @@ class ModelScanner(Scanner):
         )
         return _DirectoryContext(
             config=merged,
-            trust_remote_code=True if True in remote else False if remote else None,
+            trust_remote_code=_remote_code_setting(configs),
             config_files=config_files,
             tokenizer_files=tokenizer_files,
             chat_templates=templates,

@@ -180,7 +180,7 @@ def test_steering_surface_writable_and_mitigations(tmp_path: Path) -> None:
     summary = audit_project_control_plane(tmp_path)
     assert any(f["category"] == "steering_surface_writable" for f in summary.findings)
 
-    # Read-only flag clears steering_surface_writable
+    # The stdio launcher has no verified read-only mode.
     _write(
         tmp_path / ".mcp.json",
         json.dumps(
@@ -200,7 +200,7 @@ def test_steering_surface_writable_and_mitigations(tmp_path: Path) -> None:
         ),
     )
     ro_summary = audit_project_control_plane(tmp_path)
-    assert not any(f["category"] == "steering_surface_writable" for f in ro_summary.findings)
+    assert any(f["category"] == "steering_surface_writable" for f in ro_summary.findings)
 
     # Denying the filesystem server's own tools clears steering_surface_writable
     _write(
@@ -773,6 +773,41 @@ def _fs_project(root: Path, deny: list[str], args: list[str]) -> None:
 
 
 @pytest.mark.parametrize(
+    ("mode", "allow", "status"),
+    [
+        (None, [], "unverified"),
+        ("default", [], "prompting"),
+        ("plan", [], "prompting"),
+        ("default", ["mcp__fs"], "preapproved"),
+        ("plan", ["mcp__fs__*"], "preapproved"),
+        ("default", ["mcp__fs__write_file"], "preapproved"),
+        ("default", ["mcp__fs_backup__write_file"], "prompting"),
+    ],
+)
+def test_steering_distinguishes_prompting_from_preapproval(
+    tmp_path: Path, mode: str | None, allow: list[str], status: str
+) -> None:
+    _fs_project(tmp_path, [], ["."])
+    _write(
+        tmp_path / ".claude/settings.json",
+        json.dumps({"permissions": {"defaultMode": mode, "allow": allow}}),
+    )
+    summary = audit_project_control_plane(tmp_path)
+    [surface] = summary.steering_surfaces
+    assert surface["approval_status"] == status
+    assert surface["writable"] == (status == "preapproved")
+    assert summary.gaps == []
+
+    args = ["audit-control-plane", str(tmp_path)]
+    default = CliRunner().invoke(main, args)
+    assert default.exit_code == (1 if status == "preapproved" else 0), default.output
+    if status == "unverified":
+        strict = CliRunner().invoke(main, [*args, "--fail-on-severity", "medium"])
+        assert strict.exit_code == 1, strict.output
+        assert "steering_surface_unverified" in strict.output
+
+
+@pytest.mark.parametrize(
     ("deny", "args", "writable"),
     [
         (["Read(.claude/secret.txt)", "Read(.cursor/x)"], ["."], True),
@@ -785,18 +820,18 @@ def _fs_project(root: Path, deny: list[str], args: list[str]) -> None:
         ),
         (["mcp__fs__write_file", "mcp__fs__edit_file"], ["."], True),
         (["mcp__other"], ["."], True),
-        (["mcp__fs__write_file", "mcp__fs__edit_file", "mcp__fs__move_file"], ["."], False),
+        (["mcp__fs__write_file", "mcp__fs__edit_file", "mcp__fs__move_file"], ["."], True),
         (["mcp__fs__*"], ["."], False),
         (["mcp__fs"], ["."], False),
         ([], ["/opt/scratch:ro", "."], True),
-        ([], [".:ro"], False),
+        ([], [".:ro"], True),
         ([], ["/srv/data:ro", "./.claude"], True),
     ],
 )
 def test_steering_deny_and_read_only_are_per_server_and_root(
     tmp_path: Path, deny: list[str], args: list[str], writable: bool
 ) -> None:
-    """Only a deny of the server's tools, or ':ro' on that root, clears the finding (P1-H7)."""
+    """Only a host-scoped deny of the entire server clears a writable surface."""
     _fs_project(tmp_path, deny, args)
     summary = audit_project_control_plane(tmp_path)
     flagged = any(f["category"] == "steering_surface_writable" for f in summary.findings)
@@ -1006,6 +1041,9 @@ def test_claude_deny_governs_only_claude_launched_servers(
         name: {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]}
         for name in ("filesystem", "fs2")
     }
+    # Give each server its own approval so this test measures which client can deny it.
+    for server in servers.values():
+        server["autoApprove"] = True
     _write(tmp_path / config, json.dumps({"mcpServers": servers}))
     summary = audit_project_control_plane(tmp_path)
     flagged = {
@@ -1043,3 +1081,47 @@ def test_token_shaped_names_paths_and_rules_never_reach_any_output(tmp_path: Pat
         rendered = res.output + (out.read_text() if out.exists() else "")
         assert gh not in rendered
     assert json.loads(out.read_text())["steering_surfaces"]
+
+
+def test_steering_rules_are_host_scoped_and_allow_arguments_stay_private(tmp_path):
+    marker = "filesystem-private-fixture"
+    _write(
+        tmp_path / ".claude/settings.json",
+        json.dumps({"permissions": {"deny": ["mcp__filesystem__*"], "allow": [marker]}}),
+    )
+    _write(
+        tmp_path / ".cursor/mcp.json",
+        json.dumps(
+            {
+                "mcpServers": {
+                    "filesystem": {
+                        "command": "custom-filesystem",
+                        "args": [".", "--read-only-hint"],
+                        "readOnly": "false",
+                        "autoApprove": True,
+                    }
+                }
+            }
+        ),
+    )
+    _write(
+        tmp_path / ".mcp.json",
+        json.dumps({"mcpServers": {"filesystem": {"command": "custom-filesystem", "args": ["."]}}}),
+    )
+    summary = audit_project_control_plane(tmp_path)
+    surfaces = {s["source_file"]: s for s in summary.steering_surfaces}
+    assert surfaces[".cursor/mcp.json"]["writable"]
+    assert surfaces[".mcp.json"]["deny_covered"]
+    assert marker not in json.dumps(summary.to_dict())
+
+
+def test_partial_or_wrong_shape_claims_and_baselines_are_visible(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    baseline = tmp_path / "baseline"
+    _write(baseline / ".mcp.json", "[]")
+    claims = tmp_path / "claims.json"
+    claims.write_bytes(b"{}" + b" " * 4_194_304)
+    report = audit_project_control_plane(project, baseline_root=baseline, claims_path=claims)
+    assert any("baseline:" in gap for gap in report.gaps)
+    assert any("claims" in gap for gap in report.gaps)

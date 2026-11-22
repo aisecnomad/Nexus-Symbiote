@@ -118,8 +118,8 @@ declaration files (`.d.ts`, `.d.mts`, `.d.cts`) and scripts named with `.spec.` 
 candidates are parsed:
 
 - A Python file is a candidate when it contains `mcp`, `MCPClient`, `MCPServer`,
-  `FastMCP`, `StdioServerParameters`, `sse_client`, `streamablehttp_client`,
-  `websocket_client` or the name of
+  `FastMCP`, `StdioServerParameters`, `sse_client`, `stdio_client`,
+  `streamablehttp_client`, `streamable_http_client`, `websocket_client` or the name of
   an agent framework whose tools are collected (`langchain`, `crewai`,
   `function_tool`, `smolagents`, `pydantic_ai`) as Python reads it: decoded as its
   encoding declaration says, with identifiers in the NFKC form Python compares them

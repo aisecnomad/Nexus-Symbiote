@@ -268,7 +268,10 @@ def test_the_generated_template_loads_to_the_built_in_policy(tmp_path):
 
 
 def _scan_and_validate(tmp_path: Path) -> list[str]:
-    """The outputs of scan and validate --project on tmp_path; both fail on a bad policy."""
+    """The outputs of scan and validate --project on tmp_path.
+
+    An unsafe policy file is an error only when ``--accept-project-policy`` is passed.
+    """
     from click.testing import CliRunner
 
     from nexus_symbiote.cli import main
@@ -280,8 +283,20 @@ def _scan_and_validate(tmp_path: Path) -> list[str]:
     runner = CliRunner()
     outputs = []
     for args in (
-        ["scan", str(project), "-o", str(tmp_path.parent / "scanned.json")],
-        ["validate", str(inventory), "--project", str(project)],
+        [
+            "scan",
+            str(project),
+            "--accept-project-policy",
+            "-o",
+            str(tmp_path.parent / "scanned.json"),
+        ],
+        [
+            "validate",
+            str(inventory),
+            "--project",
+            str(project),
+            "--accept-project-policy",
+        ],
     ):
         result = runner.invoke(main, args)
         assert result.exit_code == 1, result.output

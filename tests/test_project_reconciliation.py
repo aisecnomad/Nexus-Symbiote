@@ -602,7 +602,9 @@ def test_policy_naming_fewer_default_exclusions_still_reconciles(tmp_path):
     # what the built-in policy does.
     project, target, _ = _scanned(tmp_path)
     (project / ".nexus-symbiote.yaml").write_text("scan: {exclude_paths: [node_modules, .git]}\n")
-    run = CliRunner().invoke(main, ["scan", str(project), "-o", str(target)])
+    run = CliRunner().invoke(
+        main, ["scan", str(project), "--accept-project-policy", "-o", str(target)]
+    )
     assert run.exit_code == 0, run.output
     doc = json.loads(target.read_text())
     assert ".venv" not in doc["metadata"]["completeness"]["exclusions"]

@@ -183,7 +183,9 @@ def test_an_overflowing_float_is_a_recorded_failure_not_an_internal_error(tmp_pa
 
 def test_an_overflowing_float_in_the_project_policy_is_an_invalid_policy(tmp_path):
     (tmp_path / ".nexus-symbiote.yaml").write_text(f"x: {LONG}.5\n", encoding="utf-8")
-    scanned = CliRunner().invoke(main, ["scan", "--report-only", "--check", str(tmp_path)])
+    scanned = CliRunner().invoke(
+        main, ["scan", "--report-only", "--check", "--accept-project-policy", str(tmp_path)]
+    )
     assert scanned.exit_code == 1
     assert "invalid YAML document" in scanned.output
     assert "internal error" not in scanned.output
@@ -277,7 +279,9 @@ def test_scan_with_payload_project_policy_fails_closed_promptly(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
     (project / ".nexus-symbiote.yaml").write_text(MIB_PAYLOAD, encoding="utf-8")
-    scanned = limited_scan(tmp_path, "-o", str(tmp_path / "aibom.json"), str(project))
+    scanned = limited_scan(
+        tmp_path, "--accept-project-policy", "-o", str(tmp_path / "aibom.json"), str(project)
+    )
     assert scanned.returncode == 1, scanned.stderr[-2000:]
     assert "invalid or unsupported settings: x" in scanned.stderr
     assert not (tmp_path / "aibom.json").exists()

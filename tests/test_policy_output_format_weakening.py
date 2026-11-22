@@ -28,7 +28,16 @@ def test_scan_warns_when_the_project_policy_selects_another_format(tmp_path: Pat
     (project / ".nexus-symbiote.yaml").write_text('output:\n  default_format: "cyclonedx"\n')
     output = tmp_path / "inventory.json"
     run = CliRunner().invoke(
-        main, ["scan", str(project), "--report-only", "-o", str(output)], catch_exceptions=False
+        main,
+        [
+            "scan",
+            str(project),
+            "--report-only",
+            "--accept-project-policy",
+            "-o",
+            str(output),
+        ],
+        catch_exceptions=False,
     )
     assert run.exit_code == 0, run.output
     assert "weakens the built-in gates" in run.output

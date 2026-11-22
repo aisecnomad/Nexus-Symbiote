@@ -12,7 +12,13 @@ from typing import Any, Final
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
-from nexus_symbiote.core.enums import AssuranceLevel, AutonomyLevel, RiskSeverity, TrustTier
+from nexus_symbiote.core.enums import (
+    AssuranceLevel,
+    AutonomyLevel,
+    ComponentType,
+    RiskSeverity,
+    TrustTier,
+)
 from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.models import (
     AgentComponent,
@@ -36,9 +42,14 @@ _RFC3339_RE: Final[re.Pattern[str]] = re.compile(
 )
 _SAFE_LICENSE_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9.()+\- ]{1,128}", re.ASCII)
 _LICENSE_REF_RE: Final[re.Pattern[str]] = re.compile(r"LicenseRef-[A-Za-z0-9.-]+", re.ASCII)
+# Printable ASCII only: a control, bidirectional or invisible character must arrive
+# percent-encoded, so an export never carries one that a terminal or viewer acts on.
 _SAFE_URL_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?:https|s3|gs|hf|oci)://[^\s<>\"'\\]+",
+    r"(?:https|s3|gs|hf|oci)://[\x21\x23-\x26\x28-\x3b\x3d\x3f-\x5b\x5d-\x7e]+",
     re.ASCII,
+)
+_PREVIOUS_URL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:https|s3|gs|hf|oci)://[^\s<>\"'\\]+", re.ASCII
 )
 _ALLOWED_URL_SCHEMES: Final[frozenset[str]] = frozenset({"https", "s3", "gs", "hf", "oci"})
 _SPDX_DATASET_TYPES: Final[frozenset[str]] = frozenset(
@@ -164,7 +175,7 @@ def _clean_text(value: Any, *, max_len: int = 512) -> str | None:
     return cleaned[:max_len] if cleaned else None
 
 
-def _clean_url(value: Any) -> str | None:
+def _clean_url(value: Any, *, legacy: bool = False) -> str | None:
     """Sanitize a declared download URI, preserving safe paths while stripping query/fragment/credentials."""
     if not isinstance(value, str) or not value.strip():
         return None
@@ -184,7 +195,15 @@ def _clean_url(value: Any) -> str | None:
     if parts.path and REDACTED in redact_text(unquote(parts.path)):
         return None
     rebuilt = urlunsplit((scheme, parts.netloc, parts.path, "", ""))
-    return rebuilt if _SAFE_URL_RE.fullmatch(rebuilt) else None
+    pattern = _PREVIOUS_URL_RE if legacy else _SAFE_URL_RE
+    return rebuilt if pattern.fullmatch(rebuilt) else None
+
+
+def _projected_download_location(value: Any, *, legacy: bool) -> str | None:
+    # Recovery recreates previously written projections in memory for comparison.
+    if legacy:
+        return value if isinstance(value, str) and value else None
+    return _clean_url(value)
 
 
 def _declared_url(value: Any, owner: str, notices: list[str]) -> str | None:
@@ -288,6 +307,7 @@ def spdx_license_expression(value: Any) -> str | None:
 
 
 def _conflict_risk(field_name: str, component_name: str, locator: str) -> RiskAssessment:
+    locator = neutralize(locator)
     return RiskAssessment(
         severity=RiskSeverity.MEDIUM,
         category="declaration_conflict",
@@ -300,6 +320,67 @@ def _conflict_risk(field_name: str, component_name: str, locator: str) -> RiskAs
             "do not override observed collector evidence."
         ),
     )
+
+
+def _compatible_declared_names(
+    entries: object,
+    kind: ComponentType,
+    by_key: dict[tuple[ComponentType, str], AnyComponent],
+    owner: str | None,
+) -> set[str]:
+    if not isinstance(entries, list):
+        return set()
+    names: set[str] = set()
+    conflicts: set[str] = set()
+    for entry in entries[:200]:
+        if not isinstance(entry, dict) or not (name := _clean_text(entry.get("name"), max_len=200)):
+            continue
+        names.add(name)
+        holder = by_key.get((kind, name))
+        if holder is not None:
+            version = _clean_text(entry.get("version"), max_len=128)
+            supplier = _clean_text(entry.get("supplier"), max_len=200) or owner
+            if (holder.version and version and holder.version != version) or (
+                holder.supplier and supplier and holder.supplier != supplier
+            ):
+                conflicts.add(name)
+    return names - conflicts
+
+
+def _type_conflict(
+    holder: AnyComponent | None,
+    declared: str,
+    locator: str,
+    notices: list[str],
+    *,
+    shared_names: set[str],
+) -> bool:
+    """Whether a collected component of another type holds the declared name.
+
+    The declaration is then a conflict on the holder and is not applied.
+    """
+    if holder is None or holder.name in shared_names:
+        return False
+    holder.risks.append(_conflict_risk("component_type", holder.name, locator))
+    notices.append(f"{holder.bom_ref}: {declared} name conflict with {locator}")
+    return True
+
+
+def _repeat_declaration(
+    seen: dict[str, dict[str, Any]],
+    name: str,
+    entry: dict[str, Any],
+    holder: AnyComponent | None,
+    locator: str,
+    notices: list[str],
+) -> bool:
+    if name not in seen:
+        seen[name] = entry
+        return False
+    if seen[name] != entry and holder is not None:
+        holder.risks.append(_conflict_risk("duplicate_declaration", name, locator))
+        notices.append(f"{holder.bom_ref}: conflicting declaration repeated in {locator}")
+    return True
 
 
 def _record_claim(comp: AnyComponent, key: str, locator: str) -> None:
@@ -455,10 +536,18 @@ def apply_agent_yaml_declarations(
                 elif extra_key == "version" and (ver := _clean_text(raw_val, max_len=128)):
                     _apply_version_declaration(comp, ver, locator, notices)
 
-    by_name: dict[str, AnyComponent] = {c.name: c for c in aibom.components}
-
+    # Keyed by type too: a dataset declared under a collected model's name must not take
+    # that model's slot, or a later conflicting model declaration skips the conflict check.
+    by_key: dict[tuple[ComponentType, str], AnyComponent] = {
+        (c.component_type, c.name): c for c in aibom.components
+    }
     raw_datasets = parsed.get("datasets")
+    raw_models = parsed.get("models")
+    shared_names = _compatible_declared_names(
+        raw_datasets, ComponentType.DATA_SOURCE, by_key, owner
+    ) & _compatible_declared_names(raw_models, ComponentType.MODEL, by_key, owner)
     dataset_refs_by_name: dict[str, str] = {}
+    dataset_declarations: dict[str, dict[str, Any]] = {}
     if isinstance(raw_datasets, list):
         for entry in raw_datasets[:200]:
             if not isinstance(entry, dict):
@@ -466,15 +555,24 @@ def apply_agent_yaml_declarations(
             ds_name = _clean_text(entry.get("name"), max_len=200)
             if not ds_name:
                 continue
-            existing = by_name.get(ds_name)
+            existing = by_key.get((ComponentType.DATA_SOURCE, ds_name))
+            if existing is None and _type_conflict(
+                by_key.get((ComponentType.MODEL, ds_name)),
+                "dataset",
+                locator,
+                notices,
+                shared_names=shared_names,
+            ):
+                continue
+            if _repeat_declaration(
+                dataset_declarations, ds_name, entry, existing, locator, notices
+            ):
+                continue
             ds_ver = _clean_text(entry.get("version"), max_len=128)
             ds_sup = _clean_text(entry.get("supplier"), max_len=200) or owner
             ds_lic = clean_license_identifier(entry.get("license")) or default_license
-            ds_uri = _declared_url(
-                entry.get("download_location") or entry.get("source_uri"),
-                f"dataset {ds_name}",
-                notices,
-            )
+            raw_uri = entry.get("download_location") or entry.get("source_uri")
+            ds_uri = _declared_url(raw_uri, f"dataset {ds_name}", notices)
             ds_rel = _clean_rfc3339(entry.get("release_time") or entry.get("collection_date"))
             ds_type = _clean_text(entry.get("dataset_type"), max_len=64)
             ds_avail = _clean_text(entry.get("availability"), max_len=64)
@@ -490,7 +588,8 @@ def apply_agent_yaml_declarations(
                     ds_comp.risks.append(_conflict_risk("license", ds_name, locator))
                     notices.append(f"{ds_comp.bom_ref}: license conflict with {locator}")
                     ds_lic = None
-                if ds_uri and ds_comp.source_uri and ds_comp.source_uri != ds_uri:
+                comparison_uri = ds_uri or _clean_url(raw_uri, legacy=True)
+                if comparison_uri and ds_comp.source_uri and ds_comp.source_uri != comparison_uri:
                     ds_comp.risks.append(_conflict_risk("source_uri", ds_name, locator))
                     notices.append(f"{ds_comp.bom_ref}: source_uri conflict with {locator}")
                     ds_uri = None
@@ -512,7 +611,7 @@ def apply_agent_yaml_declarations(
                     trust_tier=TrustTier.UNKNOWN,
                 )
                 aibom.components.append(ds_comp)
-                by_name[ds_name] = ds_comp
+                by_key[(ComponentType.DATA_SOURCE, ds_name)] = ds_comp
                 if ds_ver:
                     _record_claim(ds_comp, "version", locator)
                 if ds_sup:
@@ -530,14 +629,14 @@ def apply_agent_yaml_declarations(
             if ds_avail in _SPDX_AVAILABILITY_TYPES:
                 ds_comp.properties["declared_availability"] = ds_avail
                 _record_claim(ds_comp, "availability", locator)
-            if ds_pii in {"yes", "no", "noAssertion"}:
+            if isinstance(ds_pii, str) and ds_pii in {"yes", "no", "noAssertion"}:
                 ds_comp.properties["declared_sensitive_pii"] = ds_pii
                 _record_claim(ds_comp, "sensitive_personal_information", locator)
             ds_comp.properties["declaration_source_sha256"] = doc_digest
             _record_claim(ds_comp, "dataset", locator)
             dataset_refs_by_name[ds_name] = ds_comp.bom_ref
 
-    raw_models = parsed.get("models")
+    model_declarations: dict[str, dict[str, Any]] = {}
     edge_keys: set[tuple[str, str, str]] = {
         (e.source_ref, e.target_ref, e.relationship) for e in aibom.dependencies
     }
@@ -548,7 +647,17 @@ def apply_agent_yaml_declarations(
             m_name = _clean_text(entry.get("name"), max_len=200)
             if not m_name:
                 continue
-            existing = by_name.get(m_name)
+            existing = by_key.get((ComponentType.MODEL, m_name))
+            if existing is None and _type_conflict(
+                by_key.get((ComponentType.DATA_SOURCE, m_name)),
+                "model",
+                locator,
+                notices,
+                shared_names=shared_names,
+            ):
+                continue
+            if _repeat_declaration(model_declarations, m_name, entry, existing, locator, notices):
+                continue
             m_ver = _clean_text(entry.get("version"), max_len=128)
             m_sup = _clean_text(entry.get("supplier"), max_len=200) or owner
             m_lic = clean_license_identifier(entry.get("license")) or default_license
@@ -576,7 +685,7 @@ def apply_agent_yaml_declarations(
                     trust_tier=TrustTier.UNKNOWN,
                 )
                 aibom.components.append(m_comp)
-                by_name[m_name] = m_comp
+                by_key[(ComponentType.MODEL, m_name)] = m_comp
                 if m_ver:
                     _record_claim(m_comp, "version", locator)
                 if m_sup:
