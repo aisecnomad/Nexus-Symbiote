@@ -95,6 +95,14 @@ VERSION_DIFFERENCES: dict[str, str] = {
         " read as latin-1, which decodes any byte, and READONLY_BUFFER takes it as"
         " the bytes that 'bytes' leaves."
     ),
+    "int-digits": (
+        "Not a version but a loader setting: int() and PyLong_FromString refuse a"
+        " decimal literal longer than the process's int_max_str_digits (4,300 by"
+        " default, 640 at least, 0 for none: PYTHONINTMAXSTRDIGITS, -X"
+        " int_max_str_digits, sys.set_int_max_str_digits). INT, LONG, GET and PUT"
+        " text is read as a loader with no limit reads it, whatever limit the scan"
+        " runs under."
+    ),
 }
 # Differences that change no step here: find_class resolves a dotted name through
 # _getattribute / get_dotted_path in 3.14, without the '<locals>' check of 3.11-3.13,
@@ -341,11 +349,49 @@ def _c_int(data: bytes, base: int) -> int | None:
     return _py_int(text, base)
 
 
+_DIGIT_FLOOR = 640  # the lowest int_max_str_digits CPython accepts
+
+
 def _py_int(data: bytes, base: int) -> int | None:
+    """``int(data, base)`` as a loader with no ``int_max_str_digits`` limit reads it."""
     try:
         return int(data, base)
     except ValueError:
+        pass
+    if base not in (0, 10):
         return None
+    # A decimal literal as int() reads one: ASCII whitespace around, a sign, digits with
+    # single underscores between them, and in base 0 no leading zero unless all are.
+    # Base 0's 0x, 0o and 0b literals have power-of-two bases, which no limit applies to.
+    text = data.strip(b" \t\n\v\f\r")
+    sign = text[:1] if text[:1] in (b"+", b"-") else b""
+    body = text[len(sign) :]
+    digits = body.replace(b"_", b"")
+    if (
+        not digits.isdigit()
+        or body[:1] == b"_"
+        or body[-1:] == b"_"
+        or b"__" in body
+        or (base == 0 and digits[:1] == b"0" and digits.strip(b"0"))
+    ):
+        return None  # not a literal: refused under any limit
+    value = _decimal(digits)
+    return -value if sign == b"-" else value
+
+
+def _decimal(digits: bytes) -> int:
+    # Halves of at most the floor convert under any limit this process runs with;
+    # splitting in two keeps a 64 KiB literal subquadratic.
+    if len(digits) <= _DIGIT_FLOOR:
+        return int(digits)
+    half = len(digits) // 2
+    scale: int = 10 ** (len(digits) - half)
+    return _decimal(digits[:half]) * scale + _decimal(digits[half:])
+
+
+def _digit_limited(data: bytes) -> bool:
+    """Whether some loader's ``int_max_str_digits`` can refuse this INT, LONG or memo text."""
+    return len(data) - len(data.translate(None, b"0123456789")) > _DIGIT_FLOOR
 
 
 _C_FLOAT = re.compile(
@@ -631,6 +677,8 @@ class _Machine:
         old, new = parse(data, 0), parse(data, 10)
         if old != new:
             self.differs.add("int-base")
+        if _digit_limited(data):
+            self.differs.add("int-digits")
         value = old if old is not None else new
         if value is None:
             raise _LoadError  # invalid literal for int()
@@ -1034,6 +1082,8 @@ class _Machine:
         value = _py_int(data, 10)
         if value is None or (self.c and value > _LONG_MAX):
             raise _LoadError
+        if _digit_limited(data):
+            self.differs.add("int-digits")
         return value
 
     def _get(self, index: int) -> None:

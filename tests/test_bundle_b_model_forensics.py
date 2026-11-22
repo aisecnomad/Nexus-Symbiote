@@ -329,14 +329,15 @@ def test_c_unpickler_int_with_leading_zeros_past_the_int_digit_limit_is_followed
     segment = load_segment(payload, len(payload), 0, "c", Budget(65536, 64))
     assert segment.outcome == "called"
 
-    # Past what a C long holds, strtol overflows and PyLong_FromString refuses the digits,
-    # in the C unpickler as in the scanner.
+    # Past what a C long holds, strtol overflows and PyLong_FromString reads the digits:
+    # under the default limit it refuses them, under no limit it reads them and the call
+    # runs, so the walk goes on as the loader with no limit does ("int-digits").
     overflowing = b"I" + b"1" * (sys.get_int_max_str_digits() + 1) + b"\n0cos\ngetpid\n)R."
     with pytest.raises(ValueError):
         pickle.loads(overflowing)  # noqa: S301 - refused before any call
-    assert load_segment(overflowing, len(overflowing), 0, "c", Budget(65536, 64)).outcome == (
-        "error"
-    )
+    overflowed = load_segment(overflowing, len(overflowing), 0, "c", Budget(65536, 64))
+    assert overflowed.outcome == "called"
+    assert "int-digits" in overflowed.differs
 
     for rel_path in ("models/weights.dat", "models/direct.pkl"):
         target = tmp_path / rel_path
@@ -367,3 +368,46 @@ def test_hashing_reader_never_asks_for_more_than_the_limit() -> None:
     with pytest.raises(OSError, match="hash byte limit"):
         reader.read(-1)
     assert requested == [17]
+
+
+_DIGIT_CALLS = {
+    "int": b"I" + b"1" * 5000 + b"\n0cos\ngetpid\n)R.",
+    "long": b"L" + b"1" * 5000 + b"L\n0cos\ngetpid\n)R.",
+    "get": b"K0p0\n0g" + b"0" * 5000 + b"\n0cos\ngetpid\n)R.",
+    "put": b"K0p" + b"0" * 5000 + b"\n0cos\ngetpid\n)R.",
+}
+
+
+@pytest.mark.parametrize("payload", _DIGIT_CALLS.values(), ids=_DIGIT_CALLS)
+def test_text_integers_are_read_whatever_the_int_digit_limit(payload: bytes) -> None:
+    # A loader run with int_max_str_digits=0 reads every one of these and calls getpid.
+    import subprocess
+
+    loaded = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-X",
+            "int_max_str_digits=0",
+            "-c",
+            "import pickle, sys; pickle.loads(sys.stdin.buffer.read()); print('loaded')",
+        ],
+        input=payload,
+        capture_output=True,
+        check=False,
+    )
+    assert loaded.stdout.strip() == b"loaded"
+    for flavor in ("c", "py"):
+        segment = load_segment(payload, len(payload), 0, flavor, Budget(65536, 64))
+        assert segment.outcome == "called", flavor
+        assert "int-digits" in segment.differs
+
+
+def test_a_memo_index_past_a_c_long_still_fails_the_c_unpickler() -> None:
+    index = b"1" + b"0" * 5000
+    payload = b"K0p" + index + b"\n0cos\ngetpid\n)R."
+    assert load_segment(payload, len(payload), 0, "c", Budget(65536, 64)).outcome == "error"
+    boundary = b"K0p9223372036854775807\n0g9223372036854775807\n."
+    assert load_segment(boundary, len(boundary), 0, "c", Budget(4096, 64)).outcome == "stop"
+    over = b"K0p9223372036854775808\n."
+    assert load_segment(over, len(over), 0, "c", Budget(4096, 64)).outcome == "error"
