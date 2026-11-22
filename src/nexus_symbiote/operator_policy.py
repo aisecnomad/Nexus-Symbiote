@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from xml.sax.saxutils import escape as xml_escape
 
-from nexus_symbiote.core.hashing import open_directory_nofollow, open_regular_file
+from nexus_symbiote.core.hashing import gate_input_files, open_directory_nofollow, open_regular_file
 from nexus_symbiote.policy import (
     MAX_POLICY_YAML_NODES,
     Policy,
@@ -287,7 +287,14 @@ def append_step_summary(path: Path, rendered: str, *, project: Path | None = Non
             raise OSError("Secure output requires descriptor-relative no-symlink file operations")
         flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
         with _parent(root, relative, create_parents=False) as parent:
-            create_only = project is not None and _inside_project_directory(parent, project)
+            inputs = gate_input_files.get()
+            # Library callers without a record of the gate's reads retain the
+            # conservative create-only behavior inside the checked project.
+            create_only = (
+                inputs is None
+                and project is not None
+                and _inside_project_directory(parent, project)
+            )
             if create_only:
                 flags |= os.O_EXCL
             try:
@@ -304,6 +311,8 @@ def append_step_summary(path: Path, rendered: str, *, project: Path | None = Non
                     raise OutputRefusedError(_errno.EINVAL, "output must be a regular file")
                 if info.st_nlink != 1:
                     raise OutputRefusedError(_errno.EINVAL, "output must have only one hard link")
+                if inputs is not None and (info.st_dev, info.st_ino) in inputs:
+                    raise click.UsageError("--step-summary must not name a file this command reads")
                 prefix = b""
                 if info.st_size > 0:
                     last_byte = os.pread(fd, 1, info.st_size - 1)

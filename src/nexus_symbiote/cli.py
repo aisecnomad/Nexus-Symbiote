@@ -10,8 +10,9 @@ import os
 import re
 import sys
 from collections.abc import Callable, Mapping
+from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import click
 
@@ -746,9 +747,32 @@ def _operator_policy_options(func: _F) -> _F:
     )
 
 
+def _step_summary_path(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> Path | None:
+    if value is None:
+        return None
+    try:
+        return cast(Path, click.Path(dir_okay=False, path_type=Path).convert(value, param, ctx))
+    except ValueError as exc:
+        raise output_failure(exc) from exc
+
+
 def _gate_report_options(func: _F) -> _F:
+    @wraps(func)
+    def gate(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("step_summary") is None:
+            return func(*args, **kwargs)
+        from nexus_symbiote.core.hashing import gate_input_files
+
+        token = gate_input_files.set(set())
+        try:
+            return func(*args, **kwargs)
+        finally:
+            gate_input_files.reset(token)
+
     return _apply_options(
-        func,
+        cast(_F, gate),
         click.option(
             "--report-format",
             type=click.Choice(["text", "json", "markdown", "junit"]),
@@ -757,11 +781,13 @@ def _gate_report_options(func: _F) -> _F:
         ),
         click.option(
             "--step-summary",
-            type=click.Path(dir_okay=False, path_type=Path),
+            type=click.STRING,
+            metavar="FILE",
+            callback=_step_summary_path,
             default=None,
             help=(
-                "Append a Markdown gate summary (for example GITHUB_STEP_SUMMARY). With --project, "
-                "use a new file inside the project or a singly linked file outside it."
+                "Append a Markdown gate summary (for example GITHUB_STEP_SUMMARY) to a new file "
+                "or an existing singly linked report. Files read by this gate are protected."
             ),
         ),
     )
