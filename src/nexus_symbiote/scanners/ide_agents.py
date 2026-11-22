@@ -1413,10 +1413,24 @@ def _option_command(words: list[str], index: int, runner: str) -> int | None:
     return None
 
 
-def _executable_index(words: list[str]) -> int | None:
+def _executable_index(
+    words: list[str], marks: list[str] | None = None, *, skip_inputs: bool = False
+) -> int | None:
     """Index of the command `words` run, after wrappers and grouping. None if not run."""
     index = 0
     while index < len(words):
+        if marks is not None:
+            mark = marks[index]
+            if mark == ">" or (skip_inputs and mark == "<"):
+                index += 1
+                continue
+            if (
+                mark == "&"
+                and index + 1 < len(marks)
+                and (marks[index + 1] == ">" or (skip_inputs and marks[index + 1] == "<"))
+            ):
+                index += 2
+                continue
         raw = _decode_word(words[index], drop_ifs=True).strip()
         if raw in {"(", "{", ")", "}"} or words[index] == "!":
             index += 1
@@ -1644,7 +1658,7 @@ def _segment_executes(segment: str) -> bool:
     """Whether this pipeline segment runs a shell, `iex`, or an interpreter on stdin."""
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
-    index = _executable_index(words)
+    index = _executable_index(words, _redirections(segment, spans))
     if index is None:
         return _sudo_shell(words)
     names = _name_variants(words[index])
@@ -1922,7 +1936,7 @@ def _executes_saved(segment: str, saved: _Saved, depth: int = 0) -> bool:
         return False
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
-    index = _executable_index(words)
+    index = _executable_index(words, _redirections(segment, spans), skip_inputs=True)
     if index is None:
         return False
     names = _name_variants(words[index])
@@ -2092,9 +2106,10 @@ def _interpreter_program(interpreter: str, args: list[str], saved: set[str]) -> 
 
 def _relayed_names(segment: str) -> set[str]:
     """Files a segment fed a download writes: `tee`/`sponge` operands, `dd of=`, redirections."""
-    words = _shell_words(segment)
+    spans = _shell_word_spans(segment)
+    words = [segment[start:end] for start, end in spans]
     relayed: set[str] = set()
-    index = _executable_index(words)
+    index = _executable_index(words, _redirections(segment, spans))
     names = _name_variants(words[index]) if index is not None else set()
     if index is not None and names & {"tee", "sponge"}:
         for word in words[index + 1 : index + 65]:
@@ -2143,7 +2158,7 @@ def _copies_saved(segment: str, saved: set[str]) -> set[str] | None:
     """
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
-    index = _executable_index(words)
+    index = _executable_index(words, _redirections(segment, spans), skip_inputs=True)
     if index is None:
         return None
     names = _name_variants(words[index])
@@ -2206,7 +2221,7 @@ def _runs_saved_input(segment: str, saved: _Saved) -> bool:
         return False
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
-    index = _executable_index(words)
+    index = _executable_index(words, _redirections(segment, spans), skip_inputs=True)
     if index is None:
         return False
     names = _name_variants(words[index])
@@ -2380,7 +2395,7 @@ def _substitution_exec(pipelines: list[list[str]]) -> bool:
             return True
         spans = _shell_word_spans(segment)
         words = [segment[start:end] for start, end in spans]
-        index = _executable_index(words)
+        index = _executable_index(words, _redirections(segment, spans), skip_inputs=True)
         if index is None:
             continue
         # The command a wrapper or `su -c` runs may itself be the download.
@@ -2552,7 +2567,7 @@ def _computed_powershell(segment: str) -> int | None:
     """
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
-    index = _executable_index(words)
+    index = _executable_index(words, _redirections(segment, spans), skip_inputs=True)
     if index is None:
         return None
     word = words[index]
