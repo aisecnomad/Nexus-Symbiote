@@ -183,15 +183,16 @@ def _inspect_outside_untrusted(
         untrusted_ids = {_identity(d) for d in untrusted_dirs}
         for target in targets:
             unfollowed = Path(os.path.abspath(target))
-            if target.is_symlink():
-                link_parent = target.parent.resolve()
-                link_ancestors = {_identity(link_parent)} | {
-                    _identity(parent) for parent in link_parent.parents
+            if any(unfollowed.is_relative_to(d) for d in untrusted_dirs):
+                return "inside", bool(dir_inputs)
+            for prefix in reversed(unfollowed.parents):
+                prefix_resolved = prefix.resolve()
+                prefix_ancestors = {_identity(prefix_resolved)} | {
+                    _identity(parent) for parent in prefix_resolved.parents
                 }
-                if any(
-                    unfollowed.is_relative_to(d) or link_parent.is_relative_to(d)
-                    for d in untrusted_dirs
-                ) or bool(link_ancestors & untrusted_ids):
+                if any(prefix_resolved.is_relative_to(d) for d in untrusted_dirs) or bool(
+                    prefix_ancestors & untrusted_ids
+                ):
                     return "inside", bool(dir_inputs)
             resolved = target.resolve()
             # Device and inode also find the tree directory itself under a name the path

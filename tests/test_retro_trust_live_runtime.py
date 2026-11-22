@@ -826,6 +826,23 @@ def test_inspect_outside_untrusted_rejects_checkout_symlink_pointing_outside(
     failure, _ = runtime_cli._inspect_outside_untrusted((link,), (repo,))
     assert failure == "inside"
 
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    outside_nested = outside_dir / "key.pem"
+    outside_nested.write_text("key", encoding="utf-8")
+    dir_link = repo / "dir_link"
+    dir_link.symlink_to(outside_dir)
+    failure_dir, _ = runtime_cli._inspect_outside_untrusted((dir_link / "key.pem",), (repo,))
+    assert failure_dir == "inside"
+
+    # Bounce-in-and-out through a symlink pointing into the untrusted checkout.
+    via_repo = tmp_path / "via_repo"
+    via_repo.symlink_to(repo)
+    failure_bounce, _ = runtime_cli._inspect_outside_untrusted(
+        (via_repo / "dir_link" / "key.pem",), (repo,)
+    )
+    assert failure_bounce == "inside"
+
 
 def test_run_action_scratch_parent_validates_baseline_only_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -962,6 +979,28 @@ def test_single_value_multiplicity_covers_applicator_combinations_and_caps(
         "$ref": "#/$defs/d19",
     }
     assert validation._evaluate(dialects, dag_bomb, None) == validation._SCHEMA
+
+    # High-state x high-property transition blowup trips _MAX_PATH_TRANSITIONS and fails closed.
+    wide_defs: dict[str, object] = {
+        "H": {"type": "object", "properties": {f"k{i}": {"type": "string"} for i in range(500)}}
+    }
+    for i in range(11):
+        wide_defs[f"T{i}"] = {"type": "object", "additionalProperties": {"$ref": f"#/$defs/T{i}"}}
+        wide_defs[f"F{i}"] = {"type": "object", "additionalProperties": {"$ref": f"#/$defs/F{i}"}}
+        nxt = f"#/$defs/S{i + 1}" if i < 10 else "#/$defs/H"
+        wide_defs[f"S{i}"] = {
+            "type": "object",
+            "properties": {
+                "0": {"allOf": [{"$ref": nxt}, {"$ref": f"#/$defs/T{i}"}]},
+                "1": {"allOf": [{"$ref": nxt}, {"$ref": f"#/$defs/F{i}"}]},
+            },
+        }
+    transition_bomb = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": wide_defs,
+        "$ref": "#/$defs/S0",
+    }
+    assert validation._evaluate(dialects, transition_bomb, None) == validation._SCHEMA
 
     # Path-state budget overflow fails closed.
     monkeypatch.setattr(validation, "_MAX_PATH_STATES", 1)

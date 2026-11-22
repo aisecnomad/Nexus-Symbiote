@@ -1397,6 +1397,7 @@ def _collection_work_exceeds_budget(
 
 
 _MAX_PATH_STATES = 4096
+_MAX_PATH_TRANSITIONS = 16384
 
 
 def _max_single_value_multiplicity(
@@ -1439,11 +1440,16 @@ def _max_single_value_multiplicity(
     frontier: dict[tuple[int, ...], dict[int, int]] = {init_key: init}
     seen: dict[tuple[int, ...], dict[int, int]] = {init_key: dict(init)}
     expansions = 0
+    transitions = 0
 
     def _record(
         seed: dict[int, int],
         target_frontier: dict[tuple[int, ...], dict[int, int]],
     ) -> bool:
+        nonlocal transitions
+        transitions += 1
+        if transitions > _MAX_PATH_TRANSITIONS:
+            return False
         if not seed:
             return True
         closed = _close(seed)
