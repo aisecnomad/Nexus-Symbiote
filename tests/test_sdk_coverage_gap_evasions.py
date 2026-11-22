@@ -93,3 +93,63 @@ def test_typescript_computed_method_non_identifier_initializer_and_loader_aliase
     assert any("server.ts" in gap for gap in result.surfaces_excluded)
     assert any("reverse_creator.ts" in gap for gap in result.surfaces_excluded)
     assert any("require_alias.ts" in gap for gap in result.surfaces_excluded)
+
+
+def test_honest_loggers_rejects_sys_modules_alias_builtins_setattr_and_globals(
+    tmp_path: Path,
+) -> None:
+    cases = {
+        "sys_modules.py": (
+            "from sys import modules as m\n"
+            "import logging\n"
+            "m['logging'].getLogger = fn\n"
+            "logging.getLogger('mcp.client.stdio')\n"
+        ),
+        "builtins_setattr.py": (
+            "import builtins, logging\n"
+            "builtins.setattr(logging, 'getLogger', fn)\n"
+            "logging.getLogger('mcp.client.stdio')\n"
+        ),
+        "fn_globals.py": (
+            "import logging\n"
+            "def f(): pass\n"
+            "f.__globals__['logging'] = obj\n"
+            "logging.getLogger('mcp.client.stdio')\n"
+        ),
+        "getattr_modules.py": (
+            "import sys, logging\n"
+            "getattr(sys, 'modules')['logging'].getLogger = fn\n"
+            "logging.getLogger('mcp.client.stdio')\n"
+        ),
+    }
+    for name, src in cases.items():
+        case_dir = tmp_path / name.removesuffix(".py")
+        case_dir.mkdir()
+        (case_dir / name).write_text(src, encoding="utf-8")
+        result = MCPScanner().scan(case_dir)
+        assert any(name in gap for gap in result.surfaces_excluded), name
+
+
+def test_typescript_uninitialized_let_builtin_mutation_and_container_module_arg(
+    tmp_path: Path,
+) -> None:
+    header = (
+        'import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";\n'
+        'const server = new McpServer({ name: "app", version: "1.0.0" });\n'
+    )
+    (tmp_path / "late_let.ts").write_text(
+        header + 'let s; s = server; s[method]("hidden", cb);\n', encoding="utf-8"
+    )
+    (tmp_path / "builtin_assign.ts").write_text(
+        header
+        + 'Object.assign(console, { r: server.registerTool.bind(server) }); console[m]("hidden", cb);\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "container_arg.ts").write_text(
+        'Reflect.apply(helper, null, ["@modelcontextprotocol/sdk/server/mcp.js"]);\n',
+        encoding="utf-8",
+    )
+    result = MCPScanner().scan(tmp_path)
+    assert any("late_let.ts" in gap for gap in result.surfaces_excluded)
+    assert any("builtin_assign.ts" in gap for gap in result.surfaces_excluded)
+    assert any("container_arg.ts" in gap for gap in result.surfaces_excluded)

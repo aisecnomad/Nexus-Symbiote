@@ -773,10 +773,29 @@ def _ordinary_builtin_value(value: Node | None, receiver: str) -> bool:
 def _assigned_computed_builtins(index: _Index) -> set[str]:
     assigned: set[str] = set()
     for node in index.nodes:
-        if (
-            node.type not in {"assignment_expression", "augmented_assignment_expression"}
-            or node.id in index.erased
-        ):
+        if node.id in index.erased:
+            continue
+        if node.type == "call_expression":
+            arguments = node.child_by_field_name("arguments")
+            if arguments is not None and arguments.type == "arguments":
+                for arg in _parts(arguments):
+                    operand = _operand(arg)
+                    name = _identifier(operand)
+                    if name is not None and name in _COMPUTED_BUILTINS:
+                        assigned.add(name)
+                    elif (
+                        operand is not None
+                        and operand.type in {"member_expression", "subscript_expression"}
+                        and _identifier(_operand(operand.child_by_field_name("object")))
+                        in {"globalThis", "global", "self", "window"}
+                    ):
+                        prop = _called_method(operand)
+                        if prop is None:
+                            assigned.update(_COMPUTED_BUILTINS)
+                        elif prop in _COMPUTED_BUILTINS:
+                            assigned.add(prop)
+            continue
+        if node.type not in {"assignment_expression", "augmented_assignment_expression"}:
             continue
         target = _operand(node.child_by_field_name("left"))
         assigned.update(_COMPUTED_BUILTINS.intersection(_pattern_names(target)))
@@ -887,14 +906,23 @@ def _load(
 
 
 def _names_module_elsewhere(call: Node) -> bool:
-    """Whether a call passes a server or client module's name past its first argument."""
+    """Whether a call passes a server or client module's name in any argument or container literal."""
     arguments = call.child_by_field_name("arguments")
     if arguments is None or arguments.type != "arguments":
         return False
-    for value in _parts(arguments)[1:]:
+    pending = list(reversed(_parts(arguments)))
+    while pending:
+        value = _operand(pending.pop())
+        if value is None:
+            continue
         module = _string_value(value)
         if module is not None and _module_kind(module) in _LOADED:
             return True
+        if value.type in {"array", "object", "spread_element"}:
+            pending.extend(reversed(_parts(value)))
+        elif value.type == "pair":
+            if (rhs := value.child_by_field_name("value")) is not None:
+                pending.append(rhs)
     return False
 
 
@@ -1233,8 +1261,10 @@ def _collect_source(
         node.id
         for node in index.nodes
         if node.type == "variable_declarator"
-        and (rhs := _operand(node.child_by_field_name("value"))) is not None
-        and rhs.type not in scalar_literals
+        and (
+            (rhs := _operand(node.child_by_field_name("value"))) is None
+            or rhs.type not in scalar_literals
+        )
     }
     assigned_builtins = _assigned_computed_builtins(index) if servers else set()
     registrations = 0

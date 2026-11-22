@@ -183,9 +183,11 @@ _LOADERS = frozenset({"import_module", "__import__", "resolve_name"})
 _LOADER_MODULES = frozenset({"importlib", "builtins", "pkgutil"})
 # Builtins and attributes that rebind a name or a module attribute without naming it.
 _REBINDING_BUILTINS = frozenset(
-    {"globals", "locals", "vars", "exec", "eval", "setattr", "delattr", "__builtins__"}
+    {"globals", "locals", "vars", "exec", "eval", "setattr", "delattr", "__builtins__", "modules"}
 )
-_REBINDING_ATTRIBUTES = frozenset({"modules", "__dict__", "__setattr__", "__builtins__"})
+_REBINDING_ATTRIBUTES = frozenset(
+    {"modules", "__dict__", "__setattr__", "__builtins__", "__globals__"}
+)
 
 
 class _UnreadableError(ValueError):
@@ -1000,6 +1002,8 @@ def _honest_loggers(
             for alias in node.names:
                 if alias.name == "*" and not from_logging:
                     return False, set()
+                if not node.level and node.module == "sys" and alias.name == "modules":
+                    return False, set()
                 bound = alias.asname or alias.name
                 if bound in watched and not (
                     bound in loggers and from_logging and alias.name == "getLogger"
@@ -1013,13 +1017,19 @@ def _honest_loggers(
             if node.id in logging_aliases and isinstance(node.ctx, ast.Load):
                 reads[node.id] += 1
         elif isinstance(node, ast.Attribute):
-            if node.attr in _REBINDING_ATTRIBUTES:
+            if node.attr in _REBINDING_ATTRIBUTES or node.attr in _REBINDING_BUILTINS:
                 return False, set()
             if isinstance(node.value, ast.Name) and node.value.id in logging_aliases:
                 if isinstance(node.ctx, ast.Load) and not node.attr.startswith("__"):
                     attributes[node.value.id] += 1
                 else:
                     rebound.add(node.value.id)
+        elif isinstance(node, ast.Call):
+            pair = _unshadowed_getattr(node, set())
+            if pair is not None and (
+                pair[1] in _REBINDING_ATTRIBUTES or pair[1] in _REBINDING_BUILTINS
+            ):
+                return False, set()
         elif not isinstance(node, ast.alias):
             rebound.update(_bound_names([node]) & watched)
     # Any mutation or escaping read of any `logging` alias can mutate `logging.getLogger`.
