@@ -86,7 +86,12 @@ from nexus_symbiote.scanners.mcp_launch import (
     known_executable,
     origin,
 )
-from nexus_symbiote.utils.confined import ConfinedCollection, fold_name
+from nexus_symbiote.utils.confined import (
+    AGENT_DEFAULT_EXCLUDE_REASON,
+    DEFAULT_EXCLUDE_REASON,
+    ConfinedCollection,
+    fold_name,
+)
 from nexus_symbiote.utils.jsonc import strip_jsonc
 from nexus_symbiote.utils.secrets import (
     MIN_SECRET_LENGTH,
@@ -989,14 +994,17 @@ def _launch_words(texts: Iterable[str]) -> list[str]:
     for text in texts:
         words.append(text)
         if any(char.isspace() for char in text):
-            lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
-            lexer.whitespace_split = True
-            lexer.commenters = ""
-            try:
-                parts = list(lexer)
-            except ValueError:
-                # An unclosed quote still leaves the whitespace-delimited words.
+            if len(text) > _SHELL_SPLIT_LIMIT:
                 parts = text.split()
+            else:
+                lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+                lexer.whitespace_split = True
+                lexer.commenters = ""
+                try:
+                    parts = list(lexer)
+                except ValueError:
+                    # An unclosed quote still leaves the whitespace-delimited words.
+                    parts = text.split()
             words.extend(parts)
     return words
 
@@ -1275,11 +1283,49 @@ def _server_hits(config: dict[str, Any]) -> PositionHits:
 
 
 def _declared_hits(config: dict[str, Any]) -> PositionHits:
-    """The hits of a refused server's env, arguments and headers, read as a parsed one's are."""
+    """The hits of a refused server's env, arguments, headers and endpoints."""
     env, args = config.get("env"), config.get("args")
     maps = [m for m in (config.get("headers"), config.get("http_headers")) if isinstance(m, dict)]
     args = args if isinstance(args, list) else []
-    return list(_credential_hits(env if isinstance(env, dict) else {}, args, maps, ()))
+    endpoints = [
+        config[field]
+        for field in _ENDPOINT_FIELDS
+        if isinstance(config.get(field), str) and config[field]
+    ]
+    command = config.get("command") if isinstance(config.get("command"), str) else ""
+    return list(
+        _credential_hits(env if isinstance(env, dict) else {}, args, maps, endpoints, command)
+    )
+
+
+def _refused_server_view(config: dict[str, Any]) -> dict[str, Any]:
+    """Type-safe view of a refused server's credential-bearing fields for sibling scrubbing."""
+    view: dict[str, Any] = {}
+    for field in ("env", "headers", "http_headers"):
+        mapping = config.get(field)
+        if isinstance(mapping, dict):
+            view[field] = {str(k): v for k, v in mapping.items() if isinstance(v, str)}
+    for field in ("oauth", "auth"):
+        if field in config:
+            settings = config[field]
+            if isinstance(settings, dict):
+                view[field] = settings
+            elif isinstance(settings, (str, list)):
+                view[field] = {"value": settings}
+    extension = config.get(_EXTENSION_SETTINGS)
+    if isinstance(extension, dict):
+        view[_EXTENSION_SETTINGS] = extension
+    for field in (*_ENDPOINT_FIELDS, "gallery"):
+        endpoint = config.get(field)
+        if isinstance(endpoint, str):
+            view[field] = endpoint
+    command = config.get("command")
+    if isinstance(command, str):
+        view["command"] = command
+    raw_args = config.get("args")
+    if isinstance(raw_args, list):
+        view["args"] = raw_args
+    return view
 
 
 def _server_literals(config: dict[str, Any], hits: PositionHits) -> list[str]:
@@ -2693,7 +2739,20 @@ class MCPScanner(Scanner):
             skipped: list[Path] = []
             sources = list(files.iter_files(directory_links=links, observed_excludes=skipped))
             cache_dirs = [p for p in skipped if p.name.casefold() == "__pycache__"]
-            walk_complete = files.failures_recorded == 0 and files.exclusions_recorded == 0
+            policy_exclusions = getattr(files, "policy_exclusions_recorded", None)
+            if policy_exclusions is None:
+                # Default-excluded directories (.git, __pycache__, etc.) are tracked via
+                # observed_excludes/unvisited and do not make the walk incomplete; explicit
+                # policy exclusions and any overflow past surfaces_excluded still fail closed.
+                non_default = sum(
+                    1
+                    for entry in result.surfaces_excluded
+                    if not entry.endswith(DEFAULT_EXCLUDE_REASON)
+                    and not entry.endswith(AGENT_DEFAULT_EXCLUDE_REASON)
+                )
+                overflow = max(0, files.exclusions_recorded - len(result.surfaces_excluded))
+                policy_exclusions = non_default + overflow
+            walk_complete = files.failures_recorded == 0 and policy_exclusions == 0
             linked, linked_gaps = _linked_client_files(files, links)
             nested, directory_gaps = self._nested_client_files(files, [*sources, *linked])
             directory_gaps.update(path.as_posix() for path in linked_gaps)
@@ -2896,14 +2955,11 @@ class MCPScanner(Scanner):
                 continue
             values.extend(_shape_credentials(config, shape))
             if cls._server_problem(config, shape) is not None:
-                for field in ("env", "headers", "http_headers"):
-                    mapping = config.get(field)
-                    if isinstance(mapping, dict):
-                        values.extend(secret_values(mapping))
-                hits = _declared_hits(config)
-                values.extend(_literals([hit for hit in hits if hit[0] != "argument"]))
+                declared = _refused_server_view(config)
+                hits = _declared_hits(declared)
                 if server_hits is not None:
                     server_hits[id(config)] = hits
+                values.extend(_server_secrets(declared, Launch(), hits))
                 continue
             try:
                 launch = _server_launch(config)
