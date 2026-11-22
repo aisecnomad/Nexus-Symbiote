@@ -385,7 +385,14 @@ _IDE_GRANT_LEGS: dict[str, frozenset[str]] = {
 # An approval record gates its component only when it covers every action or all egress.
 _GATING_ACTIONS = frozenset({"*", "egress"})
 _READ_ACTIONS = frozenset({"read", "query", "list", "search", "get"})
-_RELATIVE_RESOURCE_SCOPE = re.compile(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_.?*-]+)+")
+_NAMED_RESOURCE_SCOPE = re.compile(r"[\w-]+(?:/[\w.?*-]+)*/?")
+_S3_BUCKET_SCOPE = re.compile(
+    r"arn:(?:aws|aws-cn|aws-us-gov):s3:::"
+    r"(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])(?:/[\w.?*-]+)*/?"
+)
+_NETWORK_SCOPE_NAMES = frozenset(
+    {"api", "ftp", "http", "https", "internet", "intranet", "localhost", "network", "web", "www"}
+)
 _UNGATED_CLAUDE_MODES = frozenset({"bypassPermissions", "acceptEdits"})
 _UNGATED_CODEX_POLICIES = frozenset({"never"})
 _UNCONFINED_CODEX_SANDBOXES = frozenset({"danger-full-access", "full-access"})
@@ -621,14 +628,20 @@ def _approval_state(
 
 
 def _independent_read(record: AuthorizationRecord) -> bool:
-    """Recognize read-only records with a relative, explicitly named resource scope."""
-    scope = record.resource_scope
-    return (
-        record.action.strip().casefold() in _READ_ACTIONS
-        and scope is not None
-        and _RELATIVE_RESOURCE_SCOPE.fullmatch(scope) is not None
-        and not {".", ".."}.intersection(scope.split("/"))
-    )
+    """A named read can coexist with egress approval. A network or unbounded grant cannot."""
+    if record.action.strip().casefold() not in _READ_ACTIONS or not record.resource_scope:
+        return False
+    scope = unicodedata.normalize("NFKC", record.resource_scope)
+    if {".", ".."}.intersection(scope.split("/")):
+        return False
+    bucket = _S3_BUCKET_SCOPE.fullmatch(scope)
+    if bucket is not None:
+        name = bucket["bucket"]
+        return ".." not in name and re.fullmatch(r"\d+(?:\.\d+){3}", name) is None
+    if _NAMED_RESOURCE_SCOPE.fullmatch(scope) is None:
+        return False
+    name = scope.partition("/")[0].casefold()
+    return name not in _NETWORK_SCOPE_NAMES and any(char.isalpha() for char in name)
 
 
 def _unexpired(record: AuthorizationRecord, now: datetime) -> bool:
