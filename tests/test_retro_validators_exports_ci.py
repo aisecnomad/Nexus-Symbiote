@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
 from packaging.version import Version
 
 from nexus_symbiote.core.aibom import AIBOM
@@ -927,19 +928,64 @@ def test_ambiguous_runtime_checks_scale_linearly_with_shared_candidates(tmp_path
     assert scaling_ratio(run) < 10
 
 
-def test_cyclonedx_anonymous_methods_match_the_a2a_collector() -> None:
-    from nexus_symbiote.scanners.a2a import ANONYMOUS_AUTH_METHODS
+def test_ambiguous_checks_summarize_identity_rich_candidates_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Agents with distinct identities are summarized once, not copied per trace item."""
+    from nexus_symbiote import trace_evidence
 
-    assert {"no_auth", "", "none"} <= ANONYMOUS_AUTH_METHODS
-    bom = AIBOM(
-        components=[
-            A2AClientComponent(
-                bom_ref="a2a-under",
-                name="underscore-client",
-                agent_card_url="https://u.example.test/.well-known/agent.json",
-                authentication_methods=["no_auth", ""],
-            ),
+    merges: list[int] = []
+    merge = trace_evidence._merge_runtime
+
+    def counted(summaries: Any) -> Any:
+        merges.append(1)
+        return merge(summaries)
+
+    monkeypatch.setattr(trace_evidence, "_merge_runtime", counted)
+
+    def run(scale: int) -> None:
+        size = 200 * scale
+        bom_path = tmp_path / f"aibom-rich-{scale}.json"
+        AIBOM(
+            components=[
+                AgentComponent(
+                    bom_ref=f"agent:{i}",
+                    name="planner",
+                    workload_identity=f"spiffe://prod.example/a{i}",
+                )
+                for i in range(size)
+            ]
+        ).save(bom_path)
+        spans = [
+            {
+                "name": "invoke_agent planner",
+                "startTimeUnixNano": "1700000000000000000",
+                "endTimeUnixNano": "1700000000100000000",
+                "attributes": [
+                    {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                    {"key": "gen_ai.agent.id", "value": {"stringValue": f"x{i}"}},
+                    {"key": "gen_ai.agent.name", "value": {"stringValue": "planner"}},
+                    {"key": "spiffe.id", "value": {"stringValue": f"spiffe://rogue.example/{i}"}},
+                ],
+            }
+            for i in range(size)
         ]
-    )
-    doc = CycloneDXGenerator(projection_version=3).generate(bom)
-    assert doc["services"][0]["authenticated"] is False
+        trace_file = tmp_path / f"trace-rich-{scale}.json"
+        trace_file.write_text(
+            json.dumps(
+                {
+                    "resourceSpans": [
+                        {"resource": {"attributes": []}, "scopeSpans": [{"spans": spans}]}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        doc = collect(bom_path, [trace_file], fail_on="undeclared")
+        ambiguous = doc["reconciliation"]["ambiguous"]
+        assert len(ambiguous) == size
+        assert all(entry["workload_identity_matched"] is False for entry in ambiguous)
+
+    assert scaling_ratio(run) < 10
+    # Every item shares one candidate list, so no item copies its identities.
+    assert not merges

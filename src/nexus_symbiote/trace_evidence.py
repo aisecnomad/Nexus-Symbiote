@@ -663,6 +663,7 @@ def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str
     mentioned: set[str] = set()
     marked: set[int] = set()
     summaries: dict[int, _RuntimeSummary] = {}
+    merges: dict[tuple[int, ...], _RuntimeSummary] = {}
     for item in observations.items.values():
         identity = _identity(item.kind, item.values)
         if "unreadable" in identity:
@@ -708,7 +709,13 @@ def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str
                     if summary is None:
                         summary = summaries[id(found)] = _summarize_runtime(found)
                     part_summaries.append(summary)
-                _apply_runtime_checks(ambiguous_entry, item, _merge_runtime(part_summaries))
+                # A merge copies every identity and hash, so it is made once per
+                # combination of lists, not once per item.
+                key = tuple(id(found) for found, _basis in parts)
+                merged = part_summaries[0] if len(part_summaries) == 1 else merges.get(key)
+                if merged is None:
+                    merged = merges[key] = _merge_runtime(part_summaries)
+                _apply_runtime_checks(ambiguous_entry, item, merged)
             result["ambiguous"].append(ambiguous_entry)
         elif item.kind in GATING_KINDS:
             result["undeclared"].append({**identity, "span_count": item.spans})
