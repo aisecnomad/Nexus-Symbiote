@@ -53,8 +53,10 @@ def test_computed_method_on_bound_server_marks_coverage_incomplete(tmp_path, ind
     source += 'other[methodName](); server["registerPrompt"]("decoy", {}, handler);'
     result = _scan(tmp_path, source)
     assert not _tools(result)
+    # A computed method on a receiver no binding names may reach the server too.
     assert [x for x in result.surfaces_excluded if "src/server.ts" in x] == [
-        "src/server.ts:3 (unresolved MCP method name)"
+        "src/server.ts:3 (unresolved MCP method name)",
+        "src/server.ts:4 (unresolved MCP registration receiver)",
     ]
 
 

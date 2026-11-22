@@ -869,3 +869,53 @@ def test_constructs_yarn_does_not_write_fail_the_lockfile(tmp_path, lock):
     result, comp = scan(tmp_path, lock)
     assert result.scan_failures == UNREAD
     assert_unbound(comp)
+
+
+DECOY_V1 = (
+    "# yarn lockfile v1\n\n"
+    + stanza("openai@4.20.0", "https://registry.yarnpkg.com/openai/-/openai-4.20.0.tgz").replace(
+        '"4.0.0"', '"4.20.0"'
+    )
+    + "\n"
+    + stanza("openai@^4.0.0", EVIL, integrity=False).replace('"4.0.0"', '"4.19.0"')
+)
+
+
+@pytest.mark.parametrize(
+    "sections",
+    [
+        {"dependencies": {"openai": "^4.0.0"}, "devDependencies": {"openai": "4.20.0"}},
+        {"optionalDependencies": {"openai": "^4.0.0"}, "devDependencies": {"openai": "4.20.0"}},
+        {"dependencies": {"openai": "^4.0.0"}, "optionalDependencies": {"openai": "*"}},
+    ],
+    ids=["dev-decoy", "optional-first", "trivial-optional-skipped"],
+)
+def test_yarn_1_binds_the_spec_yarn_takes_not_npm_s(tmp_path, sections):
+    # Yarn 1 keeps the first spec that is neither "" nor "*", in the order optional,
+    # dependencies, dev; npm's last-section spec named the decoy stanza.
+    (tmp_path / "package.json").write_text(json.dumps(sections))
+    (tmp_path / "yarn.lock").write_text(DECOY_V1, newline="")
+    result = RegistryScanner().scan(tmp_path)
+    (comp,) = result.components
+    assert result.scan_failures == []
+    assert comp.version == "4.19.0"
+    assert comp.properties["lockfile_record"] == "yarn.lock#/openai@^4.0.0"
+    assert comp.registry_uri == "https://evil.example"
+    assert {"missing_lockfile_integrity", "registry_origin"} <= {r.category for r in comp.risks}
+
+
+def test_berry_with_specs_that_differ_by_section_binds_neither(tmp_path):
+    (tmp_path / "package.json").write_text(
+        json.dumps({"dependencies": {"openai": "^4.0.0"}, "devDependencies": {"openai": "4.0.0"}})
+    )
+    (tmp_path / "yarn.lock").write_text(BERRY_HEAD + BERRY_OPENAI, newline="")
+    result = RegistryScanner().scan(tmp_path)
+    (comp,) = result.components
+    assert result.surfaces_excluded == AMBIGUOUS
+    assert_unbound(comp)
+
+
+def test_yarn_plugins_refuse_the_checksum_claim_as_yarn_path_does(tmp_path):
+    (tmp_path / ".yarnrc.yml").write_text("plugins:\n  - path: .yarn/plugins/x.cjs\n")
+    result, comp = scan(tmp_path, BERRY_HEAD + BERRY_OPENAI)
+    assert "missing_lockfile_integrity" in {r.category for r in comp.risks}

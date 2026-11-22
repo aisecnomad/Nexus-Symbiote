@@ -80,6 +80,11 @@ _IMPORTED_EVIDENCE_GAPS = frozenset(
 """Unknown-evidence categories that a bound imported claim reports without blocking."""
 _BLOCKING = {"critical", "error"}
 _SEVERITY_RANK = {"critical": 0, "error": 0, "unknown": 1, "warning": 2, "info": 3}
+# These critical findings describe model use independently of a verified byte identity.
+_MODEL_BEHAVIOR_RISKS = {
+    "unsafe_format": "serialization_format",
+    "trust_remote_code": "code_execution",
+}
 
 
 @dataclass
@@ -88,6 +93,13 @@ class IntegrityIssue:
     category: str
     detail: str
     severity: str = "error"
+
+
+@dataclass(frozen=True)
+class ModelPolicyEvidence:
+    weight_files: int
+    signatures_verified: int
+    digest_pins_verified: int
 
 
 @dataclass
@@ -103,6 +115,9 @@ class IntegrityReport:
     bytes_charged: int = 0
     issues_omitted: int = 0
     omitted_severities: set[str] = field(default_factory=set)
+    model_policy_evidence: dict[str, ModelPolicyEvidence] = field(default_factory=dict)
+    # Integrity category to inventory risk category, retained before display truncation.
+    model_behavior_risks: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @property
     def status(self) -> Literal["pass", "fail", "unknown"]:
@@ -369,6 +384,17 @@ class IntegrityValidator:
                         )
                     )
             self._check_file_hash(comp, project_root, report)
+            # Matching artifact bytes and safe model behavior are separate facts.
+            component_issues = report.issues[first_issue:]
+            behavior = {
+                issue.category: _MODEL_BEHAVIOR_RISKS[issue.category]
+                for issue in component_issues
+                if issue.category in _MODEL_BEHAVIOR_RISKS
+            }
+            if behavior:
+                report.model_behavior_risks[comp.bom_ref] = behavior
+            if any(issue.category not in _MODEL_BEHAVIOR_RISKS for issue in component_issues):
+                report.model_policy_evidence.pop(comp.bom_ref, None)
             if comp.bom_ref in bound_imports and is_imported(comp):
                 for issue in report.issues[first_issue:]:
                     if issue.severity == "unknown" and issue.category in _IMPORTED_EVIDENCE_GAPS:
@@ -490,12 +516,14 @@ class IntegrityValidator:
             if not expected_weight:
                 raise ValueError("tensor metadata requires a whole-artifact SHA-256 binding")
             algorithm, hex_digest = normalize_digest(expected_weight, "sha256")
+            located = _locate_artifact(project_root, comp.source_path)
+            if isinstance(located, str):
+                raise ValueError(located)
             root = project_root.resolve()
-            source = Path(comp.source_path)
-            # The integrity check's observation of the same file; the artifact is
-            # read once per validation.
+            # The integrity check's observation of the same file, located as that check
+            # locates it; the artifact is read once per validation.
             observation = self._model_packages(report, root).observation(
-                source.relative_to(root) if source.is_absolute() else source
+                located.resolve().relative_to(root)
             )
             if (
                 observation is None
@@ -688,6 +716,25 @@ class IntegrityValidator:
             package = packages.observe(relative)
         except (OSError, ValueError):
             package = None
+        if package is not None:
+            if package.trust_remote_code and not comp.trust_remote_code:
+                report.issues.append(
+                    IntegrityIssue(
+                        comp.bom_ref,
+                        "trust_remote_code",
+                        "Local model configuration permits repository code execution",
+                        "critical",
+                    )
+                )
+            if not package.loading_config_complete:
+                report.issues.append(
+                    IntegrityIssue(
+                        comp.bom_ref,
+                        "model_config_unverified",
+                        "Local model loading configuration could not be checked completely",
+                        "unknown",
+                    )
+                )
         observation = package.observation if package is not None else None
         if observation is None:
             actual, explanation = (
@@ -789,6 +836,14 @@ class IntegrityValidator:
         report.signatures_checked += verification.signatures_checked
         report.signatures_verified += verification.signatures_verified
         report.hashes_verified += verification.pins_verified
+        weight_count = len(package.weight_files)
+        if (
+            weight_count > 0
+            and verification.signatures_verified + verification.pins_verified == weight_count
+        ):
+            report.model_policy_evidence[comp.bom_ref] = ModelPolicyEvidence(
+                weight_count, verification.signatures_verified, verification.pins_verified
+            )
         for category, detail, severity in verification.issues:
             if severity == "unknown" and not self.require_model_signatures:
                 severity = "warning"

@@ -119,8 +119,10 @@ inputs:
       such as a file the workflow writes under RUNNER_TEMP from a trusted source; never a file
       from the checked-out code. Its artifact and bundle paths are relative to scan-path. The
       Action refuses relative paths, any path that passes through a symlink (including a
-      symlinked RUNNER_TEMP or parent directory), hard links, non-regular and oversized files, and
-      passes one snapshot to collection, validation and the risk gate. Signatures verify offline
+      symlinked RUNNER_TEMP or parent directory), hard links, non-regular and oversized files.
+      On POSIX, the original policy must have trusted ownership and writability up to the file
+      system root. The Action passes one private snapshot to collection, validation and the risk
+      gate. Signatures verify offline
       against the Sigstore trust root shipped in the Action's hash-locked sigstore package, never
       a runner cache nor a trust root the job environment names. Empty means no signer policy
     default: ""

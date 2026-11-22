@@ -19,6 +19,7 @@ from nexus_symbiote.core.models import (
     MCPServerComponent,
     PromptComponent,
 )
+from nexus_symbiote.operator_policy import render_gate_markdown
 from nexus_symbiote.scanner_catalog import BUILTIN_SCANNER_NAMES
 
 
@@ -831,3 +832,39 @@ def test_risk_report_lists_the_first_coverage_gaps_and_points_to_the_json():
     assert "  - coverage gap: 2 more in --json-output" in lines
     document["coverage_gaps"] = document["coverage_gaps"][:LISTED]
     assert all("more in --json-output" not in text for text, _ in risk_report_lines(document))
+
+
+def test_step_summary_names_completeness_and_discovery_reasons_not_raw_records():
+    document = {
+        "passed": False,
+        "completeness": {
+            "status": "fail",
+            "issues": [
+                {"surface": "tool:x", "description": "Tool x has no hash.", "severity": "error"}
+            ],
+        },
+        "integrity": {"status": "pass", "issues": []},
+        "discovery_producer": {"status": "failed", "problems": ["Producer is unverified."]},
+    }
+    rendered = render_gate_markdown("validate", document)
+    assert "- completeness\\: Tool x has no hash\\." in rendered
+    assert "- discovery\\_producer\\: Producer is unverified\\." in rendered
+    assert "surface" not in rendered
+
+
+@pytest.mark.parametrize("alias", ["same", "hard link"])
+def test_step_summary_onto_an_input_inventory_is_refused(tmp_path, alias):
+    inventory = tmp_path / "bom.json"
+    bom = AIBOM()
+    bom.add_component(MCPServerComponent(bom_ref="mcp:demo", name="demo", transport="stdio"))
+    bom.save(inventory)
+    before = inventory.read_bytes()
+    summary = inventory
+    if alias == "hard link":
+        summary = tmp_path / "summary.md"
+        summary.hardlink_to(inventory)
+    for command in (["validate", str(inventory)], ["diff", str(inventory), str(inventory)]):
+        result = CliRunner().invoke(main, [*command, "--step-summary", str(summary)])
+        assert result.exit_code == 2, result.output
+        assert "--step-summary must not name a file this command reads" in result.output
+    assert inventory.read_bytes() == before

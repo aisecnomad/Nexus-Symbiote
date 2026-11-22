@@ -262,11 +262,13 @@ def test_a_hostile_declaration_is_refused_without_decoding(tmp_path):
 
 def test_an_import_spelled_with_compatibility_characters_is_a_gap(tmp_path):
     fullwidth = "".join(chr(ord(letter) + 0xFEE0) for letter in "mcp")
+    # The class name is a tool hint too, so it is spelled the same way.
+    server_class = "".join(chr(ord(letter) + 0xFEE0) for letter in "FastMCP")
     _write(
         tmp_path,
         "pkg/server.py",
-        f"from {fullwidth}.server.fast{fullwidth} import FastMCP\n"
-        'server = FastMCP("files")\n'
+        f"from {fullwidth}.server.fast{fullwidth} import {server_class}\n"
+        f'server = {server_class}("files")\n'
         "@server.tool()\n"
         "def read(path: str) -> str:\n"
         "    return path\n",
@@ -278,7 +280,11 @@ def test_an_import_spelled_with_compatibility_characters_is_a_gap(tmp_path):
     ]
     assert result.surfaces_scanned == ["pkg/server.py"]
     literal = (tmp_path / "pkg" / "server.py").read_text(encoding="utf-8")
-    _write(tmp_path, "pkg/server.py", literal.replace(fullwidth, "mcp"))
+    _write(
+        tmp_path,
+        "pkg/server.py",
+        literal.replace(server_class, "FastMCP").replace(fullwidth, "mcp"),
+    )
     result = MCPScanner().scan(tmp_path)
     assert result.surfaces_excluded == []
     assert [c.name for c in result.components if c.component_type == "tool"] == ["read"]

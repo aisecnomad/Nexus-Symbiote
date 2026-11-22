@@ -30,6 +30,7 @@ from nexus_symbiote.scanners.base import (
     parse_python,
     source_collection_bytes,
 )
+from nexus_symbiote.scanners.credential_files import relinked, withheld
 from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV
 from nexus_symbiote.scanners.mcp_sources import _INVALID_UTF8, _source_encoding, _UnreadableError
 from nexus_symbiote.scanners.source_binding import ORIGIN_PATHS as _ORIGIN_PATHS
@@ -39,6 +40,7 @@ from nexus_symbiote.scanners.source_binding import origin as _origin
 from nexus_symbiote.scanners.source_binding import url_shape as _url_shape
 from nexus_symbiote.scanners.source_binding import url_shapes as _url_shapes
 from nexus_symbiote.scanners.source_binding import value_binding as _value_binding
+from nexus_symbiote.scanners.source_binding import whatwg_form as _whatwg_form
 from nexus_symbiote.utils.confined import CollectionError, ConfinedCollection, fold_name
 from nexus_symbiote.utils.secrets import REDACTED, redact_text
 from nexus_symbiote.utils.terminal import neutralize
@@ -835,6 +837,8 @@ class A2AScanner(Scanner):
                     # Another tool's file may use a generic name; without an object that
                     # carries an A2A field it is not a card, and not a failure.
                     data = files.read_json(relative)
+                    if self._relinked(relative, files, result):
+                        continue
                     if not isinstance(data, dict) or not _CARD_MARKERS & set(data):
                         continue
                 else:
@@ -860,6 +864,26 @@ class A2AScanner(Scanner):
             result.surfaces_scanned.append("a2a (no A2A configurations found)")
         return result
 
+    def _read_mapping(
+        self, path: Path, result: ScanResult, *, missing_ok: bool = True
+    ) -> dict[str, Any] | None:
+        """A card or client configuration; a credential-named file is a gap and is not read."""
+        files = self._files
+        if files is None:
+            raise RuntimeError("_read_mapping called outside a _collection context")
+        relative = path.as_posix()
+        if withheld(files, relative, result.surfaces_excluded):
+            return None
+        data = super()._read_mapping(path, result, missing_ok=missing_ok)
+        return None if self._relinked(relative, files, result) else data
+
+    @staticmethod
+    def _relinked(relative: str, files: ConfinedCollection, result: ScanResult) -> bool:
+        if not relinked(files, relative):
+            return False
+        result.scan_failures.append(f"{relative}: file changed during collection")
+        return True
+
     def _found_card(
         self,
         path: Path,
@@ -868,21 +892,30 @@ class A2AScanner(Scanner):
         files: ConfinedCollection,
         result: ScanResult,
     ) -> None:
+        """Queue a card path; one named as holding credentials, by its own name or that of
+        the in-root file a symlink there leads to, such as ``agent.json ->
+        credentials.json``, is a gap and is not read."""
+        if withheld(files, path.as_posix(), result.surfaces_excluded):
+            return
         canonical, exact = location
         if exact:
             cards.append(canonical)
-        elif self._is_card(path, canonical, files):
+        elif self._is_card(path, canonical, files, result):
             result.scan_failures.append(
                 f"{path.as_posix()}: case variant of {canonical} is the active "
                 "file on case-insensitive file systems and is not inventoried"
             )
 
-    @staticmethod
-    def _is_card(path: Path, canonical: str, files: ConfinedCollection) -> bool:
+    @classmethod
+    def _is_card(
+        cls, path: Path, canonical: str, files: ConfinedCollection, result: ScanResult
+    ) -> bool:
         if canonical not in _GENERIC_CARD_PATHS:
             return True
         # A generic name is a card only with an A2A field; a read failure is recorded.
         data = files.read_json(path)
+        if cls._relinked(path.as_posix(), files, result):
+            return False
         return data is None or (isinstance(data, dict) and bool(_CARD_MARKERS & set(data)))
 
     def _record_cards(self, parsed: list[tuple[str, dict[str, Any]]], result: ScanResult) -> None:
@@ -945,7 +978,7 @@ class A2AScanner(Scanner):
         ):
             raise ValueError("invalid card identity")
         # Both endpoint spellings are checked, so neither can hide behind the other.
-        named: list[str] = [url for url in declared if url]
+        named: list[str] = [_whatwg_form(url) for url in declared if url]
         endpoint: str | None = named[0] if named else None
         aliases = named[1:]
         name = _bounded_name(declared_name) if declared_name is not None else "unnamed-agent"
@@ -974,9 +1007,11 @@ class A2AScanner(Scanner):
         # that an endpoint actually enforces authentication.
         security = _security(data, skill_declarations)
         # Clients may send credentials to these alternative endpoints too.
-        interface_urls = _declared_urls(data.get("additionalInterfaces"))
+        interface_urls = [
+            _whatwg_form(url) for url in _declared_urls(data.get("additionalInterfaces"))
+        ]
         supported = _supported_interfaces(data)
-        supported_urls: list[str] = [entry["url"] for entry in supported]
+        supported_urls: list[str] = [_whatwg_form(entry["url"]) for entry in supported]
         endpoint = endpoint or (supported_urls[0] if supported_urls else None)
         signatures = _signatures(data)
         flags, extensions, extension_uris = _capabilities(data)

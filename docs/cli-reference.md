@@ -69,7 +69,7 @@ change them. See [collection limits](collection-limits.md).
 | [`verify-discovery`](#verify-discovery) | offline | Check that a ShadowScan report's bytes match the digest a BOM records; with `--projection` or `--bundle`, also compare the BOM's imported components with the report |
 | [`export-inventory`](#export-inventory) | offline | Write the reviewed repository agent as an approved inventory that ShadowScan's `--inventory` accepts |
 | [`import-sbom`](#import-sbom) | offline | Import a foreign CycloneDX or SPDX SBOM as DECLARED evidence without picking silent winners |
-| [`evidence-profile`](#evidence-profile) | offline | Report concrete evidence attributes per component without a scalar TrustScore |
+| [`evidence-profile`](#evidence-profile) | offline | Report inventory claims and corroborated evidence per component. |
 | [`export-policy`](#export-policy) | offline | Export a default-deny Cedar, Rego v1 or JSON runtime allowlist from a corroborated inventory |
 | [`init`](#init) | offline | Create a `.nexus-symbiote.yaml` policy file |
 | [`runtime keygen`](#runtime-keygen) | offline | Create an Ed25519 key pair for runtime contracts |
@@ -207,12 +207,18 @@ in the BOM is not trusted.
 written by the operator, never by the checkout. The CLI refuses a policy inside the
 scanned project or inside any Git working tree that encloses it, including a
 submodule's superproject, also under another name for any of these directories, or
-one with other hard links. The Action checks its input only against
-`GITHUB_WORKSPACE`: it refuses a path inside the workspace, one that passes through a
-symlink, or a hard link. It then copies the policy into a private directory under
-`RUNNER_TEMP`, or under the system temporary directory when `RUNNER_TEMP` is unset,
-and passes that copy to the CLI, which applies the rules above to the copy; a
-temporary directory inside a Git working tree therefore fails the run.
+one with other hard links. On POSIX systems it also refuses a policy that another user
+could replace: one not owned by you or root, one its group or others can write, or one
+under a directory, up to the file system root, that is owned by another user or that
+its group or others can write without the sticky bit. An `--operator-policy` file and
+its `--operator-policy-key` files follow the same rule, and a key inside the scanned
+project is refused whether or not the project is a git working tree. The Action checks the original signer policy and its trusted keys before use. In a
+container job, provision them in directories owned by the container user or root.
+A host-owned runner directory can fail this check even when its mode is 0755.
+For the private policy snapshot, the runner checks the nominated runner directory,
+then the platform temporary directory (which can come from `TMPDIR`, `TEMP` or
+`TMP`), then `/tmp` on POSIX. It uses only a writable, trusted directory outside
+the workspace and its enclosing Git working trees.
 
 ```json
 {
@@ -474,13 +480,15 @@ nexus-symbiote crosswalk [OPTIONS] AIBOM_PATH
 | `--project` `DIRECTORY` | Reconcile `AIBOM_PATH` against this project to corroborate `verified_models` in `--include-evidence-pack`. |
 | `--signature-policy` `FILE` | Explicit operator signer policy JSON for `--include-evidence-pack`; requires `--project`. |
 
-The findings are those that `risk` scores under the built-in policy; no project policy
-is read. For each framework edition the report lists every entry that a finding
-references, with those findings, and the categories whose findings reference none. A
-reference means that a finding records a precondition, a weakness or evidence relevant
+The findings use the built-in `risk` policy. When corroborating an evidence pack,
+the command reads the named project's scan exclusions and discovery-signature
+requirement. For each framework edition, the report lists the entries referenced
+by findings, the findings for each entry, and the categories with no references.
+A reference means that a finding records a precondition, a weakness or evidence relevant
 to an entry, never that an attack happened, that a control fails or that an obligation
-applies. It is a report, not a gate: it exits 0 whatever the findings are, and 1 only
-when the inventory cannot be read or the report cannot be written. In Markdown, every
+applies. A written report exits 0 regardless of its findings. Reading the inventory,
+corroborating a requested evidence pack, or writing the report can fail with exit
+status 1. In Markdown, every
 ASCII punctuation character of inventory text is backslash-escaped, so a terminal shows
 the backslashes.
 [Framework crosswalk](framework-crosswalk.md) describes the report and the catalog.
@@ -584,7 +592,20 @@ nexus-symbiote discover-mcp [OPTIONS] ENDPOINT
 
 ### `evidence-profile`
 
-Report concrete evidence attributes per component without a scalar TrustScore (`signed_under_policy` is `true` only when `--project` and `--signature-policy` corroborate the artifact; inventory `signing_status` assertions appear separately under `declared_signing_status`).
+The v2 profile reports per-component evidence without a scalar TrustScore.
+`policy_loaded` records policy use. `policy_verified` requires corroboration
+with no integrity issues. `digest_recorded` reflects inventory fields, while
+`digest_bound` requires locally corroborated weight files.
+
+`signed_under_policy` and `digest_pinned_under_policy` require their respective
+verification on every weight file. A package can have `digest_bound: true`
+when signatures and operator pins together cover all files. Artifact evidence
+can coexist with an unsafe-format or code-execution finding.
+
+`inventory_claims` carries collector and runtime assertions.
+`declared_signing_status` records the inventory's signing claim.
+`runtime_matched` requires runtime evidence supplied by the library caller.
+Finding counts include intrinsic model risks.
 
 ```text
 nexus-symbiote evidence-profile [OPTIONS] AIBOM_PATH
@@ -641,6 +662,19 @@ nexus-symbiote export-policy [OPTIONS] INVENTORY
 
 By default (`--verified-only`), `export-policy` refuses uncorroborated inventories unless `--project` reconciles and integrity-validates `INVENTORY` against the project or `--require-attestation` with `--trusted-key` verifies a reviewed DSSE attestation over `INVENTORY`. Pass `--include-declared` only when exporting uncorroborated declarations intentionally. With `--require-attestation` and no `--project`, tool permits rely on the reviewer's attestation. The JSON bundle also lists attested MCP servers in `allowed_mcp_servers`. Cedar and Rego emit tool and model decisions. A model permit requires `--project` and `--signature-policy` to corroborate the model's digest and signature.
 
+`export-policy --project` and `crosswalk --include-evidence-pack --project` use the named project's
+`scan.exclude_paths` and `validate.require_discovery_signature` settings. Both commands require
+completeness, integrity and any applicable discovery-producer signature. Unknown integrity issues
+exclude the affected components from verified permits and verified model evidence. These checks
+remain mandatory for every value of `validate.require_completeness`, `validate.require_integrity`,
+`validate.minimum_assurance_level` and `scan.failure_mode`.
+
+The accepted `scan.exclude_paths` entries are exactly `node_modules`, `.git`,
+`__pycache__`, `.venv` and `venv`. All other entries, including `node_modules/` and
+`./node_modules`, cause corroboration to fail even when the path is absent. Both commands
+refuse an invalid project policy and report its cause.
+Neither command accepts `--accept-project-policy` or `--no-project-policy`.
+
 ### `graph`
 
 Write a view of an inventory's associations, risk classes and exposure paths.
@@ -672,6 +706,14 @@ ranking and the JSON document.
 
 Import a foreign CycloneDX or SPDX SBOM as DECLARED evidence without picking silent winners. By default component names are hashed (`imported-<16hex>`): keyed HMAC-SHA256 (`hmac-sha256`) when `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` has at least 32 characters, or unsalted SHA-256 (`unsalted-sha256`) otherwise. Local digest matching (`declared_digest_local_match`) checks only non-empty, non-symlink, non-credential artifact files of matching type beneath `--project` and never sets `digest_bound`. The project is always walked, but files are hashed only when the SBOM declares a SHA-256, within the `model-bytes` and `model-total-bytes` limits; a file larger than `model-bytes` is left unbound, warned about and listed in `scan_failures`, while any other limit reached under `--project` ends the import with exit 1. Conflicts are found by purl and by name within one ecosystem, including nested manifests collected in the same run. An unknown ecosystem is compared with every record of the same name. An exhausted comparison sample can report an unresolved conflict. Multiple type-compatible local digest matches are marked ambiguous.
 
+Nested npm and Cargo manifests use SemVer ordering for supported requirements, including prerelease eligibility. Conda comparisons cover supported numeric constraints and version prefixes. An incompatible version rules out a version-and-build pin. A compatible version leaves the build unresolved when supplier build evidence is unavailable. Package URL comparisons ignore ancillary metadata such as checksums and subpaths. Different explicit registry or qualifier evidence for the same typed package remains unresolved at the same version. Incompatible versions for that package report a conflict.
+
+The default npm and Yarn registry addresses identify the same public registry. PyPI’s
+default index and file host also agree. With `--project`, a private repository path
+can be matched to the selected npm, uv or Poetry lock record. Its recorded file digest,
+package name and version must agree. Missing, changed or symlinked lockfiles leave a
+path-specific supplier claim unresolved.
+
 ```text
 nexus-symbiote import-sbom [OPTIONS] FOREIGN_BOM_PATH
 ```
@@ -681,6 +723,7 @@ nexus-symbiote import-sbom [OPTIONS] FOREIGN_BOM_PATH
 | `-o`, `--output` `PATH` | Write the resulting native AgentBOM JSON to this file (must lie outside `--project`). |
 | `--into` `PATH` | Existing native AgentBOM to merge imported SBOM claims into. |
 | `--project` `PATH` | Trusted project root for SHA-256 local file binding, nested manifests, and shape census. |
+| `--shareable` | Produce a standalone supplier export with keyed document, entry and identity bindings. Set `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` to a secret of at least 32 characters. This mode omits supplier filenames, raw declared digests and nonnumeric version labels. It requires a standalone import without local inventory or checkout inputs. |
 | `--reveal-names` | Retain plain component names from the foreign SBOM instead of hashed names. |
 | `--walk-manifests` | Walk nested manifests below `--project`. A nested npm lock must have an applicable v2 or v3 root record and agree with the effective dependency range. Nested pnpm and Yarn locks supply no lock evidence. Go versions describe requirements and remain manifest-only even with a `go.sum`. |
 | `--census` | Count unread non-control-plane artifact shapes (`*.ipynb`, `n8n/*.json`, `*.tf`, `Chart.yaml`). |
@@ -762,7 +805,7 @@ nexus-symbiote risk [OPTIONS] AIBOM_PATH
 | `--fail-on-unsigned-discovery` | Exit with status 1 when the BOM's ShadowScan evidence is unverified |
 | `--allow-unsigned-discovery` | Accept unverified discovery evidence explicitly (still warns); required in CI |
 | `--report-format` `text\|json\|markdown\|junit` | Gate report format (cannot disagree with `--json-output`; default: `text`). |
-| `--step-summary` `PATH` | Append a sanitized Markdown gate summary to this file. |
+| `--step-summary` `PATH` | Append to a new file or an existing singly linked report, including inside the checked project. The gate protects the files it reads. |
 | `--operator-policy` `FILE` | Signed operator policy YAML outside the scanned checkout; checkout policy may only narrow it. |
 | `--operator-policy-attestation` `FILE` | DSSE attestation envelope (`purpose: policy`) over `--operator-policy`. |
 | `--operator-policy-key` `FILE` | Trusted Ed25519 public key for `--operator-policy-attestation` (repeatable). |
@@ -894,7 +937,7 @@ nexus-symbiote runtime register [OPTIONS] SNAPSHOT_PATH
 | `--approval-key` `PATH` | Approval public key PEM the gateways trust; repeat for each. Only checked, so the gateways' signer scope map can be passed unchanged. (repeatable) |
 | `--snapshot-threshold` `INTEGER RANGE` | Minimum number of distinct snapshot signers (default: 1). |
 | `--trust-threshold` `INTEGER RANGE` | Minimum number of distinct trust-status signers (default: 1). |
-| `--signer-scopes` `PATH` | JSON object mapping key IDs to the signer scopes the gateways use. |
+| `--signer-scopes` `PATH` | Operator-owned JSON mapping of key IDs to signer scopes. Keep it outside the checkout and provision it with the same ownership, mode and single-link protections as a verification key. |
 | `--allow-shared-keys` | Accept a key in more than one ring, as gateways built with `allow_shared_keys=True` do. |
 
 The snapshot and trust status are checked as the gateway checks them, except the
@@ -1036,7 +1079,7 @@ nexus-symbiote validate [OPTIONS] AIBOM_PATH
 | `--fail-on-unsigned-discovery` | Exit with status 1 when the BOM's ShadowScan evidence is unverified |
 | `--allow-unsigned-discovery` | Accept unverified discovery evidence explicitly (still warns); required in CI |
 | `--report-format` `text\|json\|markdown\|junit` | Gate report format (cannot disagree with `--json-output`; default: `text`). |
-| `--step-summary` `PATH` | Append a sanitized Markdown gate summary to this file. |
+| `--step-summary` `PATH` | Append to a new file or an existing singly linked report, including inside the checked project. The gate protects the files it reads. |
 | `--operator-policy` `FILE` | Signed operator policy YAML outside the scanned checkout; checkout policy may only narrow it. |
 | `--operator-policy-attestation` `FILE` | DSSE attestation envelope (`purpose: policy`) over `--operator-policy`. |
 | `--operator-policy-key` `FILE` | Trusted Ed25519 public key for `--operator-policy-attestation` (repeatable). |
@@ -1246,11 +1289,15 @@ kept.
 
 ### `trifecta`
 
-Analyze an inventory offline for lethal trifectas, chained toxic flows, and tool shadowing.
+Analyze an inventory offline for lethal trifectas, chained toxic flows, and tool shadowing. A trifecta is high when applicable human-approval declarations cover every egress in its scope. It stays critical if any egress lacks coverage. The high finding reports that enforcement is unverified. Use `--fail-on-finding` to gate on it. The Python API can explicitly assume those declarations when modeling a proposed design.
+
+An unrelated read-only authorization is independent of egress only when its scope identifies data. Use an explicit table such as `table:crm.customers`, a named knowledge base such as `kb:project-notes/*`, a named S3 bucket ARN, or a DynamoDB table or named index ARN. The `table:` and `kb:` prefixes are case-insensitive. Dotted identifiers after `table:` name database objects even when a segment resembles a DNS suffix. A named collection may have numeric child identifiers or a final `/*`. A recognized document extension such as `.md`, `.pdf`, or `.txt` is accepted on a knowledge-base leaf. The CLI keeps broad selectors such as `table:all` and network-like selectors such as `kb:public` critical. These comparisons recognize common spellings and variants. The inventory records declarations and cannot verify how a particular provider interprets an arbitrary name. An untyped name (`customers`), a dotted name (`crm.customers`), or a slash namespace (`customers/*`) keeps the finding critical. Global grants, network locations, absolute paths and parent traversal also keep it critical. The recognized actions are `read`, `query`, `list`, `search`, and `get`. The action match ignores case and surrounding whitespace. An unscoped authorization, a global wildcard, or a URL scope can still affect egress approval.
 
 ```text
 nexus-symbiote trifecta [OPTIONS] AIBOM_PATH
 ```
+
+Each leg records the component’s declared approval requirement separately from runtime verification.
 
 | Option | Description |
 |---|---|
@@ -1301,7 +1348,7 @@ nexus-symbiote export-standard [OPTIONS] AIBOM_PATH
 | `--agent-yaml` `PATH` | Relative path under `--project` to an `agent.yaml` (`1.0` or `1.1`) producer declaration file; recorded at `declared` assurance (`declaration_conflict` on contradiction). |
 | `--project` `DIR` | Trusted project root used to confine `--agent-yaml` declarations (requires `--agent-yaml`). |
 
-`--agent-yaml` and `--project` must be passed together; `--project` alone never reads `agent.yaml` implicitly. Producer declarations (`schema_version`, `owner`, `version`, `automation_level`, `licenses`, `data_usage`, `compliance`, `allowed_regions`, `release_time`, `download_location`, `datasets[]`, and `models[]`) never overwrite observed collector fields (`version`, `supplier`, `autonomy_level`, and a dataset's `source_uri` and `license`); on observed components they are recorded under `declared_*` properties with per-field `declaration.<field>` claims, and a conflicting value raises `declaration_conflict` and is not stored. A `models[].training.datasets` entry adds a `trained-on` edge with `assurance_level: declared`, exported as a typed edge (CycloneDX `dependsOn` and `modelCard` datasets, SPDX `trainedOn`) whose native relationship keeps that assurance. Licences that do not parse as SPDX license expressions (listed licence ids with an optional `+`, `LicenseRef-`, `AND`, `OR`, parentheses, and `WITH` a listed exception id) export as SPDX `NoAssertion` and CycloneDX `license.name`; a licence taken from a declaration carries the comment `declared by producer`. A refused declared `download_location`, and an observed `source_uri` left out of the standard download fields (an unsupported scheme, credentials or a secret), are reported on standard error. Passing `--author` or `--agent-yaml` enriches the embedded native inventory inside the exported document, so the recovered inventory's content digest reflects those additions rather than an attestation signed over the unmodified input `AIBOM_PATH`.
+`--agent-yaml` and `--project` must be passed together; `--project` alone never reads `agent.yaml` implicitly. Producer declarations (`schema_version`, `owner`, `version`, `automation_level`, `licenses`, `data_usage`, `compliance`, `allowed_regions`, `release_time`, `download_location`, `datasets[]`, and `models[]`) never overwrite observed collector fields (`version`, `supplier`, `autonomy_level`, and a dataset's `source_uri` and `license`); on observed components they are recorded under `declared_*` properties with per-field `declaration.<field>` claims, and a conflicting value raises `declaration_conflict` and is not stored. Declarations match components by type and name. If only a collected component of the other type matches, the declaration raises a `declaration_conflict` (`component_type`) and is not applied. A model and dataset may share a name when both are declared independently. The first declaration of each type and name is retained, and a conflicting duplicate raises `declaration_conflict`. A `models[].training.datasets` entry adds a `trained-on` edge with `assurance_level: declared`, exported as a typed edge (CycloneDX `dependsOn` and `modelCard` datasets, SPDX `trainedOn`) whose native relationship keeps that assurance. Licences that do not parse as SPDX license expressions (listed licence ids with an optional `+`, `LicenseRef-`, `AND`, `OR`, parentheses, and `WITH` a listed exception id) export as SPDX `NoAssertion` and CycloneDX `license.name`; a licence taken from a declaration carries the comment `declared by producer`. A refused declared `download_location`, and an observed `source_uri` left out of the standard download fields (an unsupported scheme, credentials, a secret, or a character outside printable ASCII that is not percent-encoded), are reported on standard error. A `declared_download_location` property already in `AIBOM_PATH` passes the same check before it reaches a standard download field; a refused one is left out of those fields without a note on standard error, and the embedded native document still carries it unchanged. Recovery accepts the earlier typed download-location projection when the complete document matches it. Export generation refuses an embedded native document outside the recovery depth or byte limits. Passing `--author` or `--agent-yaml` enriches the embedded native inventory inside the exported document, so the recovered inventory's content digest reflects those additions rather than an attestation signed over the unmodified input `AIBOM_PATH`.
 
 ```bash
 nexus-symbiote scan examples/demo-agent -f json --report-only -o /tmp/demo-aibom.json
@@ -1325,7 +1372,7 @@ nexus-symbiote audit-control-plane [OPTIONS] [PROJECT_PATH]
 | `--json-output` | Emit JSON audit summary to standard output. |
 | `--fail-on-severity` `critical\|high\|medium\|low\|none` | Exit 1 when a finding or reach-rated diff alert meets or exceeds this severity, or when an input could not be read or parsed (`critical` by default). Unread inputs are printed as `[INCOMPLETE]` lines; `none` never fails. |
 
-A filesystem MCP server rooted at the project, a parent of it, or a steering path (`.claude`, `.cursor`, `CLAUDE.md`, `AGENTS.md`, `.mcp.json`, `mcp.json`), given as a relative or absolute path, raises `steering_surface_writable` (critical) when an auto-edit mode or `alwaysAllow` applies. A `:ro` suffix marks only the root it is appended to as read-only. Claude Code `Read`, `Edit`, `Write` and `Bash` deny rules govern its built-in tools, not an MCP server's own tools, so only a deny of the server (`mcp__<server>` or `mcp__<server>__*`), or of each of the reference server's `write_file`, `edit_file` and `move_file` tools, clears the finding. A deny in `.claude/settings.json` or `.claude/settings.local.json` applies only to servers Claude Code reads from `.mcp.json` or `.claude/`; it does not clear a server declared in `.cursor/mcp.json`, `.vscode/mcp.json` or `mcp.json`.
+A filesystem MCP server rooted at the project, a parent of it, or a steering path (`.claude`, `.cursor`, `CLAUDE.md`, `AGENTS.md`, `.mcp.json`, `mcp.json`) raises `steering_surface_writable` (critical) when an applicable auto-edit mode, `alwaysAllow`, or server allowance applies. Permission modes, server allowances, and whole-server denials are scoped to the declaring client. Claude modes `default` and `plan` are recorded as prompting when no applicable preapproval takes precedence. When the report cannot establish approval behavior, it records `steering_surface_unverified` (medium). A positional `:ro` suffix, a launcher flag or an arbitrary server property alone cannot establish read-only enforcement. Grant evidence records the class of allowance without copying the rule argument.
 
 For `npx` and `uvx`, the first operand is the package unless it is written as a path, and the script is the first later operand that is a path (`./x`, `dir/x`, or a script suffix such as `.ts`) and not the value of an option; a bare name is used only when the project lists it and nothing path-like follows. A project directory, such as a filesystem server root, is never read as a script. Other launchers (`node`, `python`, `sh`, `bash`, `deno`, `bun`, `tsx`) bind their first operand that is a path, including one that starts with `@`.
 

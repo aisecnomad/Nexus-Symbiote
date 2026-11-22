@@ -27,6 +27,24 @@ MAX_POLICY_LIST_ITEMS = 256
 MAX_POLICY_SUPPRESSIONS = 1000
 MAX_POLICY_ENTRY_CHARS = 1024
 _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_CI_ENVIRONMENT_VARIABLES = (
+    "CI",
+    "GITHUB_ACTIONS",
+    "GITLAB_CI",
+    "CIRCLECI",
+    "TF_BUILD",
+    "JENKINS_URL",
+    "BUILDKITE",
+    "DRONE",
+    "TRAVIS",
+)
+
+
+def running_in_ci() -> bool:
+    """Whether a recognized environment variable indicates a CI runner."""
+    return any(
+        os.environ.get(name) not in (None, "", "0", "false") for name in _CI_ENVIRONMENT_VARIABLES
+    )
 
 
 class PolicyError(ValueError):
@@ -256,6 +274,12 @@ def load_policy_file(project_root: Path) -> tuple[Policy, Path, str] | None:
     return policy, path, digest
 
 
+def resolved_project_policy(project_root: Path) -> tuple[Policy, Path | None]:
+    """Return the governing checkout policy, or the built-in default without a source path."""
+    loaded = load_policy_file(project_root)
+    return (default_policy(), None) if loaded is None else (loaded[0], loaded[1])
+
+
 def load_policy(project_root: Path) -> Policy | None:
     loaded = load_policy_file(project_root)
     return None if loaded is None else loaded[0]
@@ -276,6 +300,11 @@ def nearest_policy_file(start: Path) -> Path | None:
             except OSError:
                 continue
     return None
+
+
+def additional_exclusions(scan: ScanPolicy) -> list[str]:
+    """Project exclusions that can narrow collection beyond the built-in exclusions."""
+    return [path for path in scan.exclude_paths if path not in _ALWAYS_EXCLUDED_NAMES]
 
 
 def weakened_settings(policy: Policy) -> list[str]:
@@ -305,12 +334,17 @@ def weakened_settings(policy: Policy) -> list[str]:
         weaker.append("scan.failure_mode=report-only")
     if set(policy.scan.scanners) < set(base.scan.scanners):
         weaker.append("scan.scanners=" + ",".join(policy.scan.scanners))
-    extra = [path for path in policy.scan.exclude_paths if path not in _ALWAYS_EXCLUDED_NAMES]
+    extra = additional_exclusions(policy.scan)
     if extra:
         weaker.append("scan.exclude_paths=" + ",".join(extra))
     if policy.output.default_format != base.output.default_format:
         weaker.append(f"output.default_format={policy.output.default_format}")
     return weaker
+
+
+def gate_weakenings(weaker: list[str]) -> list[str]:
+    """Relaxations that can change whether a check passes."""
+    return [entry for entry in weaker if not entry.startswith("output.")]
 
 
 def read_sexagesimal_integers_as_text(loader: type[Any]) -> None:
@@ -404,12 +438,14 @@ def parse_yaml_mapping(text: str, *, max_nodes: int | None = None) -> dict[str, 
 def _parse_policy_with_digest(path: Path) -> tuple[Policy, str]:
     from pydantic import ValidationError
 
+    from nexus_symbiote.core.hashing import stat_input_file
+
     try:
         fd = os.open(
             path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         )
         try:
-            info = os.fstat(fd)
+            info = stat_input_file(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
                 raise PolicyError("policy must be a regular file no larger than 1 MiB")
             stream = os.fdopen(fd, "rb")

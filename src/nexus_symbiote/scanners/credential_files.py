@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from pathlib import PurePosixPath
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nexus_symbiote.utils.confined import ConfinedCollection
 
 MARKDOWN_SUFFIXES = frozenset({".md", ".mdc", ".markdown"})
 # Names that hold credentials wherever they appear. A memory file names what to
@@ -46,9 +50,12 @@ _PROGRAM_SUFFIXES = frozenset(
 _CREDENTIAL_DIRECTORIES = frozenset(
     marker + plural for marker in _CREDENTIAL_MARKERS for plural in ("", "s")
 )
+_RAIL_LINK_CREDENTIAL_STORES = frozenset(
+    {".aws", ".ssh", ".gnupg", ".kube", ".docker", ".azure", ".gcloud", ".vault", "vault"}
+)
 
 
-def credential_shaped(path: str) -> bool:
+def credential_shaped(path: str, *, colang_source: bool = False) -> bool:
     """Whether a file that is not Markdown is named as one that holds credentials, by its
     own name or by a directory on its path, such as ``secrets/token.txt``.
 
@@ -73,7 +80,7 @@ def credential_shaped(path: str) -> bool:
         return True
     if suffix in _CREDENTIAL_SUFFIXES:
         return True
-    if suffix in _PROGRAM_SUFFIXES:
+    if suffix in _PROGRAM_SUFFIXES or (colang_source and suffix == ".co"):
         # `.secrets.py` has stem `.secrets`. Directories already strip a leading dot.
         return PurePosixPath(name).stem.lstrip(".") in _CREDENTIAL_DIRECTORIES
     return any(marker in name for marker in _CREDENTIAL_MARKERS)
@@ -88,8 +95,54 @@ def credential_gap(path: str, target: str | None) -> str | None:
     return link_gap(target)
 
 
-def link_gap(target: str | None) -> str | None:
+def link_gap(target: str | None, *, colang_rail: str | None = None) -> str | None:
     """Why a symlink that leads to ``target`` is not followed, or None."""
-    if target is not None and credential_shaped(target):
+    if target is None:
+        return None
+    if any(
+        part.casefold() in _RAIL_LINK_CREDENTIAL_STORES for part in PurePosixPath(target).parts[:-1]
+    ):
+        return "symlink leads into a credential directory"
+    # A transparent rail link keeps its declared name and program role. A
+    # renamed target can be a credential store presented under a rail alias.
+    same_rail = (
+        colang_rail is not None and PurePosixPath(colang_rail).name == PurePosixPath(target).name
+    )
+    if credential_shaped(target, colang_source=same_rail):
         return f"a symlink leads to {target}, whose name says it holds credentials"
     return None
+
+
+def withheld(
+    files: ConfinedCollection, path: str, excluded: list[str], *, colang_source: bool = False
+) -> bool:
+    """Record credential-name refusals for RAG, guardrail and A2A inputs.
+
+    Known collector files use their own names. The NeMo collector can designate a
+    Colang rail as a program. A same-name link preserves that role for the target.
+    """
+    relative = PurePosixPath(path)
+    reason: str | None
+    if credential_shaped(relative.name, colang_source=colang_source):
+        reason = "its name says it holds credentials"
+    else:
+        linked = files.in_root_target(path)
+        resolved = None if linked is None else linked.as_posix()
+        reason = (
+            None
+            if resolved == relative.as_posix()
+            else link_gap(resolved, colang_rail=path if colang_source else None)
+        )
+    if reason is None:
+        return False
+    message = f"{path}: {reason}; not read or inventoried"
+    if message not in excluded:
+        excluded.append(message)
+    return True
+
+
+def relinked(files: ConfinedCollection, path: str, *, colang_source: bool = False) -> bool:
+    """Whether the read of ``path`` followed a symlink to a file named as holding
+    credentials: one replaced after ``withheld`` checked it."""
+    followed = files.link_target(path)
+    return link_gap(followed, colang_rail=path if colang_source else None) is not None

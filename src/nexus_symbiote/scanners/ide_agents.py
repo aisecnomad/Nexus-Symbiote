@@ -21,6 +21,9 @@ the markers are inventoried by the `prompt` collector.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import fnmatch
 import os
 import re
 from collections.abc import Callable, Iterable
@@ -279,15 +282,61 @@ _COMMAND_RUNNERS = frozenset(
 _VERSIONED_INTERPRETER = re.compile(r"(?:python|pypy|ruby|php|perl|node)[0-9.]*")
 
 
-def _runs_any_command(specifier: str) -> bool:
-    """Whether a wildcard Bash rule names a known command runner or interpreter."""
-    if "*" not in specifier:
+_RULE_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=\S*")
+_WINDOWS_SUFFIX = re.compile(r"\.(?:exe|cmd|bat|com)\Z", re.IGNORECASE)
+
+
+_QUOTED_RULE_PROGRAM = re.compile(r"""(?:"([^"]*)"|'([^']*)')(?=\s|:|\Z)""")
+_EVAL_ARGUMENT = re.compile(r"\s+(?:-c|-e|/c|--?command)(?=\s|:|\Z)", re.IGNORECASE)
+
+
+def _rule_program(specifier: str) -> tuple[str, str]:
+    """Separate the bare program name from its Bash permission rule arguments."""
+    words = specifier.split()
+    index = 0
+    while index < len(words) - 1 and _RULE_ASSIGNMENT.fullmatch(words[index]):
+        index += 1
+    if index >= len(words):
+        return "", ""
+    command = " ".join(words[index:])
+    quoted = _QUOTED_RULE_PROGRAM.match(command)
+    if quoted:
+        path = quoted[1] if quoted[1] is not None else quoted[2]
+        program = re.split(r"[/\\]", path)[-1]
+        return _WINDOWS_SUFFIX.sub("", program), command[quoted.end() :]
+
+    # Preserve the existing recognition of an unquoted Windows path with spaces.
+    end = index + 1
+    while "\\" in words[index] and end < len(words) and "\\" in words[end]:
+        end += 1
+    path = " ".join(words[index:end]).strip("\"'")
+    arguments = " " + " ".join(words[end:]) if words[end:] else ""
+    drive_end = 2 if re.match(r"[A-Za-z]:[\\/]", path) else 0
+    separator = path.find(":", drive_end)
+    if separator >= 0:
+        prefix = re.split(r"[/\\]", path[:separator])[-1]
+        runner = _WINDOWS_SUFFIX.sub("", prefix)
+        scoped = path[separator:] + arguments
+        if _runs_any_command(runner, scoped):
+            return runner, scoped
+    program = re.split(r"[/\\]", path)[-1]
+    name, colon, pattern = program.partition(":")
+    return _WINDOWS_SUFFIX.sub("", name), colon + pattern + arguments
+
+
+def _runs_any_command(program: str, arguments: str, wildcard: bool = False) -> bool:
+    """Whether a wildcard Bash rule names a known command runner or interpreter.
+
+    `wildcard` is set when the `*` is in the program's directory, which the program
+    name no longer holds, as in `Bash(*/bash)`.
+    """
+    if not wildcard and "*" not in program and "*" not in arguments:
         return False
-    words = specifier.split(":", 1)[0].split()
-    if not words:
-        return False
-    program = words[0].rsplit("/", 1)[-1].lower()
-    return program in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(program) is not None
+    name = program.lower()
+    if " " in name and _EVAL_ARGUMENT.match(arguments):
+        # A locally named interpreter such as "my python.exe" with an evaluation switch.
+        name = name.rsplit(" ", 1)[-1]
+    return name in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(name) is not None
 
 
 def _broad_grants(allowed: list[str]) -> list[str]:
@@ -314,9 +363,14 @@ def _broad_grants(allowed: list[str]) -> list[str]:
             continue
         broad = specifier is None or bool(_WILDCARD_SPECIFIER.fullmatch(specifier))
         if key == "bash" and specifier is not None:
-            broad |= _runs_any_command(specifier) or bool(_SUBSHELL_SPECIFIER.fullmatch(specifier))
+            program, arguments = _rule_program(specifier)
+            broad |= _runs_any_command(program, arguments, "*" in specifier) or bool(
+                _SUBSHELL_SPECIFIER.fullmatch(program + arguments)
+            )
         if key == "webfetch" and specifier is not None:
-            broad |= specifier.replace(" ", "") in {"domain:*", "domain:"}
+            # `domain:**` and `domain:*.*` match every host, as `domain:*` does.
+            domain = specifier.replace(" ", "")
+            broad |= domain.startswith("domain:") and not domain[7:].strip("*.")
         if key == "read" and specifier is None:
             # A bare Read grant covers the working directory, as reading does by default.
             continue
@@ -762,6 +816,7 @@ _PHP_CODE_FLAG = re.compile(r"-[A-Za-z]*[eEpr]\Z")
 # Where a flag's name ends when its value is attached: `--eval="$(...)"`, `-c"$(...)"`.
 _FLAG_NAME = re.compile(r"-[^\s|&;<>=\"'$`]*")
 _POWERSHELL = re.compile(r"\b(?:powershell|pwsh)(?:\.exe)?\b", re.IGNORECASE)
+_POWERSHELL_FILE_NAMES = ("pwsh", "pwsh.exe", "powershell", "powershell.exe")
 # PowerShell takes -, en dash, em dash or horizontal bar before a parameter name. A shell
 # removes quotes and escapes before PowerShell reads the argument. The console host reads
 # `-e`, `-ec` and every prefix of `-EncodedCommand` as that parameter
@@ -1118,18 +1173,66 @@ def _name_variants(word: str) -> set[str]:
     return names
 
 
-def _assignment(word: str) -> bool:
-    if not word or word.startswith("-") or "=" not in word:
-        return False
-    name, _, _value = word.partition("=")
-    return bool(name) and all(char.isalnum() or char in "_." for char in name)
+_SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+
+
+# How many words one assignment's substitution is followed across.
+_MAX_ASSIGNMENT_WORDS = 32
+
+
+def _assignment_end(words: list[str], index: int) -> int:
+    """Index after the assignment at `index` and the words its substitutions span.
+
+    The word splitter breaks `X=$(id -u)`, backticks and `${A:-a b}` at their spaces, so
+    the command after them is found only once each `$(`, `${` and backtick is closed. A
+    substitution not closed within the bound ends at its own word, so the next word is
+    still read as the possible command.
+    """
+    closers: list[str] = []
+    quotes: list[str] = []
+    quote = ""
+    for end in range(index, min(len(words), index + _MAX_ASSIGNMENT_WORDS)):
+        word = words[end]
+        position = 0
+        while position < len(word):
+            char = word[position]
+            if quote == "'":
+                if char == "'":
+                    quote = ""
+            elif char == "\\":
+                position += 1
+            elif closers and char == closers[-1] and not quote:
+                closers.pop()
+                quote = quotes.pop()
+            elif word.startswith(("$(", "${"), position):
+                quotes.append(quote)
+                closers.append(")" if word[position + 1] == "(" else "}")
+                quote = ""
+                position += 1
+            elif char == "`":
+                quotes.append(quote)
+                closers.append("`")
+                quote = ""
+            elif quote == '"':
+                if char == '"':
+                    quote = ""
+            elif char in "'\"":
+                quote = char
+            elif closers and closers[-1] == ")" and char == "(":
+                quotes.append(quote)
+                closers.append(")")
+            position += 1
+        if not closers:
+            return end + 1
+    return index + 1
 
 
 def _skip_env(words: list[str], index: int) -> int:
     while index < len(words):
         word = _decode_word(words[index], drop_ifs=True)
         if word == "--":
-            return index + 1
+            index += 1
+            break
         if word in {"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}:
             index += 1
             continue
@@ -1142,14 +1245,17 @@ def _skip_env(words: list[str], index: int) -> int:
         if word in {"--unset", "--chdir", "--split-string"}:
             index += 2
             continue
-        if _assignment(word):
-            index += 1
-            continue
-        return index
+        if word.startswith("-"):
+            return index
+        break
+    # env splits assignments at the first equals sign; they are argv data,
+    # not shell assignments. Option parsing ends at the first operand.
+    while index < len(words) and _decode_word(words[index], drop_ifs=True).find("=") > 0:
+        index += 1
     return index
 
 
-def _skip_sudo(words: list[str], index: int) -> int:
+def _skip_sudo(words: list[str], index: int, *, assignments: bool) -> int:
     arg_options = {
         "-u",
         "-g",
@@ -1188,7 +1294,7 @@ def _skip_sudo(words: list[str], index: int) -> int:
             bundle = re.match(r"-([A-Za-z]*?)([ughpUCDRTrta])", word)
             index += 2 if bundle is not None and bundle.end() == len(word) else 1
             continue
-        if _assignment(word):
+        if assignments and word.find("=") > 0:
             index += 1
             continue
         return index
@@ -1312,9 +1418,28 @@ def _executable_index(words: list[str]) -> int | None:
     index = 0
     while index < len(words):
         raw = _decode_word(words[index], drop_ifs=True).strip()
-        if raw in {"(", "{", ")", "}"}:
+        if raw in {"(", "{", ")", "}"} or words[index] == "!":
             index += 1
             continue
+        if words[index] == "time" and (
+            index + 1 == len(words)
+            or words[index + 1] == "-p"
+            or not words[index + 1].startswith("-")
+        ):
+            index += 1
+            if index < len(words) and words[index] == "-p":
+                index += 1
+            continue
+        # bash reads a word as an assignment only when its name is unquoted and valid;
+        # `1=/bin/sh`, `a.b=/bin/sh` and `"X"=/bin/sh` are commands, run by path.
+        if _SHELL_ASSIGNMENT.match(words[index]):
+            index = _assignment_end(words, index)
+            continue
+        break
+
+    # A wrapper consumes a program from its own argv. Shell assignment syntax
+    # does not apply again after that command word.
+    while index < len(words):
         names = _name_variants(words[index])
         if "env" in names:
             index = _skip_env(words, index + 1)
@@ -1324,7 +1449,7 @@ def _executable_index(words: list[str]) -> int | None:
             index = _skip_wrapper(words, index + 1, wrapper)
             continue
         if names & {"sudo", "doas"}:
-            index = _skip_sudo(words, index + 1)
+            index = _skip_sudo(words, index + 1, assignments="sudo" in names)
             continue
         runner = next(iter(sorted(names & _COMMAND_OPTION_RUNNERS.keys())), None)
         if runner is not None:
@@ -1573,22 +1698,60 @@ def _file_keys(word: str) -> set[str]:
     }
 
 
+# curl's short options that take a value: in a cluster such as `-sLo/tmp/x`, the first
+# of them takes the rest of the cluster, or the next argument.
+_CURL_VALUE_FLAGS = frozenset("AbcCdDeEFHKmoPQrTtuUwxXyYz")
+
+
 def _curl_output(word: str, args: list[str], index: int) -> tuple[str | None, int]:
     if word in {"-o", "--output"} and index + 1 < len(args):
         return _decode_word(args[index + 1], drop_ifs=True), 2
     if word.startswith("--output="):
         return word.split("=", 1)[1], 1
-    if word.startswith("-o") and not word.startswith("--") and len(word) > 2:
-        return word[2:], 1
-    if (
-        word.startswith("-")
-        and not word.startswith("--")
-        and word.endswith("o")
-        and word != "-o"
-        and index + 1 < len(args)
-    ):
-        return _decode_word(args[index + 1], drop_ifs=True), 2
+    if word.startswith("-") and not word.startswith("--"):
+        for position in range(1, len(word)):
+            flag = word[position]
+            if flag == "o":
+                if position + 1 < len(word):
+                    return word[position + 1 :], 1
+                if index + 1 < len(args):
+                    return _decode_word(args[index + 1], drop_ifs=True), 2
+                return None, 1
+            if flag in _CURL_VALUE_FLAGS:
+                break
+        # The released reading is kept: a cluster that ends in `o` names its output in the
+        # next argument. An earlier `o` takes the rest of the cluster, as curl reads it, so
+        # `-sozo` and `-fo/tmp/foo`, which the released reading took as naming the next
+        # argument, are rated by the file curl writes.
+        if word.endswith("o") and index + 1 < len(args):
+            return _decode_word(args[index + 1], drop_ifs=True), 2
     return None, 1
+
+
+def _curl_remote_name(word: str) -> bool:
+    """Whether a curl argument saves under the URL's own file name: `-O`, `-LO`."""
+    if word in {"--remote-name", "--remote-name-all"}:
+        return True
+    if not word.startswith("-") or word.startswith("--"):
+        return False
+    for flag in word[1:]:
+        if flag == "O":
+            return True
+        if flag in _CURL_VALUE_FLAGS:
+            return False
+    return False
+
+
+def _url_file_names(url: str, default: str | None) -> set[str]:
+    """The names curl `-O` or wget without `-O` save a URL's download under.
+
+    The last path segment, with and without its query; wget names an empty one `default`.
+    """
+    rest = url.split("://", 1)[-1]
+    _authority, slash, path = rest.partition("/")
+    with_query = path.split("#", 1)[0].rsplit("/", 1)[-1] if slash else ""
+    names = {name for name in (with_query, with_query.split("?", 1)[0]) if name}
+    return names or ({default} if default else set())
 
 
 def _wget_output(word: str, args: list[str], index: int) -> tuple[str | None, int]:
@@ -1631,47 +1794,64 @@ _OUTPUT_REDIRECTION = re.compile(
 )
 
 
-def _saved_names(segment: str) -> tuple[set[str], set[str]]:
-    """Filenames a downloader's output option, and a redirection, in this segment write.
+def _saved_names(segment: str) -> tuple[set[str], set[str], set[str]]:
+    """Explicit output, URL-derived filenames and redirected output in this segment.
 
     Standard output is excluded. One forward pass: a segment of repeated downloaders must
     not rescan its tail.
     """
     words = _shell_words(segment)
     saved: set[str] = set()
-    tool: str | None = None
+    inferred: set[str] = set()
+    # A later downloader name in the same command, such as `-U curl` or a URL ending in
+    # `/wget`, is an argument: the words after it are read with every named tool's
+    # options, so it cannot switch which tool's output flags are read.
+    tools: set[str] = set()
+    # The URLs, and whether wget names its output and curl saves under the URL's name.
+    urls: list[str] = []
+    named = remote = False
     cursor = 0
-    while cursor < len(words) and len(saved) < 64:
-        names = _name_variants(words[cursor])
-        detected = _downloader_name(names)
+    readers = {"curl": _curl_output, "wget": _wget_output, "iwr": _iwr_output}
+
+    while cursor < len(words):
+        detected = _downloader_name(_name_variants(words[cursor]))
+        if not tools:
+            if detected is not None:
+                tools.add(detected)
+            cursor += 1
+            continue
         if detected is not None:
-            tool = detected
-            cursor += 1
-            continue
-        if tool is None:
-            cursor += 1
-            continue
+            tools.add(detected)
         word = _decode_word(words[cursor], drop_ifs=True)
-        if tool == "curl":
-            found, step = _curl_output(word, words, cursor)
-        elif tool == "wget":
-            found, step = _wget_output(word, words, cursor)
-        else:
-            found, step = _iwr_output(word, words, cursor)
-        if found:
-            saved.update(_file_keys(found))
+        step = len(words)
+        found_any = False
+        for tool in sorted(tools):
+            found, taken = readers[tool](word, words, cursor)
+            step = min(step, taken)
+            if found:
+                found_any = True
+                named = named or tool == "wget"
+                saved.update(_file_keys(found))
+        remote = remote or ("curl" in tools and _curl_remote_name(word))
+        if not found_any and step == 1 and ("://" in word or _HOST_PATH.match(word)):
+            urls.append(word)
         cursor += step
+    if ("wget" in tools and not named) or ("curl" in tools and remote):
+        for url in urls:
+            for name in _url_file_names(url, "index.html" if "wget" in tools else None):
+                inferred.update(_file_keys(name))
     redirected: set[str] = set()
-    if tool is not None or _segment_fetches(segment):
+    if tools or _segment_fetches(segment):
         for redirection in _OUTPUT_REDIRECTION.finditer(segment):
             redirected.update(_file_keys(redirection.group("target")))
-    return saved, redirected
+    return saved, inferred, redirected
 
 
 # Runners the released classifier counted a file a downloader's output option wrote as
 # run wherever it appeared in their arguments. They keep that rule, so no form is rated
-# lower than it was. Shells count any download that way; a decoded file, and for Python
-# and Perl a download saved another way, counts only as the program.
+# lower than it was. Shells count any download that way except one saved under its URL's
+# name, which was not tracked then; that one and a decoded file count only as the
+# script, and for Python and Perl a download saved another way only as the program.
 _ANY_ARGUMENT_RUNNERS = _SHELL_NAMES | _PYTHON_NAMES | _IEX_NAMES | _EVAL_NAMES | {"perl"}
 # How deep a `-c` script, `eval` or `su -c` command line inside another is read.
 _MAX_SCRIPT_DEPTH = 4
@@ -1681,7 +1861,10 @@ class _Saved:
     """Files earlier segments saved, by how, and the unions of them that segments read.
 
     `outputs` holds files a downloader's output option wrote, `downloaded` files a
-    download wrote otherwise, and `decoded` those only `base64 -d` wrote. The unions grow
+    download wrote otherwise, and `decoded` those only `base64 -d` wrote. `programs`
+    adds to `decoded` the files a download saved under its URL's name, which a shell
+    runs only as its script: the name is also what a data file fetched for a script's
+    argument is saved as, as in `wget URL/data.csv && sh load.sh data.csv`. The unions grow
     with them: rebuilding one for each segment cost time in proportion to every file
     saved before it, which made a long chain of saves quadratic.
     """
@@ -1690,6 +1873,7 @@ class _Saved:
         self.outputs: set[str] = set()
         self.downloaded: set[str] = set()
         self.decoded: set[str] = set()
+        self.programs: set[str] = set()
         self.fetched: set[str] = set()
         self.every: set[str] = set()
 
@@ -1705,9 +1889,15 @@ class _Saved:
         self.every |= names
         self.decoded -= names
 
+    def add_named_by_url(self, names: set[str]) -> None:
+        self.programs |= names
+        self.fetched |= names
+        self.every |= names
+
     def add_decoded(self, names: set[str]) -> None:
         names = names - self.downloaded
         self.decoded |= names
+        self.programs |= names
         self.every |= names
 
 
@@ -1764,10 +1954,10 @@ def _executes_saved(segment: str, saved: _Saved, depth: int = 0) -> bool:
     if names & _SHELL_NAMES:
         return _shell_program(
             program,
-            lambda word: bool(_file_keys(word) & saved.decoded),
-            lambda rest: _any_argument(rest, saved.decoded),
+            lambda word: bool(_file_keys(word) & saved.programs),
+            lambda rest: _any_argument(rest, saved.programs),
         )
-    return _any_argument(args, saved.decoded)
+    return _any_argument(args, saved.programs)
 
 
 def _any_argument(args: list[str], saved: set[str]) -> bool:
@@ -2063,8 +2253,9 @@ def _download_then_run(pipelines: list[list[str]]) -> bool:
             source = (
                 "download" if names & saved.fetched else "decode" if copied is not None else None
             )
-            options, written = _saved_names(segment)
+            options, inferred, written = _saved_names(segment)
             saved.add_outputs(options)
+            saved.add_named_by_url(inferred)
             if fetched:
                 written |= _relayed_names(segment)
             written |= copied or set()
@@ -2178,11 +2369,12 @@ def _substitution_at(command: str, index: int, interpreter: str | None = None) -
 
 
 def _substitution_exec(pipelines: list[list[str]]) -> bool:
-    """Whether a shell, `eval`, `source` or a bare substitution runs a download."""
-    for segments in pipelines:
-        if not segments:
-            continue
-        segment = segments[0]
+    """Whether a shell, `eval`, `source` or a bare substitution runs a download.
+
+    Every segment of a pipeline counts: in `true | bash -c "$(curl ...)"` the shell's
+    script is the download whatever is piped to it.
+    """
+    for segment in (segment for segments in pipelines for segment in segments):
         stripped = segment.lstrip(" \t")
         if _opens_substitution(stripped, 0) and _substitution_downloads(stripped, 0):
             return True
@@ -2246,6 +2438,23 @@ def _output_substitution_executes(segment: str) -> bool:
 
 def _encoded_powershell(command: str) -> bool:
     """Whether a segment passes PowerShell an encoded command as its own parameter."""
+    if _encoded_in_segments(command):
+        return True
+    if "\n" not in command or _ENCODED_COMMAND.search(command) is None:
+        return False
+    # Quoted newlines can belong to one base64 argument. Preserve the existing
+    # segment reading and check that additional reading only when it differs.
+    parts: list[str] = []
+    last = 0
+    for start, end in _shell_word_spans(command):
+        word = command[start:end]
+        if "\n" in word:
+            parts.extend((command[last:start], word.replace("\n", " ")))
+            last = end
+    return bool(parts) and _encoded_in_segments("".join((*parts, command[last:])))
+
+
+def _encoded_in_segments(command: str) -> bool:
     start = 0
     for boundary in _SEGMENT_BOUNDARY.finditer(command):
         if _encoded_segment(command[start : boundary.start()]):
@@ -2265,15 +2474,19 @@ def _encoded_segment(segment: str) -> bool:
     are kept. Only a plain argument can end the parameters: after one that the shell may
     rewrite while they are read, every later encoded flag in the segment counts.
     """
-    first = _POWERSHELL.search(segment)
-    if first is None:
+    dynamic = _computed_powershell(segment)
+    if (
+        dynamic is None
+        and _POWERSHELL.search(segment) is None
+        and _POWERSHELL.search(_decode_word(segment, drop_ifs=True)) is None
+    ):
         return False
     # parameter: the next argument is read as a parameter, or else as the script or
     # command. value: the next argument may instead be the previous parameter's value.
     # script: the next argument may be -File's script, and `-` continues the parameters.
     # Nothing before the first PowerShell name can be its parameter.
     parameter = value = script = False
-    for argument in _ARGUMENT.finditer(segment, first.start()):
+    for argument in _ARGUMENT.finditer(segment):
         word = argument.group()
         plain = _PLAIN.fullmatch(word) is not None
         if parameter or value or script:
@@ -2285,7 +2498,7 @@ def _encoded_segment(segment: str) -> bool:
                 return True
             if not plain and (parameter or value or not _script_path(word)):
                 return _ENCODED_COMMAND.search(segment, argument.end()) is not None
-        if _powershell_name(word, plain):
+        if _powershell_name(word, plain) or argument.start() == dynamic:
             parameter, value, script = True, False, False
             continue
         name = _parameter_name(word) if plain else None
@@ -2322,7 +2535,90 @@ def _powershell_name(token: str, plain: bool) -> bool:
     The shell may rewrite any other token, so PowerShell's name anywhere in it counts.
     """
     start = max(token.rfind("/"), token.rfind("\\")) + 1 if plain else 0
-    return _POWERSHELL.search(token, start) is not None
+    if _POWERSHELL.search(token, start) is not None:
+        return True
+    # The shell removes quotes and escapes first, so `p'w'sh` and `p\\wsh` run pwsh.
+    decoded = _decode_word(token, drop_ifs=True)
+    start = decoded.rfind("/") + 1 if plain else 0
+    return decoded != token and _POWERSHELL.search(decoded, start) is not None
+
+
+def _computed_powershell(segment: str) -> int | None:
+    """Offset of the command word when the shell computes a name that may be PowerShell.
+
+    A variable or glob can select PowerShell. `-e`, `-ec`, `-en` and `-E` are shared by
+    other programs (`$SED -En`, `$SHELL -ec`), so require a program-name hint, `-enc` or
+    a longer prefix of `-EncodedCommand`, or an argument encoding UTF-16LE text.
+    """
+    spans = _shell_word_spans(segment)
+    words = [segment[start:end] for start, end in spans]
+    index = _executable_index(words)
+    if index is None:
+        return None
+    word = words[index]
+    pattern = _EXPANSION.sub("*", re.split(r"[/\\]", word)[-1])
+    if not any(char in pattern for char in "*?["):
+        return None
+    pattern = re.sub(r"\*+", "*", _decode_word(pattern, drop_ifs=True).lower())
+    stem = _WINDOWS_SUFFIX.sub("", pattern)
+    # `[^][]` keeps the scan linear on a run of `[`.
+    literal = re.sub(r"\[[^][]*\]", "", stem)
+    if re.search(r"[a-z]{2}", literal) is None and not any(
+        len(flag.group().lstrip("\"'‘’“”\\^`-/–—―")) > 2
+        or (position + 1 < len(words) and _encoded_payload(words[position + 1]))
+        for position in range(index + 1, len(words))
+        if (flag := _ENCODED_COMMAND.match(segment, spans[position][0])) is not None
+    ):
+        return None
+    # A longer pattern is mostly bracket expressions; it is not matched, so as not to
+    # compile hostile globs, and is read as PowerShell.
+    if len(pattern) > 64 or any(
+        fnmatch.fnmatchcase(name, pattern) for name in _POWERSHELL_FILE_NAMES
+    ):
+        return spans[index][0]
+    return None
+
+
+# An -EncodedCommand value: base64 of UTF-16LE text, so a whole number of quads.
+_BASE64_PAYLOAD = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
+
+
+_ASCII_TEXT_RUN = re.compile(r"[\t\r\n -~]{8,}")
+_TEXT_PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,}[ \t\r\n]")
+_BASE64_SPACING = str.maketrans("", "", " \t\r\n")
+
+
+def _encoded_payload(word: str) -> bool:
+    """Whether a computed program's ambiguous short switch has UTF-16LE text evidence."""
+    encoded = _decode_word(word, drop_ifs=True).translate(_BASE64_SPACING)
+    if not _BASE64_PAYLOAD.fullmatch(encoded):
+        return False
+    try:
+        text = base64.b64decode(encoded, validate=True).decode("utf-16-le", errors="replace")
+    except binascii.Error:
+        return False
+    # A UTF-16 byte-order mark or a quoted string can be mostly non-ASCII.
+    # For an unmarked operand, a single printable unit in unrelated binary
+    # data is weak evidence. Count ordinary text and shell whitespace together.
+    if text.startswith("\ufeff"):
+        return len(text) > 1
+    if not text:
+        return False
+    if len(text) == 1:
+        return "!" <= text <= "~"
+    if text[0] in {"'", '"'}:
+        end_quote = text.find(text[0], 1)
+        if end_quote >= 1 and text[1:end_quote].isprintable():
+            return True
+    if _TEXT_PREFIX.match(text.lstrip()):
+        return True
+    # A multilingual comment or string elsewhere in the operand cannot
+    # dilute a whole run of UTF-16 text. Whitespace alone supplies no evidence.
+    if any(run.group().strip() for run in _ASCII_TEXT_RUN.finditer(text)):
+        return True
+    graphic = sum("!" <= char <= "~" for char in text)
+    ordinary = graphic + sum(char in " \t\r\n" for char in text)
+    return graphic > 0 and ordinary >= 2 and ordinary * 2 >= len(text)
 
 
 def _parameter_name(token: str) -> str | None:
@@ -2546,6 +2842,45 @@ def _starting_mode_risk(ide_type: str, mode: str | None) -> RiskAssessment | Non
     return None
 
 
+def _overridden(files: list[str]) -> str:
+    """Attribution for a finding a file declares and a later settings file overrides.
+
+    The committed file's declaration still holds wherever the later file, such as an
+    uncommitted settings.local.json, is absent, so the override never drops the finding.
+    """
+    return (
+        f" Declared in {_series([repr(name) for name in files])}; the effective merged value "
+        "differs because a later settings file overrides it."
+    )
+
+
+def _layered_mode_risk(
+    risk: RiskAssessment | None,
+    documents: dict[str, dict[str, Any]],
+    effective: str | None,
+    base: str,
+) -> RiskAssessment | None:
+    """The worse of the effective starting mode's finding and each settings file's own."""
+    for name in CLAUDE_SETTINGS:
+        relative = f"{base}/{name}" if base else name
+        permissions = documents.get(relative, {}).get("permissions")
+        declared = permissions.get("defaultMode") if isinstance(permissions, dict) else None
+        if not isinstance(declared, str) or declared == effective:
+            continue
+        candidate = _starting_mode_risk("claude-code", declared)
+        current = risk.severity if risk is not None else None
+        if candidate is None or _worse(current, candidate.severity) == current:
+            continue
+        risk = candidate.model_copy(
+            update={
+                "detail": candidate.detail
+                + f" Declared in '{relative}'; the effective merged starting mode is "
+                f"'{effective or 'default'}'."
+            }
+        )
+    return risk
+
+
 class IDEAgentScanner(Scanner):
     name = "ide_agents"
 
@@ -2655,6 +2990,8 @@ class IDEAgentScanner(Scanner):
                 ),
             )
         starting_mode = None if toml_mode else _starting_mode_risk(ide_type, mode)
+        if ide_type == "claude-code":
+            starting_mode = _layered_mode_risk(starting_mode, documents, mode, base)
         if starting_mode is not None:
             risks.insert(0, starting_mode)
         layered = (
@@ -2766,11 +3103,13 @@ class IDEAgentScanner(Scanner):
         permissions across trust, user or managed policy, flags or product versions.
         """
         merged: dict[str, Any] = {}
+        layers: dict[str, dict[str, Any]] = {}
         for relative in (f"{base}/{name}" if base else name for name in CLAUDE_SETTINGS):
             data = self._read_mapping(Path(relative), result)
             if data is None:
                 continue
             documents[relative] = data
+            layers[relative] = data
             hooks = _declared_hooks(data.get("hooks"))
             if hooks:
                 properties.setdefault("declared_hooks", {})[relative] = hooks
@@ -2916,13 +3255,34 @@ class IDEAgentScanner(Scanner):
         )
         if environment_risk is not None:
             risks.append(environment_risk)
-        helpers = [key for key in _CREDENTIAL_HELPER_KEYS if merged.get(key) is not None]
+        # Findings come from each file's own declarations; `declared` is the merged value.
+        helpers = [
+            key
+            for key in _CREDENTIAL_HELPER_KEYS
+            if any(data.get(key) is not None for data in layers.values())
+        ]
         commands = "a command that runs" if len(helpers) == 1 else "commands that run"
+        approving = [
+            relative
+            for relative, data in layers.items()
+            if data.get("enableAllProjectMcpServers") is True
+        ]
+        approval_note = (
+            _overridden(approving)
+            if approving and not declared["enable_all_project_mcp_servers"]
+            else ""
+        )
+        overridden_helpers = [
+            relative
+            for relative, data in layers.items()
+            if any(data.get(key) is not None and merged.get(key) is None for key in helpers)
+        ]
+        helper_note = _overridden(overridden_helpers) if overridden_helpers else ""
         for category, severity, present, detail in (
             (
                 "mcp_auto_approval",
                 RiskSeverity.MEDIUM,
-                declared["enable_all_project_mcp_servers"],
+                bool(approving),
                 "approves every MCP server in the project's .mcp.json without a prompt",
             ),
             (
@@ -2947,11 +3307,12 @@ class IDEAgentScanner(Scanner):
             ),
         ):
             if present:
+                note = {"mcp_auto_approval": approval_note, "credential_helper": helper_note}
                 risks.append(
                     RiskAssessment(
                         severity=severity,
                         category=category,
-                        detail=f"IDE agent 'claude-code' {detail}.",
+                        detail=f"IDE agent 'claude-code' {detail}.{note.get(category, '')}",
                         recommendation="Review this setting and approve its exact value.",
                     )
                 )

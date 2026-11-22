@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import string
@@ -102,3 +103,23 @@ def test_an_npmrc_that_links_to_another_credential_file_is_a_gap(tmp_path: Path)
     )
     assert ".npmrc" not in result.surfaces_scanned
     assert value not in _everything(tmp_path)
+
+
+def test_an_npmrc_linked_from_a_secrets_folder_is_read_as_npmrc_without_its_values(
+    tmp_path: Path,
+) -> None:
+    # The link names an .npmrc, so its registry settings are read as the file's own are;
+    # neither its credential nor a digest of the file is recorded.
+    value = _value()
+    (tmp_path / "secrets").mkdir()
+    npmrc = f"registry=https://npm.example/\n//npm.example/:_authToken={value}\n"
+    (tmp_path / "secrets" / ".npmrc").write_text(npmrc)
+    (tmp_path / ".npmrc").symlink_to("secrets/.npmrc")
+    (tmp_path / "package.json").write_text('{"dependencies":{"openai":"4.52.0"}}')
+    result = RegistryScanner().scan(tmp_path)
+    assert ".npmrc" in result.surfaces_scanned
+    (component,) = result.components
+    assert component.properties["package_sources"] == [".npmrc:registry=https://npm.example"]
+    everything = _everything(tmp_path)
+    assert value not in everything
+    assert hashlib.sha256(npmrc.encode()).hexdigest() not in everything
