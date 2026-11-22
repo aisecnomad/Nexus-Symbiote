@@ -69,17 +69,20 @@ def _as_dict(val: Any) -> dict[str, Any]:
 
 
 BRIDGE_PACKAGES = _words("mcp-remote supergateway mcp-proxy @modelcontextprotocol/server-proxy")
-RUNTIME_LAUNCHERS = _words("node python python3 sh bash zsh deno bun tsx uvx npx")
+_SHELL_RUNNERS = _words("sh bash zsh dash ksh ash")
+NODE_SCRIPT_RUNNERS = _words(
+    "node nodejs tsx ts-node ts-node-esm ts-node-script ts-node-cwd "
+    "esno esmo jiti vite-node babel-node @babel/node"
+)
+RUNTIME_LAUNCHERS = (
+    _words("node python python3 deno bun uvx npx") | _SHELL_RUNNERS | NODE_SCRIPT_RUNNERS
+)
 PACKAGE_RUNNERS = _words("npx uvx")
 RUNNER_VALUE_OPTIONS = _words(
     "-p --package --from --with --with-editable --with-requirements --python"
 )
 SCRIPT_VALUE_OPTIONS = _words(
     "--tsconfig --env-file -X -W --output-dir --config --db-path --credentials --tls-key"
-)
-NODE_SCRIPT_RUNNERS = _words(
-    "node nodejs tsx ts-node ts-node-esm ts-node-script ts-node-cwd "
-    "esno esmo jiti vite-node babel-node @babel/node"
 )
 NODE_SCRIPT_SWITCHES = _words("--inspect --inspect-brk --experimental-strip-types")
 PRELOAD_OPTIONS = _words("-r --require --import --loader --experimental-loader")
@@ -94,17 +97,22 @@ HOOK_CONFIG_FILES = _tup(
     ".claude/settings.json .claude/settings.local.json .cursor/hooks.json .claude/hooks.json"
 )
 MCP_CONFIG_FILES = _tup(
-    ".mcp.json mcp.json .cursor/mcp.json .vscode/mcp.json .claude/settings.json"
+    ".mcp.json mcp.json .cursor/mcp.json .vscode/mcp.json "
+    ".claude/mcp.json .claude/settings.json .claude/settings.local.json"
 )
 JSONC_FILES = _tup(".vscode/mcp.json")
 PERMISSION_CONFIG_FILES = _tup(".claude/settings.json .claude/settings.local.json .cursor/cli.json")
 _SUMMARY_KEYS = _tup(
-    "hook_targets skill_preambles launcher_targets hosted_tools ci_agents framework_agents "
-    "identities steering_surfaces bridged_servers hook_commands reach_alerts gaps"
+    "hook_targets skill_preambles preamble_targets launcher_targets hosted_tools ci_agents "
+    "framework_agents identities steering_surfaces bridged_servers hook_commands reach_alerts gaps"
 )
+_MAX_BRIDGE_DEPTH = 4
+_SPLIT_SEPARATORS = _words("&& || ; | & ( )") | frozenset({"\n"})
+_REDIR_OPERATORS = _words("> >> < << <<< >& <& &> 2>")
 
 _EGRESS_RE = re.compile(
-    r"\b(?:curl|wget|nc|ncat|fetch\s*\(|axios\.|requests\.(?:get|post|put|request)|httpx\.|urllib\.request)\b",
+    r"\b(?:curl|wget|nc|ncat|axios\.|requests\.(?:get|post|put|request)|httpx\.|urllib\.request)\b"
+    r"|\bfetch\s*\(",
     re.IGNORECASE,
 )
 _SETTINGS_TARGET_RE = re.compile(
@@ -121,6 +129,11 @@ _PREAMBLE_RE = re.compile(r"^\s*!(?:`([^`]+)`|\s+(.+))$")
 _HEX_40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _ON_KEY_RE = re.compile(r"(?m)^([ \t]*)on([ \t]*:)")
 _PROJECT_DIR_RE = re.compile(r"^(?:\$\{?CLAUDE_PROJECT_DIR\}?|\$\{workspace(?:Folder|Root)\})/")
+_STEERING_ROOT_VAR_RE = re.compile(
+    r"^(?:\$\{?(?:CLAUDE_PROJECT_DIR|PWD)\}?|\$\{workspace(?:Folder|Root)\})(?:/(.*))?$"
+)
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_VERSIONED_PYTHON_RE = re.compile(r"^python[0-9]+(?:\.[0-9]+)?$")
 # A bare Node import can name a package and subpath. Relative paths, schemes,
 # environment expansions and parent segments cannot be classified this way.
 _NODE_PACKAGE_IMPORT = re.compile(
@@ -181,6 +194,11 @@ def _read_confined_text(files: ConfinedCollection, rel_path: str, gaps: list[str
     return raw.decode("utf-8", errors="replace") if raw is not None else None
 
 
+def _add_gap(gaps: list[str], message: str) -> None:
+    if message not in gaps:
+        gaps.append(message)
+
+
 def _load_json_docs(
     files: ConfinedCollection, all_paths: list[str], candidates: tuple[str, ...], gaps: list[str]
 ) -> list[tuple[str, dict[str, Any]]]:
@@ -195,12 +213,12 @@ def _load_json_docs(
         try:
             parsed = parse_json_strict(strip_jsonc(text) if rel_path in JSONC_FILES else text)
         except (ValueError, RecursionError):
-            gaps.append(f"{rel_path}: invalid JSON")
+            _add_gap(gaps, f"{rel_path}: invalid JSON")
             continue
         if isinstance(parsed, dict):
             docs.append((rel_path, parsed))
         else:
-            gaps.append(f"{rel_path}: configuration must be a JSON object")
+            _add_gap(gaps, f"{rel_path}: configuration must be a JSON object")
     return docs
 
 
@@ -293,6 +311,10 @@ class _RunnerEvidence:
             self.gaps.add("local package entry point is unresolved")
 
 
+def _is_runtime_launcher(base: str) -> bool:
+    return base in RUNTIME_LAUNCHERS or bool(_VERSIONED_PYTHON_RE.match(base))
+
+
 def _package_runner_target(
     runner: str,
     operands: list[str],
@@ -300,11 +322,15 @@ def _package_runner_target(
     files: ConfinedCollection | None,
     evidence: _RunnerEvidence,
 ) -> str | None:
-    """Distinguish a package runner's script from known value-taking options."""
+    """Distinguish a package or runtime launcher's script from value-taking and preload options."""
     package_seen = False
     script_runner = True
-    node_imports = runner == "node"
+    node_imports = runner in NODE_SCRIPT_RUNNERS
+    shell_runner = runner in _SHELL_RUNNERS
+    deno_or_bun = runner in {"deno", "bun"}
     pending_option: str | None = None
+    skip_inline_arg = False
+    inline_code = False
     unknown_option = False
     parse_options = True
     fallback: str | None = None
@@ -314,13 +340,24 @@ def _package_runner_target(
             evidence.option_value(pending_option, arg, node_imports=node_imports)
             pending_option = None
             continue
+        if skip_inline_arg:
+            skip_inline_arg = False
+            continue
         if parse_options and arg == "--":
             parse_options = False
             continue
-        if parse_options and arg in {"-c", "-e", "-m"}:
-            return None
         if parse_options and arg.startswith("-"):
             option, equal, value = arg.partition("=")
+            if option in {"-c", "-m"} or (option == "-e" and not shell_runner):
+                if node_imports and option == "-e":
+                    inline_code = True
+                    skip_inline_arg = not equal
+                    continue
+                return None
+            if node_imports and option in {"--eval", "-p", "--print"}:
+                inline_code = True
+                skip_inline_arg = not equal
+                continue
             if package_seen and not equal and arg.startswith("-r") and len(arg) > 2:
                 evidence.option_value("-r", arg[2:], node_imports=node_imports)
                 continue
@@ -337,12 +374,18 @@ def _package_runner_target(
                 and not equal
                 and option not in SCRIPT_SWITCHES
                 and not (node_imports and option in NODE_SCRIPT_SWITCHES)
+                and not (shell_runner and re.fullmatch(r"-[efuvx]+", option))
+                and not (deno_or_bun and option.startswith(("--allow-", "--no-", "--unstable")))
             ):
                 unknown_option = True
+            continue
+        if inline_code:
             continue
         local = _normalize_rel_candidate(arg, allow_any_file=True)
         path = posixpath.normpath(local) if local is not None else None
         if path is not None and (path.startswith("~") or "$" in path):
+            if runner not in PACKAGE_RUNNERS and "$" in path and not path.startswith("~"):
+                return path
             evidence.gaps.add("script target is unresolved")
             continue
         explicit = arg.startswith("./") or bool(_PROJECT_DIR_RE.match(arg))
@@ -363,11 +406,13 @@ def _package_runner_target(
                 continue
             reference = python_spec(arg, shorthand=True) if runner == "uvx" else npm_spec(arg)
             name = reference.name
-            node_imports = runner in {"npx", "node"} and name in NODE_SCRIPT_RUNNERS
+            node_imports = runner != "uvx" and name in NODE_SCRIPT_RUNNERS
+            shell_runner = shell_runner or name in _SHELL_RUNNERS
+            deno_or_bun = deno_or_bun or name in {"deno", "bun"}
             script_runner = (
                 reference.ecosystem not in {"npm", "pypi"}
                 or node_imports
-                or name in RUNTIME_LAUNCHERS
+                or (name is not None and _is_runtime_launcher(name))
                 or name in {"ipython", "pypy", "pypy3"}
             )
             if (
@@ -415,7 +460,142 @@ def _package_runner_target(
             fallback = path
     if pending_option in PRELOAD_OPTIONS:
         evidence.gaps.add("preload target is unresolved")
-    return fallback
+    return None if inline_code else fallback
+
+
+def _split_token_segments(tokens: list[str]) -> list[list[str]]:
+    segments: list[list[str]] = []
+    current: list[str] = []
+    skip_redir_target = False
+    for tok in tokens:
+        if tok in _SPLIT_SEPARATORS:
+            if current:
+                segments.append(current)
+                current = []
+            skip_redir_target = False
+            continue
+        if skip_redir_target:
+            skip_redir_target = False
+            continue
+        if tok in _REDIR_OPERATORS:
+            skip_redir_target = True
+            continue
+        current.append(tok)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _split_shell_commands(command: str) -> list[list[str]]:
+    """Split a shell command string into individual command token segments."""
+    text = command.strip()
+    if not text:
+        return []
+    try:
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=";|&()\n><")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        raw_tokens = list(lexer)
+    except ValueError:
+        raw_tokens = text.split()
+    return _split_token_segments(raw_tokens)
+
+
+_SIMPLE_WRAPPERS: dict[str, tuple[frozenset[str], int]] = {
+    "exec": (_words("-a"), 0),
+    "command": (frozenset(), 0),
+    "nohup": (frozenset(), 0),
+    "time": (frozenset(), 0),
+    "nice": (_words("-n --adjustment"), 0),
+    "timeout": (_words("-k -s --kill-after --signal"), 1),
+    "stdbuf": (_words("-i -o -e"), 0),
+}
+
+
+def _split_shlex_safe(text: str) -> list[str]:
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
+
+
+def _unwrap_command_tokens(tokens: list[str]) -> list[str]:
+    """Strip leading shell assignments and standard OS command wrappers (never local paths)."""
+    cur = list(tokens)
+    for _ in range(8):
+        while cur and _ENV_ASSIGN_RE.match(cur[0]):
+            cur.pop(0)
+        if not cur:
+            return []
+        first = cur[0].strip()
+        if "/" in first and not first.startswith("/"):
+            return cur
+        base = first.rsplit("/", 1)[-1]
+        if base == "env":
+            idx = 1
+            split_extra: list[str] = []
+            while idx < len(cur):
+                arg = cur[idx]
+                if arg == "--":
+                    idx += 1
+                    break
+                if arg in {"-S", "--split-string"} and idx + 1 < len(cur):
+                    split_extra = _split_shlex_safe(cur[idx + 1])
+                    idx += 2
+                    break
+                if arg.startswith("--split-string="):
+                    split_extra = _split_shlex_safe(arg.split("=", 1)[1])
+                    idx += 1
+                    break
+                if arg in {"-u", "--unset", "-C", "--chdir"} and idx + 1 < len(cur):
+                    idx += 2
+                    continue
+                if arg.startswith("-") or _ENV_ASSIGN_RE.match(arg):
+                    idx += 1
+                    continue
+                break
+            cur = split_extra + cur[idx:]
+            continue
+        spec = _SIMPLE_WRAPPERS.get(base)
+        if spec is None:
+            break
+        value_opts, skip_pos = spec
+        idx = 1
+        while idx < len(cur) and cur[idx].startswith("-"):
+            arg = cur[idx]
+            if base == "command" and arg in {"-v", "-V"}:
+                return []
+            if arg == "--":
+                idx += 1
+                break
+            if arg in value_opts or (base == "exec" and arg.endswith("a") and len(arg) > 1):
+                idx += 2
+            else:
+                idx += 1
+        cur = cur[idx + skip_pos :]
+    return cur
+
+
+def _extract_single_target(
+    tokens: list[str],
+    project_paths: frozenset[str],
+    files: ConfinedCollection | None,
+    evidence: _RunnerEvidence,
+) -> str | None:
+    unwrapped = _unwrap_command_tokens(tokens)
+    if not unwrapped:
+        return None
+    first = unwrapped[0].strip()
+    base = first.split("/")[-1]
+    direct = _normalize_rel_candidate(first)
+    if direct is not None and not _is_runtime_launcher(base):
+        return direct
+    if base in PACKAGE_RUNNERS:
+        return _package_runner_target(base, unwrapped[1:], project_paths, files, evidence)
+    if _is_runtime_launcher(base):
+        return _package_runner_target(base, [base, *unwrapped[1:]], project_paths, files, evidence)
+    return None
 
 
 def _extract_local_script_target(
@@ -427,28 +607,18 @@ def _extract_local_script_target(
 ) -> str | None:
     if not tokens:
         return None
-    first = tokens[0].strip()
-    base = first.split("/")[-1]
-    direct = _normalize_rel_candidate(first)
-    if direct is not None and base not in RUNTIME_LAUNCHERS:
-        return direct
-    node_preloads = base == "node" and any(
-        arg.partition("=")[0] in PRELOAD_OPTIONS or arg.startswith("-r") for arg in tokens[1:]
+    runner_evidence = evidence or _RunnerEvidence()
+    segments = (
+        _split_token_segments(tokens)
+        if any(tok in _SPLIT_SEPARATORS for tok in tokens)
+        else [tokens]
     )
-    if base in PACKAGE_RUNNERS or node_preloads:
-        operands = [base, *tokens[1:]] if node_preloads else tokens[1:]
-        return _package_runner_target(
-            base, operands, project_paths, files, evidence or _RunnerEvidence()
-        )
-    if base in RUNTIME_LAUNCHERS:
-        for arg in tokens[1:]:
-            if arg in {"-c", "-e", "-m"}:
-                return None
-            if not arg.startswith("-"):
-                cand = _normalize_rel_candidate(arg)
-                if cand is not None:
-                    return cand
-    return None
+    primary: str | None = None
+    for segment in segments:
+        found = _extract_single_target(segment, project_paths, files, runner_evidence)
+        if primary is None and found is not None:
+            primary = found
+    return primary
 
 
 def _audit_script_targets(
@@ -459,12 +629,32 @@ def _audit_script_targets(
     role: str,
 ) -> tuple[str | None, list[str]]:
     evidence = _RunnerEvidence(checkout=checkout)
-    primary = _extract_local_script_target(
-        tokens, checkout.paths, files=checkout.files, evidence=evidence
+    segments = (
+        _split_token_segments(tokens)
+        if any(tok in _SPLIT_SEPARATORS for tok in tokens)
+        else [tokens]
     )
-    gaps.extend(f"{source_file}: {role} {reason}" for reason in sorted(evidence.gaps))
-    targets = ([] if primary is None else [primary]) + evidence.preloads
-    return primary, list(dict.fromkeys(targets))
+    return _audit_command_segments(segments, checkout, gaps, source_file, role, evidence=evidence)
+
+
+def _audit_command_segments(
+    segments: list[list[str]],
+    checkout: _CheckoutScripts,
+    gaps: list[str],
+    source_file: str,
+    role: str,
+    *,
+    evidence: _RunnerEvidence | None = None,
+) -> tuple[str | None, list[str]]:
+    runner_evidence = evidence or _RunnerEvidence(checkout=checkout)
+    primaries: list[str] = []
+    for segment in segments:
+        found = _extract_single_target(segment, checkout.paths, checkout.files, runner_evidence)
+        if found is not None:
+            primaries.append(found)
+    gaps.extend(f"{source_file}: {role} {reason}" for reason in sorted(runner_evidence.gaps))
+    targets = primaries + runner_evidence.preloads
+    return (primaries[0] if primaries else None), list(dict.fromkeys(targets))
 
 
 def _tokenize_command(command: Any, args: Any = None) -> list[str]:
@@ -488,6 +678,7 @@ class ControlPlaneAuditSummary:
     findings: list[dict[str, Any]] = field(default_factory=list)
     hook_targets: list[dict[str, Any]] = field(default_factory=list)
     skill_preambles: list[dict[str, Any]] = field(default_factory=list)
+    preamble_targets: list[dict[str, Any]] = field(default_factory=list)
     launcher_targets: list[dict[str, Any]] = field(default_factory=list)
     hosted_tools: list[dict[str, Any]] = field(default_factory=list)
     ci_agents: list[dict[str, Any]] = field(default_factory=list)
@@ -725,8 +916,8 @@ def _inspect_hooks_and_preambles(
                     command_digest=_sha256_hex(cmd_str.encode()),
                 )
             )
-            _, targets = _audit_script_targets(
-                _tokenize_command(cmd_str), checkout, summary.gaps, cfg_path, "hook"
+            _, targets = _audit_command_segments(
+                _split_shell_commands(cmd_str), checkout, summary.gaps, cfg_path, "hook"
             )
             for target in targets:
                 rec = _bind_script_target(
@@ -770,15 +961,15 @@ def _inspect_hooks_and_preambles(
                 skill_path,
                 skill_ref,
             )
-            _, targets = _audit_script_targets(
-                _tokenize_command(cmd_body),
+            _, targets = _audit_command_segments(
+                _split_shell_commands(cmd_body),
                 checkout,
                 summary.gaps,
                 skill_path,
                 "preamble",
             )
             for target in targets:
-                _bind_script_target(
+                rec = _bind_script_target(
                     files,
                     summary,
                     owner_ref=skill_ref,
@@ -787,6 +978,8 @@ def _inspect_hooks_and_preambles(
                     role="preamble-target",
                     event_or_server=f"line:{line_no}",
                 )
+                if rec is not None:
+                    summary.preamble_targets.append(rec)
 
 
 def _extract_mcp_servers(doc: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -812,183 +1005,305 @@ def _find_bridge_package(tokens: list[str]) -> tuple[str, int] | None:
     return None
 
 
+def _audit_mcp_server(
+    files: ConfinedCollection,
+    checkout: _CheckoutScripts,
+    summary: ControlPlaneAuditSummary,
+    live_versions: dict[str, str],
+    cfg_path: str,
+    srv_name: str,
+    srv_cfg: dict[str, Any],
+    bridged_steering: list[tuple[str, str, dict[str, Any], str]],
+    *,
+    host: str,
+    visited_configs: frozenset[str],
+    depth: int = 0,
+) -> None:
+    cmd = srv_cfg.get("command")
+    args = _as_list(srv_cfg.get("args"))
+    env_map = _as_dict(srv_cfg.get("env"))
+    tokens = _tokenize_command(cmd, args)
+    str_args = [str(a) for a in args if isinstance(a, (str, int, float))]
+    srv_ref = f"mcp-server:{neutralize(srv_name)}"
+
+    reg_origin = ""
+    for idx, tok in enumerate(tokens):
+        if tok == "--registry" and idx + 1 < len(tokens):
+            reg_origin = _origin_only(tokens[idx + 1])
+        elif tok.startswith("--registry="):
+            reg_origin = _origin_only(tok.split("=", 1)[1])
+    if not reg_origin and isinstance(env_map.get("npm_config_registry"), str):
+        reg_origin = _origin_only(env_map["npm_config_registry"])
+
+    bridge_hit = _find_bridge_package(tokens)
+    if bridge_hit is not None:
+        bridge_pkg, b_idx = bridge_hit
+        endpoint_url: str | None = None
+        config_arg: str | None = None
+        for j in range(b_idx + 1, len(tokens)):
+            tok = tokens[j]
+            if tok.startswith(("http://", "https://")) and endpoint_url is None:
+                endpoint_url = tok
+            elif tok == "--config" and j + 1 < len(tokens):
+                config_arg = tokens[j + 1]
+            elif tok.startswith("--config="):
+                config_arg = tok.split("=", 1)[1]
+
+        proxied: list[str] = []
+        if config_arg is not None:
+            norm_cfg = _normalize_rel_candidate(config_arg, allow_any_file=True)
+            if norm_cfg is not None and (norm_cfg in visited_configs or depth >= _MAX_BRIDGE_DEPTH):
+                _add_gap(summary.gaps, f"{norm_cfg}: cyclic or deeply nested bridge config")
+                cfg_body = None
+            else:
+                cfg_body = (
+                    _read_confined_text(files, norm_cfg, summary.gaps)
+                    if norm_cfg is not None
+                    else None
+                )
+            if cfg_body is not None and norm_cfg is not None:
+                try:
+                    sub_doc = parse_json_strict(cfg_body)
+                except (ValueError, RecursionError):
+                    _add_gap(summary.gaps, f"{norm_cfg}: invalid JSON")
+                    sub_doc = None
+                if sub_doc is not None and not isinstance(sub_doc, dict):
+                    _add_gap(summary.gaps, f"{norm_cfg}: configuration must be a JSON object")
+                elif isinstance(sub_doc, dict):
+                    next_visited = visited_configs | {norm_cfg}
+                    for sub_name, sub_cfg in _extract_mcp_servers(sub_doc):
+                        proxied.append(sub_name)
+                        summary.edge(
+                            srv_ref, f"mcp-server:{neutralize(sub_name)}", "delegates-to", norm_cfg
+                        )
+                        bridged_steering.append((norm_cfg, sub_name, sub_cfg, host))
+                        _audit_mcp_server(
+                            files,
+                            checkout,
+                            summary,
+                            live_versions,
+                            norm_cfg,
+                            sub_name,
+                            sub_cfg,
+                            bridged_steering,
+                            host=host,
+                            visited_configs=next_visited,
+                            depth=depth + 1,
+                        )
+            if not proxied:
+                summary.flag(
+                    "proxied_servers_unresolved",
+                    RiskSeverity.MEDIUM,
+                    f"MCP bridge '{srv_name}' config '{config_arg}' could not be resolved inside project.",
+                    cfg_path,
+                    srv_name,
+                )
+        elif endpoint_url is None:
+            summary.flag(
+                "proxied_servers_unresolved",
+                RiskSeverity.MEDIUM,
+                f"MCP bridge '{srv_name}' declares neither an endpoint URL nor a readable in-root config.",
+                cfg_path,
+                srv_name,
+            )
+
+        if endpoint_url is not None:
+            summary.flag(
+                "endpoint_identity",
+                RiskSeverity.MEDIUM,
+                f"MCP bridge '{srv_name}' connects to remote endpoint via {bridge_pkg}.",
+                cfg_path,
+                srv_name,
+            )
+            if endpoint_url.startswith("http://") or "@" in endpoint_url.split("//", 1)[-1]:
+                summary.flag(
+                    "transport_security",
+                    RiskSeverity.HIGH,
+                    f"MCP bridge '{srv_name}' uses insecure HTTP or embedded credentials in URL (F21).",
+                    cfg_path,
+                    srv_name,
+                )
+
+        resolved_ver = live_versions.get(bridge_pkg) or live_versions.get(srv_name)
+        props: dict[str, Any] = _rec(
+            bridge_package=bridge_pkg,
+            proxied_servers=proxied,
+            registry_origin=reg_origin or None,
+            resolved_version=resolved_ver,
+        )
+        if resolved_ver:
+            props["version_assurance"] = "reported"
+        clean_ep = endpoint_url and (_origin_only(endpoint_url) or _clean(endpoint_url))
+        summary.add_mcp(
+            srv_name,
+            cfg_path,
+            str(cmd) if cmd else None,
+            str_args,
+            transport="stdio-bridged",
+            endpoint_url=clean_ep,
+            registry_source=reg_origin or None,
+            props=props,
+        )
+        summary.bridged_servers.append(
+            _rec(
+                server_name=srv_name,
+                endpoint_url=clean_ep,
+                transport="stdio-bridged",
+                config_path=config_arg and _clean(config_arg),
+                source_file=cfg_path,
+                **props,
+            )
+        )
+        return
+
+    direct_url = next(
+        (
+            str(srv_cfg[k]).strip()
+            for k in ("url", "serverUrl", "httpUrl")
+            if isinstance(srv_cfg.get(k), str)
+            and str(srv_cfg[k]).strip().startswith(("http://", "https://"))
+        ),
+        None,
+    )
+    if not cmd and direct_url is not None:
+        if direct_url.startswith("http://") or "@" in direct_url.split("//", 1)[-1]:
+            summary.flag(
+                "transport_security",
+                RiskSeverity.HIGH,
+                f"MCP server '{srv_name}' uses insecure HTTP or embedded credentials in URL (F21).",
+                cfg_path,
+                srv_name,
+            )
+        summary.add_mcp(
+            srv_name,
+            cfg_path,
+            None,
+            str_args,
+            transport="http",
+            endpoint_url=_origin_only(direct_url) or _clean(direct_url),
+            registry_source=reg_origin or None,
+            props={"registry_origin": reg_origin} if reg_origin else {},
+        )
+        return
+
+    primary, targets = _audit_script_targets(tokens, checkout, summary.gaps, cfg_path, "launcher")
+    props = {"registry_origin": reg_origin} if reg_origin else {}
+    for target in targets:
+        rec = _bind_script_target(
+            files,
+            summary,
+            owner_ref=srv_ref,
+            target_path=target,
+            source_file=cfg_path,
+            role="launcher-target",
+            event_or_server=srv_name,
+        )
+        if rec is not None:
+            if target == primary:
+                props["launch_target"] = rec["launch_target_sha256"]
+            summary.launcher_targets.append(
+                _rec(
+                    server_name=srv_name,
+                    target_path=target,
+                    launch_target_sha256=rec["launch_target_sha256"],
+                    classifications=rec["classifications"],
+                    source_file=cfg_path,
+                )
+            )
+    summary.add_mcp(
+        srv_name,
+        cfg_path,
+        str(cmd) if cmd else None,
+        str_args,
+        registry_source=reg_origin or None,
+        props=props,
+    )
+
+
 def _inspect_mcp_launchers_and_bridges(
     files: ConfinedCollection,
     all_paths: list[str],
     checkout: _CheckoutScripts,
     summary: ControlPlaneAuditSummary,
     live_versions: dict[str, str],
-) -> None:
+) -> list[tuple[str, str, dict[str, Any], str]]:
+    bridged_steering: list[tuple[str, str, dict[str, Any], str]] = []
     for cfg_path, doc in _load_json_docs(files, all_paths, MCP_CONFIG_FILES, summary.gaps):
+        host = _steering_host(cfg_path)
         for srv_name, srv_cfg in _extract_mcp_servers(doc):
-            cmd = srv_cfg.get("command")
-            args = _as_list(srv_cfg.get("args"))
-            env_map = _as_dict(srv_cfg.get("env"))
-            tokens = _tokenize_command(cmd, args)
-            str_args = [str(a) for a in args if isinstance(a, (str, int, float))]
-            srv_ref = f"mcp-server:{srv_name}"
-
-            reg_origin = ""
-            for idx, tok in enumerate(tokens):
-                if tok == "--registry" and idx + 1 < len(tokens):
-                    reg_origin = _origin_only(tokens[idx + 1])
-                elif tok.startswith("--registry="):
-                    reg_origin = _origin_only(tok.split("=", 1)[1])
-            if not reg_origin and isinstance(env_map.get("npm_config_registry"), str):
-                reg_origin = _origin_only(env_map["npm_config_registry"])
-
-            bridge_hit = _find_bridge_package(tokens)
-            if bridge_hit is not None:
-                bridge_pkg, b_idx = bridge_hit
-                endpoint_url: str | None = None
-                config_arg: str | None = None
-                for j in range(b_idx + 1, len(tokens)):
-                    tok = tokens[j]
-                    if tok.startswith(("http://", "https://")) and endpoint_url is None:
-                        endpoint_url = tok
-                    elif tok == "--config" and j + 1 < len(tokens):
-                        config_arg = tokens[j + 1]
-                    elif tok.startswith("--config="):
-                        config_arg = tok.split("=", 1)[1]
-
-                proxied: list[str] = []
-                if config_arg is not None:
-                    norm_cfg = _normalize_rel_candidate(config_arg, allow_any_file=True)
-                    cfg_body = (
-                        _read_confined_text(files, norm_cfg, summary.gaps)
-                        if norm_cfg is not None
-                        else None
-                    )
-                    if cfg_body is not None and norm_cfg is not None:
-                        try:
-                            sub_doc = parse_json_strict(cfg_body)
-                        except (ValueError, RecursionError):
-                            summary.gaps.append(f"{norm_cfg}: invalid JSON")
-                            sub_doc = None
-                        if isinstance(sub_doc, dict):
-                            for sub_name, _sub_cfg in _extract_mcp_servers(sub_doc):
-                                proxied.append(sub_name)
-                                summary.edge(
-                                    srv_ref, f"mcp-server:{sub_name}", "delegates-to", norm_cfg
-                                )
-                    if not proxied:
-                        summary.flag(
-                            "proxied_servers_unresolved",
-                            RiskSeverity.MEDIUM,
-                            f"MCP bridge '{srv_name}' config '{config_arg}' could not be resolved inside project.",
-                            cfg_path,
-                            srv_name,
-                        )
-                elif endpoint_url is None:
-                    summary.flag(
-                        "proxied_servers_unresolved",
-                        RiskSeverity.MEDIUM,
-                        f"MCP bridge '{srv_name}' declares neither an endpoint URL nor a readable in-root config.",
-                        cfg_path,
-                        srv_name,
-                    )
-
-                if endpoint_url is not None:
-                    summary.flag(
-                        "endpoint_identity",
-                        RiskSeverity.MEDIUM,
-                        f"MCP bridge '{srv_name}' connects to remote endpoint via {bridge_pkg}.",
-                        cfg_path,
-                        srv_name,
-                    )
-                    if endpoint_url.startswith("http://") or "@" in endpoint_url.split("//", 1)[-1]:
-                        summary.flag(
-                            "transport_security",
-                            RiskSeverity.HIGH,
-                            f"MCP bridge '{srv_name}' uses insecure HTTP or embedded credentials in URL (F21).",
-                            cfg_path,
-                            srv_name,
-                        )
-
-                resolved_ver = live_versions.get(bridge_pkg) or live_versions.get(srv_name)
-                props: dict[str, Any] = _rec(
-                    bridge_package=bridge_pkg,
-                    proxied_servers=proxied,
-                    registry_origin=reg_origin or None,
-                    resolved_version=resolved_ver,
-                )
-                if resolved_ver:
-                    props["version_assurance"] = "reported"
-                clean_ep = endpoint_url and (_origin_only(endpoint_url) or _clean(endpoint_url))
-                summary.add_mcp(
-                    srv_name,
-                    cfg_path,
-                    str(cmd) if cmd else None,
-                    str_args,
-                    transport="stdio-bridged",
-                    endpoint_url=clean_ep,
-                    registry_source=reg_origin or None,
-                    props=props,
-                )
-                summary.bridged_servers.append(
-                    _rec(
-                        server_name=srv_name,
-                        endpoint_url=clean_ep,
-                        transport="stdio-bridged",
-                        config_path=config_arg and _clean(config_arg),
-                        source_file=cfg_path,
-                        **props,
-                    )
-                )
-                continue
-
-            primary, targets = _audit_script_targets(
-                tokens, checkout, summary.gaps, cfg_path, "launcher"
-            )
-            props = {"registry_origin": reg_origin} if reg_origin else {}
-            for target in targets:
-                rec = _bind_script_target(
-                    files,
-                    summary,
-                    owner_ref=srv_ref,
-                    target_path=target,
-                    source_file=cfg_path,
-                    role="launcher-target",
-                    event_or_server=srv_name,
-                )
-                if rec is not None:
-                    if target == primary:
-                        props["launch_target"] = rec["launch_target_sha256"]
-                    summary.launcher_targets.append(
-                        _rec(
-                            server_name=srv_name,
-                            target_path=target,
-                            launch_target_sha256=rec["launch_target_sha256"],
-                            classifications=rec["classifications"],
-                            source_file=cfg_path,
-                        )
-                    )
-            summary.add_mcp(
-                srv_name,
+            _audit_mcp_server(
+                files,
+                checkout,
+                summary,
+                live_versions,
                 cfg_path,
-                str(cmd) if cmd else None,
-                str_args,
-                registry_source=reg_origin or None,
-                props=props,
+                srv_name,
+                srv_cfg,
+                bridged_steering,
+                host=host,
+                visited_configs=frozenset({cfg_path}),
             )
+    return bridged_steering
 
 
-def _covers_steering_path(root_arg: str, project_roots: tuple[str, ...]) -> bool:
+def _is_steering_rel(rel: str) -> bool:
+    return any(
+        rel == pref or rel.startswith(pref + "/") or pref.startswith(rel + "/")
+        for pref in STEERING_PREFIXES
+    )
+
+
+def _covers_steering_path(
+    root_arg: str,
+    project_roots: tuple[str, ...],
+    *,
+    files: ConfinedCollection | None = None,
+) -> bool:
     cleaned = root_arg.strip().strip("'\"")
     if not cleaned:
         return True
+    var_match = _STEERING_ROOT_VAR_RE.match(cleaned)
+    if var_match is not None:
+        cleaned = var_match.group(1) or "."
     # Absolute and parent-relative roots are placed against the audited project root.
+    rel_candidates: list[str] = []
     for project in project_roots:
         joined = posixpath.normpath(posixpath.join(project, cleaned))
         if joined == project or project.startswith(joined.rstrip("/") + "/"):
             return True
         if joined.startswith(project.rstrip("/") + "/"):
             rel = joined[len(project.rstrip("/")) + 1 :]
-            if any(
-                rel == pref or rel.startswith(pref + "/") or pref.startswith(rel + "/")
-                for pref in STEERING_PREFIXES
-            ):
+            if _is_steering_rel(rel):
                 return True
+            rel_candidates.append(rel)
+    if files is not None:
+        for rel in dict.fromkeys(rel_candidates):
+            if files.excluded(rel):
+                continue
+            file_target = files.in_root_target(rel)
+            if file_target is not None:
+                if _is_steering_rel(file_target.as_posix()):
+                    return True
+                continue
+            if files.is_directory(rel):
+                dir_target = files.link_target(rel)
+                if dir_target is not None and (dir_target == "." or _is_steering_rel(dir_target)):
+                    return True
+                continue
+            parts = rel.split("/")
+            for end in range(1, len(parts) + 1):
+                prefix = "/".join(parts[:end])
+                if files.excluded(prefix):
+                    continue
+                if files.is_directory(prefix):
+                    dir_target = files.link_target(prefix)
+                    if dir_target is not None:
+                        resolved = posixpath.normpath(posixpath.join(dir_target, *parts[end:]))
+                        if resolved == "." or _is_steering_rel(resolved):
+                            return True
+                    continue
+                if files.path_identity(prefix) is not None and files.in_root_target(prefix) is None:
+                    return True
     return False
 
 
@@ -1082,7 +1397,9 @@ class _ClaudeServerDenies:
     def covers(self, server: str) -> bool:
         address = server + "__"
         parsed_server = address[5:].partition("__")[0]
-        if server in self.rules or (parsed_server and "mcp__" + parsed_server in self.rules):
+        if (len(server) > 5 and server in self.rules) or (
+            parsed_server and "mcp__" + parsed_server in self.rules
+        ):
             return True
         index = bisect_right(self.prefixes, address) - 1
         if index >= 0 and address.startswith(self.prefixes[index]):
@@ -1101,7 +1418,10 @@ class _ClaudeServerDenies:
 
 
 def _inspect_steering_surfaces(
-    files: ConfinedCollection, all_paths: list[str], summary: ControlPlaneAuditSummary
+    files: ConfinedCollection,
+    all_paths: list[str],
+    summary: ControlPlaneAuditSummary,
+    bridged_steering: list[tuple[str, str, dict[str, Any], str]] | None = None,
 ) -> None:
     modes: dict[str, list[str]] = {}
     claude_allows: dict[str, list[str]] = {}
@@ -1149,80 +1469,82 @@ def _inspect_steering_surfaces(
     project_roots = (files.root.as_posix(), files.root.resolve().as_posix())
     server_denies = _ClaudeServerDenies(claude_denies)
 
-    for cfg_path, doc in _load_json_docs(files, all_paths, MCP_CONFIG_FILES, summary.gaps):
-        for srv_name, srv_cfg in _extract_mcp_servers(doc):
-            cmd = str(srv_cfg.get("command") or "")
-            args = [
-                str(a) for a in _as_list(srv_cfg.get("args")) if isinstance(a, (str, int, float))
-            ]
-            joined = " ".join([cmd, *args]).lower()
-            if "filesystem" not in srv_name.lower() and "server-filesystem" not in joined:
-                continue
-            host = _steering_host(cfg_path)
-            prefix = _claude_mcp_prefix(srv_name)
-            # A future or custom server can publish additional write tools. Only the
-            # owning client's deny of the whole server covers this open-ended surface.
-            deny_covered = host == "claude" and server_denies.covers(prefix)
-            srv_auto = (
-                bool(srv_cfg.get("autoApprove")) or len(_as_list(srv_cfg.get("alwaysAllow"))) > 0
+    entries: list[tuple[str, str, dict[str, Any], str]] = [
+        (cfg_path, srv_name, srv_cfg, _steering_host(cfg_path))
+        for cfg_path, doc in _load_json_docs(files, all_paths, MCP_CONFIG_FILES, summary.gaps)
+        for srv_name, srv_cfg in _extract_mcp_servers(doc)
+    ]
+    if bridged_steering:
+        entries.extend(bridged_steering)
+
+    for cfg_path, srv_name, srv_cfg, host in entries:
+        cmd = str(srv_cfg.get("command") or "")
+        args = [str(a) for a in _as_list(srv_cfg.get("args")) if isinstance(a, (str, int, float))]
+        joined = " ".join([cmd, *args]).lower()
+        if "filesystem" not in srv_name.lower() and "server-filesystem" not in joined:
+            continue
+        prefix = _claude_mcp_prefix(srv_name)
+        # A future or custom server can publish additional write tools. Only the
+        # owning client's deny of the whole server covers this open-ended surface.
+        deny_covered = host == "claude" and server_denies.covers(prefix)
+        srv_auto = bool(srv_cfg.get("autoApprove")) or len(_as_list(srv_cfg.get("alwaysAllow"))) > 0
+        eff_modes = list(modes.get(host, ()))
+        if host == "claude":
+            eff_modes.extend(
+                f"{source}:mcp-allowance"
+                for source, rules in claude_allows.items()
+                if _allows_mcp_server(rules, prefix)
             )
-            eff_modes = list(modes.get(host, ()))
-            if host == "claude":
-                eff_modes.extend(
-                    f"{source}:mcp-allowance"
-                    for source, rules in claude_allows.items()
-                    if _allows_mcp_server(rules, prefix)
+        if srv_auto:
+            eff_modes.append(f"{cfg_path}:{srv_name}:alwaysAllow")
+        writable = bool(eff_modes) and not deny_covered
+        approval_status = "preapproved" if writable else "unverified"
+        if deny_covered:
+            approval_status = "denied"
+        elif not writable and host == "claude" and claude_prompting:
+            approval_status = "prompting"
+        roots = [
+            a
+            for a in args
+            if not a.startswith("-")
+            and "server-filesystem" not in a
+            and a not in {"-y", "npx", "uvx"}
+        ] or ["."]
+        for raw_root in roots:
+            # MCP stdio has no standard readOnly field or CLI switch. Positional
+            # launcher text is not an access-control decision by a filesystem.
+            r_arg = raw_root.removesuffix(":ro")
+            if not _covers_steering_path(r_arg, project_roots, files=files):
+                continue
+            summary.steering_surfaces.append(
+                _rec(
+                    server_name=srv_name,
+                    root_path=r_arg,
+                    permission_modes=eff_modes,
+                    approval_status=approval_status,
+                    read_only=False,
+                    deny_covered=deny_covered,
+                    writable=writable,
+                    source_file=cfg_path,
                 )
-            if srv_auto:
-                eff_modes.append(f"{cfg_path}:{srv_name}:alwaysAllow")
-            writable = bool(eff_modes) and not deny_covered
-            approval_status = "preapproved" if writable else "unverified"
-            if deny_covered:
-                approval_status = "denied"
-            elif not writable and host == "claude" and claude_prompting:
-                approval_status = "prompting"
-            roots = [
-                a
-                for a in args
-                if not a.startswith("-")
-                and "server-filesystem" not in a
-                and a not in {"-y", "npx", "uvx"}
-            ] or ["."]
-            for raw_root in roots:
-                # MCP stdio has no standard readOnly field or CLI switch. Positional
-                # launcher text is not an access-control decision by a filesystem.
-                r_arg = raw_root.removesuffix(":ro")
-                if not _covers_steering_path(r_arg, project_roots):
-                    continue
-                summary.steering_surfaces.append(
-                    _rec(
-                        server_name=srv_name,
-                        root_path=r_arg,
-                        permission_modes=eff_modes,
-                        approval_status=approval_status,
-                        read_only=False,
-                        deny_covered=deny_covered,
-                        writable=writable,
-                        source_file=cfg_path,
-                    )
+            )
+            if writable:
+                summary.flag(
+                    "steering_surface_writable",
+                    RiskSeverity.CRITICAL,
+                    f"Filesystem server '{srv_name}' rooted at '{r_arg}' can modify steering files under {', '.join(eff_modes)} (F20).",
+                    cfg_path,
+                    srv_name,
                 )
-                if writable:
-                    summary.flag(
-                        "steering_surface_writable",
-                        RiskSeverity.CRITICAL,
-                        f"Filesystem server '{srv_name}' rooted at '{r_arg}' can modify steering files under {', '.join(eff_modes)} (F20).",
-                        cfg_path,
-                        srv_name,
-                    )
-                elif approval_status == "unverified":
-                    summary.flag(
-                        "steering_surface_unverified",
-                        RiskSeverity.MEDIUM,
-                        f"Write approval for filesystem server '{srv_name}' rooted at '{r_arg}' "
-                        "could not be established from the declaring client's configuration.",
-                        cfg_path,
-                        srv_name,
-                    )
+            elif approval_status == "unverified":
+                summary.flag(
+                    "steering_surface_unverified",
+                    RiskSeverity.MEDIUM,
+                    f"Write approval for filesystem server '{srv_name}' rooted at '{r_arg}' "
+                    "could not be established from the declaring client's configuration.",
+                    cfg_path,
+                    srv_name,
+                )
 
     if server_denies.remaining_glob_work < 0:
         summary.gaps.append("Claude deny rules: namespace wildcard comparison limit reached")
@@ -1676,6 +1998,12 @@ def diff_control_plane_audits(
                 for lt in s.launcher_targets
             }
         )
+        out.update(
+            {
+                f"preamble-target:{pt['target_path']}": pt["launch_target_sha256"]
+                for pt in s.preamble_targets
+            }
+        )
         return out
 
     base_targets = _target_map(baseline)
@@ -1705,6 +2033,17 @@ def diff_control_plane_audits(
             RiskSeverity.CRITICAL,
             f"hook-command:{src}:{event}:{digest[:12]}",
             f"Hook command for '{event}' in {src} (digest {digest[:12]}) is not in the baseline.",
+        )
+
+    def _preamble_keys(s: ControlPlaneAuditSummary) -> set[tuple[str, str]]:
+        return {(p["skill_path"], p["command_digest"]) for p in s.skill_preambles}
+
+    for skill_path, digest in sorted(_preamble_keys(current) - _preamble_keys(baseline)):
+        _emit(
+            "skill_preamble_changed",
+            RiskSeverity.CRITICAL,
+            f"skill-preamble:{skill_path}:{digest[:12]}",
+            f"Skill shell preamble in {skill_path} (digest {digest[:12]}) is not in the baseline.",
         )
 
     base_writable = {s["server_name"] for s in baseline.steering_surfaces if s.get("writable")}
@@ -1792,8 +2131,10 @@ def audit_project_control_plane(
                         summary.gaps.append(f"{decl_path}: invalid YAML")
         checkout = _CheckoutScripts(files, project_paths)
         _inspect_hooks_and_preambles(files, all_paths, checkout, summary)
-        _inspect_mcp_launchers_and_bridges(files, all_paths, checkout, summary, live_versions or {})
-        _inspect_steering_surfaces(files, all_paths, summary)
+        bridged_steering = _inspect_mcp_launchers_and_bridges(
+            files, all_paths, checkout, summary, live_versions or {}
+        )
+        _inspect_steering_surfaces(files, all_paths, summary, bridged_steering)
         _inspect_workflows_and_claims(files, all_paths, summary, decl_sources)
         _inspect_identities_and_authority(summary, decl_sources)
 
