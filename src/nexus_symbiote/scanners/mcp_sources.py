@@ -40,8 +40,8 @@ from nexus_symbiote.scanners.python_tools import (
     _AGENT_FACTORIES,
     _DECORATOR_IMPORTS,
     _FACTORIES,
-    _SDK_IMPORT_ROOTS,
     PYTHON_TOOL_HINTS,
+    SDK_IMPORT_ROOTS,
     _annotation_names,
     _PassiveModule,
     _ProjectImports,
@@ -1277,25 +1277,25 @@ def collect_source_references(
     entries = frozenset(
         entry
         for source_path in sources
-        if not _SDK_IMPORT_ROOTS.isdisjoint(source_path.parts[:-1])
+        if not SDK_IMPORT_ROOTS.isdisjoint(source_path.parts[:-1])
         for entry in (
             source_path.with_name(source_path.name.split(".", 1)[0] or source_path.name),
             *source_path.parents,
         )
-        if entry.parent.name in _SDK_IMPORT_ROOTS
+        if entry.parent.name in SDK_IMPORT_ROOTS
     )
     # A package link, alternate loader, or excluded local bytecode cache makes
     # the selected source uncertain. Never open a binary or enter a skipped cache.
     uncertain: set[Path] = set()
     cache_parents = {p.parent for p in unvisited if p.name.casefold() == "__pycache__"}
     for path in unvisited:
-        uncertain.update(p for p in (path, *path.parents) if p.name in _SDK_IMPORT_ROOTS)
+        uncertain.update(p for p in (path, *path.parents) if p.name in SDK_IMPORT_ROOTS)
     for path in sources:
         stem, dot, suffix = path.name.partition(".")
         if not stem or not dot or suffix == "py":
             continue
         owner = path.parent if stem == "__init__" else path.with_name(stem)
-        if owner.name in _SDK_IMPORT_ROOTS and (
+        if owner.name in SDK_IMPORT_ROOTS and (
             path.suffix.casefold() in {".so", ".pyd", ".pyc"}
             or owner.with_suffix(".py") in python_paths
             or owner / "__init__.py" in python_paths
@@ -1337,7 +1337,7 @@ def collect_source_references(
             owner = path.parent if path.name == "__init__.py" else path.with_suffix("")
             if (
                 path.suffix == ".py"
-                and owner.name in _SDK_IMPORT_ROOTS
+                and owner.name in SDK_IMPORT_ROOTS
                 and owner.parent / "__init__.py" in python_paths
                 and walk_complete
                 and owner not in uncertain_modules

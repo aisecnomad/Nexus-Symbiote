@@ -2681,6 +2681,7 @@ class MCPScanner(Scanner):
     def scan(self, project_root: Path, *, config_only: bool = False) -> ScanResult:
         result = ScanResult(scanner_name=self.name)
         found_any = False
+        walk_complete = False
         clients: dict[str, MCPClientComponent] = {}
 
         # Source text read while looking for SDK references is charged to this
@@ -2692,7 +2693,7 @@ class MCPScanner(Scanner):
             skipped: list[Path] = []
             sources = list(files.iter_files(directory_links=links, observed_excludes=skipped))
             cache_dirs = [p for p in skipped if p.name.casefold() == "__pycache__"]
-            walk_complete = not (files.failures_recorded or files.exclusions_recorded)
+            walk_complete = files.failures_recorded == 0 and files.exclusions_recorded == 0
             linked, linked_gaps = _linked_client_files(files, links)
             nested, directory_gaps = self._nested_client_files(files, [*sources, *linked])
             directory_gaps.update(path.as_posix() for path in linked_gaps)

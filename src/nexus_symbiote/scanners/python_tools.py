@@ -1314,7 +1314,7 @@ _CONTEXT_ARGUMENTS = frozenset(
         ("starlette.requests", "Request"),
     }
 )
-_SDK_IMPORT_ROOTS = frozenset(
+SDK_IMPORT_ROOTS = frozenset(
     module.partition(".")[0]
     for module, _ in _SDK_TYPES | _CONTEXT_ARGUMENTS | set(_DECORATOR_IMPORTS)
 )
