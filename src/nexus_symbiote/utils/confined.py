@@ -323,12 +323,14 @@ class _WalkScope:
         links: list[Path] | None,
         unlisted: _Unlisted,
         skipped: list[Path] | None = None,
+        observed_excludes: list[Path] | None = None,
     ) -> None:
         self.top = top
         self.walked = {top}
         self.links = links
         self.unlisted = unlisted
         self.skipped = skipped
+        self.observed_excludes = observed_excludes
 
     def covers(self, target: Path) -> bool:
         """Whether the walk reaches ``target`` already, under its own name."""
@@ -1255,8 +1257,11 @@ class ConfinedCollection:
         *,
         directory_links: list[Path] | None = None,
         skipped: list[Path] | None = None,
+        observed_excludes: list[Path] | None = None,
     ) -> Iterator[Path]:
         """Yield root-relative file paths, never through more than one symlink.
+
+        ``observed_excludes`` collects excluded paths without changing who reports them.
 
         A ``directory`` reached through one in-root symlink is walked under its
         target's name. Inside a walk that did not start through a symlink, a symlink
@@ -1307,7 +1312,7 @@ class ConfinedCollection:
         # count before and after a walk sees every walk that met a failure. Once the
         # entry budget is spent, a later walk lists nothing and records nothing: the
         # one failure that spent it names where collection stopped.
-        scope = _WalkScope(walked, directory_links, _Unlisted(), skipped)
+        scope = _WalkScope(walked, directory_links, _Unlisted(), skipped, observed_excludes)
         try:
             yield from self._walk(
                 fd, walked, 0, self._entry_budget, scope, followed=walked != relative
@@ -1352,6 +1357,8 @@ class ConfinedCollection:
                     continue
                 child = relative / name
                 if self.excluded(child):
+                    if scope.observed_excludes is not None:
+                        scope.observed_excludes.append(child)
                     if scope.skipped is not None and _default_excluded(name):
                         scope.skipped.append(child)
                     # A caller that collects skipped reports the entry itself.

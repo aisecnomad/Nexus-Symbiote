@@ -516,12 +516,14 @@ class IntegrityValidator:
             if not expected_weight:
                 raise ValueError("tensor metadata requires a whole-artifact SHA-256 binding")
             algorithm, hex_digest = normalize_digest(expected_weight, "sha256")
+            located = _locate_artifact(project_root, comp.source_path)
+            if isinstance(located, str):
+                raise ValueError(located)
             root = project_root.resolve()
-            source = Path(comp.source_path)
-            # The integrity check's observation of the same file; the artifact is
-            # read once per validation.
+            # The integrity check's observation of the same file, located as that check
+            # locates it; the artifact is read once per validation.
             observation = self._model_packages(report, root).observation(
-                source.relative_to(root) if source.is_absolute() else source
+                located.resolve().relative_to(root)
             )
             if (
                 observation is None
