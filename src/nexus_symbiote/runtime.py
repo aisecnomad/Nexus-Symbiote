@@ -1670,6 +1670,7 @@ class ReferenceGateway(Generic[T]):
         self.state = state
         self.authenticate = authenticate
         self.describe = describe
+        self._prepare: Callable[[Mapping[str, Any]], None] | None = None
         self.resolve_scope = resolve_scope
         self.execute = execute
         self.approval_actors = actors
@@ -1725,11 +1726,13 @@ class ReferenceGateway(Generic[T]):
         *,
         describe: Callable[[str, str], ServedTool],
         execute: Callable[[ToolCall], U],
+        prepare: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> ReferenceGateway[U]:
-        """Return a gateway with this policy and state that uses other describe/execute."""
+        """Bind adapters and optional preparation before recording the approval."""
         bound = cast("ReferenceGateway[U]", copy.copy(self))
         bound.describe = describe
         bound.execute = execute
+        bound._prepare = prepare
         return bound
 
     def check_validation_worker(self) -> None:
@@ -2044,6 +2047,8 @@ class ReferenceGateway(Generic[T]):
                 facts=facts,
             )
         _validate_arguments(definition.get("inputSchema"), call.arguments)
+        if self._prepare is not None:
+            self._prepare(definition)
         if self.authenticate() != context:
             raise AuthorizationError(
                 "execution identity changed during authorization", reason="identity-changed"
