@@ -13,6 +13,7 @@ import hashlib
 import io
 import pickle
 import struct
+import sys
 import zipfile
 from typing import TYPE_CHECKING
 
@@ -246,7 +247,9 @@ def test_jinja_raw_block_literal_text_does_not_false_positive(template: bytes) -
 def test_frozen_importer_nul_truncated_module_name_is_detected(
     tmp_path: Path, payload: bytes
 ) -> None:
-    assert pickle.loads(payload) > 0  # noqa: S301 - inert os.getpid()
+    if sys.version_info < (3, 13):
+        # CPython 3.11-3.12 FrozenImporter C-string strcmp executes NUL-truncated names.
+        assert pickle.loads(payload) > 0  # noqa: S301 - inert os.getpid()
     for flavor in ("c", "py"):
         seg = load_segment(payload, len(payload), 0, flavor, Budget(4096, 64))
         assert seg.outcome == "called"

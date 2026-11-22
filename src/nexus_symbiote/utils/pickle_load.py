@@ -105,7 +105,7 @@ VERSION_DIFFERENCES: dict[str, str] = {
 def _unimportable(module: str) -> bool:
     """Whether ``__import__(module)`` fails before any module code can run.
 
-    On CPython 3.11+, ``FrozenImporter`` matches frozen stdlib modules (``os``, ``io``,
+    On CPython 3.11-3.12, ``FrozenImporter`` matches frozen stdlib modules (``os``, ``io``,
     ``runpy``, ...) via C-string comparison, truncating ``module`` at the first ``\\x00``.
     """
     head = module.split("\x00", 1)[0]
