@@ -402,5 +402,9 @@ partitions alerts caused *exclusively* by the static list of serializer and prof
 transitions since `FROM_VERSION` into `tool_upgrade_changes` while keeping genuine
 supply-chain drift (added or removed components, changed commands or endpoints,
 altered tool definitions, or any component where a profile transition co-occurs
-with a content change) in `security_alerts`. Re-collect and re-approve the baseline
-once the upgrade diff has been reviewed.
+with a content change) in `security_alerts`. Both supported releases wrote tool
+fingerprints as `rfc8785-jcs-v2`, so `Tool fingerprint versions are unknown or
+incompatible` is never attributed: it names a snapshot outside the documented
+transition, and its changed hash can be a changed descriptor. A snapshot with an
+unsupported `spec_version` never reaches the comparison: `diff` refuses it at load.
+Re-collect and re-approve the baseline once the upgrade diff has been reviewed.

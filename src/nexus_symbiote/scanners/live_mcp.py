@@ -34,7 +34,7 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, NamedTuple, Protocol, cast
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from jsonschema import (
     Draft4Validator,
@@ -95,6 +95,13 @@ _CONSUMED_HEADERS = frozenset(
 # whole branch, required lists included, before it reports the first error.
 # Longer unsortable arrays under those keywords are refused before checking.
 _UNIQUE_ITEMS_PAIRWISE_LIMIT = 64
+# A path the common clients send as written: RFC 3986 path characters, and upper-case escapes
+# of bytes that are not unreserved, not starting "//". WHATWG clients encode " < > ` { };
+# urllib3 and requests also encode | ^ [ ], re-encode a stray "%" and upper-case escapes;
+# requests decodes an escaped unreserved byte and some releases strip a leading "//". An
+# observation of any other path is not what those clients reach.
+_SENT_AS_WRITTEN_PATH = re.compile(r"(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/]|%[0-9A-F]{2})*")
+_ESCAPED_UNRESERVED = re.compile(r"%(?:2[DE]|3[0-9]|4[1-9A-F]|5[0-9AF]|6[1-9A-F]|7[0-9AE])")
 # Keywords whose values the 2020-12 metaschema checks as subschemas. It checks
 # "dependencies" values through anyOf instead; see _checked_dependency_schemas.
 _SUBSCHEMA_KEYWORDS = frozenset(
@@ -339,6 +346,14 @@ def _endpoint(value: str, *, origin_only: bool = False) -> tuple[str, str, int, 
         raise
     except ValueError as exc:
         raise DiscoveryError("invalid endpoint") from exc
+    if any(unquote(part) in (".", "..") for part in parsed.path.split("/")):
+        raise DiscoveryError("endpoint dot segments refused")
+    if (
+        parsed.path.startswith("//")
+        or not _SENT_AS_WRITTEN_PATH.fullmatch(parsed.path)
+        or _ESCAPED_UNRESERVED.search(parsed.path)
+    ):
+        raise DiscoveryError("endpoint path characters or escapes that clients rewrite refused")
     if host.endswith(".") or not 1 <= port <= 65535:
         raise DiscoveryError("invalid endpoint authority")
     authority = f"[{host}]" if ":" in host else host

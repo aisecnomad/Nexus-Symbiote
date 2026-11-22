@@ -1030,6 +1030,43 @@ def _snapshot_scope(snapshot: ApprovedSnapshot) -> str:
     return "snapshot:" + digest([snapshot.tenant, snapshot.deployment_id, snapshot.agent_id])
 
 
+def _refuse_shared_directory(info: os.stat_result) -> None:
+    if info.st_mode & 0o002:
+        raise AuthorizationError(
+            "state database directory cannot be world-writable", reason="state-invalid"
+        )
+    # The sticky exception is compatible with stores shared by a trusted group.
+    # A companion check cannot reserve an absent name for a later SQLite open.
+    if info.st_mode & 0o020 and not info.st_mode & stat.S_ISVTX:
+        raise AuthorizationError(
+            "state database directory cannot be group-writable without the sticky bit",
+            reason="state-invalid",
+        )
+
+
+def _refuse_planted_companions(parent_fd: int, name: str, uid: int | None) -> None:
+    for suffix in ("-journal", "-wal", "-shm"):
+        try:
+            info = os.stat(name + suffix, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AuthorizationError(
+                "state database journal cannot be inspected", reason="state-invalid"
+            ) from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or (uid is not None and info.st_uid != uid)
+            or info.st_mode & 0o022
+        ):
+            raise AuthorizationError(
+                "state database journal must be a singly linked regular file owned by the "
+                "current user and writable only by its owner",
+                reason="state-invalid",
+            )
+
+
 def _secure_existing(path: Path) -> tuple[int, int]:
     from nexus_symbiote.core.hashing import open_directory_nofollow
 
@@ -1053,10 +1090,8 @@ def _secure_existing(path: Path) -> tuple[int, int]:
                 "state database directory must be owned by the current user",
                 reason="state-invalid",
             )
-        if parent_info.st_mode & 0o002:
-            raise AuthorizationError(
-                "state database directory cannot be world-writable", reason="state-invalid"
-            )
+        _refuse_shared_directory(parent_info)
+        _refuse_planted_companions(parent_fd, path.name, uid)
         try:
             info = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError as exc:
@@ -1223,11 +1258,8 @@ class StateStore:
                         "state database directory must be owned by the current user",
                         reason="state-invalid",
                     )
-                if parent_info.st_mode & 0o002:
-                    raise AuthorizationError(
-                        "state database directory cannot be world-writable",
-                        reason="state-invalid",
-                    )
+                _refuse_shared_directory(parent_info)
+                _refuse_planted_companions(parent_fd, path.name, uid)
                 os.close(os.open(path.name, flags, 0o600, dir_fd=parent_fd))
             finally:
                 os.close(parent_fd)
@@ -1290,11 +1322,8 @@ class StateStore:
                     "state database directory must be owned by the current user",
                     reason="state-invalid",
                 )
-            if parent_info.st_mode & 0o002:
-                raise AuthorizationError(
-                    "state database directory cannot be world-writable",
-                    reason="state-invalid",
-                )
+            _refuse_shared_directory(parent_info)
+            _refuse_planted_companions(parent_fd, self.path.name, uid)
             try:
                 info = os.stat(self.path.name, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError as exc:
@@ -1484,7 +1513,17 @@ class StateStore:
         tenant: str | None = None,
         not_after: datetime | None = None,
         check_time: Callable[[], None] | None = None,
+        now: datetime | None = None,
     ) -> None:
+        # The presented expiry must not choose which rows are deleted. A caller of
+        # record() can name an expiry; the retention watermark is this clock, and an
+        # approval nonce may not claim an expiry further ahead than its lifetime.
+        clock = datetime.now(UTC) if now is None else now
+        if not_after is not None and not_after > clock + MAX_LIFETIMES["approval"]:
+            raise AuthorizationError(
+                "approval expiry is more than 5 minutes ahead",
+                reason="approval-lifetime-exceeds-policy",
+            )
         with self._transaction() as db:
             for scope, serial, value in heads:
                 if scope.startswith("trust:"):
@@ -1524,11 +1563,18 @@ class StateStore:
                         "approval nonce has already been used", reason="approval-replayed"
                     ) from exc
                 if expires is not None:
-                    # A nonce is needed only while its approval can still verify; the
-                    # retention margin also covers gateways whose clocks disagree.
+                    # Keep a used nonce until it is older than the retention window
+                    # measured from this clock, not from the expiry just presented.
+                    # A far-future expiry would otherwise delete another tenant's
+                    # nonce that is still inside the window. The row just inserted
+                    # always survives, so a stale expiry cannot be recorded twice.
+                    # Rows with no expiry stay: SQL does not treat NULL as less than
+                    # the cutoff.
+                    watermark = min(int(clock.timestamp()), expires)
+                    cutoff = watermark - int(NONCE_RETENTION.total_seconds())
                     db.execute(
                         "DELETE FROM tenant_nonces WHERE not_after < ?",
-                        (expires - int(NONCE_RETENTION.total_seconds()),),
+                        (cutoff,),
                     )
             if check_time is not None:
                 # The write lock may have taken longer than the remaining approval lifetime.
@@ -2036,6 +2082,7 @@ class ReferenceGateway(Generic[T]):
             tenant=context.tenant,
             not_after=None if consent is None else consent.not_after,
             check_time=check_time,
+            now=timestamp,
         )
         return call
 

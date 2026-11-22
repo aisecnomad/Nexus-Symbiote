@@ -663,7 +663,7 @@ def test_trusted_key_check_compares_directories_by_identity(setup, tmp_path, mon
     repo = repository(tmp_path / "repo")
     key = repo / "trusted.pub"
     shutil.copyfile(setup["a"][1], key)
-    alias = tmp_path / "Repo"
+    alias = tmp_path / "elsewhere"
     alias.symlink_to(repo)
     check = attestation_cli._check_trust_anchors
     # A tree found under a name the path text misses, as a case variant or a bind mount of
@@ -801,7 +801,10 @@ def test_subject_name_that_is_not_utf8_is_replaced(runner, setup):
     work = setup["work"]
     name = os.fsdecode(b"inventory-\xff.json")
     subject = work / name
-    shutil.copyfile(setup["subject"], subject)
+    try:
+        shutil.copyfile(setup["subject"], subject)
+    except OSError:
+        pytest.skip("file system rejects names that are not UTF-8")
     out = work / "bytes.att"
     result = attest(runner, subject, out, private)
     assert result.exit_code == 0, result.output

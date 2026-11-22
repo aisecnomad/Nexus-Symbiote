@@ -325,7 +325,9 @@ high alert naming the property that records its digest.
 
 Every chat template that `properties.chat_templates` lists is checked for potential
 Python-internals access patterns: a dunder attribute, named or subscripted, a
-dunder name as a string such as an `attribute=` argument, or the `attr` filter.
+dunder name as a string such as an `attribute=` argument, the `attr` filter, a
+Python-mangled private name such as `self._TemplateReference__context`, read as an
+attribute or written as a string, or an underscore string repeated with `*`.
 The heuristic decodes string escapes such as `\x5f`, removes a backslash before a
 line break, and folds adjacent constant strings joined with `~` or `+`, or written
 next to each other, inside Jinja expressions. It does not evaluate templates.
@@ -344,7 +346,8 @@ collection. A template file larger than the `file-bytes` limit is digested but n
 checked, and is a coverage gap in `surfaces_excluded`.
 
 A GGUF file whose metadata exceeds the reader's bounds (65,536 keys, 16 MiB
-strings, 2,097,152 array items, 128 MiB of metadata, or the 16,000,000
+strings, 2,097,152 array items, arrays nested more than two deep, 128 MiB of
+metadata, or the 16,000,000
 structure units one scan may spend on ONNX and GGUF files and NumPy array headers)
 keeps the rating `unknown`, records `properties.gguf_metadata` and is a coverage gap in
 `surfaces_excluded`, because its chat templates were not inspected.

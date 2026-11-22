@@ -410,7 +410,10 @@ def _skip_gguf_value(reader: _Reader, kind: int, depth: int, budget: InspectionB
         if length > MAX_GGUF_STRING_BYTES:
             raise FormatError(GGUF_LIMIT)
         reader.skip(length)
-    elif kind == _GGUF_ARRAY and depth < 2:
+    elif kind == _GGUF_ARRAY:
+        if depth >= 2:
+            # The format allows deeper nesting; a template after it is unread, not absent.
+            raise FormatError(GGUF_LIMIT)
         item = reader.uint(4)
         count = reader.uint(8)
         if count > MAX_GGUF_ARRAY_ITEMS:
@@ -472,6 +475,11 @@ _TEMPLATE_ESCAPE = re.compile(
     r"\.\s*__[A-Za-z0-9_]+__|['\"]__[A-Za-z0-9_]+__['\"]|(?<![A-Za-z0-9_])attr\s*\("
     r"|\|\s*attr\b|\.\s*_(?:globals|builtins)\b"
     r"|['\"]__[A-Za-z0-9_]*['\"][\s)]*[~+]|[~+][\s(]*['\"][A-Za-z0-9_]*__['\"]"
+    # A private name Python mangled, as in self._TemplateReference__context, which
+    # reaches the render context without a dunder.
+    r"|(?:\.\s*|['\"])_[A-Za-z0-9][A-Za-z0-9_]*__[A-Za-z0-9]"
+    # Underscores repeated by string multiplication spell a dunder without writing one.
+    r"|['\"]_+['\"][\s)]*\*|\*[\s(]*['\"]_+['\"]"
 )
 # The escapes Jinja decodes in a string literal, with an escaped backslash first so
 # that it is consumed whole; every other backslash is kept as written. Jinja turns
