@@ -35,6 +35,7 @@ from nexus_symbiote.live.pinned_process import (
 )
 from nexus_symbiote.live.stdio import DEADLINE_SECONDS, MAX_TOOLS, PROTOCOL, _frames, _ready
 from nexus_symbiote.runtime import (
+    REASONS,
     AuthorizationError,
     Decision,
     Envelope,
@@ -148,7 +149,8 @@ class PinnedStdioSession:
             return self
         except PinnedProcessError as exc:
             self.__exit__(None, None, None)
-            raise AuthorizationError(str(exc)) from exc
+            reason = exc.reason if exc.reason in REASONS else "denied"
+            raise AuthorizationError(str(exc), reason=reason) from exc
         except BaseException:
             self.__exit__(None, None, None)
             raise

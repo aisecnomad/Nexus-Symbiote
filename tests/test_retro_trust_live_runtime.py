@@ -1084,9 +1084,13 @@ def test_session_lets_an_interrupt_through_with_the_teardown_failure_noted(
     monkeypatch.setattr(session_module, "terminate_process_group", fail_teardown)
     path, pin, _log = make_launcher(tmp_path, "ok")
     session = PinnedStdioSession(command=str(path), sha256=pin, server_id="server:mail")
+
+    def interrupt() -> None:
+        raise KeyboardInterrupt
+
     with pytest.raises(KeyboardInterrupt) as caught, session:
         session.describe("server:mail", "send")
-        raise KeyboardInterrupt
+        interrupt()
     assert any("orphan survived" in note for note in getattr(caught.value, "__notes__", []))
 
 
@@ -1101,3 +1105,68 @@ def test_teardown_reasons_are_documented_reason_codes() -> None:
 def test_a_parent_segment_in_a_trust_anchor_path_gets_its_own_message(tmp_path: Path) -> None:
     error = crypto_mod._trust_anchor_error(tmp_path / ".." / tmp_path.name, None)
     assert error is not None and "'..'" in error
+
+
+def _optional_node_tree() -> dict[str, object]:
+    child = {"anyOf": [{"$ref": "#/$defs/Node"}, {"type": "null"}], "default": None}
+    node = {
+        "type": "object",
+        "properties": {"value": {"type": "integer"}, "left": child, "right": dict(child)},
+        "required": ["value"],
+    }
+    return {"$defs": {"Node": node}, "$ref": "#/$defs/Node"}
+
+
+def test_output_schema_preflight_admits_recursive_trees_with_optional_children(
+    dialects: object,
+) -> None:
+    """A pydantic ``Optional["Node"]`` tree: each value reaches ``Node`` once, at any width."""
+    from nexus_symbiote import runtime_validation as validation
+
+    nullable = {
+        "$defs": {
+            "T": {
+                "type": ["object", "null"],
+                "properties": {"l": {"$ref": "#/$defs/T"}, "r": {"$ref": "#/$defs/T"}},
+            }
+        },
+        "$ref": "#/$defs/T",
+    }
+    either = {
+        "$defs": {
+            "T": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {"l": {"$ref": "#/$defs/T"}, "r": {"$ref": "#/$defs/T"}},
+                    },
+                    {"type": "string"},
+                ]
+            }
+        },
+        "$ref": "#/$defs/T",
+    }
+    for schema in (_optional_node_tree(), nullable, either):
+        assert validation._evaluate(dialects, schema, None) == validation._VALID
+
+    def tree(depth: int) -> dict[str, object]:
+        if depth == 0:
+            return {"value": 0}
+        return {"value": depth, "left": tree(depth - 1), "right": tree(depth - 1)}
+
+    assert validation._evaluate(dialects, _optional_node_tree(), tree(11)) == validation._VALID
+
+
+@pytest.mark.usefixtures("nonisolated_pinned_fixtures")
+def test_an_unavailable_launcher_isolation_keeps_its_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unavailable(*args: object, **kwargs: object) -> None:
+        raise PinnedProcessError("isolation-unavailable", "PID namespace launcher is unavailable")
+
+    monkeypatch.setattr(session_module, "spawn_pinned", unavailable)
+    path, pin, _log = make_launcher(tmp_path, "ok")
+    session = PinnedStdioSession(command=str(path), sha256=pin, server_id="server:mail")
+    with pytest.raises(AuthorizationError) as caught:
+        session.__enter__()
+    assert caught.value.reason == "isolation-unavailable"

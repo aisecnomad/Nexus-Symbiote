@@ -1275,6 +1275,10 @@ def _collection_work_exceeds_budget(
     # array element) and preserve exact slot keys whenever a key repeats across
     # containers or enters an in-place branching subgraph (allOf/anyOf/oneOf).
     counts = {root: 1}
+    # The largest count any single parent hands a node. Sums count every path, which
+    # separate sibling values (a tree's left and right) would compound per level; one
+    # value reaches a node at most ``max_dup`` times, so the sum is capped there.
+    peaks = {root: 1}
     nested: set[int] = set()
     fallible: set[int] = set()
     step_cap = _MAX_OUTPUT_REPEATED_STEPS + 1
@@ -1285,6 +1289,7 @@ def _collection_work_exceeds_budget(
 
     for _ in range(MAX_JSON_DEPTH + 1):
         following: dict[int, int] = {}
+        following_peaks: dict[int, int] = {}
         nested_following: set[int] = set()
         fallible_following: set[int] = set()
         for current in order:
@@ -1292,6 +1297,7 @@ def _collection_work_exceeds_budget(
             if not count:
                 continue
             multiplicity = max(1, max_dup.get(current, 1))
+            count = min(count, peaks.get(current, count) * multiplicity)
             # A value reaches a shared definition once per in-place path, so its
             # multiplicity stays within the schema's own size unless paths compound:
             # a chain of allOf arms that doubles per level reaches 2**depth from a
@@ -1323,6 +1329,7 @@ def _collection_work_exceeds_budget(
                         fallible_children.add(id(arm))
             for child in graph[current]:
                 counts[child] = min(step_cap, counts.get(child, 0) + count)
+                peaks[child] = max(peaks.get(child, 0), count)
                 if current in nested:
                     nested.add(child)
                 if current in fallible or child in fallible_children:
@@ -1386,6 +1393,9 @@ def _collection_work_exceeds_budget(
                         following[child] = min(
                             step_cap, following.get(child, 0) + count * cardinality
                         )
+                        following_peaks[child] = max(
+                            following_peaks.get(child, 0), min(step_cap, count * cardinality)
+                        )
                         if (
                             current in nested
                             or keyword == "contains"
@@ -1400,7 +1410,12 @@ def _collection_work_exceeds_budget(
             following == counts and nested_following == nested and fallible_following == fallible
         ):
             break
-        counts, nested, fallible = following, nested_following, fallible_following
+        counts, peaks, nested, fallible = (
+            following,
+            following_peaks,
+            nested_following,
+            fallible_following,
+        )
     return False
 
 
