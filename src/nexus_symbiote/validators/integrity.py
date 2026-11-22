@@ -837,7 +837,10 @@ class IntegrityValidator:
         report.signatures_verified += verification.signatures_verified
         report.hashes_verified += verification.pins_verified
         weight_count = len(package.weight_files)
-        if verification.signatures_verified + verification.pins_verified == weight_count:
+        if (
+            weight_count > 0
+            and verification.signatures_verified + verification.pins_verified == weight_count
+        ):
             report.model_policy_evidence[comp.bom_ref] = ModelPolicyEvidence(
                 weight_count, verification.signatures_verified, verification.pins_verified
             )

@@ -124,11 +124,15 @@ def build_evidence_profile(
         ev = {
             "pinned": _is_pinned(comp),
             "digest_recorded": _has_recorded_digest(comp),
-            "digest_bound": proof is not None,
+            "digest_bound": bool(proof and proof.weight_files > 0),
             "digest_pinned_under_policy": bool(
-                proof and proof.digest_pins_verified == proof.weight_files
+                proof
+                and proof.weight_files > 0
+                and proof.digest_pins_verified == proof.weight_files
             ),
-            "signed_under_policy": bool(proof and proof.signatures_verified == proof.weight_files),
+            "signed_under_policy": bool(
+                proof and proof.weight_files > 0 and proof.signatures_verified == proof.weight_files
+            ),
             "runtime_matched": comp.bom_ref in matched,
         }
         claims = {

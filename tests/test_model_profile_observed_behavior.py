@@ -43,3 +43,19 @@ def test_verified_model_bytes_keep_their_observed_format_finding(
     assert record["finding_count"] == 1
     assert record["highest_finding_severity"] == "critical"
     assert record["integrity_findings"] == [{"category": "unsafe_format", "severity": "critical"}]
+
+
+def test_zero_weight_model_policy_evidence_is_not_reported_verified(tmp_path, monkeypatch):
+    from nexus_symbiote import evidence_profile
+    from nexus_symbiote.validators.integrity import IntegrityReport, ModelPolicyEvidence
+
+    model = ModelComponent(bom_ref="model:empty", name="empty", source_path="empty.safetensors")
+    fake_report = IntegrityReport(
+        model_policy_evidence={"model:empty": ModelPolicyEvidence(0, 0, 0)}
+    )
+    monkeypatch.setattr(evidence_profile, "_verify_model_policy", lambda *_args: fake_report)
+    report = build_evidence_profile(AIBOM(components=[model]), project_root=tmp_path)
+    (record,) = report["components"]
+    assert record["evidence"]["digest_bound"] is False
+    assert record["evidence"]["digest_pinned_under_policy"] is False
+    assert record["evidence"]["signed_under_policy"] is False
