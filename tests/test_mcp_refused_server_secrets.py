@@ -270,3 +270,49 @@ def test_a_gemini_server_replaced_by_the_server_command_is_scrubbed(tmp_path: Pa
     shown = _scan_file(tmp_path, ".gemini/settings.json", data)
     assert "Uses ***" in shown or "Uses [" in shown
     assert SETTING not in shown
+
+
+SPLIT_SCHEME = "Qm7vX2pL9sT4wB8nR3kJ6hY5cD1fG0zA"
+
+
+@pytest.mark.parametrize(
+    "launch",
+    [
+        # The scheme word ends the assignment; the credential is the next launch word.
+        {
+            "command": "cmd",
+            "args": ["/c", "set", "AUTH_TYPE=Digest", SPLIT_SCHEME, "&&", "node", "s.js"],
+        },
+        {
+            "command": "cmd",
+            "args": ["/c", "set", "HEADER=Bearer", SPLIT_SCHEME, "&&", "node", "s.js"],
+        },
+        {
+            "command": "cmd",
+            "args": ["/c", "set", "PROXY_HEADER=Negotiate", SPLIT_SCHEME, "&&", "node", "s.js"],
+        },
+        {"command": "cmd", "args": ["/c", f"set X_HEADER=Basic {SPLIT_SCHEME}&& node s.js"]},
+        {
+            "command": "npx",
+            "args": ["mcp-remote", "--env", "CUSTOM_HEADER=AWS4-HMAC-SHA256", SPLIT_SCHEME],
+        },
+        {"command": "sh", "args": ["-c", f"API_TOKEN=Bearer {SPLIT_SCHEME} node s.js"]},
+    ],
+)
+def test_a_split_scheme_credential_is_scrubbed_from_an_echoing_sibling(
+    tmp_path: Path, launch: dict[str, object]
+) -> None:
+    """A credential after a scheme word in a secret-like assignment never reaches the exports,
+    whatever the finding classifier makes of the assignment's name."""
+    from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
+    from nexus_symbiote.generators.spdx import SPDXGenerator
+
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"launch": launch, "echo": _echo(SPLIT_SCHEME)}})
+    )
+    result = MCPScanner().scan(tmp_path)
+    bom = AIBOM(components=result.components)
+    shown = bom.model_dump_json() + "\n".join([*result.scan_failures, *result.surfaces_excluded])
+    assert SPLIT_SCHEME not in shown
+    assert SPLIT_SCHEME not in json.dumps(CycloneDXGenerator().generate(bom))
+    assert SPLIT_SCHEME not in json.dumps(SPDXGenerator().generate(bom))
