@@ -143,8 +143,25 @@ Find the references with
 `jq '.components[] | select(.component_type == "mcp-server") | {bom_ref, name, transport}' agentbom.json`.
 `--project` names the untrusted checkout and is required. Servers whose transport
 is `sse`, `streamable-http` or `http` and that record no launch command are listed as
-`not-verifiable` with reason `remote-transport` and do not make the run fail; use
-`discover-mcp --record` for them. Such a server that records a launch command, which
+`not-verifiable` with reason `remote-transport` and do not make the run fail; observe
+them with `discover-mcp --record`, attest that inventory with `attest --purpose
+generated`, and pass it to `verify-live` with `--transport-evidence`,
+`--transport-evidence-attestation` and a `--trusted-key` kept outside every
+repository that holds the project, the inventory or the evidence. Evidence verifies a
+server only when the inventory records that server's `https` origin; a missing or
+`[redacted]` endpoint, another origin, or evidence that is not a complete live
+observation fails with reason `invalid-transport-evidence`. An inventory endpoint that names a
+path must be the observed URL as `discover-mcp` records it (lower-case scheme and host, no
+default port or fragment, the path as written); one with a query, dot segments or a path
+character or escape that clients rewrite, which `discover-mcp` refuses, verifies nothing.
+Otherwise, until `--record` stores the full-URL digest (`observed_endpoint_hash`), the binding
+is origin-only, so an observation of another path on the same origin passes.
+For tools verified through transport evidence, `--record` preserves the tool's
+observation method, collector and timestamp and records the verified attestation's
+SHA-256 digest in the tool claim's `evidence_refs`.
+Each server's report names its `endpoint_binding` and the evidence's `observed_at`.
+`--require-full-url-binding` refuses origin-only evidence (it checks the path the inventory endpoint names or the digest it records against the evidence, not the configured URL, so an inventory that names or records another URL satisfies it), `--max-evidence-age HOURS` refuses older evidence, and future-dated evidence is always refused. `--require-transport-evidence` makes a remote server
+without such evidence fail with reason `remote-transport`. Such a server that records a launch command, which
 a client may start, fails with reason `ambiguous-transport` unless the launch policy
 names it; one that the launch policy names is verified through its pinned launcher. A
 server with any other transport label fails with reason `unsupported-transport`. A
@@ -153,7 +170,7 @@ reason: `missing-launch-policy`, `invalid-launch-policy`, `launcher-unavailable`
 `launcher-digest-mismatch`, `launcher-start-failed`, `isolation-unavailable`,
 `isolation-teardown-failed`, `deadline`, `unsupported-protocol-version`, `protocol`,
 `invalid-descriptor`, `ambiguous-approved-tools`, `ambiguous-transport`,
-`unsupported-transport` or `internal-error`. The 20-second deadline covers each server's MCP exchange and the
+`invalid-transport-evidence`, `unsupported-transport` or `internal-error`. The 20-second deadline covers each server's MCP exchange and the
 checks of the descriptors it served. The JSON report also records the SHA-256 of
 the inventory and of the launch policy, and each launcher's pin.
 

@@ -779,14 +779,11 @@ def test_files_that_only_mention_the_sdk_produce_nothing(tmp_path):
         },
     )
     assert result.scan_failures == []
-    assert result.surfaces_excluded == []
+    assert result.surfaces_excluded == ["node_modules: default collection exclude; not collected"]
     assert _inventory(result) == []
     # As before, only server analysis skips __tests__: an SDK import there is a client
-    # reference, a component no gate fails on.
-    assert result.surfaces_scanned == [
-        "src/__tests__/server.tsx",
-        "mcp-config (no config files found)",
-    ]
+    # reference. The excluded dependency tree prevents a complete empty-config report.
+    assert result.surfaces_scanned == ["src/__tests__/server.tsx"]
 
 
 @pytest.mark.parametrize(

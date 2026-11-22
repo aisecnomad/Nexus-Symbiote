@@ -59,6 +59,7 @@ Reference material: exact behavior, fields and limits.
 | [Examples walkthrough](../examples/README.md) | Inventory, validate, export, diff, import and compare with a trace on a synthetic agent, offline |
 | [Scanning a public agent](tutorials/scanning-a-public-agent.md) | Run the full workflow on a real repository and wire it into CI |
 | [GitHub Action](github-action.md) | Add the Action to a workflow, read what each gate checks, and supply a signer policy from outside the workspace |
+| [Container image](container-image.md) | Verify the release image's attestation, run the CLI in it without the network, or build the image yourself |
 | [Gate drift in CI](drift-gate.md) | Keep the reviewed baseline out of the pull request's reach, protect the gate from the change under review, take comparable snapshots, and read each alert |
 | [Inventory attestation](inventory-attestation.md) | Sign a reviewed baseline or a generated inventory, verify it in CI before `diff`, and check the envelope with other DSSE tooling |
 | [Trace evidence](trace-evidence.md) | Compare an inventory with the runtime use that an agent's OpenTelemetry traces report: what is read and never read, the `reported` trust level, matching rules, evidence format, gate and limits |

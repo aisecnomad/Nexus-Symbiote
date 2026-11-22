@@ -80,6 +80,7 @@ MAX_SUBJECT_NAME_CHARACTERS = 255
 MAX_NATIVE_DEPTH = 256
 # A complete envelope holds at most a 1 MiB statement in base64 and 32 signatures.
 MAX_ENVELOPE_BYTES = 2 * 1024 * 1024
+MAX_SUBJECT_BYTES = 64 * 1024 * 1024
 CLOCK_SKEW = timedelta(minutes=5)
 
 REASONS: dict[str, str] = {
@@ -175,6 +176,7 @@ class VerifiedAttestation:
 
     ``subject_sha256`` is the digest of the bytes verified and ``attested_sha256`` the
     one the statement records; they differ only when ``match`` is ``content``.
+    ``envelope_digest`` references the original envelope bytes when available.
     """
 
     predicate: InventoryPredicate
@@ -182,6 +184,7 @@ class VerifiedAttestation:
     match: Match
     subject_sha256: str
     attested_sha256: str
+    envelope_digest: str | None = None
 
 
 def subject_name(name: str) -> str:

@@ -52,7 +52,22 @@ because a file binds each variable once while two servers in it can declare the 
 name. The [TypeScript inventory](typescript-inventory.md) page covers the
 TypeScript forms in full.
 
+For Python SDK imports, the collector considers both script-directory and module-launch search roots. A local framework import must resolve to a regular module in each applicable first search root before it can suppress a coverage gap. A checkout module that could supply an SDK import produces a gap. The SDK’s standard session and request types can appear directly in a Context annotation. SDK subscriptions receiving a server or agent class and unions combining SDK objects remain visible to registration analysis. Runtime changes to import paths are unverified.
+Qualified SDK module imports remain unresolved when an installed or isolated launcher can skip a checkout package. An SDK-named helper inside a regular package can be ruled out when its bounded source contains only passive definitions and cannot supply the imported name or submodule. A same-stem alternate module, an adjacent excluded bytecode cache, or a directory link beneath the package leaves the import unresolved. Common standard-library imports before the helper definition are allowed only when the applicable search roots contain no candidate that could shadow the standard library.
+
 ## Coding-agent settings
+
+A hook can select PowerShell through a variable or glob. When the program name
+offers no PowerShell hint, `-enc` and longer prefixes of `-EncodedCommand` are
+critical. The shorter `-e`, `-ec` and `-en` forms require a base64 operand that
+has recognizable UTF-16LE text structure. Evidence includes a byte-order mark
+with content, a quoted string, a command-like prefix, or sufficient ASCII text.
+Ordinary search arguments such as
+`$GREP -e Makefile` and a value computed by the shell stay medium.
+
+Shell assignment prefixes end at the first command word. After a wrapper such
+as `command` or `nohup`, an assignment-shaped word can name the program.
+`env` consumes its own assignment operands.
 
 For Claude Code, `ide_agents` records the permission mode (`bypassPermissions` is a high finding, `acceptEdits` medium), blanket grants in its allow list, how many allow, ask and deny rules and hook handlers it declares, and findings for hook commands, the `statusLine` and `fileSuggestion` commands, the credential helpers `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh` and `otelHeadersHelper` (each command rated as a hook command is), `env` variables that redirect the API endpoint or load code (by name only), MCP auto-approval, plugins and additional directories. It does not record the rules, commands or `env` values themselves. For Codex it records the approval and sandbox settings, for Cursor its hook commands, and for Cursor, Windsurf, Cline and Codex an `agent.permissionMode` key in their JSON settings. The MCP servers that Codex and Gemini CLI settings declare are inventoried by the `mcp` collector.
 

@@ -24,6 +24,7 @@ def test_only_recognized_framework_generics_can_hide_type_arguments():
 def test_project_agents_module_is_not_an_external_sdk_import(tmp_path):
     local_agents = tmp_path / "agents"
     local_agents.mkdir()
+    (local_agents / "__init__.py").write_text("")
     (local_agents / "research.py").write_text("def summary(): return 'notes'\n")
     (tmp_path / "server.py").write_text(
         "from agents.research import summary\n"

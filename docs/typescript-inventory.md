@@ -76,6 +76,8 @@ module from a client module. `McpServer` is collected only from the
 two module names above; imported from any other spelling, it is a gap, and the
 other gaps below apply to every spelling.
 
+The collector recognizes ordinary console output redirection, primitive member assignments and zero-argument arrows returning a literal. A computed call on a replaced or unresolved receiver produces a coverage gap. Reflective changes to JavaScript globals can remain unobserved.
+
 ## Gaps
 
 The uses of the SDK below are coverage gaps that name the file and line, so the
