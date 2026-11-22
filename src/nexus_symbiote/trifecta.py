@@ -129,15 +129,19 @@ _CONFUSABLES = str.maketrans(
         "\u03c4": "t",
         "\u03c5": "u",
         "\u03c7": "x",
-        # Latin/Armenian look-alikes
+        # Latin/Armenian/Greek/Cyrillic look-alikes
         "\u0261": "g",
         "\u0578": "n",
         "\u0131": "i",
         "\u03f2": "c",
+        "\u03f9": "C",
+        "\u04c0": "L",
         "\u1d04": "c",
         "\u1d0f": "o",
+        "\u0191": "F",
         "\u0192": "f",
         "\u0251": "a",
+        "\u0555": "O",
         "\u0585": "o",
     }
 )
@@ -652,7 +656,7 @@ def _normalize_identifier(text: str) -> str:
         if unicodedata.category(ch) not in {"Cf", "Cc", "Cs", "Co", "Cn", "Mn"}
     )
     folded = cleaned.translate(_CONFUSABLES)
-    return _CAMEL_BOUNDARY_RE.sub("_", folded).strip().lower()
+    return _CAMEL_BOUNDARY_RE.sub("_", folded).strip().lower().translate(_CONFUSABLES)
 
 
 def canonical_tool_name(name: str) -> str:
@@ -789,7 +793,12 @@ def _scope_identifier(part: str, *, network_words: bool, nested: bool = False) -
     # combining marks so precomposed diacritics cannot split broad/network words.
     folded = unicodedata.normalize("NFKD", part.translate(_CONFUSABLES)).translate(_CONFUSABLES)
     folded = "".join(ch for ch in folded if unicodedata.category(ch) not in {"Mn", "Cf"})
-    normalized = _CAMEL_BOUNDARY_RE.sub("_", folded).casefold().translate(_SCOPE_LOOKALIKES)
+    normalized = (
+        _CAMEL_BOUNDARY_RE.sub("_", folded)
+        .casefold()
+        .translate(_CONFUSABLES)
+        .translate(_SCOPE_LOOKALIKES)
+    )
     letters = "".join(ch for ch in normalized if ch.isalpha())
     if not letters:
         return False

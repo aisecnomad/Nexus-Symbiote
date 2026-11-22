@@ -12,6 +12,12 @@ from nexus_symbiote.trifecta import _independent_read
     "scope",
     [
         "kb:\u03f2loud",
+        "table:\u03f9LOUD",
+        "table:W\u0555RLD",
+        "table:GL\u0555BAL",
+        "table:PUBLI\u03f9",
+        "table:WILD\u03f9ARD",
+        "table:A\u04c0\u04c0",
         "table:áll_buckets",
         "kb:wéb_api",
         "table:ᴀll",
