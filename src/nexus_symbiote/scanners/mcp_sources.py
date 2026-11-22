@@ -22,6 +22,7 @@ import codecs
 import functools
 import io
 import re
+import sys
 import tokenize
 import unicodedata
 import warnings
@@ -42,6 +43,7 @@ from nexus_symbiote.scanners.python_tools import (
     _SDK_IMPORT_ROOTS,
     PYTHON_TOOL_HINTS,
     _annotation_names,
+    _PassiveModule,
     _ProjectImports,
     collect_python_tools,
 )
@@ -1145,9 +1147,14 @@ def _python_launches(tree: ast.Module, project_imports: _ProjectImports) -> list
     return sorted(gaps)
 
 
-def _plain_module_names(
-    path: Path, source: _Source, node_limit: int, future_safe: bool
-) -> frozenset[str] | None:
+# These imports are common before a tool declaration. Without a local stdlib
+# candidate, importing them only binds their names in a passive helper.
+_PASSIVE_HEADER_MODULES = frozenset(
+    {"collections.abc", "dataclasses", "functools", "logging", "os", "pathlib", "typing"}
+)
+
+
+def _plain_module_names(path: Path, source: _Source, node_limit: int) -> _PassiveModule | None:
     """Names a passive SDK-named package helper can supply at import time."""
     try:
         tree = parse_python(_python_text(source.head))
@@ -1156,6 +1163,7 @@ def _plain_module_names(
     if next(islice(ast.walk(tree), node_limit, None), None) is not None:
         return None
     names: set[str] = set()
+    imports_stdlib = False
     for stmt in tree.body:
         if isinstance(stmt, ast.Pass) or (
             isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
@@ -1192,13 +1200,28 @@ def _plain_module_names(
                 return None
             names.add(stmt.name)
             continue
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)) and any(
+            (alias.asname or alias.name).startswith("__") for alias in stmt.names
+        ):
+            return None
+        if isinstance(stmt, ast.Import) and all(
+            alias.name in _PASSIVE_HEADER_MODULES for alias in stmt.names
+        ):
+            names.update(alias.asname or alias.name.split(".")[0] for alias in stmt.names)
+            imports_stdlib = True
+            continue
         if isinstance(stmt, ast.ImportFrom) and not stmt.level and stmt.module:
-            if (
-                future_safe
-                and stmt.module == "__future__"
-                and all(alias.name == "annotations" and not alias.asname for alias in stmt.names)
+            if stmt.module in _PASSIVE_HEADER_MODULES and all(
+                alias.name != "*" for alias in stmt.names
+            ):
+                names.update(alias.asname or alias.name for alias in stmt.names)
+                imports_stdlib = True
+                continue
+            if stmt.module == "__future__" and all(
+                alias.name == "annotations" and not alias.asname for alias in stmt.names
             ):
                 names.add("annotations")
+                imports_stdlib = True
                 continue
             # When this flat helper is imported as the top-level name, an
             # absent self-import stops execution before subsequent statements.
@@ -1209,9 +1232,9 @@ def _plain_module_names(
                     and any(alias.name != "*" and alias.name not in names for alias in stmt.names)
                 )
             ):
-                return frozenset(names)
+                return _PassiveModule(frozenset(names), imports_stdlib)
         return None
-    return frozenset(names)
+    return _PassiveModule(frozenset(names), imports_stdlib)
 
 
 def _outcome(result: ScanResult) -> tuple[int, int, int]:
@@ -1228,6 +1251,9 @@ def collect_source_references(
     sources: Sequence[Path],
     budget: SourceBudget,
     known: KnownValues | None = None,
+    *,
+    unvisited: Sequence[Path] = (),
+    walk_complete: bool = True,
 ) -> None:
     """Inventory MCP servers, MCP clients and agent tools declared in source.
 
@@ -1244,7 +1270,7 @@ def collect_source_references(
     clients = [_Kind(_script_source(suffix), _client_candidate) for suffix in _CLIENT_SUFFIXES]
     kinds = (servers, python, *clients)
     python_paths = frozenset(path for path in sources if path.suffix == ".py")
-    plain_modules: dict[Path, frozenset[str]] = {}
+    plain_modules: dict[Path, _PassiveModule] = {}
     # Include non-Python files and nested directories as possible import
     # entries. An extension module or namespace directory keeps its ambiguity.
     entries = frozenset(
@@ -1257,10 +1283,32 @@ def collect_source_references(
         )
         if entry.parent.name in _SDK_IMPORT_ROOTS
     )
-    future_safe = not any(
-        "__future__" in path.parts or path.name.partition(".")[0] == "__future__"
-        for path in sources
-    )
+    # A package link, alternate loader, or excluded local bytecode cache makes
+    # the selected source uncertain. Never open a binary or enter a skipped cache.
+    uncertain: set[Path] = set()
+    cache_parents = {p.parent for p in unvisited if p.name.casefold() == "__pycache__"}
+    for path in unvisited:
+        uncertain.update(p for p in (path, *path.parents) if p.name in _SDK_IMPORT_ROOTS)
+    for path in sources:
+        stem, dot, suffix = path.name.partition(".")
+        if not stem or not dot or suffix == "py":
+            continue
+        owner = path.parent if stem == "__init__" else path.with_name(stem)
+        if owner.name in _SDK_IMPORT_ROOTS and (
+            path.suffix.casefold() in {".so", ".pyd", ".pyc"}
+            or owner.with_suffix(".py") in python_paths
+            or owner / "__init__.py" in python_paths
+        ):
+            uncertain.add(owner)
+    uncertain_modules = frozenset(uncertain)
+    # A standard module (or one of its own imports) can also resolve to the
+    # checkout. Index candidate roots once and check them for each entry file.
+    stdlib_roots: set[Path] = set()
+    for path in (*sources, *unvisited):
+        if path.name.partition(".")[0] in sys.stdlib_module_names:
+            stdlib_roots.add(path.parent)
+        if not sys.stdlib_module_names.isdisjoint(path.parts[:-1]):
+            stdlib_roots.update(p.parent for p in path.parents if p.name in sys.stdlib_module_names)
     eligible = [path for path in sources if any(kind.eligible(path) for kind in kinds)]
     # Root files first, as before, so what a lowered budget reads stays predictable.
     eligible.sort(key=lambda path: len(path.parts) > 1)
@@ -1290,10 +1338,14 @@ def collect_source_references(
                 path.suffix == ".py"
                 and owner.name in _SDK_IMPORT_ROOTS
                 and owner.parent / "__init__.py" in python_paths
+                and walk_complete
+                and owner not in uncertain_modules
+                and path.parent not in cache_parents
+                and files.link_target(path) is None
                 and source.complete
                 and source.size <= settings.syntax_bytes
             ):
-                names = _plain_module_names(path, source, python_nodes.value, future_safe)
+                names = _plain_module_names(path, source, python_nodes.value)
                 if names is not None:
                     plain_modules[path] = names
             candidate = False
@@ -1344,7 +1396,14 @@ def collect_source_references(
             if len(nodes) > python_nodes.value:
                 fail(path, python_nodes.exceeded())
                 continue
-            project_imports = _ProjectImports(python_paths, path.parent, plain_modules, entries)
+            project_imports = _ProjectImports(
+                python_paths,
+                path.parent,
+                plain_modules,
+                entries,
+                uncertain_modules,
+                stdlib_roots.isdisjoint((Path(), Path("src"), path.parent)),
+            )
             collect_python_tools(
                 tree, nodes, text, path, result, known, project_imports=project_imports
             )

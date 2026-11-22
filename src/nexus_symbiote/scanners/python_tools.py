@@ -31,13 +31,26 @@ def _names(words: str) -> frozenset[str]:
     return frozenset(words.split())
 
 
+class _PassiveModule(NamedTuple):
+    names: frozenset[str]
+    imports_stdlib: bool
+
+
 class _ProjectImports(NamedTuple):
     """Possible Python search roots and the files found by the confined walk."""
 
     sources: frozenset[Path]
     entry_dir: Path
-    plain_modules: dict[Path, frozenset[str]]
+    plain_modules: dict[Path, _PassiveModule]
     entries: frozenset[Path]
+    uncertain_modules: frozenset[Path]
+    stdlib_search_clear: bool
+
+    def _passive_names(self, path: Path) -> frozenset[str] | None:
+        module = self.plain_modules.get(path)
+        if module is None or (module.imports_stdlib and not self.stdlib_search_clear):
+            return None
+        return module.names
 
     def _module_at(self, root: Path, relative: Path) -> bool:
         return (
@@ -62,9 +75,11 @@ class _ProjectImports(NamedTuple):
         name, dot, rest = module.partition(".")
         for root in (Path(), Path("src"), self.entry_dir):
             package = root / name
+            if package in self.uncertain_modules:
+                return True
             init = package / "__init__.py"
             if init in self.sources:
-                names = self.plain_modules.get(init)
+                names = self._passive_names(init)
                 child = rest.partition(".")[0] if dot else member
                 if names is None or child is None or package / child in self.entries:
                     return True
@@ -72,7 +87,7 @@ class _ProjectImports(NamedTuple):
                     return True
             flat = root / (name + ".py")
             if flat in self.sources:
-                names = self.plain_modules.get(flat)
+                names = self._passive_names(flat)
                 if names is None or (not dot and (member is None or member in names)):
                     return True
         return False
