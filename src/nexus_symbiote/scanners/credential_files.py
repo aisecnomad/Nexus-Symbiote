@@ -99,7 +99,7 @@ def link_gap(target: str | None, *, colang_rail: str | None = None) -> str | Non
     """Why a symlink that leads to ``target`` is not followed, or None."""
     if target is None:
         return None
-    if colang_rail is not None and any(
+    if any(
         part.casefold() in _RAIL_LINK_CREDENTIAL_STORES for part in PurePosixPath(target).parts[:-1]
     ):
         return "symlink leads into a credential directory"
@@ -123,7 +123,7 @@ def withheld(
     """
     relative = PurePosixPath(path)
     reason: str | None
-    if not colang_source and credential_shaped(relative.name):
+    if credential_shaped(relative.name, colang_source=colang_source):
         reason = "its name says it holds credentials"
     else:
         linked = files.in_root_target(path)

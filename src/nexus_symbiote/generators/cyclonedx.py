@@ -186,6 +186,7 @@ class CycloneDXGenerator(Generator):
                 subject,
                 comp_by_ref=comp_by_ref,
                 outgoing_by_source=outgoing_by_source,
+                legacy_locations=legacy_locations,
             ),
             "components": [
                 self._component(
@@ -381,6 +382,7 @@ class CycloneDXGenerator(Generator):
         *,
         comp_by_ref: dict[str, AnyComponent] | None = None,
         outgoing_by_source: dict[str, list[Any]] | None = None,
+        legacy_locations: bool = False,
     ) -> dict[str, Any]:
         # The native BOM carries no wall-clock timestamp by default; omit
         # the field rather than emitting null, which the CycloneDX schema
@@ -410,6 +412,7 @@ class CycloneDXGenerator(Generator):
                 subject=subject,
                 comp_by_ref=comp_by_ref or {},
                 outgoing_edges=(outgoing_by_source or {}).get(subject.bom_ref, ()),
+                legacy_locations=legacy_locations,
             )
         edges = sorted(
             {

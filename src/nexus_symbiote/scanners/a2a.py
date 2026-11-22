@@ -900,18 +900,22 @@ class A2AScanner(Scanner):
         canonical, exact = location
         if exact:
             cards.append(canonical)
-        elif self._is_card(path, canonical, files):
+        elif self._is_card(path, canonical, files, result):
             result.scan_failures.append(
                 f"{path.as_posix()}: case variant of {canonical} is the active "
                 "file on case-insensitive file systems and is not inventoried"
             )
 
-    @staticmethod
-    def _is_card(path: Path, canonical: str, files: ConfinedCollection) -> bool:
+    @classmethod
+    def _is_card(
+        cls, path: Path, canonical: str, files: ConfinedCollection, result: ScanResult
+    ) -> bool:
         if canonical not in _GENERIC_CARD_PATHS:
             return True
         # A generic name is a card only with an A2A field; a read failure is recorded.
         data = files.read_json(path)
+        if cls._relinked(path.as_posix(), files, result):
+            return False
         return data is None or (isinstance(data, dict) and bool(_CARD_MARKERS & set(data)))
 
     def _record_cards(self, parsed: list[tuple[str, dict[str, Any]]], result: ScanResult) -> None:
