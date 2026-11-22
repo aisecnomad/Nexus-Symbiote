@@ -66,8 +66,10 @@ def _launcher(tmp_path: Path, marker: Path, *, detached: bool = False) -> tuple[
         tmp_path / "launcher",
         f"""marker = {str(marker)!r}
 def record():
-    # Written whole before it appears, so a reader never sees an empty marker.
-    open(marker + ".tmp", "w").write(os.readlink("/proc/self"))
+    # Written whole before it appears, so a reader never sees an empty marker. In a PID
+    # namespace only /proc/self holds the host pid; elsewhere there is no namespace.
+    host = os.readlink("/proc/self") if sys.platform == "linux" else str(os.getpid())
+    open(marker + ".tmp", "w").write(host)
     os.rename(marker + ".tmp", marker)
 if os.fork() == 0:
     os.setsid()
@@ -106,12 +108,32 @@ while not os.listdir(helpers):
     )
 
 
+# The host's, read before any test simulates another platform.
+_LINUX = sys.platform.startswith("linux")
+_LINUX_ONLY = pytest.mark.skipif(not _LINUX, reason="the subreaper wrapper is Linux-only")
+_SWEEP_ONLY = pytest.mark.skipif(not _LINUX, reason="the /proc descendant sweep is Linux-only")
+_NAMESPACE_ONLY = pytest.mark.skipif(not _LINUX, reason="the PID namespace teardown is Linux-only")
+
+
 def _host_pid(marker: Path) -> int:
     return int(marker.read_text())
 
 
 def _stat(pid: int) -> list[str]:
-    """The state, parent and later fields of ``/proc/<pid>/stat``; ``["X"]`` once reaped."""
+    """The state, parent and later fields of ``/proc/<pid>/stat``; ``["X"]`` once reaped.
+
+    Without /proc only the state is known, from ``ps``, so that a process that is still
+    running is never read as reaped.
+    """
+    if not _LINUX:
+        state = subprocess.run(  # noqa: S603
+            ["/bin/ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        ).stdout.strip()
+        return [state[:1] or "X"]
     try:
         with open(f"/proc/{pid}/stat", "rb") as stat:
             return stat.read().rpartition(b")")[2].decode().split()
@@ -185,8 +207,187 @@ def test_a_missing_namespace_or_launcher_never_starts_the_pinned_program(
     assert not marker.exists()
 
 
+def test_off_linux_a_default_launch_is_refused_before_anything_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An executable named unshare on a macOS path is not util-linux's, and the teardown
+    # that would confirm a namespace ended reads /proc: no probe and no launch may pass.
+    def no_probe() -> bool:
+        raise AssertionError("no namespace probe runs off Linux")
+
+    monkeypatch.setattr(pinned_process, "_probe_namespace", no_probe)
+    monkeypatch.setattr(pinned_process.sys, "platform", "darwin")
+    assert pinned_process.namespace_available() is False
+    fake = tmp_path / "unshare"
+    fake.write_text(_SAME_NAMESPACE_UNSHARE)
+    fake.chmod(0o700)
+    monkeypatch.setattr(pinned_process, "namespace_available", lambda: True)
+    monkeypatch.setattr(pinned_process, "_unshare_path", lambda: str(fake))
+    starts: list[object] = []
+
+    def refuse_start(*args: object, **kwargs: object) -> None:
+        starts.append(args)
+        raise AssertionError("the pinned program must not be started")
+
+    monkeypatch.setattr(pinned_process.subprocess, "Popen", refuse_start)
+    marker = tmp_path / "pid"
+    command, digest = _launcher(tmp_path, marker)
+    with pytest.raises(LaunchPolicyError) as denied:
+        observe_pinned(str(command), digest)
+    assert denied.value.reason == "isolation-unavailable"
+    session = PinnedStdioSession(command=str(command), sha256=digest, server_id="server:mail")
+    with pytest.raises(AuthorizationError, match="kernel PID containment"), session:
+        pass
+    assert starts == []
+    assert not marker.exists()
+
+
+def test_off_linux_the_cli_refuses_pinned_execution_without_an_explicit_opt_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pinned_process.sys, "platform", "darwin")
+    monkeypatch.setattr("nexus_symbiote.supply_chain_cli._running_as_root", lambda: False)
+    arguments, _ = command(tmp_path, inventory(), launcher(tmp_path))
+    blocked = CliRunner().invoke(main, [*arguments, "--json-output"])
+    assert blocked.exit_code == 1, blocked.output
+    assert json.loads(blocked.stdout)["results"][0]["reason"] == "isolation-unavailable"
+
+
+def _recorded_launches(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Every process the pinned launch helpers start, still started for real."""
+    launches: list[list[str]] = []
+    popen = subprocess.Popen
+
+    def record(argv: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        launches.append(list(argv))
+        return popen(argv, **kwargs)
+
+    monkeypatch.setattr(pinned_process.subprocess, "Popen", record)
+    return launches
+
+
+def test_off_linux_verify_live_refuses_the_isolation_opt_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Off Linux only killpg would remain, and a setsid child would outlive a session
+    # reported as a success, so the opt-out is refused before any launcher runs.
+    monkeypatch.setattr(pinned_process.sys, "platform", "darwin")
+    monkeypatch.setattr("nexus_symbiote.supply_chain_cli._running_as_root", lambda: True)
+    launches = _recorded_launches(monkeypatch)
+    arguments, _ = command(tmp_path, inventory(), launcher(tmp_path))
+    refused = CliRunner().invoke(main, [*arguments, "--json-output", "--no-isolation"])
+    assert refused.exit_code == 1, refused.output
+    report = json.loads(refused.stdout)
+    assert not report["complete"]
+    assert [result["reason"] for result in report["results"]] == ["isolation-unavailable"]
+    # The shown remedy must not offer the opt-out that was just refused.
+    assert "--no-isolation" not in report["results"][0]["error"]
+    stderr = " ".join(refused.stderr.split())
+    assert "--no-isolation is refused off Linux" in stderr
+    assert "kernel PID containment is disabled" not in stderr
+    assert "--no-isolation as root" not in stderr
+    assert launches == []
+
+
+@pytest.mark.parametrize(("platform", "offered"), [("darwin", False), ("linux", True)])
+def test_the_isolation_unavailable_remedy_offers_the_opt_out_only_on_linux(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str, offered: bool
+) -> None:
+    monkeypatch.setattr(pinned_process.sys, "platform", platform)
+    shown = verify.reason_message("isolation-unavailable")
+    assert ("--no-isolation" in shown) is offered
+    assert "the pinned launcher was not executed" in shown
+    # The default launch is refused off Linux as well, and shows the same remedy.
+    monkeypatch.setattr(pinned_process, "namespace_available", lambda: False)
+    report = verify.verify_mcp_servers(inventory(), trusted_launchers=launcher(tmp_path))
+    assert [(r.reason, r.error) for r in report.results] == [("isolation-unavailable", shown)]
+
+
+def test_off_linux_isolation_off_refuses_every_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pinned_process.sys, "platform", "darwin")
+    launches = _recorded_launches(monkeypatch)
+    marker = tmp_path / "pid"
+    command_path, digest = _launcher(tmp_path, marker, detached=True)
+    with isolation_off():
+        assert pinned_process.opt_out_supported() is False
+        with pytest.raises(LaunchPolicyError) as denied:
+            observe_pinned(str(command_path), digest)
+        assert denied.value.reason == "isolation-unavailable"
+        session = PinnedStdioSession(
+            command=str(command_path), sha256=digest, server_id="server:mail"
+        )
+        with pytest.raises(AuthorizationError, match="opt-out is refused off Linux"), session:
+            pass
+        with pytest.raises(pinned_process.PinnedProcessError) as argv_denied:
+            pinned_process.isolated_argv(tmp_path / "server")
+        assert argv_denied.value.reason == "isolation-unavailable"
+    assert launches == []
+    time.sleep(0.2)
+    assert not marker.exists()
+
+
+def test_on_linux_the_isolation_opt_out_still_launches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staged = tmp_path / "server"
+    with monkeypatch.context() as linux:
+        linux.setattr(pinned_process.sys, "platform", "linux")
+        assert pinned_process.opt_out_supported() is True
+        with isolation_off():
+            argv = pinned_process.isolated_argv(staged)
+        assert argv[-1] == str(staged)
+    if not _LINUX:
+        return
+    # On a Linux host the opted-out launch runs, and its double-forked child is killed.
+    marker = tmp_path / "pid"
+    command_path, digest = _launcher(tmp_path, marker, detached=True)
+    with isolation_off():
+        observe_pinned(str(command_path), digest)
+    _assert_dead(_host_pid(marker))
+
+
+@pytest.mark.parametrize(
+    ("platform", "exited", "raised"),
+    [("darwin", True, False), ("darwin", False, True), ("linux", True, True)],
+)
+def test_only_macos_refusing_to_signal_an_exited_launcher_group_counts_as_ended(
+    monkeypatch: pytest.MonkeyPatch, platform: str, exited: bool, raised: bool
+) -> None:
+    # macOS answers killpg with EPERM when the group holds only the unreaped launcher.
+    script = "" if exited else "import time; time.sleep(30)"
+    proc = subprocess.Popen([sys.executable, "-c", script], start_new_session=True)  # noqa: S603
+    try:
+        if exited:
+            deadline = time.monotonic() + 10
+            while _stat(proc.pid)[0] not in {"Z", "X"} and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        def refuse(pgid: int, sig: int) -> None:
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+
+        monkeypatch.setattr(pinned_process.sys, "platform", platform)
+        monkeypatch.setattr(pinned_process.os, "killpg", refuse)
+        monkeypatch.setattr(pinned_process, "_kill_descendants", lambda root: None)
+        monkeypatch.setattr(pinned_process, "_kill_session", lambda sid: None)
+        # The stop needs os.waitid, which macOS has only from Python 3.13.
+        monkeypatch.setattr(pinned_process, "_stop_launcher", lambda pid: None)
+        if raised:
+            with pytest.raises(PermissionError):
+                pinned_process.terminate_process_group(proc)
+        else:
+            pinned_process.terminate_process_group(proc)
+            assert proc.returncode == 0
+    finally:
+        monkeypatch.undo()
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=5)
+
+
 def test_a_finished_pid_is_not_remembered_as_namespaced() -> None:
-    proc = subprocess.Popen(["/bin/true"], start_new_session=True)  # noqa: S603
+    proc = subprocess.Popen([sys.executable, "-c", ""], start_new_session=True)  # noqa: S603
     proc.wait(timeout=5)
     pinned_process._NAMESPACED.add(proc.pid)
     pinned_process.terminate_process_group(proc)
@@ -212,7 +413,7 @@ def test_teardown_leaves_the_exit_status_of_another_child() -> None:
 def test_a_forgotten_pid_is_swept_again_when_reused(monkeypatch: pytest.MonkeyPatch) -> None:
     swept: list[int] = []
     monkeypatch.setattr(pinned_process, "_kill_descendants", swept.append)
-    proc = subprocess.Popen(["/bin/true"], start_new_session=True)  # noqa: S603
+    proc = subprocess.Popen([sys.executable, "-c", ""], start_new_session=True)  # noqa: S603
     proc.wait(timeout=5)
     pinned_process._NAMESPACED.add(proc.pid)
     pinned_process.terminate_process_group(proc)
@@ -221,15 +422,18 @@ def test_a_forgotten_pid_is_swept_again_when_reused(monkeypatch: pytest.MonkeyPa
     assert swept == [proc.pid, proc.pid]
 
 
-def test_opt_out_kills_a_double_fork_and_a_refused_namespace_never_starts_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@_LINUX_ONLY
+def test_opt_out_kills_a_double_fork(tmp_path: Path) -> None:
     marker = tmp_path / "pid"
     command, digest = _launcher(tmp_path, marker, detached=True)
     with isolation_off():
         observe_pinned(str(command), digest)
     _assert_dead(_host_pid(marker))
 
+
+def test_a_refused_namespace_never_starts_a_double_fork(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(pinned_process, "namespace_available", lambda: False)
     off = tmp_path / "off"
     off.mkdir()
@@ -295,6 +499,7 @@ for _ in range(1000):
             os.kill(_host_pid(marker), signal.SIGKILL)
 
 
+@_SWEEP_ONLY
 def test_opt_out_stops_the_launcher_before_its_tree_is_swept(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -341,6 +546,7 @@ def test_opt_out_stops_the_launcher_before_its_tree_is_swept(
                 os.kill(pid, signal.SIGKILL)
 
 
+@_LINUX_ONLY
 def test_a_launcher_that_does_not_stop_is_still_killed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -367,9 +573,10 @@ def test_cleanup_elsewhere_than_linux_does_not_stop_the_launcher(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Python before 3.13 has no os.waitid on macOS, and the sweep that the stop serves
-    # reads Linux's /proc.
+    # reads Linux's /proc. Without them a setsid child outlived the cleanup, so the opt-out
+    # is refused there before anything runs, and nothing is left to stop or signal.
     monkeypatch.setattr(pinned_process.sys, "platform", "darwin")
-    monkeypatch.delattr(pinned_process.os, "waitid")
+    monkeypatch.delattr(pinned_process.os, "waitid", raising=False)
     kill = os.kill
     sent: list[int] = []
 
@@ -380,10 +587,12 @@ def test_cleanup_elsewhere_than_linux_does_not_stop_the_launcher(
     monkeypatch.setattr(pinned_process.os, "kill", record)
     marker = tmp_path / "pid"
     command, digest = _launcher(tmp_path, marker)
-    with isolation_off():
+    with isolation_off(), pytest.raises(LaunchPolicyError) as denied:
         observe_pinned(str(command), digest)
-    assert signal.SIGSTOP not in sent
-    _assert_dead(_host_pid(marker))
+    assert denied.value.reason == "isolation-unavailable"
+    assert sent == []
+    time.sleep(0.2)
+    assert not marker.exists()
 
 
 class _NoPrctl:
@@ -410,6 +619,14 @@ def test_subreaper_wrapper_needs_linux_prctl_and_an_interpreter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attribute: str, value: object
 ) -> None:
     staged = tmp_path / "server"
+    if not _LINUX:
+        # This host is the case the parameters simulate: no wrapper, and the opt-out is
+        # refused rather than run as a direct exec.
+        assert pinned_process._subreaper_argv(staged) is None
+        with isolation_off(), pytest.raises(pinned_process.PinnedProcessError) as denied:
+            pinned_process.isolated_argv(staged)
+        assert denied.value.reason == "isolation-unavailable"
+        return
     assert pinned_process._subreaper_argv(staged) == [
         sys.executable,
         "-I",
@@ -423,9 +640,16 @@ def test_subreaper_wrapper_needs_linux_prctl_and_an_interpreter(
     monkeypatch.setattr(owner, attribute, value, raising=False)
     assert pinned_process._subreaper_argv(staged) is None
     with isolation_off():
-        assert pinned_process.isolated_argv(staged) == [str(staged)]
+        if attribute == "platform":
+            # Off Linux the opt-out is refused rather than run as a direct exec.
+            with pytest.raises(pinned_process.PinnedProcessError) as denied:
+                pinned_process.isolated_argv(staged)
+            assert denied.value.reason == "isolation-unavailable"
+        else:
+            assert pinned_process.isolated_argv(staged) == [str(staged)]
 
 
+@_SWEEP_ONLY
 def test_opt_out_without_prctl_still_launches_and_cleans_up(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -448,10 +672,19 @@ def test_cli_requires_an_explicit_opt_out_when_the_namespace_is_unavailable(
     assert blocked.exit_code == 1, blocked.output
     assert json.loads(blocked.stdout)["results"][0]["reason"] == "isolation-unavailable"
     allowed = CliRunner().invoke(main, [*arguments, "--json-output", "--no-isolation"])
-    assert allowed.exit_code == 0, allowed.output
-    assert "kernel PID containment is disabled" in allowed.stderr
     usage = " ".join(CliRunner().invoke(main, ["verify-live", "--help"]).output.split())
-    for text in (" ".join(allowed.stderr.split()), usage):
+    assert "Refused off Linux, where no launcher runs" in usage
+    texts = [usage]
+    if _LINUX:
+        assert allowed.exit_code == 0, allowed.output
+        assert "kernel PID containment is disabled" in allowed.stderr
+        texts.append(" ".join(allowed.stderr.split()))
+    else:
+        # The opt-out is refused here before any launcher runs.
+        assert allowed.exit_code == 1, allowed.output
+        assert json.loads(allowed.stdout)["results"][0]["reason"] == "isolation-unavailable"
+        assert "--no-isolation is refused off Linux" in " ".join(allowed.stderr.split())
+    for text in texts:
         assert "its own process group" in text
         assert "stays its parent as a child subreaper" in text
         assert "ignores the signals it can" in text
@@ -465,6 +698,7 @@ def test_cli_requires_an_explicit_opt_out_when_the_namespace_is_unavailable(
     assert "--no-isolation as root" not in allowed.stderr
 
 
+@_LINUX_ONLY
 def test_a_descendant_that_cannot_be_signalled_does_not_abort_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -501,6 +735,7 @@ def test_a_descendant_that_cannot_be_signalled_does_not_abort_cleanup(
     _assert_dead(groups[0])
 
 
+@_SWEEP_ONLY
 def test_a_process_name_that_is_not_utf8_does_not_end_the_descendant_scan() -> None:
     """/proc/<pid>/status holds the name as raw bytes, and any process may set its own."""
     rename = "import ctypes, time; ctypes.CDLL(None).prctl(15, b'caf\\xe9', 0, 0, 0); "
@@ -538,12 +773,14 @@ def test_the_launcher_group_is_killed_when_the_sweep_fails(
             pinned_process.terminate_process_group(proc)
     finally:
         monkeypatch.undo()
-        with contextlib.suppress(ProcessLookupError):
+        # macOS refuses killpg for a group that holds only the killed, unreaped leader.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
             killpg(proc.pid, signal.SIGKILL)
     assert groups == [proc.pid]
     assert proc.wait(timeout=5) == -signal.SIGKILL
 
 
+@_LINUX_ONLY
 def test_no_launch_runs_python_between_fork_and_exec(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -666,6 +903,8 @@ def test_each_wrapper_hands_over_the_state_of_a_direct_exec(
 ) -> None:
     if wrapper == "gate" and _refuses_without_a_namespace(tmp_path):
         return
+    if not _LINUX:
+        pytest.skip("the subreaper wrapper is Linux-only")
     wrapped, direct, blocked = _wrapped_and_direct(tmp_path, monkeypatch, wrapper)
     assert wrapped == direct
     assert wrapped[0] == f"PATH={os.defpath}"
@@ -691,6 +930,8 @@ def test_the_launch_state_comparison_detects_a_wrapper_that_leaks(
 ) -> None:
     if wrapper == "gate" and _refuses_without_a_namespace(tmp_path):
         return
+    if not _LINUX:
+        pytest.skip("the subreaper wrapper is Linux-only")
     program = _WRAPPERS[wrapper][0]
     leaky = getattr(pinned_process, program).replace(restored, leak)
     assert leaky != getattr(pinned_process, program)
@@ -699,6 +940,7 @@ def test_the_launch_state_comparison_detects_a_wrapper_that_leaks(
     assert wrapped != direct
 
 
+@_LINUX_ONLY
 def test_a_stalled_subreaper_wrapper_is_bounded_by_the_protocol_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -918,6 +1160,8 @@ _UNDECODABLE_NAME = b"\xff\n) Z 1 (\xfe"
 @pytest.fixture
 def undecodable_bystander() -> Iterator[int]:
     """A process outside every session whose command name is not UTF-8."""
+    if not _LINUX:
+        pytest.skip("the /proc descendant sweep is Linux-only")
     proc = subprocess.Popen(  # noqa: S603
         [
             sys.executable,
@@ -1034,6 +1278,7 @@ def _end_supervised(proc: subprocess.Popen[bytes], init: int | None) -> None:
     proc.wait(timeout=5)
 
 
+@_NAMESPACE_ONLY
 def test_namespaced_cleanup_kills_an_init_that_left_the_process_group(tmp_path: Path) -> None:
     proc, init = _supervised(tmp_path)
     assert init is not None
@@ -1046,6 +1291,7 @@ def test_namespaced_cleanup_kills_an_init_that_left_the_process_group(tmp_path: 
         _end_supervised(proc, init)
 
 
+@_NAMESPACE_ONLY
 @pytest.mark.parametrize("held", [True, False])
 def test_an_init_that_outlived_a_killed_unshare_is_ended_or_reported(
     tmp_path: Path, held: bool
@@ -1076,6 +1322,7 @@ def test_an_init_that_outlived_a_killed_unshare_is_ended_or_reported(
         _end_supervised(proc, init)
 
 
+@_NAMESPACE_ONLY
 def test_a_held_init_that_does_not_end_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1114,6 +1361,7 @@ def test_an_unexpected_error_while_ending_the_namespace_is_a_teardown_failure(
         _end_supervised(proc, init)
 
 
+@_NAMESPACE_ONLY
 @pytest.mark.parametrize("mode", ["idle", "exit"])
 def test_namespaced_cleanup_without_a_running_init_succeeds(tmp_path: Path, mode: str) -> None:
     # unshare stopped before it forked, or after its init exited: nothing is left to end.
@@ -1150,6 +1398,7 @@ def test_namespaced_cleanup_fails_closed_when_the_init_does_not_end(
         _end_supervised(proc, init)
 
 
+@_NAMESPACE_ONLY
 def test_namespaced_cleanup_signals_no_child_of_a_running_unshare(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1207,6 +1456,7 @@ def test_an_unreadable_init_status_is_not_an_ended_init(monkeypatch: pytest.Monk
     assert pinned_process._ended(4242) is False
 
 
+@_NAMESPACE_ONLY
 def test_the_status_reader_returns_the_fields_of_a_live_and_a_reaped_process() -> None:
     fields = pinned_process._status(os.getpid())
     assert fields is not None
@@ -1285,8 +1535,10 @@ def test_verify_live_fails_a_server_whose_namespace_did_not_end(
     assert result.exit_code == 1, result.output
     report = json.loads(result.stdout)
     assert not report["complete"]
-    assert report["results"][0]["reason"] == "isolation-teardown-failed"
-    assert report["results"][0]["error"] == verify.REASONS["isolation-teardown-failed"]
+    # Off Linux the opt-out is refused before a launcher runs, so no teardown happens.
+    reason = "isolation-teardown-failed" if _LINUX else "isolation-unavailable"
+    assert report["results"][0]["reason"] == reason
+    assert report["results"][0]["error"] == verify.reason_message(reason)
 
 
 def test_gate_is_disabled_and_init_fd_closes_without_pidfd_send_signal(
@@ -1379,11 +1631,6 @@ def test_opt_out_kills_what_a_launcher_that_already_exited_left_behind(tmp_path:
         for stream in (proc.stdin, proc.stdout):
             if stream is not None:
                 stream.close()
-
-
-_LINUX_ONLY = pytest.mark.skipif(
-    not sys.platform.startswith("linux"), reason="the subreaper wrapper is Linux-only"
-)
 
 
 def _worker_prelude(marker: Path) -> str:
@@ -2112,6 +2359,12 @@ def test_opting_out_as_root_prints_a_second_warning(
     monkeypatch.setattr("nexus_symbiote.supply_chain_cli._running_as_root", lambda: True)
     arguments, _ = command(tmp_path, inventory(), launcher(tmp_path))
     allowed = CliRunner().invoke(main, [*arguments, "--json-output", "--no-isolation"])
+    if not _LINUX:
+        # The opt-out is refused here, so no launcher runs as root to warn about.
+        assert allowed.exit_code == 1, allowed.output
+        assert "--no-isolation is refused off Linux" in " ".join(allowed.stderr.split())
+        assert "warning: --no-isolation as root" not in allowed.stderr
+        return
     assert allowed.exit_code == 0, allowed.output
     assert "warning: --no-isolation as root" in allowed.stderr
 
@@ -2635,3 +2888,15 @@ def test_a_survivor_whose_main_thread_exited_is_not_taken_for_ended(
     finally:
         monkeypatch.undo()
         _kill_marked(marker)
+
+
+@pytest.mark.parametrize(
+    ("platform", "opted_out", "verifiable"),
+    [("darwin", True, False), ("darwin", False, True), ("linux", True, True)],
+)
+def test_teardown_is_verifiable_unless_opted_out_where_descendants_cannot_be_listed(
+    platform: str, opted_out: bool, verifiable: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pinned_process.sys, "platform", platform)
+    with isolation_off() if opted_out else contextlib.nullcontext():
+        assert pinned_process.teardown_verifiable() is verifiable

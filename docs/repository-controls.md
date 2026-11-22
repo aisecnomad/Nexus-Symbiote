@@ -1,7 +1,7 @@
 # Repository verification controls
 
-The `Verified CI` job summarizes the full test matrix, the tests at the declared
-dependency floors, quality checks (including the lock check), coverage, distribution
+The `Verified CI` job summarizes the full test matrix, the full suite on macOS, the tests
+at the declared dependency floors, quality checks (including the lock check), coverage, distribution
 checks, security regressions, dependency-advisory acceptance, CodeQL security
 policy, and the composite Action run end to end on passing, failing and hostile
 fixtures, with a check that the hostile fixture created no annotation. CodeQL is

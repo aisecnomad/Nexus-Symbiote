@@ -208,6 +208,9 @@ class Config:
     fail_on_severity: str = "high"
     binding_key: str = field(default="", repr=False)
     scratch_parent: Path | None = None
+    baseline_attestation: bytes | None = field(default=None, repr=False)
+    trusted_verifiers: tuple[Path, ...] = field(default=(), repr=False)
+    attest: bool = False
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Config:
@@ -241,6 +244,7 @@ class Config:
         if len(limits) > MAX_LIMITS_LENGTH or any(c in limits for c in "\r\n\x00"):
             raise InputError("limits must be one line of NAME=VALUE pairs separated by commas")
         _boolean(env.get("SYMBIOTE_UPLOAD_ARTIFACT", "true"), "upload-artifact")
+        attest = _boolean(env.get("SYMBIOTE_ATTEST", "false"), "attest")
         from nexus_symbiote.signature_policy import MAX_POLICY_BYTES
 
         policy = env.get("SYMBIOTE_SIGNATURE_POLICY", "")
@@ -257,6 +261,34 @@ class Config:
             if reviewed
             else None
         )
+        raw_attestation = env.get("SYMBIOTE_REVIEWED_BASELINE_ATTESTATION", "")
+        raw_verifiers_input = env.get("SYMBIOTE_TRUSTED_KEYS", "")
+        if "\x00" in raw_verifiers_input:
+            raise InputError("trusted-keys must not contain NUL")
+        raw_verifiers = tuple(
+            v for part in raw_verifiers_input.replace("\n", ",").split(",") if (v := part.strip())
+        )
+        if raw_attestation and baseline is None:
+            raise InputError("reviewed-baseline-attestation requires reviewed-baseline")
+        if raw_verifiers and not raw_attestation:
+            raise InputError("trusted-keys requires reviewed-baseline-attestation")
+        if raw_attestation and not raw_verifiers:
+            raise InputError("reviewed-baseline-attestation requires trusted-keys")
+        baseline_attestation: bytes | None = None
+        trusted_verifiers: tuple[Path, ...] = ()
+        if raw_attestation:
+            from nexus_symbiote.attestation import MAX_ENVELOPE_BYTES
+            from nexus_symbiote.runtime_cli import MAX_KEY_BYTES
+
+            baseline_attestation = _caller_owned(
+                workspace,
+                raw_attestation,
+                "reviewed-baseline-attestation",
+                MAX_ENVELOPE_BYTES,
+            )
+            for verifier_rel in raw_verifiers:
+                _caller_owned(workspace, verifier_rel, "trusted-keys", MAX_KEY_BYTES)
+            trusted_verifiers = tuple(Path(verifier_rel) for verifier_rel in raw_verifiers)
         from nexus_symbiote.scanners.mcp import (
             _MIN_SOURCE_BINDING_KEY_LENGTH,
             SOURCE_BINDING_KEY_ENV,
@@ -313,6 +345,9 @@ class Config:
             severity,
             supplied_key,
             scratch_parent,
+            baseline_attestation,
+            trusted_verifiers,
+            attest,
         )
 
 
@@ -549,6 +584,7 @@ def run(
     notes: list[str] = []
     out.emit(
         aibom_path="",
+        aibom_digest="",
         sarif_path="",
         risk_score="",
         passed="not-run",
@@ -653,6 +689,10 @@ def run(
             )
             return finish()
         out.emit_path("aibom_path", config.output)
+        export_source = config.output if config.output.is_file() else native
+        if export_source.is_file():
+            export_digest = hashlib.sha256(export_source.read_bytes()).hexdigest()
+            out.emit(aibom_digest=f"sha256:{export_digest}")
         inventory = _json_object(native.read_text(encoding="utf-8")) or {}
         claim = (inventory.get("metadata") or {}).get("completeness") or {}
         failures = claim.get("scan_failures")
@@ -786,23 +826,56 @@ def run(
         else:
             reviewed = scratch / "reviewed-baseline.json"
             reviewed.write_bytes(config.baseline)
-            compared = command(
-                ["diff", str(reviewed), str(native), "--fail-on-alert", "--json-output"]
-            )
-            document = _json_object(compared.stdout)
-            if document is None:
-                _relay("nexus-symbiote diff", _process_lines(compared.stderr))
-                _say("The reviewed baseline could not be compared: is it a native AgentBOM?")
-                record("drift", "failed")
-                out.emit(drift_passed="false")
-            else:
-                alerts = len(document.get("security_alerts") or [])
-                passed = compared.returncode == 0 and alerts == 0
-                shown = _report(diff_report_lines(document))
-                _relay("nexus-symbiote diff", [*shown, *_process_lines(compared.stderr)])
-                out.emit(drift_passed="true" if passed else "false", drift_alerts=str(alerts))
-                record("drift", "passed" if passed else "failed")
-                notes.append(f"Drift alerts against the reviewed baseline: {alerts}")
+            baseline_verified = True
+            if config.baseline_attestation is not None:
+                envelope = scratch / "reviewed-baseline.att.json"
+                envelope.write_bytes(config.baseline_attestation)
+                verifier_args: list[str] = []
+                for verifier_path in config.trusted_verifiers:
+                    verifier_args.extend(["--trusted-key", str(verifier_path)])
+                verified_att = command(
+                    [
+                        "verify-attestation",
+                        str(reviewed),
+                        str(envelope),
+                        "--purpose",
+                        "reviewed",
+                        "--json-output",
+                        *verifier_args,
+                    ]
+                )
+                _relay(
+                    "nexus-symbiote verify-attestation",
+                    _process_lines(verified_att.stdout, verified_att.stderr),
+                )
+                if verified_att.returncode != 0:
+                    _say(
+                        "The reviewed baseline failed attestation verification, so the drift gate failed."
+                    )
+                    record("drift", "failed")
+                    out.emit(drift_passed="false")
+                    notes.append("Reviewed baseline attestation: failed")
+                    baseline_verified = False
+                else:
+                    notes.append("Reviewed baseline attestation: verified")
+            if baseline_verified:
+                compared = command(
+                    ["diff", str(reviewed), str(native), "--fail-on-alert", "--json-output"]
+                )
+                document = _json_object(compared.stdout)
+                if document is None:
+                    _relay("nexus-symbiote diff", _process_lines(compared.stderr))
+                    _say("The reviewed baseline could not be compared: is it a native AgentBOM?")
+                    record("drift", "failed")
+                    out.emit(drift_passed="false")
+                else:
+                    alerts = len(document.get("security_alerts") or [])
+                    passed = compared.returncode == 0 and alerts == 0
+                    shown = _report(diff_report_lines(document))
+                    _relay("nexus-symbiote diff", [*shown, *_process_lines(compared.stderr)])
+                    out.emit(drift_passed="true" if passed else "false", drift_alerts=str(alerts))
+                    record("drift", "passed" if passed else "failed")
+                    notes.append(f"Drift alerts against the reviewed baseline: {alerts}")
     return finish()
 
 

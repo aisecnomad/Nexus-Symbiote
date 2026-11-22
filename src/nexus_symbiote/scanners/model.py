@@ -158,6 +158,9 @@ MIN_PICKLE_OPCODES = 16
 MAX_ZIP_DIRECTORY_BYTES = MAX_MODEL_HEADER_BYTES
 _ZIP_END_RECORD_BYTES = 22 + 65_535 + 20 + 56
 _ZIP_TAIL_BYTES = MAX_ZIP_DIRECTORY_BYTES + _ZIP_END_RECORD_BYTES
+# How far from the end miniz finds an end record: it searches back in 4 KiB reads past
+# the 65,535-byte comment, so a record up to this far back is one it can take.
+_MINIZ_END_SEARCH = 69_584
 ZIP_PICKLE_MEMBER = "ZIP archive with a pickle member; torch.load unpickles it"
 ZIP_OBJECT_ARRAY = (
     "ZIP archive with a NumPy object-dtype array member; np.load(allow_pickle=True) unpickles it"
@@ -294,6 +297,7 @@ _CREDENTIAL_PYTHON_STEM = re.compile(
 _HUB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,95})?")
 _CONFIG_STRING_FIELDS = ("peft_type", "quantization_method", "quant_method")
 SIGSTORE_METHOD = "sigstore-message-signature"
+OMS_DSSE_METHOD = "openssf-model-signing-dsse"
 DIGEST_PIN_METHOD = "digest-pin"
 DOCUMENTATION = "https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/model-integrity.md"
 UNUSED_ENTRY = "signature policy entry names no collected model weight file"
@@ -329,7 +333,7 @@ SHARED_DIGESTS_EXHAUSTED = (
     "scan records; those of this and later models are not recorded"
 )
 
-Verify = Callable[[Path, Path, str | None, str | None], VerificationResult]
+Verify = Callable[..., VerificationResult]
 
 
 # A file no model name rates is checked by its content under these names and suffixes.
@@ -555,25 +559,32 @@ class _ZipMember(NamedTuple):
 
 def _zip_directory(
     stream: BinaryIO, consumed: int, size: int, read: bytes = b""
-) -> list[tuple[list[_ZipMember], int]] | None:
+) -> tuple[list[tuple[list[_ZipMember], int]], bool] | None:
     """The members each central directory a ZIP reader can locate lists, and its offset.
 
     Readers locate it differently, so a decoy directory that one reads must not hide the
     one another reads. A reader that follows the specification reads the directory at
     the offset its end record stores. ``zipfile``, which ``np.load`` uses, reads the
     directory that ends where its end record starts and moves every member's offset by
-    the difference. When a ZIP64 locator precedes the end record, ``zipfile`` reads the
-    ZIP64 record right before the locator whatever the classic record holds, and other
-    readers the one at the locator's offset. Every reading that lists members is
-    returned, with the offset its directory starts at, its members' offsets as that
-    reader moves them.
+    the difference. When a ZIP64 locator precedes the end record, ``zipfile`` reads a
+    ZIP64 record whatever the classic record holds: the one at the locator's offset,
+    taking the bytes up to the locator as extensible data, and only when no record
+    starts there the one right before the locator. miniz, which ``torch.load`` uses,
+    reads the record at the locator's offset wherever it lies in the archive, also after
+    the locator. Every reading that lists members is returned, with the offset its
+    directory starts at, its members' offsets as that reader moves them, and whether
+    some reader's directory was not decided. A directory that cannot be decided does not
+    hide what another reading lists: the caller rates the archive by every reading.
 
     The rest of the stream is read in bounded chunks, keeping only the tail that can
     hold the directory within ``MAX_ZIP_DIRECTORY_BYTES``, the end-of-central-directory
     record with its comment and the ZIP64 records. ``read`` holds the bytes that end at
-    ``consumed``, already read from the stream. ``None`` when no directory can be
-    read, when any directory that lies within the archive is beyond that bound, as it
-    may list what the others do not, or when the stream ends before ``size``.
+    ``consumed``, already read from the stream; from offset 0, a small archive is held
+    whole. A directory is not decided when it lies within the archive beyond that bound
+    or runs past its end record, as it may list what the others do not, or when a ZIP64
+    locator stores an offset before that tail. ``None`` when no directory can be read,
+    when the locator itself would lie before that tail, or when the stream ends before
+    ``size``.
     """
     tail: deque[bytes] = deque([read])
     held = len(read)
@@ -593,26 +604,53 @@ def _zip_directory(
     # comment, before it searches back, so a signature in its count fields is not one.
     end_record = len(data) - 22
     if end_record < 0 or data[end_record : end_record + 4] != b"PK\x05\x06" or data[-2:] != b"\0\0":
-        end_record = data.rfind(b"PK\x05\x06", max(0, len(data) - 22 - 65_535))
+        # The last signature with a whole record after it, as far back as miniz, which
+        # torch.load uses, searches: past zipfile's 65,557 bytes, and skipping a
+        # truncated signature at the end, both of which zipfile refuses. The last one
+        # within zipfile's reach is still the one zipfile takes.
+        end_record = data.rfind(
+            b"PK\x05\x06", max(0, len(data) - _MINIZ_END_SEARCH), len(data) - 18
+        )
     if end_record < 0 or end_record + 22 > len(data):
+        return None
+    if start > 0 and end_record < 76:
+        # The locator and the ZIP64 record before it would lie in bytes not held.
         return None
     # (where the directory ends, its size, its stored offset) for each record a reader takes
     records = [(end_record, _little(data, end_record + 12, 4), _little(data, end_record + 16, 4))]
     locator = end_record - 20
+    # Where readers look for a ZIP64 record, and where one was found.
+    looked: set[int] = set()
+    found: set[int] = set()
+    undecided = False
     if locator >= 0 and data[locator : locator + 4] == b"PK\x06\x07":
-        for record in sorted({locator - 56, _little(data, locator + 8, 8) - start}):
+        stored = _little(data, locator + 8, 8) - start
+        # zipfile reads the record there over the one before the locator; when the
+        # tail does not hold it, what zipfile lists is not decided, but what the other
+        # readings list still counts.
+        undecided = stored < 0
+        looked = {locator - 56, stored}
+        for record in sorted(looked):
+            # miniz, which torch.load uses, reads the record at the stored offset anywhere
+            # in the archive, also after the locator, where a patched zipfile refuses it.
             if (
                 record >= 0
-                and record + 56 <= locator
+                and record + 56 <= len(data)
                 and data[record : record + 4] == b"PK\x06\x06"
             ):
+                found.add(record)
                 records.append(
                     (record, _little(data, record + 40, 8), _little(data, record + 48, 8))
                 )
-    if len(records) > 1 and (
-        _little(data, end_record + 10, 2) == 0xFFFF or 0xFFFFFFFF in records[0][1:]
+    if (
+        found
+        and found == looked
+        and (_little(data, end_record + 10, 2) == 0xFFFF or 0xFFFFFFFF in records[0][1:])
     ):
-        # Every reader takes a ZIP64 record over a saturated classic one.
+        # Every reader takes a ZIP64 record over a saturated classic one, but only where
+        # it looks: miniz falls back to the classic record when the stored offset holds
+        # none, and zipfile without the CVE-2025-8291 fix when the record before the
+        # locator is missing.
         del records[0]
     readings: dict[tuple[int, int, int], tuple[list[_ZipMember], int]] = {}
     for directory_end, directory_size, directory_offset in records:
@@ -622,23 +660,36 @@ def _zip_directory(
                 continue
             members = _directory_members(data, begin - start, directory_size, directory_end)
             if members is None and (
-                0 <= begin <= start + directory_end - directory_size
-                and (
-                    begin < start
-                    or directory_size > MAX_ZIP_DIRECTORY_BYTES
-                    or data[begin - start : begin - start + 4] == b"PK\x01\x02"
+                (
+                    0 <= begin <= start + directory_end - directory_size
+                    and (
+                        begin < start
+                        or directory_size > MAX_ZIP_DIRECTORY_BYTES
+                        or data[begin - start : begin - start + 4] == b"PK\x01\x02"
+                    )
+                )
+                or (
+                    directory_size > 0
+                    and start + directory_end - directory_size < begin <= size - directory_size
+                    and (begin < start or data[begin - start : begin - start + 4] == b"PK\x01\x02")
                 )
             ):
                 # A directory past the bound, or one that starts but cannot be read,
-                # may list what a decoy the other reading takes does not.
-                return None
+                # may list what a decoy the other reading takes does not. One that starts
+                # at its stored offset and runs past its end record no writer produces,
+                # and miniz still reads it; a stored offset that starts no entry, as in an
+                # archive cut out of a larger file, is one only zipfile's reading finds.
+                undecided = True
+                continue
             if members is not None:
                 shift = begin - directory_offset
                 readings[key] = (
                     [m._replace(offset=m.offset + shift) if m.offset >= 0 else m for m in members],
                     begin,
                 )
-    return list(readings.values()) or None
+    if not readings and not undecided:
+        return None
+    return list(readings.values()), undecided
 
 
 def _directory_members(data: bytes, begin: int, size: int, end: int) -> list[_ZipMember] | None:
@@ -979,23 +1030,26 @@ def _recognized_code_container(
     # archive does; zipfile reads the archive whose end record ends the file.
     if prefix[:4] not in (b"PK\x03\x04", b"PK\x05\x06"):
         return _recognized_pickle(stream, prefix, size, by_content=by_content)
-    consumed = len(prefix)
-    # An end record at offset 0 is all an empty archive holds, so the prefix is kept.
-    kept = prefix if prefix[:4] == b"PK\x05\x06" else b""
+    # Every byte read so far is kept for the directory search. In a small archive the
+    # first local header and its name can hold the ZIP64 locator or record, and zipfile
+    # and miniz read them there; an end record at offset 0 is all an empty archive holds.
+    kept = prefix
     if prefix[:4] == b"PK\x03\x04":
         header = prefix + stream.read(22)
-        consumed = len(header)
         first = b""
         if len(header) == 30:
             name_length = int.from_bytes(header[26:28], "little")
             if 0 < name_length <= 4096:
                 first = stream.read(name_length)
-                consumed += len(first)
+        kept = header + first
         if _pickle_member(first):
             return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_PICKLE_MEMBER
-    readings = _zip_directory(stream, consumed, size, kept)
-    if readings is None:
+    directory = _zip_directory(stream, len(kept), size, kept)
+    if directory is None:
         return SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD
+    readings, undecided = directory
+    # A member any reading lists counts, even when another reader's directory is not
+    # decided: a locator or directory that cannot be read must not hide one that can.
     if any(_pickle_member(member.name) for members, _ in readings for member in members):
         return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_PICKLE_MEMBER
     arrays: bool | None = False
@@ -1005,6 +1059,8 @@ def _recognized_code_container(
             return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_OBJECT_ARRAY
         if found is None:
             arrays = None
+    if undecided:
+        return SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD
     return SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE if arrays is False else ZIP_MEMBER_UNREAD
 
 
@@ -1658,11 +1714,37 @@ def memoized(verify: Verify, results: dict[tuple[Any, ...], VerificationResult])
     """
 
     def cached(
-        artifact: Path, bundle: Path, identity: str | None, issuer: str | None
+        artifact: Path,
+        bundle: Path,
+        identity: str | None,
+        issuer: str | None,
+        *,
+        allow_oms_dsse: bool = False,
+        rekor_root_hash: str | None = None,
+        minimum_rekor_tree_size: int | None = None,
     ) -> VerificationResult:
-        key = (artifact, bundle, identity, issuer)
+        key = (
+            artifact,
+            bundle,
+            identity,
+            issuer,
+            allow_oms_dsse,
+            rekor_root_hash,
+            minimum_rekor_tree_size,
+        )
         if key not in results:
-            results[key] = verify(artifact, bundle, identity, issuer)
+            if allow_oms_dsse or rekor_root_hash is not None or minimum_rekor_tree_size is not None:
+                results[key] = verify(
+                    artifact,
+                    bundle,
+                    identity,
+                    issuer,
+                    allow_oms_dsse=allow_oms_dsse,
+                    rekor_root_hash=rekor_root_hash,
+                    minimum_rekor_tree_size=minimum_rekor_tree_size,
+                )
+            else:
+                results[key] = verify(artifact, bundle, identity, issuer)
         return results[key]
 
     return cached
@@ -1868,7 +1950,7 @@ def unused_policy_entries(
             continue
         identity = files.path_identity(relative)
         if identity is not None and identity == report:
-            if isinstance(policy, SigstoreArtifactPolicy):
+            if isinstance(policy, SigstoreArtifactPolicy) and not policy.allow_oms_dsse:
                 continue
             unused.append((relative.as_posix(), REPORT_ENTRY_KIND))
         elif identity is not None and identity in found:
@@ -1903,7 +1985,7 @@ def verify_weight_files(
     root: Path,
     policies: Mapping[Path, ArtifactPolicy],
     *,
-    verify: Callable[[Path, Path, str | None, str | None], VerificationResult],
+    verify: Verify,
     unbound: str | None = None,
 ) -> WeightVerification:
     """Verify every weight file against its operator policy entry, main file first.
@@ -1935,9 +2017,12 @@ def verify_weight_files(
             continue
         if policy.policy_digest is not None:
             refs.add(POLICY_REF_PREFIX + policy.policy_digest)
-        attempted.append(
-            DIGEST_PIN_METHOD if isinstance(policy, DigestPinPolicy) else SIGSTORE_METHOD
+        entry_method = (
+            DIGEST_PIN_METHOD
+            if isinstance(policy, DigestPinPolicy)
+            else (OMS_DSSE_METHOD if policy.allow_oms_dsse else SIGSTORE_METHOD)
         )
+        attempted.append(entry_method)
         if digest is None:
             rejected = True
             reason = "Artifact could not be hashed through the confined reader"
@@ -1956,12 +2041,27 @@ def verify_weight_files(
                 issues.append(("signature_verification_failed", reason, "error"))
             continue
         checked += 1
-        result = verify(
-            policy.artifact_path,
-            policy.bundle_path,
-            policy.expected_identity,
-            policy.expected_issuer,
-        )
+        if (
+            policy.allow_oms_dsse
+            or policy.rekor_root_hash is not None
+            or policy.minimum_rekor_tree_size is not None
+        ):
+            result = verify(
+                policy.artifact_path,
+                policy.bundle_path,
+                policy.expected_identity,
+                policy.expected_issuer,
+                allow_oms_dsse=policy.allow_oms_dsse,
+                rekor_root_hash=policy.rekor_root_hash,
+                minimum_rekor_tree_size=policy.minimum_rekor_tree_size,
+            )
+        else:
+            result = verify(
+                policy.artifact_path,
+                policy.bundle_path,
+                policy.expected_identity,
+                policy.expected_issuer,
+            )
         details = result.details or {}
         if result.error == SIGSTORE_MISSING:
             unavailable = True
@@ -1979,14 +2079,18 @@ def verify_weight_files(
             and pinned
         ):
             signatures += 1
-            methods[path] = SIGSTORE_METHOD
+            methods[path] = entry_method
             refs.update(
                 {
-                    f"{SIGSTORE_METHOD}:{label}@{digest}",
+                    f"{entry_method}:{label}@{digest}",
                     f"identity:{policy.expected_identity}",
                     f"issuer:{policy.expected_issuer}",
                 }
             )
+            if policy.rekor_root_hash is not None:
+                refs.add(f"rekor-root:{policy.rekor_root_hash}")
+            if policy.minimum_rekor_tree_size is not None:
+                refs.add(f"rekor-min-tree-size:{policy.minimum_rekor_tree_size}")
             bundle_digest = details.get("bundle_digest")
             if isinstance(bundle_digest, str):
                 refs.add(f"bundle:{_label(policy.bundle_path, root)}@{bundle_digest}")
@@ -2017,7 +2121,7 @@ def verify_weight_files(
             )
             for label in uncovered
         )
-    elif methods.get(main) == SIGSTORE_METHOD:
+    elif methods.get(main) in {SIGSTORE_METHOD, OMS_DSSE_METHOD}:
         status = SigningStatus.SIGSTORE_SIGNED
     else:
         status = SigningStatus.DIGEST_PINNED
