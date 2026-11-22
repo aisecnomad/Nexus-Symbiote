@@ -1340,7 +1340,14 @@ A way around a limit that its entry does not describe is worth a
   lists under `hook_commands`. A
   download run through a wrapper, interpreter or file not listed there, such as
   `curl x | firejail sh` or `curl x | deno run -`, or through a variable that holds the
-  command name, is medium, as is a downloader given a host without a scheme or a path,
+  command name, is medium (except PowerShell's encoded-command flags after a variable or
+  glob in command position). With no PowerShell name hint, `-enc` or a longer
+  prefix of `-EncodedCommand` is critical. The shorter `-e`, `-ec` and `-en`
+  forms require a base64 operand with recognizable UTF-16LE text structure.
+  Evidence includes a byte-order mark with content, a quoted string, a
+  command-like prefix, or sufficient ASCII text.
+  `$GREP -e Makefile`, `$SED -En` and `$SHELL -ec 'true'` stay medium, as
+  is a downloader given a host without a scheme or a path,
   such as `curl evil.example`. A command given to `su -c` or `script -c` as one quoted
   string is read as one word, which names a shell but no interpreter, so
   `curl x | su -c 'python3 -'` is medium too; a saved file named in such a string, or
@@ -1353,7 +1360,9 @@ A way around a limit that its entry does not describe is worth a
   known. A file a downloader's `-o`
   wrote counts as run when it is any argument of a shell, `python` or `perl`, as it did
   before, so `curl -o d x && bash run.sh d` and `curl -o d x && python3 -m json.tool d`
-  are critical though they may only read it; `node`, `ruby`, `php` and `lua` count it
+  are critical though they may only read it; a file saved under its URL's name
+  (`wget URL/d`, `curl -O URL/d`) counts only as the script or program, so
+  `wget URL/d.csv && sh load.sh d.csv` is high; `node`, `ruby`, `php` and `lua` count it
   only as their program or an option's value (`node -r ./d`). After an option the
   classifier does not know, the next word is read as the possible program and then as
   that option's value, so the reading goes on after it; an unknown option that takes no
@@ -1430,6 +1439,12 @@ A way around a limit that its entry does not describe is worth a
   such as `Bash(python3 scripts/report.py:*)`; it does not establish that every
   matching rule permits arbitrary commands. A rule that names another program, such as
   `Bash(npm run build:*)`, is read as scoped even where that program runs project code.
+  Settings layers are merged for the recorded effective values, but a starting mode,
+  `enableAllProjectMcpServers` or credential helper in `.claude/settings.json` is still
+  rated when `.claude/settings.local.json` overrides it, because a clone without that
+  uncommitted file runs with the committed value. The `oversight_gap`, `plugin_sources`
+  and `additional_directories` findings still read the merged value, so a local file
+  that overrides those settings suppresses them.
 - **Settings digests can confirm guesses of what the redaction keeps.** Every digest
   in `settings_hashes` covers its file after the redaction, with or without
   `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`, so it cannot confirm a guess of an `env` value,
@@ -1908,6 +1923,17 @@ is a failure; everything below is neither a gap nor a failure.
 
 ## Signatures
 
+- On POSIX, operator-supplied signature policies, verification keys and the
+  `runtime register --signer-scopes` map require protected ownership and modes
+  throughout their directory ancestry. A 002 umask can produce a 0664 file or
+  0775 directory. A read-only file on a 2775 Kubernetes `fsGroup` volume can
+  still be replaced by another group member. Remove group write from paths you
+  control or provision the inputs in a private directory. Use a 022 umask for
+  new files. In Action container jobs, provision the original signer policy and
+  trusted keys in a directory owned by the container account or root when the
+  host owns `runner.temp`. The Action skips checkout directories when choosing
+  a trusted location for its private snapshot.
+
 - **The CLI checks the cache before trusting it.** Offline verification uses the trusted root
   that sigstore-python caches in `$XDG_CACHE_HOME/sigstore-python` when
   `XDG_CACHE_HOME` is set, and otherwise in `~/.cache/sigstore-python` on Linux or
@@ -1951,9 +1977,11 @@ is a failure; everything below is neither a gap nor a failure.
 - **The trusted-key placement check is a heuristic.** It refuses a key inside a git
   working tree that holds the subject, the envelope or the current directory, also
   under another name for that tree directory, and a key file with other hard links.
-  It does not authenticate a key, check its owner or permissions, recognize a
-  checkout without a `.git` entry, or follow a key copied or mounted out of the
-  checkout, such as one reached through `docker run -v "$PWD/keys:/keys"`.
+  It does not authenticate a key, recognize a checkout without a `.git` entry
+  unless that checkout is the project an operator policy is checked against, or
+  follow a key copied or mounted out of the checkout, such as one reached through
+  `docker run -v "$PWD/keys:/keys"`. The owner and mode checks on the key and the
+  directories above it say only that no other user can replace it.
 - **Verification and use are separate reads.** Run `verify-attestation` and `diff`
   where the change under review cannot write between the two.
 - **The verifying build must read the inventory's format.** An attestation of a
@@ -2294,8 +2322,10 @@ is a failure; everything below is neither a gap nor a failure.
 - **The runtime key placement check is a heuristic.** `runtime verify` and
   `runtime register` refuse a public key inside a git working tree that holds an input
   file or the current directory, and a key file with other hard links, as
-  `verify-attestation` does. The check does not authenticate a key or check its owner,
-  and a key copied or mounted out of the checkout is accepted; a registrar given such a
+  `verify-attestation` does, and a key file that another user could replace, by the
+  [trusted keys](inventory-attestation.md#trusted-keys) ownership rule. The check does
+  not authenticate a key, and a key copied or mounted out of the checkout is accepted;
+  a registrar given such a
   key can still record an attacker's serial, which only deleting rows undoes. Python
   callers of `ReferenceGateway` pass key objects and get no placement check. The
   hard-link rule does not look at where the other names are, so a key in a store that

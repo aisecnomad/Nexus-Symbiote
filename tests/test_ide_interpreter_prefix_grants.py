@@ -71,3 +71,45 @@ def test_the_scanner_reports_the_grant_as_a_permission_scope_finding(tmp_path: P
     )
     finding = next(r for r in agent.risks if r.category == "permission_scope")
     assert "shell commands" in finding.detail
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        r"Bash(C:\Windows\System32\cmd.exe /c *)",
+        r"Bash(C:\Program Files\PowerShell\7\pwsh.exe -c *)",
+        r"Bash(C:\Python312\python.exe -c *)",
+        r'Bash("C:\Tools\my python.exe" -c *)',
+        r'Bash("C:\Program Files\Python\python.exe":*)',
+        "Bash('/opt/Team Tools/bin/python3' -c *)",
+        r"Bash(.\tools\bash.exe *)",
+        "Bash(python.exe -c *)",
+        "Bash(node.cmd -e *)",
+        "Bash(perl.exe -e *)",
+        "Bash(FOO=1 bash -c *)",
+        "Bash(A=1 B=2 bash *)",
+        "Bash(NODE_ENV=prod node -e *)",
+    ],
+)
+def test_a_windows_path_suffix_or_assignment_does_not_hide_an_interpreter(rule: str) -> None:
+    assert _broad_grants([rule]) == ["shell commands"]
+
+
+@pytest.mark.parametrize("rule", ["WebFetch(domain:**)", "WebFetch(domain:*.*)"])
+def test_a_domain_made_only_of_wildcards_is_an_unscoped_fetch_grant(rule: str) -> None:
+    assert _broad_grants([rule]) == ["web fetches"]
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        r"Bash(C:\tools\lint.exe *)",
+        r'Bash("C:\Program Files\Tools\lint.exe" -c *)',
+        r'Bash("C:\Tools\my python.exe" --version *)',
+        r'Bash("C:\Tools\python helper.exe" --version *)',
+        "Bash(FOO=1 npm test *)",
+        "WebFetch(domain:example.com)",
+    ],
+)
+def test_a_windows_or_assigned_ordinary_program_stays_scoped(rule: str) -> None:
+    assert _broad_grants([rule]) == []
