@@ -112,6 +112,10 @@ REQUIRED_COMMANDS: dict[str, dict[str, tuple[str, ...]]] = {
         "security-regressions": (
             "requirements-action.lock",
             "scripts/check_security_regressions.py",
+            # The recall floors and the parser smoke gate: a scan made by this checkout,
+            # not a committed score file.
+            "scripts/check_precision_gate.py --fresh",
+            "scripts/fuzz_parsers.py",
         ),
         "dependency-audit": (
             "scripts/check_dependency_advisories.py",

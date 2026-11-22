@@ -152,6 +152,8 @@ def ci_workflow():
         ("verified", "sys.exit(bool(failed))"),
         ("offline-invariant", "requirements-ci.lock"),
         ("offline-invariant", "unshare --net"),
+        ("security-regressions", "scripts/check_precision_gate.py --fresh"),
+        ("security-regressions", "scripts/fuzz_parsers.py"),
     ],
 )
 def test_a_gate_job_hollowed_out_under_its_name_is_rejected(tmp_path, job, command):
@@ -1045,3 +1047,16 @@ def test_the_image_push_holds_no_oidc_token(tmp_path):
 
     errors = workflow_errors(tmp_path, "release.yml", change)
     assert any("image may hold write permissions only for packages" in e for e in errors)
+
+
+def test_a_precision_gate_scored_from_a_committed_file_is_rejected(tmp_path):
+    workflow = ci_workflow()
+    for step in workflow["jobs"]["security-regressions"]["steps"]:
+        if "check_precision_gate.py" in step.get("run", ""):
+            step["run"] = step["run"].replace("--fresh", "--scores benchmarks/scores.json")
+    path = tmp_path / "ci.yml"
+    path.write_text(yaml.safe_dump(workflow))
+    assert any(
+        "security-regressions no longer runs scripts/check_precision_gate.py --fresh" in error
+        for error in checker.check(path)
+    )
