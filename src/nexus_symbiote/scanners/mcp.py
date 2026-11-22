@@ -1153,7 +1153,7 @@ def _scheme_assignment_name(name: str, *, variable: bool = True) -> bool:
 
 def _benign_selector_switch(key: str, body: str) -> bool:
     """Whether a bare ``--option`` after a mode selector reads as a normal CLI switch."""
-    if not any(char.isdigit() for char in body):
+    if len(body) < 32 and not any(char.isdigit() for char in body):
         if "-" in body and _LOWER_LONG_OPTION.fullmatch(key):
             return True
         if "_" in body and len(body) < 16 and body.replace("_", "").islower():
@@ -1174,6 +1174,8 @@ def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
     if word.startswith("--") and _CLI_FLAG.fullmatch(key):
         body = key[2:]
         if equals and argument not in {"", "="}:
+            if credential_binding and literal_value(body):
+                return True
             return literal_value(argument)
         if (
             not equals
@@ -1181,7 +1183,9 @@ def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
         ):
             return False
         if equals:
-            return len(body) >= MIN_SECRET_LENGTH and (argument == "=" or "-" not in body)
+            return len(body) >= MIN_SECRET_LENGTH and (
+                argument == "=" or "-" not in body or literal_value(body)
+            )
         if len(body) < MIN_SECRET_LENGTH or placeholder(body):
             return False
         if credential_binding:
@@ -1193,9 +1197,14 @@ def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
             or any(char.isdigit() for char in body)
             or (body.isascii() and not body.islower())
         )
-    # Padding belongs to the operand. Only a genuine assignment has a
-    # nonempty value following the separator and no further equals sign.
-    if argument and "=" not in argument and _SCHEME_ASSIGNMENT_OPERAND.fullmatch(word):
+    # Padding belongs to the operand. Only a genuine option assignment has a
+    # non-credential key and a nonempty value with no further equals sign.
+    if (
+        argument
+        and "=" not in argument
+        and _SCHEME_ASSIGNMENT_OPERAND.fullmatch(word)
+        and not literal_value(key)
+    ):
         return literal_value(argument)
     if _SCHEME_NUMBER.fullmatch(word):
         return True
@@ -3364,12 +3373,16 @@ class MCPScanner(Scanner):
             if value is not None and value != "":
                 commands.append(value)
         if len(commands) > 1:
+            for cmd_item in commands:
+                dropped.append({"command": cmd_item})
             result.scan_failures.append(
                 f"{dialect.path}: MCP server command declared under more than one setting"
             )
         elif commands and not isinstance(commands[0], str):
+            dropped.append({"command": commands[0]})
             result.scan_failures.append(f"{dialect.path}: invalid MCP server command")
         elif commands and _PLAIN_COMMAND.fullmatch(commands[0].strip(" \t")) is None:
+            dropped.append({"command": commands[0]})
             result.scan_failures.append(
                 f"{dialect.path}: MCP server command 'mcp' is not plain words and is not "
                 "inventoried"
