@@ -55,7 +55,7 @@ def _toml_string_end(text: str, position: int, quote_char: str) -> int:
         position = run
 
 
-def _longest_dotted_key(text: str) -> int:
+def _longest_dotted_key(text: str, on_string: Callable[[int, int], None] | None = None) -> int:
     """The most dots between two TOML structure characters outside strings and
     comments, in one linear pass: a dotted key or table name has that many.
 
@@ -73,6 +73,8 @@ def _longest_dotted_key(text: str) -> int:
             dots += 1
         elif char in "\"'":
             position = _toml_string_end(text, position, char)
+            if on_string is not None:
+                on_string(found.start(), position)
         else:
             longest, dots = max(longest, dots), 0
             if char == "#":
@@ -80,11 +82,16 @@ def _longest_dotted_key(text: str) -> int:
                 position = len(text) if newline < 0 else newline
 
 
-def loads(text: str, *, parse_float: Callable[[str], Any] = float) -> dict[str, Any]:
+def loads(
+    text: str,
+    *,
+    parse_float: Callable[[str], Any] = float,
+    on_string: Callable[[int, int], None] | None = None,
+) -> dict[str, Any]:
     """Parse TOML only after bounding dotted keys, including quoted parts.
 
     ``parse_float`` is passed to ``tomllib``, so a caller can refuse nonfinite numbers.
     """
-    if _longest_dotted_key(text) > _MAX_DOTTED_KEY:
+    if _longest_dotted_key(text, on_string) > _MAX_DOTTED_KEY:
         raise TOMLBoundsError("dotted key exceeds the length limit")
     return tomllib.loads(text, parse_float=parse_float)

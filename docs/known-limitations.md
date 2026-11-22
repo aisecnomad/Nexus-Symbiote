@@ -1486,7 +1486,35 @@ is a failure; everything below is neither a gap nor a failure.
 - **Rewordings are missed.** Cyrillic homoglyphs, HTML entities, `[//]: #` comments,
   "note for automated auditors" and override phrasings outside the rules give no
   finding. Invisible characters are removed before matching, so text that uses them
-  as word separators reads as one word. JSON keys are not scanned, only values.
+  as word separators reads as one word. In a `.json` source, keys are not scanned,
+  only values.
+- **Escapes are decoded where a host decodes them.** In a `.jsonc`, `.yaml`, `.yml`
+  or `.toml` source, and in the YAML front matter of a Markdown file, the rules also
+  read every string and key the file decodes to, so `"\u0049gnore all previous
+  instructions"` matches as the text it spells. Such a match is located by JSON
+  pointer, as in a `.json` source, unless the raw text already gave the same
+  component the same rule. YAML of at most 20,000 parser events and 64 nested flow
+  collections, and TOML within the dotted-key bound, each up to 65,536 characters,
+  are parsed; YAML keeps an escape in a plain or single-quoted scalar as text, so
+  it is not decoded there. YAML or TOML past those bounds, and a file that does not
+  parse, have every backslash escape, line continuation and YAML `''` decoded by
+  pattern, in literal strings and comments too, which can only add findings; a match
+  there is located at its byte offset in the file. Decoded Markdown front matter
+  uses YAML and starts with at least three dashes, with optional leading whitespace.
+  Tagged fences, TOML fences, and blocks without a closing delimiter receive the raw
+  text checks only.
+- When a server and tool share a name, declaration position and recorded MCP relationships
+  identify the owner. Each unresolved declaration carries its own file-level risk. A library
+  caller without a repository agent can collect an explicit ownership diagnostic. With no
+  diagnostics list, a source component carries the risk marked as unresolved.
+- **Hidden markup is reported as hidden markup.** When the `prompt` collector rates
+  a Markdown file's hidden markup high, the rules skip the text of each HTML comment,
+  closed processing instruction and `#` reference definition in it, which
+  `hidden_markup` reports. A `<!--`, `<?` or definition inside a fenced code block or
+  code span is shown as written and is not skipped; fences and spans are found as
+  generously as any reader finds them, inside block quotes and list items too, so a
+  real comment that a stray fence or backtick seems to enclose is matched as
+  visible text. An unclosed `<!--` is skipped only to the next blank line.
 - **Prohibitions are recognized narrowly.** `TP-CRED-002` treats a credential read as
   a prohibition when `never`, `not`, `cannot`, "refuse to" or "decline to" comes
   right before the verb, with only adverbs (`ever`, `just`, `simply`, `directly`,
