@@ -5,7 +5,8 @@ agent cards, and the instruction, skill, tool and configuration files that the
 selected collectors recorded as component sources. It reads no other file. Every
 rule is a bounded lexical scan, so the pass is O(N) in the scanned text. Default-
 ignorable code points are removed and the rest is NFKC-normalized before matching,
-with a map back to UTF-8 byte offsets. Findings are appended to the owning existing
+with a map back to UTF-8 byte offsets. JSON, JSONC, YAML and TOML sources and Markdown
+front matter are also read as the strings they decode to. Findings are appended to the owning existing
 components; matched payload text and secret values are never written into them.
 """
 
@@ -17,9 +18,10 @@ import re
 import sys
 import tokenize
 import unicodedata
-from collections import deque
+from bisect import bisect_left, bisect_right
+from collections import Counter, deque
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -36,10 +38,12 @@ from nexus_symbiote.core.models import (
     SkillPackageComponent,
     ToolComponent,
 )
+from nexus_symbiote.scanners.base import YAML_TOKEN_LIMIT
 from nexus_symbiote.scanners.prompt import HIDDEN_CHARACTERS
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.jsonc import strip_jsonc
 from nexus_symbiote.utils.terminal import neutralize
+from nexus_symbiote.utils.toml import loads as toml_loads
 
 RULE_PACK_VERSION = "1.0.0"
 
@@ -112,6 +116,47 @@ _SIDE_CHANNEL_PARAM_NAMES = frozenset(
 )
 # Typographic apostrophes fold to ASCII so that "Don’t tell" reads as "Don't tell".
 _APOSTROPHES = {"‘": "'", "’": "'"}
+# A host passes a model the strings these formats, and the YAML front matter of a Markdown
+# file, decode to, where an escape such as \u0049 spells "I"; the rules read those strings
+# as well as the raw text.
+_DECODED_FORMATS = {".jsonc": "JSON", ".yaml": "YAML", ".yml": "YAML", ".toml": "TOML"}
+_MARKDOWN_SUFFIXES = frozenset({".md", ".mdc", ".markdown"})
+_FRONT_MATTER_RE = re.compile(
+    r"\ufeff?(?>(?:[ \t]*\r?\n)*)[ \t]*-{3,}[ \t]*\r?\n(.*?)^(?:-{3,}|\.\.\.)[ \t]*\r?$",
+    re.S | re.M,
+)
+# The bounds the prompt collector parses YAML and TOML within: the parsers are pure Python,
+# and PyYAML's cost grows with flow nesting. Past them, escapes are decoded by pattern.
+_MAX_PARSED_CHARS = 65_536
+_MAX_YAML_FLOW_DEPTH = 64
+_FLOW_BRACKETS_RE = re.compile(r"[\[\]{}]")
+# Every escape a JSON, YAML or TOML string can hold, a line continuation and YAML's ''.
+# Decoding them anywhere, inside a literal string or a comment too, only adds findings.
+_ESCAPE_RE = re.compile(
+    r"\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|[ \t]*\r?\n\s*|(.))|''", re.S
+)
+_NAMED_ESCAPES = {
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+    "b": "\b",
+    "f": "\f",
+    "v": "\v",
+    "a": "\a",
+    "0": "\0",
+    "e": "\x1b",
+    "L": "\u2028",
+    "P": "\u2029",
+    "N": "\x85",
+    "_": "\xa0",
+}
+# A comment opener left open hides nothing past the paragraph it opens in.
+_BLANK_LINE_RE = re.compile(r"\n[ \t]*\r?\n")
+# Fences and code spans as generously as any reader finds them, inside quotes and list
+# items too: a "<!--" taken for code is not masked, which can only add findings.
+_FENCE_OPEN_RE = re.compile(r"^[ \t>*+\-.)0-9]*?((?>`{3,})(?![^\n]*`)|~{3,})", re.M)
+_FENCE_CLOSE_RE = re.compile(r"^[ \t>]*(`{3,}|~{3,})[ \t]*\r?$", re.M)
+_BACKTICK_RUN_RE = re.compile(r"`+")
 
 _DIRECTIVE_TAG_OPEN_RE = re.compile(
     r"<((?:important|system|instructions?|hidden|secret|override)[\w-]{0,40})\b[^>]{0,120}>",
@@ -289,6 +334,7 @@ _TOOL_NAME_CALL_TEMPLATES = (
     ".{name}]",
     "[{name}]",
 )
+_YAML_PLAIN_NAME = re.compile(r"""(?m)^[ \t]*(?:-[ \t]+)?name:[ \t]+([^\s#,'"}\]]+)[ \t]*(?=#|$)""")
 
 _RULE_DESCRIPTIONS: dict[str, str] = {
     "TP-TAG-001": "coercive directive XML-style tag containing override, secret-read, or exfiltration action",
@@ -316,6 +362,7 @@ class TextPoisoningHit:
     surface: str
     summary: str
     where: str = ""
+    unresolved_declaration: int = 0
 
 
 ComponentWithRisks = (
@@ -473,13 +520,16 @@ def scan_text_block(
     # 2. TP-CMT-001: HTML comments carrying override, exfil, or secret-read directives
     search_pos = 0
     while (cmt_start := normalized.find("<!--", search_pos)) != -1:
-        cmt_end = normalized.find("-->", cmt_start + 4, cmt_start + 4 + _MAX_COMMENT_BODY_CHARS)
+        # Read a possible body when the opener and closer overlap. Markdown masking
+        # handles short empty comments separately so subsequent text stays visible.
+        body_start = cmt_start + 4
+        cmt_end = normalized.find("-->", body_start, body_start + _MAX_COMMENT_BODY_CHARS)
         stop = (
             cmt_end + 3
             if cmt_end != -1
-            else min(len(normalized), cmt_start + 4 + _MAX_COMMENT_BODY_CHARS)
+            else min(len(normalized), body_start + _MAX_COMMENT_BODY_CHARS)
         )
-        if _COMMENT_ATTACK_RE.search(normalized[cmt_start + 4 : stop]) is not None:
+        if _COMMENT_ATTACK_RE.search(normalized[body_start:stop]) is not None:
             record("TP-CMT-001", base_category, cmt_start)
         search_pos = stop
 
@@ -567,7 +617,15 @@ def extract_json_text_entries(
     return results
 
 
-_Owner = tuple[str, dict[str, Any]] | None
+@dataclass(frozen=True)
+class _SourceOwner:
+    name: str
+    node: dict[str, Any]
+    kind: str
+    server: str | None
+
+
+_SERVER_COLLECTIONS = frozenset({"mcpServers", "servers", "mcp_servers", "context_servers", "mcp"})
 
 
 def _pointer_segment(key: str | tuple[str, int]) -> str:
@@ -577,9 +635,10 @@ def _pointer_segment(key: str | tuple[str, int]) -> str:
 
 
 def _json_strings_with_owners(
-    data: object, names: Iterable[str]
-) -> Iterator[tuple[str, str, _Owner]]:
-    """``(JSON pointer, string, owner)`` for every nonblank string, in O(size).
+    data: object, names: Iterable[str], *, keys: bool = False
+) -> Iterator[tuple[str, str, _SourceOwner | None, bool]]:
+    """``(JSON pointer, string, owner, is_key)`` for every nonblank string, and with
+    ``keys`` every nonblank key at the pointer of its value, in O(size).
 
     The owner is the innermost enclosing object whose ``name`` names a component in
     ``names``; failing that, the innermost one stored under a key that does (as in
@@ -588,25 +647,62 @@ def _json_strings_with_owners(
     indexes and known field names only, and stop growing past the printed length.
     """
     known = frozenset(names)
-    queue: deque[tuple[str, object, _Owner, _Owner]] = deque([("", data, None, None)])
+    queue: deque[tuple[str, object, _SourceOwner | None, _SourceOwner | None, str, str | None]] = (
+        deque([("", data, None, None, "", None)])
+    )
     while queue:
-        pointer, node, by_name, by_key = queue.popleft()
+        pointer, node, by_name, by_key, slot, server = queue.popleft()
         if isinstance(node, str):
             if node.strip():
-                yield pointer, node, by_name or by_key
+                yield pointer, node, by_name or by_key, False
             continue
         long = len(pointer) > _MAX_WHERE_CHARS
         if isinstance(node, dict):
             label = node.get("name")
-            if isinstance(label, str) and label in known:
-                by_name = (label, node)
+            inherited = by_name or by_key
+            inside_tool = (
+                inherited is not None and inherited.kind == "tool" and inherited.node is not node
+            )
+            if not inside_tool and isinstance(label, str) and label in known:
+                if slot == "server":
+                    server = label
+                by_name = _SourceOwner(label, node, slot, server)
             for key, val in node.items():
                 child = pointer if long else f"{pointer}/{_pointer_segment(key)}"
-                inner = (key, val) if key in known and isinstance(val, dict) else by_key
-                queue.append((child, val, by_name, inner))
+                text = key[0] if isinstance(key, tuple) else key
+                if keys and isinstance(text, str) and text.strip():
+                    yield child, text, by_name or by_key, True
+                if inside_tool:
+                    queue.append((child, val, by_name, by_key, "", server))
+                    continue
+                kind, host = "", server
+                if slot == "servers":
+                    kind, host = "server", text
+                elif slot == "tools" or text == "function":
+                    kind = "tool"
+                elif text in _SERVER_COLLECTIONS:
+                    kind = "servers"
+                elif text == "tools":
+                    kind = "tools"
+                inner = by_key
+                if text in known and isinstance(val, dict):
+                    inner = _SourceOwner(text, val, kind, host)
+                queue.append(
+                    (
+                        child,
+                        val,
+                        None if slot in ("servers", "tools") else by_name,
+                        inner,
+                        kind,
+                        host,
+                    )
+                )
         elif isinstance(node, list):
+            kind = {"servers": "server", "tools": "tool"}.get(slot, "")
             for idx, item in enumerate(node):
-                queue.append((pointer if long else f"{pointer}/{idx}", item, by_name, by_key))
+                queue.append(
+                    (pointer if long else f"{pointer}/{idx}", item, by_name, by_key, kind, server)
+                )
 
 
 def _keep_duplicates(pairs: list[tuple[str, Any]]) -> dict[str | tuple[str, int], Any]:
@@ -637,6 +733,188 @@ def _parse_json_leniently(text: str) -> object:
     raise AssertionError("unreachable")
 
 
+def _joined_surrogates(text: str) -> str:
+    # A UTF-16 reader joins the halves of a pair that YAML spells as two escapes.
+    if not any("\ud800" <= ch <= "\udfff" for ch in text):
+        return text
+    return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
+
+
+def _yaml_tree(text: str, raw_matches: _RawMatches | None = None, start: int = 0) -> object:
+    """The documents of ``text`` as dicts, lists, strings and booleans, built from at most
+    ``YAML_TOKEN_LIMIT`` parser events in O(N). An alias is not expanded, a duplicate
+    key is kept as ``_keep_duplicates`` keeps it, and a key that is not a string is
+    kept with its value under a key no string can spell."""
+    import yaml
+
+    documents: list[object] = []
+    stack: list[tuple[bool, bool, list[object]]] = []
+    flows = 0
+    for count, event in enumerate(yaml.parse(text, Loader=yaml.SafeLoader), start=1):
+        if count > YAML_TOKEN_LIMIT:
+            raise ValueError("too many YAML events")
+        node: object
+        if isinstance(event, yaml.CollectionStartEvent):
+            flow = bool(event.flow_style)
+            flows += flow
+            if flows > _MAX_YAML_FLOW_DEPTH:
+                raise ValueError("YAML nested too deep")
+            stack.append((isinstance(event, yaml.MappingStartEvent), flow, []))
+            continue
+        if isinstance(event, yaml.CollectionEndEvent):
+            is_mapping, flow, children = stack.pop()
+            flows -= flow
+            node = children
+            if is_mapping:
+                mapping: dict[str | tuple[object, int], object] = {}
+                seen: dict[str, int] = {}
+                for index in range(0, len(children) - 1, 2):
+                    key, value = children[index], children[index + 1]
+                    if isinstance(key, str):
+                        n = seen[key] = seen.get(key, 0) + 1
+                        mapping[key if n == 1 else (key, n)] = value
+                    else:
+                        mapping[(None, index)] = [key, value]
+                node = mapping
+        elif isinstance(event, yaml.ScalarEvent):
+            node = _joined_surrogates(event.value)
+            if (
+                raw_matches is not None
+                and event.start_mark is not None
+                and event.end_mark is not None
+            ):
+                raw_matches.bind(start + event.start_mark.index, start + event.end_mark.index, node)
+            # MCP annotations distinguish boolean true from the quoted string "true".
+            lower = event.value.lower() if len(event.value) <= 5 else ""
+            if lower in yaml.SafeLoader.bool_values and (
+                event.tag == "tag:yaml.org,2002:bool"
+                or (
+                    event.tag is None
+                    and event.implicit[0]
+                    and event.value in (lower, lower.capitalize(), lower.upper())
+                )
+            ):
+                node = yaml.SafeLoader.bool_values[lower]
+        elif isinstance(event, yaml.AliasEvent):
+            node = None
+        else:
+            continue
+        (stack[-1][2] if stack else documents).append(node)
+    return documents[0] if len(documents) == 1 else documents
+
+
+def _flow_depth(text: str) -> int:
+    # Counts brackets in strings and comments too: a cheap first bound on PyYAML's work.
+    depth = deepest = 0
+    for match in _FLOW_BRACKETS_RE.finditer(text):
+        depth = depth + 1 if match.group() in "[{" else max(depth - 1, 0)
+        deepest = max(deepest, depth)
+    return deepest
+
+
+def _decoded_source(
+    rel_path: str, text: str, *, raw_matches: _RawMatches | None = None
+) -> tuple[object, tuple[int, int] | None]:
+    """What a host decodes a JSONC, YAML or TOML source, or a Markdown file's YAML front
+    matter, to: ``(tree, None)`` when it parses within the bounds, ``(None, span)`` for
+    the part of ``text`` to decode by pattern when it does not, and ``(None, None)``
+    when it holds no escape.
+    """
+    suffix = PurePosixPath(rel_path).suffix.lower()
+    kind = _DECODED_FORMATS.get(suffix)
+    span = (0, len(text))
+    if kind is None:
+        front = _FRONT_MATTER_RE.match(text) if suffix in _MARKDOWN_SUFFIXES else None
+        if front is None:
+            return None, None
+        kind, span = "YAML", front.span(1)
+    body = text[span[0] : span[1]]
+    has_escapes = "\\" in body or (kind == "YAML" and "''" in body)
+    if not (has_escapes or raw_matches is not None):
+        return None, None
+    import yaml
+
+    try:
+        if kind == "JSON":
+            parsed = _parse_json_leniently(body)
+            if raw_matches is not None:
+                # Strict JSON can contain separators that the JSONC lexer refuses.
+                # In that case keep the raw observations as well as the parsed tree.
+                try:
+                    strip_jsonc(body, on_string=lambda a, b: raw_matches.bind(a, b, body, "JSON"))
+                except ValueError:
+                    pass
+            return parsed, None
+        if len(body) <= _MAX_PARSED_CHARS:
+            if kind == "TOML":
+                if raw_matches is not None:
+                    return toml_loads(
+                        body, on_string=lambda a, b: raw_matches.bind(a, b, body, "TOML")
+                    ), None
+                return toml_loads(body), None
+            if _flow_depth(body) <= _MAX_YAML_FLOW_DEPTH:
+                if raw_matches is not None:
+                    return _yaml_tree(body, raw_matches, span[0]), None
+                return _yaml_tree(body), None
+    except (ValueError, OverflowError, RecursionError, yaml.YAMLError):
+        # Malformed input still needs the same escape inspection as input over a parse limit.
+        return None, span if has_escapes else None
+    return None, span if has_escapes else None
+
+
+def _escape_decoded(text: str, start: int, end: int) -> tuple[str, list[int]]:
+    """``text[start:end]`` with every escape decoded and each surrogate pair joined, and
+    for each character of the result the index in ``text`` it came from."""
+    chars: list[str] = []
+    origins: list[int] = []
+    pos = start
+    for match in _ESCAPE_RE.finditer(text, start, end):
+        chars.extend(text[pos : match.start()])
+        origins.extend(range(pos, match.start()))
+        pos = match.end()
+        digits = match.group(1) or match.group(2) or match.group(3)
+        if digits is not None:
+            code = int(digits, 16)
+            decoded = chr(code) if code <= sys.maxunicode else match.group()
+        elif match.group() == "''":
+            decoded = "'"
+        elif match.group(4) is None:
+            decoded = ""
+        else:
+            decoded = _NAMED_ESCAPES.get(match.group(4), match.group(4))
+        for ch in decoded:
+            if "\udc00" <= ch <= "\udfff" and chars and "\ud800" <= chars[-1] <= "\udbff":
+                chars[-1] = _joined_surrogates(chars[-1] + ch)
+            else:
+                chars.append(ch)
+                origins.append(match.start())
+    chars.extend(text[pos:end])
+    origins.extend(range(pos, end))
+    return "".join(chars), origins
+
+
+def _escape_decoded_hits(
+    text: str, span: tuple[int, int], rel_path: str, is_tool_surface: bool
+) -> list[TextPoisoningHit]:
+    """Hits in ``text[span]`` with its escapes decoded, at their byte offsets in ``text``."""
+    decoded, origins = _escape_decoded(text, *span)
+    hits = scan_text_block(decoded, surface=rel_path, is_tool_surface=is_tool_surface)
+    if not hits:
+        return []
+    origin_at: dict[int, int] = {}
+    byte_pos = 0
+    for ch, origin in zip(decoded, origins, strict=True):
+        origin_at[byte_pos] = origin
+        byte_pos += _utf8_width(ch)
+    return [
+        replace(
+            hit,
+            byte_offset=len(text[: origin_at[hit.byte_offset]].encode("utf-8", "surrogatepass")),
+        )
+        for hit in hits
+    ]
+
+
 def _collect_schema_property_names(schema: dict[str, Any] | None) -> set[str]:
     if not isinstance(schema, dict):
         return set()
@@ -647,7 +925,8 @@ def _collect_schema_property_names(schema: dict[str, Any] | None) -> set[str]:
         props = node.get("properties")
         if isinstance(props, dict):
             for k, v in props.items():
-                names.add(k)
+                if isinstance(k, str):
+                    names.add(k)
                 if isinstance(v, dict):
                     queue.append(v)
         for combiner in ("items", "additionalProperties"):
@@ -728,12 +1007,54 @@ def _fallback_component(
     return min(others, key=_priority_key) if others else root_agent
 
 
+def _shared_names(candidates: list[ComponentWithRisks]) -> set[str]:
+    counts = Counter(comp.name for comp in candidates)
+    return {name for name, count in counts.items() if count > 1}
+
+
+def _declaration_index(
+    candidates: list[ComponentWithRisks],
+) -> dict[tuple[str, str, str | None], ComponentWithRisks | None]:
+    """Index unique owners by name, declaration kind and the collected MCP edges."""
+    owners: dict[tuple[str, str, str | None], ComponentWithRisks | None] = {}
+    servers = {c.bom_ref: c for c in candidates if isinstance(c, MCPServerComponent)}
+    parents: dict[str, set[str]] = {}
+    for server in servers.values():
+        for tool_ref in server.tool_refs:
+            parents.setdefault(tool_ref, set()).add(server.bom_ref)
+    for comp in candidates:
+        keys: list[tuple[str, str, str | None]] = [(comp.name, "", None)]
+        if isinstance(comp, MCPServerComponent):
+            keys.append((comp.name, "server", None))
+        if isinstance(comp, ToolComponent):
+            keys.append((comp.name, "tool", None))
+            links = parents.get(comp.bom_ref, set()).copy()
+            if comp.mcp_server_ref:
+                links.add(comp.mcp_server_ref)
+            if len(links) == 1 and (host := servers.get(next(iter(links)))) is not None:
+                keys.append((comp.name, "tool", host.name))
+        for key in keys:
+            owners[key] = comp if key not in owners else None
+    return owners
+
+
+def _file_level_owner(
+    candidates: list[ComponentWithRisks], root_agent: AgentComponent | None
+) -> ComponentWithRisks | None:
+    if root_agent is not None:
+        return root_agent
+    containers = [component for component in candidates if not isinstance(component, ToolComponent)]
+    return containers[0] if len(containers) == 1 else None
+
+
 def _attribute_source_component(
     content: str,
     raw_bytes: bytes,
     byte_offset: int,
     candidates: list[ComponentWithRisks],
     fallback: ComponentWithRisks | None,
+    *,
+    yaml_names: bool = False,
 ) -> ComponentWithRisks | None:
     """Pick the most specific component owning ``byte_offset`` inside a multi-entity source."""
     if not candidates:
@@ -743,11 +1064,17 @@ def _attribute_source_component(
 
     char_pos = len(raw_bytes[:byte_offset].decode("utf-8", errors="ignore"))
     prefix = content[max(0, char_pos - 600) : char_pos]
+    plain_names = (
+        {m.group(1): m.start(1) for m in _YAML_PLAIN_NAME.finditer(prefix)} if yaml_names else {}
+    )
     best: ComponentWithRisks | None = None
     best_idx = -1
     # The candidate declared nearest before the hit owns it: a tool's call or definition,
     # or a server's table or key. Ties go to tools, which sort first.
     for candidate in sorted(candidates, key=_priority_key):
+        plain = plain_names.get(candidate.name, -1)
+        if plain > best_idx:
+            best_idx, best = plain, candidate
         for tmpl in _TOOL_NAME_CALL_TEMPLATES:
             found = prefix.rfind(tmpl.format(name=candidate.name))
             if found > best_idx:
@@ -764,6 +1091,51 @@ _MD_COMMENT_LINE_RE = re.compile(
 )
 
 
+def _code_spans(text: str, start: int, end: int) -> Iterator[tuple[int, int]]:
+    """Code spans of ``text[start:end]``: backtick runs paired with the next run of the
+    same length in their paragraph, in O(N)."""
+    paragraphs: list[list[tuple[int, int]]] = [[]]
+    blanks = _BLANK_LINE_RE.finditer(text, start, end)
+    blank = next(blanks, None)
+    for run in _BACKTICK_RUN_RE.finditer(text, start, end):
+        while blank is not None and blank.end() <= run.start():
+            paragraphs.append([])
+            blank = next(blanks, None)
+        paragraphs[-1].append(run.span())
+    for runs in paragraphs:
+        later: dict[int, deque[int]] = {}
+        for index, (run_start, run_end) in enumerate(runs):
+            later.setdefault(run_end - run_start, deque()).append(index)
+        index = 0
+        while index < len(runs):
+            same = later[runs[index][1] - runs[index][0]]
+            while same and same[0] <= index:
+                same.popleft()
+            if same:
+                yield runs[index][0], runs[same[0]][1]
+                index = same.popleft()
+            index += 1
+
+
+def _code_regions(text: str) -> list[tuple[int, int]]:
+    """Sorted ``(start, end)`` spans of ``text`` that a Markdown reader may show as code:
+    fenced blocks, an unclosed one running to the end, and code spans, in O(N)."""
+    regions: list[tuple[int, int]] = []
+    pos = 0
+    while (fence := _FENCE_OPEN_RE.search(text, pos)) is not None:
+        regions.extend(_code_spans(text, pos, fence.start()))
+        marker = fence.group(1)
+        pos = len(text)
+        for close in _FENCE_CLOSE_RE.finditer(text, fence.end()):
+            run = close.group(1)
+            if run[0] == marker[0] and len(run) >= len(marker):
+                pos = close.end()
+                break
+        regions.append((fence.start(), pos))
+    regions.extend(_code_spans(text, pos, len(text)))
+    return regions
+
+
 def _mask_hidden_markdown_markup(text: str) -> str:
     """Blank hidden HTML/PI/reference comments, keeping every UTF-8 byte offset.
 
@@ -771,19 +1143,33 @@ def _mask_hidden_markdown_markup(text: str) -> str:
     measured in the masked text are offsets in the file.
     """
     masked = bytearray(len(text))
+    code = _code_regions(text)
+    code_starts = [region[0] for region in code]
+
+    def in_code(index: int) -> bool:
+        at = bisect_right(code_starts, index) - 1
+        return at >= 0 and index < code[at][1]
+
     for open_tok, close_tok in (("<!--", "-->"), ("<?", "?>")):
         pos = 0
         while (start := text.find(open_tok, pos)) != -1:
-            end = text.find(close_tok, start + len(open_tok), start + 4096)
-            if end == -1 and open_tok == "<?":
-                # Only a closed processing instruction is hidden from rendered views.
+            # Short HTML comments can close with a delimiter overlapping the opener.
+            end = text.find(close_tok, start + 2, start + 4096)
+            if in_code(start) or (end == -1 and open_tok == "<?"):
+                # Code is shown as written, and only a closed processing instruction is
+                # hidden from rendered views.
                 pos = start + len(open_tok)
                 continue
-            stop = end + len(close_tok) if end != -1 else min(len(text), start + 4096)
+            if end != -1:
+                stop = end + len(close_tok)
+            else:
+                blank = _BLANK_LINE_RE.search(text, start, start + 4096)
+                stop = blank.start() if blank is not None else min(len(text), start + 4096)
             masked[start:stop] = b"\x01" * (stop - start)
             pos = stop
     for match in _MD_COMMENT_LINE_RE.finditer(text):
-        masked[match.start() : match.end()] = b"\x01" * (match.end() - match.start())
+        if not in_code(match.start()):
+            masked[match.start() : match.end()] = b"\x01" * (match.end() - match.start())
     return "".join(
         " " * _utf8_width(ch) if flag else ch for ch, flag in zip(text, masked, strict=True)
     )
@@ -792,37 +1178,29 @@ def _mask_hidden_markdown_markup(text: str) -> str:
 def _append_consolidated_risks(
     component: ComponentWithRisks,
     hits: list[TextPoisoningHit],
-    *,
-    seen_keys: set[tuple[str, str, str]],
 ) -> int:
-    """Group hits by ``(category, surface)`` and append sanitized ``RiskAssessment`` entries."""
-    grouped: dict[tuple[str, str], list[TextPoisoningHit]] = {}
+    """Keep a separate file-level risk for each unresolved declaration."""
+    grouped: dict[tuple[str, str, int], list[TextPoisoningHit]] = {}
     for hit in hits:
-        grouped.setdefault((hit.category, hit.surface), []).append(hit)
+        grouped.setdefault((hit.category, hit.surface, hit.unresolved_declaration), []).append(hit)
 
     added = 0
-    for (category, surface), group in sorted(grouped.items()):
-        dedup_key = (component.bom_ref, category, surface)
-        if dedup_key in seen_keys:
-            continue
-        seen_keys.add(dedup_key)
+    for (category, surface, unresolved), group in sorted(grouped.items()):
         # The first location of each rule, so each offset is that of the rule printed beside
         # it; TP-SIDENOTE-004 shares its trigger's location and is listed after it.
-        firsts: dict[str, TextPoisoningHit] = {}
         order = sorted(
             group,
             key=lambda h: (h.where, h.byte_offset, h.rule_id == "TP-SIDENOTE-004", h.rule_id),
         )
-        for h in order:
-            firsts.setdefault(h.rule_id, h)
         located = [
             f"{h.rule_id} at byte_offset={h.byte_offset}"
             + (f" of {neutralize(h.where)[:_MAX_WHERE_CHARS]}" if h.where else "")
-            for h in firsts.values()
+            for h in order
         ]
-        first = next(iter(firsts.values()))
+        first = order[0]
+        owner = "component ownership unresolved" if unresolved else neutralize(component.name)
         detail = (
-            f"Surface '{neutralize(surface)}' ({neutralize(component.name)}) matched "
+            f"Surface '{neutralize(surface)}' ({owner}) matched "
             f"{'; '.join(located)} (pack={RULE_PACK_VERSION}): {first.summary}. "
             "Matched payload text is withheld."
         )
@@ -836,7 +1214,7 @@ def _append_consolidated_risks(
                 category=category,
                 detail=detail,
                 recommendation=recommendation,
-                references=[f"{_RULE_REFERENCE_PREFIX}{rid}" for rid in firsts],
+                references=[f"{_RULE_REFERENCE_PREFIX}{hit.rule_id}" for hit in order],
             )
         )
         added += 1
@@ -888,52 +1266,149 @@ def _scan_component_fields(comp: ComponentWithRisks) -> list[TextPoisoningHit]:
     return []
 
 
-def _scan_json_source(
+_SourceFindings = list[tuple[ComponentWithRisks | None, list[TextPoisoningHit]]]
+
+
+class _RawMatches:
+    """Reconcile raw and parsed evidence only inside the same source string token."""
+
+    def __init__(self, source: bytes, hits: list[TextPoisoningHit]) -> None:
+        self.at: dict[int, list[TextPoisoningHit]] = {}
+        self.by_value: dict[tuple[str, str], set[tuple[str, int]]] = {}
+        self.covered: set[tuple[str, int]] = set()
+        char = byte = 0
+        for hit in sorted(hits, key=lambda h: h.byte_offset):
+            char += len(source[byte : hit.byte_offset].decode("utf-8"))
+            byte = hit.byte_offset
+            self.at.setdefault(char, []).append(hit)
+        self.positions = sorted(self.at)
+
+    def bind(self, start: int, end: int, text: str, syntax: str = "YAML") -> None:
+        positions = self.positions[
+            bisect_left(self.positions, start) : bisect_left(self.positions, end)
+        ]
+        if not positions:
+            return
+        value = text
+        if syntax == "JSON":
+            value = json.loads(text[start:end])
+        elif syntax == "TOML":
+            value = toml_loads("v=" + text[start:end])["v"]
+        for pos in positions:
+            for hit in self.at[pos]:
+                self.by_value.setdefault((value, hit.rule_id), set()).add(
+                    (hit.rule_id, hit.byte_offset)
+                )
+
+    def record(self, value: str, hits: list[TextPoisoningHit]) -> None:
+        for hit in hits:
+            self.covered.update(self.by_value.get((value, hit.rule_id), ()))
+
+
+@dataclass
+class _DeclarationFindings:
+    target: ComponentWithRisks | None
+    node: dict[str, Any] | None
+    has_tool_schema: bool
+    unresolved: bool
+    hits: list[TextPoisoningHit] = field(default_factory=list)
+    text_values: list[str] = field(default_factory=list)
+
+
+def _scan_structured_source(
     rel_path: str,
     parsed: object,
     comps: list[ComponentWithRisks],
     root_agent: AgentComponent | None,
-) -> list[tuple[ComponentWithRisks, list[TextPoisoningHit]]]:
-    """Scan each string of a JSON source and give its hits to the component that holds it.
+    *,
+    include_keys: bool = False,
+    tool_context: bool | None = None,
+    raw_matches: _RawMatches | None = None,
+) -> _SourceFindings:
+    """Scan a parsed configuration and evaluate each tool's text alongside its own schema.
 
     A string belongs to the innermost enclosing object whose ``name`` (or key) names a
-    component recorded for this file, so a poisoned tool's text is never charged to a
-    sibling tool declared beside it.
+    component recorded for this file. The declaration kind and server's tool references
+    disambiguate shared names. Only unresolved declarations stay at file scope.
     """
-    by_name: dict[str, ComponentWithRisks] = {}
-    for comp in sorted(comps, key=_priority_key):
-        by_name.setdefault(comp.name, comp)
+    owners = _declaration_index(comps)
+    linked_names = {name for name, kind, host in owners if kind == "tool" and host is not None}
+    tool_names = {comp.name for comp in comps if isinstance(comp, ToolComponent)}
+    file_owner = _file_level_owner(comps, root_agent)
     fallback = _fallback_component(comps, root_agent) if comps else root_agent
-    groups: dict[str, tuple[ComponentWithRisks, dict[str, Any] | None, list[TextPoisoningHit]]]
-    groups = {}
-    texts: dict[str, list[str]] = {}
-    for pointer, value, owner in _json_strings_with_owners(parsed, by_name):
-        target, node = (by_name[owner[0]], owner[1]) if owner is not None else (fallback, None)
+    groups: dict[tuple[str | None, int], _DeclarationFindings] = {}
+    for pointer, value, owner, is_key in _json_strings_with_owners(
+        parsed, (comp.name for comp in comps), keys=include_keys
+    ):
+        target, node, ambiguous = fallback, None, False
+        if owner is not None:
+            node = owner.node
+            typed_key = (owner.name, owner.kind, None)
+            scoped_key = (owner.name, owner.kind, owner.server)
+            if owner.kind == "tool" and owner.server is not None and owner.name in linked_names:
+                target = owners.get(scoped_key)
+            elif owner.kind in ("tool", "server"):
+                target = owners.get(typed_key)
+            else:
+                target = owners[owner.name, "", None]
+            ambiguous = target is None
+            if ambiguous:
+                target = file_owner
         if target is None:
-            continue
-        is_tool = isinstance(target, (ToolComponent, A2AServerComponent, MCPServerComponent))
-        group = groups.setdefault(target.bom_ref, (target, node, []))
-        if group[1] is None and node is not None:
-            group = groups[target.bom_ref] = (target, node, group[2])
-        group[2].extend(
-            scan_text_block(value, surface=rel_path, is_tool_surface=is_tool, where=pointer)
+            ambiguous = True
+        has_tool_schema = isinstance(target, ToolComponent) or (
+            ambiguous and owner is not None and owner.kind != "server" and owner.name in tool_names
         )
-        texts.setdefault(target.bom_ref, []).append(value)
-    results: list[tuple[ComponentWithRisks, list[TextPoisoningHit]]] = []
-    for ref, (target, node, hits) in groups.items():
-        if isinstance(target, ToolComponent) and node is not None:
-            schema = next(
-                (node[k] for k in ("inputSchema", "input_schema", "parameters") if k in node),
-                None,
+        is_tool = (
+            has_tool_schema
+            or isinstance(target, (A2AServerComponent, MCPServerComponent))
+            or (target is None and bool(tool_names))
+            if tool_context is None
+            else tool_context
+        )
+        group_key = (None if target is None else target.bom_ref, id(node))
+        group = groups.get(group_key)
+        if group is None:
+            group = groups[group_key] = _DeclarationFindings(
+                target, node, has_tool_schema, ambiguous
             )
-            ann = node.get("annotations")
+        hits = scan_text_block(
+            value,
+            surface=rel_path,
+            is_tool_surface=is_tool,
+            where=pointer or ("$" if include_keys else ""),
+        )
+        group.hits.extend(hits)
+        if raw_matches is not None:
+            raw_matches.record(value, hits)
+        if has_tool_schema and not is_key:
+            group.text_values.append(value)
+    results: _SourceFindings = []
+    for ordinal, group in enumerate(groups.values(), start=1):
+        target, hits = group.target, group.hits
+        if group.has_tool_schema and hits:
+            declaration = group.node or {}
+            explicit_tool = target if isinstance(target, ToolComponent) else None
+            schema = next(
+                (
+                    declaration[k]
+                    for k in ("inputSchema", "input_schema", "parameters")
+                    if k in declaration
+                ),
+                explicit_tool.input_schema if explicit_tool is not None else None,
+            )
+            ann = declaration.get(
+                "annotations", explicit_tool.annotations if explicit_tool is not None else None
+            )
             hits = hits + check_sidenote_tool_schema(
                 schema if isinstance(schema, dict) else None,
-                "\n".join(texts[ref]),
+                "\n".join(group.text_values),
                 ann if isinstance(ann, dict) else None,
                 surface=rel_path,
                 existing_hits=hits,
             )
+        if group.unresolved:
+            hits = [replace(hit, unresolved_declaration=ordinal) for hit in hits]
         results.append((target, hits))
     return results
 
@@ -943,7 +1418,7 @@ def _scan_text_source(
     raw_text: str,
     comps: list[ComponentWithRisks],
     root_agent: AgentComponent | None,
-) -> list[tuple[ComponentWithRisks, list[TextPoisoningHit]]]:
+) -> _SourceFindings:
     suffix = PurePosixPath(rel_path).suffix.lower()
     is_tool_ctx = any(
         isinstance(c, (ToolComponent, A2AServerComponent, MCPServerComponent)) for c in comps
@@ -951,7 +1426,7 @@ def _scan_text_source(
     scan_input = raw_text
     if (
         not is_tool_ctx
-        and suffix in {".md", ".mdc", ".markdown"}
+        and suffix in _MARKDOWN_SUFFIXES
         and any(
             r.category == "hidden_markup" and r.severity == RiskSeverity.HIGH
             for comp in comps
@@ -960,12 +1435,64 @@ def _scan_text_source(
     ):
         scan_input = _mask_hidden_markdown_markup(raw_text)
     hits = scan_text_block(scan_input, surface=rel_path, is_tool_surface=is_tool_ctx)
+    shared_names = _shared_names(comps)
     raw_bytes = raw_text.encode("utf-8") if hits else b""
-    by_target: dict[str, tuple[ComponentWithRisks, list[TextPoisoningHit]]] = {}
+    raw_matches = _RawMatches(raw_bytes, hits) if shared_names and hits else None
+    tree, span = _decoded_source(rel_path, raw_text, raw_matches=raw_matches)
+    if span is not None:
+        located = {(h.rule_id, h.byte_offset) for h in hits}
+        hits += [
+            h
+            for h in _escape_decoded_hits(raw_text, span, rel_path, is_tool_ctx)
+            if (h.rule_id, h.byte_offset) not in located
+        ]
+    file_owner = _file_level_owner(comps, root_agent) if shared_names else None
+    if hits and not raw_bytes:
+        raw_bytes = raw_text.encode("utf-8")
+    decoded_groups = (
+        _scan_structured_source(
+            rel_path,
+            tree,
+            comps,
+            root_agent,
+            include_keys=True,
+            tool_context=is_tool_ctx,
+            raw_matches=raw_matches,
+        )
+        if tree is not None
+        else []
+    )
+    by_target: dict[str | None, tuple[ComponentWithRisks | None, list[TextPoisoningHit]]] = {}
     for h in hits:
-        chosen = _attribute_source_component(raw_text, raw_bytes, h.byte_offset, comps, root_agent)
-        if chosen is not None:
-            by_target.setdefault(chosen.bom_ref, (chosen, []))[1].append(h)
+        if raw_matches is not None and (h.rule_id, h.byte_offset) in raw_matches.covered:
+            continue
+        chosen = _attribute_source_component(
+            raw_text,
+            raw_bytes,
+            h.byte_offset,
+            comps,
+            root_agent,
+            yaml_names=suffix in (".yaml", ".yml"),
+        )
+        if shared_names and (chosen is None or chosen is root_agent or chosen.name in shared_names):
+            chosen = file_owner
+            h = replace(h, unresolved_declaration=-(h.byte_offset + 1))
+        if chosen is not None or shared_names:
+            ref = None if chosen is None else chosen.bom_ref
+            by_target.setdefault(ref, (chosen, []))[1].append(h)
+    if decoded_groups:
+        # A decoded string is reported at its pointer, as in a JSON source, unless the raw
+        # text already gave its owner the same rule.
+        found = {
+            (ref, h.rule_id, h.unresolved_declaration)
+            for ref, (_, group) in by_target.items()
+            for h in group
+        }
+        for target, decoded in decoded_groups:
+            ref = None if target is None else target.bom_ref
+            extra = [h for h in decoded if (ref, h.rule_id, h.unresolved_declaration) not in found]
+            if extra:
+                by_target.setdefault(ref, (target, []))[1].extend(extra)
     return list(by_target.values())
 
 
@@ -1012,7 +1539,7 @@ def apply_text_poisoning_rules(
                 components_by_path.setdefault(path, []).append(comp)
     agents = [c for c in components if isinstance(c, AgentComponent)]
     root_agent = min(agents, key=lambda a: a.bom_ref) if agents else None
-    seen_keys: set[tuple[str, str, str]] = set()
+    located_hits: dict[str, dict[tuple[str, str, str, int], TextPoisoningHit]] = {}
     own_failures: list[str] = []
     own_exclusions: list[str] = []
     scanned_rel_paths: set[str] = set()
@@ -1022,6 +1549,24 @@ def apply_text_poisoning_rules(
         own_failures.append(
             f"{neutralize(subject)}: text-poisoning rules could not be applied ({reason})"
         )
+
+    def remember(target: ComponentWithRisks, hits: list[TextPoisoningHit]) -> None:
+        if not hits:
+            return
+        # Source passes come first. Keep their locations for shared rules while
+        # admitting additional rules derived from component fields afterwards.
+        firsts: dict[tuple[str, str, str, int], TextPoisoningHit] = {}
+        for hit in hits:
+            key = (hit.category, hit.surface, hit.rule_id, hit.unresolved_declaration)
+            previous = firsts.get(key)
+            if previous is None or (hit.where, hit.byte_offset) < (
+                previous.where,
+                previous.byte_offset,
+            ):
+                firsts[key] = hit
+        saved = located_hits.setdefault(target.bom_ref, {})
+        for key, hit in firsts.items():
+            saved.setdefault(key, hit)
 
     # Source files first: their findings carry file byte offsets or JSON pointers, which
     # the in-memory fields scanned after them cannot give for the same component.
@@ -1063,22 +1608,29 @@ def apply_text_poisoning_rules(
                             if not all(isinstance(c, _INSTRUCTION_KINDS) for c in comps):
                                 failed(rel_path, "not JSON")
                     owned = (
-                        _scan_json_source(rel_path, parsed, comps, root_agent)
+                        _scan_structured_source(rel_path, parsed, comps, root_agent)
                         if isinstance(parsed, (dict, list))
                         else _scan_text_source(rel_path, raw_text, comps, root_agent)
                     )
                     for target, hits in owned:
-                        added += _append_consolidated_risks(target, hits, seen_keys=seen_keys)
+                        if target is not None:
+                            remember(target, hits)
+                        elif hits:
+                            failed(rel_path, "finding has no unambiguous component owner")
+                            if failures is None:
+                                # The library caller has no diagnostics sink. Carry the
+                                # explicitly file-level risk on a stable existing record.
+                                remember(min(comps, key=_priority_key), hits)
                 except (ValueError, RecursionError) as exc:
                     failed(rel_path, type(exc).__name__)
 
     for comp in components:
         try:
-            added += _append_consolidated_risks(
-                comp, _scan_component_fields(comp), seen_keys=seen_keys
-            )
+            remember(comp, _scan_component_fields(comp))
         except (ValueError, RecursionError) as exc:
             failed(comp.bom_ref, type(exc).__name__)
+        if comp.bom_ref in located_hits:
+            added += _append_consolidated_risks(comp, list(located_hits.pop(comp.bom_ref).values()))
 
     if surfaces is not None:
         surfaces.extend(sorted(scanned_rel_paths))

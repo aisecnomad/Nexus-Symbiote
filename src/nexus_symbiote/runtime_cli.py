@@ -334,6 +334,23 @@ def _load_public(path: Path) -> Ed25519PublicKey:
     return public
 
 
+def _refuse_source_overwrite(output: Path | None, source: Path) -> None:
+    from nexus_symbiote.utils.terminal import output_failure
+
+    if output is None:
+        return
+    try:
+        # Path text alone misses a second name for the same file (a hard link, a bind
+        # mount or a case variant), so an existing output is also compared by identity.
+        same = output.resolve() == source.resolve() or (
+            output.exists() and os.path.samefile(output, source)
+        )
+    except (OSError, RuntimeError) as exc:
+        raise output_failure(exc) from exc
+    if same:
+        raise click.BadParameter("output must not overwrite the source inventory")
+
+
 @click.group("runtime")
 def runtime_group() -> None:
     """Sign and verify purpose-specific contracts for mediated tool integrations."""

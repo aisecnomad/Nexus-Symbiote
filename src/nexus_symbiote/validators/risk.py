@@ -20,9 +20,11 @@ from nexus_symbiote.core.models import (
     AnyComponent,
     ComponentBase,
     ModelComponent,
+    PromptComponent,
     RiskAssessment,
 )
 from nexus_symbiote.scanner_catalog import BUILTIN_SCANNER_NAMES
+from nexus_symbiote.scanners.prompt import withholds_content_hash
 
 if TYPE_CHECKING:
     from nexus_symbiote.policy import RiskPolicy, Suppression
@@ -97,8 +99,10 @@ def component_content_digest(component: ComponentBase) -> str | None:
         value = getattr(component, name, None)
         if isinstance(value, str) and value:
             return value
-    if component.properties.get("content_hash_withheld"):
+    if isinstance(component, PromptComponent) and withholds_content_hash(component):
         # The keyed binding is the only record of the content; see ``content_unbound``.
+        # Only the prompt collector withholds a digest: on any other record the flag is
+        # supplied text, and a binding it carried would outlive a change of the bytes.
         binding = component.properties.get("static_value_binding")
         return binding if isinstance(binding, str) and binding else None
     return component.hashes.get("sha256") or None

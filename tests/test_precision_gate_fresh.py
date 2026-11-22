@@ -18,6 +18,32 @@ from nexus_symbiote.scanner_catalog import BUILTIN_SCANNER_NAMES
 COMMITTED = precision_gate.BENCH_DIR / "results" / "scores.json"
 
 
+def test_fresh_scan_uses_the_checkout_with_a_symlinked_temp_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    physical = tmp_path / "physical"
+    physical.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(physical, target_is_directory=True)
+    monkeypatch.setenv("PYTHONPATH", "src")
+    monkeypatch.setenv("NEXUS_SYMBIOTE_LIMITS", "unknown=1")
+    calls = []
+    invoke = precision_gate.subprocess.run
+
+    def record(args, **kwargs):
+        calls.append((kwargs["cwd"], kwargs["env"]))
+        return invoke(args, **kwargs)
+
+    monkeypatch.setattr(precision_gate.subprocess, "run", record)
+    scores = precision_gate.fresh_scores(alias)
+    assert not precision_gate.evaluate_class_floors(scores)
+    assert len(calls) == 3
+    for cwd, env in calls:
+        assert cwd == physical
+        assert Path(env["PYTHONPATH"]) == Path(__file__).resolve().parents[1] / "src"
+        assert "NEXUS_SYMBIOTE_LIMITS" not in env
+
+
 def test_the_fresh_gate_scores_a_scan_made_by_this_checkout(tmp_path: Path) -> None:
     out = tmp_path / "precision-gate.json"
     assert precision_gate.main(["--fresh", "--out", str(out)]) == 0

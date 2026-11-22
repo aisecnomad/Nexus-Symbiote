@@ -49,6 +49,7 @@ from nexus_symbiote.sbom_cli import register_sbom_commands
 from nexus_symbiote.supply_chain_cli import STAGED_INVENTORY, register_supply_chain_commands
 from nexus_symbiote.text_poisoning import apply_text_poisoning_rules
 from nexus_symbiote.trace_cli import register_trace_commands
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDE_ACCEPTANCE, DEFAULT_EXCLUDES
 from nexus_symbiote.utils.files import write_output_file
 from nexus_symbiote.utils.terminal import (
     echo_line,
@@ -443,6 +444,24 @@ def _unsigned_discovery_flags(fail_on_unsigned_discovery: bool, allow: bool) -> 
         raise click.UsageError(
             "--fail-on-unsigned-discovery and --allow-unsigned-discovery contradict each other"
         )
+
+
+DISCOVERY_SIGNATURE_NEEDS_PROJECT = (
+    "The policy sets validate.require_discovery_signature and the inventory carries "
+    "ShadowScan discovery evidence; only --project with --signature-policy can verify "
+    "the report's signer."
+)
+
+
+def _discovery_signature_unverifiable(policy: Policy, bom: AIBOM) -> bool:
+    """The policy requires a verified discovery signer that this run has no project to check.
+
+    ``--allow-unsigned-discovery`` does not waive it: like ``scan --check``, the policy
+    requirement is the operator's and only a producer check over the report bytes meets it.
+    """
+    from nexus_symbiote.validators.completeness import carries_discovery_evidence
+
+    return policy.validation.require_discovery_signature and carries_discovery_evidence(bom)
 
 
 def _unsigned_discovery_failure_reason(
@@ -1014,6 +1033,21 @@ def _render_aibom(
     ),
 )
 @click.option(
+    "--accept-default-exclude",
+    type=click.Choice(sorted(DEFAULT_EXCLUDE_ACCEPTANCE)),
+    multiple=True,
+    help="Accept one default exclusion while retaining the path in the inventory. Repeat as needed.",
+)
+@click.option(
+    "--accept-default-excludes",
+    is_flag=True,
+    help=(
+        "Do not record a coverage gap for a non-empty default-excluded name (.git, "
+        "node_modules, __pycache__, .venv, venv). Without this flag such an entry "
+        "makes coverage partial. An empty directory does not."
+    ),
+)
+@click.option(
     "--fail-on-unsigned-discovery",
     is_flag=True,
     help="With --check, exit with status 1 when ShadowScan discovery evidence is unverified.",
@@ -1041,6 +1075,8 @@ def scan(
     operator_policy_max_age_days: int = 90,
     no_project_policy: bool = False,
     accept_project_policy: bool = False,
+    accept_default_excludes: bool = False,
+    accept_default_exclude: tuple[str, ...] = (),
     check_only: bool = False,
     fail_on_unsigned_discovery: bool = False,
     allow_unsigned_discovery: bool = False,
@@ -1065,7 +1101,6 @@ def scan(
 
     from nexus_symbiote.graph import assemble_repository_agent
     from nexus_symbiote.policy import PolicyError
-    from nexus_symbiote.utils.confined import DEFAULT_EXCLUDES
     from nexus_symbiote.validators.risk import RiskScorer
 
     op_policy, op_digest, op_signers = _resolve_operator_policy(
@@ -1117,6 +1152,8 @@ def scan(
     )
     surfaces_scanned: list[str] = []
     surfaces_excluded: list[str] = []
+    accepted_default_exclusions: set[str] = set()
+    accepted_default_names: set[str] = set()
     scan_failures: list[str] = []
     failures_by: dict[str, list[str]] = {}
     excluded_by: dict[str, list[str]] = {}
@@ -1146,7 +1183,10 @@ def scan(
         try:
             configure = getattr(scanner, "configure", None)
             if configure:
-                configure(exclude_paths=policy.scan.exclude_paths)
+                configure(
+                    exclude_paths=policy.scan.exclude_paths,
+                    accept_default_excludes=accept_default_excludes or accept_default_exclude,
+                )
             elif policy.scan.exclude_paths:
                 raise ValueError("scanner does not support configured exclude_paths")
             result = scanner.scan(root)
@@ -1165,6 +1205,8 @@ def scan(
             _merge_scan_result(name, result, aibom, collected, scan_failures)
             surfaces_scanned.extend(result.surfaces_scanned)
             surfaces_excluded.extend(result.surfaces_excluded)
+            accepted_default_exclusions.update(result.accepted_default_exclusions)
+            accepted_default_names.update(result.accepted_default_names)
             scan_failures.extend(result.scan_failures)
             failures_by[name] = scan_failures[failure_count:]
             excluded_by[name] = list(result.surfaces_excluded)
@@ -1251,9 +1293,18 @@ def scan(
         collectors_requested=list(selected),
         collectors_completed=completed,
         exclusions=sorted(
-            {*policy.scan.exclude_paths, *(f"**/{name}" for name in DEFAULT_EXCLUDES)}
+            {
+                *policy.scan.exclude_paths,
+                *(f"**/{name}" for name in DEFAULT_EXCLUDES),
+                *accepted_default_exclusions,
+            }
         ),
         unobserved_surfaces=[
+            *(f"accepted default exclusion: {name}" for name in sorted(accepted_default_names)),
+            *(
+                f"accepted default exclusion path: {path}"
+                for path in sorted(accepted_default_exclusions)
+            ),
             "runtime",
             "effective-identity",
             "effective-authorization",
@@ -1904,6 +1955,21 @@ def _raise_on_misplaced_attestation_key(attestation_report: Mapping[str, object]
     ),
 )
 @click.option(
+    "--accept-default-exclude",
+    type=click.Choice(sorted(DEFAULT_EXCLUDE_ACCEPTANCE)),
+    multiple=True,
+    help="Accept one default exclusion while retaining the path in the inventory. Repeat as needed.",
+)
+@click.option(
+    "--accept-default-excludes",
+    is_flag=True,
+    help=(
+        "Do not record a coverage gap for a non-empty default-excluded name (.git, "
+        "node_modules, __pycache__, .venv, venv) when reconciling the project. Without "
+        "this flag such an entry makes the local collection partial."
+    ),
+)
+@click.option(
     "--skip-integrity",
     is_flag=True,
     help=(
@@ -1944,6 +2010,8 @@ def validate(
     operator_policy_max_age_days: int = 90,
     no_project_policy: bool = False,
     accept_project_policy: bool = False,
+    accept_default_excludes: bool = False,
+    accept_default_exclude: tuple[str, ...] = (),
     skip_integrity: bool = False,
     json_output: bool = False,
     report_format: str | None = None,
@@ -2027,6 +2095,7 @@ def validate(
     # Only the reconciliation below may claim that the inventory was compared with the project.
     basis = "project-not-reconciled" if root is not None else "supplied-bom"
     bound_imports: frozenset[str] = frozenset()
+    supplier_observed: frozenset[str] = frozenset()
     completeness: dict[str, Any] = {"status": "skipped", "skipped_by": "policy"}
     if policy.validation.require_completeness:
         cv = CompletenessValidator()
@@ -2036,12 +2105,14 @@ def validate(
                 root,
                 exclude_paths=policy.scan.exclude_paths,
                 signature_policies=signature_policies,
+                accept_default_excludes=accept_default_excludes or accept_default_exclude,
             )
             if root is not None
             else cv.validate(bom)
         )
         completeness = {"status": "pass" if c_report.is_complete else "fail", **c_report.to_dict()}
         bound_imports = c_report.bound_imports
+        supplier_observed = c_report.supplier_observed
         if root is not None:
             # The risk command's vocabulary: reconciled, with supplier claims, or failed.
             basis = c_report.basis
@@ -2082,6 +2153,9 @@ def validate(
         )
         discovery = {"status": status, "problems": problems}
         passed = passed and not problems
+    elif root is None and _discovery_signature_unverifiable(policy, bom):
+        discovery = {"status": "failed", "problems": [DISCOVERY_SIGNATURE_NEEDS_PROJECT]}
+        passed = False
     elif carries_discovery_evidence(bom):
         discovery = {"status": "not-verified", "problems": []}
     producer_verified = discovery is not None and discovery["status"] == "verified"
@@ -2092,7 +2166,9 @@ def validate(
         already_verified=producer_verified,
     )
     passed = passed and unsigned_reason is None
-    assurance_errors = assurance_problems(bom, minimum, imported_claims=bound_imports)
+    assurance_errors = assurance_problems(
+        bom, minimum, imported_claims=bound_imports, supplier_observed=supplier_observed
+    )
     # Graph integrity is structural and cannot be disabled by a coverage policy.
     graph_issues = validate_graph(bom)
     passed = passed and not assurance_errors and not graph_issues
@@ -2179,6 +2255,21 @@ def validate(
     ),
 )
 @click.option(
+    "--accept-default-exclude",
+    type=click.Choice(sorted(DEFAULT_EXCLUDE_ACCEPTANCE)),
+    multiple=True,
+    help="Accept one default exclusion while retaining the path in the inventory. Repeat as needed.",
+)
+@click.option(
+    "--accept-default-excludes",
+    is_flag=True,
+    help=(
+        "Do not record a coverage gap for a non-empty default-excluded name (.git, "
+        "node_modules, __pycache__, .venv, venv) when reconciling the project. Without "
+        "this flag such an entry makes the local collection partial."
+    ),
+)
+@click.option(
     "--require-discovery-signature",
     is_flag=True,
     help=(
@@ -2212,6 +2303,8 @@ def risk(
     operator_policy_max_age_days: int = 90,
     no_project_policy: bool = False,
     accept_project_policy: bool = False,
+    accept_default_excludes: bool = False,
+    accept_default_exclude: tuple[str, ...] = (),
     fail_on_unsigned_discovery: bool = False,
     allow_unsigned_discovery: bool = False,
     project: Path | None = None,
@@ -2331,6 +2424,7 @@ def risk(
             root,
             exclude_paths=policy.scan.exclude_paths,
             signature_policies=signature_policies,
+            accept_default_excludes=accept_default_excludes or accept_default_exclude,
         )
         discovery: list[str] = []
         if discovery_signature_required(
@@ -2387,6 +2481,8 @@ def risk(
         allow_unsigned_discovery=allow_unsigned_discovery,
         already_verified=producer_verified,
     )
+    if root is None and _discovery_signature_unverifiable(policy, bom):
+        unsigned_reason, producer = DISCOVERY_SIGNATURE_NEEDS_PROJECT, "failed"
     if unsigned_reason is not None:
         reasons = [unsigned_reason]
         if attestation_failure_reason is not None:

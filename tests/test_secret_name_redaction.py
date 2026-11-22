@@ -9,6 +9,7 @@ import pytest
 from nexus_symbiote.utils.secrets import (
     REDACTED,
     SecretScrubber,
+    holds_token_shape,
     redact_descriptor,
     redact_metadata,
     redact_text,
@@ -286,6 +287,30 @@ def test_tokens_inside_names_are_found_in_linear_time(unit):
         redact_text(text, identifier=True)
 
     assert scaling_ratio(run) < 10
+
+
+@pytest.mark.parametrize("unit", ["sk-", "eyJ", "eyJaaaaaaaaa", "x-sk-eyJ1."])
+def test_a_glued_token_shape_is_looked_for_in_linear_time(unit):
+    # Each start of a JWT or sk- form read to the end of the run; retried at every start
+    # of "sk-" * n that was quadratic.
+    def run(scale: int) -> None:
+        assert not holds_token_shape(unit * (12_000 // len(unit) * scale))
+
+    assert scaling_ratio(run) < 10
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "prod-sk-ant-" + "a" * 20,
+        "x-eyJabcdefgh.ijklmnopq",
+        "sk-sk-a1a1a1a1a1a1a1a1a1",
+        "eyJeyJabcdefgh.ijklmnopq",
+        "1AKIA" + "A" * 16,
+    ],
+)
+def test_a_token_shape_glued_to_other_text_is_still_found(text):
+    assert holds_token_shape(text)
 
 
 @pytest.mark.parametrize(
