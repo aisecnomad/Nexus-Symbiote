@@ -88,7 +88,7 @@ _DISTINCT_SHAPES = (
     r"|npm_[A-Za-z0-9]{36}|pypi-[\w-]{50,}+|hf_[A-Za-z0-9]{30,}+"
     r"|pcsk_[A-Za-z0-9_]{20,}+|gsk_[A-Za-z0-9]{20,}+|r8_[A-Za-z0-9]{20,}+"
     r"|pplx-[A-Za-z0-9]{20,}+|xai-[A-Za-z0-9]{20,}+|lsv2_(?:pt|sk)_[A-Za-z0-9_]{20,}+"
-    r"|sk-proj-[A-Za-z0-9_-]{20,}+"
+    r"|sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}+|sk-[A-Za-z0-9]{32,}+"
     r"|tvly-[A-Za-z0-9-]{20,}+|fw_[A-Za-z0-9]{20,}+"
     r"|SG\.[\w-]{16,}+\.[\w-]{16,}+|dckr_pat_[\w-]{20,}+|shp(?:at|ss|ca)_[0-9a-fA-F]{32}"
     r"|SK[0-9a-f]{32}(?![A-Za-z0-9])"
@@ -119,7 +119,9 @@ _NAMED_TOKEN = re.compile(rf"(?<![\w-]){_JWT}|(?<![A-Za-z0-9])(?:{_DISTINCT_SHAP
 # plain name such as disk-management-service-v2 does not read as one.
 _EMBEDDED_TOKEN = re.compile(rf"(?:AKIA|ASIA)[A-Z0-9]{{16}}|(?:{_DISTINCT_SHAPES})")
 _TOKEN_SEGMENT = re.compile(r"[\w-]++")
-_SK_BOUNDARY = re.compile(r"(?<!\w)sk-")
+# An ordinary word can end in "sk". A preceding digit or underscore does
+# not establish that word suffix in a tag, prerelease or dependency name.
+_SK_BOUNDARY = re.compile(r"(?:(?<!\w)|(?<=[\d_]))sk-")
 _DECIMAL_DIGIT = re.compile(r"\d")
 _JWT_PAYLOAD_START = re.compile(r"\.[\w-]{8}")
 
