@@ -8,6 +8,7 @@ import posixpath
 import re
 import shlex
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -27,7 +28,7 @@ from nexus_symbiote.core.models import (
 )
 from nexus_symbiote.policy import PolicyError, parse_yaml_mapping
 from nexus_symbiote.scanners.credential_files import credential_gap, credential_shaped
-from nexus_symbiote.scanners.mcp_launch import npm_spec
+from nexus_symbiote.scanners.mcp_launch import npm_spec, python_spec
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.jsonc import strip_jsonc
 from nexus_symbiote.utils.secrets import redact_text
@@ -74,6 +75,11 @@ RUNNER_VALUE_OPTIONS = _words(
 SCRIPT_VALUE_OPTIONS = _words(
     "--tsconfig --env-file -X -W --output-dir --config --db-path --credentials --tls-key"
 )
+NODE_SCRIPT_RUNNERS = _words(
+    "node nodejs tsx ts-node ts-node-esm ts-node-script ts-node-cwd "
+    "esno esmo jiti vite-node babel-node @babel/node"
+)
+NODE_SCRIPT_SWITCHES = _words("--inspect --inspect-brk --experimental-strip-types")
 PRELOAD_OPTIONS = _words("-r --require --import --loader --experimental-loader")
 SCRIPT_ARGUMENT_OPTIONS = SCRIPT_VALUE_OPTIONS | PRELOAD_OPTIONS
 SCRIPT_SWITCHES = _words("--watch --quiet --verbose --no-warnings --no-deprecation -u -B")
@@ -114,6 +120,11 @@ _PREAMBLE_RE = re.compile(r"^\s*!(?:`([^`]+)`|\s+(.+))$")
 _HEX_40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _ON_KEY_RE = re.compile(r"(?m)^([ \t]*)on([ \t]*:)")
 _PROJECT_DIR_RE = re.compile(r"^(?:\$\{?CLAUDE_PROJECT_DIR\}?|\$\{workspace(?:Folder|Root)\})/")
+# A bare Node import can name a package and subpath. Relative paths, schemes,
+# environment expansions and parent segments cannot be classified this way.
+_NODE_PACKAGE_IMPORT = re.compile(
+    r"((?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*)(?:/[A-Za-z0-9_][\w.-]*)*", re.ASCII
+)
 _SPIFFE_RE = re.compile(r"^spiffe://[a-z0-9.-]+/[A-Za-z0-9._/-]+$")
 
 
@@ -213,11 +224,55 @@ def _normalize_rel_candidate(token: str, *, allow_any_file: bool = False) -> str
 
 
 @dataclass
+class _CheckoutScripts:
+    files: ConfinedCollection
+    paths: frozenset[str]
+
+    @cached_property
+    def local_node_packages(self) -> set[str] | None:
+        """Read the root manifest once, and only for audits that see bare Node preloads."""
+        if "package.json" not in self.paths:
+            return set()
+        manifest = self.files.read_json("package.json")
+        if not isinstance(manifest, dict) or manifest.get("workspaces"):
+            return None
+        local: set[str] = set()
+        name = manifest.get("name")
+        if isinstance(name, str) and "exports" in manifest:
+            local.add(name)
+        for section in (
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+        ):
+            for package, spec in _as_dict(manifest.get(section)).items():
+                if isinstance(spec, str) and (
+                    spec in {".", ".."}
+                    or spec.startswith(
+                        ("file:", "link:", "workspace:", "portal:", "./", "../", "/", "~")
+                    )
+                ):
+                    local.add(package)
+        return local
+
+
+@dataclass
 class _RunnerEvidence:
+    checkout: _CheckoutScripts | None = None
     preloads: list[str] = field(default_factory=list)
     gaps: set[str] = field(default_factory=set)
 
-    def option_value(self, option: str, value: str) -> None:
+    def _dependency_import(self, value: str) -> bool:
+        match = _NODE_PACKAGE_IMPORT.fullmatch(value)
+        if match is None:
+            return False
+        if self.checkout is None:
+            return True
+        local = self.checkout.local_node_packages
+        return local is not None and match[1] not in local
+
+    def option_value(self, option: str, value: str, *, node_imports: bool) -> None:
         if option in PRELOAD_OPTIONS:
             path = _normalize_rel_candidate(value, allow_any_file=True)
             if (
@@ -227,7 +282,7 @@ class _RunnerEvidence:
                 and not path.startswith("~")
             ):
                 self.preloads.append(posixpath.normpath(path))
-            else:
+            elif not (node_imports and self._dependency_import(value)):
                 self.gaps.add("preload target is unresolved")
         elif option in {"-p", "--package", "--from", "--with", "--with-editable"} and (
             value in {".", ".."} or value.startswith(("./", "../", "/", "file:", "~", "$"))
@@ -244,6 +299,8 @@ def _package_runner_target(
 ) -> str | None:
     """Distinguish a package runner's script from known value-taking options."""
     package_seen = False
+    script_runner = True
+    node_imports = runner == "node"
     pending_option: str | None = None
     unknown_option = False
     parse_options = True
@@ -251,7 +308,7 @@ def _package_runner_target(
     for arg in operands:
         follows_unknown, unknown_option = unknown_option, False
         if pending_option is not None:
-            evidence.option_value(pending_option, arg)
+            evidence.option_value(pending_option, arg, node_imports=node_imports)
             pending_option = None
             continue
         if parse_options and arg == "--":
@@ -262,17 +319,22 @@ def _package_runner_target(
         if parse_options and arg.startswith("-"):
             option, equal, value = arg.partition("=")
             if package_seen and not equal and arg.startswith("-r") and len(arg) > 2:
-                evidence.option_value("-r", arg[2:])
+                evidence.option_value("-r", arg[2:], node_imports=node_imports)
                 continue
             if not package_seen and not equal and arg.startswith("-p") and len(arg) > 2:
-                evidence.option_value("-p", arg[2:])
+                evidence.option_value("-p", arg[2:], node_imports=node_imports)
                 continue
             if option in (SCRIPT_ARGUMENT_OPTIONS if package_seen else RUNNER_VALUE_OPTIONS):
                 if equal:
-                    evidence.option_value(option, value)
+                    evidence.option_value(option, value, node_imports=node_imports)
                 else:
                     pending_option = option
-            elif package_seen and not equal and option not in SCRIPT_SWITCHES:
+            elif (
+                package_seen
+                and not equal
+                and option not in SCRIPT_SWITCHES
+                and not (node_imports and option in NODE_SCRIPT_SWITCHES)
+            ):
                 unknown_option = True
             continue
         local = _normalize_rel_candidate(arg, allow_any_file=True)
@@ -285,7 +347,9 @@ def _package_runner_target(
         path_like = explicit or "/" in arg or scripted
         listed = path in project_paths
         if follows_unknown:
-            if scripted or (explicit and not posixpath.splitext(arg)[1]):
+            if scripted or (
+                (path_like or listed) and (script_runner or not posixpath.splitext(arg)[1])
+            ):
                 evidence.gaps.add("option arity leaves the script target unresolved")
             continue
         if not package_seen:
@@ -294,13 +358,22 @@ def _package_runner_target(
             if arg in {".", "..", "./", "../"} or arg.startswith(("../", "/", "file:")):
                 evidence.gaps.add("local package entry point is unresolved")
                 continue
+            reference = python_spec(arg, shorthand=True) if runner == "uvx" else npm_spec(arg)
+            name = reference.name
+            node_imports = runner in {"npx", "node"} and name in NODE_SCRIPT_RUNNERS
+            script_runner = (
+                reference.ecosystem not in {"npm", "pypi"}
+                or node_imports
+                or name in RUNTIME_LAUNCHERS
+                or name in {"ipython", "pypy", "pypy3"}
+            )
             if (
                 runner == "npx"
                 and (
                     arg == "@modelcontextprotocol/server-filesystem"
                     or arg.startswith("@modelcontextprotocol/server-filesystem@")
                 )
-                and npm_spec(arg).name == "@modelcontextprotocol/server-filesystem"
+                and name == "@modelcontextprotocol/server-filesystem"
             ):
                 # The registry reference server accepts filesystem roots as data operands.
                 return None
@@ -324,10 +397,15 @@ def _package_runner_target(
             and not (listed or scripted)
             and npm_spec(arg).ecosystem == "npm"
         ):
-            continue
+            if not script_runner or files is None:
+                continue
+            if files.regular_file(path) is None:
+                evidence.gaps.add("scoped script target is unresolved")
+                continue
         if path_like:
             if f"{path}/" in project_paths or (files is not None and files.is_directory(path)):
-                evidence.gaps.add("directory entry point is unresolved")
+                if script_runner:
+                    evidence.gaps.add("directory entry point is unresolved")
                 continue
             return path
         if fallback is None and listed and "." not in path:
@@ -372,14 +450,15 @@ def _extract_local_script_target(
 
 def _audit_script_targets(
     tokens: list[str],
-    project_paths: frozenset[str],
-    files: ConfinedCollection,
+    checkout: _CheckoutScripts,
     gaps: list[str],
     source_file: str,
     role: str,
 ) -> tuple[str | None, list[str]]:
-    evidence = _RunnerEvidence()
-    primary = _extract_local_script_target(tokens, project_paths, files=files, evidence=evidence)
+    evidence = _RunnerEvidence(checkout=checkout)
+    primary = _extract_local_script_target(
+        tokens, checkout.paths, files=checkout.files, evidence=evidence
+    )
     gaps.extend(f"{source_file}: {role} {reason}" for reason in sorted(evidence.gaps))
     targets = ([] if primary is None else [primary]) + evidence.preloads
     return primary, list(dict.fromkeys(targets))
@@ -630,7 +709,7 @@ def _iter_hook_commands(doc: dict[str, Any]) -> list[tuple[str, str]]:
 def _inspect_hooks_and_preambles(
     files: ConfinedCollection,
     all_paths: list[str],
-    project_paths: frozenset[str],
+    checkout: _CheckoutScripts,
     summary: ControlPlaneAuditSummary,
 ) -> None:
     for cfg_path, doc in _load_json_docs(files, all_paths, HOOK_CONFIG_FILES, summary.gaps):
@@ -644,7 +723,7 @@ def _inspect_hooks_and_preambles(
                 )
             )
             _, targets = _audit_script_targets(
-                _tokenize_command(cmd_str), project_paths, files, summary.gaps, cfg_path, "hook"
+                _tokenize_command(cmd_str), checkout, summary.gaps, cfg_path, "hook"
             )
             for target in targets:
                 rec = _bind_script_target(
@@ -690,8 +769,7 @@ def _inspect_hooks_and_preambles(
             )
             _, targets = _audit_script_targets(
                 _tokenize_command(cmd_body),
-                project_paths,
-                files,
+                checkout,
                 summary.gaps,
                 skill_path,
                 "preamble",
@@ -734,7 +812,7 @@ def _find_bridge_package(tokens: list[str]) -> tuple[str, int] | None:
 def _inspect_mcp_launchers_and_bridges(
     files: ConfinedCollection,
     all_paths: list[str],
-    project_paths: frozenset[str],
+    checkout: _CheckoutScripts,
     summary: ControlPlaneAuditSummary,
     live_versions: dict[str, str],
 ) -> None:
@@ -857,7 +935,7 @@ def _inspect_mcp_launchers_and_bridges(
                 continue
 
             primary, targets = _audit_script_targets(
-                tokens, project_paths, files, summary.gaps, cfg_path, "launcher"
+                tokens, checkout, summary.gaps, cfg_path, "launcher"
             )
             props = {"registry_origin": reg_origin} if reg_origin else {}
             for target in targets:
@@ -1558,10 +1636,9 @@ def audit_project_control_plane(
                         decl_sources.append((decl_path, _parse_yaml(text), AssuranceLevel.DECLARED))
                     except (PolicyError, ValueError, RecursionError):
                         summary.gaps.append(f"{decl_path}: invalid YAML")
-        _inspect_hooks_and_preambles(files, all_paths, project_paths, summary)
-        _inspect_mcp_launchers_and_bridges(
-            files, all_paths, project_paths, summary, live_versions or {}
-        )
+        checkout = _CheckoutScripts(files, project_paths)
+        _inspect_hooks_and_preambles(files, all_paths, checkout, summary)
+        _inspect_mcp_launchers_and_bridges(files, all_paths, checkout, summary, live_versions or {})
         _inspect_steering_surfaces(files, all_paths, summary)
         _inspect_workflows_and_claims(files, all_paths, summary, decl_sources)
         _inspect_identities_and_authority(summary, decl_sources)
