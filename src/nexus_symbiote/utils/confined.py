@@ -22,7 +22,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, NoReturn, Self, cast
 
 from nexus_symbiote import limits
-from nexus_symbiote.core.hashing import descriptor_binding, open_directory_nofollow
+from nexus_symbiote.core.hashing import descriptor_binding, open_directory_nofollow, stat_input_file
 from nexus_symbiote.limits import Bound
 
 # Defaults only: a collection reads the operator's current limits when it is created.
@@ -857,7 +857,7 @@ class ConfinedCollection:
                 raise CollectionError("expected a regular file")
             fd, opened = self._open_file(relative)
             try:
-                before = os.fstat(fd)
+                before = stat_input_file(fd)
                 if not stat.S_ISREG(before.st_mode):
                     raise CollectionError("not a regular file")
                 limit = self._file_bound
@@ -945,7 +945,7 @@ class ConfinedCollection:
             finally:
                 os.close(parent)
             try:
-                before = os.fstat(fd)
+                before = stat_input_file(fd)
                 if not stat.S_ISREG(before.st_mode):
                     raise CollectionError("nonregular file")
                 if before.st_size > limit.value:
@@ -1016,7 +1016,7 @@ class ConfinedCollection:
             finally:
                 os.close(parent)
             try:
-                before = os.fstat(fd)
+                before = stat_input_file(fd)
                 budget = self._budget
                 if not stat.S_ISREG(before.st_mode):
                     raise CollectionError("nonregular file")

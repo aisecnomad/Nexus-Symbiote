@@ -245,8 +245,8 @@ file system root, that are owned by you or root and that their group and others 
 write unless the directory is sticky, as `/tmp` is. Whoever can write a directory above
 the key can rename the directory below it away and put another key in its place. The
 same rule applies to `runtime` public keys, `--operator-policy`, its
-`--operator-policy-attestation` keys and `--signature-policy` files. A key that breaks it
-fails verification with the `key-invalid` reason.
+`--operator-policy-attestation` keys and `--signature-policy` files. The inventory attestation commands report `key-invalid` for this refusal. Runtime
+commands and operator-policy verification report the error through their own CLI diagnostics.
 
 Like every input, a key file is read without following symbolic links and with a size
 limit; FIFOs and devices are refused. Each distinct key counts once: two copies of the

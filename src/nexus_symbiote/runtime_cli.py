@@ -133,8 +133,8 @@ def _read(
     return raw
 
 
-def _json_object(path: Path) -> dict[str, Any]:
-    document = strict_json(_read(path))
+def _json_object(path: Path, *, trust_anchor: str = "") -> dict[str, Any]:
+    document = strict_json(_read(path, trust_anchor=trust_anchor))
     if not isinstance(document, dict):
         raise AuthorizationError("input must be a JSON object", reason="json-not-object")
     return document
@@ -188,8 +188,13 @@ def _check_key_placement(
             # a directory or file inside a tree gives the key another location: not found.
             ancestors = {_identity(parent) for parent in resolved.parents}
             if any(resolved.is_relative_to(d) for d in untrusted_dirs) or ancestors & untrusted:
+                location = (
+                    f"{option} must lie outside the target checkout and every git working tree"
+                    if dir_inputs
+                    else f"a {option} file must lie outside every git working tree"
+                )
                 raise click.UsageError(
-                    f"a {option} file must lie outside every git working tree that holds "
+                    f"{location} that holds "
                     f"{holders} or the current directory, and outside {holders}; "
                     "this catches misplacement, it does not authenticate the key"
                 )
@@ -651,13 +656,22 @@ def register(
             option=option,
             holders="SNAPSHOT_PATH, a --trust, --state or --signer-scopes file,",
         )
+    if signer_scopes is not None:
+        _check_key_placement(
+            (signer_scopes,),
+            (snapshot_path, trust_path, state),
+            option="--signer-scopes",
+            holders="SNAPSHOT_PATH, --trust or --state",
+        )
     try:
         scopes = (
             {}
             if signer_scopes is None
             else {
                 name: SignerScope.model_validate(scope)
-                for name, scope in _json_object(signer_scopes).items()
+                for name, scope in _json_object(
+                    signer_scopes, trust_anchor="signer scope policy"
+                ).items()
             }
         )
         rings = {

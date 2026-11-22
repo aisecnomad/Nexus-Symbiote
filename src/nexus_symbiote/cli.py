@@ -10,8 +10,9 @@ import os
 import re
 import sys
 from collections.abc import Callable, Mapping
+from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import click
 
@@ -625,16 +626,24 @@ def _refuse_step_summary_input(step_summary: Path) -> None:
     Appending Markdown to an input would corrupt it in place. Compared by identity, so a
     hard link or a case variant of the input is refused too.
     """
+    from nexus_symbiote.policy import POLICY_FILE_NAMES
+
     ctx = click.get_current_context(silent=True)
-    if ctx is None or not step_summary.exists():
+    if ctx is None:
         return
-    named: list[object] = []
-    for param in ctx.command.params:
-        if param.name == "step_summary" or not isinstance(param.type, click.Path):
-            continue
-        value = ctx.params.get(param.name or "")
-        named.extend(value if isinstance(value, tuple | list) else [value])
     try:
+        if not step_summary.exists():
+            return
+        named: list[object] = []
+        for param in ctx.command.params:
+            if param.name == "step_summary" or not isinstance(param.type, click.Path):
+                continue
+            value = ctx.params.get(param.name or "")
+            named.extend(value if isinstance(value, tuple | list) else [value])
+        project = ctx.params.get("project")
+        if project and not ctx.params.get("no_project_policy"):
+            # The checkout policy consulted by risk and validate has no explicit file option.
+            named.extend(Path(project) / name for name in POLICY_FILE_NAMES)
         same = any(
             os.path.exists(source) and os.path.samefile(step_summary, source)
             for source in named
@@ -653,6 +662,7 @@ def _emit_gate_report(
     text_lines: Any,
     *,
     step_summary: Path | None = None,
+    project: Path | None = None,
     operator_source: str | None = None,
 ) -> None:
     from nexus_symbiote.operator_policy import (
@@ -663,7 +673,9 @@ def _emit_gate_report(
 
     if step_summary is not None:
         _refuse_step_summary_input(step_summary)
-        append_step_summary(step_summary, render_gate_markdown(gate_name, document))
+        append_step_summary(
+            step_summary, render_gate_markdown(gate_name, document), project=project
+        )
     if report_format == "json":
         click.echo(json_text(json.dumps(document, indent=2)))
     elif report_format == "markdown":
@@ -735,9 +747,32 @@ def _operator_policy_options(func: _F) -> _F:
     )
 
 
+def _step_summary_path(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> Path | None:
+    if value is None:
+        return None
+    try:
+        return cast(Path, click.Path(dir_okay=False, path_type=Path).convert(value, param, ctx))
+    except ValueError as exc:
+        raise output_failure(exc) from exc
+
+
 def _gate_report_options(func: _F) -> _F:
+    @wraps(func)
+    def gate(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("step_summary") is None:
+            return func(*args, **kwargs)
+        from nexus_symbiote.core.hashing import gate_input_files
+
+        token = gate_input_files.set(set())
+        try:
+            return func(*args, **kwargs)
+        finally:
+            gate_input_files.reset(token)
+
     return _apply_options(
-        func,
+        cast(_F, gate),
         click.option(
             "--report-format",
             type=click.Choice(["text", "json", "markdown", "junit"]),
@@ -746,9 +781,14 @@ def _gate_report_options(func: _F) -> _F:
         ),
         click.option(
             "--step-summary",
-            type=click.Path(dir_okay=False, path_type=Path),
+            type=click.STRING,
+            metavar="FILE",
+            callback=_step_summary_path,
             default=None,
-            help="Write an injection-safe Markdown gate summary to this file (for example GITHUB_STEP_SUMMARY).",
+            help=(
+                "Append a Markdown gate summary (for example GITHUB_STEP_SUMMARY) to a new file "
+                "or an existing singly linked report. Files read by this gate are protected."
+            ),
         ),
     )
 
@@ -2130,6 +2170,7 @@ def validate(
         document,
         lambda: validation_report_lines(document, project=root),
         step_summary=step_summary,
+        project=root,
         operator_source=policy_source if op_digest is not None else None,
     )
     if not passed:
@@ -2381,6 +2422,7 @@ def risk(
                 failed,
                 lambda: risk_report_lines(failed),
                 step_summary=step_summary,
+                project=root,
                 operator_source=op_source_line,
             )
             _gate_exit(detailed)
@@ -2420,6 +2462,7 @@ def risk(
             unsigned,
             lambda: risk_report_lines(unsigned),
             step_summary=step_summary,
+            project=root,
             operator_source=op_source_line,
         )
         _gate_exit(detailed)
@@ -2459,6 +2502,7 @@ def risk(
         document,
         lambda: risk_report_lines(document, failures=failures),
         step_summary=step_summary,
+        project=root,
         operator_source=op_source_line,
     )
     if not passed:
