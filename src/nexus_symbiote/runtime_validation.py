@@ -1271,37 +1271,51 @@ def _collection_work_exceeds_budget(
     # one level, while all in-place callers are processed before their targets.
     counts = {root: 1}
     nested: set[int] = set()
+    fallible: set[int] = set()
     for _ in range(MAX_JSON_DEPTH + 1):
         following: dict[int, int] = {}
         nested_following: set[int] = set()
+        fallible_following: set[int] = set()
         for current in order:
             count = counts.get(current, 0)
             if not count:
                 continue
             node = nodes[current]
-            count = min(count, MAX_JSON_NODES // footprint[current])
+            # Only schemas that abort collection validation on a non-conforming
+            # value can bound repetitions by a conforming value's node footprint.
+            # Branches under contains/anyOf/oneOf/not/if can fail repeatedly on
+            # single-node values without stopping collection evaluation.
+            limit = MAX_JSON_NODES if current in fallible else MAX_JSON_NODES // footprint[current]
+            count = min(count, limit)
             costly = work[current] > 32 or (current in nested and branching[current])
             if costly and count * work[current] > _MAX_OUTPUT_REPEATED_STEPS:
                 return True
+            fallible_children: set[int] = set()
+            for kw in ("not", "if"):
+                if isinstance(node.get(kw), dict):
+                    fallible_children.add(id(node[kw]))
+            for kw in ("anyOf", "oneOf"):
+                for arm in node.get(kw, ()):
+                    if isinstance(arm, dict):
+                        fallible_children.add(id(arm))
             for child in graph[current]:
                 counts[child] = max(counts.get(child, 0), count)
                 if current in nested:
                     nested.add(child)
+                if current in fallible or child in fallible_children:
+                    fallible.add(child)
             items = int(min(node.get("maxItems", MAX_JSON_NODES), MAX_JSON_NODES))
             properties = int(min(node.get("maxProperties", MAX_JSON_NODES), MAX_JSON_NODES))
             patterns = node.get("patternProperties", {})
             comparisons = len(patterns) * min(count * properties, MAX_JSON_NODES)
             if node.get("uniqueItems") and items:
-                element = node.get("items")
-                sortable = isinstance(element, dict) and element.get("type") in (
-                    "string",
-                    "number",
-                    "integer",
-                )
+                # jsonschema evaluates uniqueItems independently of items and falls
+                # back to quadratic comparisons on unhashable or mixed-type arrays.
                 entries = min(count * items, MAX_JSON_NODES)
-                comparisons += (
-                    entries * items.bit_length() if sortable else entries * (items - 1) // 2
-                )
+                unique_comparisons = entries * (items - 1) // 2
+                if unique_comparisons > _MAX_OUTPUT_REPEATED_STEPS:
+                    return True
+                comparisons += unique_comparisons
             if comparisons > 16 * _MAX_OUTPUT_REPEATED_STEPS:
                 return True
 
@@ -1344,13 +1358,21 @@ def _collection_work_exceeds_budget(
                     if isinstance(part, dict):
                         child = id(part)
                         following[child] = max(following.get(child, 0), count * cardinality)
-                        if current in nested or count > 1 and cardinality > 1:
+                        if (
+                            current in nested
+                            or keyword == "contains"
+                            or (count > 1 and cardinality > 1)
+                        ):
                             nested_following.add(child)
+                        if current in fallible or keyword == "contains":
+                            fallible_following.add(child)
             if len(fixed_costs) > 1 and count * sum(fixed_costs) > _MAX_OUTPUT_REPEATED_STEPS:
                 return True
-        if not following or (following == counts and nested_following == nested):
+        if not following or (
+            following == counts and nested_following == nested and fallible_following == fallible
+        ):
             break
-        counts, nested = following, nested_following
+        counts, nested, fallible = following, nested_following, fallible_following
     return False
 
 

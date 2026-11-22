@@ -95,3 +95,60 @@ def test_closed_collection_annotation_work_is_bounded_before_dispatch(monkeypatc
     assert validation._evaluate(dialects, schema, None) == validation._VALID
     record["unevaluatedProperties"] = False
     assert validation._evaluate(dialects, schema, None) == validation._SCHEMA
+
+
+@pytest.mark.parametrize(
+    ("schema", "expected"),
+    [
+        (
+            {"uniqueItems": True, "type": "array", "items": {"type": "string"}},
+            validation._SCHEMA,
+        ),
+        (
+            {"type": "array", "items": {"type": "string"}, "uniqueItems": True, "maxItems": 1000},
+            validation._SCHEMA,
+        ),
+        (
+            {"type": "array", "items": {"type": "string"}, "uniqueItems": True, "maxItems": 200},
+            validation._VALID,
+        ),
+    ],
+)
+def test_unique_items_requires_quadratic_bound_even_for_scalar_items(dialects, schema, expected):
+    assert validation._evaluate(dialects, schema, None) == expected
+
+
+@pytest.mark.parametrize(
+    "wrapper", ["contains-footprint", "contains-branching", "anyOf", "not", "if"]
+)
+def test_fallible_branches_cannot_use_conforming_footprint_to_bypass_budget(dialects, wrapper):
+    expensive = {
+        "anyOf": [{"type": "string", "minLength": i} for i in range(40)],
+        "type": "array",
+        "minItems": 2000,
+    }
+    if wrapper == "contains-footprint":
+        schema = {"type": "array", "contains": expensive}
+    elif wrapper == "contains-branching":
+        schema = {
+            "type": "array",
+            "contains": {"anyOf": [{"type": "string", "minLength": i} for i in range(20)]},
+        }
+    elif wrapper == "anyOf":
+        schema = {"type": "array", "items": {"anyOf": [expensive, {"type": "integer"}]}}
+    elif wrapper == "not":
+        schema = {"type": "array", "items": {"not": expensive}}
+    else:
+        schema = {"type": "array", "items": {"if": expensive, "then": True, "else": True}}
+    assert validation._evaluate(dialects, schema, None) == validation._SCHEMA
+
+
+def test_simple_and_bounded_contains_remain_admitted(dialects):
+    simple = {"type": "array", "contains": {"type": "string", "pattern": "^ticket-"}}
+    bounded = {
+        "type": "array",
+        "maxItems": 10,
+        "contains": {"anyOf": [{"type": "string", "minLength": i} for i in range(20)]},
+    }
+    assert validation._evaluate(dialects, simple, None) == validation._VALID
+    assert validation._evaluate(dialects, bounded, None) == validation._VALID
