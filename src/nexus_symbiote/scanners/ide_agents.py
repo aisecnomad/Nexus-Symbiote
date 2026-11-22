@@ -393,6 +393,10 @@ def _broad_grants(allowed: list[str]) -> list[str]:
                         continue
                     if fnmatch.fnmatchcase(tool_key, key):
                         classes.add(label)
+                if (specifier is None or bool(_WILDCARD_SPECIFIER.fullmatch(specifier))) and all(
+                    fnmatch.fnmatchcase(probe, key) for probe in ("mcp__alpha__x", "mcp__beta__y")
+                ):
+                    classes.add("every MCP server tool")
     return sorted(classes)
 
 
@@ -1309,19 +1313,32 @@ def _assignment_end(words: list[str], index: int) -> int:
     return index + 1
 
 
-def _unwrap_env_split_string(payload: str, depth: int) -> str | None:
-    """Extract the command word carried inside ``env -S`` / ``--split-string``."""
+def _unwrap_env_split_string(payload: str, depth: int) -> list[str]:
+    """Split and unwrap the command and arguments carried inside ``env -S`` / ``--split-string``."""
     if depth >= 4:
-        return None
+        return []
     inner = _decode_word(payload, drop_ifs=True)
     parts = _shell_words(inner)
     if not parts:
-        return None
+        return []
     pos = _skip_env(parts, 0, depth=depth + 1)
-    return parts[pos] if pos < len(parts) else None
+    return parts[pos:]
 
 
-def _skip_env(words: list[str], index: int, *, depth: int = 0) -> int:
+def _skip_env(
+    words: list[str],
+    index: int,
+    *,
+    depth: int = 0,
+    orig: list[int] | None = None,
+) -> int:
+    def _splice(start: int, stop: int, replacement: list[str]) -> int:
+        words[start:stop] = replacement
+        if orig is not None:
+            slot = orig[stop - 1]
+            orig[start:stop] = [slot] * len(replacement)
+        return start
+
     while index < len(words):
         word = _decode_word(words[index], drop_ifs=True)
         if word == "--":
@@ -1335,17 +1352,15 @@ def _skip_env(words: list[str], index: int, *, depth: int = 0) -> int:
             continue
         if word in {"-S", "--split-string"}:
             if index + 1 < len(words):
-                cmd = _unwrap_env_split_string(words[index + 1], depth)
-                if cmd is not None:
-                    words[index + 1] = cmd
-                    return index + 1
+                unwrapped = _unwrap_env_split_string(words[index + 1], depth)
+                if unwrapped:
+                    return _splice(index, index + 2, unwrapped)
             index += 2
             continue
         if word.startswith("--split-string="):
-            cmd = _unwrap_env_split_string(word.split("=", 1)[1], depth)
-            if cmd is not None:
-                words[index] = cmd
-                return index
+            unwrapped = _unwrap_env_split_string(word.split("=", 1)[1], depth)
+            if unwrapped:
+                return _splice(index, index + 1, unwrapped)
             index += 1
             continue
         if word.startswith(("--unset=", "--chdir=")):
@@ -1360,17 +1375,15 @@ def _skip_env(words: list[str], index: int, *, depth: int = 0) -> int:
                 flag, attached = bundle.group(2), bundle.group(3)
                 if flag == "S":
                     if attached:
-                        cmd = _unwrap_env_split_string(attached, depth)
-                        if cmd is not None:
-                            words[index] = cmd
-                            return index
+                        unwrapped = _unwrap_env_split_string(attached, depth)
+                        if unwrapped:
+                            return _splice(index, index + 1, unwrapped)
                         index += 1
                     else:
                         if index + 1 < len(words):
-                            cmd = _unwrap_env_split_string(words[index + 1], depth)
-                            if cmd is not None:
-                                words[index + 1] = cmd
-                                return index + 1
+                            unwrapped = _unwrap_env_split_string(words[index + 1], depth)
+                            if unwrapped:
+                                return _splice(index, index + 2, unwrapped)
                         index += 2
                 else:
                     index += 1 if attached else 2
@@ -1619,7 +1632,7 @@ def _executable_index(
     while cur < len(argv):
         names = _name_variants(argv[cur])
         if "env" in names:
-            cur = _skip_env(argv, cur + 1)
+            cur = _skip_env(argv, cur + 1, orig=orig)
             continue
         wrapper = next(iter(names & _WRAPPERS.keys()), None)
         if wrapper is not None:
@@ -1850,14 +1863,32 @@ def _sudo_shell(words: list[str]) -> bool:
     return False
 
 
+def _expand_env_words(words: list[str]) -> list[str]:
+    if not any("env" in _name_variants(word) for word in words):
+        return words
+    expanded = list(words)
+    idx = 0
+    steps = 0
+    while idx < len(expanded) and steps < 32:
+        if "env" in _name_variants(expanded[idx]):
+            nxt = _skip_env(expanded, idx + 1)
+            idx = nxt if nxt > idx else idx + 1
+            steps += 1
+        else:
+            idx += 1
+    return expanded
+
+
 def _segment_downloads(segment: str) -> bool:
-    return any(_name_variants(word) & _DOWNLOAD_NAMES for word in _shell_words(segment))
+    return any(
+        _name_variants(word) & _DOWNLOAD_NAMES for word in _expand_env_words(_shell_words(segment))
+    )
 
 
 def _segment_fetches(segment: str) -> bool:
     """Whether a word downloads, or `base64` is given a decode flag among its arguments."""
     decoder = False
-    for word in _shell_words(segment):
+    for word in _expand_env_words(_shell_words(segment)):
         names = _name_variants(word)
         if names & _DOWNLOAD_NAMES:
             return True

@@ -844,6 +844,45 @@ def _parse_frontmatter_mapping(language: str, raw: str) -> dict[str, Any]:
     return parse_yaml_mapping(raw, max_nodes=MAX_FRONTMATTER_YAML_NODES)
 
 
+def _try_parse_frontmatter(language: str, raw: str) -> dict[str, Any] | None:
+    try:
+        return _parse_frontmatter_mapping(language, raw)
+    except (PolicyError, ValueError, TypeError, RecursionError, MemoryError):
+        return None
+
+
+def _parse_frontmatter_candidates(
+    candidates: list[tuple[str, str, str]],
+) -> tuple[list[dict[str, Any]], bool]:
+    metas: list[dict[str, Any]] = []
+    first_lang, first_raw, _ = candidates[0]
+    if not first_raw.strip():
+        primary_ok = True
+    else:
+        parsed = _try_parse_frontmatter(first_lang, first_raw)
+        primary_ok = parsed is not None
+        if parsed is not None:
+            metas.append(parsed)
+    if len(candidates) == 2:
+        alt_lang, alt_raw, _ = candidates[1]
+        if alt_raw.strip():
+            alt_meta = _try_parse_frontmatter(alt_lang, alt_raw)
+            if alt_meta is not None:
+                metas.append(alt_meta)
+                primary_ok = True
+            elif primary_ok and len(alt_raw) > len(first_raw):
+                # Dual `...` / `---` reading: strip the `...` line to parse smuggled tail.
+                tail = alt_raw[len(first_raw) :]
+                _, _, after_dots = tail.partition("\n")
+                if not after_dots and "\r" in tail:
+                    _, _, after_dots = tail.partition("\r")
+                if after_dots.strip():
+                    tail_meta = _try_parse_frontmatter(alt_lang, after_dots)
+                    if tail_meta is not None:
+                        metas.append(tail_meta)
+    return metas, primary_ok
+
+
 def scan_subagent_and_rule_frontmatter(
     files: Any,
     base: str,
@@ -898,44 +937,8 @@ def scan_subagent_and_rule_frontmatter(
             candidates = front_matter_candidates(text)
             if not candidates:
                 continue
-            metas: list[dict[str, Any]] = []
-            primary_ok = False
-            first_lang, first_raw, _ = candidates[0]
-            if not first_raw.strip():
-                primary_ok = True
-            else:
-                try:
-                    metas.append(_parse_frontmatter_mapping(first_lang, first_raw))
-                    primary_ok = True
-                except (PolicyError, ValueError, TypeError, RecursionError, MemoryError):
-                    pass
-            if len(candidates) == 2:
-                alt_lang, alt_raw, _ = candidates[1]
-                if alt_raw.strip():
-                    alt_parsed = False
-                    try:
-                        metas.append(_parse_frontmatter_mapping(alt_lang, alt_raw))
-                        primary_ok = True
-                        alt_parsed = True
-                    except (PolicyError, ValueError, TypeError, RecursionError, MemoryError):
-                        pass
-                    if not alt_parsed and primary_ok and len(alt_raw) > len(first_raw):
-                        # Dual `...` / `---` reading: strip the `...` line to parse smuggled tail.
-                        tail = alt_raw[len(first_raw) :]
-                        _, _, after_dots = tail.partition("\n")
-                        if not after_dots and "\r" in tail:
-                            _, _, after_dots = tail.partition("\r")
-                        if after_dots.strip():
-                            try:
-                                metas.append(_parse_frontmatter_mapping(alt_lang, after_dots))
-                            except (
-                                PolicyError,
-                                ValueError,
-                                TypeError,
-                                RecursionError,
-                                MemoryError,
-                            ):
-                                pass
+            first_lang = candidates[0][0]
+            metas, primary_ok = _parse_frontmatter_candidates(candidates)
             if not primary_ok:
                 if scan_failures is not None:
                     label = first_lang.upper() if first_lang in {"toml", "json"} else "YAML"
@@ -948,8 +951,8 @@ def scan_subagent_and_rule_frontmatter(
                 if is_agent:
                     risks.extend(extract_subagent_inline_mcp_servers(meta, rel))
                 merged_meta.update(meta)
-                if meta.get("alwaysApply") is True:
-                    merged_meta["alwaysApply"] = True
+            if any(meta.get("alwaysApply") is True for meta in metas):
+                merged_meta["alwaysApply"] = True
             if len(metas) > 1:
                 for key in ("globs", "applyTo", "paths"):
                     combined_globs: list[str] = []
