@@ -21,15 +21,17 @@ import ast
 import codecs
 import functools
 import io
+import posixpath
 import re
 import sys
 import tokenize
 import unicodedata
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Any
 
 from nexus_symbiote import limits
 from nexus_symbiote.core.enums import TrustTier
@@ -52,6 +54,7 @@ from nexus_symbiote.scanners.ts_tools import (
     NOT_SOURCE_NAMES,
     REACHED,
     SCRIPT_SUFFIXES,
+    SKIPPED_DIRECTORIES,
     SOURCE_MARKERS,
     UTF16_BYTE_ORDER_MARKS,
     collect_typescript_source,
@@ -67,10 +70,19 @@ _SDK_IMPORT = re.compile(
 )
 
 # Test, build output, documentation and example trees are not searched, so code
-# that only illustrates an SDK never fails the collector.
+# that only illustrates an SDK never fails the collector. A file a configured server
+# launches is searched wherever it is: the client runs it and serves its tools.
 SOURCE_SEARCH_SKIPPED = frozenset(
     {"tests", "test", "dist", "build", "docs", "benchmarks", "examples"}
 )
+_SKIPPED_TREES = SOURCE_SEARCH_SKIPPED | SKIPPED_DIRECTORIES
+_LAUNCHED_SUFFIXES = frozenset({".py", *SCRIPT_SUFFIXES})
+_LAUNCH_WORD = re.compile(r"[\s=]+")
+_MODULE_NAME = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
+_SAFE_PATH = re.compile(r"[\w.\-/]{1,255}")
+_WORKSPACE_PREFIXES = ("${workspaceFolder}/", "${workspaceRoot}/", "./")
+# A server's config file, the directory its client starts it in, and its raw entry.
+LaunchedServer = tuple[str, str, Mapping[str, Any]]
 # The launcher names below, like the server class names among the tool hints, are
 # markers too, so a file that reaches one through a module of its own project, without
 # naming the SDK, is read.
@@ -580,19 +592,118 @@ class _Kind:
     selected: list[tuple[Path, bytes]] = field(default_factory=list)
 
 
-def _python_source(path: Path) -> bool:
-    return path.suffix == ".py" and not SOURCE_SEARCH_SKIPPED.intersection(path.parts)
-
-
-def _script_source(suffix: str) -> Callable[[Path], bool]:
+def _python_source(launched: frozenset[Path]) -> Callable[[Path], bool]:
     def eligible(path: Path) -> bool:
-        return (
-            path.suffix == suffix
-            and not SOURCE_SEARCH_SKIPPED.intersection(path.parts)
-            and not path.name.endswith(NOT_SOURCE_NAMES)
+        return path.suffix == ".py" and (
+            path in launched or not SOURCE_SEARCH_SKIPPED.intersection(path.parts)
         )
 
     return eligible
+
+
+def _script_source(suffix: str, launched: frozenset[Path]) -> Callable[[Path], bool]:
+    def eligible(path: Path) -> bool:
+        return path.suffix == suffix and (
+            path in launched
+            or (
+                not SOURCE_SEARCH_SKIPPED.intersection(path.parts)
+                and not path.name.endswith(NOT_SOURCE_NAMES)
+            )
+        )
+
+    return eligible
+
+
+def _launch_words(config: Mapping[str, Any]) -> Iterator[tuple[str | None, str]]:
+    """Each word of a server's raw command and arguments, with the word before it.
+
+    Shell strings and ``--flag=value`` arguments are split too, so a word may be
+    one no client passes alone: a reference only selects a file for the search.
+    """
+    command, args = config.get("command"), config.get("args")
+    texts = [command] if isinstance(command, str) else []
+    if isinstance(args, list):
+        texts.extend(arg for arg in args if isinstance(arg, str))
+    previous: str | None = None
+    for text in texts:
+        for raw in _LAUNCH_WORD.split(text):
+            word = raw.strip("\"'").replace("\\", "/")
+            if word:
+                yield previous, word
+                previous = word
+
+
+def _referenced_paths(word: str, previous: str | None) -> tuple[tuple[str, ...], bool]:
+    """Relative files a launch word may run, and whether it names a source exactly."""
+    if previous == "-m" or (word.startswith("-m") and len(word) > 2):
+        module = word if previous == "-m" else word[2:]
+        if not _MODULE_NAME.fullmatch(module):
+            return (), False
+        stem = module.replace(".", "/")
+        return (f"{stem}.py", f"{stem}/__main__.py"), True
+    for prefix in _WORKSPACE_PREFIXES:
+        word = word.removeprefix(prefix)
+    if not word or word.startswith(("/", "-", "~")) or "$" in word or ":" in word:
+        return (), False
+    if PurePosixPath(word).suffix in _LAUNCHED_SUFFIXES:
+        return (word,), True
+    if "/" not in word:
+        return (), False
+    # node resolves an extensionless script and python runs a directory's __main__.py.
+    return (
+        *(f"{word}{suffix}" for suffix in sorted(_LAUNCHED_SUFFIXES)),
+        *(f"{word}/index{suffix}" for suffix in sorted(SCRIPT_SUFFIXES)),
+        f"{word}/__main__.py",
+    ), False
+
+
+def _launched_sources(
+    servers: Sequence[LaunchedServer],
+    sources: Sequence[Path],
+    result: ScanResult,
+    known: KnownValues | None,
+) -> frozenset[Path]:
+    """Walked files under a skipped directory that a configured server may launch.
+
+    Arguments are read before redaction, only to select files: no argument value is
+    recorded unless it is a path the scan read no credential value into. A source
+    named exactly under a skipped directory that the walk did not reach is a gap.
+    """
+    walked = {path.as_posix(): path for path in sources}
+    launched: set[Path] = set()
+    gaps: dict[str, None] = {}
+    for config_path, directory, config in servers:
+        bases = [directory]
+        cwd = config.get("cwd")
+        if isinstance(cwd, str) and cwd.strip("./") and not cwd.startswith(("/", "$", "~")):
+            bases.append(posixpath.join(directory, cwd))
+        for previous, word in _launch_words(config):
+            references, exact = _referenced_paths(word, previous)
+            found = False
+            skipped: list[str] = []
+            for reference in references:
+                for base in bases:
+                    relative = posixpath.normpath(posixpath.join(base, reference))
+                    if relative.startswith("../") or relative == "..":
+                        continue
+                    if relative in walked:
+                        launched.add(walked[relative])
+                        found = True
+                    elif _SKIPPED_TREES.intersection(PurePosixPath(relative).parts[:-1]):
+                        skipped.append(relative)
+            if exact and skipped and not found:
+                shown = skipped[0]
+                named = _SAFE_PATH.fullmatch(shown) is not None and not (
+                    known is not None and known.held_by(shown)
+                )
+                target = f"source {shown}" if named else "a source file"
+                gaps[
+                    f"{config_path}: a server launches {target} under a directory the source "
+                    "search skips, which the collection did not read; its declared tools are "
+                    "not collected"
+                ] = None
+    result.surfaces_excluded.extend(gaps)
+    return frozenset(path for path in launched if _SKIPPED_TREES.intersection(path.parts))
 
 
 def _server_import(tree: ast.Module) -> bool:
@@ -1289,6 +1400,7 @@ def collect_source_references(
     *,
     unvisited: Sequence[Path] = (),
     walk_complete: bool = True,
+    launched: Sequence[LaunchedServer] = (),
 ) -> None:
     """Inventory MCP servers, MCP clients and agent tools declared in source.
 
@@ -1296,13 +1408,19 @@ def collect_source_references(
     as a stream, root files first, and ``budget`` bounds the text read: running out
     of it is the budget's one named failure, and nothing after it is read. A server
     name declared in source that holds one of the ``known`` values, which the scan
-    read from configuration files, is not recorded.
+    read from configuration files, is not recorded. A file one of the ``launched``
+    servers runs is searched even under a directory the search otherwise skips.
     """
     settings = limits.current()
     python_nodes = limits.bound("python-nodes")
-    servers = _Kind(is_server_source, _server_candidate)
-    python = _Kind(_python_source, _python_candidate)
-    clients = [_Kind(_script_source(suffix), _client_candidate) for suffix in _CLIENT_SUFFIXES]
+    started = _launched_sources(launched, sources, result, known)
+    servers = _Kind(
+        lambda path: is_server_source(path, launched=path in started), _server_candidate
+    )
+    python = _Kind(_python_source(started), _python_candidate)
+    clients = [
+        _Kind(_script_source(suffix, started), _client_candidate) for suffix in _CLIENT_SUFFIXES
+    ]
     kinds = (servers, python, *clients)
     python_paths = frozenset(path for path in sources if path.suffix == ".py")
     plain_modules: dict[Path, _PassiveModule] = {}

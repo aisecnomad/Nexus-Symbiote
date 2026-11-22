@@ -893,7 +893,10 @@ A way around a limit that its entry does not describe is worth a
 - **Some directories are skipped.** Server source under directories named `build`,
   `dist`, `test`, `tests`, `docs`, `benchmarks` or `examples`, and `__tests__` for
   TypeScript and JavaScript, is skipped without a gap, and so are TypeScript
-  declaration files and scripts named like `server.test.mjs` or `server.spec.ts`.
+  declaration files and scripts named like `server.test.mjs` or `server.spec.ts`,
+  unless a configured server's `command` or `args` names the file. A file such a
+  server reaches some other way, such as through a wrapper script, a package entry
+  point, an absolute path or a `$VARIABLE`, stays skipped without a gap.
 - **Framework tools are collected by decorator only.** Module-level functions
   decorated with `@tool` (LangChain, CrewAI, smolagents), `@function_tool` (OpenAI
   Agents SDK) or PydanticAI's `@agent.tool` are collected by name; the descriptor is

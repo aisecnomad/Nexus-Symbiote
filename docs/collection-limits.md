@@ -113,7 +113,13 @@ The mcp collector searches Python files and TypeScript and JavaScript files
 outside directories named `tests`, `test`, `dist`, `build`, `docs`, `benchmarks`
 and `examples` (and `__tests__` for TypeScript and JavaScript servers), other than
 declaration files (`.d.ts`, `.d.mts`, `.d.cts`) and scripts named with `.spec.` or
-`.test.` before their suffix, root files first. Each is read as a stream under
+`.test.` before their suffix, root files first. A file that a configured server's
+`command` or `args` names is searched wherever it is and whatever its name: a
+path such as `examples/srv.py`, an extensionless path such as `examples/server`
+(with each source suffix, or as a directory's `index` script or `__main__.py`), or a
+`-m` module such as `examples.srv`, each also relative to the server's `cwd`. Shell
+strings and `--flag=value` arguments are split into words for this. A source file named that way under one of those directories that
+the walk did not reach is a gap. Each is read as a stream under
 `source-scan-bytes`, in the text the language's own tools read, and only
 candidates are parsed:
 
