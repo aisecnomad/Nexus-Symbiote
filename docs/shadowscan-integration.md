@@ -581,7 +581,10 @@ the check on. An entry matches the report by path or by file, so another name
 for the same file, such as a different case on a case-insensitive filesystem,
 counts too. So does `--require-discovery-signature` on `validate` or `risk`, or
 `validate.require_discovery_signature: true` in the project policy, which then
-fails when no entry names the report. The project-policy setting is ignored, like
+fails when no entry names the report. Set in an operator policy, it also fails
+`validate` and `risk` without `--project` on an inventory that carries
+ShadowScan evidence, whatever `--allow-unsigned-discovery` says, as no report
+can be verified there. The project-policy setting is ignored, like
 the rest of the file, under `--no-project-policy`, so CI that ignores the project
 policy passes the command-line flag. Keep the signature policy outside the
 checkout, as the project policy can be changed by the code it gates. When the

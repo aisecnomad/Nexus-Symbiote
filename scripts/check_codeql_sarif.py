@@ -41,10 +41,12 @@ def evaluate(document: Any, sha: str) -> dict[str, Any]:
         for source in provenance:
             if not isinstance(source, dict) or source.get("revisionId") != sha:
                 raise ValueError("SARIF source revision differs from the checked-out commit")
-        invocations = run.get("invocations", [])
+        # The CodeQL CLI records each run's invocation but not, by default, its source
+        # revision, so provenance is checked when present and an invocation is required.
+        invocations = run.get("invocations")
         if (
             not isinstance(invocations, list)
-            or ("invocations" in run and not invocations)
+            or not invocations
             or any(
                 not isinstance(invocation, dict)
                 or invocation.get("executionSuccessful") is not True
