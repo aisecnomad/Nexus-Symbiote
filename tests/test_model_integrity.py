@@ -647,6 +647,24 @@ def test_gguf_metadata_beyond_the_bounds_is_a_coverage_gap(project, monkeypatch)
     assert result.components[0].serialization_safety == SerializationSafety.UNKNOWN
 
 
+def test_gguf_arrays_nested_past_the_bound_are_a_coverage_gap(project):
+    # Audit P1-M9: array<array<array>> before the template was refused as unreadable, so
+    # the template went uninspected with no gap recorded.
+    def array(item: int, values: list[bytes]) -> bytes:
+        return item.to_bytes(4, "little") + len(values).to_bytes(8, "little") + b"".join(values)
+
+    nested = gguf_string("k.nested") + (9).to_bytes(4, "little")
+    nested += array(9, [array(9, [array(4, [])])])
+    data = bytearray(gguf("{{ x.__class__ }}"))
+    data[16:24] = (int.from_bytes(data[16:24], "little") + 1).to_bytes(8, "little")
+    (project / "model.gguf").write_bytes(bytes(data[:24]) + nested + bytes(data[24:]))
+    result = ModelScanner().scan(project)
+    assert result.surfaces_excluded == [
+        "model.gguf: GGUF chat templates not inspected: GGUF metadata exceeds the inspection limits"
+    ]
+    assert result.components[0].serialization_safety == SerializationSafety.UNKNOWN
+
+
 # Format detection ---------------------------------------------------------------------
 
 

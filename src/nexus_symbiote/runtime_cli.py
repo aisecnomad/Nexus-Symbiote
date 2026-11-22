@@ -157,28 +157,67 @@ def _identity(path: Path) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
 
+def _verify_outside_checkout(
+    target: Path, untrusted_roots: tuple[Path, ...], *, label: str
+) -> None:
+    try:
+        resolved_roots = [p.resolve() for p in untrusted_roots]
+        search_starts = [
+            *(p if p.is_dir() else p.parent for p in resolved_roots),
+            Path.cwd().resolve(),
+        ]
+        trees = _working_trees(search_starts)
+        forbidden_dirs = [
+            *trees,
+            *(p for p in resolved_roots if p.is_dir() and p not in trees),
+        ]
+        forbidden_ids = {_identity(d) for d in forbidden_dirs}
+        resolved_target = target.resolve()
+        ancestor_ids = {_identity(parent) for parent in resolved_target.parents}
+        if any(resolved_target.is_relative_to(d) for d in forbidden_dirs) or bool(
+            ancestor_ids & forbidden_ids
+        ):
+            raise click.UsageError(
+                f"{label} must lie outside the target checkout and every git working tree "
+                "that holds the checkout or the current directory"
+            )
+        if os.stat(resolved_target).st_nlink != 1:
+            raise click.UsageError(f"{label} must not have multiple hard links")
+    except click.UsageError:
+        raise
+    except (OSError, RuntimeError):
+        raise click.UsageError(f"{label} cannot be inspected safely") from None
+
+
 def _check_key_placement(
     keys: tuple[Path, ...], inputs: tuple[Path, ...], *, option: str, holders: str
 ) -> None:
-    """Refuse a trusted key that a change to a working tree around the inputs could supply.
+    """Refuse a trusted key that a change to a working tree or untrusted root could supply.
 
-    This catches misplacement, such as a key committed beside the contracts it is to
-    judge; it does not authenticate the key.
+    This catches misplacement, such as a key committed beside the contracts or inside
+    the project directory it is to judge; it does not authenticate the key.
     """
     try:
-        trees = _working_trees([*(path.resolve().parent for path in inputs), Path.cwd().resolve()])
-        untrusted = {_identity(tree) for tree in trees}
+        resolved_inputs = [path.resolve() for path in inputs]
+        dir_inputs = [p for p in resolved_inputs if p.is_dir()]
+        search_starts = [
+            *(p if p.is_dir() else p.parent for p in resolved_inputs),
+            Path.cwd().resolve(),
+        ]
+        trees = _working_trees(search_starts)
+        untrusted_dirs = [*trees, *(d for d in dir_inputs if d not in trees)]
+        untrusted = {_identity(d) for d in untrusted_dirs}
         for key in keys:
             resolved = key.resolve()
             # Device and inode also find the tree directory itself under a name the path
             # text misses, such as a case variant or a bind mount of the tree. A mount of
             # a directory or file inside a tree gives the key another location: not found.
             ancestors = {_identity(parent) for parent in resolved.parents}
-            if any(resolved.is_relative_to(tree) for tree in trees) or ancestors & untrusted:
+            if any(resolved.is_relative_to(d) for d in untrusted_dirs) or ancestors & untrusted:
                 raise click.UsageError(
                     f"a {option} file must lie outside every git working tree that holds "
-                    f"{holders} or the current directory; this catches misplacement, it "
-                    "does not authenticate the key"
+                    f"{holders} or the current directory, and outside {holders}; "
+                    "this catches misplacement, it does not authenticate the key"
                 )
             if os.stat(resolved).st_nlink != 1:
                 raise click.UsageError(
@@ -293,6 +332,23 @@ def _load_public(path: Path) -> Ed25519PublicKey:
     if not isinstance(public, Ed25519PublicKey):
         raise _KeyFileError("only Ed25519 public keys are supported")
     return public
+
+
+def _refuse_source_overwrite(output: Path | None, source: Path) -> None:
+    from nexus_symbiote.utils.terminal import output_failure
+
+    if output is None:
+        return
+    try:
+        # Path text alone misses a second name for the same file (a hard link, a bind
+        # mount or a case variant), so an existing output is also compared by identity.
+        same = output.resolve() == source.resolve() or (
+            output.exists() and os.path.samefile(output, source)
+        )
+    except (OSError, RuntimeError) as exc:
+        raise output_failure(exc) from exc
+    if same:
+        raise click.BadParameter("output must not overwrite the source inventory")
 
 
 @click.group("runtime")

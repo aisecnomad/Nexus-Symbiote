@@ -53,7 +53,7 @@ def test_a_project_policy_is_not_applied_unless_accepted(tmp_path: Path) -> None
     assert accepted_meta.get("policy_weakened")
 
 
-def test_unsafe_unused_policy_is_distinguished_from_an_incomplete_lookup(tmp_path: Path) -> None:
+def test_scan_refuses_an_unreadable_policy_symlink(tmp_path: Path) -> None:
     project = tmp_path / "checkout cannot be listed"
     project.mkdir()
     (project / ".nexus-symbiote.yaml").symlink_to("unused.yaml")
@@ -62,9 +62,9 @@ def test_unsafe_unused_policy_is_distinguished_from_an_incomplete_lookup(tmp_pat
 
     run = CliRunner().invoke(main, ["scan", str(project), "--report-only", "-o", str(output)])
 
-    assert run.exit_code == 0, run.output
-    assert "was not applied because it is invalid or unsafe to read" in run.output
-    assert output.exists()
+    assert run.exit_code == 1, run.output
+    assert "policy must not be a symlink" in run.stderr
+    assert not output.exists()
 
 
 def test_in_ci_a_project_policy_is_still_not_applied_without_the_flag(

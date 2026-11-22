@@ -52,11 +52,11 @@ through `ReferenceGateway`. It reads no checkout; see
 
 `scan` runs the whole pipeline in one command (`cli.py`):
 
-1. **Policy.** It loads `.nexus-symbiote.yaml` from the scan root only when
-   `--accept-project-policy` is given. Otherwise it uses the built-in policy.
-   `--no-project-policy` does the same and does not warn that a file was left
-   unused. It also loads any operator signer policy. Every relaxation of the
-   built-in gates is recorded in `policy_weakened` when a project policy is applied.
+1. **Policy.** It reads a bounded checkout policy from the scan root. Settings
+   that tighten the governing gates apply automatically, including in a mixed file.
+   A relaxation requires `--accept-project-policy`. `--no-project-policy` skips the file.
+   A signed operator policy bounds the effective gates. Applied relaxations
+   are recorded in `policy_weakened`.
 2. **Collection.** Each selected collector reads the checkout through the confined
    reader and returns components, relationships, findings, scanned surfaces, gaps
    and failures. Recorded paths are made relative to the scan root.

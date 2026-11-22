@@ -19,10 +19,11 @@ import os
 import tempfile
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast, get_args
+from typing import Final, get_args
 
 import click
 from click.testing import CliRunner
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import ValidationError
 
 from nexus_symbiote import attestation, limits
@@ -43,12 +44,12 @@ from nexus_symbiote.policy import (
 from nexus_symbiote.runtime import key_id
 from nexus_symbiote.runtime_cli import (
     _check_key_placement,
-    _identity,
     _InputTooLargeError,
     _KeyFileError,
     _read,
-    _working_trees,
+    _verify_outside_checkout,
 )
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDE_ACCEPTANCE, ROOT_GIT_METADATA
 from nexus_symbiote.utils.terminal import safe_line
 from nexus_symbiote.validators.completeness import (
     CompletenessValidator,
@@ -58,9 +59,6 @@ from nexus_symbiote.validators.completeness import (
 )
 from nexus_symbiote.validators.integrity import IntegrityValidator
 from nexus_symbiote.validators.risk import RiskScorer
-
-if TYPE_CHECKING:
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 MAX_OPERATOR_POLICY_BYTES = 1024 * 1024
 # The signed-policy contract of `nexus_symbiote.operator_policy` and the CLI's operator-policy
@@ -78,38 +76,6 @@ _SEVERITY_STRICTNESS: dict[str, int] = {
     "info": 5,
 }
 _ASSURANCE_STRICTNESS: dict[str, int] = {"declared": 0, "observed": 1, "verified": 2}
-
-
-def _verify_outside_checkout(
-    target: Path, untrusted_roots: tuple[Path, ...], *, label: str
-) -> None:
-    try:
-        resolved_roots = [p.resolve() for p in untrusted_roots]
-        search_starts = [
-            *(p if p.is_dir() else p.parent for p in resolved_roots),
-            Path.cwd().resolve(),
-        ]
-        trees = _working_trees(search_starts)
-        forbidden_dirs = [
-            *trees,
-            *(p for p in resolved_roots if p.is_dir() and p not in trees),
-        ]
-        forbidden_ids = {_identity(d) for d in forbidden_dirs}
-        resolved_target = target.resolve()
-        ancestor_ids = {_identity(parent) for parent in resolved_target.parents}
-        if any(resolved_target.is_relative_to(d) for d in forbidden_dirs) or bool(
-            ancestor_ids & forbidden_ids
-        ):
-            raise click.UsageError(
-                f"{label} must lie outside the target checkout and every git working tree "
-                "that holds the checkout or the current directory"
-            )
-        if os.stat(resolved_target).st_nlink != 1:
-            raise click.UsageError(f"{label} must not have multiple hard links")
-    except click.UsageError:
-        raise
-    except (OSError, RuntimeError):
-        raise click.UsageError(f"{label} cannot be inspected safely") from None
 
 
 def clamp_operator_floor(operator_policy: Policy, project_policy: Policy | None) -> Policy:
@@ -165,7 +131,9 @@ def _line(prefix: str, *values: object) -> str:
     return safe_line(prefix, *values) + "\n"
 
 
-def validation_failures(bom: AIBOM, root: Path, policy: Policy) -> list[str]:
+def validation_failures(
+    bom: AIBOM, root: Path, policy: Policy, *, accept_default_excludes: tuple[str, ...] = ()
+) -> list[str]:
     """Apply the checks of `validate --project`; only a pass verdict yields no failure."""
     validation = policy.validation
     minimum = validation.minimum_assurance_level
@@ -177,7 +145,9 @@ def validation_failures(bom: AIBOM, root: Path, policy: Policy) -> list[str]:
     excluded = policy.scan.exclude_paths
     bound_imports: frozenset[str] = frozenset()
     if validation.require_completeness:
-        c_rep = CompletenessValidator().validate_against_project(bom, root, exclude_paths=excluded)
+        c_rep = CompletenessValidator().validate_against_project(
+            bom, root, exclude_paths=excluded, accept_default_excludes=accept_default_excludes
+        )
         bound_imports = c_rep.bound_imports
         if not c_rep.is_complete:
             failures.append("completeness validation failed under operator policy")
@@ -215,9 +185,12 @@ def run_staged_gate(
     trusted_keys: tuple[Path, ...] = (),
     allow_unsigned: bool = False,
     max_age_days: int = DEFAULT_MAX_AGE_DAYS,
+    accept_default_excludes: tuple[str, ...] = (ROOT_GIT_METADATA,),
 ) -> tuple[int, str]:
     """Verify operator policy placement/attestation in-place and run repository gates."""
     try:
+        if any(name not in DEFAULT_EXCLUDE_ACCEPTANCE for name in accept_default_excludes):
+            raise click.UsageError("unknown built-in exclusion")
         if not project_dir.is_dir():
             raise click.UsageError("--project must name an existing directory")
         if allow_unsigned and (attestation_source is not None or trusted_keys):
@@ -267,7 +240,9 @@ def run_staged_gate(
         if attestation_source is not None:
             ring: dict[str, Ed25519PublicKey] = {}
             for key_path in trusted_keys:
-                pub = cast("Ed25519PublicKey", _load_trusted_public(key_path))
+                pub = _load_trusted_public(key_path)
+                if not isinstance(pub, Ed25519PublicKey):
+                    raise _KeyFileError("only Ed25519 public keys are supported")
                 ring[key_id(pub)] = pub
             raw_env = _read(attestation_source, attestation.MAX_ENVELOPE_BYTES)
             attestation.verify_attestation(
@@ -298,7 +273,7 @@ def run_staged_gate(
     cli_policy_args: list[str] = []
     # Collection uses the operator's settings. The checks below apply any stricter checkout floor.
     supports_operator = _has_option("scan", "--operator-policy")
-    scan_extra_args = []
+    scan_extra_args: list[str] = []
     if not supports_operator or _has_option("scan", "--no-project-policy"):
         scan_extra_args.append("--no-project-policy")
     if supports_operator:
@@ -317,6 +292,10 @@ def run_staged_gate(
         # trigger the CI weakened-project-policy abort before operator clamping runs.
         for scanner_name in operator_policy.scan.scanners:
             scan_extra_args.extend(["--scanner", scanner_name])
+
+    accept_args = [f"--accept-default-exclude={name}" for name in accept_default_excludes]
+    if _has_option("scan", "--accept-default-exclude"):
+        scan_extra_args.extend(accept_args)
 
     # The checks below collect outside any CLI command, which is where the operator's
     # NEXUS_SYMBIOTE_LIMITS would otherwise be applied.
@@ -353,7 +332,9 @@ def run_staged_gate(
         if project_policy is not None:
             lines.append("The checkout policy was used only to tighten the operator's checks.\n")
 
-        failures = validation_failures(bom, resolved_project, effective)
+        failures = validation_failures(
+            bom, resolved_project, effective, accept_default_excludes=accept_default_excludes
+        )
         lines.extend(_line("Error: ", failure) for failure in failures)
 
         scorer = RiskScorer(
@@ -370,10 +351,12 @@ def run_staged_gate(
         if failures or not passed:
             return 1, "".join(lines)
 
-        if supports_operator:
-            risk_args = [*cli_policy_args]
+        if supports_operator and _has_option("risk", "--operator-policy"):
+            risk_args = list(cli_policy_args)
             if _has_option("risk", "--no-project-policy"):
                 risk_args.append("--no-project-policy")
+            if _has_option("risk", "--accept-default-exclude"):
+                risk_args.extend(accept_args)
             risk_res = runner.invoke(
                 cli_main,
                 ["risk", str(candidate_bom), "--project", str(project_dir), *risk_args],
@@ -397,6 +380,21 @@ def run_staged_gate(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", type=Path, required=True, help="Target checkout directory")
+    exclusions = parser.add_mutually_exclusive_group()
+    exclusions.add_argument(
+        "--accept-default-exclude",
+        dest="accept_default_excludes",
+        action="append",
+        choices=sorted(DEFAULT_EXCLUDE_ACCEPTANCE),
+        help="Accept this built-in exclusion (repeatable, default: root:.git)",
+    )
+    exclusions.add_argument(
+        "--no-accept-default-excludes",
+        dest="accept_default_excludes",
+        action="store_const",
+        const=(),
+        help="Report every occupied built-in exclusion",
+    )
     parser.add_argument(
         "--operator-policy",
         type=Path,
@@ -446,6 +444,9 @@ def main(argv: list[str] | None = None) -> int:
         trusted_keys=tuple(args.operator_policy_key),
         allow_unsigned=args.allow_unsigned_operator_policy,
         max_age_days=args.operator_policy_max_age_days,
+        accept_default_excludes=(ROOT_GIT_METADATA,)
+        if args.accept_default_excludes is None
+        else tuple(args.accept_default_excludes),
     )
     if output:
         print(output, end="" if output.endswith("\n") else "\n")

@@ -116,7 +116,7 @@ def test_critical_gate_independent_of_score_and_explicit_ignore():
 
 
 class FailingScanner:
-    def configure(self, *, exclude_paths):
+    def configure(self, *, exclude_paths, accept_default_excludes=False):
         self.exclusions = exclude_paths
 
     def scan(self, root):
@@ -144,7 +144,7 @@ def test_policy_exclusions_reach_scanner(tmp_path, monkeypatch):
     seen = []
 
     class RecordingScanner(FailingScanner):
-        def configure(self, *, exclude_paths):
+        def configure(self, *, exclude_paths, accept_default_excludes=False):
             seen.extend(exclude_paths)
 
         def scan(self, root):

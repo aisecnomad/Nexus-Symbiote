@@ -55,8 +55,9 @@ def test_json_shortcut_reports_ambiguous_policy_without_echoing_its_content(tmp_
     run = CliRunner().invoke(
         main, ["risk", str(inventory), "--project", str(project), "--json-output"]
     )
-    assert json.loads(run.stdout)["policy_unapplied"] == {"reason": "invalid-or-ambiguous"}
-    assert "was not applied" in run.stderr
+    assert run.exit_code == 1, run.output
+    assert not run.stdout
+    assert "keep one policy file" in run.stderr
     assert "untrusted policy contents" not in run.output
 
 

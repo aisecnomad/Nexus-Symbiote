@@ -205,7 +205,7 @@ trusted keys signed exactly that file, not that it is the newest one they signed
 | Policy | Written by | What it does |
 | --- | --- | --- |
 | Built-in policy | The release | The default gates, used with `--no-project-policy` |
-| Project policy | The project, as `.nexus-symbiote.yaml` | With `--accept-project-policy`, selects collectors and exclusions and changes gates and output. Every relaxation is listed in `policy_weakened`. [Policy reference](policy-reference.md) |
+| Project policy | The project, as `.nexus-symbiote.yaml` | Selects collectors, exclusions, gates and output. Tightening settings apply automatically, including in mixed files. A relaxation requires `--accept-project-policy`. Every relaxation is listed in `policy_weakened`. [Policy reference](policy-reference.md) |
 | Signer policy | The operator, outside the project | Names the Sigstore signers or digest pins that verify model artifacts and ShadowScan reports ([signer policy](cli-reference.md#signer-policy)) |
 | Launch policy | The operator, outside the project and its repository | Pins the stdio launchers `verify-live` may start ([launch policy](cli-reference.md#launch-policy)) |
 

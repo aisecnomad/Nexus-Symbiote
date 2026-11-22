@@ -403,3 +403,34 @@ def test_a_failed_producer_check_does_not_relabel_a_passed_reconciliation(tmp_pa
     text = CliRunner().invoke(main, args[:-1]).output
     assert "Project reconciliation failed" not in text
     assert "No operator signature policy entry names" in text
+
+
+@pytest.mark.parametrize("command", ["validate", "risk"])
+@pytest.mark.parametrize("accept", [False, True])
+def test_a_policy_requiring_the_signature_fails_without_a_project_to_check(
+    tmp_path, monkeypatch, command, accept
+):
+    # Without --project no report can be re-read or verified, so the operator's
+    # requirement fails the gate, as scan --check does, even with unsigned evidence accepted.
+    for name in ("CI", "GITHUB_ACTIONS"):
+        monkeypatch.delenv(name, raising=False)
+    _, bom = _project(tmp_path, UNGATED)
+    operator = tmp_path / "operator.yaml"
+    operator.write_text(GATED)
+    args = [command, str(bom), "--json-output", "--operator-policy", str(operator)]
+    args += ["--allow-unsigned-operator-policy"]
+    if accept:
+        args.append("--allow-unsigned-discovery")
+    result = CliRunner().invoke(main, args)
+    document = json.loads(result.stdout)
+    assert result.exit_code == 1 and document["passed"] is False
+    if command == "validate":
+        assert document["discovery_producer"]["status"] == "failed"
+        (problem,) = document["discovery_producer"]["problems"]
+    else:
+        assert document["discovery_producer"] == "failed"
+        (problem,) = document["gate_reasons"]
+    assert "validate.require_discovery_signature" in problem and "--project" in problem
+    operator.write_text(UNGATED)
+    relaxed = CliRunner().invoke(main, args)
+    assert relaxed.exit_code == 0, relaxed.output

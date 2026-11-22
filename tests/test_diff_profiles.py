@@ -48,6 +48,26 @@ def test_legacy_profile_requires_reapproval_even_when_digest_looks_equal():
         assert "re-approve" in result.components_modified[0].details[0]
 
 
+def test_changed_digest_under_one_legacy_profile_is_a_rug_pull():
+    # Both digests come from one named serializer, so they are comparable: a change is
+    # a changed descriptor, not an incompatible profile.
+    result = AIBOMDiffer().diff(
+        document("sha256:" + "a" * 64, "rfc8785-jcs-v1"),
+        document("sha256:" + "b" * 64, "rfc8785-jcs-v1"),
+    )
+    assert result.components_modified[0].severity == "critical"
+    assert result.components_modified[0].details == [
+        "Tool definition hash changed — possible rug-pull attack."
+    ]
+    for old_version, new_version in ((None, None), (None, "rfc8785-jcs-v1")):
+        unnamed = AIBOMDiffer().diff(
+            document("sha256:" + "a" * 64, old_version),
+            document("sha256:" + "b" * 64, new_version),
+        )
+        assert unnamed.components_modified[0].severity == "high"
+        assert "incompatible" in unnamed.components_modified[0].details[0]
+
+
 def test_mcp_endpoint_substitution_after_scan(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
