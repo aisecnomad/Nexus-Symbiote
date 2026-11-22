@@ -5,7 +5,6 @@ from __future__ import annotations
 import itertools
 import json
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -18,6 +17,7 @@ from nexus_symbiote.utils.confined import (
     _lexical_target,
     fold_name,
 )
+from tests.support import scaling_ratio
 
 
 def _collect(root: Path) -> tuple[list[Path], list[str]]:
@@ -250,16 +250,20 @@ def test_case_variant_search_spends_a_bounded_budget(tmp_path):
     for top in range(10):
         for below in range(10):
             (tmp_path / ("A" + "." * top) / ("B" + "." * below)).mkdir(parents=True)
-    failures: list[str] = []
-    start = time.perf_counter()
-    with ConfinedCollection(tmp_path, failures, max_entries=300) as files:
-        for index in range(2000):
-            assert files.read_bytes(f"a/b/x{index}.md", missing_ok=True) is None
-    assert time.perf_counter() - start < 10
+
+    def run(scale: int) -> list[str]:
+        failures: list[str] = []
+        with ConfinedCollection(tmp_path, failures, max_entries=300) as files:
+            for index in range(500 * scale):
+                assert files.read_bytes(f"a/b/x{index}.md", missing_ok=True) is None
+        return failures
+
+    failures = run(4)
     assert failures and all(
         f.endswith(": entries limit of 300 exceeded; this limit is fixed for this input")
         for f in failures
     )
+    assert scaling_ratio(run) < 10
 
 
 def test_path_with_a_nul_character_is_a_refused_read_not_an_error(tmp_path):
@@ -336,32 +340,40 @@ def test_lookups_beside_thousands_of_same_folding_directories_stay_fast(tmp_path
     for name in _same_folding_names(2000):
         (tmp_path / name).mkdir()
         (tmp_path / name / "keep").write_text("")
-    failures: list[str] = []
-    start = time.perf_counter()
-    with ConfinedCollection(tmp_path, failures) as files:
-        for index in range(2000):
-            assert files.read_bytes(f"a/m{index}.md", missing_ok=True) is None
-    assert time.perf_counter() - start < 10
+
+    def run(scale: int) -> list[str]:
+        failures: list[str] = []
+        with ConfinedCollection(tmp_path, failures) as files:
+            for index in range(500 * scale):
+                assert files.read_bytes(f"a/m{index}.md", missing_ok=True) is None
+        return failures
+
+    failures = run(4)
     assert failures == [
         "a: more than 16 names in its directory differ from it only by case or "
         "normalisation and are not checked"
     ]
+    assert scaling_ratio(run) < 10
 
 
 def test_a_spent_variant_budget_is_one_failure_and_ends_every_later_search(tmp_path):
     for top in _same_folding_names(16):
         for below in _same_folding_names(16, "b"):
             (tmp_path / top / below).mkdir(parents=True)
-    failures: list[str] = []
-    start = time.perf_counter()
-    with ConfinedCollection(tmp_path, failures, max_entries=1000) as files:
-        for index in range(2000):
-            assert files.read_bytes(f"a/b/x{index}.md", missing_ok=True) is None
-        assert files.case_variants("a/b") == []
-    assert time.perf_counter() - start < 10
+
+    def run(scale: int) -> list[str]:
+        failures: list[str] = []
+        with ConfinedCollection(tmp_path, failures, max_entries=1000) as files:
+            for index in range(500 * scale):
+                assert files.read_bytes(f"a/b/x{index}.md", missing_ok=True) is None
+            assert files.case_variants("a/b") == []
+        return failures
+
+    failures = run(4)
     assert len(failures) == 1 and failures[0].endswith(
         ": entries limit of 1000 exceeded; this limit is fixed for this input"
     )
+    assert scaling_ratio(run) < 10
 
 
 @pytest.mark.parametrize("fillers", [3, 0])

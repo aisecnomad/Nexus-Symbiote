@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import json
-import time
 from pathlib import Path
 
 import pytest
@@ -12,6 +11,7 @@ from click.testing import CliRunner
 
 from nexus_symbiote.cli import main
 from nexus_symbiote.scanners.registry import RegistryScanner, _ComposeWalk
+from tests.support import scaling_ratio
 
 SHA512 = "sha512-" + base64.b64encode(b"x" * 64).decode()
 
@@ -810,23 +810,30 @@ def test_builds_outside_the_project_root_are_gaps(tmp_path, build):
 
 
 @pytest.mark.parametrize(
-    ("anchor", "services"),
+    ("anchor", "make_services"),
     [
         # Every service aliases one service whose build holds the inline Dockerfile.
         (
             "x-agent: &agent\n  build:\n    dockerfile_inline: |\n",
-            "services: {" + ", ".join(f"s{i}: *agent" for i in range(2_000)) + "}\n",
+            lambda scale: (
+                "services: {" + ", ".join(f"s{i}: *agent" for i in range(500 * scale)) + "}\n"
+            ),
         ),
         # Each service has a build of its own, and all alias one inline scalar.
         (
             "x-inline: &inline |\n",
-            "services:\n"
-            + "".join(f"  s{i}: {{build: {{dockerfile_inline: *inline}}}}\n" for i in range(1_000)),
+            lambda scale: (
+                "services:\n"
+                + "".join(
+                    f"  s{i}: {{build: {{dockerfile_inline: *inline}}}}\n"
+                    for i in range(250 * scale)
+                )
+            ),
         ),
     ],
 )
 def test_an_inline_dockerfile_shared_by_many_services_is_parsed_once(
-    tmp_path, monkeypatch, anchor, services
+    tmp_path, monkeypatch, anchor, make_services
 ):
     # Parsing it again for each alias took tens of minutes for one Compose file.
     parsed: list[int] = []
@@ -836,18 +843,27 @@ def test_an_inline_dockerfile_shared_by_many_services_is_parsed_once(
         parsed.append(len(content))
         return original(content)
 
+    roots = {}
+    for scale in (1, 4):
+        root = tmp_path / f"scale_{scale}"
+        body = "".join(f"      RUN echo {i}\n" for i in range(7_000 * scale))
+        _write(
+            root,
+            {
+                "compose.yaml": anchor
+                + "      FROM ollama/ollama:0.5.7\n"
+                + body
+                + make_services(scale)
+            },
+        )
+        roots[scale] = root
     monkeypatch.setattr(RegistryScanner, "_dockerfile_images", staticmethod(counting))
-    body = "".join(f"      RUN echo {i}\n" for i in range(28_000))
-    _write(
-        tmp_path,
-        {"compose.yaml": anchor + "      FROM ollama/ollama:0.5.7\n" + body + services},
-    )
-    started = time.monotonic()
-    result = RegistryScanner().scan(tmp_path)
-    assert time.monotonic() - started < 20
+    result = RegistryScanner().scan(roots[4])
     assert result.scan_failures == [] and result.surfaces_excluded == []
     assert [c.name for c in result.components] == ["ollama/ollama:0.5.7"]
     assert len(parsed) == 1 and parsed[0] > 400_000
+    monkeypatch.setattr(RegistryScanner, "_dockerfile_images", staticmethod(original))
+    assert scaling_ratio(lambda scale: RegistryScanner().scan(roots[scale])) < 10
 
 
 def _count_path_reads(monkeypatch) -> list[str]:
@@ -866,39 +882,58 @@ LONG_PATH = "ab/" * 140_000 + "ab"
 
 
 @pytest.mark.parametrize(
-    "compose",
+    "make_compose",
     [
         # Each service has a build of its own, and all alias one context, one
         # dockerfile, both, or merge one mapping that holds the context.
-        "x-c: &c "
-        + LONG_PATH
-        + "\nservices:\n"
-        + "".join(f"  s{i}: {{build: {{context: *c}}}}\n" for i in range(1_000)),
-        "x-c: &c "
-        + LONG_PATH
-        + "\nservices:\n"
-        + "".join(f"  s{i}: {{build: {{dockerfile: *c}}}}\n" for i in range(1_000)),
-        "x-c: &c "
-        + LONG_PATH
-        + "\nservices:\n"
-        + "".join(f"  s{i}: {{build: {{context: *c, dockerfile: *c}}}}\n" for i in range(1_000)),
-        "x-b: &b {context: "
-        + LONG_PATH
-        + "}\nservices:\n"
-        + "".join(f"  s{i}: {{build: {{<<: *b}}}}\n" for i in range(1_000)),
+        lambda scale, path: (
+            "x-c: &c "
+            + path
+            + "\nservices:\n"
+            + "".join(f"  s{i}: {{build: {{context: *c}}}}\n" for i in range(250 * scale))
+        ),
+        lambda scale, path: (
+            "x-c: &c "
+            + path
+            + "\nservices:\n"
+            + "".join(f"  s{i}: {{build: {{dockerfile: *c}}}}\n" for i in range(250 * scale))
+        ),
+        lambda scale, path: (
+            "x-c: &c "
+            + path
+            + "\nservices:\n"
+            + "".join(
+                f"  s{i}: {{build: {{context: *c, dockerfile: *c}}}}\n" for i in range(250 * scale)
+            )
+        ),
+        lambda scale, path: (
+            "x-b: &b {context: "
+            + path
+            + "}\nservices:\n"
+            + "".join(f"  s{i}: {{build: {{<<: *b}}}}\n" for i in range(250 * scale))
+        ),
     ],
 )
-def test_a_build_path_shared_by_many_builds_is_read_once(tmp_path, monkeypatch, compose):
+def test_a_build_path_shared_by_many_builds_is_read_once(tmp_path, monkeypatch, make_compose):
     # Splitting it again for each build took minutes for one Compose file.
+    roots = {}
+    for scale in (1, 4):
+        root = tmp_path / f"scale_{scale}"
+        path = "ab/" * (35_000 * scale) + "ab"
+        _write(
+            root,
+            {"compose.yaml": make_compose(scale, path), "Dockerfile": "FROM ollama/ollama:0.5.7\n"},
+        )
+        roots[scale] = root
+    original = _ComposeWalk._local
     read = _count_path_reads(monkeypatch)
-    _write(tmp_path, {"compose.yaml": compose, "Dockerfile": "FROM ollama/ollama:0.5.7\n"})
-    started = time.monotonic()
-    result = RegistryScanner().scan(tmp_path)
-    assert time.monotonic() - started < 10
+    result = RegistryScanner().scan(roots[4])
     assert result.scan_failures == []
     assert result.surfaces_excluded == ["compose.yaml: build context not followed"]
     assert [c.name for c in result.components] == ["ollama/ollama:0.5.7"]
     assert [path for path in read if len(path) > 100] == [LONG_PATH]
+    monkeypatch.setattr(_ComposeWalk, "_local", staticmethod(original))
+    assert scaling_ratio(lambda scale: RegistryScanner().scan(roots[scale])) < 10
 
 
 def test_a_root_context_shared_by_many_builds_is_split_once(tmp_path, monkeypatch):

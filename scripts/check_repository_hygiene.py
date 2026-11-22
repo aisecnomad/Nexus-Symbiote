@@ -484,6 +484,122 @@ def vendor_issues(root: Path) -> list[str]:
     return errors
 
 
+_COST_BOUND_NAME_WORDS = frozenset({"fast", "linear", "linearly", "bounded", "scales", "scaling"})
+_WALL_CLOCK_FUNCS = frozenset({"monotonic", "perf_counter"})
+
+
+def _is_wall_clock_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return (
+            isinstance(func.value, ast.Name)
+            and func.value.id == "time"
+            and func.attr in _WALL_CLOCK_FUNCS
+        )
+    return isinstance(func, ast.Name) and func.id in _WALL_CLOCK_FUNCS
+
+
+def _is_wall_clock_diff(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Sub)
+        and _is_wall_clock_call(node.left)
+    )
+
+
+def _is_numeric_constant(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    )
+
+
+def _has_deadline_comment(lines: list[str], start_line: int, end_line: int) -> bool:
+    """True if the assertion lines or the immediately preceding comment line names a deadline."""
+    for idx in range(max(0, start_line - 2), min(len(lines), end_line)):
+        line = lines[idx]
+        if "#" in line and "deadline" in line.split("#", 1)[1].lower():
+            return True
+    return False
+
+
+def wall_clock_cost_bound_issues(root: Path, files: list[Path]) -> list[str]:
+    """Reject absolute wall-clock cost bounds in performance/linearity tests.
+
+    Tests whose names signal cost or linearity (``fast``, ``linear``, ``bounded``, ``scales``)
+    must use relative growth bounds such as ``tests.support.scaling_ratio`` instead of fixed
+    wall-clock ceilings, unless explicitly marked as a product timeout deadline check.
+    """
+    errors: list[str] = []
+    for relative in files:
+        if relative.suffix != ".py" or not relative.parts or relative.parts[0] != "tests":
+            continue
+        try:
+            text = read_file(root, relative).decode("utf-8")
+            tree = ast.parse(text, filename=str(relative))
+        except (OSError, ValueError, SyntaxError, UnicodeError):
+            continue
+        lines = text.splitlines()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not node.name.startswith("test_"):
+                continue
+            words = set(node.name.lower().split("_"))
+            if "deadline" in words or not (words & _COST_BOUND_NAME_WORDS):
+                continue
+            elapsed_vars: set[str] = set()
+            for child in ast.walk(node):
+                if isinstance(child, ast.Assign) and _is_wall_clock_diff(child.value):
+                    for target in child.targets:
+                        if isinstance(target, ast.Name):
+                            elapsed_vars.add(target.id)
+                elif (
+                    isinstance(child, ast.AnnAssign)
+                    and child.value is not None
+                    and _is_wall_clock_diff(child.value)
+                    and isinstance(child.target, ast.Name)
+                ):
+                    elapsed_vars.add(child.target.id)
+
+            def _is_elapsed(expr: ast.AST, tracked: set[str] = elapsed_vars) -> bool:
+                return _is_wall_clock_diff(expr) or (
+                    isinstance(expr, ast.Name) and expr.id in tracked
+                )
+
+            for child in ast.walk(node):
+                if not isinstance(child, ast.Assert):
+                    continue
+                end_line = child.end_lineno or child.lineno
+                for sub in ast.walk(child.test):
+                    if not isinstance(sub, ast.Compare):
+                        continue
+                    operands = [sub.left, *sub.comparators]
+                    is_bound = any(
+                        (
+                            isinstance(op, (ast.Lt, ast.LtE))
+                            and _is_elapsed(left)
+                            and _is_numeric_constant(right)
+                        )
+                        or (
+                            isinstance(op, (ast.Gt, ast.GtE))
+                            and _is_numeric_constant(left)
+                            and _is_elapsed(right)
+                        )
+                        for left, op, right in zip(operands, sub.ops, sub.comparators, strict=False)
+                    )
+                    if is_bound and not _has_deadline_comment(lines, child.lineno, end_line):
+                        errors.append(
+                            f"{relative}:{child.lineno}: {node.name} uses an absolute wall-clock "
+                            "cost bound; use tests.support.scaling_ratio or mark a product timeout "
+                            "with a '# deadline' comment"
+                        )
+    return errors
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     try:
@@ -505,6 +621,7 @@ def main() -> int:
             *readme_link_issues(root),
             *version_issues(root),
             *vendor_issues(root),
+            *wall_clock_cost_bound_issues(root, files),
         ]
     except (OSError, ValueError, subprocess.SubprocessError):
         print("Repository hygiene could not inspect the tracked source.")
