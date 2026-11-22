@@ -2185,6 +2185,7 @@ is a failure; everything below is neither a gap nor a failure.
   routed through `invoke`. The operator builds the authentication, description,
   scope and execution adapters and must close every other path to the tools; see
   [security boundary](runtime-assurance.md#security-boundary).
+- A group-writable sticky SQLite state directory (1770) trusts every group member. A member who can create a SQLite companion can roll back state and make a used approval usable again. Use a dedicated service-owned 0700 state directory when members are outside that trust boundary. Stop all gateways and preserve the database and its companions together during migration or recovery.
 - **Superseded snapshots stay usable until retired.** Snapshots, trust statuses and
   the companion BOM must come from an operator-controlled channel. A superseded
   snapshot stays valid on a state store until a newer one is registered or
