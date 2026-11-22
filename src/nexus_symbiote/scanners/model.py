@@ -156,12 +156,12 @@ MAX_PICKLE_MARKS = 64
 MIN_PICKLE_OPCODES = 16
 # A ZIP central directory is listed from the archive's end; a longer one is not read.
 MAX_ZIP_DIRECTORY_BYTES = MAX_MODEL_HEADER_BYTES
-_ZIP_END_RECORD_BYTES = 22 + 65_535 + 20 + 56
-_ZIP_TAIL_BYTES = MAX_ZIP_DIRECTORY_BYTES + _ZIP_END_RECORD_BYTES
 # How far from the end miniz finds an end record: mz_zip_reader_locate_header_sig
 # steps back in 4,096-byte reads overlapping by 3 bytes (4,093-byte stride) until
 # archive_size - cur_file_ofs >= 65,535 + 22, reaching 4,096 + 16 * 4,093 = 69,584.
-_MINIZ_END_SEARCH = 69_584
+_MINIZ_END_SEARCH = 4_096 + 16 * (4_096 - 3)
+_ZIP_END_RECORD_BYTES = _MINIZ_END_SEARCH + 20 + 56
+_ZIP_TAIL_BYTES = MAX_ZIP_DIRECTORY_BYTES + _ZIP_END_RECORD_BYTES
 ZIP_PICKLE_MEMBER = "ZIP archive with a pickle member; torch.load unpickles it"
 ZIP_OBJECT_ARRAY = (
     "ZIP archive with a NumPy object-dtype array member; np.load(allow_pickle=True) unpickles it"
@@ -1121,10 +1121,6 @@ def inspect_model_format(
                         prefix=prefix,
                         max_header_bytes=MAX_MODEL_HEADER_BYTES,
                     )
-                    return (
-                        SerializationSafety.SAFE,
-                        "Bounded SafeTensors header, shapes and offsets checked",
-                    )
                 except HeaderLimitError:
                     raise
                 except (ValueError, RecursionError, UnicodeError):
@@ -1145,6 +1141,23 @@ def inspect_model_format(
                         SerializationSafety.UNKNOWN,
                         "Malformed or unsupported SafeTensors structure",
                     )
+                replay = _PrefixedStream(bytes(capture.captured), opened)
+                polyglot = _recognized_code_container(
+                    cast(BinaryIO, replay),
+                    prefix,
+                    size,
+                    budget or InspectionBudget(),
+                    by_content=True,
+                )
+                if (
+                    polyglot is not None
+                    and polyglot[0] is SerializationSafety.UNSAFE_CODE_EXECUTION
+                ):
+                    return polyglot
+                return (
+                    SerializationSafety.SAFE,
+                    "Bounded SafeTensors header, shapes and offsets checked",
+                )
             else:
                 container = _recognized_code_container(
                     opened,

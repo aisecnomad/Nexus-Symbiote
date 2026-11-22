@@ -213,8 +213,10 @@ def test_safetensors_valid_and_malformed_non_pickle_preserve_verdicts(tmp_path: 
         b'{% raw %}{#{% endraw %}{{ "_" ~ "_class_" ~ "_" }}',
         b'{% raw %}{{ \'{% endraw %}{{ "_" ~ "_class_" ~ "_" }}',
         b'{%- raw -%}{# unclosed comment {%- endraw -%}{{ "_" + "_globals_" + "_" }}',
-        b'{%+ raw +%}{% if "{%+ endraw +%}{{ "_" ~ "_subclasses_" ~ "_" }}',
+        b'{%+ raw %}{% if "{%+ endraw -%}{{ "_" ~ "_subclasses_" ~ "_" }}',
         b'{% raw %}{% raw %}{% endraw %}{{ "_" ~ "_builtins_" ~ "_" }}',
+        b'{% raw %}{% endraw +%}{# {% endraw %}{{ "_" ~ "_class_" ~ "_" }}',
+        b'{% set x = ({1: {2: 3}}, a["_" ~ "_class_" ~ "_"]) %}',
     ],
 )
 def test_jinja_raw_block_cannot_blind_joined_literal_marker(template: bytes) -> None:
@@ -231,6 +233,59 @@ def test_jinja_raw_block_cannot_blind_joined_literal_marker(template: bytes) -> 
 )
 def test_jinja_raw_block_literal_text_does_not_false_positive(template: bytes) -> None:
     assert template_escape_markers(template) is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"cos\x00x\ngetpid\n)R.",
+        b"cos\x00/\ngetpid\n)R.",
+        b"\x80\x04\x8c\x04os\x00x\x8c\x06getpid\x93)R.",
+    ],
+)
+def test_frozen_importer_nul_truncated_module_name_is_detected(
+    tmp_path: Path, payload: bytes
+) -> None:
+    assert pickle.loads(payload) > 0  # noqa: S301 - inert os.getpid()
+    for flavor in ("c", "py"):
+        seg = load_segment(payload, len(payload), 0, flavor, Budget(4096, 64))
+        assert seg.outcome == "called"
+    weights = tmp_path / "weights.dat"
+    weights.write_bytes(payload)
+    result = ModelScanner().scan(tmp_path)
+    matched = [c for c in result.components if c.source_path == "weights.dat"]
+    assert len(matched) == 1
+    assert matched[0].serialization_safety is SerializationSafety.UNSAFE_CODE_EXECUTION
+
+
+def test_valid_safetensors_and_executable_pickle_polyglot_is_rated_critical(
+    tmp_path: Path,
+) -> None:
+    header_len = (28 << 8) | 0x43  # SHORT_BINBYTES len 28
+    prefix = struct.pack("<Q", header_len)
+    chunk = bytearray(b'{"__metadata__":{"a":"')
+    json_tail = b'"},"w":{"dtype":"F32","shape":[16],"data_offsets":[0,64]}}'
+    k = len(json_tail) + 10
+    target = header_len - 2 - k
+    chunk.append(ord("0"))
+    while target - len(chunk) > 128:
+        chunk.extend(b"C" + bytes([125]) + b"a" * 125 + b"0")
+    s = target - len(chunk) - 3
+    chunk.extend(b"C" + bytes([s]) + b"a" * s + b"0")
+    chunk.extend(b"C" + bytes([k]) + b"b" * (k - len(json_tail)) + json_tail)
+    tensor_data = b"0cos\ngetpid\n)R.".ljust(64, b"\x00")
+    polyglot = prefix + bytes(chunk) + tensor_data
+    assert pickle.loads(polyglot) > 0  # noqa: S301 - inert os.getpid()
+
+    path = tmp_path / "polyglot.safetensors"
+    path.write_bytes(polyglot)
+    safety, _ = inspect_model_format(path)
+    assert safety is SerializationSafety.UNSAFE_CODE_EXECUTION
+
+    with open_regular_file(path) as stream:
+        obs = observe_model_artifact(path, stream=stream)
+    assert obs.safety is SerializationSafety.UNSAFE_CODE_EXECUTION
+    assert obs.digest == f"sha256:{hashlib.sha256(polyglot).hexdigest()}"
 
 
 def test_jinja_raw_block_scanning_stays_linear() -> None:

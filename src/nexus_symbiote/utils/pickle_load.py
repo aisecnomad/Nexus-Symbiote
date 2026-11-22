@@ -103,8 +103,13 @@ VERSION_DIFFERENCES: dict[str, str] = {
 
 
 def _unimportable(module: str) -> bool:
-    """Whether ``__import__(module)`` fails before any module code can run."""
-    return not module or "\x00" in module or any("/" in part for part in module.split("."))
+    """Whether ``__import__(module)`` fails before any module code can run.
+
+    On CPython 3.11+, ``FrozenImporter`` matches frozen stdlib modules (``os``, ``io``,
+    ``runpy``, ...) via C-string comparison, truncating ``module`` at the first ``\\x00``.
+    """
+    head = module.split("\x00", 1)[0]
+    return not head or any("/" in part for part in head.split("."))
 
 
 class _LoadError(Exception):
