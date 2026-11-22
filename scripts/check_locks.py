@@ -309,34 +309,53 @@ def _unreachable(lock: Lock, declared: Collection[str]) -> list[str]:
 
     uv records why each pin is in a lock in its `# via` lines. A pin is reachable when it is
     declared in pyproject.toml and uv says so, or when a reachable pin of this lock is named
-    as its parent; a `-c` constraint is no reason to install anything. This rejects an entry
-    inserted into a lock offline; a forged `# via` naming a real parent is caught only by
-    regenerating the lock and comparing it.
+    as its parent; a `-c` constraint is no reason to install anything. Reachability is
+    evaluated per individual pin so an unreferenced duplicate entry for an already-reachable
+    package is still caught.
     """
-    reached = {
-        name
-        for name, pins in lock.pins.items()
-        if name in declared and any(pin.via & DECLARED_SOURCES for pin in pins)
+    pin_entries = [
+        (name, idx, pin) for name, pins in lock.pins.items() for idx, pin in enumerate(pins)
+    ]
+    reached_pins: set[tuple[str, int]] = {
+        (name, idx)
+        for name, idx, pin in pin_entries
+        if name in declared and bool(pin.via & DECLARED_SOURCES)
     }
-    parents = {
-        name: {
-            canonicalize_name(source)
-            for pin in pins
-            for source in pin.via
-            if PACKAGE_SOURCE.fullmatch(source)
+    reached_names: set[str] = {name for name, _idx in reached_pins}
+    pin_parents: dict[tuple[str, int], set[str]] = {
+        (name, idx): {
+            canonicalize_name(source) for source in pin.via if PACKAGE_SOURCE.fullmatch(source)
         }
-        for name, pins in lock.pins.items()
+        for name, idx, pin in pin_entries
     }
     changed = True
     while changed:
-        found = {name for name, wanted in parents.items() if wanted & reached} - reached
-        reached |= found
+        found = {
+            key
+            for key, wanted in pin_parents.items()
+            if key not in reached_pins and (wanted & reached_names)
+        }
+        reached_pins |= found
+        reached_names |= {name for name, _idx in found}
         changed = bool(found)
-    return [
-        f"{lock.path}: {name} is not required by pyproject.toml or by another pin of the lock;"
-        " remove it or run `make lock`"
-        for name in sorted(lock.pins.keys() - reached)
-    ]
+    issues: list[str] = []
+    for name in sorted(lock.pins):
+        pins = lock.pins[name]
+        missing = [pin for idx, pin in enumerate(pins) if (name, idx) not in reached_pins]
+        if not missing:
+            continue
+        if len(missing) == len(pins):
+            issues.append(
+                f"{lock.path}: {name} is not required by pyproject.toml or by another pin of"
+                " the lock; remove it or run `make lock`"
+            )
+        else:
+            for pin in missing:
+                issues.append(
+                    f"{lock.path}: {name}=={pin.version} is not required by pyproject.toml or by"
+                    " another pin of the lock; remove it or run `make lock`"
+                )
+    return issues
 
 
 def check(root: Path = ROOT) -> list[str]:

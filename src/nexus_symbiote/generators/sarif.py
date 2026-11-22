@@ -151,7 +151,12 @@ class SARIFGenerator(Generator):
         if source is None or str(source) in {"", "."}:
             return None
         text = str(source)
-        if not text.startswith("/") and _SCHEME.match(text):
+        if (
+            "\\" in text
+            or "\x00" in text
+            or any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+            or (not text.startswith("/") and _SCHEME.match(text))
+        ):
             return None
         path = Path(text)
         if path.is_absolute():

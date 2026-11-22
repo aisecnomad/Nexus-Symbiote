@@ -77,11 +77,27 @@ _SEVERITY_RANK = {"critical": 0, "error": 0, "unknown": 1, "warning": 2, "info":
 NO_LOCAL_SUBJECT = "No local project subject was available to reconcile."
 COLLECTOR_OWNED_PROPERTIES = frozenset(
     {
+        "artifact_verified",
         "collection_mode",
-        "content_hash_withheld",
+        "config_file_hash",
         "config_hash",
         "config_hash_profile",
+        "content_hash_withheld",
+        "displayed_descriptor_differs",
         "identity_source",
+        "lockfile_integrity",
+        "lockfile_record",
+        "lockfile_sha256",
+        "named_format",
+        "observed_declaration_hash",
+        "observed_declaration_hash_profile",
+        "observed_descriptor_hash",
+        "observed_identity_hash",
+        "observed_identity_hash_profile",
+        "pinning_state",
+        "rail_files",
+        "settings_hashes",
+        "source_values_bound",
         "weight_files",
     }
 )

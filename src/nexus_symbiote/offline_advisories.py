@@ -777,6 +777,13 @@ def match_offline_advisories(
     records, db_digest = load_offline_advisory_db(db_path)
     pkg_index = _build_package_index(records)
     covered = {ecosystem for ecosystem, _ in pkg_index}
+    eco_dated: dict[str, datetime] = {}
+    for (eco_key, _), pkg_entries in pkg_index.items():
+        for adv, _ in pkg_entries:
+            if adv.dated is not None and (
+                eco_key not in eco_dated or adv.dated > eco_dated[eco_key]
+            ):
+                eco_dated[eco_key] = adv.dated
     db_dated = max((adv.dated for adv in records if adv.dated is not None), default=None)
     feed_errors = [
         _feed_age_error("offline advisory DB", "newest record", db_dated, now, max_feed_age_days)
@@ -870,6 +877,20 @@ def match_offline_advisories(
             continue
         targets.append((comp.bom_ref, eco, name, version))
 
+    queried_ecosystems: dict[str, str] = {}
+    for _, eco, _, _ in targets:
+        queried_ecosystems.setdefault(eco.lower(), eco)
+    for eco_key, eco_label in sorted(queried_ecosystems.items()):
+        eco_err = _feed_age_error(
+            f"offline advisory DB ({eco_label})",
+            "newest record",
+            eco_dated.get(eco_key),
+            now,
+            max_feed_age_days,
+        )
+        if eco_err is not None:
+            report.errors.append(eco_err)
+
     if len(targets) > MAX_OFFLINE_COMPONENTS:
         report.errors.append(
             f"Package component limit exceeded ({len(targets)} > {MAX_OFFLINE_COMPONENTS})"
@@ -923,12 +944,20 @@ def match_offline_advisories(
                 if entry["severity"] != "critical":
                     entry["severity"] = "critical"
                     entry["severity_elevated_by"] = sources[0]
-            for lid in lookup_ids:
-                if (epss_hit := epss_index.get(lid)) is not None:
-                    entry["epss_score"] = epss_hit.score
-                    if epss_hit.percentile is not None:
-                        entry["epss_percentile"] = epss_hit.percentile
-                    break
+            epss_hits = [
+                epss_entry for lid in lookup_ids if (epss_entry := epss_index.get(lid)) is not None
+            ]
+            if epss_hits:
+                best_epss = max(
+                    epss_hits,
+                    key=lambda item: (
+                        item.score,
+                        item.percentile if item.percentile is not None else -1.0,
+                    ),
+                )
+                entry["epss_score"] = best_epss.score
+                if best_epss.percentile is not None:
+                    entry["epss_percentile"] = best_epss.percentile
             entry.update(
                 {
                     "component_ref": bom_ref,

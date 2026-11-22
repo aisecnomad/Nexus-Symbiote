@@ -257,6 +257,18 @@ UNSAFE_GATE_ENV = frozenset(
         "PYTHONINSPECT",
         "PYTEST_ADDOPTS",
         "PYTEST_PLUGINS",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+        "VIRTUAL_ENV",
+        "MYPYPATH",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        # coverage.py config and hook variables (COVERAGE_JSON is an explicit output path in ci.yml).
+        "COVERAGE_RCFILE",
+        "COVERAGE_FILE",
+        "COVERAGE_PROCESS_START",
+        "COVERAGE_CORE",
+        "COVERAGE_RUN",
+        "COVERAGE_DEBUG",
         # bash imports these at startup: SHELLOPTS=noexec parses a gate without running
         # it and exits 0, and ENV, PS4 and BASHOPTS run or change code before it. PATH
         # can put a stub first in place of python, mypy or git.
@@ -272,9 +284,10 @@ UNSAFE_GATE_ENV = frozenset(
 )
 # Families of variables that do the same: bash imports BASH_FUNC_<name>%% as a function
 # that shadows the gate's program, PYTHON* (PYTHONUSERBASE with a committed
-# usercustomize) can run code before the gate, and GIT_* (GIT_DIR) can point git at
-# another history. A name outside [A-Za-z0-9_] is no ordinary variable either.
-UNSAFE_GATE_ENV_PREFIXES = ("BASH_FUNC_", "PYTHON", "GIT_", "XDG_")
+# usercustomize) can run code before the gate, GIT_* (GIT_DIR) can point git at
+# another history, and PIP_/UV_/MYPY_/RUFF_ can alter package or gate behavior.
+# A name outside [A-Za-z0-9_] is no ordinary variable either.
+UNSAFE_GATE_ENV_PREFIXES = ("BASH_FUNC_", "PYTHON", "GIT_", "XDG_", "PIP_", "UV_", "MYPY_", "RUFF_")
 ENV_NAME = re.compile(r"[A-Za-z0-9_]+")
 # An earlier step that appends to $GITHUB_ENV or $GITHUB_PATH sets the environment of
 # every later step of the job, gates included, out of reach of the env checks; only this

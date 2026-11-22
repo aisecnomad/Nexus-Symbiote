@@ -555,6 +555,48 @@ def _is_mismatched(entry: Mapping[str, Any]) -> bool:
     )
 
 
+def _apply_runtime_checks(
+    entry: dict[str, Any], item: _Item, candidates: Sequence[AnyComponent]
+) -> None:
+    """Attach workload-identity and tool-definition-hash match checks for candidate components."""
+    if item.workload_identities or item.unreadable_workload_identities:
+        entry["reported_workload_identities"] = sorted(item.workload_identities)
+        if item.unreadable_workload_identities:
+            entry["unreadable_workload_identities"] = item.unreadable_workload_identities
+            entry["workload_identity_matched"] = False
+        else:
+            declared_per_cand = [
+                _trimmed(getattr(comp, "workload_identity", None)) for comp in candidates
+            ]
+            if all(declared_per_cand):
+                declared_ids = {cid for cid in declared_per_cand if cid is not None}
+                entry["workload_identity_matched"] = item.workload_identities <= declared_ids
+            else:
+                entry["workload_identity_matched"] = None
+    tools = [comp for comp in candidates if isinstance(comp, ToolComponent)]
+    if (item.definition_hashes or item.unreadable_definition_hashes) and tools:
+        entry["reported_definition_hashes"] = sorted(item.definition_hashes)
+        reported_norm = {_normalized_sha256(h) for h in item.definition_hashes}
+        if item.unreadable_definition_hashes:
+            entry["unreadable_definition_hashes"] = item.unreadable_definition_hashes
+            entry["definition_hash_matched"] = False
+        elif None in reported_norm:
+            entry["definition_hash_matched"] = False
+        elif all(tool.definition_hash for tool in tools):
+            valid_declared = {
+                norm
+                for tool in tools
+                if tool.definition_hash and (norm := _normalized_sha256(tool.definition_hash))
+            }
+            entry["definition_hash_matched"] = (
+                bool(valid_declared) and reported_norm <= valid_declared
+            )
+        else:
+            entry["definition_hash_matched"] = None
+    if _is_mismatched(entry):
+        entry["span_count"] = item.spans
+
+
 def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str, Any]]]:
     """Sort every observed item into one reconciliation list, and list unmentioned declarations.
 
@@ -588,41 +630,7 @@ def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str
             }
             if item.caller_identities:
                 matched_entry["caller_workload_identities"] = sorted(item.caller_identities)
-            if item.workload_identities or item.unreadable_workload_identities:
-                declared_id = _trimmed(getattr(component, "workload_identity", None))
-                matched_entry["reported_workload_identities"] = sorted(item.workload_identities)
-                if item.unreadable_workload_identities:
-                    matched_entry["unreadable_workload_identities"] = (
-                        item.unreadable_workload_identities
-                    )
-                    matched_entry["workload_identity_matched"] = False
-                elif declared_id:
-                    matched_entry["workload_identity_matched"] = item.workload_identities == {
-                        declared_id
-                    }
-                else:
-                    matched_entry["workload_identity_matched"] = None
-            if (item.definition_hashes or item.unreadable_definition_hashes) and isinstance(
-                component, ToolComponent
-            ):
-                matched_entry["reported_definition_hashes"] = sorted(item.definition_hashes)
-                reported_norm = {_normalized_sha256(h) for h in item.definition_hashes}
-                if item.unreadable_definition_hashes:
-                    matched_entry["unreadable_definition_hashes"] = (
-                        item.unreadable_definition_hashes
-                    )
-                    matched_entry["definition_hash_matched"] = False
-                elif None in reported_norm:
-                    matched_entry["definition_hash_matched"] = False
-                elif component.definition_hash:
-                    declared_hash = _normalized_sha256(component.definition_hash)
-                    matched_entry["definition_hash_matched"] = (
-                        declared_hash is not None and reported_norm == {declared_hash}
-                    )
-                else:
-                    matched_entry["definition_hash_matched"] = None
-            if _is_mismatched(matched_entry):
-                matched_entry["span_count"] = item.spans
+            _apply_runtime_checks(matched_entry, item, (component,))
             result["matched"].append(matched_entry)
             server = getattr(component, "mcp_server_ref", None)
             if isinstance(server, str):
@@ -630,9 +638,20 @@ def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str
         elif count:
             heads = heapq.merge(*(found for found, _basis in parts), key=_ref)
             listed = [component.bom_ref for component in islice(heads, LISTED_CANDIDATES)]
-            result["ambiguous"].append(
-                {**identity, "candidates": listed, "candidates_omitted": count - len(listed)}
-            )
+            ambiguous_entry: dict[str, Any] = {
+                **identity,
+                "candidates": listed,
+                "candidates_omitted": count - len(listed),
+            }
+            if (
+                item.workload_identities
+                or item.unreadable_workload_identities
+                or item.definition_hashes
+                or item.unreadable_definition_hashes
+            ):
+                all_candidates = [comp for found, _basis in parts for comp in found]
+                _apply_runtime_checks(ambiguous_entry, item, all_candidates)
+            result["ambiguous"].append(ambiguous_entry)
         elif item.kind in GATING_KINDS:
             result["undeclared"].append({**identity, "span_count": item.spans})
         else:
@@ -704,7 +723,12 @@ def _gate(
         unidentified = sum(
             1 for entry in reconciliation["unidentified"] if entry["kind"] in GATING_KINDS
         )
-        mismatched = sum(1 for entry in reconciliation["matched"] if _is_mismatched(entry))
+        mismatched = sum(
+            1
+            for bucket in ("matched", "ambiguous")
+            for entry in reconciliation[bucket]
+            if _is_mismatched(entry)
+        )
         if undeclared:
             reasons.append(
                 f"{undeclared} reported tool, model, agent or MCP endpoint "
@@ -718,8 +742,8 @@ def _gate(
             )
         if mismatched:
             reasons.append(
-                f"{mismatched} matched {'item reports' if mismatched == 1 else 'items report'} a "
-                "conflicting or unreadable workload identity or tool definition hash"
+                f"{mismatched} reconciled {'item reports' if mismatched == 1 else 'items report'} "
+                "a conflicting or unreadable workload identity or tool definition hash"
             )
         unclassified = coverage["spans_unclassified"]
         if unclassified:
@@ -944,9 +968,10 @@ def _findings(document: Mapping[str, Any]) -> Iterable[tuple[str, dict[str, Any]
     for entry in reconciliation["unidentified"]:
         if entry["kind"] in GATING_KINDS:
             yield "unidentified", entry
-    for entry in reconciliation["matched"]:
-        if _is_mismatched(entry):
-            yield "mismatched", entry
+    for bucket in ("matched", "ambiguous"):
+        for entry in reconciliation[bucket]:
+            if _is_mismatched(entry):
+                yield "mismatched", entry
 
 
 def sarif_document(document: Mapping[str, Any], anchor: str) -> dict[str, Any]:

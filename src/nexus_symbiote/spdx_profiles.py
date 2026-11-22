@@ -224,7 +224,13 @@ def _clean_rfc3339(value: Any) -> str | None:
     candidate = value.strip()
     if len(candidate) == 10 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", candidate, re.ASCII):
         candidate = f"{candidate}T00:00:00Z"
-    return candidate if _RFC3339_RE.fullmatch(candidate) else None
+    if not _RFC3339_RE.fullmatch(candidate):
+        return None
+    try:
+        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00").replace("z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def clean_license_identifier(value: Any) -> str | None:

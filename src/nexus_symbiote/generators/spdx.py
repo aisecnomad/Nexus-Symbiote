@@ -493,6 +493,8 @@ class SPDXGenerator(Generator):
         legacy_locations: bool = False,
     ) -> dict[str, Any]:
         from nexus_symbiote.spdx_profiles import (
+            _SPDX_AVAILABILITY_TYPES,
+            _clean_rfc3339,
             _clean_url,
             _projected_download_location,
             normalize_spdx_dataset_type,
@@ -542,7 +544,12 @@ class SPDXGenerator(Generator):
                     element["ai_autonomyType"] = presence
                     if not (isinstance(comp, AgentComponent) and comp.autonomy_level is not None):
                         declared_fields.append("ai_autonomyType")
-                rel_ts = comp.properties.get("declared_release_time")
+                raw_rel_ts = comp.properties.get("declared_release_time")
+                rel_ts = (
+                    raw_rel_ts
+                    if legacy_locations and isinstance(raw_rel_ts, str)
+                    else _clean_rfc3339(raw_rel_ts)
+                )
                 if isinstance(rel_ts, str) and rel_ts:
                     element["releaseTime"] = rel_ts
                     declared_fields.append("releaseTime")
@@ -580,7 +587,12 @@ class SPDXGenerator(Generator):
                         raw_ds_type if isinstance(raw_ds_type, str) else None
                     )
                 ]
-                rel_ts = comp.properties.get("declared_release_time")
+                raw_rel_ts = comp.properties.get("declared_release_time")
+                rel_ts = (
+                    raw_rel_ts
+                    if legacy_locations and isinstance(raw_rel_ts, str)
+                    else _clean_rfc3339(raw_rel_ts)
+                )
                 if isinstance(rel_ts, str) and rel_ts:
                     element["releaseTime"] = rel_ts
                     declared_fields.append("releaseTime")
@@ -595,7 +607,9 @@ class SPDXGenerator(Generator):
                     if not observed_loc:
                         declared_fields.append("software_downloadLocation")
                 avail = comp.properties.get("declared_availability")
-                if isinstance(avail, str) and avail:
+                if isinstance(avail, str) and (
+                    (legacy_locations and bool(avail)) or avail in _SPDX_AVAILABILITY_TYPES
+                ):
                     element["dataset_datasetAvailability"] = avail
                     declared_fields.append("dataset_datasetAvailability")
                 pii = comp.properties.get("declared_sensitive_pii")
