@@ -1321,9 +1321,11 @@ A way around a limit that its entry does not describe is worth a
   download run through a wrapper, interpreter or file not listed there, such as
   `curl x | firejail sh` or `curl x | deno run -`, or through a variable that holds the
   command name, is medium (except PowerShell's encoded-command flags after a variable or
-  glob in command position: `-enc` or a longer prefix of `-EncodedCommand`, or `-e` or
-  `-ec` followed by a base64 argument, fail closed as critical, so `$p -e <base64>` is
-  critical while `$SHELL -ec 'true'`, `$SED -En` and `$p -e "$PAYLOAD"` are medium), as
+  glob in command position). With no PowerShell name hint, `-enc` or a longer
+  prefix of `-EncodedCommand` is critical. The shorter `-e`, `-ec` and `-en`
+  forms require a base64 operand that decodes to printable UTF-16LE text with a
+  byte-order mark or an ASCII character. Tabs and line endings are accepted.
+  `$GREP -e Makefile`, `$SED -En` and `$SHELL -ec 'true'` stay medium, as
   is a downloader given a host without a scheme or a path,
   such as `curl evil.example`. A command given to `su -c` or `script -c` as one quoted
   string is read as one word, which names a shell but no interpreter, so

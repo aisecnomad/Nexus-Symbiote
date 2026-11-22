@@ -48,13 +48,16 @@ TypeScript forms in full.
 
 ## Coding-agent settings
 
-A hook whose program is a variable or glob can receive a PowerShell encoded-command
-flag. The collector cannot resolve the program from static settings, so it rates
-that combination critical when the flag is `-enc` or a longer prefix of
-`-EncodedCommand`, or when a shorter one (`-e`, `-ec`) is followed by a base64
-argument, as in `p=pwsh; $p -e <base64>`. Flags other programs share, as in
-`$PYTHON -E scripts/hook.py`, `$SED -En` or `$SHELL -ec 'true'`, stay medium, and so
-does `$p -e "$PAYLOAD"`, whose value the shell computes.
+A hook can select PowerShell through a variable or glob. When the program name
+offers no PowerShell hint, `-enc` and longer prefixes of `-EncodedCommand` are
+critical. The shorter `-e`, `-ec` and `-en` forms require a base64 operand that
+decodes to printable UTF-16LE text with a byte-order mark or an ASCII character.
+Tabs and line endings are accepted. Ordinary search arguments such as
+`$GREP -e Makefile` and a value computed by the shell stay medium.
+
+Shell assignment prefixes end at the first command word. After a wrapper such
+as `command` or `nohup`, an assignment-shaped word can name the program.
+`env` consumes its own assignment operands.
 
 For Claude Code, `ide_agents` records the permission mode (`bypassPermissions` is a high finding, `acceptEdits` medium), blanket grants in its allow list, how many allow, ask and deny rules and hook handlers it declares, and findings for hook commands, the `statusLine` and `fileSuggestion` commands, the credential helpers `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh` and `otelHeadersHelper` (each command rated as a hook command is), `env` variables that redirect the API endpoint or load code (by name only), MCP auto-approval, plugins and additional directories. It does not record the rules, commands or `env` values themselves. For Codex it records the approval and sandbox settings, for Cursor its hook commands, and for Cursor, Windsurf, Cline and Codex an `agent.permissionMode` key in their JSON settings. The MCP servers that Codex and Gemini CLI settings declare are inventoried by the `mcp` collector.
 
