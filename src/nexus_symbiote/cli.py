@@ -574,6 +574,10 @@ def _get_scanners() -> dict[str, type]:
     return SCANNER_REGISTRY
 
 
+_ACCEPT_PROJECT_POLICY_HELP = (
+    "Accept checkout settings that relax a gate. Tightening settings apply automatically, "
+    "including in mixed policies. Operator policy always sets the minimum."
+)
 DETAILED_EXIT_KEY = "nexus_symbiote.detailed_exit_codes"
 _MODE_FLAGS = frozenset({"--offline", "--live"})
 # Click 8.2+ shows a group's own help, which carries no input, through this error.
@@ -1011,11 +1015,7 @@ def _render_aibom(
 @click.option(
     "--accept-project-policy",
     is_flag=True,
-    help=(
-        "Accept a checkout policy that relaxes a gate. Tightening-only policies apply "
-        "automatically. A policy that includes a relaxation is withheld as a unit "
-        "unless accepted. Operator policy always sets the minimum."
-    ),
+    help=_ACCEPT_PROJECT_POLICY_HELP,
 )
 @click.option(
     "--fail-on-unsigned-discovery",
@@ -1784,11 +1784,7 @@ def verify_discovery(
 @click.option(
     "--accept-project-policy",
     is_flag=True,
-    help=(
-        "Accept a checkout policy that relaxes a gate. Tightening-only policies apply "
-        "automatically. A policy that includes a relaxation is withheld as a unit "
-        "unless accepted. Operator policy always sets the minimum."
-    ),
+    help=_ACCEPT_PROJECT_POLICY_HELP,
 )
 @click.option(
     "--skip-integrity",
@@ -2027,11 +2023,7 @@ def validate(
 @click.option(
     "--accept-project-policy",
     is_flag=True,
-    help=(
-        "Accept a checkout policy that relaxes a gate. Tightening-only policies apply "
-        "automatically. A policy that includes a relaxation is withheld as a unit "
-        "unless accepted. Operator policy always sets the minimum."
-    ),
+    help=_ACCEPT_PROJECT_POLICY_HELP,
 )
 @click.option(
     "--require-discovery-signature",
