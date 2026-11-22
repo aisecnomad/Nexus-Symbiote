@@ -354,7 +354,7 @@ class Scanner(ABC):
         except ImportError:
             result.scan_failures.append(f"{path.as_posix()}: YAML parser unavailable")
             return None
-        from nexus_symbiote.policy import parse_yaml_mapping
+        from nexus_symbiote.policy import check_yaml_flow_depth, parse_yaml_mapping
 
         frame = (
             yaml.StreamStartToken,
@@ -363,6 +363,7 @@ class Scanner(ABC):
             yaml.DocumentEndToken,
         )
         try:
+            check_yaml_flow_depth(text)
             graph = named = content = False
             for index, token in enumerate(yaml.scan(text)):
                 if index >= YAML_TOKEN_LIMIT:

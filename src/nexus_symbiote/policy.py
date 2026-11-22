@@ -362,6 +362,91 @@ def _integer_or_text(loader: Any, node: Any) -> Any:
     return text if ":" in text else loader.construct_yaml_int(node)
 
 
+MAX_YAML_FLOW_DEPTH = 64
+_YAML_FLOW_SPECIAL = re.compile(r"""[\[\]{}"'#\r\n]""")
+_YAML_DQ_STOP = re.compile(r'["\\]')
+_YAML_BLOCK_HEADER = re.compile(r"(?:^|[ \t:])[|>][+-]?\d?[+-]?[ \t]*(?:#[^\r\n]*)?\Z")
+
+
+def check_yaml_flow_depth(text: str, *, max_depth: int = MAX_YAML_FLOW_DEPTH) -> None:
+    """Reject deeply nested YAML flow collections in one linear pass before PyYAML scans.
+
+    PyYAML's scanner tracks flow simple keys in time quadratic in flow nesting depth,
+    so a few kilobytes of nested ``[`` or ``{`` can stall ``yaml.scan`` before a token
+    budget trips. Strings, comments, and indented block scalars are skipped so ordinary
+    literal brackets never trigger false positives.
+    """
+    depth = 0
+    pos = 0
+    length = len(text)
+    line_start = 0
+    block_indent: int | None = None
+
+    while pos < length:
+        if block_indent is not None:
+            nl = text.find("\n", pos)
+            line_end = length if nl < 0 else nl
+            line = text[pos:line_end].rstrip("\r")
+            stripped = line.lstrip(" ")
+            if not stripped or (len(line) - len(stripped)) > block_indent:
+                pos = line_end + 1 if nl >= 0 else length
+                line_start = pos
+                continue
+            block_indent = None
+
+        found = _YAML_FLOW_SPECIAL.search(text, pos)
+        if found is None:
+            return
+        ch = found.group()
+        start = found.start()
+        pos = found.end()
+        if ch in "\r\n":
+            if depth == 0:
+                raw_line = text[line_start:start]
+                if _YAML_BLOCK_HEADER.search(raw_line):
+                    block_indent = len(raw_line) - len(raw_line.lstrip(" "))
+            if ch == "\r" and pos < length and text[pos] == "\n":
+                pos += 1
+            line_start = pos
+        elif ch == "#":
+            if start == 0 or text[start - 1] in " \t\r\n":
+                nl = text.find("\n", pos)
+                if nl < 0:
+                    return
+                if depth == 0:
+                    raw_line = text[line_start:start]
+                    if _YAML_BLOCK_HEADER.search(raw_line):
+                        block_indent = len(raw_line) - len(raw_line.lstrip(" "))
+                pos = nl + 1
+                line_start = pos
+        elif ch == '"':
+            while pos < length:
+                stop = _YAML_DQ_STOP.search(text, pos)
+                if stop is None:
+                    return
+                if stop.group() == "\\":
+                    pos = stop.end() + 1
+                else:
+                    pos = stop.end()
+                    break
+        elif ch == "'":
+            while pos < length:
+                nxt = text.find("'", pos)
+                if nxt < 0:
+                    return
+                if nxt + 1 < length and text[nxt + 1] == "'":
+                    pos = nxt + 2
+                else:
+                    pos = nxt + 1
+                    break
+        elif ch in "[{":
+            depth += 1
+            if depth > max_depth:
+                raise PolicyError(f"YAML flow nesting exceeds depth limit ({max_depth})")
+        elif depth > 0:
+            depth -= 1
+
+
 def _contains_lone_surrogate(value: str) -> bool:
     return any("\ud800" <= char <= "\udfff" for char in value)
 
@@ -375,6 +460,7 @@ def parse_yaml_mapping(text: str, *, max_nodes: int | None = None) -> dict[str, 
     """
     if _contains_lone_surrogate(text):
         raise PolicyError("invalid YAML document")
+    check_yaml_flow_depth(text)
     try:
         import yaml
     except ImportError as exc:

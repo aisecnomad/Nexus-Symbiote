@@ -24,7 +24,8 @@ ORIGIN_PATHS = frozenset({"", "/"})
 _HOSTNAME = re.compile(r"[\w.-]+|[0-9a-f:.]+", re.ASCII)
 # A2A 1.0 gRPC interfaces give a "hostname:port" address without a scheme.
 _HOST_PORT = re.compile(r"(?:(?:[\w-]+\.)+[\w-]+|localhost|\[[0-9a-f:.]+\]):\d{1,5}", re.I)
-_SPECIAL_SCHEME = re.compile(r"(ftp|https?|wss?):(?!//)", re.I)
+_SPECIAL_SCHEME = re.compile(r"(ftp|https?|wss?):", re.I)
+_WHATWG_C0_SPACE = "".join(chr(code) for code in range(0x21))
 _URL_ASCII_WHITESPACE = str.maketrans("", "", "\t\r\n")
 
 
@@ -82,15 +83,19 @@ def odd_host(url: str) -> bool:
 def whatwg_form(url: str) -> str:
     """``url`` with "//" before the authority of a special scheme, as WHATWG parsers read it.
 
-    They skip any run of "/" and "\\" after ``http:``, so ``http:host/x`` and
-    ``http:\\\\host`` connect to ``host`` in clear text, while urlsplit reads no host in
-    them and the origin and transport checks would see none.
+    WHATWG basic URL parsing strips leading and trailing C0 controls/spaces and removes
+    all ASCII tabs and newlines before matching a scheme, then skips any run of "/" and
+    "\\" after a special scheme such as ``http:``. Without this normalisation, forms like
+    ``ht\\ttp://host/x``, ``http:host/x`` or ``http:\\\\host`` diverge from ``urlsplit``.
     """
-    value = url.strip()
-    match = _SPECIAL_SCHEME.match(value)
+    cleaned = url.strip(_WHATWG_C0_SPACE).translate(_URL_ASCII_WHITESPACE)
+    match = _SPECIAL_SCHEME.match(cleaned)
     if match is None:
         return url
-    rest = value[match.end() :].translate(_URL_ASCII_WHITESPACE).lstrip("/\\")
+    after = cleaned[match.end() :]
+    if after.startswith("//") and len(after) > 2 and after[2] not in "/\\":
+        return cleaned
+    rest = after.lstrip("/\\")
     if not rest or rest.startswith(" "):
         return url
     return f"{match[1]}://{rest}"

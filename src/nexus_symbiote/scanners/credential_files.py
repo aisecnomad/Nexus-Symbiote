@@ -50,9 +50,29 @@ _PROGRAM_SUFFIXES = frozenset(
 _CREDENTIAL_DIRECTORIES = frozenset(
     marker + plural for marker in _CREDENTIAL_MARKERS for plural in ("", "s")
 )
-_RAIL_LINK_CREDENTIAL_STORES = frozenset(
-    {".aws", ".ssh", ".gnupg", ".kube", ".docker", ".azure", ".gcloud", ".vault", "vault"}
+_CREDENTIAL_STORE_NAMES = frozenset(
+    {
+        "aws",
+        "ssh",
+        "gnupg",
+        "kube",
+        "docker",
+        "azure",
+        "gcloud",
+        "vault",
+        "oci",
+        "sops",
+        "terraform.d",
+        "1password",
+        "helm",
+        "gh",
+        "heroku",
+    }
 )
+# Dotted home-directory credential stores (plus XDG `.config`, which hosts CLI
+# credential files such as `gh/hosts.yml`, `gcloud/`, `helm/`, `sops/`).
+_DOT_CREDENTIAL_STORES = frozenset({*(f".{name}" for name in _CREDENTIAL_STORE_NAMES), ".config"})
+_RAIL_LINK_CREDENTIAL_STORES = _DOT_CREDENTIAL_STORES | _CREDENTIAL_STORE_NAMES
 
 
 def credential_shaped(path: str, *, colang_source: bool = False) -> bool:
@@ -65,7 +85,11 @@ def credential_shaped(path: str, *, colang_source: bool = False) -> bool:
     if PurePosixPath(path).suffix.lower() in MARKDOWN_SUFFIXES:
         return False
     directories = PurePosixPath(path).parts[:-1]
-    if any(part.lower().lstrip(".") in _CREDENTIAL_DIRECTORIES for part in directories):
+    if any(
+        part.casefold().lstrip(".") in _CREDENTIAL_DIRECTORIES
+        or part.casefold() in _DOT_CREDENTIAL_STORES
+        for part in directories
+    ):
         return True
     name = PurePosixPath(path).name.lower()
     suffix = PurePosixPath(name).suffix
@@ -123,7 +147,7 @@ def withheld(
     """
     relative = PurePosixPath(path)
     reason: str | None
-    if credential_shaped(relative.name, colang_source=colang_source):
+    if credential_shaped(path, colang_source=colang_source):
         reason = "its name says it holds credentials"
     else:
         linked = files.in_root_target(path)

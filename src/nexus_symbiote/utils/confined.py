@@ -581,6 +581,7 @@ class ConfinedCollection:
         self._unlisted = _Unlisted()
         self._block: _Unlisted | None = None
         self._variants_reported: set[Path] = set()
+        self._policy_exclusions_recorded = 0
         self._file_bound = _bound(max_file_bytes, "file-bytes")
         self._entry_bound = _bound(max_entries, "entries")
         self._depth_bound = _bound(max_depth, "depth")
@@ -693,6 +694,11 @@ class ConfinedCollection:
         return self._exclusion_log.recorded
 
     @property
+    def policy_exclusions_recorded(self) -> int:
+        """Explicit collection-policy exclusions recorded so far, excluding default excludes."""
+        return self._policy_exclusions_recorded
+
+    @property
     def bytes_exhausted(self) -> bool:
         """Whether the collection's total byte budget is spent, so no further read succeeds.
 
@@ -781,6 +787,7 @@ class ConfinedCollection:
                 folded[:index] in self._folded_excluded for index in range(len(folded) + 1)
             )
         if denied:
+            self._policy_exclusions_recorded += 1
             self._exclusion_log.add(f"{relative}: excluded by collection policy")
         return denied
 
@@ -983,9 +990,10 @@ class ConfinedCollection:
         A symlink whose lexical target is a regular file beneath the root, not
         excluded and reached without a further symlink is read through its target
         (``link_target`` names it); any other symlink is a recorded failure. With
-        ``missing_ok`` an absent file is not a failure, but a case or normalisation
-        variant of its name is, unless the caller reads it separately and names it
-        in ``variants_read``: case-insensitive file systems open that variant.
+        ``missing_ok`` an absent file is not a failure, and any case or normalisation
+        variant of its name — whether the exact spelling is absent or coexists beside
+        it — is reported as a failure unless the caller reads it separately and names
+        it in ``variants_read``: case-insensitive file systems collide on both.
         """
         relative: Path | str = str(path)
         try:
@@ -1021,9 +1029,12 @@ class ConfinedCollection:
                     self._resolves_to(opened, after) and self._same_link(relative, opened)
                 ):
                     raise CollectionError("file changed during collection")
-                return b"".join(chunks)
+                data = b"".join(chunks)
             finally:
                 os.close(fd)
+            if missing_ok and not self._lifted and isinstance(relative, Path):
+                self._report_case_variants(relative, variants_read)
+            return data
         except FileNotFoundError:
             if not missing_ok:
                 self._fail(relative, "file unavailable during collection")
@@ -1314,6 +1325,8 @@ class ConfinedCollection:
         # one failure that spent it names where collection stopped.
         scope = _WalkScope(walked, directory_links, _Unlisted(), skipped, observed_excludes)
         try:
+            if relative.parts:
+                self._report_case_variants(relative, ())
             yield from self._walk(
                 fd, walked, 0, self._entry_budget, scope, followed=walked != relative
             )
@@ -1345,106 +1358,119 @@ class ConfinedCollection:
                         return
                     budget[0] -= 1
                     entries.append(entry.name)
-            for name in sorted(entries):
-                if _undecodable(name):
-                    # A surrogate-escaped name cannot be written to, or read back from,
-                    # an inventory; the entry and anything beneath it are a gap.
-                    self._record(
-                        relative / _escaped(name),
-                        "name is not valid UTF-8; not collected",
-                        scope.unlisted,
-                    )
-                    continue
-                child = relative / name
-                if self.excluded(child):
-                    if scope.observed_excludes is not None:
-                        scope.observed_excludes.append(child)
-                    if scope.skipped is not None and _default_excluded(name):
-                        scope.skipped.append(child)
-                    # A caller that collects skipped reports the entry itself.
-                    if (
-                        scope.skipped is None
-                        and _default_excluded(name)
-                        and self._default_exclude_occupied(directory_fd, name)
-                    ):
-                        in_agent_config = _under_agent_configuration_directory(child)
-                        canonical = fold_name(name)
-                        accepted = canonical in self._accepted_default_names or (
-                            canonical == ".git"
-                            and ROOT_GIT_METADATA in self._accepted_default_names
-                        )
-                        if (
-                            not in_agent_config
-                            and accepted
-                            and (canonical != ".git" or self._is_git_metadata(directory_fd, child))
-                        ):
-                            self.accepted_default_names.add(canonical)
-                            if self._accepted_default_exclusions is not None:
-                                self._accepted_default_exclusions.append(
-                                    reference_text(child.as_posix())
-                                )
-                        else:
-                            reason = (
-                                AGENT_DEFAULT_EXCLUDE_REASON
-                                if in_agent_config
-                                else DEFAULT_EXCLUDE_REASON
-                            )
-                            self._exclusion_log.add(f"{child.as_posix()}: {reason}")
-                    continue
-                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError:
+            self._record(relative, "directory changed or could not be read", scope.unlisted)
+            return
+        for name in sorted(entries):
+            if _undecodable(name):
+                # A surrogate-escaped name cannot be written to, or read back from,
+                # an inventory; the entry and anything beneath it are a gap.
+                self._record(
+                    relative / _escaped(name),
+                    "name is not valid UTF-8; not collected",
+                    scope.unlisted,
+                )
+                continue
+            child = relative / name
+            if self.excluded(child):
+                if scope.observed_excludes is not None:
+                    scope.observed_excludes.append(child)
+                if scope.skipped is not None and _default_excluded(name):
+                    scope.skipped.append(child)
+                # A caller that collects skipped reports the entry itself.
                 if (
-                    self._root_dev is not None
-                    and stat.S_ISDIR(metadata.st_mode)
-                    and metadata.st_dev != self._root_dev
+                    scope.skipped is None
+                    and _default_excluded(name)
+                    and self._default_exclude_occupied(directory_fd, name)
                 ):
-                    self._record(child, "cross-filesystem mount excluded", scope.unlisted)
-                    continue
-                if stat.S_ISLNK(metadata.st_mode):
-                    if followed:
-                        self._record(
-                            child, "symlink reached through another symlink", scope.unlisted
+                    in_agent_config = _under_agent_configuration_directory(child)
+                    canonical = fold_name(name)
+                    accepted = canonical in self._accepted_default_names or (
+                        canonical == ".git" and ROOT_GIT_METADATA in self._accepted_default_names
+                    )
+                    if (
+                        not in_agent_config
+                        and accepted
+                        and (canonical != ".git" or self._is_git_metadata(directory_fd, child))
+                    ):
+                        self.accepted_default_names.add(canonical)
+                        if self._accepted_default_exclusions is not None:
+                            self._accepted_default_exclusions.append(
+                                reference_text(child.as_posix())
+                            )
+                    else:
+                        reason = (
+                            AGENT_DEFAULT_EXCLUDE_REASON
+                            if in_agent_config
+                            else DEFAULT_EXCLUDE_REASON
                         )
-                        continue
-                    try:
-                        target = self._walked_link(directory_fd, child)
-                        follow = target is not None and self._follows(child, target, scope)
-                    except _LinkRefusedError as exc:
-                        self._record(child, exc.reason, scope.unlisted)
-                        continue
-                    except LimitExceededError:
-                        # The listing that spent the entry budget recorded it once.
-                        return
-                    if target is None:
-                        yield child
-                    elif follow:
-                        yield from self._walk_target(target, depth + 1, budget, scope)
-                elif stat.S_ISDIR(metadata.st_mode):
-                    if child in scope.walked:
-                        # Walked already, through a symlink that named it.
-                        continue
+                        self._exclusion_log.add(f"{child.as_posix()}: {reason}")
+                continue
+            try:
+                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError:
+                self._record(child, "directory changed or could not be read", scope.unlisted)
+                continue
+            if (
+                self._root_dev is not None
+                and stat.S_ISDIR(metadata.st_mode)
+                and metadata.st_dev != self._root_dev
+            ):
+                self._record(child, "cross-filesystem mount excluded", scope.unlisted)
+                continue
+            if stat.S_ISLNK(metadata.st_mode):
+                if followed:
+                    self._record(child, "symlink reached through another symlink", scope.unlisted)
+                    continue
+                try:
+                    target = self._walked_link(directory_fd, child)
+                    follow = target is not None and self._follows(child, target, scope)
+                except _LinkRefusedError as exc:
+                    self._record(child, exc.reason, scope.unlisted)
+                    continue
+                except LimitExceededError:
+                    # The listing that spent the entry budget recorded it once.
+                    return
+                except OSError:
+                    self._record(child, "directory changed or could not be read", scope.unlisted)
+                    continue
+                if target is None:
+                    yield child
+                elif follow:
+                    yield from self._walk_target(target, depth + 1, budget, scope)
+            elif stat.S_ISDIR(metadata.st_mode):
+                if child in scope.walked:
+                    # Walked already, through a symlink that named it.
+                    continue
+                try:
                     child_fd = os.open(
                         name,
                         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                         dir_fd=directory_fd,
                     )
+                except OSError:
+                    self._record(child, "directory changed or could not be read", scope.unlisted)
+                    continue
+                try:
                     try:
-                        if (
-                            self._root_dev is not None
-                            and os.fstat(child_fd).st_dev != self._root_dev
-                        ):
-                            self._record(child, "cross-filesystem mount excluded", scope.unlisted)
-                            continue
-                        yield from self._walk(
-                            child_fd, child, depth + 1, budget, scope, followed=followed
+                        child_dev = os.fstat(child_fd).st_dev
+                    except OSError:
+                        self._record(
+                            child, "directory changed or could not be read", scope.unlisted
                         )
-                    finally:
-                        os.close(child_fd)
-                elif stat.S_ISREG(metadata.st_mode):
-                    yield child
-                else:
-                    self._record(child, "nonregular file excluded", scope.unlisted)
-        except OSError:
-            self._record(relative, "directory changed or could not be read", scope.unlisted)
+                        continue
+                    if self._root_dev is not None and child_dev != self._root_dev:
+                        self._record(child, "cross-filesystem mount excluded", scope.unlisted)
+                        continue
+                    yield from self._walk(
+                        child_fd, child, depth + 1, budget, scope, followed=followed
+                    )
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(metadata.st_mode):
+                yield child
+            else:
+                self._record(child, "nonregular file excluded", scope.unlisted)
 
     def _follows(self, link: Path, target: Path, scope: _WalkScope) -> bool:
         """Whether a walk goes on into the directory a walked symlink names."""

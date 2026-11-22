@@ -20,7 +20,7 @@ from nexus_symbiote.core.enums import RiskSeverity, TrustTier
 from nexus_symbiote.core.hashing import hash_bytes, hash_canonical
 from nexus_symbiote.core.identifiers import reference_text
 from nexus_symbiote.core.models import GuardrailComponent, RAGSourceComponent, RiskAssessment
-from nexus_symbiote.policy import read_sexagesimal_integers_as_text
+from nexus_symbiote.policy import check_yaml_flow_depth, read_sexagesimal_integers_as_text
 from nexus_symbiote.scanners.base import (
     Scanner,
     ScanResult,
@@ -242,7 +242,7 @@ def _transport(raw: str) -> str | None:
     text with ``:``, ``@`` or ``=``, such as a connection string, shows no scheme; text
     without them is a path.
     """
-    value = raw.strip()
+    value = whatwg_form(raw.strip())
     match = _SCHEME.match(value)
     if match:
         return "" if value[match.end() : match.end() + 1].isdigit() else match.group(1).lower()
@@ -397,7 +397,7 @@ class RAGScanner(Scanner):
                     self._config_variant(path, files, result)
                 elif fold_name(path.name) in _FOLDED_GUARDRAIL_NAMES:
                     guardrails.append(path)
-                elif path.suffix == NEMO_RAIL_SUFFIX:
+                elif path.suffix.lower() == NEMO_RAIL_SUFFIX:
                     rails.setdefault(path.parent, []).append(path)
                 elif path.name in ENV_FILES and len(path.parts) == 1:
                     raw = files.read_bytes(path)
@@ -450,6 +450,16 @@ class RAGScanner(Scanner):
                 result.scan_failures.append(
                     f"{relative}: more than {_MAX_ENTRIES} Colang files beside the configuration"
                 )
+                continue
+            for rail in siblings:
+                if rail.suffix != NEMO_RAIL_SUFFIX:
+                    result.scan_failures.append(
+                        f"{rail.as_posix()}: case variant of "
+                        f"{rail.with_suffix(NEMO_RAIL_SUFFIX).as_posix()} is the active file on "
+                        "case-insensitive file systems and is not inventoried"
+                    )
+            siblings = [rail for rail in siblings if rail.suffix == NEMO_RAIL_SUFFIX]
+            if canonical in NEMO_CONFIG_NAMES and not siblings:
                 continue
             siblings = [
                 rail
@@ -604,6 +614,7 @@ class RAGScanner(Scanner):
             result.scan_failures.append(f"{path.as_posix()}: YAML parser unavailable")
             return None
         try:
+            check_yaml_flow_depth(content)
             # Anchors/aliases and tags are unnecessary for this static profile;
             # rejecting them avoids recursive or amplified configuration graphs.
             for index, token in enumerate(yaml.scan(content)):
