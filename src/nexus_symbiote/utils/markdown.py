@@ -122,6 +122,7 @@ def _html_block_ends(kind: int, line: str, offset: int) -> bool:
 # Inline: what pairs backticks, and what can take one out of a code span.
 _INLINE_SPECIAL = re.compile(r"[\\`\[\]<]")
 _BACKTICKS = re.compile(r"`+")
+_IMPORT_FILENAME = re.compile(r"@\S+")
 _ESCAPABLE = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 _DEFINITION = re.compile(r"\[(?:[^\\\[\]]|\\.){0,1000}\]:", re.S)
 # After a link reference definition commonmark.js reads a line as part of its paragraph,
@@ -334,13 +335,36 @@ def _text_outside_code(text: str) -> list[str]:
             return parts
         # A quote marker or a closing code span can put an import at the start of
         # rendered text even when the raw file has no whitespace before its @.
+        # Raw HTML has no inline code spans. A repeated line that another
+        # reading places in prose must keep its possible inline boundaries.
+        html_lines = set.intersection(
+            *(
+                {
+                    line
+                    for kind, block in alt.blocks
+                    if kind == "html"
+                    for line in block.split("\n")
+                    if "`@" in line
+                }
+                for alt in readers
+            )
+        )
+        if html_lines:
+            html_lines.difference_update(
+                line
+                for alt in readers
+                for kind, block in alt.blocks
+                if kind in {"paragraph", "heading", "literal"}
+                for line in block.split("\n")
+                if "`@" in line
+            )
         alternatives = [text]
         for line in lines:
             if "@" in line:
                 bare = _CONTAINER_MARKS.sub("", line, count=1)
                 if bare != line:
                     alternatives.append(bare)
-                if "`@" in bare:
+                if "`@" in bare and line not in html_lines and bare not in html_lines:
                     inline = _outside_spans(bare, import_boundaries_only=True)
                     if inline != bare:
                         alternatives.append(inline)
@@ -806,7 +830,7 @@ def _outside_spans(text: str, *, import_boundaries_only: bool = False) -> str:
     last_close = text.rfind(">")
     taken = -1
     kept: list[str] = []
-    copied = brackets = 0
+    copied = brackets = literal_end = 0
     positions = None
     while (found := _INLINE_SPECIAL.search(text, position)) is not None:
         position = found.start()
@@ -822,11 +846,17 @@ def _outside_spans(text: str, *, import_boundaries_only: bool = False) -> str:
                 position = end
             else:
                 span_end = starts[index] + end - position
-                # For an ambiguous block, only a closing span can expose a new @.
-                # Preserve later backticks that may be part of the import filename.
-                if not import_boundaries_only or text[span_end : span_end + 1] == "@":
-                    kept.extend((text[copied:position], " "))
-                    copied = span_end
+                # A real closing span may introduce an import. Keep any backticks
+                # in that raw filename, and mask every unrelated span in this reading.
+                keep_to = max(position, min(span_end, literal_end))
+                kept.append(text[copied:keep_to])
+                if keep_to < span_end:
+                    kept.append(" ")
+                copied = span_end
+                if import_boundaries_only and span_end >= literal_end:
+                    filename = _IMPORT_FILENAME.match(text, span_end)
+                    if filename is not None:
+                        literal_end = filename.end()
                 position = span_end
         elif char == "<":
             position += 1
@@ -856,6 +886,8 @@ def _outside_spans(text: str, *, import_boundaries_only: bool = False) -> str:
                     syntax = _LINK_LABEL if following == "[" else _LENIENT_INLINE_LINK
                     if (match := syntax.match(text, position)) is not None:
                         position = match.end()
+    if import_boundaries_only and not literal_end:
+        return text
     kept.append(text[copied:])
     return "".join(kept)
 
