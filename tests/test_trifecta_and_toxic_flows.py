@@ -1055,3 +1055,12 @@ def test_secret_env_key_anchors_bound_a_word(name: str, secret: bool) -> None:
     from nexus_symbiote.trifecta import _SECRET_ENV_KEY_RE
 
     assert bool(_SECRET_ENV_KEY_RE.search(name)) is secret
+
+
+def test_required_approvals_are_visible_on_unverified_flow_legs():
+    report = analyze_trifecta(_trifecta_bom(gated=True))
+    flow = next(f for f in report.findings if f.kind == "lethal_trifecta")
+    assert any(leg["component_approval_declared"] for leg in flow.evidence)
+    assert all(
+        not leg["approval_enforcement_verified"] and not leg["gated"] for leg in flow.evidence
+    )

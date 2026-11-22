@@ -1276,6 +1276,8 @@ An unrelated read-only authorization is independent of egress only when its scop
 nexus-symbiote trifecta [OPTIONS] AIBOM_PATH
 ```
 
+Each leg records the component’s declared approval requirement separately from runtime verification.
+
 | Option | Description |
 |---|---|
 | `-o`, `--output` `PATH` | Write the trifecta and toxic-flow report JSON to this file instead of standard output. |

@@ -552,6 +552,7 @@ class LegEvidence:
     locator: str | None
     assurance: AssuranceLevel
     gated: bool
+    component_approval_declared: bool
 
 
 @dataclass(frozen=True)
@@ -1379,10 +1380,11 @@ def _evidence_entry(
         "locator": item.locator,
         "assurance": item.assurance.value,
         "gated": item.gated,
+        "component_approval_declared": item.component_approval_declared,
+        "approval_enforcement_verified": False,
     }
     if egress_approval_declared is not None:
         evidence["egress_approval_declared"] = egress_approval_declared
-        evidence["approval_enforcement_verified"] = False
     return evidence
 
 
@@ -1470,6 +1472,7 @@ def _scope_findings(
                     and tag not in {"path_egress", "path_sink"}
                     and (gated_owner or sig.explicitly_gated)
                     and not sig.explicitly_ungated,
+                    sig.explicitly_gated,
                 )
             )
         return found
