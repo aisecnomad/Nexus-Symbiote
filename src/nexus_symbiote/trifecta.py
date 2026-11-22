@@ -490,9 +490,32 @@ _SCOPE_LOOKALIKES = str.maketrans(
         char.casefold(): replacement
         for char, replacement in {
             "ԝ": "w",
-            "ᴡ": "w",
-            "ᴇ": "e",
+            "ᴀ": "a",
             "ʙ": "b",
+            "ᴄ": "c",
+            "ᴅ": "d",
+            "ᴇ": "e",
+            "ꜰ": "f",
+            "ɢ": "g",
+            "ʜ": "h",
+            "ɪ": "i",
+            "ᴊ": "j",
+            "ᴋ": "k",
+            "ʟ": "l",
+            "ᴍ": "m",
+            "ɴ": "n",
+            "ᴏ": "o",
+            "ᴑ": "o",
+            "ᴘ": "p",
+            "ʀ": "r",
+            "ᴛ": "t",
+            "ᴜ": "u",
+            "ᴠ": "v",
+            "ᴡ": "w",
+            "ʏ": "y",
+            "ᴢ": "z",
+            "\u04c0": "l",
+            "\u04cf": "l",
             "ω": "w",
             "ǝ": "e",
             "г": "r",
@@ -761,7 +784,11 @@ def _scope_identifier(part: str, *, network_words: bool, nested: bool = False) -
     if part.isdecimal():
         # A numeric key below a named resource identifies a record or partition.
         return nested
-    folded = unicodedata.normalize("NFKD", part).translate(_CONFUSABLES)
+    # Translate confusables before NFKD so characters like Greek lunate sigma
+    # (\u03f2) are mapped before NFKD folds them to another code point, then strip
+    # combining marks so precomposed diacritics cannot split broad/network words.
+    folded = unicodedata.normalize("NFKD", part.translate(_CONFUSABLES)).translate(_CONFUSABLES)
+    folded = "".join(ch for ch in folded if unicodedata.category(ch) not in {"Mn", "Cf"})
     normalized = _CAMEL_BOUNDARY_RE.sub("_", folded).casefold().translate(_SCOPE_LOOKALIKES)
     letters = "".join(ch for ch in normalized if ch.isalpha())
     if not letters:
@@ -772,7 +799,7 @@ def _scope_identifier(part: str, *, network_words: bool, nested: bool = False) -
     if not _BROAD_SELECTORS.isdisjoint(forms):
         return False
     words = [word.translate(_SCOPE_SPELLING) for word in _SEPARATOR_RE.split(normalized) if word]
-    if len(words) > 1 and words[0] in _BROAD_SELECTORS:
+    if len(words) > 1 and any(word in _BROAD_SELECTORS for word in words):
         # A quantifier separated from its object need not use a known object name.
         return False
     return not network_words or (
@@ -786,7 +813,8 @@ def _named_data_scope(kind: str, value: str) -> bool:
         if _TABLE_NAME.fullmatch(value) is None:
             return False
         parts = value.split(".")
-        # A qualified SQL name can legitimately use a public or internal schema.
+        # A qualified SQL name can legitimately use a public or internal schema,
+        # or dotted catalog/schema/table names that resemble DNS labels.
         network_words = len(parts) == 1
     else:
         path = value.removesuffix("/")
