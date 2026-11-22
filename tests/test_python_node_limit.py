@@ -144,7 +144,9 @@ def test_nothing_in_the_checkout_raises_the_limit(tmp_path):
     assert result.exit_code == 1
     assert _failures(document) == [f"server.py: {OVER_DEFAULT}"]
     (project / ".nexus-symbiote.yaml").write_text("limits:\n  python-nodes: 10000000\n")
-    refused = CliRunner().invoke(main, ["scan", str(project), "-o", str(tmp_path / "p.json")])
+    refused = CliRunner().invoke(
+        main, ["scan", str(project), "--accept-project-policy", "-o", str(tmp_path / "p.json")]
+    )
     assert refused.exit_code == 1
     assert "invalid policy" in refused.output
 

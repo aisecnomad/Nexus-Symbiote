@@ -336,7 +336,14 @@ def test_validate_never_claims_a_comparison_the_policy_skipped(tmp_path, policy,
         other.mkdir()
         (other / "CLAUDE.md").write_text("A different agent.\n")
         path = _scanned(other, tmp_path / "other.json")
-    args = ["validate", str(path), "--project", str(project), *extra]
+    args = [
+        "validate",
+        str(path),
+        "--project",
+        str(project),
+        "--accept-project-policy",
+        *extra,
+    ]
     runner = CliRunner()
     result = runner.invoke(main, args)
     # The policy still decides the verdict; only the stated basis must be true.
@@ -629,7 +636,9 @@ def test_baseline_names_why_the_built_in_gate_refused_it(tmp_path):
     # The checkout's policy turns the scan gate into a report; the baseline gate holds.
     (project / ".nexus-symbiote.yaml").write_text("scan: {failure_mode: report-only}\n")
     target = tmp_path / "baseline.json"
-    result = CliRunner().invoke(main, ["baseline", str(project), "-o", str(target)])
+    result = CliRunner().invoke(
+        main, ["baseline", str(project), "--accept-project-policy", "-o", str(target)]
+    )
     assert result.exit_code == 1 and not target.exists()
     lines = _lines(result.stderr)
     assert "Built-in scan gate failed; a project policy cannot relax it here:" in lines

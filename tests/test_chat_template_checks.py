@@ -320,8 +320,18 @@ def test_accepting_the_template_does_not_accept_the_model_file(runner, tmp_path,
     (project / ".nexus-symbiote.yaml").write_text(
         SUPPRESS_TEMPLATE.format(artifact=artifact, fingerprint=fingerprint), encoding="utf-8"
     )
-    run = runner.invoke(main, ["scan", str(project), "-o", str(bom)])
-    risk = runner.invoke(main, ["risk", str(bom), "--project", str(project), "--json-output"])
+    run = runner.invoke(main, ["scan", str(project), "--accept-project-policy", "-o", str(bom)])
+    risk = runner.invoke(
+        main,
+        [
+            "risk",
+            str(bom),
+            "--project",
+            str(project),
+            "--accept-project-policy",
+            "--json-output",
+        ],
+    )
     assert risk.exit_code == run.exit_code, risk.output
     scored = json.loads(risk.stdout)
     assert [item["category"] for item in scored["suppressed_findings"]] == ["serialization_format"]

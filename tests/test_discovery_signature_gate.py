@@ -84,7 +84,17 @@ def _verifier(monkeypatch, **overrides):
 
 
 def _validate(bom: Path, project: Path, *extra: str):
-    return CliRunner().invoke(main, ["validate", str(bom), "--project", str(project), *extra])
+    return CliRunner().invoke(
+        main,
+        [
+            "validate",
+            str(bom),
+            "--project",
+            str(project),
+            "--accept-project-policy",
+            *extra,
+        ],
+    )
 
 
 def test_required_signature_without_an_operator_entry_fails_validate_and_risk(tmp_path):
@@ -93,7 +103,17 @@ def test_required_signature_without_an_operator_entry_fails_validate_and_risk(tm
     assert result.exit_code == 1
     assert "Discovery producer check" in result.output
     assert "No operator signature policy entry names the ShadowScan report" in result.output
-    risk = CliRunner().invoke(main, ["risk", str(bom), "--project", str(project), "--json-output"])
+    risk = CliRunner().invoke(
+        main,
+        [
+            "risk",
+            str(bom),
+            "--project",
+            str(project),
+            "--accept-project-policy",
+            "--json-output",
+        ],
+    )
     assert risk.exit_code == 1
     reasons = json.loads(risk.stdout)["gate_reasons"]
     assert any("No operator signature policy entry names" in reason for reason in reasons)
@@ -368,7 +388,14 @@ def test_signed_report_reports_a_verified_producer(tmp_path, monkeypatch):
 
 def test_a_failed_producer_check_does_not_relabel_a_passed_reconciliation(tmp_path):
     project, bom = _project(tmp_path, GATED)
-    args = ["risk", str(bom), "--project", str(project), "--json-output"]
+    args = [
+        "risk",
+        str(bom),
+        "--project",
+        str(project),
+        "--accept-project-policy",
+        "--json-output",
+    ]
     document = json.loads(CliRunner().invoke(main, args).stdout)
     assert document["assessment_basis"] == "project-reconciled"
     assert document["overall_score"] is None and document["passed"] is False

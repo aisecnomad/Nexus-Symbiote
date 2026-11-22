@@ -193,9 +193,16 @@ def test_invalid_policy_keys_cannot_forge_output_lines(tmp_path):
         'risk:\n  "x\\e[2K\\r\\n::error title=Policy::forged by checkout\\n": 1\n'
     )
     for args in (
-        ["scan", str(project), "-o", str(tmp_path / "again.json")],
-        ["validate", str(inventory), "--project", str(project)],
-        ["risk", str(inventory), "--project", str(project), "--json-output"],
+        ["scan", str(project), "--accept-project-policy", "-o", str(tmp_path / "again.json")],
+        ["validate", str(inventory), "--project", str(project), "--accept-project-policy"],
+        [
+            "risk",
+            str(inventory),
+            "--project",
+            str(project),
+            "--accept-project-policy",
+            "--json-output",
+        ],
     ):
         result = runner.invoke(main, args)
         assert result.exit_code == 1, args

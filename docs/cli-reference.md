@@ -145,7 +145,7 @@ Colors are used only on a terminal, and `NO_COLOR` turns them off.
 | Exit | Meaning |
 |---|---|
 | `0` | The command completed and every requested gate passed. |
-| `1` | A gate or check failed (risk gate, integrity, digest or signature mismatch, a `diff` security alert, since `--fail-on-alert` is the default and only `--no-fail-on-alert` turns that gate off, incomplete collection or observation), the input could not be read or parsed, `import-shadowscan` ran without `--report-only`, unverified ShadowScan discovery evidence was imported, validated or scored in CI without `--allow-unsigned-discovery`, a project policy that weakens a gate was applied in CI without `--accept-project-policy`, the host lacks the POSIX file primitives confinement needs, as Windows does ([platforms](../SECURITY.md#platforms)), or an unexpected internal error occurred. |
+| `1` | A gate or check failed (risk gate, integrity, digest or signature mismatch, a `diff` security alert, since `--fail-on-alert` is the default and only `--no-fail-on-alert` turns that gate off, incomplete collection or observation), the input could not be read or parsed, `import-shadowscan` ran without `--report-only`, unverified ShadowScan discovery evidence was imported, validated or scored in CI without `--allow-unsigned-discovery`, the host lacks the POSIX file primitives confinement needs, as Windows does ([platforms](../SECURITY.md#platforms)), or an unexpected internal error occurred. |
 | `2` | Usage error: an unknown command or option, a missing argument or file, a `PROJECT_PATH` of `scan` or `baseline` or a `--project` of `validate`, `risk`, `verify-artifact` or `verify-live` that is a file, a `verify-live` launch policy kept where the [launch policy](#launch-policy) rules forbid, a `verify-attestation` `--trusted-key` kept where the [trusted-key rule](#verify-attestation) forbids or a `runtime verify` or `runtime register` public key kept where the same rule forbids, an invalid value (including a malformed `verify-artifact --sha256` and an incomplete `--bundle`, `--signer-identity` and `--issuer` set), a relative project path that a symbolic link leads outside the working directory, an invalid `NEXUS_SYMBIOTE_MODE` or collection limit, a `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` shorter than 32 characters, a malformed `SOURCE_DATE_EPOCH` for `scan`, `baseline` or `import-shadowscan`, or a live command run without live mode (`advisories --dry-run` contacts nothing and runs in either mode). |
 
 What exit status 1 means for each gate:
@@ -193,7 +193,7 @@ in the BOM is not trusted.
 | `XDG_CACHE_HOME`, `HOME` | Where sigstore-python caches the trusted root that offline Sigstore verification uses; see [known limitations](known-limitations.md#signatures). |
 | `NEXUS_SYMBIOTE_SIGSTORE_TRUST_ROOT` | An explicit Sigstore `trusted_root.json` file, or a directory holding one, for offline Sigstore verification. `--trust-root` overrides it. Without a pinned digest the file and its directory must be owned by the user and not writable by group or others. |
 | `NEXUS_SYMBIOTE_SIGSTORE_TRUST_ROOT_SHA256` | The SHA-256 the explicit trust root's bytes must match. `--trust-root-sha256` overrides it; set without a trust root, it is a usage error. |
-| `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `CIRCLECI`, `TF_BUILD`, `JENKINS_URL`, `BUILDKITE`, `DRONE`, `TRAVIS` | Any value other than empty, `0` or `false` marks the run as automated: `import-shadowscan`, `scan --check`, `baseline`, `validate` and `risk` then fail on unverified ShadowScan discovery evidence unless `--allow-unsigned-discovery` is given, and `scan`, `validate` and `risk` fail on a project policy that weakens a gate unless `--no-project-policy` or `--accept-project-policy` is given. |
+| `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `CIRCLECI`, `TF_BUILD`, `JENKINS_URL`, `BUILDKITE`, `DRONE`, `TRAVIS` | Any value other than empty, `0` or `false` marks the run as automated: `import-shadowscan`, `scan --check`, `baseline`, `validate` and `risk` then fail on unverified ShadowScan discovery evidence unless `--allow-unsigned-discovery` is given. These variables do not apply or refuse a project policy. |
 | `TMPDIR` | Where `verify-live` stages the private copy of a pinned launcher. |
 | `_NEXUS_SYMBIOTE_COMPLETE` | Ignored. Shell completion is not offered, because an inherited completion variable would make every command, gates included, exit 0 without running. |
 | `SOURCE_DATE_EPOCH` | A whole number of seconds since 1970-01-01T00:00:00Z: 1 to 12 ASCII digits, at most 253402300799. `scan`, `baseline` and `import-shadowscan` then record that instant as the collection time; without it they record none. The serial number is derived from the content digest either way, so the same inputs give byte-identical native JSON and CycloneDX files, and, with the variable set, byte-identical SPDX files too. Any other value is a usage error whose message does not repeat it. Gates still use the clock, for example to decide whether a suppression has expired. See [reproducible inventories](reproducible-inventories.md). |
@@ -442,8 +442,8 @@ nexus-symbiote baseline [OPTIONS] [PROJECT_PATH]
 | `-o`, `--baseline-path` `PATH` | Where to write the unsigned baseline (default: .nexus-symbiote-baseline.json, in the working directory, not the project). |
 | `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. `root:.git` accepts the checkout marker. Explicit `.git` also accepts regular nested Git metadata files without following their pointers. |
 | `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`), as `scan` does. The staged inventory is still re-gated, so this flag is what keeps that gap out of the baseline. An empty directory does not. |
-| `--no-project-policy` | Use built-in policy without reading configuration from the target, as scan does. |
-| `--accept-project-policy` | In CI, accept a project policy that weakens the built-in gates explicitly; without it such a policy fails the command there (exit 1). Interactive runs only warn. |
+| `--no-project-policy` | Ignore the checkout policy without opening it. |
+| `--accept-project-policy` | Accept reviewed checkout relaxations within the operator policy. Tightening settings apply automatically, including in mixed files. |
 | `--signature-policy` `FILE` | Explicit operator signer policy JSON, kept outside the project, as for scan; also verifies any merged ShadowScan discovery report. |
 | `--fail-on-unsigned-discovery` | Exit with status 1 when the snapshot merges unverified ShadowScan discovery evidence. |
 | `--allow-unsigned-discovery` | Accept unverified ShadowScan discovery evidence explicitly (still warns); required in CI when no `--signature-policy` verifies the report. |
@@ -669,7 +669,7 @@ exclude the affected components from verified permits and verified model evidenc
 remain mandatory for every value of `validate.require_completeness`, `validate.require_integrity`,
 `validate.minimum_assurance_level` and `scan.failure_mode`.
 
-In CI, the accepted `scan.exclude_paths` entries are exactly `node_modules`, `.git`,
+The accepted `scan.exclude_paths` entries are exactly `node_modules`, `.git`,
 `__pycache__`, `.venv` and `venv`. All other entries, including `node_modules/` and
 `./node_modules`, cause corroboration to fail even when the path is absent. Both commands
 refuse an invalid project policy and report its cause.
@@ -799,8 +799,8 @@ nexus-symbiote risk [OPTIONS] AIBOM_PATH
 | `--fail-on-severity` `critical\|high\|medium\|low\|info\|none` | Fail on any finding at or above this severity (default: from policy, built-in critical); none disables it. |
 | `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. `root:.git` accepts the checkout marker. Explicit `.git` also accepts regular nested Git metadata files without following their pointers. |
 | `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`). Without this flag such an entry makes coverage partial. An empty directory does not. |
-| `--no-project-policy` | Use built-in policy without reading configuration from the target. |
-| `--accept-project-policy` | In CI, accept a project policy that weakens the built-in gates explicitly; without it such a policy fails the command there (exit 1). Interactive runs only warn. |
+| `--no-project-policy` | Ignore the checkout policy without opening it. |
+| `--accept-project-policy` | Accept reviewed checkout relaxations within the operator policy. Tightening settings apply automatically, including in mixed files. |
 | `--require-discovery-signature` | Require the operator signature policy to verify any ShadowScan report the inventory records or the project contains, whatever the project policy says; requires --project. JSON output reports the result as `discovery_producer` |
 | `--fail-on-unsigned-discovery` | Exit with status 1 when the BOM's ShadowScan evidence is unverified |
 | `--allow-unsigned-discovery` | Accept unverified discovery evidence explicitly (still warns); required in CI |
@@ -963,15 +963,15 @@ nexus-symbiote scan [OPTIONS] [PROJECT_PATH]
 | Option | Description |
 |---|---|
 | `-o`, `--output` `PATH` | Output file path (default: standard output) |
-| `-f`, `--format` `json\|cyclonedx\|spdx\|sarif` | Output format (default: json, or from .nexus-symbiote.yaml) |
-| `--scanner` `TEXT` | Collector to run, once each: mcp, model, prompt, rag, registry, a2a, ide_agents, shadowscan (default: all, or from .nexus-symbiote.yaml). A collector left out makes coverage partial. (repeatable) |
+| `-f`, `--format` `json\|cyclonedx\|spdx\|sarif` | Output format. Defaults to json unless the accepted policy sets a format. |
+| `--scanner` `TEXT` | Collector to run, once each: mcp, model, prompt, rag, registry, a2a, ide_agents, shadowscan. Defaults to all unless the accepted policy selects collectors. A collector left out makes coverage partial. (repeatable) |
 | `--report-only` | Emit findings and collection failures without a CI failure. With `--check`, unverified discovery evidence and a failed producer check still exit 1. |
 | `--check` | Collect and apply the scan gate without writing an inventory. Cannot be combined with `-o`. |
 | `--signature-policy` `PATH` | Explicit operator signer policy JSON |
 | `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. `root:.git` accepts the checkout marker. Explicit `.git` also accepts regular nested Git metadata files without following their pointers. |
 | `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`). Without this flag such an entry makes coverage partial. An empty directory does not. |
-| `--no-project-policy` | Use built-in policy without reading configuration from the target. |
-| `--accept-project-policy` | In CI, accept a project policy that weakens the built-in gates explicitly; without it such a policy fails the command there (exit 1). Interactive runs only warn. |
+| `--no-project-policy` | Ignore the checkout policy without opening it. |
+| `--accept-project-policy` | Accept reviewed checkout relaxations within the operator policy. Tightening settings apply automatically, including in mixed files. |
 | `--fail-on-unsigned-discovery` | With `--check`, exit with status 1 when ShadowScan discovery evidence is unverified. |
 | `--allow-unsigned-discovery` | With `--check`, accept unverified ShadowScan discovery evidence explicitly (still warns); required in CI when no `--signature-policy` verifies the report. |
 | `--operator-policy` `FILE` | Signed operator policy YAML outside the scanned checkout; checkout policy may only narrow it. |
@@ -1071,8 +1071,8 @@ nexus-symbiote validate [OPTIONS] AIBOM_PATH
 | `--signature-policy` `PATH` | Explicit operator signer policy JSON; requires --project |
 | `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. `root:.git` accepts the checkout marker. Explicit `.git` also accepts regular nested Git metadata files without following their pointers. |
 | `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`). Without this flag such an entry makes coverage partial. An empty directory does not. |
-| `--no-project-policy` | Use built-in policy without reading configuration from the target. |
-| `--accept-project-policy` | In CI, accept a project policy that weakens the built-in gates explicitly; without it such a policy fails the command there (exit 1). Interactive runs only warn. |
+| `--no-project-policy` | Ignore the checkout policy without opening it. |
+| `--accept-project-policy` | Accept reviewed checkout relaxations within the operator policy. Tightening settings apply automatically, including in mixed files. |
 | `--skip-integrity` | Check completeness only and report integrity as skipped, for a repository whose models cannot be signed yet. The skip is printed and recorded in `--json-output`. |
 | `--json-output` | Print the validation report as JSON. |
 | `--require-discovery-signature` | Require the operator signature policy to verify any ShadowScan report the inventory records or the project contains, whatever the project policy says; requires --project |

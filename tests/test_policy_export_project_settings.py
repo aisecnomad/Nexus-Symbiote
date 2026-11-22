@@ -34,13 +34,27 @@ def _commands(project, path):
 
 def test_corroboration_uses_the_same_exclusions_as_validation(project_scope):
     runner, project, path = project_scope
-    _write_project_policy(project, "scan:\n  exclude_paths: [drafts]\n")
+    (project / "venv").mkdir()
+    (project / "venv" / "AGENTS.md").write_text("Check vendored instructions.\n", encoding="utf-8")
+    _write_project_policy(project, "scan:\n  exclude_paths: []\n")
     validate = runner.invoke(main, ["validate", str(path), "--project", str(project)])
     assert validate.exit_code == 1, validate.output
     for args in _commands(project, path):
         result = runner.invoke(main, args)
         assert result.exit_code == 1, result.output
         assert "failed completeness reconciliation" in result.stderr
+        assert not result.stdout
+
+
+def test_corroboration_rejects_extra_project_exclusions_locally(project_scope, monkeypatch):
+    runner, project, path = project_scope
+    _write_project_policy(project, "scan:\n  exclude_paths: [drafts]\n")
+    monkeypatch.setattr("nexus_symbiote.policy_export.running_in_ci", lambda: False)
+    for args in _commands(project, path):
+        result = runner.invoke(main, args)
+        assert result.exit_code == 1, result.output
+        assert "weakens the built-in gates because" in result.stderr
+        assert "in CI" not in result.stderr
         assert not result.stdout
 
 

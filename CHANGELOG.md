@@ -6,6 +6,7 @@ Notable changes to Nexus SymBiote, newest release first. Within a release, secur
 
 ### Security
 
+- **Breaking.** `scan`, `baseline`, and `validate` or `risk` with `--project` apply checkout settings that tighten the governing gates, including in mixed policies. Relaxations require `--accept-project-policy`. A signed operator policy remains the floor. Omitted settings inherit that floor. A malformed, ambiguous or unreadable checkout policy stops the command. The default exit status is 1. For `scan`, `validate` and `risk` it is 4 with `--detailed-exit-codes`. Pass `--no-project-policy` to ignore the file. The init template preserves operator-approved category ignores and suppressions.
 - **Breaking:** `evidence-profile` now emits v2. Read collector and runtime declarations from `inventory_claims`, and treat `digest_bound` as corroboration of all model weight files. Update consumers that parsed the v1 evidence fields.
 - The `trifecta` CLI keeps an unapproved read on an untyped resource critical. Explicit data scopes can retain declared approval coverage. Runtime enforcement remains unverified.
 - The Python inventory reports unresolved qualified SDK imports across checkout and installed launch modes. Passive package helpers retain their ordinary SDK tool inventory.
