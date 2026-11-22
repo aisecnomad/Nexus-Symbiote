@@ -674,6 +674,12 @@ Import a foreign CycloneDX or SPDX SBOM as DECLARED evidence without picking sil
 
 Nested npm and Cargo manifests use SemVer ordering for supported requirements, including prerelease eligibility. Conda comparisons cover supported numeric constraints and version prefixes. An incompatible version rules out a version-and-build pin. A compatible version leaves the build unresolved when supplier build evidence is unavailable. Package URL comparisons ignore ancillary metadata such as checksums and subpaths. Different explicit registry or qualifier evidence for the same typed package remains unresolved at the same version. Incompatible versions for that package report a conflict.
 
+The default npm and Yarn registry addresses identify the same public registry. PyPI’s
+default index and file host also agree. With `--project`, a private repository path
+can be matched to the selected npm, uv or Poetry lock record. Its recorded file digest,
+package name and version must agree. Missing, changed or symlinked lockfiles leave a
+path-specific supplier claim unresolved.
+
 ```text
 nexus-symbiote import-sbom [OPTIONS] FOREIGN_BOM_PATH
 ```
