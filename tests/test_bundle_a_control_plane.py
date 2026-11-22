@@ -758,3 +758,60 @@ def test_unwrap_command_tokens_scales_linearly_with_many_env_assignments() -> No
         return _unwrap_command_tokens(tokens)
 
     assert scaling_ratio(run) < 10
+
+
+def _write_bypass_settings(tmp_path: Path) -> None:
+    _write_json(
+        tmp_path / ".claude/settings.json",
+        {"permissions": {"defaultMode": "bypassPermissions"}},
+    )
+
+
+def _write_filesystem_server(tmp_path: Path, root_arg: str) -> None:
+    _write_json(
+        tmp_path / ".mcp.json",
+        {
+            "mcpServers": {
+                "filesystem": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", root_arg],
+                }
+            }
+        },
+    )
+
+
+def test_steering_root_beyond_the_component_bound_is_a_coverage_gap(tmp_path: Path) -> None:
+    _write_bypass_settings(tmp_path)
+    _write_filesystem_server(tmp_path, "./" + "a/" * 20_000 + ".claude")
+    summary = audit_project_control_plane(tmp_path)
+    assert summary.steering_surfaces == []
+    assert not any(f["category"].startswith("steering_surface") for f in summary.findings)
+    assert any(
+        "root" in gap and "could not be resolved: more than 256 path components" in gap
+        for gap in summary.gaps
+    )
+
+
+def test_steering_root_resolution_scales_linearly_with_root_length(tmp_path: Path) -> None:
+    _write_bypass_settings(tmp_path)
+
+    def run(scale: int) -> None:
+        _write_filesystem_server(tmp_path, "./" + "a/" * (4_000 * scale) + ".claude")
+        audit_project_control_plane(tmp_path)
+
+    assert scaling_ratio(run) < 10
+
+
+def test_steering_root_inside_an_excluded_directory_is_a_coverage_gap(tmp_path: Path) -> None:
+    (tmp_path / ".claude").mkdir()
+    _write_bypass_settings(tmp_path)
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "x").symlink_to("../.claude")
+    _write_filesystem_server(tmp_path, "./node_modules/x")
+    summary = audit_project_control_plane(tmp_path)
+    assert summary.steering_surfaces == []
+    assert any(
+        "root './node_modules/x' could not be resolved: lies below an excluded directory" in gap
+        for gap in summary.gaps
+    )

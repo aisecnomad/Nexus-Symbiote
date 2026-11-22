@@ -113,6 +113,7 @@ _SUMMARY_KEYS = _tup(
 _MAX_BRIDGE_DEPTH = 4
 _MAX_BRIDGE_EXPANSIONS = 64
 _MAX_SYMLINK_HOPS = 8
+_MAX_STEERING_COMPONENTS = 256
 _SPLIT_SEPARATORS = _words("&& || ; | & ( )") | frozenset({"\n"})
 _SPLIT_CHAR_SET = frozenset(";|&()\n")
 _REDIR_OP_RE = re.compile(r"^(?:[0-9]+)?(?:>>?|<<?<?|>&|<&|&>>?|>\||<>)$")
@@ -1576,13 +1577,28 @@ def _is_steering_rel(rel: str) -> bool:
     )
 
 
-def _resolve_steering_symlinks(raw_rel: str, files: ConfinedCollection) -> bool:
-    """Walk ``raw_rel`` component-by-component, resolving in-root symlinks before ``..``."""
+def _resolve_steering_symlinks(
+    raw_rel: str, files: ConfinedCollection, unresolved: list[str] | None = None
+) -> bool:
+    """Walk ``raw_rel`` component-by-component, resolving in-root symlinks before ``..``.
+
+    Each step inspects the prefix walked so far, so the walk is bounded by component
+    count: every collection lookup costs the prefix's length, and an unbounded root would
+    cost quadratic time. A root that exceeds the bound, or that enters a directory the
+    collection excludes (whose symlinks are never resolved), is reported through
+    ``unresolved`` and returns ``False`` so the caller records a coverage gap.
+    """
     queue: deque[str] = deque(seg for seg in raw_rel.split("/") if seg and seg != ".")
     resolved: list[str] = []
     above = 0
     hops = 0
+    steps = 0
     while queue:
+        steps += 1
+        if steps > _MAX_STEERING_COMPONENTS:
+            if unresolved is not None:
+                unresolved.append(f"more than {_MAX_STEERING_COMPONENTS} path components")
+            return False
         seg = queue.popleft()
         if seg == "..":
             if resolved:
@@ -1595,6 +1611,14 @@ def _resolve_steering_symlinks(raw_rel: str, files: ConfinedCollection) -> bool:
             continue
         candidate = "/".join([*resolved, seg])
         if files.excluded(candidate):
+            # A root that is an excluded directory names that tree. A root below one
+            # names an entry the collection never inspects, which may be a link.
+            if queue:
+                if unresolved is not None:
+                    unresolved.append(
+                        "lies below an excluded directory, whose links are not resolved"
+                    )
+                return False
             resolved.append(seg)
             continue
         if files.is_directory(candidate):
@@ -1640,6 +1664,7 @@ def _covers_steering_path(
     project_roots: tuple[str, ...],
     *,
     files: ConfinedCollection | None = None,
+    unresolved: list[str] | None = None,
 ) -> bool:
     cleaned = _QUOTED_LEADING_VAR_RE.sub(r"\2", root_arg.strip().replace("\\", "/")).strip("'\"")
     if not cleaned or cleaned == "~" or cleaned.startswith("~/"):
@@ -1666,7 +1691,7 @@ def _covers_steering_path(
             rel_candidates.append(rel)
     if files is not None:
         for raw_rel in dict.fromkeys(raw_rel_candidates + rel_candidates):
-            if _resolve_steering_symlinks(raw_rel, files):
+            if _resolve_steering_symlinks(raw_rel, files, unresolved):
                 return True
     return False
 
@@ -1884,7 +1909,8 @@ def _inspect_steering_surfaces(
             # MCP stdio has no standard readOnly field or CLI switch. Positional
             # launcher text is not an access-control decision by a filesystem.
             r_arg = raw_root.removesuffix(":ro")
-            if not _covers_steering_path(r_arg, project_roots, files=files):
+            unresolved: list[str] = []
+            if not _covers_steering_path(r_arg, project_roots, files=files, unresolved=unresolved):
                 normalized_root = _STEERING_ROOT_VAR_RE.sub(
                     lambda match: (match.group(1) or "").lstrip("/") or ".",
                     _QUOTED_LEADING_VAR_RE.sub(r"\2", r_arg.strip().replace("\\", "/")).strip(
@@ -1896,6 +1922,12 @@ def _inspect_steering_surfaces(
                         summary.gaps,
                         f"{cfg_path}: filesystem server '{_clean(srv_name)}' root '{_clean(r_arg)}' "
                         "uses unresolved variable expansion",
+                    )
+                elif unresolved:
+                    _add_gap(
+                        summary.gaps,
+                        f"{cfg_path}: filesystem server '{_clean(srv_name)}' root "
+                        f"'{_clean(r_arg)[:120]}' could not be resolved: {unresolved[0]}",
                     )
                 continue
             summary.steering_surfaces.append(
