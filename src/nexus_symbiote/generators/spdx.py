@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -241,7 +242,12 @@ class SPDXGenerator(Generator):
         return _DocumentIds(f"{self._namespace}/document/{revision}")
 
     def _projection(
-        self, aibom: AIBOM, native: dict[str, Any] | None = None, *, legacy_v2: bool = False
+        self,
+        aibom: AIBOM,
+        native: dict[str, Any] | None = None,
+        *,
+        legacy_v2: bool = False,
+        legacy_locations: bool = False,
     ) -> dict[str, Any]:
         prepare(aibom)
         native = native_document(aibom) if native is None else native
@@ -318,7 +324,10 @@ class SPDXGenerator(Generator):
         native_by_ref = native_components(native)
         ordered = sorted(aibom.components, key=lambda c: c.bom_ref)
         components = [
-            self._element(comp, ids, native_by_ref[comp.bom_ref], v4=v4) for comp in ordered
+            self._element(
+                comp, ids, native_by_ref[comp.bom_ref], v4=v4, legacy_locations=legacy_locations
+            )
+            for comp in ordered
         ]
         comp_by_spdx_id = {ids.element("component", comp.bom_ref): comp for comp in ordered}
         edge_values = {
@@ -481,9 +490,11 @@ class SPDXGenerator(Generator):
         native: dict[str, Any],
         *,
         v4: bool = False,
+        legacy_locations: bool = False,
     ) -> dict[str, Any]:
         from nexus_symbiote.spdx_profiles import (
             _clean_url,
+            _projected_download_location,
             normalize_spdx_dataset_type,
             spdx_autonomy_presence,
         )
@@ -535,8 +546,11 @@ class SPDXGenerator(Generator):
                 if isinstance(rel_ts, str) and rel_ts:
                     element["releaseTime"] = rel_ts
                     declared_fields.append("releaseTime")
-                dl_loc = comp.properties.get("declared_download_location")
-                if isinstance(dl_loc, str) and dl_loc:
+                # A supplied inventory may declare any value; it is cleaned as agent.yaml's is.
+                dl_loc = _projected_download_location(
+                    comp.properties.get("declared_download_location"), legacy=legacy_locations
+                )
+                if dl_loc:
                     element["software_downloadLocation"] = dl_loc
                     declared_fields.append("software_downloadLocation")
                 domain = comp.properties.get("declared_domain")
@@ -570,8 +584,12 @@ class SPDXGenerator(Generator):
                 if isinstance(rel_ts, str) and rel_ts:
                     element["releaseTime"] = rel_ts
                     declared_fields.append("releaseTime")
-                observed_loc = _clean_url(getattr(comp, "source_uri", None))
-                dl_loc = observed_loc or comp.properties.get("declared_download_location")
+                observed_loc = _clean_url(
+                    getattr(comp, "source_uri", None), legacy=legacy_locations
+                )
+                dl_loc = observed_loc or _projected_download_location(
+                    comp.properties.get("declared_download_location"), legacy=legacy_locations
+                )
                 if isinstance(dl_loc, str) and dl_loc:
                     element["software_downloadLocation"] = dl_loc
                     if not observed_loc:
@@ -581,7 +599,7 @@ class SPDXGenerator(Generator):
                     element["dataset_datasetAvailability"] = avail
                     declared_fields.append("dataset_datasetAvailability")
                 pii = comp.properties.get("declared_sensitive_pii")
-                if pii in {"yes", "no", "noAssertion"}:
+                if isinstance(pii, str) and pii in {"yes", "no", "noAssertion"}:
                     element["dataset_hasSensitivePersonalInformation"] = pii
                     declared_fields.append("dataset_hasSensitivePersonalInformation")
             else:
@@ -697,29 +715,39 @@ class SPDXGenerator(Generator):
         projection = declared_projection(properties)
         namespace = _document_namespace(doc["spdxId"])
         recovered, native = recover_native(properties)
+        candidates: Iterable[dict[str, Any]]
         if projection == PROJECTION_V4:
             author_prop = next(
                 (p["value"] for p in properties if p["name"] == _AUTHOR_PROPERTY),
                 None,
             )
-            expected = SPDXGenerator(
-                namespace, projection_version=4, author=author_prop
-            )._projection(recovered, native)
-        elif projection in {PROJECTION, PREVIOUS_PROJECTION}:
-            expected = SPDXGenerator(namespace)._projection(
-                recovered, native, legacy_v2=projection == PREVIOUS_PROJECTION
+            exporter = SPDXGenerator(namespace, projection_version=4, author=author_prop)
+            candidates = (
+                exporter._projection(recovered, native, legacy_locations=legacy)
+                for legacy in (False, True)
             )
+        elif projection in {PROJECTION, PREVIOUS_PROJECTION}:
+            candidates = [
+                SPDXGenerator(namespace)._projection(
+                    recovered, native, legacy_v2=projection == PREVIOUS_PROJECTION
+                )
+            ]
         elif projection is None and namespace is not None:
-            expected = _legacy.spdx_projection(recovered, namespace, native)
+            candidates = [_legacy.spdx_projection(recovered, namespace, native)]
         else:
             raise ValueError("unsupported SPDX projection version")
+
         # Without a native timestamp, CreationInfo.created is render-time
         # metadata and a re-projection at recovery time legitimately differs
         # only there. With one, the export must carry exactly that timestamp.
-        actual, wanted = _public_view(document), _public_view(expected)
-        if recovered.metadata.timestamp is None:
-            actual, wanted = _without_created(actual), _without_created(wanted)
-        if unordered_projection(actual) != unordered_projection(wanted):
+        def public_projection(value: dict[str, Any]) -> Any:
+            view = _public_view(value)
+            if recovered.metadata.timestamp is None:
+                view = _without_created(view)
+            return unordered_projection(view)
+
+        actual = public_projection(document)
+        if not any(actual == public_projection(candidate) for candidate in candidates):
             raise ValueError("SPDX projection conflicts with the embedded native document")
         # Only the flat reference topology emitted by a supported projection may
         # reach schema validation. Inline reference objects can make the general

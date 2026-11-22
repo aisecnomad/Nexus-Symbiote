@@ -62,3 +62,27 @@ def test_compose_variable_defaults_are_redacted(tmp_path, shape):
     assert "Secret4567" not in text
     assert TOKEN not in text
     assert "***" in component.name
+
+
+GITLAB = "".join(("gl", "pat-", "Ab3Cd5Ef7Gh9Jk1Lm2Np"))
+
+
+@pytest.mark.parametrize(
+    "filename, content",
+    [
+        ("requirements.txt", f"openai[{TOKEN}]==1.0.0\n"),
+        ("requirements.txt", f"openai-{GITLAB}==1.0.0\n"),
+        ("requirements.txt", f"openai{TOKEN}==1.0.0\n"),
+        ("Dockerfile", f"FROM ollama/ollama:{TOKEN}\n"),
+        ("Dockerfile", f"FROM {GITLAB.lower()}.example.invalid/ollama:latest\n"),
+        ("Dockerfile", f"FROM {GITLAB}.example.invalid/ollama:latest\n"),
+    ],
+    ids=["pypi-extra", "pypi-name", "pypi-name-glued", "oci-tag", "oci-host", "oci-host-mixed"],
+)
+def test_a_token_in_a_package_name_or_image_reference_is_redacted(tmp_path, filename, content):
+    result, text = _scan(tmp_path, filename, content)
+    (component,) = result.components
+    assert TOKEN.lower() not in text.lower() and GITLAB.lower() not in text.lower()
+    assert component.package_url is None and component.registry_uri is None
+    assert "image_repository" not in component.properties
+    assert "credential_exposure" in {r.category for r in component.risks}

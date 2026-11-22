@@ -474,3 +474,24 @@ def test_card_below_a_well_known_directory_link_is_recorded(tmp_path):
         "web/.well-known/agent-card.json: symlink target is the collection root",
         "web/.well-known/agent.json: symlink target is the collection root",
     ]
+
+
+@pytest.mark.parametrize(
+    ("link", "target", "value"),
+    [
+        ("agent.json", "credentials.json", CARD),
+        (".well-known/agent-card.json", ".well-known/secret.json", CARD),
+        ("a2a.json", "secrets.json", {"clients": [{"name": "c", "url": "https://a.example"}]}),
+    ],
+)
+def test_a_declaration_linked_to_a_credential_file_is_a_gap_and_not_read(
+    tmp_path, link, target, value
+):
+    _write(tmp_path, target, {**value, "description": "SYNTH_MARKER"})
+    (tmp_path / link).symlink_to(Path(target).name)
+    result = A2AScanner().scan(tmp_path)
+    assert result.components == [] and result.scan_failures == []
+    assert result.surfaces_excluded == [
+        f"{link}: a symlink leads to {target}, whose name says it holds credentials; "
+        "not read or inventoried"
+    ]
