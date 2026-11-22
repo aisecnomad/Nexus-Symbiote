@@ -1301,10 +1301,21 @@ def _declared_hits(config: dict[str, Any]) -> PositionHits:
 def _refused_server_view(config: dict[str, Any]) -> dict[str, Any]:
     """Type-safe view of a refused server's credential-bearing fields for sibling scrubbing."""
     view: dict[str, Any] = {}
+    nested_extra: dict[str, Any] = {}
     for field in ("env", "headers", "http_headers"):
         mapping = config.get(field)
         if isinstance(mapping, dict):
-            view[field] = {str(k): v for k, v in mapping.items() if isinstance(v, str)}
+            str_items: dict[str, str] = {}
+            for k, v in mapping.items():
+                key = str(k)
+                if isinstance(v, str):
+                    str_items[key] = v
+                elif isinstance(v, (dict, list)):
+                    nested_extra[key] = v
+            if str_items:
+                view[field] = str_items
+        elif isinstance(mapping, (str, list)):
+            nested_extra[field] = mapping
     for field in ("oauth", "auth"):
         if field in config:
             settings = config[field]
@@ -1314,17 +1325,45 @@ def _refused_server_view(config: dict[str, Any]) -> dict[str, Any]:
                 view[field] = {"value": settings}
     extension = config.get(_EXTENSION_SETTINGS)
     if isinstance(extension, dict):
-        view[_EXTENSION_SETTINGS] = extension
+        view[_EXTENSION_SETTINGS] = dict(extension)
+    elif isinstance(extension, (str, list)):
+        nested_extra[_EXTENSION_SETTINGS] = extension
     for field in (*_ENDPOINT_FIELDS, "gallery"):
         endpoint = config.get(field)
         if isinstance(endpoint, str):
             view[field] = endpoint
+        elif isinstance(endpoint, (dict, list)):
+            nested_extra[field] = endpoint
     command = config.get("command")
+    extra_args: list[Any] = []
     if isinstance(command, str):
         view["command"] = command
+    elif isinstance(command, list):
+        if command and isinstance(command[0], str):
+            view["command"] = command[0]
+            extra_args.extend(command[1:])
+        else:
+            extra_args.extend(command)
+    elif isinstance(command, dict):
+        nested_extra["command"] = command
     raw_args = config.get("args")
     if isinstance(raw_args, list):
-        view["args"] = raw_args
+        extra_args.extend(raw_args)
+    elif isinstance(raw_args, str):
+        extra_args.append(raw_args)
+    elif isinstance(raw_args, dict):
+        nested_extra["args"] = raw_args
+    if extra_args:
+        view["args"] = extra_args
+        for idx, item in enumerate(extra_args):
+            if isinstance(item, (dict, list)):
+                nested_extra[f"args.{idx}"] = item
+    if nested_extra:
+        existing = view.get(_EXTENSION_SETTINGS)
+        if isinstance(existing, dict):
+            view[_EXTENSION_SETTINGS] = {"_existing": existing, "_refused_nested": nested_extra}
+        else:
+            view[_EXTENSION_SETTINGS] = nested_extra
     return view
 
 

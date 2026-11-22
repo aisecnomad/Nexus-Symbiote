@@ -189,3 +189,46 @@ def test_muse_f_370_1_git_default_exclude_preserves_walk_complete(tmp_path: Path
     _write(with_git, "other_excluded/x.py", "x = 1\n")
     excl_names = sorted(c.name for c in excluded_scanner.scan(with_git).components)
     assert "ping" not in excl_names
+
+
+@pytest.mark.parametrize(
+    ("label", "refused_cfg"),
+    [
+        (
+            "args_string",
+            {"command": "npx", "args": "--api-key=sk-proj-RefusedStrArgSecret9876543210"},
+        ),
+        (
+            "command_list",
+            {"command": ["npx", "--api-key=sk-proj-RefusedCmdListSecret9876543210"]},
+        ),
+        (
+            "env_nested_dict",
+            {
+                "command": "npx",
+                "args": [123],
+                "env": {"API_KEY": {"val": "sk-proj-RefusedEnvDictSecret9876543210"}},
+            },
+        ),
+    ],
+)
+def test_refused_server_malformed_field_shapes_scrub_siblings(
+    tmp_path: Path, label: str, refused_cfg: dict[str, object]
+) -> None:
+    secret_map = {
+        "args_string": "sk-proj-RefusedStrArgSecret9876543210",
+        "command_list": "sk-proj-RefusedCmdListSecret9876543210",
+        "env_nested_dict": "sk-proj-RefusedEnvDictSecret9876543210",
+    }
+    probe = secret_map[label]
+    doc = {
+        "mcpServers": {
+            "refused": refused_cfg,
+            "sibling": {"command": "echo", "args": [f"leak={probe}"]},
+        }
+    }
+    case_dir = tmp_path / label
+    _write(case_dir, ".mcp.json", json.dumps(doc))
+    result = MCPScanner().scan(case_dir)
+    exported = json.dumps([c.model_dump(mode="json") for c in result.components])
+    assert probe not in exported
