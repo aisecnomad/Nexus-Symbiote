@@ -850,16 +850,56 @@ def _builtin_escapes(node: Node, index: _Index) -> bool:
     return parent.type != "unary_expression"
 
 
+def _builtin_aliases(index: _Index) -> tuple[dict[str, set[str]], set[int]]:
+    """Names declared as ``const out = console``, transitively, with the builtins each may
+    hold, and the declarators' name and value nodes. The names are matched by spelling,
+    not scope, so a same-named variable elsewhere over-reports rather than hides."""
+    held_by: dict[str, set[str]] = {}
+    declarators: list[tuple[str, str, int, int]] = []
+    for node in index.nodes:
+        if node.type != "variable_declarator" or node.id in index.erased:
+            continue
+        target = node.child_by_field_name("name")
+        value = _operand(node.child_by_field_name("value"))
+        name, source = _identifier(target), _identifier(value)
+        if target is None or value is None or name is None or source is None:
+            continue
+        if name not in _COMPUTED_BUILTINS:
+            held_by.setdefault(source, set()).add(name)
+            declarators.append((name, source, target.id, value.id))
+    aliases: dict[str, set[str]] = {}
+    pending = [(builtin, builtin) for builtin in _COMPUTED_BUILTINS]
+    while pending:
+        source, builtin = pending.pop()
+        for name in held_by.get(source, ()):
+            if builtin not in aliases.setdefault(name, set()):
+                aliases[name].add(builtin)
+                pending.append((name, builtin))
+    positions = {
+        node_id
+        for name, source, target_id, value_id in declarators
+        if source in _COMPUTED_BUILTINS or source in aliases
+        for node_id in (target_id, value_id)
+    }
+    return aliases, positions
+
+
 def _assigned_computed_builtins(index: _Index) -> set[str]:
     assigned: set[str] = set()
+    # Copying a builtin into a name cannot change it; the copy is followed instead, and
+    # counts once it escapes or a property is assigned through it.
+    aliases, alias_positions = _builtin_aliases(index)
     for node in index.nodes:
         if node.id in index.erased:
             continue
         if node.type in {"identifier", "shorthand_property_identifier"}:
             name = _name(node)
-            if name in _COMPUTED_BUILTINS:
+            held = {name} if name in _COMPUTED_BUILTINS else aliases.get(name, set())
+            if node.type == "identifier" and node.id in alias_positions:
+                continue
+            if held:
                 if _builtin_escapes(node, index):
-                    assigned.add(name)
+                    assigned.update(held)
             elif name in _GLOBAL_OBJECTS and _builtin_escapes(node, index):
                 assigned.update(_COMPUTED_BUILTINS)
             continue
@@ -876,11 +916,11 @@ def _assigned_computed_builtins(index: _Index) -> set[str]:
         if target is None or target.type not in {"member_expression", "subscript_expression"}:
             continue
         receiver = _identifier(_operand(target.child_by_field_name("object")))
-        if receiver is not None and receiver in _COMPUTED_BUILTINS:
+        if receiver is not None and (receiver in _COMPUTED_BUILTINS or receiver in aliases):
             if node.type != "assignment_expression" or not _ordinary_builtin_value(
                 node.child_by_field_name("right"), receiver
             ):
-                assigned.add(receiver)
+                assigned.update(aliases.get(receiver, {receiver}))
         elif receiver in _GLOBAL_OBJECTS:
             property_name = _called_method(target)
             if property_name is None:
@@ -1462,7 +1502,7 @@ def _collect_source(
             continue
         from nexus_symbiote.scanners.prompt import detect_invisible_characters
 
-        raw_source = (node.text or b"").decode("utf-8", "replace")
+        raw_source = _registration_literal_text(arguments)
         decoded_source = _decode_js_unicode_escapes(raw_source) if "\\" in raw_source else None
         tool_risks = detect_invisible_characters(
             raw_source,
@@ -1494,6 +1534,30 @@ def _collect_source(
         server.tool_count += 1
         components.append(tool)
     result.components.extend(components)
+
+
+def _registration_literal_text(arguments: Node | None) -> str:
+    """The text of a registration's name and config, without any function in them.
+
+    A handler is code, not text a host shows the model: a sanitizer may name the very
+    characters it strips. Skipping functions also keeps each byte in at most one
+    registration's text, so registrations nested in handlers are read in linear time.
+    """
+    if arguments is None or arguments.text is None:
+        return ""
+    source, base = arguments.text, arguments.start_byte
+    pieces: list[bytes] = []
+    cursor = base
+    pending = [arguments]
+    while pending:
+        part = pending.pop()
+        if part.type in _FUNCTIONS:
+            pieces.append(source[cursor - base : part.start_byte - base])
+            cursor = part.end_byte
+        else:
+            pending.extend(reversed(part.children))
+    pieces.append(source[cursor - base :])
+    return b"".join(pieces).decode("utf-8", "replace")
 
 
 # An escaped backslash is consumed first, so the ``\\u202e`` of a literal backslash

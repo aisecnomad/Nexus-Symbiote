@@ -60,6 +60,22 @@ _TEXT_RISK_CATEGORIES = frozenset(
         "line_separators",
     }
 )
+# Marks a risk that record_candidate copied from a served descriptor, so a later clean
+# verification clears only those and never a risk the static scan found in the source.
+SERVED_DESCRIPTOR_REFERENCE = "source:served-descriptor"
+
+
+def _replace_served_risks(
+    risks: list[RiskAssessment], served: tuple[RiskAssessment, ...]
+) -> list[RiskAssessment]:
+    kept = [risk for risk in risks if SERVED_DESCRIPTOR_REFERENCE not in risk.references]
+    for risk in served:
+        copy = risk.model_copy(deep=True)
+        if SERVED_DESCRIPTOR_REFERENCE not in copy.references:
+            copy.references.append(SERVED_DESCRIPTOR_REFERENCE)
+        kept.append(copy)
+    return kept
+
 
 # Fixed, nonsecret explanations; reports never carry exception text or server data.
 REASONS: dict[str, str] = {
@@ -982,8 +998,7 @@ def record_candidate(
                     display_differs=finding.display_differs,
                 )
             )
-            tool.risks = [risk for risk in tool.risks if risk.category not in _TEXT_RISK_CATEGORIES]
-            tool.risks.extend(risk.model_copy(deep=True) for risk in finding.text_risks)
+            tool.risks = _replace_served_risks(tool.risks, finding.text_risks)
             tool.assurance_level = AssuranceLevel.OBSERVED
             if finding.remote_claim is not None:
                 tool.claims["tool_definition"] = finding.remote_claim.model_copy(
@@ -1015,12 +1030,7 @@ def record_candidate(
                     result.declaration or {}, result.declaration_hash, result.identity_hash
                 )
             )
-            server.risks = [
-                risk for risk in server.risks if risk.category not in _TEXT_RISK_CATEGORIES
-            ]
-            server.risks.extend(
-                risk.model_copy(deep=True) for risk in result.declaration_text_risks
-            )
+            server.risks = _replace_served_risks(server.risks, result.declaration_text_risks)
             if result.transport_evidence:
                 # Later evidence then binds the full URL, not only the origin.
                 endpoint_hash = result.transport_evidence["observed_endpoint_hash"]

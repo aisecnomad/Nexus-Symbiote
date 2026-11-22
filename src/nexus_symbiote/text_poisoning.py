@@ -910,10 +910,11 @@ def _decoded_sources(
             if cand_kind == "JSON":
                 parsed = _parse_json_leniently(body)
                 if raw_matches is not None:
-                    json_body = body
+                    json_at = span[0]
 
-                    def _bind_json(a: int, b: int, _body: str = json_body) -> None:
-                        raw_matches.bind(a, b, _body, "JSON")
+                    # Raw hits sit at file offsets, so a token's body offsets shift by the span.
+                    def _bind_json(a: int, b: int, _at: int = json_at) -> None:
+                        raw_matches.bind(_at + a, _at + b, text, "JSON")
 
                     try:
                         strip_jsonc(body, on_string=_bind_json)
@@ -921,16 +922,18 @@ def _decoded_sources(
                         # _parse_json_leniently succeeded while strip_jsonc refused U+2028/U+2029,
                         # so body is valid strict JSON with no comments and every quoted token is a string.
                         for match in _JSON_STRING_RE.finditer(body):
-                            raw_matches.bind(match.start(), match.end(), body, "JSON")
+                            raw_matches.bind(
+                                span[0] + match.start(), span[0] + match.end(), text, "JSON"
+                            )
                 trees.append(parsed)
                 continue
             if len(body) <= _MAX_PARSED_CHARS:
                 if cand_kind == "TOML":
                     if raw_matches is not None:
-                        toml_body = body
+                        toml_at = span[0]
 
-                        def _bind_toml(a: int, b: int, _body: str = toml_body) -> None:
-                            raw_matches.bind(a, b, _body, "TOML")
+                        def _bind_toml(a: int, b: int, _at: int = toml_at) -> None:
+                            raw_matches.bind(_at + a, _at + b, text, "TOML")
 
                         trees.append(toml_loads(body, on_string=_bind_toml))
                     else:

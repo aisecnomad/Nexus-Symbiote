@@ -72,6 +72,9 @@ from nexus_symbiote.utils.toml import loads as toml_loads
 
 FORMAT = "nexus-symbiote/instruction-diff/v1"
 MAX_FILES = 2000
+# Prompt templates are ordinary repository content and can far outnumber instruction files,
+# so they have their own budget, and those past it are coverage gaps, not a refusal.
+MAX_PROMPT_TEMPLATES = 2000
 MAX_FRONTMATTER_NODES = 4096
 MAX_SHOW_TEXT_CHARS = 4096
 # One block holds many URLs, and each change repeats the block, so the text shown is bounded
@@ -166,6 +169,19 @@ class InstructionChange:
 _RULE_DIRECTORIES = frozenset(
     d for d, kind in INSTRUCTION_DIRECTORIES.items() if kind == "rules-file"
 )
+# Each host honours only its own scoping key; another host's key leaves the rule global.
+_HOST_SCOPE_KEYS = {
+    ".claude/rules/": ("paths",),
+    ".cursor/rules/": ("globs",),
+    ".github/instructions/": ("applyTo",),
+}
+
+
+def _scope_keys(rel_path: str) -> tuple[str, ...]:
+    for prefix, keys in _HOST_SCOPE_KEYS.items():
+        if rel_path.startswith(prefix):
+            return keys
+    return ("globs", "applyTo", "paths")
 
 
 @dataclass(frozen=True)
@@ -635,7 +651,12 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
         rel_path=rel_path,
         content=content,
         globs=frozenset(globs),
-        path_scoped=any(not g.startswith("!") for g in globs),
+        path_scoped=any(
+            not g.startswith("!")
+            for meta in metas
+            for key in _scope_keys(rel_path)
+            for g in _glob_list(meta.get(key))
+        ),
         always_apply=always_apply,
         frontmatter_grants=fm_grants,
         blocks=blocks,
@@ -694,9 +715,10 @@ def _read_confined_tree(root: Path) -> tuple[dict[str, _ParsedInstruction], list
     importers: list[str] = []
     variants: list[tuple[Path, Path]] = []
     reported_skipped: set[Path] = set()
+    templates: set[str] = set()
 
     def _add_record(rel_path: str, text: str) -> None:
-        if len(records) >= MAX_FILES:
+        if len(records) - len(templates) >= MAX_FILES:
             raise click.ClickException(f"instruction tree exceeds maximum file limit ({MAX_FILES})")
         records[rel_path] = _parse_instruction(rel_path, text, failures)
         texts[rel_path] = text
@@ -751,11 +773,19 @@ def _read_confined_tree(root: Path) -> tuple[dict[str, _ParsedInstruction], list
                 or relative in records
             ):
                 continue
+            if prompt_template and len(templates) >= MAX_PROMPT_TEMPLATES:
+                excluded.append(
+                    f"{relative}: prompt template beyond the first {MAX_PROMPT_TEMPLATES}; "
+                    "not collected"
+                )
+                continue
             text = _read_confined_file(
                 relative, files, failures, excluded, fail_on_credential=not prompt_template
             )
             if text is None:
                 continue
+            if prompt_template:
+                templates.add(relative)
             _add_record(relative, text)
             if nested and path.name in _IMPORTING_NAMES:
                 importers.append(relative)
