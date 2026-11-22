@@ -13,6 +13,7 @@ repository are not observed during static scans and are outside this model.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import re
 from bisect import bisect_right
@@ -24,8 +25,10 @@ from nexus_symbiote.core.enums import HumanInTheLoop, RiskSeverity
 from nexus_symbiote.core.hashing import canonical_json
 from nexus_symbiote.core.models import RiskAssessment
 from nexus_symbiote.policy import PolicyError, parse_yaml_mapping
+from nexus_symbiote.utils.markdown import front_matter_candidates
 from nexus_symbiote.utils.secrets import REDACTED, redact_text
 from nexus_symbiote.utils.terminal import neutralize
+from nexus_symbiote.utils.toml import loads as toml_loads
 
 MAX_RECORDED_DENY_RULES = 512
 MAX_RECORDED_DOMAINS = 512
@@ -96,7 +99,9 @@ _COMMAND_RUNNERS = frozenset(
 )
 _VERSIONED_INTERPRETER = re.compile(r"(?:python|pypy|ruby|php|perl|node)[0-9.]*|py")
 _SHELL_META_RE = re.compile(r"(?:&&|\|\||[;|`]|\$\()")
-_FORCE_FLAG_RE = re.compile(r"(?:^|\s)--force(?:\s|$|=)|(?:^|\s)-rf(?:\s|$)", re.IGNORECASE)
+_FORCE_FLAG_RE = re.compile(
+    r"(?:^|[\s:])--force(?:[\s:=]|$)|(?:^|[\s:])-rf(?:[\s:]|$)", re.IGNORECASE
+)
 _SHELL_OPERATORS_RE = re.compile(r"([;|&$`(){}<>\n]+)")
 _SCHEME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-")
 
@@ -306,19 +311,33 @@ class _RuleBucket:
 def _spec_runs_arbitrary_command(spec: str) -> bool:
     if _SHELL_META_RE.search(spec):
         return True
-    words = spec.split(":", 1)[0].split()
-    if not words:
-        return False
-    program = words[0].rsplit("/", 1)[-1].lower()
+    from nexus_symbiote.scanners.ide_agents import _rule_program
+
+    program_raw, _ = _rule_program(spec)
+    program = program_raw.lower()
+    if not program:
+        words = spec.split(":", 1)[0].split()
+        if not words:
+            return False
+        program = words[0].rsplit("/", 1)[-1].lower()
     if program.startswith("*"):
         return True
     stripped = program.rstrip("*")
     return stripped in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(stripped) is not None
 
 
+def _base_matches_destructive_tool(base: str) -> bool:
+    lowered = base.strip().lower()
+    if lowered in _EXACT_DESTRUCTIVE_TOOLS:
+        return True
+    if "*" in lowered or "?" in lowered:
+        return any(fnmatch.fnmatchcase(tool, lowered) for tool in _EXACT_DESTRUCTIVE_TOOLS)
+    return False
+
+
 def _narrow_spec_is_destructive(base: str, spec: str) -> bool:
     """Return True when a narrow allow specifier grants destructive or runner capability."""
-    if base.lower() in _EXACT_DESTRUCTIVE_TOOLS and _spec_runs_arbitrary_command(spec):
+    if _base_matches_destructive_tool(base) and _spec_runs_arbitrary_command(spec):
         return True
     if _FORCE_FLAG_RE.search(spec):
         return True
@@ -816,7 +835,13 @@ def extract_subagent_inline_mcp_servers(
     ]
 
 
-_FM_RE = re.compile(r"\A---[ \t]*\r?\n(?:(.*?)\r?\n)?---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
+def _parse_frontmatter_mapping(language: str, raw: str) -> dict[str, Any]:
+    if language == "toml":
+        parsed = toml_loads(raw)
+        if not isinstance(parsed, dict):
+            raise PolicyError("TOML front matter must be a mapping")
+        return parsed
+    return parse_yaml_mapping(raw, max_nodes=MAX_FRONTMATTER_YAML_NODES)
 
 
 def scan_subagent_and_rule_frontmatter(
@@ -870,18 +895,69 @@ def scan_subagent_and_rule_frontmatter(
                     if scan_failures is not None:
                         scan_failures.append(f"{neutralize(rel)}: file changed during collection")
                     continue
-            match = _FM_RE.match(text)
-            if match is None or not match.group(1) or not match.group(1).strip():
+            candidates = front_matter_candidates(text)
+            if not candidates:
                 continue
-            try:
-                meta = parse_yaml_mapping(match.group(1), max_nodes=MAX_FRONTMATTER_YAML_NODES)
-            except (PolicyError, ValueError, TypeError, RecursionError, MemoryError):
+            metas: list[dict[str, Any]] = []
+            primary_ok = False
+            first_lang, first_raw, _ = candidates[0]
+            if not first_raw.strip():
+                primary_ok = True
+            else:
+                try:
+                    metas.append(_parse_frontmatter_mapping(first_lang, first_raw))
+                    primary_ok = True
+                except (PolicyError, ValueError, TypeError, RecursionError, MemoryError):
+                    pass
+            if len(candidates) == 2:
+                alt_lang, alt_raw, _ = candidates[1]
+                if alt_raw.strip():
+                    alt_parsed = False
+                    try:
+                        metas.append(_parse_frontmatter_mapping(alt_lang, alt_raw))
+                        primary_ok = True
+                        alt_parsed = True
+                    except (PolicyError, ValueError, TypeError, RecursionError, MemoryError):
+                        pass
+                    if not alt_parsed and primary_ok and len(alt_raw) > len(first_raw):
+                        # Dual `...` / `---` reading: strip the `...` line to parse smuggled tail.
+                        tail = alt_raw[len(first_raw) :]
+                        _, _, after_dots = tail.partition("\n")
+                        if not after_dots and "\r" in tail:
+                            _, _, after_dots = tail.partition("\r")
+                        if after_dots.strip():
+                            try:
+                                metas.append(_parse_frontmatter_mapping(alt_lang, after_dots))
+                            except (
+                                PolicyError,
+                                ValueError,
+                                TypeError,
+                                RecursionError,
+                                MemoryError,
+                            ):
+                                pass
+            if not primary_ok:
                 if scan_failures is not None:
-                    scan_failures.append(f"{neutralize(rel)}: invalid YAML front matter")
+                    label = first_lang.upper() if first_lang in {"toml", "json"} else "YAML"
+                    scan_failures.append(f"{neutralize(rel)}: invalid {label} front matter")
                 continue
-            if is_agent:
-                risks.extend(extract_subagent_inline_mcp_servers(meta, rel))
-            scope = extract_activation_scope(meta)
+            if not metas:
+                continue
+            merged_meta: dict[str, Any] = {}
+            for meta in metas:
+                if is_agent:
+                    risks.extend(extract_subagent_inline_mcp_servers(meta, rel))
+                merged_meta.update(meta)
+                if meta.get("alwaysApply") is True:
+                    merged_meta["alwaysApply"] = True
+            if len(metas) > 1:
+                for key in ("globs", "applyTo", "paths"):
+                    combined_globs: list[str] = []
+                    for meta in metas:
+                        combined_globs.extend(_normalize_patterns(meta.get(key)))
+                    if combined_globs:
+                        merged_meta[key] = combined_globs
+            scope = extract_activation_scope(merged_meta)
             if scope is not None:
                 activation_scopes[neutralize(rel)] = scope
     if activation_scopes:

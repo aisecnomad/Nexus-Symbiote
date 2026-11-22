@@ -357,25 +357,42 @@ def _broad_grants(allowed: list[str]) -> list[str]:
         key = tool.lower()
         if key.startswith("mcp__"):
             server = key.removeprefix("mcp__")
-            whole_server = "__" not in server or server.endswith("__*")
-            if server in {"", "*"} or (whole_server and specifier in (None, "", "*")):
-                classes.add("MCP server tools")
+            server_part, sep, tool_part = server.partition("__")
+            if not server_part.strip("*") and (not sep or not tool_part.strip("*")):
+                classes.add("every MCP server tool")
+            else:
+                whole_server = "__" not in server or server.endswith("__*")
+                if whole_server and specifier in (None, "", "*"):
+                    classes.add("MCP server tools")
             continue
         broad = specifier is None or bool(_WILDCARD_SPECIFIER.fullmatch(specifier))
-        if key == "bash" and specifier is not None:
+        matches_bash = key == "bash" or (
+            ("*" in key or "?" in key) and fnmatch.fnmatchcase("bash", key)
+        )
+        if matches_bash and specifier is not None:
             program, arguments = _rule_program(specifier)
             broad |= _runs_any_command(program, arguments, "*" in specifier) or bool(
                 _SUBSHELL_SPECIFIER.fullmatch(program + arguments)
             )
-        if key == "webfetch" and specifier is not None:
+        matches_webfetch = key == "webfetch" or (
+            ("*" in key or "?" in key) and fnmatch.fnmatchcase("webfetch", key)
+        )
+        if matches_webfetch and specifier is not None:
             # `domain:**` and `domain:*.*` match every host, as `domain:*` does.
             domain = specifier.replace(" ", "")
             broad |= domain.startswith("domain:") and not domain[7:].strip("*.")
         if key == "read" and specifier is None:
             # A bare Read grant covers the working directory, as reading does by default.
             continue
-        if broad and key in _SCOPED_TOOL_CLASSES:
-            classes.add(_SCOPED_TOOL_CLASSES[key])
+        if broad:
+            if key in _SCOPED_TOOL_CLASSES:
+                classes.add(_SCOPED_TOOL_CLASSES[key])
+            elif "*" in key or "?" in key:
+                for tool_key, label in _SCOPED_TOOL_CLASSES.items():
+                    if tool_key == "read" and specifier is None:
+                        continue
+                    if fnmatch.fnmatchcase(tool_key, key):
+                        classes.add(label)
     return sorted(classes)
 
 
@@ -873,19 +890,13 @@ _HOST_PATH = re.compile(r"(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+(?::[0-9]+)?/")
 _SEVERITY_RANK = {severity: index for index, severity in enumerate(RiskSeverity)}
 
 
-def _command_pipelines(command: str) -> list[list[str]]:
-    """Pipelines in ``command``.
-
-    ``|`` and ``|&`` separate segments of one pipeline. A newline after either stays
-    in that pipeline, as the shell reads it. ``||`` does not: it is a logical or, as
-    ``&&``, ``;``, a newline elsewhere and a background ``&`` are command separators.
-    ``>&``, ``<&`` and ``&>`` stay inside a segment.
-    """
+def _split_pipelines(command: str, *, respect_quotes: bool) -> list[list[str]]:
     pipelines: list[list[str]] = []
     segments: list[str] = []
     buf: list[str] = []
     length = len(command)
     index = 0
+    quote = ""
 
     def flush_segment() -> None:
         segments.append("".join(buf))
@@ -900,6 +911,27 @@ def _command_pipelines(command: str) -> list[list[str]]:
     while index < length:
         char = command[index]
         nxt = command[index + 1] if index + 1 < length else ""
+        if respect_quotes:
+            if quote:
+                buf.append(char)
+                if char == quote:
+                    quote = ""
+                elif quote == '"' and char == "\\" and index + 1 < length:
+                    buf.append(nxt)
+                    index += 2
+                    continue
+                index += 1
+                continue
+            if char in "'\"":
+                quote = char
+                buf.append(char)
+                index += 1
+                continue
+            if char == "\\" and nxt not in {"", "\n", "\r"}:
+                buf.append(char)
+                buf.append(nxt)
+                index += 2
+                continue
         if char == "|" and nxt == "|":
             flush_command()
             index += 2
@@ -941,6 +973,17 @@ def _command_pipelines(command: str) -> list[list[str]]:
         index += 1
     flush_command()
     return pipelines
+
+
+def _command_pipelines(command: str) -> list[list[str]]:
+    """Pipelines in ``command``.
+
+    ``|`` and ``|&`` separate segments of one pipeline. A newline after either stays
+    in that pipeline, as the shell reads it. ``||`` does not: it is a logical or, as
+    ``&&``, ``;``, a newline elsewhere and a background ``&`` are command separators.
+    ``>&``, ``<&`` and ``&>`` stay inside a segment.
+    """
+    return _split_pipelines(command, respect_quotes=False)
 
 
 def _skip_pipe_gap(command: str, index: int) -> int:
@@ -1212,7 +1255,7 @@ def _name_variants(word: str) -> set[str]:
     return names
 
 
-_SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+_SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]\s]+\])?\+?=")
 
 
 # How many words one assignment's substitution is followed across.
@@ -1266,24 +1309,76 @@ def _assignment_end(words: list[str], index: int) -> int:
     return index + 1
 
 
-def _skip_env(words: list[str], index: int) -> int:
+def _unwrap_env_split_string(payload: str, depth: int) -> str | None:
+    """Extract the command word carried inside ``env -S`` / ``--split-string``."""
+    if depth >= 4:
+        return None
+    inner = _decode_word(payload, drop_ifs=True)
+    parts = _shell_words(inner)
+    if not parts:
+        return None
+    pos = _skip_env(parts, 0, depth=depth + 1)
+    return parts[pos] if pos < len(parts) else None
+
+
+def _skip_env(words: list[str], index: int, *, depth: int = 0) -> int:
     while index < len(words):
         word = _decode_word(words[index], drop_ifs=True)
         if word == "--":
             index += 1
             break
-        if word in {"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}:
+        if word in {"-", "-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}:
             index += 1
             continue
-        if word in {"-u", "-C", "-S"}:
+        if word in {"-u", "-C"}:
             index += 2
             continue
-        if word.startswith(("--unset=", "--chdir=", "--split-string=")):
+        if word in {"-S", "--split-string"}:
+            if index + 1 < len(words):
+                cmd = _unwrap_env_split_string(words[index + 1], depth)
+                if cmd is not None:
+                    words[index + 1] = cmd
+                    return index + 1
+            index += 2
+            continue
+        if word.startswith("--split-string="):
+            cmd = _unwrap_env_split_string(word.split("=", 1)[1], depth)
+            if cmd is not None:
+                words[index] = cmd
+                return index
             index += 1
             continue
-        if word in {"--unset", "--chdir", "--split-string"}:
+        if word.startswith(("--unset=", "--chdir=")):
+            index += 1
+            continue
+        if word in {"--unset", "--chdir"}:
             index += 2
             continue
+        if word.startswith("-") and not word.startswith("--") and len(word) > 1:
+            bundle = re.fullmatch(r"-([i0v]*)([uCS])(.*)", word)
+            if bundle is not None:
+                flag, attached = bundle.group(2), bundle.group(3)
+                if flag == "S":
+                    if attached:
+                        cmd = _unwrap_env_split_string(attached, depth)
+                        if cmd is not None:
+                            words[index] = cmd
+                            return index
+                        index += 1
+                    else:
+                        if index + 1 < len(words):
+                            cmd = _unwrap_env_split_string(words[index + 1], depth)
+                            if cmd is not None:
+                                words[index + 1] = cmd
+                                return index + 1
+                        index += 2
+                else:
+                    index += 1 if attached else 2
+                continue
+            if re.fullmatch(r"-[i0v]+", word):
+                index += 1
+                continue
+            return index
         if word.startswith("-"):
             return index
         break
@@ -1345,7 +1440,7 @@ def _skip_exec(words: list[str], index: int) -> int:
         word = _decode_word(words[index], drop_ifs=True)
         if word == "--":
             return index + 1
-        if word in {"-a", "--argv0"}:
+        if word in {"-a", "--argv0"} or re.fullmatch(r"-[cl]*a", word):
             index += 2
             continue
         if word.startswith("-"):
@@ -1358,6 +1453,7 @@ def _skip_exec(words: list[str], index: int) -> int:
 # Programs that run the command after their options and a fixed number of operands:
 # the options that take a value, and how many operands come before the command.
 _WRAPPERS: dict[str, tuple[frozenset[str], int]] = {
+    "builtin": (frozenset(), 0),
     "nohup": (frozenset(), 0),
     "setsid": (frozenset(), 0),
     "time": (frozenset({"-f", "--format", "-o", "--output"}), 0),
@@ -2494,7 +2590,13 @@ def _fetch_exec(command: str) -> bool:
     pipelines = _command_pipelines(command)
     if _substitution_exec(pipelines) or _download_then_run(pipelines):
         return True
-    for segments in pipelines:
+    pipe_views = pipelines
+    if any(ch in command for ch in "'\"\\"):
+        seen = {tuple(p) for p in pipelines}
+        extra = [p for p in _split_pipelines(command, respect_quotes=True) if tuple(p) not in seen]
+        if extra:
+            pipe_views = [*pipelines, *extra]
+    for segments in pipe_views:
         # One forward pass: a fetch and an executor later in the same pipeline.
         fetched = False
         for segment in segments:
@@ -2652,6 +2754,7 @@ def _computed_powershell(segment: str) -> int | None:
     if re.search(r"[a-z]{2}", literal) is None and not any(
         len(flag.group().lstrip("\"'‘’“”\\^`-/–—―")) > 2
         or (position + 1 < len(words) and _encoded_payload(words[position + 1]))
+        or (":" in words[position] and _encoded_payload(words[position].split(":", 1)[1]))
         for position in range(index + 1, len(words))
         if (flag := _ENCODED_COMMAND.match(segment, spans[position][0])) is not None
     ):
@@ -3286,6 +3389,48 @@ class IDEAgentScanner(Scanner):
             properties["tool_human_in_the_loop_total"] = tool_total
             properties["tool_human_in_the_loop_truncated"] = True
         risks.extend(oversight_risks)
+        if len(layers) > 1:
+            merged_gap_keys = {
+                risk.detail.split(" in '", 1)[0]
+                for risk in oversight_risks
+                if risk.category == "oversight_gap"
+            }
+            overridden_gaps: dict[str, tuple[RiskAssessment, list[str]]] = {}
+            for relative, data in layers.items():
+                raw_layer_rules = data.get("permissions")
+                layer_rules: dict[str, Any] = (
+                    raw_layer_rules if isinstance(raw_layer_rules, dict) else {}
+                )
+                raw_layer_mode = layer_rules.get("defaultMode")
+                layer_mode = raw_layer_mode if isinstance(raw_layer_mode, str) else None
+                layer_raw_always = data.get("alwaysAllow") or layer_rules.get("alwaysAllow")
+                layer_always: Iterable[str] = (
+                    layer_raw_always if isinstance(layer_raw_always, (str, list)) else ()
+                )
+                _, layer_oversight, _, _ = evaluate_tool_oversight(
+                    layer_rules,
+                    always_allow=layer_always,
+                    approval_policy=layer_mode,
+                    source_name=relative,
+                    text_formatter=_safe_projected_text,
+                )
+                for layer_risk in layer_oversight:
+                    if layer_risk.category != "oversight_gap":
+                        continue
+                    key = layer_risk.detail.split(" in '", 1)[0]
+                    if key in merged_gap_keys:
+                        continue
+                    existing = overridden_gaps.get(key)
+                    if existing is None:
+                        overridden_gaps[key] = (layer_risk, [relative])
+                    elif relative not in existing[1]:
+                        existing[1].append(relative)
+            for layer_risk, layer_files in overridden_gaps.values():
+                risks.append(
+                    layer_risk.model_copy(
+                        update={"detail": f"{layer_risk.detail}{_overridden(layer_files)}"}
+                    )
+                )
         hook_commands = 0
         hook_severity: RiskSeverity | None = None
         # Auto-run settings and credential helpers run without an agent event, as hooks do.
@@ -3364,6 +3509,26 @@ class IDEAgentScanner(Scanner):
             if any(data.get(key) is not None and merged.get(key) is None for key in helpers)
         ]
         helper_note = _overridden(overridden_helpers) if overridden_helpers else ""
+        plugin_layers = [
+            relative
+            for relative, data in layers.items()
+            if _count(data.get("enabledPlugins")) or _count(data.get("extraKnownMarketplaces"))
+        ]
+        plugin_note = (
+            _overridden(plugin_layers)
+            if plugin_layers
+            and not (declared["enabled_plugins"] or declared["extra_known_marketplaces"])
+            else ""
+        )
+        dir_layers = [
+            relative
+            for relative, data in layers.items()
+            if isinstance(data.get("permissions"), dict)
+            and _count(data["permissions"].get("additionalDirectories"))
+        ]
+        dir_note = (
+            _overridden(dir_layers) if dir_layers and not declared["additional_directories"] else ""
+        )
         for category, severity, present, detail in (
             (
                 "mcp_auto_approval",
@@ -3381,19 +3546,24 @@ class IDEAgentScanner(Scanner):
             (
                 "plugin_sources",
                 RiskSeverity.LOW,
-                bool(declared["enabled_plugins"] or declared["extra_known_marketplaces"]),
+                bool(plugin_layers),
                 "enables plugins or registers plugin marketplaces, which can add commands, "
                 "agents, hooks and MCP servers",
             ),
             (
                 "additional_directories",
                 RiskSeverity.LOW,
-                bool(declared["additional_directories"]),
+                bool(dir_layers),
                 "grants access to directories outside the project",
             ),
         ):
             if present:
-                note = {"mcp_auto_approval": approval_note, "credential_helper": helper_note}
+                note = {
+                    "mcp_auto_approval": approval_note,
+                    "credential_helper": helper_note,
+                    "plugin_sources": plugin_note,
+                    "additional_directories": dir_note,
+                }
                 risks.append(
                     RiskAssessment(
                         severity=severity,
