@@ -500,11 +500,20 @@ def _unescaped(match: re.Match[str]) -> str:
 
 
 _RAW_OPEN = re.compile(r"\{%[+-]?\s*raw\s*-?%\}")
-# Jinja2 3.1 ends a raw block at "%}", "-%}" or "+%}"; it opens one only at "%}" or "-%}".
-_RAW_CLOSE = re.compile(r"\{%[+-]?\s*endraw\s*[+-]?%\}")
+# Jinja2 3.x ends a raw block at "%}", "-%}" or "+%}"; 2.x only at "%}" or "-%}", so a
+# "+%}" that ends the block for one renderer leaves the next tags inside it for the other.
+# Both readings are checked. Either opens a block only at "%}" or "-%}".
+_RAW_CLOSES = (
+    re.compile(r"\{%[+-]?\s*endraw\s*[+-]?%\}"),
+    re.compile(r"\{%[+-]?\s*endraw\s*-?%\}"),
+)
 
 
 def _joined_literal_marker(text: str) -> bool:
+    return any(_joined_literal_scan(text, raw_close) for raw_close in _RAW_CLOSES)
+
+
+def _joined_literal_scan(text: str, raw_close_pattern: re.Pattern[str]) -> bool:
     """Find dunder names made by joining constant Jinja string literals.
 
     This is deliberately a bounded lexical heuristic, not a Jinja evaluator.
@@ -524,7 +533,7 @@ def _joined_literal_marker(text: str) -> bool:
             if text.startswith("{%", position):
                 raw_open = _RAW_OPEN.match(text, position)
                 if raw_open is not None:
-                    raw_close = _RAW_CLOSE.search(text, raw_open.end())
+                    raw_close = raw_close_pattern.search(text, raw_open.end())
                     position = size if raw_close is None else raw_close.end()
                     continue
                 close = "%}"
@@ -604,6 +613,14 @@ def _joined_literal_marker(text: str) -> bool:
                 # Let the outer loop process the operator or expression boundary.
                 position = after_string
                 break
+            # The chain goes on, so the outer loop never reads the brackets skipped
+            # between these pieces: count them here, or a ")" in ("x") ~ "y" leaves the
+            # tag open for good.
+            for char in text[after_string:position]:
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth = max(0, depth - 1)
         if pieces > 1 and state == 5:
             return True
     return False

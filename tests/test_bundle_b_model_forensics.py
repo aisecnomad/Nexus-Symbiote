@@ -225,6 +225,14 @@ def test_safetensors_valid_and_malformed_non_pickle_preserve_verdicts(tmp_path: 
         b'{{ ({1: {2: 3}}, a["_" ~ "_class_" ~ "_"]) }}',
         b'{{ {1: {2: 3}} and "{% raw %}" }}{{ a["_" ~ "_class_" ~ "_"] }}',
         b'{{ {1: 2}}}{{ a["_" ~ "_class_" ~ "_"] }}',
+        # A ")" skipped between two joined pieces still closes its "(": the tag ends at
+        # its "}}" and the apostrophe after it is text, not the start of a string.
+        b'{{ ("x") ~ "y" }} Don\'t {{ a["_" ~ "_class_" ~ "_"] }}',
+        b"{{ ('<|' + message['role'] + '|>') + '\\n' }} Don't "
+        b'{{ cycler["_" ~ "_init_" ~ "_"]["_" ~ "_globals_" ~ "_"] }}',
+        # Jinja2 3.x ends this raw block at "+%}", 2.x only at the later "{% endraw %}",
+        # which makes the payload a live tag: both readings are checked.
+        b'{% raw %}X{% endraw +%}{# {% endraw %}{{ a["_" ~ "_class_" ~ "_"] }} #}',
     ],
 )
 def test_jinja_raw_block_cannot_blind_joined_literal_marker(template: bytes) -> None:
