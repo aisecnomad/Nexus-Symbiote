@@ -690,3 +690,81 @@ def test_registry_toml_reports_exact_nesting_depth_bounds_error(tmp_path: Path) 
     result = RegistryScanner().scan(tmp_path)
     assert any("TOML nesting exceeds the depth limit" in f for f in result.scan_failures)
     assert not any("dotted key exceeds" in f for f in result.scan_failures)
+
+
+# --- Flow-depth guard: bounded inside the loader, with a floor at level 0 ---
+
+
+@pytest.mark.parametrize(
+    "payload", ["]" * 4000 + "[" * 4000 + "\n", "}" * 4000 + "{" * 4000 + "\n"]
+)
+def test_flow_level_underflow_cannot_pass_the_depth_bound(payload: str) -> None:
+    from nexus_symbiote.policy import PolicyError, check_yaml_flow_depth, parse_yaml_mapping
+
+    with pytest.raises(PolicyError):
+        check_yaml_flow_depth(payload)
+    with pytest.raises(PolicyError):
+        parse_yaml_mapping(payload)
+
+    def run(scale: int) -> None:
+        half = 1000 * scale
+        doc = payload[0] * half + payload[-2] * half + "\n"
+        with pytest.raises(PolicyError):
+            parse_yaml_mapping(doc)
+
+    assert scaling_ratio(run) < 10
+
+
+def test_scanner_yaml_with_an_underflow_payload_is_refused_in_linear_time(tmp_path: Path) -> None:
+    from nexus_symbiote.scanners.rag import RAGScanner
+
+    def run(scale: int) -> None:
+        half = 8000 * scale
+        (tmp_path / "rag_config.yaml").write_text("]" * half + "[" * half + "\n", encoding="utf-8")
+        result = RAGScanner().scan(tmp_path)
+        assert any("rag_config.yaml" in failure for failure in result.scan_failures)
+
+    assert scaling_ratio(run) < 10
+
+
+def test_deep_flow_nesting_is_refused_by_scanner_and_policy_loader(tmp_path: Path) -> None:
+    from nexus_symbiote.policy import PolicyError, parse_yaml_mapping
+    from nexus_symbiote.scanners.rag import RAGScanner
+
+    deep = "a: " + "[" * 200 + "]" * 200 + "\n"
+    with pytest.raises(PolicyError):
+        parse_yaml_mapping(deep)
+    (tmp_path / "rag_config.yaml").write_text(deep, encoding="utf-8")
+    result = RAGScanner().scan(tmp_path)
+    assert any("rag_config.yaml" in failure for failure in result.scan_failures)
+    shallow = "a: " + "[" * 20 + "]" * 20 + "\n"
+    assert parse_yaml_mapping(shallow) == {"a": [[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]}
+
+
+# --- Undotted store names withhold only Colang rail links, never regular files ---
+
+
+def test_regular_files_under_undotted_store_names_are_inventoried(tmp_path: Path) -> None:
+    from nexus_symbiote.scanners.credential_files import credential_gap, link_gap
+    from nexus_symbiote.scanners.prompt import PromptScanner
+
+    assert credential_gap("services/docker/CLAUDE.md", "services/docker/CLAUDE.md") is None
+    assert credential_gap("deploy/helm/AGENTS.md", "deploy/helm/AGENTS.md") is None
+    assert link_gap("docker/Dockerfile") is None
+    assert link_gap("docker/main.co", colang_rail="rails/main.co") is not None
+    assert link_gap(".docker/config.json") is not None
+    assert link_gap(".config/gh/hosts.yml") is not None
+
+    (tmp_path / "services" / "docker").mkdir(parents=True)
+    (tmp_path / "services" / "docker" / "CLAUDE.md").write_text(
+        "# docker notes\n", encoding="utf-8"
+    )
+    (tmp_path / "deploy" / "helm").mkdir(parents=True)
+    (tmp_path / "deploy" / "helm" / "AGENTS.md").write_text("# helm notes\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").write_text("# root\n", encoding="utf-8")
+    result = PromptScanner().scan(tmp_path)
+    paths = {component.source_path for component in result.components}
+    assert {"CLAUDE.md", "services/docker/CLAUDE.md", "deploy/helm/AGENTS.md"} <= paths
+    assert not any(
+        "symlink leads into a credential directory" in gap for gap in result.surfaces_excluded
+    )

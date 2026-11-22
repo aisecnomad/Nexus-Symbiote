@@ -120,9 +120,12 @@ def credential_shaped(path: str, *, colang_source: bool = False) -> bool:
 def credential_gap(path: str, target: str | None) -> str | None:
     """Why the file at ``path`` is not read, or None: its name, or the name of
     ``target``, the in-root file a symlink at ``path`` leads to, says it holds
-    credentials."""
+    credentials. A regular file names itself as its target and is judged by its
+    name alone."""
     if credential_shaped(path):
         return "its name says it holds credentials"
+    if target is None or PurePosixPath(target) == PurePosixPath(path):
+        return None
     return link_gap(target)
 
 
@@ -132,8 +135,11 @@ def link_gap(target: str | None, *, colang_rail: str | None = None) -> str | Non
         return None
     target_path = PurePosixPath(target)
     directories = target_path.parts[:-1]
+    # An undotted store name (`docker/`, `helm/`) is an ordinary project directory for
+    # every file but a Colang rail reached through a link, which keeps its program role.
+    stores = _RAIL_LINK_CREDENTIAL_STORES if colang_rail is not None else _DOT_CREDENTIAL_STORES
     if (
-        any(part.casefold() in _RAIL_LINK_CREDENTIAL_STORES for part in directories)
+        any(part.casefold() in stores for part in directories)
         or _has_xdg_credential_store(directories)
         or (
             bool(directories)

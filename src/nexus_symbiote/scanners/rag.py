@@ -20,7 +20,7 @@ from nexus_symbiote.core.enums import RiskSeverity, TrustTier
 from nexus_symbiote.core.hashing import hash_bytes, hash_canonical
 from nexus_symbiote.core.identifiers import reference_text
 from nexus_symbiote.core.models import GuardrailComponent, RAGSourceComponent, RiskAssessment
-from nexus_symbiote.policy import check_yaml_flow_depth, read_sexagesimal_integers_as_text
+from nexus_symbiote.policy import bounded_flow_loader, read_sexagesimal_integers_as_text
 from nexus_symbiote.scanners.base import (
     Scanner,
     ScanResult,
@@ -625,10 +625,9 @@ class RAGScanner(Scanner):
             result.scan_failures.append(f"{path.as_posix()}: YAML parser unavailable")
             return None
         try:
-            check_yaml_flow_depth(content)
             # Anchors/aliases and tags are unnecessary for this static profile;
             # rejecting them avoids recursive or amplified configuration graphs.
-            for index, token in enumerate(yaml.scan(content)):
+            for index, token in enumerate(yaml.scan(content, Loader=bounded_flow_loader())):
                 if index >= 20_000 or isinstance(
                     token, (yaml.AliasToken, yaml.AnchorToken, yaml.TagToken)
                 ):
@@ -637,7 +636,7 @@ class RAGScanner(Scanner):
                     )
                     return None
 
-            class UniqueSafeLoader(yaml.SafeLoader):
+            class UniqueSafeLoader(bounded_flow_loader()):  # type: ignore[misc]
                 pass
 
             def unique_mapping(loader: Any, node: Any) -> dict[Any, Any]:
