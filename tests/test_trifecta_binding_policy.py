@@ -90,7 +90,10 @@ def test_read_scope_is_independent_of_egress_and_modeling_keeps_its_precedence(a
     root = _agent("agent:root", tool_refs=[reader.bom_ref, private.bom_ref, outbound.bom_ref])
     root.authorizations = [
         AuthorizationRecord(
-            principal="reviewer", action=action, resource_scope="kb/*", approval_required=False
+            principal="reviewer",
+            action=action,
+            resource_scope="kb:project/*",
+            approval_required=False,
         )
     ]
     bom = AIBOM(components=[root, reader, private, outbound])

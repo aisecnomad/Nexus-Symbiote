@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import re
 import shlex
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -26,6 +28,7 @@ from nexus_symbiote.core.models import (
 )
 from nexus_symbiote.policy import PolicyError, parse_yaml_mapping
 from nexus_symbiote.scanners.credential_files import credential_gap, credential_shaped
+from nexus_symbiote.scanners.mcp_launch import npm_spec, python_spec
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.jsonc import strip_jsonc
 from nexus_symbiote.utils.secrets import redact_text
@@ -65,8 +68,24 @@ def _as_dict(val: Any) -> dict[str, Any]:
 
 BRIDGE_PACKAGES = _words("mcp-remote supergateway mcp-proxy @modelcontextprotocol/server-proxy")
 RUNTIME_LAUNCHERS = _words("node python python3 sh bash zsh deno bun tsx uvx npx")
+PACKAGE_RUNNERS = _words("npx uvx")
+RUNNER_VALUE_OPTIONS = _words(
+    "-p --package --from --with --with-editable --with-requirements --python"
+)
+SCRIPT_VALUE_OPTIONS = _words(
+    "--tsconfig --env-file -X -W --output-dir --config --db-path --credentials --tls-key"
+)
+NODE_SCRIPT_RUNNERS = _words(
+    "node nodejs tsx ts-node ts-node-esm ts-node-script ts-node-cwd "
+    "esno esmo jiti vite-node babel-node @babel/node"
+)
+NODE_SCRIPT_SWITCHES = _words("--inspect --inspect-brk --experimental-strip-types")
+PRELOAD_OPTIONS = _words("-r --require --import --loader --experimental-loader")
+SCRIPT_ARGUMENT_OPTIONS = SCRIPT_VALUE_OPTIONS | PRELOAD_OPTIONS
+SCRIPT_SWITCHES = _words("--watch --quiet --verbose --no-warnings --no-deprecation -u -B")
+FS_WRITE_TOOLS = _words("write_file edit_file move_file")
 INSTALLED_BIN_DIRS = _tup("node_modules/.bin/ .venv/bin/ venv/bin/")
-SCRIPT_SUFFIXES = _tup(".sh .py .js .mjs .cjs .ts .rb .pl")
+SCRIPT_SUFFIXES = _tup(".sh .py .js .mjs .cjs .jsx .ts .mts .cts .tsx .rb .pl")
 CODE_EXEC_HOSTED_TOOLS = _words("code_interpreter computer_use bash local_shell code_execution")
 UNTRUSTED_CI_TRIGGERS = _words("issue_comment discussion_comment pull_request_target workflow_run")
 STEERING_PREFIXES = _tup(".claude .cursor CLAUDE.md AGENTS.md .mcp.json mcp.json")
@@ -80,7 +99,7 @@ JSONC_FILES = _tup(".vscode/mcp.json")
 PERMISSION_CONFIG_FILES = _tup(".claude/settings.json .claude/settings.local.json .cursor/cli.json")
 _SUMMARY_KEYS = _tup(
     "hook_targets skill_preambles launcher_targets hosted_tools ci_agents framework_agents "
-    "identities steering_surfaces bridged_servers reach_alerts gaps"
+    "identities steering_surfaces bridged_servers hook_commands reach_alerts gaps"
 )
 
 _EGRESS_RE = re.compile(
@@ -101,6 +120,11 @@ _PREAMBLE_RE = re.compile(r"^\s*!(?:`([^`]+)`|\s+(.+))$")
 _HEX_40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _ON_KEY_RE = re.compile(r"(?m)^([ \t]*)on([ \t]*:)")
 _PROJECT_DIR_RE = re.compile(r"^(?:\$\{?CLAUDE_PROJECT_DIR\}?|\$\{workspace(?:Folder|Root)\})/")
+# A bare Node import can name a package and subpath. Relative paths, schemes,
+# environment expansions and parent segments cannot be classified this way.
+_NODE_PACKAGE_IMPORT = re.compile(
+    r"((?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*)(?:/[A-Za-z0-9_][\w.-]*)*", re.ASCII
+)
 _SPIFFE_RE = re.compile(r"^spiffe://[a-z0-9.-]+/[A-Za-z0-9._/-]+$")
 
 
@@ -115,11 +139,11 @@ def _clean(val: Any) -> str:
 
 def _parse_yaml(text: str) -> dict[str, Any]:
     try:
-        for index, _token in enumerate(yaml.scan(text)):
+        for index, _token in enumerate(yaml.scan(text, Loader=yaml.SafeLoader)):
             if index >= 20_000:
                 raise ValueError("YAML exceeds 20,000 tokens")
-    except yaml.YAMLError as exc:
-        raise ValueError(str(exc)) from exc
+    except yaml.YAMLError:
+        raise ValueError("invalid YAML") from None
     return parse_yaml_mapping(text)
 
 
@@ -142,8 +166,8 @@ def _read_confined_bytes(files: ConfinedCollection, rel_path: str, gaps: list[st
         named = rel_path.startswith(INSTALLED_BIN_DIRS)
         raw = files.read_named(rel_path) if named else files.read_bytes(rel_path, missing_ok=True)
         gap = credential_gap(rel_path, files.link_target(rel_path))
-    except (OSError, ValueError) as exc:
-        gaps.append(f"{rel_path}: {neutralize(str(exc))}")
+    except (OSError, ValueError):
+        gaps.append(f"{rel_path}: read refused")
         return None
     if gap is not None:
         gaps.append(f"{rel_path}: {gap}")
@@ -169,8 +193,8 @@ def _load_json_docs(
             continue
         try:
             parsed = parse_json_strict(strip_jsonc(text) if rel_path in JSONC_FILES else text)
-        except (ValueError, RecursionError) as exc:
-            gaps.append(f"{rel_path}: invalid JSON ({neutralize(str(exc))})")
+        except (ValueError, RecursionError):
+            gaps.append(f"{rel_path}: invalid JSON")
             continue
         if isinstance(parsed, dict):
             docs.append((rel_path, parsed))
@@ -199,7 +223,205 @@ def _normalize_rel_candidate(token: str, *, allow_any_file: bool = False) -> str
     return None
 
 
-def _extract_local_script_target(tokens: list[str]) -> str | None:
+@dataclass
+class _CheckoutScripts:
+    files: ConfinedCollection
+    paths: frozenset[str]
+
+    @cached_property
+    def local_node_packages(self) -> set[str] | None:
+        """Read the root manifest once, and only for audits that see bare Node preloads."""
+        if "package.json" not in self.paths:
+            return set()
+        manifest = self.files.read_json("package.json")
+        if not isinstance(manifest, dict) or manifest.get("workspaces"):
+            return None
+        local: set[str] = set()
+        name = manifest.get("name")
+        if isinstance(name, str) and "exports" in manifest:
+            local.add(name)
+        for section in (
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+        ):
+            for package, spec in _as_dict(manifest.get(section)).items():
+                if isinstance(spec, str) and (
+                    spec in {".", ".."}
+                    or spec.startswith(
+                        ("file:", "link:", "workspace:", "portal:", "./", "../", "/", "~")
+                    )
+                ):
+                    local.add(package)
+        return local
+
+
+@dataclass
+class _RunnerEvidence:
+    checkout: _CheckoutScripts | None = None
+    preloads: list[str] = field(default_factory=list)
+    gaps: set[str] = field(default_factory=set)
+
+    def _dependency_import(self, value: str) -> bool:
+        match = _NODE_PACKAGE_IMPORT.fullmatch(value)
+        if match is None:
+            return False
+        if self.checkout is None:
+            return True
+        local = self.checkout.local_node_packages
+        return local is not None and match[1] not in local
+
+    def option_value(self, option: str, value: str, *, node_imports: bool) -> None:
+        if option in PRELOAD_OPTIONS:
+            path = _normalize_rel_candidate(value, allow_any_file=True)
+            if (
+                path
+                and (value.startswith("./") or _PROJECT_DIR_RE.match(value))
+                and "$" not in path
+                and not path.startswith("~")
+            ):
+                self.preloads.append(posixpath.normpath(path))
+            elif not (node_imports and self._dependency_import(value)):
+                self.gaps.add("preload target is unresolved")
+        elif option in {"-p", "--package", "--from", "--with", "--with-editable"} and (
+            value in {".", ".."} or value.startswith(("./", "../", "/", "file:", "~", "$"))
+        ):
+            self.gaps.add("local package entry point is unresolved")
+
+
+def _package_runner_target(
+    runner: str,
+    operands: list[str],
+    project_paths: frozenset[str],
+    files: ConfinedCollection | None,
+    evidence: _RunnerEvidence,
+) -> str | None:
+    """Distinguish a package runner's script from known value-taking options."""
+    package_seen = False
+    script_runner = True
+    node_imports = runner == "node"
+    pending_option: str | None = None
+    unknown_option = False
+    parse_options = True
+    fallback: str | None = None
+    for arg in operands:
+        follows_unknown, unknown_option = unknown_option, False
+        if pending_option is not None:
+            evidence.option_value(pending_option, arg, node_imports=node_imports)
+            pending_option = None
+            continue
+        if parse_options and arg == "--":
+            parse_options = False
+            continue
+        if parse_options and arg in {"-c", "-e", "-m"}:
+            return None
+        if parse_options and arg.startswith("-"):
+            option, equal, value = arg.partition("=")
+            if package_seen and not equal and arg.startswith("-r") and len(arg) > 2:
+                evidence.option_value("-r", arg[2:], node_imports=node_imports)
+                continue
+            if not package_seen and not equal and arg.startswith("-p") and len(arg) > 2:
+                evidence.option_value("-p", arg[2:], node_imports=node_imports)
+                continue
+            if option in (SCRIPT_ARGUMENT_OPTIONS if package_seen else RUNNER_VALUE_OPTIONS):
+                if equal:
+                    evidence.option_value(option, value, node_imports=node_imports)
+                else:
+                    pending_option = option
+            elif (
+                package_seen
+                and not equal
+                and option not in SCRIPT_SWITCHES
+                and not (node_imports and option in NODE_SCRIPT_SWITCHES)
+            ):
+                unknown_option = True
+            continue
+        local = _normalize_rel_candidate(arg, allow_any_file=True)
+        path = posixpath.normpath(local) if local is not None else None
+        if path is not None and (path.startswith("~") or "$" in path):
+            evidence.gaps.add("script target is unresolved")
+            continue
+        explicit = arg.startswith("./") or bool(_PROJECT_DIR_RE.match(arg))
+        scripted = arg.endswith(SCRIPT_SUFFIXES)
+        path_like = explicit or "/" in arg or scripted
+        listed = path in project_paths
+        if follows_unknown:
+            if scripted or (
+                (path_like or listed) and (script_runner or not posixpath.splitext(arg)[1])
+            ):
+                evidence.gaps.add("option arity leaves the script target unresolved")
+            continue
+        if not package_seen:
+            package_seen = True
+            parse_options = True
+            if arg in {".", "..", "./", "../"} or arg.startswith(("../", "/", "file:")):
+                evidence.gaps.add("local package entry point is unresolved")
+                continue
+            reference = python_spec(arg, shorthand=True) if runner == "uvx" else npm_spec(arg)
+            name = reference.name
+            node_imports = runner in {"npx", "node"} and name in NODE_SCRIPT_RUNNERS
+            script_runner = (
+                reference.ecosystem not in {"npm", "pypi"}
+                or node_imports
+                or name in RUNTIME_LAUNCHERS
+                or name in {"ipython", "pypy", "pypy3"}
+            )
+            if (
+                runner == "npx"
+                and (
+                    arg == "@modelcontextprotocol/server-filesystem"
+                    or arg.startswith("@modelcontextprotocol/server-filesystem@")
+                )
+                and name == "@modelcontextprotocol/server-filesystem"
+            ):
+                # The registry reference server accepts filesystem roots as data operands.
+                return None
+            # The first operand names the package. A bare name is resolved from the
+            # registry, so a project file of that name (a decoy `tsx`) is not the script.
+            if (
+                path is not None
+                and not arg.startswith("@")
+                and (explicit or scripted or ("/" in arg and listed))
+            ):
+                if f"{path}/" in project_paths or (files is not None and files.is_directory(path)):
+                    evidence.gaps.add("local package entry point is unresolved")
+                    return None
+                return path
+            continue
+        if path is None:
+            continue
+        if (
+            runner == "npx"
+            and arg.startswith("@")
+            and not (listed or scripted)
+            and npm_spec(arg).ecosystem == "npm"
+        ):
+            if not script_runner or files is None:
+                continue
+            if files.regular_file(path) is None:
+                evidence.gaps.add("scoped script target is unresolved")
+                continue
+        if path_like:
+            if f"{path}/" in project_paths or (files is not None and files.is_directory(path)):
+                if script_runner:
+                    evidence.gaps.add("directory entry point is unresolved")
+                continue
+            return path
+        if fallback is None and listed and "." not in path:
+            fallback = path
+    if pending_option in PRELOAD_OPTIONS:
+        evidence.gaps.add("preload target is unresolved")
+    return fallback
+
+
+def _extract_local_script_target(
+    tokens: list[str],
+    project_paths: frozenset[str] = frozenset(),
+    *,
+    files: ConfinedCollection | None = None,
+    evidence: _RunnerEvidence | None = None,
+) -> str | None:
     if not tokens:
         return None
     first = tokens[0].strip()
@@ -207,6 +429,14 @@ def _extract_local_script_target(tokens: list[str]) -> str | None:
     direct = _normalize_rel_candidate(first)
     if direct is not None and base not in RUNTIME_LAUNCHERS:
         return direct
+    node_preloads = base == "node" and any(
+        arg.partition("=")[0] in PRELOAD_OPTIONS or arg.startswith("-r") for arg in tokens[1:]
+    )
+    if base in PACKAGE_RUNNERS or node_preloads:
+        operands = [base, *tokens[1:]] if node_preloads else tokens[1:]
+        return _package_runner_target(
+            base, operands, project_paths, files, evidence or _RunnerEvidence()
+        )
     if base in RUNTIME_LAUNCHERS:
         for arg in tokens[1:]:
             if arg in {"-c", "-e", "-m"}:
@@ -216,6 +446,22 @@ def _extract_local_script_target(tokens: list[str]) -> str | None:
                 if cand is not None:
                     return cand
     return None
+
+
+def _audit_script_targets(
+    tokens: list[str],
+    checkout: _CheckoutScripts,
+    gaps: list[str],
+    source_file: str,
+    role: str,
+) -> tuple[str | None, list[str]]:
+    evidence = _RunnerEvidence(checkout=checkout)
+    primary = _extract_local_script_target(
+        tokens, checkout.paths, files=checkout.files, evidence=evidence
+    )
+    gaps.extend(f"{source_file}: {role} {reason}" for reason in sorted(evidence.gaps))
+    targets = ([] if primary is None else [primary]) + evidence.preloads
+    return primary, list(dict.fromkeys(targets))
 
 
 def _tokenize_command(command: Any, args: Any = None) -> list[str]:
@@ -246,6 +492,7 @@ class ControlPlaneAuditSummary:
     identities: list[dict[str, Any]] = field(default_factory=list)
     steering_surfaces: list[dict[str, Any]] = field(default_factory=list)
     bridged_servers: list[dict[str, Any]] = field(default_factory=list)
+    hook_commands: list[dict[str, Any]] = field(default_factory=list)
     reach_alerts: list[dict[str, Any]] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
 
@@ -460,12 +707,25 @@ def _iter_hook_commands(doc: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def _inspect_hooks_and_preambles(
-    files: ConfinedCollection, all_paths: list[str], summary: ControlPlaneAuditSummary
+    files: ConfinedCollection,
+    all_paths: list[str],
+    checkout: _CheckoutScripts,
+    summary: ControlPlaneAuditSummary,
 ) -> None:
     for cfg_path, doc in _load_json_docs(files, all_paths, HOOK_CONFIG_FILES, summary.gaps):
-        for event_name, cmd_str in _iter_hook_commands(doc):
-            target = _extract_local_script_target(_tokenize_command(cmd_str))
-            if target is not None:
+        for raw_event, cmd_str in _iter_hook_commands(doc):
+            event_name = _clean(raw_event)
+            summary.hook_commands.append(
+                _rec(
+                    source_file=cfg_path,
+                    event=event_name,
+                    command_digest=_sha256_hex(cmd_str.encode()),
+                )
+            )
+            _, targets = _audit_script_targets(
+                _tokenize_command(cmd_str), checkout, summary.gaps, cfg_path, "hook"
+            )
+            for target in targets:
                 rec = _bind_script_target(
                     files,
                     summary,
@@ -507,8 +767,14 @@ def _inspect_hooks_and_preambles(
                 skill_path,
                 skill_ref,
             )
-            target = _extract_local_script_target(_tokenize_command(cmd_body))
-            if target is not None:
+            _, targets = _audit_script_targets(
+                _tokenize_command(cmd_body),
+                checkout,
+                summary.gaps,
+                skill_path,
+                "preamble",
+            )
+            for target in targets:
                 _bind_script_target(
                     files,
                     summary,
@@ -546,6 +812,7 @@ def _find_bridge_package(tokens: list[str]) -> tuple[str, int] | None:
 def _inspect_mcp_launchers_and_bridges(
     files: ConfinedCollection,
     all_paths: list[str],
+    checkout: _CheckoutScripts,
     summary: ControlPlaneAuditSummary,
     live_versions: dict[str, str],
 ) -> None:
@@ -592,8 +859,8 @@ def _inspect_mcp_launchers_and_bridges(
                     if cfg_body is not None and norm_cfg is not None:
                         try:
                             sub_doc = parse_json_strict(cfg_body)
-                        except (ValueError, RecursionError) as exc:
-                            summary.gaps.append(f"{norm_cfg}: invalid JSON ({exc})")
+                        except (ValueError, RecursionError):
+                            summary.gaps.append(f"{norm_cfg}: invalid JSON")
                             sub_doc = None
                         if isinstance(sub_doc, dict):
                             for sub_name, _sub_cfg in _extract_mcp_servers(sub_doc):
@@ -667,9 +934,11 @@ def _inspect_mcp_launchers_and_bridges(
                 )
                 continue
 
-            target = _extract_local_script_target(tokens)
+            primary, targets = _audit_script_targets(
+                tokens, checkout, summary.gaps, cfg_path, "launcher"
+            )
             props = {"registry_origin": reg_origin} if reg_origin else {}
-            if target is not None:
+            for target in targets:
                 rec = _bind_script_target(
                     files,
                     summary,
@@ -680,7 +949,8 @@ def _inspect_mcp_launchers_and_bridges(
                     event_or_server=srv_name,
                 )
                 if rec is not None:
-                    props["launch_target"] = rec["launch_target_sha256"]
+                    if target == primary:
+                        props["launch_target"] = rec["launch_target_sha256"]
                     summary.launcher_targets.append(
                         _rec(
                             server_name=srv_name,
@@ -700,21 +970,39 @@ def _inspect_mcp_launchers_and_bridges(
             )
 
 
-def _covers_steering_path(root_arg: str) -> bool:
+def _covers_steering_path(root_arg: str, project_roots: tuple[str, ...]) -> bool:
     cleaned = root_arg.strip().strip("'\"")
-    if cleaned in {".", "./", ""}:
+    if not cleaned:
         return True
-    if cleaned.startswith("./"):
-        cleaned = cleaned[2:]
-    return any(
-        cleaned == pref or cleaned.startswith(pref + "/") or pref.startswith(cleaned + "/")
-        for pref in STEERING_PREFIXES
-    )
+    # Absolute and parent-relative roots are placed against the audited project root.
+    for project in project_roots:
+        joined = posixpath.normpath(posixpath.join(project, cleaned))
+        if joined == project or project.startswith(joined.rstrip("/") + "/"):
+            return True
+        if joined.startswith(project.rstrip("/") + "/"):
+            rel = joined[len(project.rstrip("/")) + 1 :]
+            if any(
+                rel == pref or rel.startswith(pref + "/") or pref.startswith(rel + "/")
+                for pref in STEERING_PREFIXES
+            ):
+                return True
+    return False
 
 
-def _deny_covers_steering(deny_rules: list[str]) -> bool:
-    low = [r.lower() for r in deny_rules]
-    return any(".claude" in r or "claude.md" in r for r in low) and any(".cursor" in r for r in low)
+def _steering_host(path: str) -> str:
+    if path.startswith(".claude/") or path == ".mcp.json":
+        return "claude"
+    return path.split("/", 1)[0]
+
+
+def _deny_covers_steering(deny_rules: list[str], server_name: str, reference_server: bool) -> bool:
+    # Claude Code Read/Edit/Write path rules govern its built-in file tools, not an MCP server,
+    # which writes from its own process. Only a deny of the server's tools stops it.
+    prefix = f"mcp__{server_name}"
+    rules = {r.strip() for r in deny_rules}
+    if prefix in rules or f"{prefix}__*" in rules:
+        return True
+    return reference_server and all(f"{prefix}__{tool}" in rules for tool in FS_WRITE_TOOLS)
 
 
 def _inspect_steering_surfaces(
@@ -732,12 +1020,13 @@ def _inspect_steering_surfaces(
             s_item = str(item)
             if s_item in {"*", "Edit", "Write"} or "filesystem" in s_item:
                 auto_edit_modes.append(f"{s_path}:allow:{s_item}")
-        for x in _as_list(perms.get("deny")):
-            deny_rules.append(str(x))
+        # A Claude Code deny rule governs only the servers Claude Code itself launches.
+        if _steering_host(s_path) == "claude":
+            deny_rules.extend(str(x) for x in _as_list(perms.get("deny")))
         if doc.get("approvalPolicy") in {"never", "auto-edit"}:
             auto_edit_modes.append(f"{s_path}:{doc['approvalPolicy']}")
 
-    deny_covered = _deny_covers_steering(deny_rules)
+    project_roots = (files.root.as_posix(), files.root.resolve().as_posix())
 
     for cfg_path, doc in _load_json_docs(files, all_paths, MCP_CONFIG_FILES, summary.gaps):
         for srv_name, srv_cfg in _extract_mcp_servers(doc):
@@ -748,24 +1037,27 @@ def _inspect_steering_surfaces(
             joined = " ".join([cmd, *args]).lower()
             if "filesystem" not in srv_name.lower() and "server-filesystem" not in joined:
                 continue
-            read_only = (
-                bool(srv_cfg.get("readOnly"))
-                or "--readonly" in joined
-                or "--read-only" in joined
-                or any(a.endswith(":ro") for a in args)
+            server_read_only = (
+                bool(srv_cfg.get("readOnly")) or "--readonly" in joined or "--read-only" in joined
+            )
+            deny_covered = _steering_host(cfg_path) == "claude" and _deny_covers_steering(
+                deny_rules, srv_name, "server-filesystem" in joined
             )
             srv_auto = (
                 bool(srv_cfg.get("autoApprove")) or len(_as_list(srv_cfg.get("alwaysAllow"))) > 0
             )
             roots = [
-                a.split(":ro")[0]
+                a
                 for a in args
                 if not a.startswith("-")
                 and "server-filesystem" not in a
                 and a not in {"-y", "npx", "uvx"}
             ] or ["."]
-            for r_arg in roots:
-                if not _covers_steering_path(r_arg):
+            for raw_root in roots:
+                # ':ro' marks only the root it is appended to as read-only.
+                r_arg = raw_root.removesuffix(":ro")
+                read_only = server_read_only or raw_root.endswith(":ro")
+                if not _covers_steering_path(r_arg, project_roots):
                     continue
                 eff_modes = list(auto_edit_modes)
                 if srv_auto:
@@ -883,8 +1175,8 @@ def _record_ci_agent(
     if isinstance(mcp_config_raw, str) and mcp_config_raw.strip():
         try:
             mcp_doc = parse_json_strict(mcp_config_raw)
-        except (ValueError, RecursionError) as exc:
-            summary.gaps.append(f"{source_file}: invalid inline mcp_config ({exc})")
+        except (ValueError, RecursionError):
+            summary.gaps.append(f"{source_file}: invalid inline mcp_config")
             mcp_doc = None
         if isinstance(mcp_doc, dict):
             for s_name, s_cfg in _extract_mcp_servers(mcp_doc):
@@ -967,8 +1259,8 @@ def _inspect_workflows_and_claims(
             continue
         try:
             doc = _parse_yaml(_ON_KEY_RE.sub(r'\1"on"\2', text))
-        except (PolicyError, ValueError, RecursionError) as exc:
-            summary.gaps.append(f"{wf_path}: {neutralize(str(exc))}")
+        except (PolicyError, ValueError, RecursionError):
+            summary.gaps.append(f"{wf_path}: invalid YAML")
             continue
         on_block = doc.get("on")
         if isinstance(on_block, str):
@@ -1245,13 +1537,31 @@ def diff_control_plane_audits(
     base_targets = _target_map(baseline)
     for key, curr_sha in sorted(_target_map(current).items()):
         base_sha = base_targets.get(key)
-        if base_sha is not None and base_sha != curr_sha:
+        if base_sha is None:
+            _emit(
+                "launch_target_added",
+                RiskSeverity.CRITICAL,
+                f"agent-control:{key}",
+                f"Launch target '{key}' (digest {curr_sha[:12]}) is not in the baseline.",
+            )
+        elif base_sha != curr_sha:
             _emit(
                 "launch_target_changed",
                 RiskSeverity.CRITICAL,
                 f"agent-control:{key}",
                 f"Launch target '{key}' digest changed from {base_sha[:12]} to {curr_sha[:12]}.",
             )
+
+    def _hook_keys(s: ControlPlaneAuditSummary) -> set[tuple[str, str, str]]:
+        return {(h["source_file"], h["event"], h["command_digest"]) for h in s.hook_commands}
+
+    for src, event, digest in sorted(_hook_keys(current) - _hook_keys(baseline)):
+        _emit(
+            "hook_command_changed",
+            RiskSeverity.CRITICAL,
+            f"hook-command:{src}:{event}:{digest[:12]}",
+            f"Hook command for '{event}' in {src} (digest {digest[:12]}) is not in the baseline.",
+        )
 
     base_writable = {s["server_name"] for s in baseline.steering_surfaces if s.get("writable")}
     for s in current.steering_surfaces:
@@ -1270,7 +1580,14 @@ def diff_control_plane_audits(
     for i in current.identities:
         pid = i["principal_id"]
         curr_set = set(_as_list(i.get("delegates_to"))) | set(_as_list(i.get("scopes")))
-        if pid in base_id_del and not curr_set.issubset(base_id_del[pid]):
+        if pid not in base_id_del:
+            _emit(
+                "identity_added",
+                RiskSeverity.HIGH,
+                f"agent-control:{pid}",
+                f"Identity '{pid}' is not in the baseline.",
+            )
+        elif not curr_set.issubset(base_id_del[pid]):
             _emit(
                 "delegation_widened",
                 RiskSeverity.HIGH,
@@ -1300,27 +1617,36 @@ def audit_project_control_plane(
             parsed = parse_json_strict(raw_claims)
             if isinstance(parsed, dict):
                 decl_sources.append(("shadowscan:claims", parsed, AssuranceLevel.DECLARED))
-        except (OSError, ValueError, RecursionError) as exc:
-            summary.gaps.append(f"{claims_path.name}: {neutralize(str(exc))}")
+            else:
+                summary.gaps.append(f"{claims_path.name}: claims file is not a JSON object")
+        except (OSError, ValueError, RecursionError):
+            summary.gaps.append(f"{claims_path.name}: invalid JSON")
 
     with ConfinedCollection(project_root, summary.gaps) as files:
         all_paths = sorted(p.as_posix() for p in files.iter_files())
+        # Directories carry a trailing '/', so an operand naming one is not read as a script.
+        project_paths = frozenset(all_paths).union(
+            p[: i + 1] for p in all_paths for i, c in enumerate(p) if c == "/"
+        )
         for decl_path in ("agent.yaml", "agent.yml"):
             if decl_path in all_paths:
                 text = _read_confined_text(files, decl_path, summary.gaps)
                 if text is not None:
                     try:
                         decl_sources.append((decl_path, _parse_yaml(text), AssuranceLevel.DECLARED))
-                    except (PolicyError, ValueError, RecursionError) as exc:
-                        summary.gaps.append(f"{decl_path}: {neutralize(str(exc))}")
-        _inspect_hooks_and_preambles(files, all_paths, summary)
-        _inspect_mcp_launchers_and_bridges(files, all_paths, summary, live_versions or {})
+                    except (PolicyError, ValueError, RecursionError):
+                        summary.gaps.append(f"{decl_path}: invalid YAML")
+        checkout = _CheckoutScripts(files, project_paths)
+        _inspect_hooks_and_preambles(files, all_paths, checkout, summary)
+        _inspect_mcp_launchers_and_bridges(files, all_paths, checkout, summary, live_versions or {})
         _inspect_steering_surfaces(files, all_paths, summary)
         _inspect_workflows_and_claims(files, all_paths, summary, decl_sources)
         _inspect_identities_and_authority(summary, decl_sources)
 
     if baseline_root is not None:
-        base_summary = audit_project_control_plane(baseline_root)
+        base_summary = audit_project_control_plane(baseline_root, claims_path=claims_path)
+        # An unreadable baseline hides what changed, so its gaps fail the gate too.
+        summary.gaps.extend(f"baseline: {gap}" for gap in base_summary.gaps)
         summary.reach_alerts = diff_control_plane_audits(
             base_summary,
             summary,

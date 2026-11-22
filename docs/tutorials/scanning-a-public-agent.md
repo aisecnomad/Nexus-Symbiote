@@ -39,10 +39,11 @@ nexus-symbiote --version
 Static collection is offline by default and does not execute project modules,
 MCP launchers or model loaders. Scan the target you detached in step 1, with
 project-supplied policy disabled so an untrusted checkout cannot pick its own
-gates:
+gates. Accept the checkout's Git metadata with `--accept-default-exclude .git`:
 
 ```bash
 nexus-symbiote scan public-mcp-servers \
+  --accept-default-exclude .git \
   --no-project-policy \
   -o public.aibom.json
 nexus-symbiote summary public.aibom.json
@@ -66,6 +67,7 @@ collectors you intend to review. Repeat `--scanner` once per collector:
 
 ```bash
 nexus-symbiote scan public-mcp-servers \
+  --accept-default-exclude .git \
   --no-project-policy \
   --scanner mcp --scanner registry \
   -o public.mcp-only.aibom.json
@@ -80,6 +82,7 @@ This scan writes the inventory but exits 1: omitted collectors are recorded as
 ```bash
 nexus-symbiote validate public.aibom.json \
   --project public-mcp-servers \
+  --accept-default-exclude .git \
   --no-project-policy
 nexus-symbiote risk public.aibom.json --no-project-policy
 ```
@@ -99,9 +102,9 @@ step will reject the stale snapshot. See
 ## 5. Export reviewable BOMs
 
 ```bash
-nexus-symbiote scan public-mcp-servers --no-project-policy -f cyclonedx -o public.cdx.json
-nexus-symbiote scan public-mcp-servers --no-project-policy -f spdx     -o public.spdx.json
-nexus-symbiote scan public-mcp-servers --no-project-policy -f sarif    -o public.sarif
+nexus-symbiote scan public-mcp-servers --accept-default-exclude .git --no-project-policy -f cyclonedx -o public.cdx.json
+nexus-symbiote scan public-mcp-servers --accept-default-exclude .git --no-project-policy -f spdx     -o public.spdx.json
+nexus-symbiote scan public-mcp-servers --accept-default-exclude .git --no-project-policy -f sarif    -o public.sarif
 ```
 
 The CycloneDX 1.7 and SPDX 3.0.1 exports carry a digest-bound native extension
@@ -121,9 +124,9 @@ inventory from step 3 was collected without a key, so take the baseline again:
 ```bash
 # One secret of 32 or more characters, kept outside the checkout; the same for every scan.
 export NEXUS_SYMBIOTE_SOURCE_BINDING_KEY="$AGENTBOM_BINDING_KEY"
-nexus-symbiote scan public-mcp-servers --no-project-policy -o reviewed.aibom.json
+nexus-symbiote scan public-mcp-servers --accept-default-exclude .git --no-project-policy -o reviewed.aibom.json
 # ... after the target advances to a new commit ...
-nexus-symbiote scan public-mcp-servers --no-project-policy -o current.aibom.json
+nexus-symbiote scan public-mcp-servers --accept-default-exclude .git --no-project-policy -o current.aibom.json
 nexus-symbiote diff reviewed.aibom.json current.aibom.json --fail-on-alert
 ```
 

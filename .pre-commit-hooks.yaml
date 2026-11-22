@@ -3,7 +3,7 @@
   description: >-
     Collect the local inventory and apply the scan gate with the built-in policy, writing
     nothing into the working tree. A convenience for your own tree, not an execution approval
-  entry: nexus-symbiote scan . --no-project-policy --check
+  entry: nexus-symbiote scan . --no-project-policy --accept-default-exclude root:.git --check
   language: python
   always_run: true
   pass_filenames: false
@@ -12,7 +12,7 @@
   description: >-
     The same gate as nexus-symbiote-scan, whose scan gate includes the risk gate; kept so that
     existing configurations keep working. Configure one of the two
-  entry: nexus-symbiote scan . --no-project-policy --check
+  entry: nexus-symbiote scan . --no-project-policy --accept-default-exclude root:.git --check
   language: python
   always_run: true
   pass_filenames: false

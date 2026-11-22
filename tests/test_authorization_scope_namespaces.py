@@ -38,9 +38,9 @@ from tests.test_trifecta_declared_scope import _gated_owner, _verdict
         ("table:crm.customers", True),
         ("table:public.users", True),
         ("table:orders", True),
-        ("bücher", True),
-        ("données/*", True),
-        ("orders", True),
+        ("bücher", False),
+        ("données/*", False),
+        ("orders", False),
     ],
 )
 def test_typed_and_network_scope_names_at_the_cli(tmp_path, basis, scope, bounded):

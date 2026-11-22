@@ -870,3 +870,98 @@ def test_a_local_finding_cannot_be_reworded_or_removed(tmp_path):
     model["risks"] = [r for r in model["risks"] if r["category"] != "signing_status"]
     validated, risked = _gates(project, target, doc, skip_integrity=True)
     _assert_refused(validated, risked, "Missing or mismatched local component from model files")
+
+
+@pytest.mark.parametrize(
+    ("subject", "key"),
+    [
+        ("prompt", "content_hash_withheld"),
+        ("prompt", "static_value_binding"),
+        ("prompt", "static_value_binding_profile"),
+        ("prompt", "static_config_hash"),
+        ("prompt", "static_card_hash"),
+        ("prompt", "weight_files"),
+        ("agent", "collection_mode"),
+    ],
+)
+def test_a_supplier_cannot_add_collector_owned_binding_properties(tmp_path, subject, key):
+    # Risk fingerprints, integrity and the static binding checks read these keys, so a
+    # value only the supplier recorded is refused rather than listed as a claim.
+    project, target, doc = _scanned(tmp_path)
+    component = (
+        _agent(doc)
+        if subject == "agent"
+        else next(c for c in doc["components"] if c["bom_ref"] == "prompt:CLAUDE.md")
+    )
+    assert key not in component["properties"]
+    component["properties"][key] = "hmac-sha256:" + "0" * 64
+    validated, risked = _gates(project, target, doc, skip_integrity=True)
+    _assert_refused(
+        validated,
+        risked,
+        "collector-owned properties the local collection did not record: "
+        f"{component['bom_ref']} ({key})",
+    )
+
+
+def test_a_supplier_added_hash_cannot_turn_integrity_unknown_into_pass(tmp_path):
+    project, target, doc = _scanned(tmp_path)
+    server = next(c for c in doc["components"] if c["component_type"] == "mcp-server")
+    assert not server["hashes"]
+    # The true digest of the server's file: integrity would verify it as recorded evidence.
+    server["hashes"] = {"sha256": hashlib.sha256((project / ".mcp.json").read_bytes()).hexdigest()}
+    validated, risked = _gates(project, target, doc)
+    _assert_refused(
+        validated,
+        risked,
+        f"Missing or mismatched local component from MCP inventory: {server['bom_ref']}",
+    )
+
+
+def _minimum_observed(project: Path, target: Path, doc: dict) -> dict:
+    (project / ".nexus-symbiote.yaml").write_text("validate: {minimum_assurance_level: observed}\n")
+    target.write_text(json.dumps(doc))
+    args = [
+        "validate",
+        "--skip-integrity",
+        "--json-output",
+        str(target),
+        "--project",
+        str(project),
+        "--accept-project-policy",
+    ]
+    return json.loads(CliRunner().invoke(main, args).stdout)
+
+
+def test_a_supplier_added_observation_cannot_meet_the_minimum_assurance(tmp_path):
+    manifest = "name: triage\nmodels: {chat: {provider: example, requested_ref: latest}}\n"
+    project, target, doc = _scanned(tmp_path, {"agent.yaml": manifest})
+    hosted = next(c for c in doc["components"] if c["bom_ref"].endswith("/hosted/chat"))
+    declared = ["minimum observed assurance not attained (1 declared component)"]
+    honest = _minimum_observed(project, target, doc)
+    assert honest["passed"] is False and honest["assurance_errors"] == declared
+    hosted["claims"]["runtime_observation"] = {
+        "assurance": "observed",
+        "method": "supplier-observer",
+        "scope": "runtime",
+        "collector": "supplier",
+    }
+    forged = _minimum_observed(project, target, doc)
+    assert forged["completeness"]["status"] == "pass"
+    assert (hosted["bom_ref"], "claim", "runtime_observation") in _claims(forged["completeness"])
+    assert forged["passed"] is False and forged["assurance_errors"] == declared
+
+
+def test_an_observation_added_to_a_locally_observed_component_keeps_the_minimum(tmp_path):
+    project, target, doc = _scanned(tmp_path)
+    assert _minimum_observed(project, target, doc)["passed"] is True
+    tool = _tool(doc)
+    tool["claims"]["tool_definition"] = {
+        "assurance": "observed",
+        "method": "operator-pinned-stdio-tools-list",
+        "scope": "served-descriptor",
+        "collector": "nexus-symbiote-live-stdio",
+    }
+    recorded = _minimum_observed(project, target, doc)
+    assert (tool["bom_ref"], "claim", "tool_definition") in _claims(recorded["completeness"])
+    assert recorded["passed"] is True and recorded["assurance_errors"] == []

@@ -36,13 +36,13 @@ from tests.test_trifecta_and_toxic_flows import _name_only_tools
         ("read", "arn:aws:s3:::127.0.0.1/*", True),
         ("read", "arn:aws:s3:::kb-bucket/../other", True),
         ("write", "customers", True),
-        ("read", "kb", False),
-        ("list", "customers", False),
-        ("query", "données/*", False),
-        ("read", "kb/", False),
+        ("read", "kb", True),
+        ("list", "customers", True),
+        ("query", "données/*", True),
+        ("read", "kb/", True),
         ("read", "arn:aws:s3:::kb-bucket/*", False),
         ("read", "arn:aws-us-gov:s3:::kb-bucket/records/*", False),
-        ("get", "kb/*", False),
+        ("get", "kb/*", True),
     ],
 )
 def test_named_read_and_network_scopes_in_the_cli(tmp_path, action, scope, critical):

@@ -28,8 +28,8 @@ from tests.test_trifecta_declared_scope import _gated_owner, _verdict
         ("table:bücher", True),
         ("kb:données/*", True),
         ("table:all", False),
-        ("table:localhost.example.com", False),
-        ("table:sample.com", False),
+        ("table:localhost.example.com", True),
+        ("table:sample.com", True),
         ("table:crm.*", False),
         ("tаble:customers", False),  # Cyrillic letter in the resource type.
         ("kb:project-notes", True),
