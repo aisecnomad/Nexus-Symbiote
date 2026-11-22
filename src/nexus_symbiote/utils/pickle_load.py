@@ -311,6 +311,7 @@ _STRTOL = {
     10: re.compile(rb"[ \t\n\v\f\r]*[+-]?[0-9]+"),
 }
 _LONG_MIN, _LONG_MAX = -(2**63), 2**63 - 1
+_LONG_DIGITS = 22  # octal digits of 2**64; no C long needs more in base 8 or 10
 
 
 def _c_int(data: bytes, base: int) -> int | None:
@@ -325,7 +326,15 @@ def _c_int(data: bytes, base: int) -> int | None:
         if base == 0 and digits[1:2] in (b"x", b"X"):
             value = int(digits[2:], 16)
         else:
-            value = int(digits, 8 if base == 0 and digits[:1] == b"0" else 10)
+            # strtol takes any run of leading zeros, but int() refuses a decimal literal
+            # longer than sys.get_int_max_str_digits(): 4,301 zeros load in the C
+            # unpickler and must not end the walk. More significant digits than any C
+            # long holds overflow strtol, so PyLong_FromString (_py_int) decides.
+            significant = digits.lstrip(b"0") or b"0"
+            if len(significant) > _LONG_DIGITS:
+                value = _LONG_MAX + 1
+            else:
+                value = int(significant, 8 if base == 0 and digits[:1] == b"0" else 10)
         value = -value if signed[:1] == b"-" else value
     if text[end : end + 1] in (b"", b"\n") and _LONG_MIN <= value <= _LONG_MAX:
         return value

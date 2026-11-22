@@ -217,8 +217,14 @@ def test_safetensors_valid_and_malformed_non_pickle_preserve_verdicts(tmp_path: 
         b'{%- raw -%}{# unclosed comment {%- endraw -%}{{ "_" + "_globals_" + "_" }}',
         b'{%+ raw %}{% if "{%+ endraw -%}{{ "_" ~ "_subclasses_" ~ "_" }}',
         b'{% raw %}{% raw %}{% endraw %}{{ "_" ~ "_builtins_" ~ "_" }}',
-        b'{% raw %}{% endraw +%}{# {% endraw %}{{ "_" ~ "_class_" ~ "_" }}',
+        # Jinja2 3.1 ends a raw block at "+%}" too (TOKEN_RAW_BEGIN's end rule).
+        b'{% raw %}hello{% endraw +%}{{ a["_" ~ "_class_" ~ "_"] }}',
         b'{% set x = ({1: {2: 3}}, a["_" ~ "_class_" ~ "_"]) %}',
+        # A "}}" that closes nested dict braces does not end the tag: Jinja's lexer
+        # matches a tag's end only while brackets balance.
+        b'{{ ({1: {2: 3}}, a["_" ~ "_class_" ~ "_"]) }}',
+        b'{{ {1: {2: 3}} and "{% raw %}" }}{{ a["_" ~ "_class_" ~ "_"] }}',
+        b'{{ {1: 2}}}{{ a["_" ~ "_class_" ~ "_"] }}',
     ],
 )
 def test_jinja_raw_block_cannot_blind_joined_literal_marker(template: bytes) -> None:
@@ -231,6 +237,8 @@ def test_jinja_raw_block_cannot_blind_joined_literal_marker(template: bytes) -> 
         b'{% raw %}{{ "_" ~ "_class_" ~ "_" }}{% endraw %}{{ "hello" }}',
         b'{%- raw -%}{{ "_" ~ "_class_" ~ "_" }}{%- endraw -%}',
         b'{% raw %}{{ "_" ~ "_class_" ~ "_" }}',
+        b'{% raw %}{{ "_" ~ "_class_" ~ "_" }}{% endraw +%}{{ "hello" }}',
+        b'{{ {1: {2: 3}} }}"_" ~ "_class_" ~ "_"',
     ],
 )
 def test_jinja_raw_block_literal_text_does_not_false_positive(template: bytes) -> None:
@@ -309,3 +317,53 @@ def test_jinja_raw_block_scanning_stays_linear() -> None:
         return template_escape_markers(chunk + b'{{ "plain" }}')
 
     assert scaling_ratio(run) < 10
+
+
+def test_c_unpickler_int_with_leading_zeros_past_the_int_digit_limit_is_followed(
+    tmp_path: Path,
+) -> None:
+    # strtol reads any number of leading zeros; int() refuses more than 4,300 digits.
+    zeros = b"0" * (sys.get_int_max_str_digits() + 1)
+    payload = b"I" + zeros + b"\n0cos\ngetpid\n)R."
+    assert pickle.loads(payload) > 0  # noqa: S301 - inert os.getpid()
+    segment = load_segment(payload, len(payload), 0, "c", Budget(65536, 64))
+    assert segment.outcome == "called"
+
+    # Past what a C long holds, strtol overflows and PyLong_FromString refuses the digits,
+    # in the C unpickler as in the scanner.
+    overflowing = b"I" + b"1" * (sys.get_int_max_str_digits() + 1) + b"\n0cos\ngetpid\n)R."
+    with pytest.raises(ValueError):
+        pickle.loads(overflowing)  # noqa: S301 - refused before any call
+    assert load_segment(overflowing, len(overflowing), 0, "c", Budget(65536, 64)).outcome == (
+        "error"
+    )
+
+    for rel_path in ("models/weights.dat", "models/direct.pkl"):
+        target = tmp_path / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+    result = ModelScanner().scan(tmp_path)
+    for rel_path in ("models/weights.dat", "models/direct.pkl"):
+        matched = [c for c in result.components if c.source_path == rel_path]
+        assert len(matched) == 1, rel_path
+        assert matched[0].serialization_safety is SerializationSafety.UNSAFE_CODE_EXECUTION
+
+
+def test_hashing_reader_never_asks_for_more_than_the_limit() -> None:
+    from dataclasses import replace
+
+    from nexus_symbiote import limits
+    from nexus_symbiote.scanners.model import _HashingModelReader
+
+    requested: list[int] = []
+
+    class _Recording(io.BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            requested.append(-1 if size is None else size)
+            return super().read(size)
+
+    with limits.applied(replace(limits.DEFAULTS, model_bytes=16)):
+        reader = _HashingModelReader(_Recording(b"A" * 64))
+    with pytest.raises(OSError, match="hash byte limit"):
+        reader.read(-1)
+    assert requested == [17]

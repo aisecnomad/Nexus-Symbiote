@@ -500,7 +500,8 @@ def _unescaped(match: re.Match[str]) -> str:
 
 
 _RAW_OPEN = re.compile(r"\{%[+-]?\s*raw\s*-?%\}")
-_RAW_CLOSE = re.compile(r"\{%[+-]?\s*endraw\s*-?%\}")
+# Jinja2 3.1 ends a raw block at "%}", "-%}" or "+%}"; it opens one only at "%}" or "-%}".
+_RAW_CLOSE = re.compile(r"\{%[+-]?\s*endraw\s*[+-]?%\}")
 
 
 def _joined_literal_marker(text: str) -> bool:
@@ -515,6 +516,9 @@ def _joined_literal_marker(text: str) -> bool:
     position = 0
     size = len(text)
     close: str | None = None
+    # Jinja matches a tag's end only while its brackets balance, so the "}}" that ends
+    # {1: {2: 3}} inside "{{ ... }}" does not end the tag.
+    depth = 0
     while position < size:
         if close is None:
             if text.startswith("{%", position):
@@ -524,9 +528,11 @@ def _joined_literal_marker(text: str) -> bool:
                     position = size if raw_close is None else raw_close.end()
                     continue
                 close = "%}"
+                depth = 0
                 position += 2
             elif text.startswith("{{", position):
                 close = "}}"
+                depth = 0
                 position += 2
             elif text.startswith("{#", position):
                 end = text.find("#}", position + 2)
@@ -534,9 +540,17 @@ def _joined_literal_marker(text: str) -> bool:
             else:
                 position += 1
             continue
-        if text.startswith(close, position):
+        if depth == 0 and text.startswith(close, position):
             close = None
             position += 2
+            continue
+        if text[position] in "([{":
+            depth += 1
+            position += 1
+            continue
+        if text[position] in ")]}":
+            depth = max(0, depth - 1)
+            position += 1
             continue
         if text[position] not in "\"'":
             position += 1
