@@ -23,6 +23,7 @@ from nexus_symbiote.core.enums import RiskSeverity, SerializationSafety
 from nexus_symbiote.core.hashing import open_regular_file
 from nexus_symbiote.scanners.model import (
     ModelScanner,
+    _PrefixedStream,
     _zip64_location,
     inspect_model_format,
     observe_model_artifact,
@@ -289,6 +290,17 @@ def test_valid_safetensors_and_executable_pickle_polyglot_is_rated_critical(
         obs = observe_model_artifact(path, stream=stream)
     assert obs.safety is SerializationSafety.UNSAFE_CODE_EXECUTION
     assert obs.digest == f"sha256:{hashlib.sha256(polyglot).hexdigest()}"
+
+
+def test_prefixed_stream_read_all_and_zero_preserve_bytes() -> None:
+    stream = _PrefixedStream(b"hello", io.BytesIO(b"world"))
+    assert stream.read(0) == b""
+    assert stream.read(-1) == b"helloworld"
+    assert stream.read() == b""
+
+    chunked = _PrefixedStream(b"hello", io.BytesIO(b"world"))
+    assert chunked.read(3) == b"hel"
+    assert chunked.read() == b"loworld"
 
 
 def test_jinja_raw_block_scanning_stays_linear() -> None:

@@ -1291,7 +1291,7 @@ class _CaptureReader:
     def fileno(self) -> int:
         return self._stream.fileno()
 
-    def read(self, size: int) -> bytes:
+    def read(self, size: int = -1) -> bytes:
         data = self._stream.read(size)
         self.captured.extend(data)
         return data
@@ -1311,7 +1311,13 @@ class _PrefixedStream:
     def fileno(self) -> int:
         return self._stream.fileno()
 
-    def read(self, size: int) -> bytes:
+    def read(self, size: int = -1) -> bytes:
+        if size == 0:
+            return b""
+        if size < 0:
+            head = bytes(self._buffered[self._pos :])
+            self._pos = len(self._buffered)
+            return head + self._stream.read(-1)
         if self._pos < len(self._buffered):
             end = min(len(self._buffered), self._pos + size)
             head = bytes(self._buffered[self._pos : end])
