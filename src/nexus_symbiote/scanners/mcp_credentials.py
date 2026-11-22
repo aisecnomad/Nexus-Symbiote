@@ -607,6 +607,18 @@ def literal_value(value: str, *, password: bool = False) -> bool:
     return credential_shaped(value)
 
 
+def public_value(value: str) -> bool:
+    """Whether ``value`` positively names something public, whatever placeholder it holds.
+
+    The refusals of ``literal_value`` that say where a value points (a URL, a path, a
+    package, an image, a host, public key material), and not the ones that only say what
+    it looks like or lacks: a label, a setting, a placeholder or a weak shape is not
+    evidence that a value is public.
+    """
+    value = _strip(value)
+    return "://" in value or public_material(value) or reference(value) or _locator_or_value(value)
+
+
 def _token_hits(value: str) -> list[Hit]:
     return [
         (SHAPE_CLASS, match.group())

@@ -30,7 +30,7 @@ from bisect import bisect_left
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date
-from itertools import pairwise
+from itertools import chain, pairwise
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
@@ -79,6 +79,7 @@ from nexus_symbiote.scanners.mcp_credentials import (
     name_words,
     placeholder,
     private_key_forms,
+    public_value,
     rewrapped_key_literals,
     strongest,
     value_hits,
@@ -1042,11 +1043,24 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
         "cmd",
         "cmd.exe",
     }
-    words = _launch_words(
-        [*([command] if command else []), *(a for a in args if isinstance(a, str))]
-    )
+    # Each text is split once here: its own words are also the ones a pairing is read from.
+    arguments = [_launch_words([a]) for a in args if isinstance(a, str)]
+    words = [*(_launch_words([command]) if command else []), *chain.from_iterable(arguments)]
+    for _, *inner in arguments:
+        values.extend(_withheld_scheme_operands(inner, cmd=cmd))
     for index, word in enumerate(words):
         values.extend(_shape_secrets(word))
+        following = words[index + 1] if index + 1 < len(words) else None
+        in_set = False
+        if cmd and following is not None:
+            prev = words[index - 1] if index > 0 else None
+            raw_before = words[index - 2] if index > 1 else None
+            before = (
+                None
+                if raw_before is not None and any(c.isspace() for c in raw_before)
+                else raw_before
+            )
+            in_set = _cmd_set_word(prev, before)
         name, equals, value = word.partition("=")
         if equals and not _requirement(name, value):
             name = name.lstrip("-").strip(" \"'")
@@ -1056,25 +1070,22 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
                     values.append(value)
                 values.extend(_shape_secrets(value))
                 # cmd's `set API_TOKEN=Bearer <token>` leaves the credential in the next word.
-                if index + 1 < len(words) and secret_like(name, f"{value} {words[index + 1]}"):
+                if following is not None and secret_like(name, f"{value} {following}"):
+                    variable = not word.startswith("-")
                     if value.lower() in _ASSIGNMENT_SCHEMES:
-                        prev = words[index - 1] if index > 0 else None
-                        raw_before = words[index - 2] if index > 1 else None
-                        before = (
-                            None
-                            if raw_before is not None and any(c.isspace() for c in raw_before)
-                            else raw_before
-                        )
                         values.extend(
                             literal
-                            for _, literal in _assignment_word_hits(
-                                word,
-                                words[index + 1],
-                                in_set=cmd and _cmd_set_word(prev, before),
-                            )
+                            for _, literal in _assignment_word_hits(word, following, in_set=in_set)
                         )
-                    elif _scheme_assignment_name(name, variable=not word.startswith("-")):
-                        values.extend(scheme_credentials(f"{value} {words[index + 1]}"))
+                    elif _scheme_assignment_name(name, variable=variable):
+                        values.extend(scheme_credentials(f"{value} {following}"))
+                    # Withholding fails closed. The rules above choose what raises a
+                    # finding; an operand they leave unflagged still stays out of exports
+                    # unless it is positively a public launch word.
+                    if not _public_scheme_following(
+                        name, value, following, variable=variable, in_set=in_set
+                    ):
+                        values.extend(scheme_credentials(f"{value} {following}"))
         if index > 0:
             flag = words[index - 1]
             if (
@@ -1326,10 +1337,20 @@ def _benign_env_assignment_after_selector(key: str, argument: str) -> bool:
     )
 
 
-def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
-    """Whether the argument following an authentication scheme may be its literal value."""
+_OperandKind = Literal["credential", "public", "unclassified"]
+
+
+def _scheme_operand_kind(word: str, *, credential_binding: bool) -> _OperandKind:
+    """How the argument following an authentication scheme reads.
+
+    ``credential`` may be the scheme's literal value and raises a finding. ``public`` is
+    positively a launch word of its own: a known switch, an ordinary option or setting,
+    a label. ``unclassified`` is neither. It raises no finding, but an unfamiliar, weak
+    or placeholder shape is not evidence that a value is public, so it stays out of
+    exports wherever the scheme rule withholds it.
+    """
     if len(word) < MIN_SECRET_LENGTH or is_reference(word):
-        return False
+        return "public"
     key, equals, argument = word.partition("=")
     if word.startswith("--") and _CLI_FLAG.fullmatch(key):
         body = key[2:]
@@ -1337,26 +1358,28 @@ def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
             if not credential_binding and _benign_cli_option_name(key, body, bare=False):
                 # Separate CLI option (e.g. --model=..., --tenant-id=...); its own word
                 # inspection still checks credential flag names and embedded token shapes.
-                return False
-            return literal_value(body) or literal_value(argument)
+                return "public"
+            return (
+                "credential" if literal_value(body) or literal_value(argument) else "unclassified"
+            )
         if (
             not equals
             and body.casefold().replace("-", "").replace("_", "") in _PUBLIC_SCHEME_SWITCHES
         ):
-            return False
+            return "public"
         if equals:
             if len(body) < MIN_SECRET_LENGTH:
-                return False
+                return "public" if argument == "" else "unclassified"
             if argument == "=":
-                return True
+                return "credential"
             if not credential_binding and _benign_cli_option_name(key, body, bare=True):
-                return False
-            return "-" not in body or literal_value(body)
-        if len(body) < MIN_SECRET_LENGTH or placeholder(body):
-            return False
-        if credential_binding:
-            return True
-        return not _benign_cli_option_name(key, body, bare=True)
+                return "public"
+            return "credential" if "-" not in body or literal_value(body) else "unclassified"
+        if len(body) < MIN_SECRET_LENGTH:
+            return "public"
+        if not credential_binding and _benign_cli_option_name(key, body, bare=True):
+            return "public"
+        return "unclassified" if placeholder(body) else "credential"
     # Padding belongs to the operand. Only a genuine option assignment has a
     # non-credential key and a nonempty value with no further equals sign.
     if (
@@ -1366,22 +1389,24 @@ def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
         and not literal_value(key)
     ):
         if not credential_binding and _benign_env_assignment_after_selector(key, argument):
-            return False
-        return literal_value(argument)
+            return "public"
+        return "credential" if literal_value(argument) else "unclassified"
     if _SCHEME_NUMBER.fullmatch(word):
-        return True
+        return "credential"
     if placeholder(word):
-        return False
+        # A launcher's own package (@example/server@1.0.0) holds a placeholder word too.
+        return "public" if not credential_binding and public_value(word) else "unclassified"
     if word.isascii() and word.isalpha():
         if credential_binding or len(word) >= 16:
-            return True
-        return (
+            return "credential"
+        unusual_case = (
             any(char.isupper() for char in word[1:])
             and _CAMEL_SWITCH.fullmatch(word) is None
             and not word.isupper()
         )
+        return "credential" if unusual_case else "public"
     if credential_binding:
-        return True
+        return "credential"
     if (
         word.isascii()
         and any(char.isupper() for char in word)
@@ -1389,18 +1414,38 @@ def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
         and any(char.isdigit() for char in word)
         and word.isalnum()
     ):
+        return "credential"
+    if literal_value(word):
+        return "credential"
+    return "public" if public_value(word) else "unclassified"
+
+
+def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
+    """Whether the argument following an authentication scheme may be its literal value."""
+    return _scheme_operand_kind(word, credential_binding=credential_binding) == "credential"
+
+
+def _public_scheme_following(
+    name: str, scheme: str, following: str, *, variable: bool, in_set: bool
+) -> bool:
+    """Whether the word after ``NAME=<scheme>`` is positively a public launch word."""
+    binding = (
+        _classify_scheme_assignment(name, scheme, variable=variable, in_set=in_set)
+        == "credential_binding"
+    )
+    if not binding and _public_mode_label(following):
         return True
-    return literal_value(word)
+    return _scheme_operand_kind(following, credential_binding=binding) == "public"
 
 
-def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = False) -> list[Hit]:
-    """The hits of a ``NAME=value`` word, ``--name=value`` and ``--env=NAME=value`` included.
+def _assigned(word: str) -> tuple[str, str, bool] | None:
+    """The name and value of a ``NAME=value`` word, and whether the name is a variable.
 
-    cmd's ``set API_TOKEN=Bearer <token>`` leaves the credential in the next word.
+    ``--env=NAME=value`` and its kin name the variable inside the flag's value.
     """
     name, equals, value = word.partition("=")
     if not equals or _requirement(name, value):
-        return []
+        return None
     variable = not name.startswith("-")
     name = name.lstrip("-").strip(" \"'")
     if name.lower() in _ASSIGNMENT_FLAGS and "=" in value:
@@ -1408,10 +1453,45 @@ def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = Fa
         name, _, value = value.strip(" \"'").partition("=")
         name = name.strip(" \"'")
         if _requirement(name, value):
-            return []
+            return None
     value = value.strip(" \"'")
     if not name or not value or name.lower() in {"h", "header"}:
+        return None
+    return name, value, variable
+
+
+def _withheld_scheme_operands(words: Sequence[str], *, cmd: bool) -> Iterator[str]:
+    """What the pairing rule reads after each ``NAME=<scheme>`` word of one command line.
+
+    ``_assignment_word_hits`` narrows the pairing to operands that read as credentials,
+    which decides the finding. Withholding fails closed: an operand it leaves unflagged
+    stays out of exports unless it is positively a public launch word. ``words`` are the
+    shell words of one argument, as ``_argument_hits`` pairs them.
+    """
+    for index in range(len(words) - 1):
+        assigned = _assigned(words[index])
+        if assigned is None:
+            continue
+        name, value, variable = assigned
+        if value.lower() not in _ASSIGNMENT_SCHEMES:
+            continue
+        in_set = cmd and _cmd_set_word(
+            words[index - 1] if index else None, words[index - 2] if index > 1 else None
+        )
+        following = words[index + 1]
+        if not _public_scheme_following(name, value, following, variable=variable, in_set=in_set):
+            yield from (literal for _, literal in value_hits(name, f"{value} {following}"))
+
+
+def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = False) -> list[Hit]:
+    """The hits of a ``NAME=value`` word, ``--name=value`` and ``--env=NAME=value`` included.
+
+    cmd's ``set API_TOKEN=Bearer <token>`` leaves the credential in the next word.
+    """
+    assigned = _assigned(word)
+    if assigned is None:
         return []
+    name, value, variable = assigned
     hits = value_hits(name, value)
     if following is None or value.lower() not in _ASSIGNMENT_SCHEMES:
         return hits
