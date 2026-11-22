@@ -2662,7 +2662,10 @@ class MCPScanner(Scanner):
             project_root, result, max_total_bytes=source_collection_bytes()
         ) as files:
             links: list[Path] = []
-            sources = list(files.iter_files(directory_links=links))
+            skipped: list[Path] = []
+            sources = list(files.iter_files(directory_links=links, observed_excludes=skipped))
+            cache_dirs = [p for p in skipped if p.name.casefold() == "__pycache__"]
+            walk_complete = not (files.failures_recorded or files.exclusions_recorded)
             linked, linked_gaps = _linked_client_files(files, links)
             nested, directory_gaps = self._nested_client_files(files, [*sources, *linked])
             directory_gaps.update(path.as_posix() for path in linked_gaps)
@@ -2684,7 +2687,9 @@ class MCPScanner(Scanner):
             )
             if known is not None:
                 self._read_host_settings(files, sources, links, known)
-                self._scan_code_mcp_clients(result, sources, known)
+                self._scan_code_mcp_clients(
+                    result, sources, known, [*links, *cache_dirs], walk_complete
+                )
 
         if not found_any and not result.scan_failures and not result.surfaces_excluded:
             result.surfaces_scanned.append("mcp-config (no config files found)")
@@ -4226,14 +4231,27 @@ class MCPScanner(Scanner):
                 known.add(configured)
 
     def _scan_code_mcp_clients(
-        self, result: ScanResult, sources: list[Path], known: KnownValues
+        self,
+        result: ScanResult,
+        sources: list[Path],
+        known: KnownValues,
+        unvisited: list[Path],
+        walk_complete: bool,
     ) -> None:
         if self._files is None:
             raise RuntimeError("_scan_code_mcp_clients called outside a _collection context")
         from nexus_symbiote.scanners.mcp_sources import collect_source_references
 
         budget = SourceBudget("MCP source references", result)
-        collect_source_references(self._files, result, sources, budget, known)
+        collect_source_references(
+            self._files,
+            result,
+            sources,
+            budget,
+            known,
+            unvisited=unvisited,
+            walk_complete=walk_complete,
+        )
 
     @staticmethod
     def _tokenize_identifier(text: str) -> set[str]:

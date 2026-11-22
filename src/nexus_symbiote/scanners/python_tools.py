@@ -31,25 +31,65 @@ def _names(words: str) -> frozenset[str]:
     return frozenset(words.split())
 
 
+class _PassiveModule(NamedTuple):
+    names: frozenset[str]
+    imports_stdlib: bool
+
+
 class _ProjectImports(NamedTuple):
-    """Python modules found by the confined source walk on common import paths."""
+    """Possible Python search roots and the files found by the confined walk."""
 
     sources: frozenset[Path]
-    roots: tuple[Path, ...]
+    entry_dir: Path
+    plain_modules: dict[Path, _PassiveModule]
+    entries: frozenset[Path]
+    uncertain_modules: frozenset[Path]
+    stdlib_search_clear: bool
 
-    def has_module(self, module: str) -> bool:
-        relative = Path(*module.split("."))
-        return any(
+    def _passive_names(self, path: Path) -> frozenset[str] | None:
+        module = self.plain_modules.get(path)
+        if module is None or (module.imports_stdlib and not self.stdlib_search_clear):
+            return None
+        return module.names
+
+    def _module_at(self, root: Path, relative: Path) -> bool:
+        return (
             root / relative.with_suffix(".py") in self.sources
             or root / relative / "__init__.py" in self.sources
-            for root in self.roots
+        ) and all(root / p / "__init__.py" in self.sources for p in relative.parents if p.parts)
+
+    def has_module(self, module: str) -> bool:
+        # A local exemption requires a regular module in every plausible first
+        # search root: the checkout for -m, the entry directory for a script,
+        # and the source root for a module installed from a src layout.
+        relative = Path(*module.split("."))
+        return (
+            self._module_at(Path(), relative)
+            and self._module_at(self.entry_dir, relative)
+            and (self.entry_dir.parts[:1] != ("src",) or self._module_at(Path("src"), relative))
         )
 
-    def shadows(self, module: str) -> bool:
-        while module:
-            if self.has_module(module):
+    def shadows(self, module: str, member: str | None = None) -> bool:
+        # Any unresolved first search root withholds SDK provenance. A passive
+        # sibling can only supply its own names or an existing package child.
+        name, dot, rest = module.partition(".")
+        for root in (Path(), Path("src"), self.entry_dir):
+            package = root / name
+            if package in self.uncertain_modules:
                 return True
-            module = module.rpartition(".")[0]
+            init = package / "__init__.py"
+            if init in self.sources:
+                names = self._passive_names(init)
+                child = rest.partition(".")[0] if dot else member
+                if names is None or child is None or package / child in self.entries:
+                    return True
+                if not dot and member in names:
+                    return True
+            flat = root / (name + ".py")
+            if flat in self.sources:
+                names = self._passive_names(flat)
+                if names is None or (not dot and (member is None or member in names)):
+                    return True
         return False
 
 
@@ -831,9 +871,10 @@ def _report_import_scope(
         stmt.module in modules and any(a.name == "*" for a in stmt.names) for stmt in imports
     ):
         result.surfaces_excluded.append(f"{path.as_posix()}: unresolved Python MCP factory import")
+    # Isolated and installed entry points may skip the checkout even when a
+    # regular package of the same name is present beside this file.
     qualified_sdk_import = any(
-        isinstance(node, ast.Import)
-        and any(_framework_module(a.name, project_imports) for a in node.names)
+        isinstance(node, ast.Import) and any(_framework_module(a.name, None) for a in node.names)
         for node in nodes
     )
     if qualified_sdk_import or _unrecognized_framework_import(
@@ -875,7 +916,7 @@ def _unrecognized_framework_import(
             if (module, a.name) in _DECORATOR_IMPORTS or (module, a.name) in _AGENT_FACTORIES:
                 continue
             if (module, a.name) in _NON_REGISTERING_IMPORTS and (
-                project_imports is None or not project_imports.shadows(module)
+                project_imports is None or not project_imports.shadows(module, a.name)
             ):
                 continue
             if a.name == "*":
@@ -1244,9 +1285,7 @@ _TYPE_BUILTINS = _names(
 # packages still need analysis when operators such as subscription evaluate them.
 _SDK_GENERICS = frozenset(
     {
-        ("agents", "Agent"),
         ("agents", "RunContextWrapper"),
-        ("agents.agent", "Agent"),
         ("agents.run_context", "RunContextWrapper"),
         ("fastmcp", "Context"),
         ("fastmcp.server", "Context"),
@@ -1256,10 +1295,29 @@ _SDK_GENERICS = frozenset(
         ("mcp.server.mcpserver", "Context"),
         ("pydantic_ai", "RunContext"),
         ("pydantic_ai.tools", "RunContext"),
-        *_AGENT_FACTORIES,
     }
 )
-_SDK_TYPES = _SDK_GENERICS | _FACTORIES
+_SDK_TYPES = (
+    _SDK_GENERICS | _FACTORIES | {("agents", "Agent"), ("agents.agent", "Agent"), *_AGENT_FACTORIES}
+)
+
+
+# Concrete SDK context parameters used by its public examples. They are safe as
+# direct arguments of the real Context generic, not operands of arbitrary code.
+_CONTEXT_ARGUMENTS = frozenset(
+    {
+        ("mcp", "ServerSession"),
+        ("mcp.server.session", "ServerSession"),
+        ("mcp.shared.context", "RequestContext"),
+        ("mcp.types", "Request"),
+        ("mcp.types", "ServerRequest"),
+        ("starlette.requests", "Request"),
+    }
+)
+_SDK_IMPORT_ROOTS = frozenset(
+    module.partition(".")[0]
+    for module, _ in _SDK_TYPES | _CONTEXT_ARGUMENTS | set(_DECORATOR_IMPORTS)
+)
 
 
 class _TypeSyntax:
@@ -1267,11 +1325,10 @@ class _TypeSyntax:
 
     Evaluating ``A | B`` hands each operand to the other's ``__or__`` or ``__ror__``,
     and FastMCP and ``typing.get_type_hints`` evaluate annotations whatever the
-    ``__future__`` import says. So a union is set aside only when every member is
-    pure type syntax: a constant, a name or attribute path that resolves to a
-    ``typing`` name, a builtin class, or a recognized SDK type, a subscript of
-    an applicable generic whose arguments are pure too, or such a
-    union. Each node is decided once, so the work stays linear in the nodes.
+    ``__future__`` import says. Plain builtin and typing expressions are checked
+    recursively. Optional server types are recognized separately. Combining
+    SDK objects, or passing a server class to an SDK subscript, remains visible
+    to registration analysis. Purity is cached per node.
     """
 
     def __init__(self, nodes: list[ast.AST], project_imports: _ProjectImports | None) -> None:
@@ -1279,16 +1336,23 @@ class _TypeSyntax:
         self._sdk_types = frozenset(
             identity
             for identity in _SDK_TYPES
-            if project_imports is None or not project_imports.shadows(identity[0])
+            if project_imports is None or not project_imports.shadows(*identity)
         )
         self._sdk_generics = _SDK_GENERICS & self._sdk_types
+        self._optional_types = (_FACTORIES | _SDK_GENERICS) & self._sdk_types
+        self._context_arguments = {
+            identity
+            for identity in _CONTEXT_ARGUMENTS
+            if project_imports is None or not project_imports.shadows(*identity)
+        }
+        known_classes = self._sdk_types | self._context_arguments
         bindings = _bindings(nodes)
         imported: dict[str, list[tuple[str, str]]] = {}
         for node in nodes:
             if isinstance(node, ast.ImportFrom) and not node.level and node.module is not None:
                 for alias in node.names:
                     identity = (node.module, alias.name)
-                    if identity in self._sdk_types:
+                    if identity in known_classes:
                         imported.setdefault(alias.asname or alias.name, []).append(identity)
         self._classes = {
             name: paths[0]
@@ -1312,11 +1376,6 @@ class _TypeSyntax:
             return None
         return ".".join((module, *reversed(attributes[1:]))), attributes[0]
 
-    def subscriptable(self, node: ast.expr) -> bool:
-        return (
-            _generic(node, self._names, self._roots) or self._sdk_type(node) in self._sdk_generics
-        )
-
     def _children(self, node: ast.AST) -> list[ast.AST] | None:
         """The parts whose purity decides ``node``'s, or None when it is not pure."""
         if isinstance(node, ast.Constant):
@@ -1324,16 +1383,11 @@ class _TypeSyntax:
         if isinstance(node, (ast.Name, ast.Attribute)):
             if isinstance(node, ast.Name) and node.id in self._builtins:
                 return []
-            return (
-                []
-                if _generic(node, self._names, self._roots)
-                or self._sdk_type(node) in self._sdk_types
-                else None
-            )
+            return [] if _generic(node, self._names, self._roots) else None
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
             return [node.left, node.right]
         if isinstance(node, ast.Subscript):
-            return [node.slice] if self.subscriptable(node.value) else None
+            return [node.slice] if _generic(node.value, self._names, self._roots) else None
         if isinstance(node, (ast.Tuple, ast.List)):
             return list(node.elts)
         return None
@@ -1359,6 +1413,21 @@ class _TypeSyntax:
             stack.pop()
         return known[node]
 
+    def _sdk_subscript(self, annotation: ast.Subscript) -> bool:
+        generic = self._sdk_type(annotation.value)
+        if generic is None or generic not in self._sdk_generics:
+            return False
+        if self.pure(annotation.slice):
+            return True
+        if generic[1] != "Context":
+            return False
+        arguments = (
+            annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
+        )
+        return all(
+            self.pure(arg) or self._sdk_type(arg) in self._context_arguments for arg in arguments
+        )
+
     def parts(self, annotations: Sequence[ast.expr]) -> set[ast.AST]:
         """The names, attributes of names and string constants used only as types."""
         pending = list(annotations)
@@ -1371,11 +1440,28 @@ class _TypeSyntax:
             elif isinstance(annotation, ast.Constant):
                 found.add(annotation)
             elif isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
-                if self.pure(annotation):
+                # A union of two SDK values can invoke SDK-defined operators.
+                # A simple optional SDK annotation retains its type-only use.
+                optional_sdk_type = any(
+                    (
+                        self._sdk_type(value) in self._optional_types
+                        or (isinstance(value, ast.Subscript) and self._sdk_subscript(value))
+                    )
+                    and isinstance(other, ast.Constant)
+                    and other.value is None
+                    for value, other in (
+                        (annotation.left, annotation.right),
+                        (annotation.right, annotation.left),
+                    )
+                )
+                if self.pure(annotation) or optional_sdk_type:
                     pending += (annotation.left, annotation.right)
             elif isinstance(annotation, (ast.Tuple, ast.List)):
                 pending += annotation.elts
-            elif isinstance(annotation, ast.Subscript) and self.subscriptable(annotation.value):
+            elif isinstance(annotation, ast.Subscript) and (
+                _generic(annotation.value, self._names, self._roots)
+                or self._sdk_subscript(annotation)
+            ):
                 found.update(_chain(annotation.value) or ())
                 pending.append(annotation.slice)
         return found
@@ -1393,8 +1479,8 @@ def _annotation_names(
     set aside: the whole annotation, a member of a ``|`` union of pure type syntax
     (see ``_TypeSyntax``), and an argument of a generic of ``typing``,
     ``typing_extensions`` or ``collections.abc``, such as ``Optional[...]``, of a
-    built-in generic such as ``list[...]``, or of a recognized SDK generic that
-    cannot resolve to a module in the checkout. A call, a walrus, any other
+    built-in generic such as ``list[...]``, or of a recognized SDK generic with only
+    plain type arguments. A call, a walrus, any other
     subscript or union and every other expression in an annotation is analyzed as code.
     """
     pending: list[ast.expr] = list(extra_roots)
@@ -2184,7 +2270,10 @@ def collect_python_tools(
         stmt
         for stmt in candidates
         if stmt.module is not None
-        and (project_imports is None or not project_imports.shadows(stmt.module))
+        and (
+            project_imports is None
+            or all(not project_imports.shadows(stmt.module, alias.name) for alias in stmt.names)
+        )
     ]
     if len(resolved) != len(candidates):
         result.surfaces_excluded.append(
