@@ -574,34 +574,40 @@ def _creators(index: _Index) -> set[str]:
     A name bound to any of them may be one, wherever it is bound, so the set only grows.
     """
     creators = {"createRequire"}
-    for node in index.nodes:
-        if node.id in index.erased:
-            continue
-        if node.type == "import_specifier":
-            if _imported_name(node.child_by_field_name("name")) == "createRequire":
-                alias = node.child_by_field_name("alias")
-                if alias is not None:
-                    creators.add(_name(alias))
-        elif node.type == "pair_pattern":
-            if _literal_key(node.child_by_field_name("key")) == "createRequire":
-                target = node.child_by_field_name("value")
-                if target is not None and target.type == "assignment_pattern":
-                    target = target.child_by_field_name("left")
-                if (alias_name := _identifier(target)) is not None:
-                    creators.add(alias_name)
-        elif node.type in {"variable_declarator", "assignment_expression"}:
-            value = _operand(
-                node.child_by_field_name("value" if node.type == "variable_declarator" else "right")
-            )
-            if value is not None and (
-                (value.type == "identifier" and _name(value) in creators)
-                or _property(value) == "createRequire"
-            ):
-                target = node.child_by_field_name(
-                    "name" if node.type == "variable_declarator" else "left"
+    for _ in range(8):
+        before = len(creators)
+        for node in index.nodes:
+            if node.id in index.erased:
+                continue
+            if node.type == "import_specifier":
+                if _imported_name(node.child_by_field_name("name")) == "createRequire":
+                    alias = node.child_by_field_name("alias")
+                    if alias is not None:
+                        creators.add(_name(alias))
+            elif node.type == "pair_pattern":
+                if _literal_key(node.child_by_field_name("key")) == "createRequire":
+                    target = node.child_by_field_name("value")
+                    if target is not None and target.type == "assignment_pattern":
+                        target = target.child_by_field_name("left")
+                    if (alias_name := _identifier(target)) is not None:
+                        creators.add(alias_name)
+            elif node.type in {"variable_declarator", "assignment_expression"}:
+                value = _operand(
+                    node.child_by_field_name(
+                        "value" if node.type == "variable_declarator" else "right"
+                    )
                 )
-                if (alias_name := _identifier(target)) is not None:
-                    creators.add(alias_name)
+                if value is not None and (
+                    (value.type == "identifier" and _name(value) in creators)
+                    or _property(value) == "createRequire"
+                ):
+                    target = node.child_by_field_name(
+                        "name" if node.type == "variable_declarator" else "left"
+                    )
+                    if (alias_name := _identifier(target)) is not None:
+                        creators.add(alias_name)
+        if len(creators) == before:
+            break
     return creators
 
 
@@ -673,6 +679,24 @@ def _bindings(index: _Index, root: Node) -> _Declarations:
                 scope = index.var_scope(parent) if kind.type == "var" else node
                 for loop_name in _pattern_names(node.child_by_field_name("left")):
                     bind(scope, loop_name, "other", node)
+    for _ in range(8):
+        before = len(found.loaders)
+        for node in index.nodes:
+            if node.id in index.erased:
+                continue
+            if node.type in {"variable_declarator", "assignment_expression"}:
+                rhs = _operand(
+                    node.child_by_field_name(
+                        "value" if node.type == "variable_declarator" else "right"
+                    )
+                )
+                if rhs is not None and rhs.type == "identifier" and _name(rhs) in found.loaders:
+                    lhs = node.child_by_field_name(
+                        "name" if node.type == "variable_declarator" else "left"
+                    )
+                    found.loaders.update(_pattern_names(lhs))
+        if len(found.loaders) == before:
+            break
     return found
 
 
@@ -1202,11 +1226,15 @@ def _collect_source(
         resolver.bind(scope, receiver, (server, node.end_byte))
         servers[node.id] = (server, node.end_byte)
     components: list[MCPServerComponent | ToolComponent] = [s for s, _ in servers.values()]
+    scalar_literals = frozenset(
+        {"number", "string", "template_string", "true", "false", "null", "undefined", "regex"}
+    )
     aliases = {
         node.id
         for node in index.nodes
         if node.type == "variable_declarator"
-        and _identifier(_operand(node.child_by_field_name("value"))) is not None
+        and (rhs := _operand(node.child_by_field_name("value"))) is not None
+        and rhs.type not in scalar_literals
     }
     assigned_builtins = _assigned_computed_builtins(index) if servers else set()
     registrations = 0

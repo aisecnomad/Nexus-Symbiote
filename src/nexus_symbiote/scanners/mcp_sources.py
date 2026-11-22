@@ -958,27 +958,41 @@ def _named_module(call: ast.Call) -> set[str]:
     return _argument_literals(call, containers=True)
 
 
-def _honest_loggers(nodes: list[ast.AST], loggers: set[str]) -> tuple[bool, set[str]]:
+def _honest_loggers(
+    nodes: list[ast.AST], loggers: set[str], *, stdlib_clear: bool = True
+) -> tuple[bool, set[str]]:
     """Whether ``logging.getLogger`` can only be the standard library's, and which of the
     names ``from logging import getLogger`` binds can only be that function.
 
     Assigning ``getLogger`` a loader, by rebinding a name, ``logging`` itself or one of
-    its attributes, turns a logger name into a module to load. So ``logging`` counts
-    only when every binding of it is ``import logging`` and it is only read for a
-    plain attribute, and an imported name only when no other binding gives it a value.
-    A star import from another module, and builtins or attributes that rebind names or
-    module attributes without naming them, withdraw every exemption.
+    its attributes (including through an alias such as ``import logging as L``), turns a
+    logger name into a module to load. A local ``logging.py`` or uncertain stdlib search
+    root also withdraws the exemption.
     """
-    watched = {"logging", *loggers}
+    if not stdlib_clear:
+        return False, set()
+    logging_aliases: set[str] = {"logging"}
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "logging" or alias.name.startswith("logging."):
+                    logging_aliases.add(alias.asname or alias.name.split(".")[0])
+    watched = logging_aliases | loggers
     rebound: set[str] = set()
     imported = False
-    reads = attributes = 0
+    reads: dict[str, int] = dict.fromkeys(logging_aliases, 0)
+    attributes: dict[str, int] = dict.fromkeys(logging_aliases, 0)
     for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 bound = alias.asname or alias.name.split(".")[0]
-                honest = bound == "logging" and (not alias.asname or alias.name == "logging")
-                imported = imported or honest
+                honest = (
+                    bound in logging_aliases
+                    and (not alias.asname or alias.name == "logging")
+                    and (alias.name == "logging" or alias.name.startswith("logging."))
+                )
+                if bound == "logging" and honest:
+                    imported = True
                 if bound in watched and not honest:
                     rebound.add(bound)
         elif isinstance(node, ast.ImportFrom):
@@ -996,19 +1010,24 @@ def _honest_loggers(nodes: list[ast.AST], loggers: set[str]) -> tuple[bool, set[
                 return False, set()
             if node.id in watched and not isinstance(node.ctx, ast.Load):
                 rebound.add(node.id)
-            reads += node.id == "logging" and isinstance(node.ctx, ast.Load)
+            if node.id in logging_aliases and isinstance(node.ctx, ast.Load):
+                reads[node.id] += 1
         elif isinstance(node, ast.Attribute):
             if node.attr in _REBINDING_ATTRIBUTES:
                 return False, set()
-            if isinstance(node.value, ast.Name) and node.value.id == "logging":
+            if isinstance(node.value, ast.Name) and node.value.id in logging_aliases:
                 if isinstance(node.ctx, ast.Load) and not node.attr.startswith("__"):
-                    attributes += 1
+                    attributes[node.value.id] += 1
                 else:
-                    rebound.add("logging")
+                    rebound.add(node.value.id)
         elif not isinstance(node, ast.alias):
             rebound.update(_bound_names([node]) & watched)
-    honest_module = imported and "logging" not in rebound and reads == attributes
-    return honest_module, loggers - rebound
+    # Any mutation or escaping read of any `logging` alias can mutate `logging.getLogger`.
+    module_tampered = any(
+        alias in rebound or reads[alias] != attributes[alias] for alias in logging_aliases
+    )
+    honest_module = imported and not module_tampered
+    return honest_module, (set() if module_tampered else loggers - rebound)
 
 
 def _exempt_call(func: ast.expr, owned: set[str], loggers: set[str], logging_module: bool) -> bool:
@@ -1114,7 +1133,10 @@ def _python_launches(tree: ast.Module, project_imports: _ProjectImports) -> list
                         if not star:
                             unused.add(alias.asname or name)
     loaders = _loader_aliases(nodes, loaders, bound_names)
-    logging_module, loggers = _honest_loggers(nodes, loggers)
+    stdlib_clear = project_imports is None or (
+        project_imports.stdlib_search_clear and not project_imports.has_module("logging")
+    )
+    logging_module, loggers = _honest_loggers(nodes, loggers, stdlib_clear=stdlib_clear)
     annotations = _annotation_names(nodes, project_imports=project_imports)
     for node in nodes:
         if isinstance(node, ast.Call):

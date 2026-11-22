@@ -24,6 +24,7 @@ PYTHON_TOOL_HINTS = (
     "function_tool",
     "smolagents",
     "pydantic_ai",
+    "agents",
 )
 
 
@@ -817,35 +818,68 @@ def _reaches_low_level(nodes: list[ast.AST]) -> bool:
     """Whether the file imports the low-level server or reaches it as an attribute.
 
     Any import of the low-level module, of ``Server``, ``lowlevel`` or ``*`` from
-    ``mcp.server``, and any attribute path from a name bound to ``mcp`` or
-    ``mcp.server`` to ``lowlevel`` or ``Server`` counts. Each attribute is decided once,
-    children before parents, so the work stays linear in the nodes.
+    ``mcp.server``, and any attribute path (including via simple variable aliases such as
+    ``s = mcp.server; s.Server(...)``) from a name bound to ``mcp`` or ``mcp.server`` to
+    ``lowlevel`` or ``Server`` counts. Earlier bindings are never erased by unrelated
+    imports of the same local name in dead branches.
     """
-    bound: dict[str, str | None] = {}
+    bound: dict[str, set[str]] = {}
     for node in nodes:
         if isinstance(node, ast.Import):
             for a in node.names:
                 if _low_level_state(a.name) == _LOW_LEVEL_MODULE:
                     return True
                 module = a.name if a.asname else a.name.split(".")[0]
-                bound[a.asname or module] = _low_level_state(module)
+                state = _low_level_state(module)
+                if state is not None:
+                    bound.setdefault(a.asname or module, set()).add(state)
         elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
             for a in node.names:
                 state = _low_level_step(_low_level_state(node.module), a.name)
                 if state == _LOW_LEVEL_MODULE or (a.name == "*" and node.module == "mcp.server"):
                     return True
                 if state is not None:
-                    bound[a.asname or a.name] = state
-    if not any(bound.values()):
+                    bound.setdefault(a.asname or a.name, set()).add(state)
+    if not bound:
         return False
-    states: dict[ast.AST, str | None] = {}
-    for node in reversed(nodes):
-        if isinstance(node, ast.Name):
-            states[node] = bound.get(node.id)
-        elif (access := _attribute_access(node)) is not None:
-            states[node] = _low_level_step(states.get(access[0]), access[1])
-            if states[node] == _LOW_LEVEL_MODULE:
-                return True
+    for _ in range(4):
+        states: dict[ast.AST, set[str]] = {}
+        for node in reversed(nodes):
+            if isinstance(node, ast.Name):
+                if node.id in bound:
+                    states[node] = set(bound[node.id])
+            elif (access := _attribute_access(node)) is not None:
+                parent_states = states.get(access[0])
+                if parent_states:
+                    next_states: set[str] = set()
+                    for st in parent_states:
+                        stepped = _low_level_step(st, access[1])
+                        if stepped == _LOW_LEVEL_MODULE:
+                            return True
+                        if stepped is not None:
+                            next_states.add(stepped)
+                    if next_states:
+                        states[node] = next_states
+        grew = False
+        for node in nodes:
+            if isinstance(node, ast.Assign):
+                val_states = states.get(node.value)
+                if val_states:
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            existing = bound.setdefault(target.id, set())
+                            before = len(existing)
+                            existing.update(val_states)
+                            grew = grew or len(existing) > before
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                val_states = states.get(node.value)
+                if val_states and isinstance(node.target, ast.Name):
+                    existing = bound.setdefault(node.target.id, set())
+                    before = len(existing)
+                    existing.update(val_states)
+                    grew = grew or len(existing) > before
+        if not grew:
+            break
     return False
 
 
