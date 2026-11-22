@@ -31,7 +31,11 @@ from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV
 from nexus_symbiote.scanners.mcp_sources import SOURCE_SEARCH_SKIPPED
 from nexus_symbiote.scanners.source_binding import BindingError, value_binding
 from nexus_symbiote.utils.confined import CollectionError, ConfinedCollection, fold_name
-from nexus_symbiote.utils.markdown import hidden_text, text_outside_code
+from nexus_symbiote.utils.markdown import (
+    front_matter_candidates,
+    hidden_text,
+    text_outside_code,
+)
 from nexus_symbiote.utils.terminal import neutralize
 from nexus_symbiote.utils.toml import loads as toml_loads
 
@@ -843,41 +847,11 @@ _ESCAPE = re.compile(
     re.S,
 )
 _NAMED_ESCAPES = {"L": "\u2028", "P": "\u2029", "N": "\x85", "_": "\xa0", "e": "\x1b"}
-# An opening line may name the language, as in `---yaml` or `--- toml`.
-_FRONT_MATTER = re.compile(
-    r"---[ \t]*([A-Za-z]*)[ \t]*\r?\n(.*?)^(?:---|\.\.\.)[ \t]*\r?$", re.S | re.M
-)
 _FRONT_MATTER_FORMATS = {"toml": "TOML", "json": "JSON"}
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
-def _escaped_text(relative: str, text: str, gaps: list[str]) -> str | None:
-    """What a JSON, YAML or TOML prompt file, or the YAML front matter of a Markdown
-    one, decodes to, or ``None`` when it holds no backslash.
-
-    YAML of at most ``_MAX_YAML_EVENTS`` events and ``_MAX_YAML_FLOW_DEPTH`` nested flow
-    collections and TOML within the dotted-key bound, each up to ``_MAX_PARSED_CHARACTERS``,
-    give the strings they parse to, one per line. JSON, which a host may read leniently,
-    with comments, duplicate keys or lone surrogates, and YAML or TOML that does not
-    parse or is past those bounds, give the text with
-    each escape that an odd run of backslashes starts decoded: ``\\xXX``, ``\\uXXXX``,
-    ``\\UXXXXXXXX``, YAML's ``\\L``, ``\\P``, ``\\N`` and ``\\_``, and ``\\e``. That
-    also decodes YAML and TOML escapes in a literal string or a comment, which only
-    adds findings. A backslash that ends a line is removed with the line break and the
-    indentation after it, as YAML and TOML continue a string. A surrogate pair is joined,
-    as a UTF-16 reader joins it. YAML or TOML decoded by pattern is a gap in ``gaps``.
-    """
-    body = text.removeprefix("\ufeff")
-    if "\\" not in body:
-        return None
-    kind = _ESCAPED_FORMATS.get(PurePosixPath(relative).suffix.lower())
-    what = kind
-    if kind is None:
-        front = _FRONT_MATTER.match(body) if _markup(relative) else None
-        if front is None or "\\" not in front.group(2):
-            return None
-        kind = _FRONT_MATTER_FORMATS.get(front.group(1).lower(), "YAML")
-        what, body = f"{kind} front matter", front.group(2)
+def _decode_escaped_payload(relative: str, kind: str, what: str, body: str, gaps: list[str]) -> str:
     if (
         kind != "JSON"
         and len(body) <= _MAX_PARSED_CHARACTERS
@@ -897,6 +871,46 @@ def _escaped_text(relative: str, text: str, gaps: list[str]) -> str | None:
             "escapes decoded by pattern, which may not decode them as a host does"
         )
     return _joined_surrogates(_ESCAPE.sub(_unescape, body))
+
+
+def _escaped_text(relative: str, text: str, gaps: list[str]) -> str | None:
+    """What a JSON, YAML or TOML prompt file, or the front matter of a Markdown
+    one, decodes to, or ``None`` when it holds no backslash.
+
+    YAML of at most ``_MAX_YAML_EVENTS`` events and ``_MAX_YAML_FLOW_DEPTH`` nested flow
+    collections and TOML within the dotted-key bound, each up to ``_MAX_PARSED_CHARACTERS``,
+    give the strings they parse to, one per line. JSON, which a host may read leniently,
+    with comments, duplicate keys or lone surrogates, and YAML or TOML that does not
+    parse or is past those bounds, give the text with
+    each escape that an odd run of backslashes starts decoded: ``\\xXX``, ``\\uXXXX``,
+    ``\\UXXXXXXXX``, YAML's ``\\L``, ``\\P``, ``\\N`` and ``\\_``, and ``\\e``. That
+    also decodes YAML and TOML escapes in a literal string or a comment, which only
+    adds findings. A backslash that ends a line is removed with the line break and the
+    indentation after it, as YAML and TOML continue a string. A surrogate pair is joined,
+    as a UTF-16 reader joins it. YAML or TOML decoded by pattern is a gap in ``gaps``.
+    """
+    body = text.removeprefix("\ufeff")
+    if "\\" not in body:
+        return None
+    kind = _ESCAPED_FORMATS.get(PurePosixPath(relative).suffix.lower())
+    if kind is not None:
+        return _decode_escaped_payload(relative, kind, kind, body, gaps)
+    if not _markup(relative):
+        return None
+    candidates = front_matter_candidates(text)
+    if not candidates:
+        return None
+    lang, first_raw, _ = candidates[0]
+    fm_kind = _FRONT_MATTER_FORMATS.get(lang, "YAML")
+    what = f"{fm_kind} front matter"
+    decoded: list[str] = []
+    if "\\" in first_raw:
+        decoded.append(_decode_escaped_payload(relative, fm_kind, what, first_raw, gaps))
+    if len(candidates) == 2:
+        wider_raw = candidates[1][1]
+        if "\\" in wider_raw[len(first_raw) :]:
+            decoded.append(_decode_escaped_payload(relative, fm_kind, what, wider_raw, gaps))
+    return "\n".join(decoded) if decoded else None
 
 
 def _flow_depth(text: str) -> int:

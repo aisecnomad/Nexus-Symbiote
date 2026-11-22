@@ -139,13 +139,10 @@ _TAKEN = re.compile(r"[`\]]")
 
 
 # Front matter, which hosts take out of a file before they read the rest as Markdown: a
-# `---` line that opens the file, possibly naming a language, to the next `---` or `...`
+# `---` line that opens the file, possibly naming a language, to the next closing delimiter
 # line. Where a reader keeps it, YAML in it can open a code fence that runs to the end.
-_FRONT_MATTER = re.compile(
-    r"\ufeff?---[ \t]*[A-Za-z]*[ \t]*(?:\r\n|\r|\n)(?:.*?(?:\r\n|\r|\n))??"
-    r"(?:---|\.\.\.)[ \t]*(?:\r\n|\r|\n|\Z)",
-    re.S,
-)
+_FRONT_MATTER_OPEN = re.compile(r"\ufeff?---[ \t]*+(?:([A-Za-z]++)[ \t]*+)?(?:\r\n|\r|\n)")
+_FRONT_MATTER_LINE_END = re.compile(r"\r\n|\r|\n")
 
 
 class _AmbiguousError(Exception):
@@ -172,10 +169,34 @@ class _Block:
     after_code: bool = False
 
 
-def _without_front_matter(text: str) -> str | None:
-    """``text`` after the front matter it opens with, or ``None`` when it has none."""
-    front = _FRONT_MATTER.match(text)
-    return None if front is None else text[front.end() :]
+def front_matter_candidates(text: str) -> list[tuple[str, str, str]]:
+    """Return ``(language, raw_front_matter, body)`` candidates for leading front matter.
+
+    TOML and JSON front matter close only on ``---`` so a ``...`` line inside a multiline
+    string cannot end them early. YAML front matter closes on ``---`` or ``...``; when
+    ``...`` appears before a later ``---``, both readings are returned so neither a
+    YAML-stream parser nor a ``---``-only parser (such as gray-matter) can hide content.
+    """
+    opened = _FRONT_MATTER_OPEN.match(text)
+    if opened is None:
+        return []
+    language = (opened.group(1) or "").lower()
+    allow_dots = language not in {"toml", "json"}
+    candidates: list[tuple[str, str, str]] = []
+    pos = opened.end()
+    end = len(text)
+    while pos < end:
+        nl = _FRONT_MATTER_LINE_END.search(text, pos)
+        line_end = end if nl is None else nl.start()
+        next_pos = end if nl is None else nl.end()
+        line = text[pos:line_end]
+        if line.startswith("---") and not line[3:].strip(" \t"):
+            candidates.append((language, text[opened.end() : pos], text[next_pos:]))
+            break
+        if allow_dots and not candidates and line.startswith("...") and not line[3:].strip(" \t"):
+            candidates.append((language, text[opened.end() : pos], text[next_pos:]))
+        pos = next_pos
+    return candidates
 
 
 def _union(first: tuple[str, ...] | list[str], second: tuple[str, ...] | list[str]) -> list[str]:
@@ -305,8 +326,9 @@ def text_outside_code(text: str) -> list[str]:
     reading are returned.
     """
     parts = _text_outside_code(text)
-    body = _without_front_matter(text)
-    return parts if body is None else _union(parts, _text_outside_code(body))
+    for _, _, body in front_matter_candidates(text):
+        parts = _union(parts, _text_outside_code(body))
+    return parts
 
 
 def _text_outside_code(text: str) -> list[str]:
@@ -937,14 +959,13 @@ def hidden_text(text: str) -> HiddenText:
     returned, each as often as the reading that holds it more often.
     """
     hidden = _hidden_text(text)
-    body = _without_front_matter(text)
-    if body is None:
-        return hidden
-    in_body = _hidden_text(body)
-    return HiddenText(
-        tuple(_union(hidden.definitions, in_body.definitions)),
-        tuple(_union(hidden.html, in_body.html)),
-    )
+    for _, _, body in front_matter_candidates(text):
+        in_body = _hidden_text(body)
+        hidden = HiddenText(
+            tuple(_union(hidden.definitions, in_body.definitions)),
+            tuple(_union(hidden.html, in_body.html)),
+        )
+    return hidden
 
 
 def _hidden_text(text: str) -> HiddenText:

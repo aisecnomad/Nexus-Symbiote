@@ -60,9 +60,14 @@ from nexus_symbiote.scanners.prompt import (
     _resolve_import,
 )
 from nexus_symbiote.utils.confined import ConfinedCollection, fold_name
-from nexus_symbiote.utils.markdown import commonmark_block_readings, hidden_text
+from nexus_symbiote.utils.markdown import (
+    commonmark_block_readings,
+    front_matter_candidates,
+    hidden_text,
+)
 from nexus_symbiote.utils.secrets import redact_metadata, redact_text
 from nexus_symbiote.utils.terminal import echo_line, json_text, neutralize
+from nexus_symbiote.utils.toml import loads as toml_loads
 
 FORMAT = "nexus-symbiote/instruction-diff/v1"
 MAX_FILES = 2000
@@ -77,10 +82,6 @@ TEXT_WITHHELD = "[text withheld: --show-text output limit reached]"
 # in a grant out of memory and output.
 _MAX_GRANT_CHARS = 512
 
-_FRONTMATTER_RE = re.compile(
-    r"\A---[ \t]*\r?\n(?:(.*?)\r?\n)?---[ \t]*(?:\r?\n|\Z)",
-    re.DOTALL,
-)
 _URL_RE = re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{1,31}://[^\s<>\"'`\)\]]+")
 _PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_/:])"
@@ -322,25 +323,38 @@ def _uses_frontmatter(rel_path: str) -> bool:
     )
 
 
+def _parse_frontmatter_payload(language: str, raw: str) -> dict[str, Any]:
+    if language == "toml":
+        parsed = toml_loads(raw)
+        if not isinstance(parsed, dict):
+            raise PolicyError("TOML front matter must be a mapping")
+        return parsed
+    return parse_yaml_mapping(raw, max_nodes=MAX_FRONTMATTER_NODES)
+
+
 def _parse_frontmatter(
     rel_path: str, content: str, failures: list[str]
 ) -> tuple[dict[str, Any], str]:
     if not _uses_frontmatter(rel_path):
         return {}, content
-    # Front-matter readers such as gray-matter drop a byte order mark before the delimiter.
-    unmarked = content.removeprefix("\ufeff")
-    match = _FRONTMATTER_RE.match(unmarked)
-    if match is None:
+    candidates = front_matter_candidates(content)
+    if not candidates:
         return {}, content
-    raw_yaml = match.group(1) or ""
-    body = unmarked[match.end() :]
-    if not raw_yaml.strip():
+    language, raw_fm, body = candidates[0]
+    if not raw_fm.strip():
         return {}, body
     try:
-        parsed = parse_yaml_mapping(raw_yaml, max_nodes=MAX_FRONTMATTER_NODES)
-    except (PolicyError, yaml.YAMLError, RecursionError):
-        failures.append(f"{rel_path}: invalid YAML front matter")
-        return _fallback_frontmatter_fields(raw_yaml), body
+        parsed = _parse_frontmatter_payload(language, raw_fm)
+    except (PolicyError, ValueError, yaml.YAMLError, RecursionError):
+        if len(candidates) == 2:
+            alt_lang, alt_raw, alt_body = candidates[1]
+            try:
+                return _parse_frontmatter_payload(alt_lang, alt_raw), alt_body
+            except (PolicyError, ValueError, yaml.YAMLError, RecursionError):
+                pass
+        label = language.upper() if language in {"toml", "json"} else "YAML"
+        failures.append(f"{rel_path}: invalid {label} front matter")
+        return _fallback_frontmatter_fields(raw_fm), body
     return parsed, body
 
 
@@ -508,12 +522,23 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
     fm_grants = _frontmatter_grants(meta)
 
     readings = commonmark_block_readings(body)
+    hidden = hidden_text(body)
+    if _uses_frontmatter(rel_path):
+        candidates = front_matter_candidates(content)
+        if len(candidates) == 2 and body == candidates[0][2]:
+            dash_body = candidates[1][2]
+            for dash_name, dash_blocks in commonmark_block_readings(dash_body).items():
+                readings[f"frontmatter-dash-{dash_name}"] = dash_blocks
+            dash_hidden = hidden_text(dash_body)
+            hidden = type(hidden)(
+                tuple((Counter(hidden.definitions) | Counter(dash_hidden.definitions)).elements()),
+                tuple((Counter(hidden.html) | Counter(dash_hidden.html)).elements()),
+            )
     blocks = (
         tuple(readings["common"])
-        if "common" in readings
+        if len(readings) == 1 and "common" in readings
         else tuple(dict.fromkeys(block for reading in readings.values() for block in reading))
     )
-    hidden = hidden_text(body)
     comments: list[str] = []
     pos = 0
     while (start := body.find("<!--", pos)) != -1:
