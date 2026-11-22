@@ -55,6 +55,9 @@ _RULE_REFERENCE_PREFIX = "rule:"
 _MAX_TAG_BODY_CHARS = 800
 _MAX_COMMENT_BODY_CHARS = 1_200
 _MAX_WHERE_CHARS = 160
+_MAX_UNRESOLVED_RISKS_PER_SURFACE = 16
+_MAX_OVERFLOW_LOCATIONS = 12
+_JSON_STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL)
 
 # Skill resources other than text declarations (scripts, images) are files the skill may
 # use, not text loaded as instructions; every other collected source is scanned.
@@ -663,10 +666,21 @@ def _json_strings_with_owners(
             inside_tool = (
                 inherited is not None and inherited.kind == "tool" and inherited.node is not node
             )
-            if not inside_tool and isinstance(label, str) and label in known:
-                if slot == "server":
+            if not inside_tool and slot == "server":
+                if isinstance(label, str) and label and (label in known or server is None):
                     server = label
+                elif server is None:
+                    server = ""
+            if not inside_tool and isinstance(label, str) and label in known:
                 by_name = _SourceOwner(label, node, slot, server)
+            elif (
+                not inside_tool
+                and slot == "server"
+                and server is not None
+                and by_name is None
+                and by_key is None
+            ):
+                by_name = _SourceOwner(server, node, "server", server)
             for key, val in node.items():
                 child = pointer if long else f"{pointer}/{_pointer_segment(key)}"
                 text = key[0] if isinstance(key, tuple) else key
@@ -685,7 +699,7 @@ def _json_strings_with_owners(
                 elif text == "tools":
                     kind = "tools"
                 inner = by_key
-                if text in known and isinstance(val, dict):
+                if isinstance(val, dict) and (text in known or slot == "servers"):
                     inner = _SourceOwner(text, val, kind, host)
                 queue.append(
                     (
@@ -838,12 +852,13 @@ def _decoded_source(
         if kind == "JSON":
             parsed = _parse_json_leniently(body)
             if raw_matches is not None:
-                # Strict JSON can contain separators that the JSONC lexer refuses.
-                # In that case keep the raw observations as well as the parsed tree.
                 try:
                     strip_jsonc(body, on_string=lambda a, b: raw_matches.bind(a, b, body, "JSON"))
                 except ValueError:
-                    pass
+                    # _parse_json_leniently succeeded while strip_jsonc refused U+2028/U+2029,
+                    # so body is valid strict JSON with no comments and every quoted token is a string.
+                    for match in _JSON_STRING_RE.finditer(body):
+                        raw_matches.bind(match.start(), match.end(), body, "JSON")
             return parsed, None
         if len(body) <= _MAX_PARSED_CHARS:
             if kind == "TOML":
@@ -1175,49 +1190,126 @@ def _mask_hidden_markdown_markup(text: str) -> str:
     )
 
 
+def _format_hit_location(hit: TextPoisoningHit) -> str:
+    return f"{hit.rule_id} at byte_offset={hit.byte_offset}" + (
+        f" of {neutralize(hit.where)[:_MAX_WHERE_CHARS]}" if hit.where else ""
+    )
+
+
+def _hit_sort_key(hit: TextPoisoningHit) -> tuple[str, int, bool, str]:
+    return (hit.where, hit.byte_offset, hit.rule_id == "TP-SIDENOTE-004", hit.rule_id)
+
+
 def _append_consolidated_risks(
     component: ComponentWithRisks,
     hits: list[TextPoisoningHit],
 ) -> int:
-    """Keep a separate file-level risk for each unresolved declaration."""
-    grouped: dict[tuple[str, str, int], list[TextPoisoningHit]] = {}
+    """Keep separate file-level risks for unresolved declarations up to a bounded cap."""
+    resolved: dict[tuple[str, str], list[TextPoisoningHit]] = {}
+    unresolved_by_surface: dict[tuple[str, str], dict[int, list[TextPoisoningHit]]] = {}
     for hit in hits:
-        grouped.setdefault((hit.category, hit.surface, hit.unresolved_declaration), []).append(hit)
+        surface_key = (hit.category, hit.surface)
+        if hit.unresolved_declaration:
+            unresolved_by_surface.setdefault(surface_key, {}).setdefault(
+                hit.unresolved_declaration, []
+            ).append(hit)
+        else:
+            resolved.setdefault(surface_key, []).append(hit)
 
+    recommendation = (
+        "Remove coercive tags, override directives, hidden instructions, or credential-relay "
+        "guidance from untrusted tool metadata, agent cards, or prompt files before loading into LLM context."
+    )
     added = 0
-    for (category, surface, unresolved), group in sorted(grouped.items()):
-        # The first location of each rule, so each offset is that of the rule printed beside
-        # it; TP-SIDENOTE-004 shares its trigger's location and is listed after it.
-        order = sorted(
-            group,
-            key=lambda h: (h.where, h.byte_offset, h.rule_id == "TP-SIDENOTE-004", h.rule_id),
-        )
-        located = [
-            f"{h.rule_id} at byte_offset={h.byte_offset}"
-            + (f" of {neutralize(h.where)[:_MAX_WHERE_CHARS]}" if h.where else "")
-            for h in order
-        ]
+
+    def emit(
+        category: str,
+        surface: str,
+        order: list[TextPoisoningHit],
+        owner: str,
+        *,
+        overflow_locations: list[TextPoisoningHit] | None = None,
+        total_locations: int | None = None,
+    ) -> None:
+        nonlocal added
+        shown_hits = order if overflow_locations is None else overflow_locations
+        located = [_format_hit_location(h) for h in shown_hits]
+        omitted = 0 if total_locations is None else max(0, total_locations - len(shown_hits))
+        extra = f" (+{omitted} more locations)" if omitted else ""
         first = order[0]
-        owner = "component ownership unresolved" if unresolved else neutralize(component.name)
         detail = (
             f"Surface '{neutralize(surface)}' ({owner}) matched "
-            f"{'; '.join(located)} (pack={RULE_PACK_VERSION}): {first.summary}. "
+            f"{'; '.join(located)}{extra} (pack={RULE_PACK_VERSION}): {first.summary}. "
             "Matched payload text is withheld."
         )
-        recommendation = (
-            "Remove coercive tags, override directives, hidden instructions, or credential-relay "
-            "guidance from untrusted tool metadata, agent cards, or prompt files before loading into LLM context."
-        )
+        references = list(dict.fromkeys(f"{_RULE_REFERENCE_PREFIX}{hit.rule_id}" for hit in order))
         component.risks.append(
             RiskAssessment(
                 severity=RiskSeverity.HIGH,
                 category=category,
                 detail=detail,
                 recommendation=recommendation,
-                references=[f"{_RULE_REFERENCE_PREFIX}{hit.rule_id}" for hit in order],
+                references=references,
             )
         )
         added += 1
+
+    all_keys = sorted(resolved.keys() | unresolved_by_surface.keys())
+    for category, surface in all_keys:
+        if (category, surface) in resolved:
+            # The first location of each rule, so each offset is that of the rule printed beside
+            # it; TP-SIDENOTE-004 shares its trigger's location and is listed after it.
+            order = sorted(resolved[(category, surface)], key=_hit_sort_key)
+            emit(category, surface, order, neutralize(component.name))
+        by_decl = unresolved_by_surface.get((category, surface))
+        if not by_decl:
+            continue
+
+        def unresolved_order(hit: TextPoisoningHit) -> tuple[bool, int, tuple[str, int, bool, str]]:
+            return (
+                hit.unresolved_declaration < 0,
+                abs(hit.unresolved_declaration),
+                _hit_sort_key(hit),
+            )
+
+        sorted_groups = sorted(
+            (sorted(group, key=_hit_sort_key) for group in by_decl.values()),
+            key=lambda g: unresolved_order(g[0]),
+        )
+        if len(sorted_groups) <= _MAX_UNRESOLVED_RISKS_PER_SURFACE:
+            for order in sorted_groups:
+                emit(category, surface, order, "component ownership unresolved")
+            continue
+        keep = _MAX_UNRESOLVED_RISKS_PER_SURFACE - 1
+        for order in sorted_groups[:keep]:
+            emit(category, surface, order, "component ownership unresolved")
+        overflow_groups = sorted_groups[keep:]
+        all_overflow = sorted(
+            (hit for group in overflow_groups for hit in group),
+            key=unresolved_order,
+        )
+        # Keep the earliest occurrence of every distinct rule in the overflow summary,
+        # then fill up to _MAX_OVERFLOW_LOCATIONS with the earliest remaining locations.
+        first_by_rule: dict[str, TextPoisoningHit] = {}
+        for hit in all_overflow:
+            first_by_rule.setdefault(hit.rule_id, hit)
+        shown = list(first_by_rule.values())
+        seen_ids = {id(h) for h in shown}
+        for hit in all_overflow:
+            if len(shown) >= _MAX_OVERFLOW_LOCATIONS:
+                break
+            if id(hit) not in seen_ids:
+                shown.append(hit)
+                seen_ids.add(id(hit))
+        shown.sort(key=unresolved_order)
+        emit(
+            category,
+            surface,
+            all_overflow,
+            f"component ownership unresolved across {len(overflow_groups)} additional declarations",
+            overflow_locations=shown,
+            total_locations=len(all_overflow),
+        )
     return added
 
 
@@ -1275,7 +1367,7 @@ class _RawMatches:
     def __init__(self, source: bytes, hits: list[TextPoisoningHit]) -> None:
         self.at: dict[int, list[TextPoisoningHit]] = {}
         self.by_value: dict[tuple[str, str], set[tuple[str, int]]] = {}
-        self.covered: set[tuple[str, int]] = set()
+        self.covered_owners: dict[tuple[str, int], set[tuple[str | None, int]]] = {}
         char = byte = 0
         for hit in sorted(hits, key=lambda h: h.byte_offset):
             char += len(source[byte : hit.byte_offset].decode("utf-8"))
@@ -1300,9 +1392,18 @@ class _RawMatches:
                     (hit.rule_id, hit.byte_offset)
                 )
 
-    def record(self, value: str, hits: list[TextPoisoningHit]) -> None:
+    def record(
+        self,
+        value: str,
+        hits: list[TextPoisoningHit],
+        *,
+        owner_ref: str | None,
+        unresolved: int,
+    ) -> None:
+        owner = (owner_ref, unresolved)
         for hit in hits:
-            self.covered.update(self.by_value.get((value, hit.rule_id), ()))
+            for raw_key in self.by_value.get((value, hit.rule_id), ()):
+                self.covered_owners.setdefault(raw_key, set()).add(owner)
 
 
 @dataclass
@@ -1313,6 +1414,7 @@ class _DeclarationFindings:
     unresolved: bool
     hits: list[TextPoisoningHit] = field(default_factory=list)
     text_values: list[str] = field(default_factory=list)
+    matched_values: list[tuple[str, list[TextPoisoningHit]]] = field(default_factory=list)
 
 
 def _scan_structured_source(
@@ -1332,25 +1434,37 @@ def _scan_structured_source(
     disambiguate shared names. Only unresolved declarations stay at file scope.
     """
     owners = _declaration_index(comps)
+    known_names = {comp.name for comp in comps}
+    collected_servers = {comp.name for comp in comps if isinstance(comp, MCPServerComponent)}
     linked_names = {name for name, kind, host in owners if kind == "tool" and host is not None}
     tool_names = {comp.name for comp in comps if isinstance(comp, ToolComponent)}
     file_owner = _file_level_owner(comps, root_agent)
     fallback = _fallback_component(comps, root_agent) if comps else root_agent
     groups: dict[tuple[str | None, int], _DeclarationFindings] = {}
     for pointer, value, owner, is_key in _json_strings_with_owners(
-        parsed, (comp.name for comp in comps), keys=include_keys
+        parsed, known_names, keys=include_keys
     ):
         target, node, ambiguous = fallback, None, False
         if owner is not None:
             node = owner.node
             typed_key = (owner.name, owner.kind, None)
             scoped_key = (owner.name, owner.kind, owner.server)
-            if owner.kind == "tool" and owner.server is not None and owner.name in linked_names:
-                target = owners.get(scoped_key)
-            elif owner.kind in ("tool", "server"):
+            if owner.kind == "tool" and owner.server is not None:
+                if owner.name in linked_names:
+                    target = owners.get(scoped_key)
+                elif collected_servers and owner.server not in collected_servers:
+                    target = None
+                else:
+                    target = owners.get(typed_key)
+            elif owner.kind == "server":
+                if collected_servers or owner.name in known_names:
+                    target = owners.get(typed_key)
+                else:
+                    target = fallback
+            elif owner.kind == "tool":
                 target = owners.get(typed_key)
             else:
-                target = owners[owner.name, "", None]
+                target = owners.get((owner.name, "", None))
             ambiguous = target is None
             if ambiguous:
                 target = file_owner
@@ -1379,8 +1493,8 @@ def _scan_structured_source(
             where=pointer or ("$" if include_keys else ""),
         )
         group.hits.extend(hits)
-        if raw_matches is not None:
-            raw_matches.record(value, hits)
+        if raw_matches is not None and hits:
+            group.matched_values.append((value, hits))
         if has_tool_schema and not is_key:
             group.text_values.append(value)
     results: _SourceFindings = []
@@ -1407,6 +1521,11 @@ def _scan_structured_source(
                 surface=rel_path,
                 existing_hits=hits,
             )
+        unresolved = ordinal if group.unresolved else 0
+        if raw_matches is not None and group.matched_values:
+            owner_ref = None if target is None else target.bom_ref
+            for value, matched in group.matched_values:
+                raw_matches.record(value, matched, owner_ref=owner_ref, unresolved=unresolved)
         if group.unresolved:
             hits = [replace(hit, unresolved_declaration=ordinal) for hit in hits]
         results.append((target, hits))
@@ -1436,8 +1555,9 @@ def _scan_text_source(
         scan_input = _mask_hidden_markdown_markup(raw_text)
     hits = scan_text_block(scan_input, surface=rel_path, is_tool_surface=is_tool_ctx)
     shared_names = _shared_names(comps)
+    structured_attribution = bool(shared_names) or (is_tool_ctx and suffix in _DECODED_FORMATS)
     raw_bytes = raw_text.encode("utf-8") if hits else b""
-    raw_matches = _RawMatches(raw_bytes, hits) if shared_names and hits else None
+    raw_matches = _RawMatches(raw_bytes, hits) if structured_attribution and hits else None
     tree, span = _decoded_source(rel_path, raw_text, raw_matches=raw_matches)
     if span is not None:
         located = {(h.rule_id, h.byte_offset) for h in hits}
@@ -1464,8 +1584,6 @@ def _scan_text_source(
     )
     by_target: dict[str | None, tuple[ComponentWithRisks | None, list[TextPoisoningHit]]] = {}
     for h in hits:
-        if raw_matches is not None and (h.rule_id, h.byte_offset) in raw_matches.covered:
-            continue
         chosen = _attribute_source_component(
             raw_text,
             raw_bytes,
@@ -1477,9 +1595,13 @@ def _scan_text_source(
         if shared_names and (chosen is None or chosen is root_agent or chosen.name in shared_names):
             chosen = file_owner
             h = replace(h, unresolved_declaration=-(h.byte_offset + 1))
+        chosen_ref = None if chosen is None else chosen.bom_ref
+        if raw_matches is not None:
+            covered = raw_matches.covered_owners.get((h.rule_id, h.byte_offset))
+            if covered and (shared_names or covered != {(chosen_ref, 0)}):
+                continue
         if chosen is not None or shared_names:
-            ref = None if chosen is None else chosen.bom_ref
-            by_target.setdefault(ref, (chosen, []))[1].append(h)
+            by_target.setdefault(chosen_ref, (chosen, []))[1].append(h)
     if decoded_groups:
         # A decoded string is reported at its pointer, as in a JSON source, unless the raw
         # text already gave its owner the same rule.
