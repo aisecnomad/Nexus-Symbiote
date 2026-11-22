@@ -211,19 +211,47 @@ def _only_html_disagrees(exc: _AmbiguousError, readers: list[_Reader]) -> bool:
     )
 
 
-def _import_boundaries(blocks: list[tuple[str, str]]) -> list[str]:
+def _adjacent_container_imports(lines: list[str], eligible: set[str] | None = None) -> list[str]:
+    """Recover only paired spans spanning consecutive prose lines with container marks."""
+    parts: list[str] = []
+    group: list[str] = []
+
+    def finish() -> None:
+        if len(group) > 1:
+            content = "\n".join(group)
+            if "`@" in content:
+                paired = _outside_spans(content, import_boundaries_only=True)
+                if paired != content:
+                    parts.append(paired)
+        group.clear()
+
+    for line in lines:
+        mark = _CONTAINER_MARKS.match(line)
+        if mark is not None and mark[0].strip():
+            bare = line[mark.end() :]
+            if bare.strip() and (eligible is None or bare in eligible):
+                group.append(bare)
+                continue
+        finish()
+    finish()
+    return parts
+
+
+def _import_boundaries(blocks: list[tuple[str, str]], lines: list[str]) -> list[str]:
+    if not any("`@" in line for line in lines):
+        return []
     parts = []
+    eligible: set[str] = set()
     for kind, content in blocks:
-        if kind not in {"paragraph", "heading"} or "`@" not in content:
+        if kind not in {"paragraph", "heading"}:
+            continue
+        eligible.update(content.split("\n"))
+        if "`@" not in content:
             continue
         inline = _outside_spans(content, import_boundaries_only=True)
-        if inline == content:
-            # An earlier container can hold the opening backtick. Preserve the
-            # literal filename that follows a possible close in this block.
-            inline = re.sub(r"(?<=[^\s`])`++(?=@)", " ", content)
         if inline != content:
             parts.append(inline)
-    return parts
+    return parts + _adjacent_container_imports(lines, eligible)
 
 
 def text_outside_code(text: str) -> list[str]:
@@ -258,13 +286,14 @@ def _text_outside_code(text: str) -> list[str]:
             parts: list[str] = []
             for alternative in readers:
                 parts = _union(
-                    parts, _union(alternative.parts, _import_boundaries(alternative.blocks))
+                    parts, _union(alternative.parts, _import_boundaries(alternative.blocks, lines))
                 )
             return parts
         # A quote marker or a closing code span can put an import at the start of
         # rendered text even when the raw file has no whitespace before its @.
         alternatives = [text]
         if "`@" in text:
+            alternatives.extend(_adjacent_container_imports(lines))
             across_lines = _outside_spans(text, import_boundaries_only=True)
             if across_lines != text:
                 alternatives.append(across_lines)
@@ -283,12 +312,6 @@ def _text_outside_code(text: str) -> list[str]:
                         rendered = _outside_spans(bare)
                         if rendered != inline:
                             alternatives.append(rendered)
-                    else:
-                        # The opener may be on an earlier line. Keep backticks in
-                        # the filename and leave ordinary inline-code examples alone.
-                        boundary = re.sub(r"(?<=[^\s`])`++(?=@)", " ", bare)
-                        if boundary != bare:
-                            alternatives.append(boundary)
         for alternative in readers:
             alternatives = _union(alternatives, alternative.parts)
         return alternatives
