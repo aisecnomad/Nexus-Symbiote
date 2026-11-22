@@ -103,7 +103,7 @@ fields call for one that its findings no longer carry, as in an edited inventory
 explains how some of these are classified, such as when a `.bin` file is critical and
 which characters count as hidden.
 
-For MCP `credential_exposure`, a named credential can span two arguments, including a numeric or option-shaped value. A transport switch after an authentication-mode selector remains an option. In a refused server record, a value-only field can supply credential evidence when its value is credential-shaped.
+For MCP `credential_exposure`, a named credential can span two arguments, including a numeric or option-shaped value. Separate CLI switches and option assignments after an authentication-mode selector remain options and are evaluated under their own flag names. In a refused server record, a value-only field can supply credential evidence when its value is credential-shaped.
 
 For registry identifiers, a complete ordinary component such as `desk`, `risk`, `kiosk` or `task` can end in the letters `sk`. The collector preserves those package identities when the suffix lacks specific provider evidence. A qualified provider key can still be withheld at the same boundary.
 

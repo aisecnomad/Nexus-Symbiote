@@ -32,7 +32,7 @@ from dataclasses import dataclass, replace
 from datetime import date
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 from packaging.utils import canonicalize_name
@@ -1038,6 +1038,10 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
         values.extend(_shape_secrets(value))
     for _, source_value in launch.sources:
         values.extend(_url_secrets(source_value))
+    cmd = bool(command) and posixpath.basename(command.replace("\\", "/")).casefold() in {
+        "cmd",
+        "cmd.exe",
+    }
     words = _launch_words(
         [*([command] if command else []), *(a for a in args if isinstance(a, str))]
     )
@@ -1054,8 +1058,20 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
                 # cmd's `set API_TOKEN=Bearer <token>` leaves the credential in the next word.
                 if index + 1 < len(words) and secret_like(name, f"{value} {words[index + 1]}"):
                     if value.lower() in _ASSIGNMENT_SCHEMES:
+                        prev = words[index - 1] if index > 0 else None
+                        raw_before = words[index - 2] if index > 1 else None
+                        before = (
+                            None
+                            if raw_before is not None and any(c.isspace() for c in raw_before)
+                            else raw_before
+                        )
                         values.extend(
-                            literal for _, literal in _assignment_word_hits(word, words[index + 1])
+                            literal
+                            for _, literal in _assignment_word_hits(
+                                word,
+                                words[index + 1],
+                                in_set=cmd and _cmd_set_word(prev, before),
+                            )
                         )
                     elif _scheme_assignment_name(name, variable=not word.startswith("-")):
                         values.extend(scheme_credentials(f"{value} {words[index + 1]}"))
@@ -1083,7 +1099,7 @@ _ASSIGNMENT_FLAGS = frozenset({"env", "e", "build-arg"})
 _ASSIGNMENT_SCHEMES = frozenset({"bearer", "basic", "token", "bot", "apikey", "api-key"})
 _SCHEME_DESCRIPTORS = frozenset({"type", "mode", "scheme", "method", "transport", "strategy"})
 _PUBLIC_TOKEN_SELECTORS = frozenset({"format", "source", "profile", "output", "kind"})
-# These common switches can follow a mode selector in a launch declaration.
+# These common switches can follow a credential binding in a launch declaration.
 # Normalize spelling only for the comparison; exports keep the original text.
 _PUBLIC_SCHEME_SWITCHES = _names(
     "transport stateless privileged verbose readonly dryrun version debug help quiet "
@@ -1092,13 +1108,30 @@ _PUBLIC_SCHEME_SWITCHES = _names(
     "production telemetry recursive localhost maxconcurrentrequests enableautomaticupdates"
 )
 _LOWER_LONG_OPTION = re.compile(r"--[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
+_LOWER_CLI_DIGIT_SEGMENT = re.compile(r"(?:[a-z]{1,10}[0-9]{1,3}|[a-z][0-9]{1,2}[a-z])")
 _CAMEL_SWITCH = re.compile(r"[A-Za-z][a-z]+(?:[A-Z][a-z]+)+")
-# A short public version or date label after a mode selector (e.g. Workspace2,
-# WorkspaceV2, OpenAPI3, 20250618). Mixed-case tokens with multiple digits or
-# random runs stay private.
-_MODE_LABEL = re.compile(
-    r"(?:(?:[A-Z][a-z]{2,10}|OpenAPI|OAuth|HTTP|TLS|SAML|OIDC|GraphQL|JSON|YAML|GRPC)[Vv]?[0-9]|[0-9]{8})"
+_CLI_ACRONYMS = (
+    r"(?:HTTPS|HTTP[23]|HTTP|TLS1[23]|TLS|MTLS|SSL|SSH|URL|URI|JSONL|JSON|YAML|TOML|XML|CSV|"
+    r"SQL|SSE|MCP|GRPC|RPC|REST|API|SDK|CLI|TTY|ANSI|UTF16|UTF8|UTF|DNS|TCP|UDP|IPC|PID|"
+    r"CORS|CSRF|OIDC|SAML|JWKS|JWK|JWT|PEM|DER|AWS|GCP|IAM|KMS|HSM|IP[Vv][46]|IP|IO|FS|DB|UI|"
+    r"OS|CA|SNI|ALPN|UUID|ID|EOF|HTML|DOM|WASM|GPU|CPU|RAM|LLM|RAG|A2A|SBOM|VEX|OAuth2|OAuth)"
 )
+_ACRONYM_CLI_SWITCH = re.compile(
+    rf"(?:[a-z]{{2,}}(?:[A-Z][a-z]+)*{_CLI_ACRONYMS}(?:[A-Z][a-z]+)*"
+    rf"|{_CLI_ACRONYMS}(?:[A-Z][a-z]+)+)"
+)
+# A short public version or date label after a mode selector (e.g. Workspace2,
+# Workspace10, WorkspaceV2, OpenAPI3, OpenAPI3.1, 20250618). Mixed-case tokens
+# or random alphanumeric runs stay private.
+_MODE_LABEL = re.compile(
+    r"(?:(?:[A-Z][a-z]{2,10}|OpenAPI|OAuth|HTTP|TLS|SAML|OIDC|GraphQL|JSON|YAML|GRPC)"
+    r"[Vv]?[0-9]{1,2}(?:\.[0-9]{1,2})?|[0-9]{8})"
+)
+_BENIGN_ENV_KEY = re.compile(r"[A-Z]{2,15}(?:_[A-Z0-9]{1,15}){0,4}")
+_PUBLIC_UUID = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_RELEASE_VERSION_SEGMENT = re.compile(r"[0-9]{1,2}(?:\.[0-9]{1,2})?[a-z]?|(?:19|20)[0-9]{2}")
 _SCHEME_NUMBER = re.compile(r"[+]?[0-9]+(?:[.][0-9]+)?")
 _SCHEME_ASSIGNMENT_OPERAND = re.compile(r"[A-Za-z0-9_-]+=[A-Za-z0-9_+=-]+")
 # curl's `-u user:password`, also in a cluster of short flags (`-su`), and httpie's `-a`
@@ -1154,6 +1187,8 @@ _SCHEME_AUTH_WORDS = frozenset(
     }
 )
 
+_SchemeAssignmentKind = Literal["credential_binding", "mode_selector", "public_selector"]
+
 
 def _scheme_assignment_name(name: str, *, variable: bool = True) -> bool:
     words = name_words(name)
@@ -1174,19 +1209,121 @@ def _scheme_assignment_name(name: str, *, variable: bool = True) -> bool:
     )
 
 
-def _benign_selector_switch(key: str, body: str) -> bool:
-    """Whether a bare ``--option`` after a mode selector reads as a normal CLI switch."""
-    if len(body) < 32 and not any(char.isdigit() for char in body):
-        if "-" in body and _LOWER_LONG_OPTION.fullmatch(key):
+def _classify_scheme_assignment(
+    name: str, scheme: str, *, variable: bool, in_set: bool
+) -> _SchemeAssignmentKind:
+    """Distinguish a credential binding from an authentication-mode or public selector."""
+    if in_set or _scheme_assignment_name(name, variable=variable):
+        return "credential_binding"
+    words = name_words(name)
+    if (
+        not variable
+        and scheme.lower() == "token"
+        and words
+        and words[-1] in _PUBLIC_TOKEN_SELECTORS
+        and not credential_name(name)
+        and not any(credential_name(word) for word in words[:-1])
+        and _SCHEME_AUTH_WORDS.isdisjoint(words[:-1])
+    ):
+        return "public_selector"
+    return "mode_selector"
+
+
+def _is_valid_iso_date(digits: str) -> bool:
+    if len(digits) != 8 or not digits.isdecimal():
+        return False
+    try:
+        date.fromisoformat(digits)
+    except ValueError:
+        return False
+    return True
+
+
+def _public_mode_label(word: str) -> bool:
+    """Whether ``word`` is a short public version or ISO date label after a mode selector."""
+    if len(word) > 12 or _MODE_LABEL.fullmatch(word) is None:
+        return False
+    return _is_valid_iso_date(word) if word.isdecimal() else True
+
+
+def _public_release_identifier(value: str) -> bool:
+    """Whether ``value`` is a structured model or release identifier (e.g. claude-sonnet-4-20250514)."""
+    if len(value) >= 48 or "-" not in value or not value.isascii():
+        return False
+    segments = value.split("-")
+    if not (2 <= len(segments) <= 6):
+        return False
+    has_word = False
+    for segment in segments:
+        if not segment or len(segment) > 15:
+            return False
+        if segment.isalpha() and segment.islower():
+            if len(segment) >= 3:
+                has_word = True
+            continue
+        if _RELEASE_VERSION_SEGMENT.fullmatch(segment) or _is_valid_iso_date(segment):
+            continue
+        return False
+    return has_word
+
+
+def _benign_delimited_option(segments: list[str]) -> bool:
+    """Whether lowercase segments of a ``--foo-bar`` or ``--foo_bar`` option are normal CLI words."""
+    digit_segments = 0
+    has_word = False
+    for segment in segments:
+        if not segment:
+            return False
+        if segment.isalpha() and segment.islower():
+            if len(segment) >= 2:
+                has_word = True
+            continue
+        if _LOWER_CLI_DIGIT_SEGMENT.fullmatch(segment):
+            digit_segments += 1
+            if digit_segments > 1:
+                return False
+            continue
+        return False
+    return has_word
+
+
+def _benign_cli_option_name(key: str, body: str, *, bare: bool) -> bool:
+    """Whether ``--<body>`` reads as an ordinary CLI option name rather than an opaque secret."""
+    if not (2 <= len(body) < 32) or not body.isascii():
+        return False
+    if "-" in body:
+        if "_" in body or _LOWER_LONG_OPTION.fullmatch(key) is None:
+            return False
+        return _benign_delimited_option(body.split("-"))
+    if "_" in body:
+        max_len = 16 if bare else 24
+        if len(body) >= max_len or not body.islower():
+            return False
+        return _benign_delimited_option(body.split("_"))
+    if _ACRONYM_CLI_SWITCH.fullmatch(body):
+        return True
+    if body.isalpha():
+        if _CAMEL_SWITCH.fullmatch(body):
             return True
-        if "_" in body and len(body) < 16 and body.replace("_", "").islower():
+        if len(body) < 16 and (body.islower() or (body[0].isupper() and body[1:].islower())):
             return True
-        if body.isascii() and body.isalpha():
-            if _CAMEL_SWITCH.fullmatch(body):
-                return True
-            if len(body) < 16 and (body.islower() or (body[0].isupper() and body[1:].islower())):
-                return True
     return False
+
+
+def _benign_env_assignment_after_selector(key: str, argument: str) -> bool:
+    """Whether ``KEY=value`` after a mode selector is a separate non-credential env assignment."""
+    if (
+        not (3 <= len(key) < 32)
+        or _BENIGN_ENV_KEY.fullmatch(key) is None
+        or credential_name(key)
+        or _scheme_assignment_name(key, variable=True)
+    ):
+        return False
+    return (
+        not literal_value(argument)
+        or _PUBLIC_UUID.fullmatch(argument) is not None
+        or _public_release_identifier(argument)
+    )
 
 
 def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
@@ -1197,29 +1334,29 @@ def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
     if word.startswith("--") and _CLI_FLAG.fullmatch(key):
         body = key[2:]
         if equals and argument not in {"", "="}:
-            if credential_binding and literal_value(body):
-                return True
-            return literal_value(argument)
+            if not credential_binding and _benign_cli_option_name(key, body, bare=False):
+                # Separate CLI option (e.g. --model=..., --tenant-id=...); its own word
+                # inspection still checks credential flag names and embedded token shapes.
+                return False
+            return literal_value(body) or literal_value(argument)
         if (
             not equals
             and body.casefold().replace("-", "").replace("_", "") in _PUBLIC_SCHEME_SWITCHES
         ):
             return False
         if equals:
-            return len(body) >= MIN_SECRET_LENGTH and (
-                argument == "=" or "-" not in body or literal_value(body)
-            )
+            if len(body) < MIN_SECRET_LENGTH:
+                return False
+            if argument == "=":
+                return True
+            if not credential_binding and _benign_cli_option_name(key, body, bare=True):
+                return False
+            return "-" not in body or literal_value(body)
         if len(body) < MIN_SECRET_LENGTH or placeholder(body):
             return False
         if credential_binding:
             return True
-        if _benign_selector_switch(key, body):
-            return False
-        return (
-            len(body) >= 16
-            or any(char.isdigit() for char in body)
-            or (body.isascii() and not body.islower())
-        )
+        return not _benign_cli_option_name(key, body, bare=True)
     # Padding belongs to the operand. Only a genuine option assignment has a
     # non-credential key and a nonempty value with no further equals sign.
     if (
@@ -1228,6 +1365,8 @@ def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
         and _SCHEME_ASSIGNMENT_OPERAND.fullmatch(word)
         and not literal_value(key)
     ):
+        if not credential_binding and _benign_env_assignment_after_selector(key, argument):
+            return False
         return literal_value(argument)
     if _SCHEME_NUMBER.fullmatch(word):
         return True
@@ -1276,16 +1415,8 @@ def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = Fa
     hits = value_hits(name, value)
     if following is None or value.lower() not in _ASSIGNMENT_SCHEMES:
         return hits
-    words = name_words(name)
-    if (
-        not variable
-        and value.lower() == "token"
-        and words
-        and words[-1] in _PUBLIC_TOKEN_SELECTORS
-        and not credential_name(name)
-        and not any(credential_name(word) for word in words[:-1])
-        and _SCHEME_AUTH_WORDS.isdisjoint(words[:-1])
-    ):
+    kind = _classify_scheme_assignment(name, value, variable=variable, in_set=in_set)
+    if kind == "public_selector":
         return hits
     if in_set:
         # cmd's SET takes the rest of the assignment, including a literal
@@ -1298,19 +1429,11 @@ def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = Fa
         ):
             hits.extend(value_hits(name, f"{value} {following}") or [(SCHEME_CLASS, following)])
             return hits
-    credential_binding = in_set or _scheme_assignment_name(name, variable=variable)
-    # Only a selector can explain a short date or version label. An unfamiliar
+    credential_binding = kind == "credential_binding"
+    # Only a mode selector can explain a short date or version label. An unfamiliar
     # switch or an ordinary alphabetic word can itself be a bearer credential.
-    if not credential_binding and len(following) <= 12 and _MODE_LABEL.fullmatch(following):
-        if not following.isdecimal():
-            return hits
-        try:
-            date.fromisoformat(following)
-        except ValueError:
-            # Only a valid public date can account for an eight-digit mode label.
-            pass
-        else:
-            return hits
+    if not credential_binding and _public_mode_label(following):
+        return hits
     if is_reference(following):
         hits.extend(value_hits(name if credential_binding else "token", following))
         return hits

@@ -232,3 +232,194 @@ def test_non_assignment_digest_selector_keeps_public_package_spec(tmp_path: Path
     )
     assert "@example/mcp-server@1.0.0" in inventory.to_json()
     assert not has_exposure(result)
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "--auth-type=bearer",
+        "--auth=token",
+        "--auth-mode=basic",
+        "--authentication=bearer",
+        "--auth-header=bearer",
+        "--token-source=token",
+        "--env=AUTH_TYPE=Bearer",
+    ],
+)
+@pytest.mark.parametrize(
+    "public_arg",
+    [
+        "--no-http2",
+        "--http2-only",
+        "--ipv4-only",
+        "--oauth2-pkce",
+        "--tls13-only",
+        "--s3-bucket",
+        "--utf8-mode",
+        "--sha256-verify",
+        "--k8s-context",
+        "--no_http2",
+        "--enableTLS",
+        "--disableSSL",
+        "--allowHTTP2",
+        "--noHTTP2",
+        "--enableMTLS",
+        "--useJSON",
+        "--enableMCP",
+        "--allowSSE",
+        "--disableCORS",
+        "--enableIPv4",
+        "--TLSMode",
+        "--HTTPProxy",
+        "--model=claude-sonnet-4-20250514",
+        "--tenant-id=18ac72c8-1813-4200-9ff1-a800cbcda102",
+        "--workspace=team-alpha-2025",
+        "--no-http2=true",
+        "--enableTLS=true",
+        "--env=NODE_ENV=production",
+        "--enable-automatic-updates=",
+        "MODEL=claude-sonnet-4-20250514",
+        "TENANT_ID=18ac72c8-1813-4200-9ff1-a800cbcda102",
+        "PORT=8080",
+        "Workspace10",
+        "WorkspaceV10",
+        "OpenAPI3.1",
+        "OAuth2.1",
+    ],
+)
+def test_mode_selector_keeps_benign_cli_options_switches_and_labels_public(
+    tmp_path: Path, selector: str, public_arg: str
+) -> None:
+    result, inventory = _scan(
+        tmp_path,
+        {
+            "source": {"command": "node", "args": [selector, public_arg]},
+            "sibling": _echo(public_arg),
+        },
+    )
+    assert not has_exposure(result)
+    assert all(public_arg in doc for doc in exports(inventory))
+
+
+@pytest.mark.parametrize(
+    ("selector", "following", "hidden_literal"),
+    [
+        (
+            "--auth-type=bearer",
+            "--api-key=ZqSEx7Wv3Lp9Rk2Tm5Yn",
+            "ZqSEx7Wv3Lp9Rk2Tm5Yn",
+        ),
+        (
+            "--auth-type=bearer",
+            "--env=API_TOKEN=ZqSEx7Wv3Lp9Rk2Tm5Yn",
+            "ZqSEx7Wv3Lp9Rk2Tm5Yn",
+        ),
+        (
+            "--auth-type=bearer",
+            "--model=ghp_k9X2mP7qR4wZ8vL3nB6tY1cF5hJ0dS2uE4gK",
+            "ghp_k9X2mP7qR4wZ8vL3nB6tY1cF5hJ0dS2uE4gK",
+        ),
+        (
+            "--auth-type=bearer",
+            "--model=${API_TOKEN:-RealDefaultMarker847}",
+            "RealDefaultMarker847",
+        ),
+        ("--auth-type=bearer", "--aB3cD4eF=8492", "--aB3cD4eF=8492"),
+        ("--auth-type=bearer", "--x9k2m8p4q7r1=val", "--x9k2m8p4q7r1=val"),
+        ("--auth-type=bearer", "--x=ZqSEx7Wv3Lp9Rk2Tm5Yn", "--x=ZqSEx7Wv3Lp9Rk2Tm5Yn"),
+        (
+            "--auth-type=bearer",
+            "--enable-automatic-updates==",
+            "--enable-automatic-updates==",
+        ),
+        ("--auth-type=bearer", "--xqtrkm849wznvb", "--xqtrkm849wznvb"),
+        ("--auth-type=bearer", "--xqtr84-wznv92", "--xqtr84-wznv92"),
+        ("--auth-type=bearer", "--token-849271", "--token-849271"),
+        ("--auth-type=bearer", "--xqtrKWZNpmvb", "--xqtrKWZNpmvb"),
+        ("--auth-type=bearer", "--XKJQPWZRMNVB", "--XKJQPWZRMNVB"),
+        (
+            "--auth-type=bearer",
+            "--cobalt-falcon-harbor-quartz-velvet-cipher=1",
+            "--cobalt-falcon-harbor-quartz-velvet-cipher=1",
+        ),
+        (
+            "--auth-type=bearer",
+            "MODEL=a9f2c8d4-e5b6a7c8-d9e0f1a2",
+            "MODEL=a9f2c8d4-e5b6a7c8-d9e0f1a2",
+        ),
+        (
+            "--auth-type=bearer",
+            "MODEL=claude-4-83749261",
+            "MODEL=claude-4-83749261",
+        ),
+        (
+            "--auth-type=bearer",
+            "MODEL=a-b-c-d-e-f-20250514",
+            "MODEL=a-b-c-d-e-f-20250514",
+        ),
+        (
+            "--auth-type=bearer",
+            "MODEL=superlongsegmentname-4-20250514",
+            "MODEL=superlongsegmentname-4-20250514",
+        ),
+        ("--auth-type=bearer", "--qzx__wvn_kpm", "--qzx__wvn_kpm"),
+        ("--auth-type=bearer", "--a-http2-b", "--a-http2-b"),
+        (
+            "--auth-type=bearer",
+            "FOO=deadbeef84927163a5c4e2",
+            "FOO=deadbeef84927163a5c4e2",
+        ),
+        (
+            "--auth-type=bearer",
+            "AB=deadbeef84927163a5c4e2",
+            "AB=deadbeef84927163a5c4e2",
+        ),
+        (
+            "--auth-type=bearer",
+            "API_KEY=18ac72c8-1813-4200-9ff1-a800cbcda102",
+            "18ac72c8-1813-4200-9ff1-a800cbcda102",
+        ),
+        ("--auth-type=bearer", "Workspace8492", "Workspace8492"),
+        ("--auth-type=bearer", "claude-4-83749261", "claude-4-83749261"),
+        ("--env=API_TOKEN=Bearer", "--no-http2", "--no-http2"),
+        ("--env=API_TOKEN=Bearer", "--enableTLS", "--enableTLS"),
+        ("--env=API_TOKEN=Bearer", "Workspace10", "Workspace10"),
+    ],
+)
+def test_mode_selector_refactor_keeps_adversarial_secrets_redacted(
+    tmp_path: Path, selector: str, following: str, hidden_literal: str
+) -> None:
+    result, inventory = _scan(
+        tmp_path,
+        {
+            "source": {"command": "node", "args": [selector, following]},
+            "sibling": _echo(hidden_literal),
+        },
+    )
+    assert has_exposure(result)
+    assert all(hidden_literal not in doc for doc in exports(inventory))
+
+
+@pytest.mark.parametrize("operand", ["--no-http2", "--enableTLS", "Workspace10"])
+def test_cmd_set_still_redacts_benign_looking_operands(tmp_path: Path, operand: str) -> None:
+    result, inventory = _scan(
+        tmp_path,
+        {
+            "source": {"command": "cmd", "args": ["/c", f"set AUTH_TYPE=Bearer {operand}"]},
+            "sibling": _echo(operand),
+        },
+    )
+    assert has_exposure(result)
+    assert all(operand not in doc for doc in exports(inventory))
+
+
+def test_short_empty_option_after_mode_selector_stays_public(tmp_path: Path) -> None:
+    result, inventory = _scan(
+        tmp_path,
+        {
+            "source": {"command": "node", "args": ["--auth-type=bearer", "--empty="]},
+            "sibling": _echo("--empty="),
+        },
+    )
+    assert not has_exposure(result)
+    assert all("--empty=" in doc for doc in exports(inventory))
