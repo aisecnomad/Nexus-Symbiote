@@ -305,6 +305,25 @@ def _optional_object(value: object, where: str) -> dict[str, Any]:
     return {} if value is None else _object(value, where)
 
 
+# Span containers under a name this reader does not read: the pre-1.0 OTLP name and the
+# proto field names, which proto3 JSON parsers also accept. Skipping them would hide their
+# spans while a sibling entry's spans still let the gate pass.
+_UNREAD_CONTAINERS = frozenset(
+    {
+        "resource_spans",
+        "scope_spans",
+        "instrumentationLibrarySpans",
+        "instrumentation_library_spans",
+    }
+)
+
+
+def _refuse_unread_containers(value: dict[str, Any], where: str) -> None:
+    unread = sorted(_UNREAD_CONTAINERS.intersection(value))
+    if unread:
+        raise _MalformedError(f"{where} holds {unread[0]}, which is not read; use scopeSpans")
+
+
 def _optional_list(value: object, where: str) -> list[Any]:
     if value is None:
         return []
@@ -434,10 +453,12 @@ class TraceReader:
             raise _MalformedError(
                 "the object has no resourceSpans array; it is not an OTLP/JSON export"
             )
+        _refuse_unread_containers(document, "the document")
         record.records += 1
         for i, resource_spans in enumerate(document["resourceSpans"]):
             path = f"resourceSpans[{i}]"
             entry = _object(resource_spans, path)
+            _refuse_unread_containers(entry, path)
             resource = _optional_object(entry.get("resource"), f"{path}.resource")
             values, content, _ = self._attributes(
                 resource.get("attributes"), f"{path}.resource.attributes", resource=True
