@@ -72,11 +72,14 @@ RUNNER_VALUE_OPTIONS = _words(
     "-p --package --from --with --with-editable --with-requirements --python"
 )
 SCRIPT_VALUE_OPTIONS = _words(
-    "--tsconfig --env-file -r --require --import --loader -X -W --output-dir"
+    "--tsconfig --env-file -X -W --output-dir --config --db-path --credentials --tls-key"
 )
+PRELOAD_OPTIONS = _words("-r --require --import --loader --experimental-loader")
+SCRIPT_ARGUMENT_OPTIONS = SCRIPT_VALUE_OPTIONS | PRELOAD_OPTIONS
+SCRIPT_SWITCHES = _words("--watch --quiet --verbose --no-warnings --no-deprecation -u -B")
 FS_WRITE_TOOLS = _words("write_file edit_file move_file")
 INSTALLED_BIN_DIRS = _tup("node_modules/.bin/ .venv/bin/ venv/bin/")
-SCRIPT_SUFFIXES = _tup(".sh .py .js .mjs .cjs .ts .rb .pl")
+SCRIPT_SUFFIXES = _tup(".sh .py .js .mjs .cjs .jsx .ts .mts .cts .tsx .rb .pl")
 CODE_EXEC_HOSTED_TOOLS = _words("code_interpreter computer_use bash local_shell code_execution")
 UNTRUSTED_CI_TRIGGERS = _words("issue_comment discussion_comment pull_request_target workflow_run")
 STEERING_PREFIXES = _tup(".claude .cursor CLAUDE.md AGENTS.md .mcp.json mcp.json")
@@ -209,19 +212,47 @@ def _normalize_rel_candidate(token: str, *, allow_any_file: bool = False) -> str
     return None
 
 
+@dataclass
+class _RunnerEvidence:
+    preloads: list[str] = field(default_factory=list)
+    gaps: set[str] = field(default_factory=set)
+
+    def option_value(self, option: str, value: str) -> None:
+        if option in PRELOAD_OPTIONS:
+            path = _normalize_rel_candidate(value, allow_any_file=True)
+            if (
+                path
+                and (value.startswith("./") or _PROJECT_DIR_RE.match(value))
+                and "$" not in path
+                and not path.startswith("~")
+            ):
+                self.preloads.append(posixpath.normpath(path))
+            else:
+                self.gaps.add("preload target is unresolved")
+        elif option in {"-p", "--package", "--from", "--with", "--with-editable"} and (
+            value in {".", ".."} or value.startswith(("./", "../", "/", "file:", "~", "$"))
+        ):
+            self.gaps.add("local package entry point is unresolved")
+
+
 def _package_runner_target(
     runner: str,
     operands: list[str],
     project_paths: frozenset[str],
     files: ConfinedCollection | None,
+    evidence: _RunnerEvidence,
 ) -> str | None:
     """Distinguish a package runner's script from known value-taking options."""
-    package_seen = pending_value = False
+    package_seen = False
+    pending_option: str | None = None
+    unknown_option = False
     parse_options = True
     fallback: str | None = None
     for arg in operands:
-        if pending_value:
-            pending_value = False
+        follows_unknown, unknown_option = unknown_option, False
+        if pending_option is not None:
+            evidence.option_value(pending_option, arg)
+            pending_option = None
             continue
         if parse_options and arg == "--":
             parse_options = False
@@ -229,20 +260,50 @@ def _package_runner_target(
         if parse_options and arg in {"-c", "-e", "-m"}:
             return None
         if parse_options and arg.startswith("-"):
-            value_options = SCRIPT_VALUE_OPTIONS if package_seen else RUNNER_VALUE_OPTIONS
-            pending_value = arg in value_options
+            option, equal, value = arg.partition("=")
+            if package_seen and not equal and arg.startswith("-r") and len(arg) > 2:
+                evidence.option_value("-r", arg[2:])
+                continue
+            if not package_seen and not equal and arg.startswith("-p") and len(arg) > 2:
+                evidence.option_value("-p", arg[2:])
+                continue
+            if option in (SCRIPT_ARGUMENT_OPTIONS if package_seen else RUNNER_VALUE_OPTIONS):
+                if equal:
+                    evidence.option_value(option, value)
+                else:
+                    pending_option = option
+            elif package_seen and not equal and option not in SCRIPT_SWITCHES:
+                unknown_option = True
             continue
         local = _normalize_rel_candidate(arg, allow_any_file=True)
         path = posixpath.normpath(local) if local is not None else None
         if path is not None and (path.startswith("~") or "$" in path):
-            path = None
+            evidence.gaps.add("script target is unresolved")
+            continue
         explicit = arg.startswith("./") or bool(_PROJECT_DIR_RE.match(arg))
         scripted = arg.endswith(SCRIPT_SUFFIXES)
         path_like = explicit or "/" in arg or scripted
         listed = path in project_paths
+        if follows_unknown:
+            if scripted or (explicit and not posixpath.splitext(arg)[1]):
+                evidence.gaps.add("option arity leaves the script target unresolved")
+            continue
         if not package_seen:
             package_seen = True
             parse_options = True
+            if arg in {".", "..", "./", "../"} or arg.startswith(("../", "/", "file:")):
+                evidence.gaps.add("local package entry point is unresolved")
+                continue
+            if (
+                runner == "npx"
+                and (
+                    arg == "@modelcontextprotocol/server-filesystem"
+                    or arg.startswith("@modelcontextprotocol/server-filesystem@")
+                )
+                and npm_spec(arg).name == "@modelcontextprotocol/server-filesystem"
+            ):
+                # The registry reference server accepts filesystem roots as data operands.
+                return None
             # The first operand names the package. A bare name is resolved from the
             # registry, so a project file of that name (a decoy `tsx`) is not the script.
             if (
@@ -250,9 +311,12 @@ def _package_runner_target(
                 and not arg.startswith("@")
                 and (explicit or scripted or ("/" in arg and listed))
             ):
+                if f"{path}/" in project_paths or (files is not None and files.is_directory(path)):
+                    evidence.gaps.add("local package entry point is unresolved")
+                    return None
                 return path
             continue
-        if path is None or f"{path}/" in project_paths:
+        if path is None:
             continue
         if (
             runner == "npx"
@@ -262,11 +326,14 @@ def _package_runner_target(
         ):
             continue
         if path_like:
-            if files is not None and files.is_directory(path):
+            if f"{path}/" in project_paths or (files is not None and files.is_directory(path)):
+                evidence.gaps.add("directory entry point is unresolved")
                 continue
             return path
-        if fallback is None and listed:
+        if fallback is None and listed and "." not in path:
             fallback = path
+    if pending_option in PRELOAD_OPTIONS:
+        evidence.gaps.add("preload target is unresolved")
     return fallback
 
 
@@ -275,6 +342,7 @@ def _extract_local_script_target(
     project_paths: frozenset[str] = frozenset(),
     *,
     files: ConfinedCollection | None = None,
+    evidence: _RunnerEvidence | None = None,
 ) -> str | None:
     if not tokens:
         return None
@@ -283,8 +351,14 @@ def _extract_local_script_target(
     direct = _normalize_rel_candidate(first)
     if direct is not None and base not in RUNTIME_LAUNCHERS:
         return direct
-    if base in PACKAGE_RUNNERS:
-        return _package_runner_target(base, tokens[1:], project_paths, files)
+    node_preloads = base == "node" and any(
+        arg.partition("=")[0] in PRELOAD_OPTIONS or arg.startswith("-r") for arg in tokens[1:]
+    )
+    if base in PACKAGE_RUNNERS or node_preloads:
+        operands = [base, *tokens[1:]] if node_preloads else tokens[1:]
+        return _package_runner_target(
+            base, operands, project_paths, files, evidence or _RunnerEvidence()
+        )
     if base in RUNTIME_LAUNCHERS:
         for arg in tokens[1:]:
             if arg in {"-c", "-e", "-m"}:
@@ -294,6 +368,21 @@ def _extract_local_script_target(
                 if cand is not None:
                     return cand
     return None
+
+
+def _audit_script_targets(
+    tokens: list[str],
+    project_paths: frozenset[str],
+    files: ConfinedCollection,
+    gaps: list[str],
+    source_file: str,
+    role: str,
+) -> tuple[str | None, list[str]]:
+    evidence = _RunnerEvidence()
+    primary = _extract_local_script_target(tokens, project_paths, files=files, evidence=evidence)
+    gaps.extend(f"{source_file}: {role} {reason}" for reason in sorted(evidence.gaps))
+    targets = ([] if primary is None else [primary]) + evidence.preloads
+    return primary, list(dict.fromkeys(targets))
 
 
 def _tokenize_command(command: Any, args: Any = None) -> list[str]:
@@ -554,10 +643,10 @@ def _inspect_hooks_and_preambles(
                     command_digest=_sha256_hex(cmd_str.encode()),
                 )
             )
-            target = _extract_local_script_target(
-                _tokenize_command(cmd_str), project_paths, files=files
+            _, targets = _audit_script_targets(
+                _tokenize_command(cmd_str), project_paths, files, summary.gaps, cfg_path, "hook"
             )
-            if target is not None:
+            for target in targets:
                 rec = _bind_script_target(
                     files,
                     summary,
@@ -599,10 +688,15 @@ def _inspect_hooks_and_preambles(
                 skill_path,
                 skill_ref,
             )
-            target = _extract_local_script_target(
-                _tokenize_command(cmd_body), project_paths, files=files
+            _, targets = _audit_script_targets(
+                _tokenize_command(cmd_body),
+                project_paths,
+                files,
+                summary.gaps,
+                skill_path,
+                "preamble",
             )
-            if target is not None:
+            for target in targets:
                 _bind_script_target(
                     files,
                     summary,
@@ -762,9 +856,11 @@ def _inspect_mcp_launchers_and_bridges(
                 )
                 continue
 
-            target = _extract_local_script_target(tokens, project_paths, files=files)
+            primary, targets = _audit_script_targets(
+                tokens, project_paths, files, summary.gaps, cfg_path, "launcher"
+            )
             props = {"registry_origin": reg_origin} if reg_origin else {}
-            if target is not None:
+            for target in targets:
                 rec = _bind_script_target(
                     files,
                     summary,
@@ -775,7 +871,8 @@ def _inspect_mcp_launchers_and_bridges(
                     event_or_server=srv_name,
                 )
                 if rec is not None:
-                    props["launch_target"] = rec["launch_target_sha256"]
+                    if target == primary:
+                        props["launch_target"] = rec["launch_target_sha256"]
                     summary.launcher_targets.append(
                         _rec(
                             server_name=srv_name,
