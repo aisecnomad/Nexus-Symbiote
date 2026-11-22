@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, TypeVar
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from packageurl import PackageURL
 from packaging.requirements import InvalidRequirement, Requirement
@@ -114,6 +114,7 @@ class _IdentityBucket:
     extra_digest_conflicts: int = 0
     unmarked_peers: list[AnyComponent] = field(default_factory=list)
     provenance_ids: set[str] = field(default_factory=set)
+    matched_lock_ids: set[str] | None = None
     has_unspecified_provenance: bool = False
     has_unknown_qualifiers: bool = False
     has_ambiguous_provenance: bool = False
@@ -619,7 +620,9 @@ _PURL_METADATA_QUALIFIERS = frozenset(
 )
 
 
-def _repository_identity(value: str) -> str:
+def _repository_identity(value: str, ecosystem: str | None) -> str:
+    if not value.isascii() or "\\" in value or any(ch <= " " or ch == "\x7f" for ch in value):
+        return value
     try:
         parts = urlsplit(value)
         port = parts.port
@@ -633,7 +636,14 @@ def _repository_identity(value: str) -> str:
         host = f"[{host}]"
     if port is not None and port != default_port:
         host += f":{port}"
-    return urlunsplit((parts.scheme, host, parts.path.rstrip("/"), parts.query, parts.fragment))
+    url = urlunsplit((parts.scheme, host, parts.path.rstrip("/"), parts.query, parts.fragment))
+    if ecosystem == "npm" and _reg._DEFAULT_NPM_REGISTRY.fullmatch(url):
+        return "https://registry.npmjs.org"
+    if ecosystem == "pypi" and (
+        url in _reg._PYPI_ORIGINS or _reg._DEFAULT_PYPI_INDEX.fullmatch(url)
+    ):
+        return _reg._PYPI_ORIGIN
+    return url
 
 
 @dataclass(frozen=True)
@@ -643,6 +653,7 @@ class _PurlIdentity:
     qualified: bool
     unknown_qualifiers: bool
     version: str | None = None
+    repository: str | None = None
 
     @property
     def ambiguous(self) -> bool:
@@ -677,12 +688,12 @@ def _purl_identity(purl: str | None, *, lock_origin: str | None = None) -> _Purl
     if ambiguous:
         return _PurlIdentity(stem, stem, False, True, package.version)
     qualifiers = {
-        name: _repository_identity(value) if name == "repository_url" else value
+        name: _repository_identity(value, package.type) if name == "repository_url" else value
         for name, value in (package.qualifiers or {}).items()
         if name not in _PURL_METADATA_QUALIFIERS
     }
     if lock_origin and package.type in {"npm", "pypi"}:
-        qualifiers.setdefault("repository_url", _repository_identity(lock_origin))
+        qualifiers.setdefault("repository_url", _repository_identity(lock_origin, package.type))
     identity = PackageURL(
         type=package.type, namespace=package.namespace, name=package.name, qualifiers=qualifiers
     ).to_string()
@@ -692,6 +703,7 @@ def _purl_identity(purl: str | None, *, lock_origin: str | None = None) -> _Purl
         bool(qualifiers),
         bool(qualifiers.keys() - {"repository_url"}),
         package.version,
+        qualifiers.get("repository_url"),
     )
 
 
@@ -776,6 +788,188 @@ def _purl_provenance(purl: _PurlIdentity | None, key: bytes | None) -> _Provenan
     return base, qualified, purl.unknown_qualifiers
 
 
+def _legacy_public_registries(
+    suppliers: list[_PurlIdentity | None], key: bytes | None
+) -> dict[str, str]:
+    """Recognize an older hidden inventory that bound a public registry's other spelling."""
+    aliases = {
+        "https://registry.npmjs.org": ("https://registry.yarnpkg.com",),
+        _reg._PYPI_ORIGIN: ("https://files.pythonhosted.org", "https://pypi.org/simple"),
+    }
+    bindings: dict[str, str] = {}
+    for purl in suppliers:
+        if purl is None or not purl.repository or purl.repository not in aliases:
+            continue
+        package = PackageURL.from_string(purl.identity)
+        if (package.type, purl.repository) not in {
+            ("npm", "https://registry.npmjs.org"),
+            ("pypi", _reg._PYPI_ORIGIN),
+        }:
+            continue
+        canonical = _identity_binding(key, "purl-provenance:" + purl.identity)
+        for alias in aliases[purl.repository]:
+            old = PackageURL(
+                type=package.type,
+                namespace=package.namespace,
+                name=package.name,
+                qualifiers={**(package.qualifiers or {}), "repository_url": alias},
+            )
+            bindings[_identity_binding(key, "purl-provenance:" + old.to_string())] = canonical
+    return bindings
+
+
+def _selected_repository_url(comp: RegistryEntryComponent, lock: dict[str, Any]) -> str | None:
+    """Recover the repository of the exact recorded package, solely for comparison."""
+    source = comp.source_path
+    locator = comp.properties.get("lockfile_record")
+    if not isinstance(locator, str) or not source or not comp.version:
+        return None
+    if source in _reg.RegistryScanner._NPM_LOCKFILES:
+        packages = lock.get("packages")
+        key = comp.properties.get("npm_alias", comp.name)
+        if not isinstance(key, str) or not isinstance(packages, dict):
+            return None
+        if locator != source + "#/packages/" + _reg._pointer_token("node_modules/" + key):
+            return None
+        row = packages.get("node_modules/" + key)
+        if (
+            not isinstance(row, dict)
+            or row.get("name", key) != comp.name
+            or row.get("version") != comp.version
+        ):
+            return None
+        url = row.get("resolved")
+        if not isinstance(url, str) or _reg._index_origin(url) is None:
+            return None
+        parts = urlsplit(url)
+        directory, separator, archive = parts.path.rpartition("/-/")
+        if not separator or archive != f"{comp.name.rsplit('/', 1)[-1]}-{comp.version}.tgz":
+            return None
+        for spelling in (comp.name, quote(comp.name, safe="@")):
+            package_dir = "/" + spelling
+            if directory.endswith(package_dir):
+                return urlunsplit(parts._replace(path=directory.removesuffix(package_dir)))
+        return None
+    entries = lock.get("package")
+    prefix = source + "#/package/"
+    if not locator.startswith(prefix):
+        return None
+    slot = locator.removeprefix(prefix)
+    if (
+        not isinstance(entries, list)
+        or not re.fullmatch(r"[0-9]{1,8}", slot)
+        or int(slot) >= len(entries)
+    ):
+        return None
+    row = entries[int(slot)]
+    if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+        return None
+    if _norm_pkg(row["name"]) != _norm_pkg(comp.name) or row.get("version") != comp.version:
+        return None
+    metadata = row.get("source")
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("registry" if source == "uv.lock" else "url")
+    return value if isinstance(value, str) else None
+
+
+def _plain_repository_path(url: str) -> bool:
+    if _reg._index_origin(url) is None:
+        return False
+    parts = urlsplit(url)
+    return (
+        parts.username is None
+        and not parts.query
+        and not parts.fragment
+        and bool(parts.path.strip("/"))
+        and "//" not in parts.path
+        and all(
+            part not in {".", ".."} and re.fullmatch(r"[A-Za-z0-9._~+-]+", part) is not None
+            for part in parts.path.strip("/").split("/")
+        )
+    )
+
+
+def _matched_lock_repositories(
+    root: Path | None,
+    components: list[AnyComponent],
+    suppliers: list[_PurlIdentity | None],
+    key: bytes | None,
+    failures: list[str],
+) -> dict[int, str]:
+    """Allow a specific supplier path only when the same lock bytes and package name it."""
+    wanted = {
+        (p.stem, p.repository): _identity_binding(key, "purl-provenance:" + p.identity)
+        for p in suppliers
+        if p and p.repository and not p.unknown_qualifiers and _plain_repository_path(p.repository)
+    }
+    if root is None or not wanted:
+        return {}
+    wanted_stems = {stem for stem, _ in wanted}
+    names = {"uv.lock", "poetry.lock", *_reg.RegistryScanner._NPM_LOCKFILES}
+    pending: dict[str, list[tuple[RegistryEntryComponent, _PurlIdentity, str]]] = {}
+    for comp in components:
+        if not isinstance(comp, RegistryEntryComponent) or comp.source_path not in names:
+            continue
+        if "imported_source_format" in comp.properties:
+            continue
+        if comp.registry_type != (
+            "npm" if comp.source_path in _reg.RegistryScanner._NPM_LOCKFILES else "pypi"
+        ):
+            continue
+        if (
+            comp.properties.get("collection_mode") != "lockfile-resolution-claim"
+            or not comp.registry_uri
+        ):
+            continue
+        digest = comp.properties.get("lockfile_sha256")
+        purl = _purl_identity(comp.package_url, lock_origin=comp.registry_uri)
+        if (
+            purl
+            and purl.stem in wanted_stems
+            and not purl.unknown_qualifiers
+            and purl.repository == _repository_identity(comp.registry_uri, comp.registry_type)
+            and isinstance(digest, str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+        ):
+            pending.setdefault(comp.source_path, []).append((comp, purl, digest))
+    matches: dict[int, str] = {}
+    with ConfinedCollection(root, failures) as files:
+        for name, records in pending.items():
+            try:
+                # Lock corroboration never follows a link, including a replaced
+                # leaf between inventory collection and this later import.
+                with files.open_regular(name) as stream:
+                    raw = b"".join(iter(lambda: stream.read(128 * 1024), b""))
+            except OSError:
+                continue
+            digest = hash_bytes(raw)
+            recorded = [(comp, p) for comp, p, expected in records if expected == digest]
+            if not recorded:
+                continue
+            try:
+                doc = (
+                    parse_json_strict(raw, max_bytes=files.max_file_bytes)
+                    if name in _reg.RegistryScanner._NPM_LOCKFILES
+                    else load_toml(raw.decode("utf-8"))
+                )
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(doc, dict):
+                continue
+            for comp, purl in recorded:
+                url = _selected_repository_url(comp, doc)
+                if url and _plain_repository_path(url):
+                    canonical = _repository_identity(url, comp.registry_type)
+                    if (
+                        _repository_identity(_reg._index_origin(url) or "", comp.registry_type)
+                        == purl.repository
+                        and (matched := wanted.get((purl.stem, canonical))) is not None
+                    ):
+                        matches[id(comp)] = matched
+    return matches
+
+
 def _stored_provenance(value: object, bindings: list[str]) -> _Provenance | None:
     if not isinstance(value, list) or len(value) != 3:
         return None
@@ -793,7 +987,9 @@ def _stored_provenance(value: object, bindings: list[str]) -> _Provenance | None
     return base, qualified, unknown
 
 
-def _record_provenance(buckets: dict[str, _IdentityBucket], record: _Provenance | None) -> None:
+def _record_provenance(
+    buckets: dict[str, _IdentityBucket], record: _Provenance | None, matched_lock: str | None = None
+) -> None:
     if record is None:
         return
     base, qualified, unknown = record
@@ -801,6 +997,12 @@ def _record_provenance(buckets: dict[str, _IdentityBucket], record: _Provenance 
     if qualified is None:
         bucket.has_unspecified_provenance = True
         bucket.has_ambiguous_provenance |= unknown
+    elif matched_lock is not None:
+        allowed = {qualified, matched_lock}
+        if bucket.matched_lock_ids is None:
+            bucket.matched_lock_ids = allowed
+        else:
+            bucket.matched_lock_ids.intersection_update(allowed)
     elif len(bucket.provenance_ids) < 2:
         # Two distinct values suffice to detect disagreement with any qualifier.
         bucket.provenance_ids.add(qualified)
@@ -820,6 +1022,8 @@ def _provenance_disagrees(
         return True
     if qualified is None:
         return bucket.has_unknown_qualifiers
+    if bucket.matched_lock_ids is not None and qualified not in bucket.matched_lock_ids:
+        return True
     return any(peer != qualified for peer in bucket.provenance_ids) or (
         unknown and bucket.has_unspecified_provenance
     )
@@ -899,6 +1103,11 @@ def import_foreign_sbom(
     matches: dict[tuple[str, frozenset[str]], tuple[str | None, bool]] = {}
 
     buckets: dict[str, _IdentityBucket] = {}
+    supplier_purls = [_purl_identity(entry["purl"]) for entry in entries]
+    public_aliases = _legacy_public_registries(supplier_purls, key)
+    matched_locks = _matched_lock_repositories(
+        project_root, bom.components, supplier_purls, key, local_failures
+    )
     context = _identity_binding(key, "context-v4")
     incomplete_identity = False
     for existing in bom.components:
@@ -926,13 +1135,17 @@ def import_foreign_sbom(
             ):
                 keys_for_existing = stored
                 provenance = _stored_provenance(existing.properties.get("purl_provenance"), stored)
+                if provenance and provenance[1] in public_aliases:
+                    base_id, old_id, unknown = provenance
+                    assert old_id is not None
+                    provenance = (base_id, public_aliases[old_id], unknown)
             elif existing.properties.get("name_hashed"):
                 # Old exports preserve only the display pseudonym. It cannot establish
                 # that a differently spelled name or versionless PURL did not match.
                 incomplete_identity = True
                 keys_for_existing = ["legacy:" + existing.name]
                 provenance = None
-        _record_provenance(buckets, provenance)
+        _record_provenance(buckets, provenance, matched_locks.get(id(existing)))
         version_ecosystem = _nested_version_ecosystem(existing)
         comparison_version = existing.version or (purl.version if purl is not None else None)
         if version_ecosystem == "conda" and comparison_version:
@@ -976,9 +1189,8 @@ def import_foreign_sbom(
         return res
 
     prefix_map = {"machine-learning-model": "sbom:model:", "data": "sbom:data:"}
-    for index, entry in enumerate(entries):
+    for index, (entry, purl) in enumerate(zip(entries, supplier_purls, strict=True)):
         raw_name: str = entry["name"]
-        purl = _purl_identity(entry["purl"])
         raw_version = entry["version"] or (purl.version if purl is not None else None)
         clean_ver = _clean_str(raw_version)[:128] if raw_version else None
         if shareable and clean_ver and not re.fullmatch(r"v?[0-9]+(?:\.[0-9]+){1,3}", clean_ver):
