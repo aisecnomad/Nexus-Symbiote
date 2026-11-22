@@ -1060,13 +1060,18 @@ class ConfinedCollection:
 
     @contextmanager
     def open_regular(
-        self, path: str | Path, *, max_bytes: int | Bound | None = None
+        self,
+        path: str | Path,
+        *,
+        max_bytes: int | Bound | None = None,
+        expected_link_target: Path | None = None,
     ) -> Iterator[BinaryIO]:
         """Yield a confined regular stream or raise OSError after recording failure.
 
         ``max_bytes`` bounds the artifact size and bytes read; reads require an
         explicit chunk size (at most four MiB). Collection-wide budget still
         applies. The trusted consumer must not bypass read() with fileno().
+        An expected root-relative target permits one confined symlink to that target.
         """
         named: Path | str = str(path)
         limit = self._file_bound if max_bytes is None else _bound(max_bytes, "file-bytes")
@@ -1078,12 +1083,16 @@ class ConfinedCollection:
                 raise CollectionError(reason)
             if not relative.parts:
                 raise CollectionError("expected a regular file")
-            parent = self._open_parent(relative)
+            if expected_link_target is None:
+                fd, opened = self._open_no_follow(relative), relative
+            else:
+                fd, opened = self._open_file(relative)
             try:
-                fd = self._open_leaf_no_follow(parent, relative.name)
-            finally:
-                os.close(parent)
-            try:
+                if expected_link_target is not None and (
+                    opened == relative or opened != expected_link_target
+                ):
+                    reason = "stream refused (symlink target changed)"
+                    raise CollectionError(reason)
                 before = stat_input_file(fd)
                 if not stat.S_ISREG(before.st_mode):
                     raise CollectionError("nonregular file")
@@ -1102,8 +1111,8 @@ class ConfinedCollection:
         try:
             yield cast(BinaryIO, stream)
             after = os.fstat(fd)
-            if descriptor_binding(before) != descriptor_binding(after) or not self._resolves_to(
-                relative, after
+            if descriptor_binding(before) != descriptor_binding(after) or not (
+                self._resolves_to(opened, after) and self._same_link(relative, opened)
             ):
                 self._fail(relative, "file changed during collection")
                 raise OSError("artifact changed during collection")
