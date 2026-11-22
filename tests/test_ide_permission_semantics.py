@@ -72,6 +72,54 @@ def test_local_mode_declaration_does_not_hide_project_tool_allowance(tmp_path: P
     assert any(r.category == "permission_scope" for r in agent.risks)
 
 
+def test_local_settings_do_not_suppress_findings_the_project_file_declares(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / ".claude"
+    directory.mkdir()
+    # An inert placeholder helper: the scanner only classifies the string.
+    (directory / "settings.json").write_text(
+        json.dumps(
+            {
+                "permissions": {"defaultMode": "bypassPermissions"},
+                "enableAllProjectMcpServers": True,
+                "apiKeyHelper": "echo placeholder",
+            }
+        )
+    )
+    (directory / "settings.local.json").write_text(
+        json.dumps(
+            {
+                "permissions": {"defaultMode": "default"},
+                "enableAllProjectMcpServers": False,
+                "apiKeyHelper": None,
+            }
+        )
+    )
+    result = IDEAgentScanner().scan(tmp_path)
+    assert not result.scan_failures
+    agent = claude_agent(result)
+    # The effective merged values are reported as such...
+    assert agent.permission_mode == "default"
+    declared = agent.properties["settings_declarations"]
+    assert declared["enable_all_project_mcp_servers"] is False
+    assert declared["api_key_helper"] is False
+    # ...and never drop what the committed file declares, which names its source.
+    findings = {r.category: r for r in agent.risks if r.category != "permission_scope"}
+    mode = next(r for r in agent.risks if "bypassPermissions" in r.detail)
+    assert mode.category == "permission_scope"
+    assert mode.severity.value == "high"
+    for finding in (mode, findings["mcp_auto_approval"], findings["credential_helper"]):
+        assert "'.claude/settings.json'" in finding.detail
+
+
+def test_project_only_findings_keep_their_detail(tmp_path: Path) -> None:
+    write_settings(tmp_path, {"defaultMode": "bypassPermissions"})
+    [mode] = claude_agent(IDEAgentScanner().scan(tmp_path)).risks
+    assert mode.category == "permission_scope"
+    assert "Declared in" not in mode.detail
+
+
 def test_deny_and_ask_declarations_are_not_claimed_to_be_effective_authorization(
     tmp_path: Path,
 ) -> None:

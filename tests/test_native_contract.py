@@ -517,3 +517,19 @@ def test_the_digest_readers_read_a_versionless_document_alike(document):
     ]
     assert predicate.get("content_digest") == expected
     assert predicate.get("spec_version") == (None if expected is None else "1.0.0")
+
+
+def test_an_embedded_document_that_fails_the_schema_is_refused_without_its_values():
+    from nexus_symbiote.core.canonical import content_digest
+    from nexus_symbiote.generators._common import recover_native
+
+    document = {"components": [{"bom_ref": "x", "component_type": "tool", "name": {"SYNTH": 1}}]}
+    embedded = [
+        {"name": "nexus-symbiote:document", "value": json.dumps(document)},
+        {"name": "nexus-symbiote:documentDigest", "value": content_digest(document)},
+        {"name": "nexus-symbiote:lossReport", "value": "[]"},
+    ]
+    with pytest.raises(NativeFormatError) as refused:
+        recover_native(embedded)
+    assert not isinstance(refused.value, ValidationError)
+    assert str(refused.value) == "It does not match the native AgentBOM schema."

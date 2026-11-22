@@ -388,13 +388,29 @@ consumed; a fresh approval does not establish that a retry is safe.
 10. Arguments against the approved input schema in a bounded worker
     (`arguments-invalid`, `schema-invalid`, `validation-capacity`,
     `validation-timeout`, `validation-unavailable`, `validation-failed`).
-11. Authenticate again; the context must be unchanged (`identity-changed`).
-12. In one state transaction: the recorded trust status and snapshot must still
+11. For a pinned tool with an `outputSchema`, preflight the schema and reserve a
+    pending-response slot. Refuse unsupported schemas and cycles at the same result
+    location. One location admits up to 96 nested schema applications. Across child
+    values the stack is capped at 160 applications and by interpreter headroom.
+    The usual budget is 1,024 steps per location. It counts keyword widths and
+    charges annotation walks to each caller. An explicit union of at least 16
+    alternatives costing at most 32 steps each may use 4,096 steps, including
+    through a cheap wrapper. Repeated rule costs use a 32,768-step estimate. Nested cardinalities
+    and fixed property or tuple entries count toward it. A conforming row with required
+    fields consumes multiple JSON nodes. Scalar enum comparisons and property lookups
+    cost less than validator calls. The estimate also accounts for unique-item comparisons,
+    pattern matching and repeated annotation collection. Actual validation also has independent CPU and wall-time limits. A refusal is
+    reported as `schema-invalid` before approval consumption or dispatch.
+    Up to four responses can be pending.
+    A pending call releases its preflight worker. Its returned result takes
+    priority for the next available worker and can wait up to 12 seconds.
+12. Authenticate again. The context must be unchanged (`identity-changed`).
+13. In one state transaction: the recorded trust status and snapshot must still
     be the ones checked (`trust-superseded`, `snapshot-superseded`), the approval
     nonce is consumed (`approval-replayed`), and every contract and signer scope
     is checked against the clock again, including the distinct approver quorum.
     The commit admits the call.
-13. Report the decision to `on_decision`, then call `execute(call)`.
+14. Report the decision to `on_decision`, then call `execute(call)`.
 
 `ReferenceGateway.register_snapshot(snapshot, trust=...)` runs steps 3 and 4 for
 the snapshot's own tenant, deployment and agent, without a workload context or a
@@ -581,13 +597,14 @@ the gateway does not emit a second denial or an execution-outcome record.
 `allow_shared_keys`, `clock` and `state` above, without adapters, and returns a
 gateway whose only use is `register_snapshot`; `invoke` on it is refused with
 `configuration-invalid`. `approval_keys` is optional and only checked, so the
-gateways' scope map can be reused.
+gateways' scope map can be reused. The `--signer-scopes` file is an operator trust input. Keep it outside the repositories holding the snapshot, trust status or state and outside the current repository. Provision it as a singly linked regular file with the same owner and directory protections as the trusted verification keys.
 
-`bind_adapters(describe=..., execute=...)` returns a gateway with the same policy
-and state that uses other description and execution adapters, as
-`invoke_pinned_stdio` does. `check_validation_worker()` runs one trivial schema
-validation and raises the worker's reason code; call it at start-up or from a
-readiness probe.
+`bind_adapters(describe=..., execute=..., prepare=...)` returns a gateway with
+the same policy and state. The optional `prepare` callback receives the verified
+descriptor after input validation and before approval is recorded. The pinned
+stdio adapter uses it to prepare output validation. `check_validation_worker()`
+runs one trivial schema validation and raises the worker's reason code. Call it
+at start-up or from a readiness probe.
 
 ## State store
 

@@ -52,7 +52,7 @@ reconciliation checks this evidence against the directories it observes.
 
 ## Supply the signer policy
 
-Write the signer policy outside the workspace from a trusted source, such as a repository or organization variable, never from the checked-out code:
+On a hosted job where the runner owns its temporary directory, write the signer policy outside the workspace from a trusted source such as a repository or organization variable. The following example uses that layout.
 
 ```yaml
       - name: Write the signer policy
@@ -65,4 +65,8 @@ Write the signer policy outside the workspace from a trusted source, such as a r
           signature-policy: ${{ runner.temp }}/signers.json
 ```
 
-The Action refuses a policy inside the workspace, a path that passes through a symlink (including a symlinked `RUNNER_TEMP`), or a hard link, passes one snapshot of it, written under `RUNNER_TEMP`, to collection, validation and the risk gate, and reports its SHA-256, as `sha256:<hex>`, in the `signature-policy-digest` output. It verifies signatures offline against the Sigstore trust root shipped in its hash-locked `sigstore` package, never a cache on the runner. The job's `NEXUS_SYMBIOTE_SIGSTORE_TRUST_ROOT`, `NEXUS_SYMBIOTE_SIGSTORE_TRUST_ROOT_SHA256` and `NEXUS_SYMBIOTE_MODE` variables are not passed to the Action's commands, so an earlier step cannot replace that trust root or select live mode through `GITHUB_ENV`. The [signer policy format](cli-reference.md#signer-policy) is in the CLI reference.
+In a `container:` job, the host may own `runner.temp` under a different UID. Provision the original signer policy and any `trusted-keys` outside the checkout under a path owned by the container account or root, such as an operator-mounted `/run/nexus-operator/signers.json`, and supply that path to the Action. A dedicated 0700 directory and a 0600 file meet the permission requirements. A group-writable home or a 2775 `fsGroup` volume can invalidate an otherwise read-only key. For service-owned paths, remove group write access from the file and its ancestors, or move the trust anchor into a private directory. A 022 umask avoids new group-writable files and directories.
+
+The Action requires the original policy outside the workspace and any enclosing repository, through a path with no symlinks or hard links. On POSIX the file and its ancestors must be owned by the caller or root. The file must be writable only by its owner, and a group- or world-writable ancestor needs sticky protection. In a container job, provision the original file in a directory satisfying these rules within the container.
+
+The Action passes one private snapshot to collection, validation and the risk gate and reports its SHA-256 in the `signature-policy-digest` output. It uses `RUNNER_TEMP` when the directory satisfies the same ancestry checks and can try the platform temporary directory (which can come from `TMPDIR`, `TEMP` or `TMP`) and then `/tmp` on POSIX. Every candidate must pass the same checks. It verifies signatures offline against the Sigstore trust root shipped in its hash-locked `sigstore` package, never a cache on the runner. The job's `NEXUS_SYMBIOTE_SIGSTORE_TRUST_ROOT`, `NEXUS_SYMBIOTE_SIGSTORE_TRUST_ROOT_SHA256` and `NEXUS_SYMBIOTE_MODE` variables are not passed to the Action's commands, so an earlier step cannot replace that trust root or select live mode through `GITHUB_ENV`. The [signer policy format](cli-reference.md#signer-policy) is in the CLI reference.
