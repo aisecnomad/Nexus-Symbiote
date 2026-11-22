@@ -529,6 +529,7 @@ SSE_HEADERS = {"Content-Type": "text/event-stream"}
 NOT_ASCII = "endpoint must be an ASCII HTTPS URL without controls"
 NOT_PLAIN = "endpoint credentials, queries, fragments or non-HTTPS scheme refused"
 NOT_DOTS = "endpoint dot segments refused"
+NOT_SENT_AS_WRITTEN = "endpoint path characters that clients encode refused"
 
 
 def raw_reply(
@@ -833,6 +834,14 @@ def test_a_bearer_credential_in_the_endpoint_is_refused_before_any_request(endpo
         ("https://fixture.example/./mcp", NOT_DOTS),
         ("https://fixture.example/a/%2E%2e/mcp", NOT_DOTS),
         ("https://fixture.example/mcp/..", NOT_DOTS),
+        *(
+            ("https://fixture.example" + path, NOT_SENT_AS_WRITTEN)
+            for path in ['/m"cp', "/m{cp}", "/m<cp>", "/m`cp", "/m|cp", "/m^cp", "/m[cp]"]
+        ),
+        *(
+            ("https://fixture.example" + path, NOT_SENT_AS_WRITTEN)
+            for path in ["/m%zzcp", "/mcp%", "/mcp%2", "/%%2e%2e/mcp"]
+        ),
     ],
 )
 def test_endpoint_encoding_and_authority_checks_fail_before_any_request(endpoint, failure):
@@ -845,7 +854,16 @@ def test_endpoint_encoding_and_authority_checks_fail_before_any_request(endpoint
 
 
 @pytest.mark.parametrize(
-    "path", ["/a%2F..%2Fmcp", "/x/.%2Fmcp", "/.well-known/mcp", "/v1.0/mcp", "/..hidden/mcp"]
+    "path",
+    [
+        "/a%2F..%2Fmcp",
+        "/x/.%2Fmcp",
+        "/.well-known/mcp",
+        "/v1.0/mcp",
+        "/..hidden/mcp",
+        "/~team/m!$&'()*+,;=:@cp",
+        "/m%7Bcp%7d",
+    ],
 )
 def test_a_path_without_a_dot_segment_is_observed_as_written(path):
     from nexus_symbiote.scanners.live_mcp import _endpoint

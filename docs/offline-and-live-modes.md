@@ -152,10 +152,10 @@ server only when the inventory records that server's `https` origin; a missing o
 `[redacted]` endpoint, another origin, or evidence that is not a complete live
 observation fails with reason `invalid-transport-evidence`. An inventory endpoint that names a
 path must be the observed URL as `discover-mcp` records it (lower-case scheme and host, no
-default port or fragment, the path as written); one with a query or dot segments, which
-`discover-mcp` refuses, verifies nothing. Otherwise, until `--record` stores the full-URL digest
-(`observed_endpoint_hash`), the binding is origin-only, so an observation of another path on the
-same origin passes.
+default port or fragment, the path as written); one with a query, dot segments or a path
+character that clients percent-encode, which `discover-mcp` refuses, verifies nothing.
+Otherwise, until `--record` stores the full-URL digest (`observed_endpoint_hash`), the binding
+is origin-only, so an observation of another path on the same origin passes.
 For tools verified through transport evidence, `--record` preserves the tool's
 observation method, collector and timestamp and records the verified attestation's
 SHA-256 digest in the tool claim's `evidence_refs`.

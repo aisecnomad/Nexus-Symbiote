@@ -95,6 +95,9 @@ _CONSUMED_HEADERS = frozenset(
 # whole branch, required lists included, before it reports the first error.
 # Longer unsortable arrays under those keywords are refused before checking.
 _UNIQUE_ITEMS_PAIRWISE_LIMIT = 64
+# RFC 3986 path characters and escapes. Clients percent-encode the others (urllib3 also a
+# stray "%") before they send, so an observation of such a path is not what they reach.
+_SENT_AS_WRITTEN_PATH = re.compile(r"(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/]|%[0-9A-Fa-f]{2})*")
 # Keywords whose values the 2020-12 metaschema checks as subschemas. It checks
 # "dependencies" values through anyOf instead; see _checked_dependency_schemas.
 _SUBSCHEMA_KEYWORDS = frozenset(
@@ -339,6 +342,8 @@ def _endpoint(value: str, *, origin_only: bool = False) -> tuple[str, str, int, 
         raise
     except ValueError as exc:
         raise DiscoveryError("invalid endpoint") from exc
+    if not _SENT_AS_WRITTEN_PATH.fullmatch(parsed.path):
+        raise DiscoveryError("endpoint path characters that clients encode refused")
     if any(unquote(part) in (".", "..") for part in parsed.path.split("/")):
         raise DiscoveryError("endpoint dot segments refused")
     if host.endswith(".") or not 1 <= port <= 65535:
