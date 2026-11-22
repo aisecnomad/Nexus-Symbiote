@@ -349,15 +349,13 @@ def _parse_frontmatter(
         return [], content
     language, raw_fm, body = candidates[0]
     metas: list[dict[str, Any]] = []
-    primary_ok = False
-    if not raw_fm.strip():
-        primary_ok = True
-    else:
+    primary_ok = True
+    if raw_fm.strip():
         try:
             metas.append(_parse_frontmatter_payload(language, raw_fm))
-            primary_ok = True
         except (PolicyError, ValueError, yaml.YAMLError, RecursionError):
-            pass
+            # Fall back to alternate candidate or line-level field extraction below.
+            primary_ok = False
     if len(candidates) == 2:
         alt_lang, alt_raw, alt_body = candidates[1]
         if alt_raw.strip():
