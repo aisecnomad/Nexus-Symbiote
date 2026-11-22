@@ -163,3 +163,22 @@ def test_a_specifiers_map_does_not_let_a_record_found_by_name_bind(
     assert "pnpm-lock.yaml: selected package version disagrees with package.json" in (
         result.scan_failures
     )
+
+
+def test_importer_sections_that_resolve_a_name_differently_bind_neither(tmp_path: Path) -> None:
+    # A later section's record used to replace an earlier one's.
+    (tmp_path / "package.json").write_text('{"dependencies":{"openai":"^4.0.0"}}')
+    (tmp_path / "pnpm-lock.yaml").write_text(
+        "lockfileVersion: '9.0'\nimporters:\n  .:\n"
+        "    dependencies:\n      openai:\n        specifier: ^4.0.0\n        version: 4.19.0\n"
+        "    devDependencies:\n      openai:\n        specifier: ^4.0.0\n        version: 4.20.0\n"
+        f"packages:\n  openai@4.19.0: {REAL}\n  openai@4.20.0: {DECOY}\n"
+        "snapshots:\n  openai@4.19.0: {}\n  openai@4.20.0: {}\n"
+    )
+    result = RegistryScanner().scan(tmp_path)
+    (component,) = result.components
+    assert component.package_url is None
+    assert "package_resolution" not in component.claims
+    assert result.surfaces_excluded == [
+        "pnpm-lock.yaml: multiple package resolutions for openai are ambiguous"
+    ]
