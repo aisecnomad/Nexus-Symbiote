@@ -749,3 +749,25 @@ def test_a_declared_source_cannot_take_a_reserved_evidence_ref(tmp_path):
     refs = {c.bom_ref for c in result.components}
     assert "rag:declared-import-chroma" in refs
     assert "rag:import-chroma" in refs
+
+
+@pytest.mark.parametrize("url", ["http:qdrant.example/kb", "http:\\\\qdrant.example\\kb"])
+def test_a_nested_endpoint_without_slashes_is_read_as_whatwg_parsers_read_it(tmp_path, url):
+    component = _source(tmp_path, {**BASE, "vector_store": {"endpoint": url}})
+    (finding,) = [r for r in component.risks if r.severity.value == "high"]
+    assert finding.category == "data_integrity"
+    # WHATWG parsers end the host at a backslash, so that form keeps no origin.
+    origin = "http://qdrant.example" if "\\" not in url else "[redacted-url]"
+    assert finding.detail == f"RAG source 'kb' declares an unencrypted endpoint: {origin}"
+    assert component.properties["endpoint_origins"] == [origin]
+
+
+def test_a_configuration_linked_to_a_credential_file_is_a_gap_and_not_read(tmp_path):
+    (tmp_path / "credentials.json").write_text(json.dumps({"sources": [BASE]}))
+    (tmp_path / "rag_config.json").symlink_to("credentials.json")
+    result = RAGScanner().scan(tmp_path)
+    assert result.components == [] and result.scan_failures == []
+    assert result.surfaces_excluded == [
+        "rag_config.json: a symlink leads to credentials.json, whose name says it holds "
+        "credentials; not read or inventoried"
+    ]

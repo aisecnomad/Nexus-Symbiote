@@ -24,6 +24,8 @@ ORIGIN_PATHS = frozenset({"", "/"})
 _HOSTNAME = re.compile(r"[\w.-]+|[0-9a-f:.]+", re.ASCII)
 # A2A 1.0 gRPC interfaces give a "hostname:port" address without a scheme.
 _HOST_PORT = re.compile(r"(?:(?:[\w-]+\.)+[\w-]+|localhost|\[[0-9a-f:.]+\]):\d{1,5}", re.I)
+_SPECIAL_SCHEME = re.compile(r"(ftp|https?|wss?):(?!//)", re.I)
+_URL_ASCII_WHITESPACE = str.maketrans("", "", "\t\r\n")
 
 
 class BindingError(ValueError):
@@ -75,6 +77,23 @@ def odd_host(url: str) -> bool:
     if "\\" in parsed.netloc:
         return True
     return hostname is not None and not _HOSTNAME.fullmatch(hostname)
+
+
+def whatwg_form(url: str) -> str:
+    """``url`` with "//" before the authority of a special scheme, as WHATWG parsers read it.
+
+    They skip any run of "/" and "\\" after ``http:``, so ``http:host/x`` and
+    ``http:\\\\host`` connect to ``host`` in clear text, while urlsplit reads no host in
+    them and the origin and transport checks would see none.
+    """
+    value = url.strip()
+    match = _SPECIAL_SCHEME.match(value)
+    if match is None:
+        return url
+    rest = value[match.end() :].translate(_URL_ASCII_WHITESPACE).lstrip("/\\")
+    if not rest or rest.startswith(" "):
+        return url
+    return f"{match[1]}://{rest}"
 
 
 def authority(url: str) -> str:

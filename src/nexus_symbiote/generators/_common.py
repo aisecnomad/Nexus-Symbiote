@@ -7,7 +7,12 @@ import binascii
 import re
 from typing import Any, Literal
 
-from nexus_symbiote.core.aibom import AIBOM, native_document
+from nexus_symbiote.core.aibom import (
+    AIBOM,
+    MAX_NATIVE_NESTING,
+    _nested_deeper_than,
+    native_document,
+)
 from nexus_symbiote.core.canonical import content_digest, json_text
 from nexus_symbiote.core.enums import ComponentType
 from nexus_symbiote.core.hashing import extract_version_pin, parse_json_strict
@@ -316,8 +321,13 @@ def document_properties(
     bom: AIBOM, target: str, native: dict[str, Any] | None = None
 ) -> list[dict[str, str]]:
     document = native_document(bom) if native is None else native
+    if _nested_deeper_than(document, MAX_NATIVE_NESTING):
+        raise ValueError("embedded native document is nested too deeply")
+    encoded = json_text(document)
+    if len(encoded.encode("utf-8")) > NATIVE_DOCUMENT_LIMIT:
+        raise ValueError("embedded native document exceeds the byte limit")
     return [
-        {"name": "nexus-symbiote:document", "value": json_text(document)},
+        {"name": "nexus-symbiote:document", "value": encoded},
         {"name": "nexus-symbiote:documentDigest", "value": content_digest(document)},
         {
             "name": "nexus-symbiote:lossReport",
@@ -364,8 +374,9 @@ def recover_native(properties: list[dict[str, Any]]) -> tuple[AIBOM, dict[str, A
     """Recover the native representation and its exact embedded document.
 
     The digest binds the embedded document, without authenticating its producer. The
-    embedded text is parsed like a native AgentBOM file: bounded, and with duplicate
-    keys and non-finite numbers rejected.
+    embedded text is parsed and validated like a native AgentBOM file: bounded in size
+    and nesting, with duplicate keys and non-finite numbers rejected, and refused
+    without quoting its values.
     """
     required = {
         "nexus-symbiote:document",
@@ -386,8 +397,11 @@ def recover_native(properties: list[dict[str, Any]]) -> tuple[AIBOM, dict[str, A
         )
     except RecursionError as exc:
         raise ValueError("embedded native document is nested too deeply") from exc
+    if _nested_deeper_than(document, MAX_NATIVE_NESTING):
+        raise ValueError("embedded native document is nested too deeply")
     if not isinstance(document, dict):
         raise ValueError("embedded native document must be a JSON object")
     if props["nexus-symbiote:documentDigest"] != content_digest(document):
         raise ValueError("embedded native document digest mismatch")
-    return AIBOM.from_document(document), document
+    # As a native file is loaded: the refusal never quotes the document's values.
+    return AIBOM.from_native(document), document
