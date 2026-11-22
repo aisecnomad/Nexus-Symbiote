@@ -78,6 +78,7 @@ from nexus_symbiote.scanners.mcp_credentials import (
     literal_value,
     name_words,
     placeholder,
+    private_key_forms,
     rewrapped_key_literals,
     strongest,
     value_hits,
@@ -621,7 +622,9 @@ def _zed_server(config: dict[str, Any]) -> _Normalized:
             if key in ("args", "env"):
                 if key in config:
                     problem = f"MCP server declares {key} both in and beside its command object"
-                config[key] = value
+                    config[f"command.{key}"] = value
+                else:
+                    config[key] = value
             else:
                 config[f"command.{key}"] = value
     launched = bool(config.get("command")) or any(config.get(field) for field in _ENDPOINT_FIELDS)
@@ -719,6 +722,8 @@ def _opencode_server(config: dict[str, Any]) -> _Normalized:
             config["command"] = command[0]
             if "args" in config:
                 problem = "MCP server declares args beside a command list"
+                if command[1:]:
+                    config["command.args"] = command[1:]
             else:
                 config["args"] = command[1:]
     if "environment" in config:
@@ -844,6 +849,7 @@ def _shape_secrets(value: str) -> list[str]:
     return [
         *_scheme_secrets(value),
         *(match.group() for match in TOKEN_SHAPE.finditer(value)),
+        *private_key_forms(value),
         *_header_line_secrets(value),
         *_url_secrets(value),
     ]
@@ -876,7 +882,7 @@ def _url_secrets(value: str) -> list[str]:
         if username is not None:
             for candidate in dict.fromkeys((username, unquote(username))):
                 found.extend(match.group() for match in TOKEN_SHAPE.finditer(candidate))
-        for query_name, query_value in parse_qsl(parsed.query):
+        for query_name, query_value in parse_qsl(parsed.query.replace(";", "&")):
             if not is_reference(query_value):
                 if secret_like(query_name, query_value):
                     found.append(query_value)
@@ -972,17 +978,26 @@ def _settings_secrets(settings: dict[str, Any]) -> list[str]:
 # options and hub block inputs. Their values are scrubbed from every server of the file
 # all the same.
 _SHAPE_CREDENTIALS = {
-    "opencode": ("environment",),
+    "zed": ("command.env", "command.args"),
+    "opencode": ("environment", "command.args"),
     "continue": ("apiKey", "requestOptions", "with"),
 }
 
 
 def _shape_credentials(config: dict[str, Any], shape: str) -> list[str]:
     """Credential values ``config`` holds in its shape's uninterpreted credential fields."""
-    fields = {
-        field: config[field] for field in _SHAPE_CREDENTIALS.get(shape, ()) if field in config
-    }
-    return _settings_secrets(fields) if fields else []
+    found: list[str] = []
+    fields: dict[str, Any] = {}
+    for field in _SHAPE_CREDENTIALS.get(shape, ()):
+        if field not in config:
+            continue
+        if field in {"command.args", "command.env"}:
+            found.extend(_malformed_values(config[field], field))
+        else:
+            fields[field] = config[field]
+    if fields:
+        found.extend(_settings_secrets(fields))
+    return found
 
 
 def _launch_words(texts: Iterable[str]) -> list[str]:
@@ -1042,7 +1057,7 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
                         values.extend(
                             literal for _, literal in _assignment_word_hits(word, words[index + 1])
                         )
-                    else:
+                    elif _scheme_assignment_name(name, variable=not word.startswith("-")):
                         values.extend(scheme_credentials(f"{value} {words[index + 1]}"))
         if index > 0:
             flag = words[index - 1]
@@ -1280,6 +1295,9 @@ def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = Fa
             pass
         else:
             return hits
+    if is_reference(following):
+        hits.extend(value_hits(name if credential_binding else "token", following))
+        return hits
     if _scheme_operand(following, credential_binding=credential_binding):
         paired = value_hits(name, f"{value} {following}")
         hits.extend(paired or [(SCHEME_CLASS, following)])
@@ -1487,13 +1505,16 @@ def _server_hits(config: dict[str, Any]) -> PositionHits:
 
 
 def _declared_hits(config: dict[str, Any]) -> PositionHits:
-    """The hits of a refused server's env, arguments and headers, read as a parsed one's are."""
+    """The hits of a refused server's env, arguments, headers and endpoints."""
     env, args = config.get("env"), config.get("args")
     maps = [m for m in (config.get("headers"), config.get("http_headers")) if isinstance(m, dict)]
+    endpoints = [
+        value for field in _ENDPOINT_FIELDS if isinstance(value := config.get(field), str) and value
+    ]
     args = args if isinstance(args, list) else []
     return list(
         _credential_hits(
-            env if isinstance(env, dict) else {}, args, maps, (), config.get("command", "")
+            env if isinstance(env, dict) else {}, args, maps, endpoints, config.get("command", "")
         )
     )
 
@@ -1524,7 +1545,7 @@ def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
                 )
                 pending.append((str(key), value, use_shape))
         elif isinstance(item, list):
-            if name in {"args", "command"}:
+            if name in {"", "args", "command", "command.args"}:
                 for index, word in enumerate(item):
                     if isinstance(word, str):
                         previous = item[index - 1] if index else None
@@ -1538,10 +1559,13 @@ def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
                             )
                         )
             if len(item) == 2 and isinstance(item[0], str) and _scheme_assignment_name(item[0]):
-                pending.extend(((name, item[0], False), ("value", item[1], True)))
+                pending.extend(((name, item[0], False), (item[0], item[1], True)))
             else:
                 pending.extend((name, value, inferred) for value in item)
-        elif isinstance(item, str) and not is_reference(item):
+        elif isinstance(item, str):
+            if is_reference(item):
+                yield from (literal for _, literal in value_hits(name or "secret", item))
+                continue
             if secret_like(name, item) or (
                 (inferred or _scheme_assignment_name(name)) and literal_value(item)
             ):
@@ -3067,10 +3091,12 @@ class MCPScanner(Scanner):
             for server, hits in server_hits.items():
                 literals.extend(_server_literals(configs[server], hits))
             unique = set(filter(None, values))
+            wrapped_found: list[str] = []
             if len(unique) <= MAX_SECRETS_PER_FILE:
                 try:
                     for wrapped in rewrapped_key_literals(data, tuple(unique)):
                         unique.add(wrapped)
+                        wrapped_found.append(wrapped)
                         if len(unique) > MAX_SECRETS_PER_FILE:
                             break
                 except WrappedKeySearchLimitError:
@@ -3081,12 +3107,15 @@ class MCPScanner(Scanner):
                     )
                     continue
             if len(unique) > MAX_SECRETS_PER_FILE:
+                if known is not None:
+                    known.refuse()
                 result.scan_failures.append(
                     f"{dialect.path}: more than {MAX_SECRETS_PER_FILE} credential values in one "
                     "file; not collected"
                 )
                 continue
-            # Wrapped copies contain whitespace and cannot be part of a source name.
+            if known is not None and wrapped_found:
+                known.add(wrapped_found)
             file_secrets = SecretScrubber(unique)
             collected.append((dialect, data, read, file_secrets, server_hits))
         # A name may repeat a literal of any client file, so every file is read first.
@@ -3655,7 +3684,15 @@ class MCPScanner(Scanner):
             {"-y", "--yes", *(package.spec for package in packages)} if launcher_package else set()
         )
         unbound = self._unbound_values(
-            args, env, headers, endpoint_url, command, launch, recorded, identity
+            args,
+            env,
+            headers,
+            endpoint_url,
+            command,
+            launch,
+            recorded,
+            identity,
+            multiple_endpoints=len(endpoints) > 1,
         )
         unbound.extend(
             self._unbound_client_values(
@@ -4057,6 +4094,8 @@ class MCPScanner(Scanner):
         """Export an origin only for an authority every URL parser reads the same way."""
         if expands(url):
             return "[redacted]", "endpoint depends on environment expansion"
+        if any(char.isspace() or ord(char) < 32 for char in url):
+            return "[redacted]", "endpoint URL cannot be parsed"
         try:
             parsed = urlsplit(url)
             hostname = parsed.hostname
@@ -4146,6 +4185,8 @@ class MCPScanner(Scanner):
         launch: Launch,
         recorded: set[str],
         identity: _Identity,
+        *,
+        multiple_endpoints: bool = False,
     ) -> list[str]:
         """Values only the keyed binding covers, named by kind."""
         unbound = []
@@ -4155,7 +4196,7 @@ class MCPScanner(Scanner):
             # A redacted command, or one exported case-folded or without its Windows
             # suffix: MCPServer and mcpserver are different files on POSIX.
             unbound.append("command")
-        if identity.endpoint == "[redacted]":
+        if identity.endpoint == "[redacted]" or multiple_endpoints:
             unbound.append("endpoint")
         if any(arg not in recorded for arg in args):
             unbound.append("launch arguments")
