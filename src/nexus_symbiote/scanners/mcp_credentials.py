@@ -616,7 +616,9 @@ def public_value(value: str) -> bool:
     evidence that a value is public.
     """
     value = _strip(value)
-    return "://" in value or public_material(value) or reference(value) or _locator_or_value(value)
+    # Not ``reference``: it also accepts a literal that merely contains `${NAME}`. A whole
+    # reference is already public by ``is_reference`` before this is asked.
+    return "://" in value or public_material(value) or _locator_or_value(value)
 
 
 def _token_hits(value: str) -> list[Hit]:

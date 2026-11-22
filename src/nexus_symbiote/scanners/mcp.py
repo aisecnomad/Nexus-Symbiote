@@ -1428,14 +1428,32 @@ def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
 def _public_scheme_following(
     name: str, scheme: str, following: str, *, variable: bool, in_set: bool
 ) -> bool:
-    """Whether the word after ``NAME=<scheme>`` is positively a public launch word."""
-    binding = (
+    """Whether the word after ``NAME=<scheme>`` is positively a public launch word.
+
+    A variable whose name ends in ``header`` (``HEADER``, ``CUSTOM_HEADER``) holds a whole
+    header value, so its operand is read as a binding's for withholding, whatever the
+    finding rules call it. A flag of that name (``--auth-header=bearer``) selects a header
+    mode, and a switch, an option, a setting, a label or a locator after it stays public;
+    a bare word after it is withheld, since a mode name does not make one public.
+    """
+    words = name_words(name)
+    header = bool(words) and words[-1] == "header"
+    binding = (header and variable) or (
         _classify_scheme_assignment(name, scheme, variable=variable, in_set=in_set)
         == "credential_binding"
     )
     if not binding and _public_mode_label(following):
         return True
-    return _scheme_operand_kind(following, credential_binding=binding) == "public"
+    if _scheme_operand_kind(following, credential_binding=binding) != "public":
+        return False
+    if not header or variable or binding:
+        return True
+    return (
+        following.startswith("-")
+        or "=" in following
+        or _PUBLIC_UUID.fullmatch(following) is not None
+        or public_value(following)
+    )
 
 
 def _assigned(word: str) -> tuple[str, str, bool] | None:

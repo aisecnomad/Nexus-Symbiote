@@ -112,3 +112,40 @@ def test_only_a_positively_public_word_escapes_withholding(name, scheme, followi
         mcp._public_scheme_following(name, scheme, following, variable=False, in_set=False)
         is public
     )
+
+
+SPLIT_LITERALS = ["SuperSecretKey", "Summer24", "Zq4Rt8Lm2Xw9${SUFFIX}"]
+
+
+@pytest.mark.parametrize("literal", SPLIT_LITERALS)
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-y", "srv@1.0.0", "HEADER=Bearer"],
+        ["mcp-remote", "https://mcp.example/mcp", "--env", "CUSTOM_HEADER=AWS4-HMAC-SHA256"],
+    ],
+    ids=["header-variable", "env-flag-header"],
+)
+def test_a_header_named_operand_in_split_arguments_is_withheld(tmp_path, args, literal):
+    source = {"command": "npx", "args": [*args, literal]}
+    assert _withheld(tmp_path, source, literal) == [0, 0, 0, 0]
+
+
+# `Summer24` reads as a mode label (`Workspace10`) after a header-mode flag, which this
+# pull request keeps public by design, so only the shapes no label explains are pinned.
+@pytest.mark.parametrize("literal", ["SuperSecretKey", "Zq4Rt8Lm2Xw9${SUFFIX}"])
+def test_a_bare_word_after_an_auth_header_flag_is_withheld(tmp_path, literal):
+    source = {"command": "node", "args": ["s.js", "--auth-header=bearer", literal]}
+    assert _withheld(tmp_path, source, literal) == [0, 0, 0, 0]
+
+
+@pytest.mark.parametrize("switch", ["--no-cache", "--verbose", "--readOnly"])
+def test_a_switch_after_an_auth_header_flag_stays_public(tmp_path, switch):
+    _, inventory = _scan(
+        tmp_path,
+        {
+            "source": {"command": "node", "args": ["--auth-header=bearer", switch]},
+            "sibling": _echo(switch),
+        },
+    )
+    assert all(switch in document for document in exports(inventory))
