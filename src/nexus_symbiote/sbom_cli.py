@@ -102,6 +102,11 @@ def _handle_walk_failures(bom: _aibom.AIBOM, failures: list[str]) -> None:
 @click.option("-o", "--output", type=_PATH_OUT, help="Write resulting native AgentBOM JSON.")
 @click.option("--into", "into_bom", type=_PATH_FILE, help="Existing native AgentBOM to merge into.")
 @click.option("--project", type=_PATH_DIR, help="Project root for binding, manifests, census.")
+@click.option(
+    "--shareable",
+    is_flag=True,
+    help="Export a standalone supplier inventory with keyed identifiers and no local paths.",
+)
 @click.option("--reveal-names", is_flag=True, help="Retain plain component names.")
 @click.option("--walk-manifests", is_flag=True, help="Walk nested manifests below --project.")
 @click.option("--census", is_flag=True, help="Count unread artifact shapes below --project.")
@@ -112,11 +117,16 @@ def import_sbom_cmd(
     into_bom: Path | None,
     project: Path | None,
     reveal_names: bool,
+    shareable: bool,
     walk_manifests: bool,
     census: bool,
     json_output: bool,
 ) -> None:
     """Import a foreign CycloneDX or SPDX SBOM as DECLARED evidence without picking silent winners."""
+    if shareable and (into_bom or project or reveal_names or walk_manifests or census):
+        raise click.UsageError(
+            "--shareable requires a standalone import without local inventory or names"
+        )
     if (walk_manifests or census) and project is None:
         raise click.UsageError("--walk-manifests and --census require --project")
     key = os.environ.get(SOURCE_BINDING_KEY_ENV, "")
@@ -144,7 +154,11 @@ def import_sbom_cmd(
 
     try:
         summary = _imp.import_foreign_sbom(
-            foreign_bom_path, target_aibom=base_bom, project_root=root, reveal_names=reveal_names
+            foreign_bom_path,
+            target_aibom=base_bom,
+            project_root=root,
+            reveal_names=reveal_names,
+            shareable=shareable,
         )
     except (OSError, ValueError, UnicodeError, RecursionError, PolicyError) as exc:
         detail = next(
@@ -183,7 +197,7 @@ def import_sbom_cmd(
     if json_output:
         report = {
             "source_format": summary.source_format,
-            "document_sha256": summary.document_sha256,
+            ("document_hmac_sha256" if shareable else "document_sha256"): summary.document_sha256,
             "imported_count": summary.imported_count,
             "bound_local_count": summary.bound_local_count,
             "conflict_count": summary.conflict_count,
