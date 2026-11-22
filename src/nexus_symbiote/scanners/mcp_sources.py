@@ -1145,38 +1145,73 @@ def _python_launches(tree: ast.Module, project_imports: _ProjectImports) -> list
     return sorted(gaps)
 
 
-def _plain_flat_module(path: Path, source: _Source, node_limit: int) -> bool:
-    """Whether this file provably cannot provide submodules when imported by its stem.
-
-    A sibling SDK-named file can run as a module before a dotted import finishes.
-    Missing, unreadable or unclassified evidence must keep that ambiguity visible.
-    """
+def _plain_module_names(
+    path: Path, source: _Source, node_limit: int, future_safe: bool
+) -> frozenset[str] | None:
+    """Names a passive SDK-named package helper can supply at import time."""
     try:
         tree = parse_python(_python_text(source.head))
     except (_UnreadableError, SyntaxError, ValueError, RecursionError):
-        return False
+        return None
     if next(islice(ast.walk(tree), node_limit, None), None) is not None:
-        return False
+        return None
+    names: set[str] = set()
     for stmt in tree.body:
         if isinstance(stmt, ast.Pass) or (
             isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
         ):
             continue
-        if (
-            isinstance(stmt, ast.Assign)
-            and isinstance(stmt.value, ast.Constant)
-            and all(isinstance(t, ast.Name) and not t.id.startswith("__") for t in stmt.targets)
-        ):
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Constant):
+            for target in stmt.targets:
+                if not isinstance(target, ast.Name) or target.id.startswith("__"):
+                    return None
+                names.add(target.id)
             continue
-        # As a flat top-level module this import raises before any later code
-        # can install a submodule. As a package member it can use the real SDK.
-        return (
-            isinstance(stmt, ast.ImportFrom)
-            and not stmt.level
-            and stmt.module is not None
-            and stmt.module.startswith(path.stem + ".")
-        )
-    return True
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and not stmt.name.startswith(
+            "__"
+        ):
+            args = stmt.args
+            if (
+                stmt.decorator_list
+                or stmt.returns
+                or getattr(stmt, "type_params", None)
+                or args.defaults
+                or any(v is not None for v in args.kw_defaults)
+                or any(
+                    arg.annotation
+                    for arg in (
+                        *args.posonlyargs,
+                        *args.args,
+                        *args.kwonlyargs,
+                        args.vararg,
+                        args.kwarg,
+                    )
+                    if arg
+                )
+            ):
+                return None
+            names.add(stmt.name)
+            continue
+        if isinstance(stmt, ast.ImportFrom) and not stmt.level and stmt.module:
+            if (
+                future_safe
+                and stmt.module == "__future__"
+                and all(alias.name == "annotations" and not alias.asname for alias in stmt.names)
+            ):
+                names.add("annotations")
+                continue
+            # When this flat helper is imported as the top-level name, an
+            # absent self-import stops execution before subsequent statements.
+            if path.name != "__init__.py" and (
+                stmt.module.startswith(path.stem + ".")
+                or (
+                    stmt.module == path.stem
+                    and any(alias.name != "*" and alias.name not in names for alias in stmt.names)
+                )
+            ):
+                return frozenset(names)
+        return None
+    return frozenset(names)
 
 
 def _outcome(result: ScanResult) -> tuple[int, int, int]:
@@ -1209,7 +1244,23 @@ def collect_source_references(
     clients = [_Kind(_script_source(suffix), _client_candidate) for suffix in _CLIENT_SUFFIXES]
     kinds = (servers, python, *clients)
     python_paths = frozenset(path for path in sources if path.suffix == ".py")
-    plain_modules: set[Path] = set()
+    plain_modules: dict[Path, frozenset[str]] = {}
+    # Include non-Python files and nested directories as possible import
+    # entries. An extension module or namespace directory keeps its ambiguity.
+    entries = frozenset(
+        entry
+        for source_path in sources
+        if not _SDK_IMPORT_ROOTS.isdisjoint(source_path.parts[:-1])
+        for entry in (
+            source_path.with_name(source_path.name.split(".", 1)[0] or source_path.name),
+            *source_path.parents,
+        )
+        if entry.parent.name in _SDK_IMPORT_ROOTS
+    )
+    future_safe = not any(
+        "__future__" in path.parts or path.name.partition(".")[0] == "__future__"
+        for path in sources
+    )
     eligible = [path for path in sources if any(kind.eligible(path) for kind in kinds)]
     # Root files first, as before, so what a lowered budget reads stays predictable.
     eligible.sort(key=lambda path: len(path.parts) > 1)
@@ -1234,15 +1285,17 @@ def collect_source_references(
                 if files.bytes_exhausted:
                     break
                 continue
+            owner = path.parent if path.name == "__init__.py" else path.with_suffix("")
             if (
                 path.suffix == ".py"
-                and path.stem in _SDK_IMPORT_ROOTS
-                and path.parent / "__init__.py" in python_paths
+                and owner.name in _SDK_IMPORT_ROOTS
+                and owner.parent / "__init__.py" in python_paths
                 and source.complete
                 and source.size <= settings.syntax_bytes
-                and _plain_flat_module(path, source, python_nodes.value)
             ):
-                plain_modules.add(path)
+                names = _plain_module_names(path, source, python_nodes.value, future_safe)
+                if names is not None:
+                    plain_modules[path] = names
             candidate = False
             for kind in kinds:
                 if not kind.eligible(path):
@@ -1272,7 +1325,6 @@ def collect_source_references(
         collect_typescript_source(path, content, result, known)
         if _outcome(result) != before:
             surfaces.append(path.as_posix())
-    flat_modules = frozenset(plain_modules)
     for path, content in python.selected:
         location = path.as_posix()
         before = _outcome(result)
@@ -1292,7 +1344,7 @@ def collect_source_references(
             if len(nodes) > python_nodes.value:
                 fail(path, python_nodes.exceeded())
                 continue
-            project_imports = _ProjectImports(python_paths, path.parent, flat_modules)
+            project_imports = _ProjectImports(python_paths, path.parent, plain_modules, entries)
             collect_python_tools(
                 tree, nodes, text, path, result, known, project_imports=project_imports
             )

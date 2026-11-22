@@ -36,7 +36,8 @@ class _ProjectImports(NamedTuple):
 
     sources: frozenset[Path]
     entry_dir: Path
-    plain_modules: frozenset[Path]
+    plain_modules: dict[Path, frozenset[str]]
+    entries: frozenset[Path]
 
     def _module_at(self, root: Path, relative: Path) -> bool:
         return (
@@ -55,15 +56,25 @@ class _ProjectImports(NamedTuple):
             and (self.entry_dir.parts[:1] != ("src",) or self._module_at(Path("src"), relative))
         )
 
-    def shadows(self, module: str) -> bool:
-        # One plausible checkout binding is enough to withhold SDK provenance.
-        name, dotted, _ = module.partition(".")
+    def shadows(self, module: str, member: str | None = None) -> bool:
+        # Any unresolved first search root withholds SDK provenance. A passive
+        # sibling can only supply its own names or an existing package child.
+        name, dot, rest = module.partition(".")
         for root in (Path(), Path("src"), self.entry_dir):
-            if root / name / "__init__.py" in self.sources:
-                return True
+            package = root / name
+            init = package / "__init__.py"
+            if init in self.sources:
+                names = self.plain_modules.get(init)
+                child = rest.partition(".")[0] if dot else member
+                if names is None or child is None or package / child in self.entries:
+                    return True
+                if not dot and member in names:
+                    return True
             flat = root / (name + ".py")
-            if flat in self.sources and (not dotted or flat not in self.plain_modules):
-                return True
+            if flat in self.sources:
+                names = self.plain_modules.get(flat)
+                if names is None or (not dot and (member is None or member in names)):
+                    return True
         return False
 
 
@@ -845,9 +856,10 @@ def _report_import_scope(
         stmt.module in modules and any(a.name == "*" for a in stmt.names) for stmt in imports
     ):
         result.surfaces_excluded.append(f"{path.as_posix()}: unresolved Python MCP factory import")
+    # Isolated and installed entry points may skip the checkout even when a
+    # regular package of the same name is present beside this file.
     qualified_sdk_import = any(
-        isinstance(node, ast.Import)
-        and any(_framework_module(a.name, project_imports) for a in node.names)
+        isinstance(node, ast.Import) and any(_framework_module(a.name, None) for a in node.names)
         for node in nodes
     )
     if qualified_sdk_import or _unrecognized_framework_import(
@@ -889,7 +901,7 @@ def _unrecognized_framework_import(
             if (module, a.name) in _DECORATOR_IMPORTS or (module, a.name) in _AGENT_FACTORIES:
                 continue
             if (module, a.name) in _NON_REGISTERING_IMPORTS and (
-                project_imports is None or not project_imports.shadows(module)
+                project_imports is None or not project_imports.shadows(module, a.name)
             ):
                 continue
             if a.name == "*":
@@ -1309,14 +1321,14 @@ class _TypeSyntax:
         self._sdk_types = frozenset(
             identity
             for identity in _SDK_TYPES
-            if project_imports is None or not project_imports.shadows(identity[0])
+            if project_imports is None or not project_imports.shadows(*identity)
         )
         self._sdk_generics = _SDK_GENERICS & self._sdk_types
         self._optional_types = (_FACTORIES | _SDK_GENERICS) & self._sdk_types
         self._context_arguments = {
             identity
             for identity in _CONTEXT_ARGUMENTS
-            if project_imports is None or not project_imports.shadows(identity[0])
+            if project_imports is None or not project_imports.shadows(*identity)
         }
         known_classes = self._sdk_types | self._context_arguments
         bindings = _bindings(nodes)
@@ -1416,7 +1428,10 @@ class _TypeSyntax:
                 # A union of two SDK values can invoke SDK-defined operators.
                 # A simple optional SDK annotation retains its type-only use.
                 optional_sdk_type = any(
-                    self._sdk_type(value) in self._optional_types
+                    (
+                        self._sdk_type(value) in self._optional_types
+                        or (isinstance(value, ast.Subscript) and self._sdk_subscript(value))
+                    )
                     and isinstance(other, ast.Constant)
                     and other.value is None
                     for value, other in (
@@ -2240,7 +2255,10 @@ def collect_python_tools(
         stmt
         for stmt in candidates
         if stmt.module is not None
-        and (project_imports is None or not project_imports.shadows(stmt.module))
+        and (
+            project_imports is None
+            or all(not project_imports.shadows(stmt.module, alias.name) for alias in stmt.names)
+        )
     ]
     if len(resolved) != len(candidates):
         result.surfaces_excluded.append(
