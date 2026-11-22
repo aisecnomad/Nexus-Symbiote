@@ -1,234 +1,134 @@
-"""Positive and adversarial regression tests for Bundle F2:
-External #255 (refused-server secret scrubbing) and Muse F-370-1 (walk_complete with .git).
+"""Muse F-370-1: a default-excluded directory does not make the MCP source walk incomplete.
+
+``pkg/srv.py`` serves its tools through the Python SDK beside ``pkg/mcp.py``, a passive
+helper named for the SDK's import root. The import resolves past the helper only while
+the walk is complete, so an ordinary checkout, whose occupied ``.git`` is a default
+exclude, dropped the server's tools. A default-excluded entry is reported as a gap and
+handed to the search as unvisited instead; an explicit exclusion still fails closed.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
-from nexus_symbiote.scanners.mcp import MAX_ARGUMENTS, MCPScanner
+from nexus_symbiote.scanners.base import ScanResult
+from nexus_symbiote.scanners.mcp import MCPScanner
+from nexus_symbiote.utils.confined import ConfinedCollection
+
+_GAP = "pkg/srv.py: Python SDK import may resolve to checkout code"
+_GIT_GAP = ".git: default collection exclude; not collected"
+_POLICY_GAP = "other_excluded: excluded by collection policy"
+_EVERY_TOOL = ["ping", "pong", "real", "top"]
+_WITHOUT_HELPER = ["pong", "top"]
 
 
-def _write(root: Path, rel: str, content: str) -> Path:
-    path = root / rel
+def _write(root: Path, relative: str, content: str) -> None:
+    path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
-    return path
 
 
-# ---------------------------------------------------------------------------
-# External #255: refused MCP server must still scrub sibling servers
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("case", "refused_cfg"),
-    [
-        (
-            "cli_password",
-            {
-                "command": "npx",
-                "args": ["-y", "srv", "--password", "Open-Sesame-Pass"],
-                "tools": 1,
-            },
-        ),
-        (
-            "auth_client_secret",
-            {
-                "url": "https://api.example/mcp",
-                "auth": {"client_secret": "Open-Sesame-Pass"},
-                "tools": 1,
-            },
-        ),
-        (
-            "oauth_client_secret",
-            {
-                "url": "https://api.example/mcp",
-                "oauth": {"clientSecret": "Open-Sesame-Pass"},
-                "tools": 1,
-            },
-        ),
-        (
-            "non_dict_auth",
-            {
-                "url": "https://api.example/mcp",
-                "auth": "Bearer Open-Sesame-Pass",
-                "tools": 1,
-            },
-        ),
-        (
-            "url_userinfo",
-            {
-                "url": "https://user:Open-Sesame-Pass@api.example/mcp",
-                "tools": 1,
-            },
-        ),
-        (
-            "gallery_userinfo",
-            {
-                "url": "https://api.example/mcp",
-                "gallery": "https://user:Open-Sesame-Pass@gallery.example/mcp",
-                "tools": 1,
-            },
-        ),
-        (
-            "inline_shell_assignment",
-            {
-                "command": "sh",
-                "args": ["-c", "API_KEY=Open-Sesame-Pass exec srv"],
-                "tools": 1,
-            },
-        ),
-        (
-            "over_limit_args",
-            {
-                "command": "npx",
-                "args": ["x"] * (MAX_ARGUMENTS + 2) + ["--password", "Open-Sesame-Pass"],
-            },
-        ),
-    ],
-)
-def test_external_255_refused_server_scrubs_sibling_tool_descriptions(
-    tmp_path: Path, case: str, refused_cfg: dict[str, object]
-) -> None:
-    probe_value = "Open-Sesame-Pass"
-    doc = {
-        "mcpServers": {
-            "broken": refused_cfg,
-            "sibling": {
-                "command": "python3",
-                "args": ["server.py"],
-                "tools": [
-                    {
-                        "name": "describe_config",
-                        "description": f"Uses credential {probe_value} for upstream requests",
-                    }
-                ],
-            },
-        }
-    }
-    _write(tmp_path, ".mcp.json", json.dumps(doc))
-    result = MCPScanner().scan(tmp_path)
-    assert result.scan_failures, case
-    exported = json.dumps(
-        [c.model_dump(mode="json") for c in result.components]
-        + list(result.scan_failures)
-        + list(result.surfaces_excluded)
+def _server(name: str, tool: str) -> str:
+    return (
+        "from mcp.server.fastmcp import FastMCP\n"
+        f"app = FastMCP({name!r})\n"
+        "@app.tool()\n"
+        f"def {tool}() -> str:\n"
+        "    return 'pong'\n"
     )
-    assert probe_value not in exported, f"{case} leaked {probe_value} into sibling output"
 
 
-def test_external_255_huge_refused_arg_scrubs_linearly(tmp_path: Path) -> None:
-    probe_value = "Open-Sesame-Pass"
-    huge_arg = ("a " * 40_000) + f"API_KEY={probe_value}"
-    doc = {
-        "mcpServers": {
-            "broken": {"command": "sh", "args": ["-c", huge_arg], "tools": 1},
-            "sibling": {
-                "command": "python3",
-                "args": ["server.py"],
-                "tools": [{"name": "t", "description": f"echo {probe_value}"}],
-            },
-        }
-    }
-    _write(tmp_path, ".mcp.json", json.dumps(doc))
-    result = MCPScanner().scan(tmp_path)
-    exported = json.dumps([c.model_dump(mode="json") for c in result.components])
-    assert probe_value not in exported
-
-
-# ---------------------------------------------------------------------------
-# Muse F-370-1: .git default exclude must not break walk_complete
-# ---------------------------------------------------------------------------
-
-
-def _write_shadow_repo(root: Path, *, with_git: bool = False, with_pycache: bool = False) -> None:
+def _checkout(root: Path, *, git: bool = False, helper: str = "HELPER = 1\n") -> None:
+    """``real``/``ping`` need the helper read as passive; ``top``/``pong`` need no helper."""
     _write(root, "pkg/__init__.py", "")
-    _write(root, "pkg/mcp.py", "HELPER = 1\n")
-    _write(
-        root,
-        "pkg/srv.py",
-        (
-            "from mcp.server.fastmcp import FastMCP\n"
-            "app = FastMCP('real')\n"
-            "@app.tool()\n"
-            "def ping() -> str:\n"
-            "    return 'pong'\n"
-        ),
-    )
-    if with_git:
+    _write(root, "pkg/mcp.py", helper)
+    _write(root, "pkg/srv.py", _server("real", "ping"))
+    _write(root, "top.py", _server("top", "pong"))
+    if git:
         _write(root, ".git/HEAD", "ref: refs/heads/main\n")
-    if with_pycache:
-        _write(root, "pkg/__pycache__/mcp.cpython-312.pyc", "bytecode")
 
 
-def test_muse_f_370_1_git_default_exclude_preserves_walk_complete(tmp_path: Path) -> None:
-    clean = tmp_path / "clean"
-    with_git = tmp_path / "with_git"
-    with_cache = tmp_path / "with_cache"
-    _write_shadow_repo(clean, with_git=False)
-    _write_shadow_repo(with_git, with_git=True)
-    _write_shadow_repo(with_cache, with_git=True, with_pycache=True)
+def _names(result: ScanResult) -> list[str]:
+    assert not result.scan_failures
+    return sorted(component.name for component in result.components)
 
-    clean_names = sorted(c.name for c in MCPScanner().scan(clean).components)
-    git_names = sorted(c.name for c in MCPScanner().scan(with_git).components)
-    assert "real" in clean_names
-    assert "ping" in clean_names
-    assert git_names == clean_names
 
-    # Explicit pkg/__pycache__ still marks pkg uncertain (fail-closed preserved).
-    cache_names = sorted(c.name for c in MCPScanner().scan(with_cache).components)
-    assert "ping" not in cache_names
+def test_git_metadata_keeps_the_walk_complete(tmp_path: Path) -> None:
+    clean, with_git = tmp_path / "clean", tmp_path / "with_git"
+    _checkout(clean)
+    _checkout(with_git, git=True)
+    assert _names(MCPScanner().scan(clean)) == _EVERY_TOOL
 
-    # Explicit policy exclusion still sets walk_complete=False (fail-closed preserved).
-    excluded_scanner = MCPScanner()
-    excluded_scanner.configure(exclude_paths=("other_excluded",))
-    _write(with_git, "other_excluded/x.py", "x = 1\n")
-    excl_names = sorted(c.name for c in excluded_scanner.scan(with_git).components)
-    assert "ping" not in excl_names
+    result = MCPScanner().scan(with_git)
+    assert _names(result) == _EVERY_TOOL
+    assert result.surfaces_excluded == [_GIT_GAP]
+
+
+def test_an_explicit_exclusion_leaves_the_walk_incomplete(tmp_path: Path) -> None:
+    _checkout(tmp_path, git=True)
+    _write(tmp_path, "other_excluded/x.py", "x = 1\n")
+    scanner = MCPScanner()
+    scanner.configure(exclude_paths=("other_excluded",))
+    result = scanner.scan(tmp_path)
+    assert _names(result) == _WITHOUT_HELPER
+    assert result.surfaces_excluded == [_GIT_GAP, _POLICY_GAP, _GAP]
+
+
+@pytest.mark.parametrize("cache", ["__pycache__", "__PYCACHE__", "__pycache__."])
+def test_a_bytecode_cache_beside_the_helper_still_fails_closed(tmp_path: Path, cache: str) -> None:
+    # A case-insensitive file system opens each spelling as the cache Python loads from.
+    _checkout(tmp_path, git=True)
+    _write(tmp_path, f"pkg/{cache}/mcp.cpython-312.pyc", "bytecode")
+    result = MCPScanner().scan(tmp_path)
+    assert _names(result) == _WITHOUT_HELPER
+    assert _GAP in result.surfaces_excluded
 
 
 @pytest.mark.parametrize(
-    ("label", "refused_cfg"),
+    "sibling",
     [
-        (
-            "args_string",
-            {"command": "npx", "args": "--api-key=sk-proj-RefusedStrArgSecret9876543210"},
-        ),
-        (
-            "command_list",
-            {"command": ["npx", "--api-key=sk-proj-RefusedCmdListSecret9876543210"]},
-        ),
-        (
-            "env_nested_dict",
-            {
-                "command": "npx",
-                "args": [123],
-                "env": {"API_KEY": {"val": "sk-proj-RefusedEnvDictSecret9876543210"}},
-            },
-        ),
+        "pkg/venv/__init__.py",
+        "pkg/VENV/__init__.py",
+        "venv/__init__.py",
+        "pkg/mcp/.git/HEAD",
+        "pkg/mcp/venv/pyvenv.cfg",
     ],
 )
-def test_refused_server_malformed_field_shapes_scrub_siblings(
-    tmp_path: Path, label: str, refused_cfg: dict[str, object]
+def test_an_unvisited_sibling_keeps_the_helper_uncertain(tmp_path: Path, sibling: str) -> None:
+    # ``venv`` is both a default exclude and a standard module, so a checkout copy in a
+    # search root can shadow what the helper imports; an excluded entry under a
+    # directory named for the SDK leaves that package's contents unread.
+    _checkout(tmp_path, git=True, helper="import logging\nHELPER = 1\n")
+    _write(tmp_path, sibling, "server = object()\n")
+    result = MCPScanner().scan(tmp_path)
+    assert _names(result) == _WITHOUT_HELPER
+    assert _GAP in result.surfaces_excluded
+
+
+def test_the_listed_exclusions_are_classified_without_a_collection_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    secret_map = {
-        "args_string": "sk-proj-RefusedStrArgSecret9876543210",
-        "command_list": "sk-proj-RefusedCmdListSecret9876543210",
-        "env_nested_dict": "sk-proj-RefusedEnvDictSecret9876543210",
-    }
-    probe = secret_map[label]
-    doc = {
-        "mcpServers": {
-            "refused": refused_cfg,
-            "sibling": {"command": "echo", "args": [f"leak={probe}"]},
-        }
-    }
-    case_dir = tmp_path / label
-    _write(case_dir, ".mcp.json", json.dumps(doc))
-    result = MCPScanner().scan(case_dir)
-    exported = json.dumps([c.model_dump(mode="json") for c in result.components])
-    assert probe not in exported
+    monkeypatch.delattr(ConfinedCollection, "policy_exclusions_recorded", raising=False)
+    _checkout(tmp_path, git=True)
+    assert _names(MCPScanner().scan(tmp_path)) == _EVERY_TOOL
+
+    _write(tmp_path, "other_excluded/x.py", "x = 1\n")
+    scanner = MCPScanner()
+    scanner.configure(exclude_paths=("other_excluded",))
+    assert _names(scanner.scan(tmp_path)) == _WITHOUT_HELPER
+
+
+@pytest.mark.parametrize(("recorded", "expected"), [(0, _EVERY_TOOL), (1, _WITHOUT_HELPER)])
+def test_a_collection_count_of_policy_exclusions_is_read_instead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorded: int, expected: list[str]
+) -> None:
+    monkeypatch.setattr(
+        ConfinedCollection,
+        "policy_exclusions_recorded",
+        property(lambda self: recorded),
+        raising=False,
+    )
+    _checkout(tmp_path, git=True)
+    assert _names(MCPScanner().scan(tmp_path)) == expected

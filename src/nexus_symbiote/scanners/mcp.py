@@ -994,17 +994,14 @@ def _launch_words(texts: Iterable[str]) -> list[str]:
     for text in texts:
         words.append(text)
         if any(char.isspace() for char in text):
-            if len(text) > _SHELL_SPLIT_LIMIT:
+            lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            try:
+                parts = list(lexer)
+            except ValueError:
+                # An unclosed quote still leaves the whitespace-delimited words.
                 parts = text.split()
-            else:
-                lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
-                lexer.whitespace_split = True
-                lexer.commenters = ""
-                try:
-                    parts = list(lexer)
-                except ValueError:
-                    # An unclosed quote still leaves the whitespace-delimited words.
-                    parts = text.split()
             words.extend(parts)
     return words
 
@@ -1283,88 +1280,11 @@ def _server_hits(config: dict[str, Any]) -> PositionHits:
 
 
 def _declared_hits(config: dict[str, Any]) -> PositionHits:
-    """The hits of a refused server's env, arguments, headers and endpoints."""
+    """The hits of a refused server's env, arguments and headers, read as a parsed one's are."""
     env, args = config.get("env"), config.get("args")
     maps = [m for m in (config.get("headers"), config.get("http_headers")) if isinstance(m, dict)]
     args = args if isinstance(args, list) else []
-    endpoints = [
-        config[field]
-        for field in _ENDPOINT_FIELDS
-        if isinstance(config.get(field), str) and config[field]
-    ]
-    command = config.get("command") if isinstance(config.get("command"), str) else ""
-    return list(
-        _credential_hits(env if isinstance(env, dict) else {}, args, maps, endpoints, command)
-    )
-
-
-def _refused_server_view(config: dict[str, Any]) -> dict[str, Any]:
-    """Type-safe view of a refused server's credential-bearing fields for sibling scrubbing."""
-    view: dict[str, Any] = {}
-    nested_extra: dict[str, Any] = {}
-    for field in ("env", "headers", "http_headers"):
-        mapping = config.get(field)
-        if isinstance(mapping, dict):
-            str_items: dict[str, str] = {}
-            for k, v in mapping.items():
-                key = str(k)
-                if isinstance(v, str):
-                    str_items[key] = v
-                elif isinstance(v, (dict, list)):
-                    nested_extra[key] = v
-            if str_items:
-                view[field] = str_items
-        elif isinstance(mapping, (str, list)):
-            nested_extra[field] = mapping
-    for field in ("oauth", "auth"):
-        if field in config:
-            settings = config[field]
-            if isinstance(settings, dict):
-                view[field] = settings
-            elif isinstance(settings, (str, list)):
-                view[field] = {"value": settings}
-    extension = config.get(_EXTENSION_SETTINGS)
-    if isinstance(extension, dict):
-        view[_EXTENSION_SETTINGS] = dict(extension)
-    elif isinstance(extension, (str, list)):
-        nested_extra[_EXTENSION_SETTINGS] = extension
-    for field in (*_ENDPOINT_FIELDS, "gallery"):
-        endpoint = config.get(field)
-        if isinstance(endpoint, str):
-            view[field] = endpoint
-        elif isinstance(endpoint, (dict, list)):
-            nested_extra[field] = endpoint
-    command = config.get("command")
-    extra_args: list[Any] = []
-    if isinstance(command, str):
-        view["command"] = command
-    elif isinstance(command, list):
-        if command and isinstance(command[0], str):
-            view["command"] = command[0]
-            extra_args.extend(command[1:])
-        else:
-            extra_args.extend(command)
-    elif isinstance(command, dict):
-        nested_extra["command"] = command
-    raw_args = config.get("args")
-    if isinstance(raw_args, list):
-        extra_args.extend(raw_args)
-    elif isinstance(raw_args, str):
-        extra_args.append(raw_args)
-    elif isinstance(raw_args, dict):
-        nested_extra["args"] = raw_args
-    if extra_args:
-        view["args"] = extra_args
-        for idx, item in enumerate(extra_args):
-            if isinstance(item, (dict, list)):
-                nested_extra[f"args.{idx}"] = item
-    if nested_extra:
-        existing = view.get(_EXTENSION_SETTINGS)
-        if isinstance(existing, dict):
-            view[_EXTENSION_SETTINGS] = {"_existing": existing, "_refused_nested": nested_extra}
-        else:
-            view[_EXTENSION_SETTINGS] = nested_extra
-    return view
+    return list(_credential_hits(env if isinstance(env, dict) else {}, args, maps, ()))
 
 
 def _server_literals(config: dict[str, Any], hits: PositionHits) -> list[str]:
@@ -2759,6 +2679,28 @@ def _configured_values(document: Any) -> list[str] | None:
     return values
 
 
+def _policy_exclusions(files: ConfinedCollection, result: ScanResult) -> int:
+    """Exclusions the walk recorded that leave the source search incomplete.
+
+    A default-excluded entry such as ``.git``, ``venv`` or ``__pycache__`` is reported
+    as a gap and handed to the search as unvisited, where it keeps the modules beside
+    it uncertain, so it does not make the walk incomplete; an explicit collection-policy
+    exclusion does, and so does any exclusion past the listing bound, which cannot be
+    told apart. A collection that counts policy exclusions itself is asked instead.
+    """
+    recorded: int | None = getattr(files, "policy_exclusions_recorded", None)
+    if recorded is not None:
+        return recorded
+    listed = result.surfaces_excluded
+    policy = sum(
+        1
+        for entry in listed
+        if not entry.endswith(DEFAULT_EXCLUDE_REASON)
+        and not entry.endswith(AGENT_DEFAULT_EXCLUDE_REASON)
+    )
+    return policy + max(0, files.exclusions_recorded - len(listed))
+
+
 class MCPScanner(Scanner):
     name = "mcp"
     _resolvers: _Resolvers | None = None
@@ -2777,21 +2719,7 @@ class MCPScanner(Scanner):
             links: list[Path] = []
             skipped: list[Path] = []
             sources = list(files.iter_files(directory_links=links, observed_excludes=skipped))
-            cache_dirs = [p for p in skipped if p.name.casefold() == "__pycache__"]
-            policy_exclusions = getattr(files, "policy_exclusions_recorded", None)
-            if policy_exclusions is None:
-                # Default-excluded directories (.git, __pycache__, etc.) are tracked via
-                # observed_excludes/unvisited and do not make the walk incomplete; explicit
-                # policy exclusions and any overflow past surfaces_excluded still fail closed.
-                non_default = sum(
-                    1
-                    for entry in result.surfaces_excluded
-                    if not entry.endswith(DEFAULT_EXCLUDE_REASON)
-                    and not entry.endswith(AGENT_DEFAULT_EXCLUDE_REASON)
-                )
-                overflow = max(0, files.exclusions_recorded - len(result.surfaces_excluded))
-                policy_exclusions = non_default + overflow
-            walk_complete = files.failures_recorded == 0 and policy_exclusions == 0
+            walk_complete = files.failures_recorded == 0 and _policy_exclusions(files, result) == 0
             linked, linked_gaps = _linked_client_files(files, links)
             nested, directory_gaps = self._nested_client_files(files, [*sources, *linked])
             directory_gaps.update(path.as_posix() for path in linked_gaps)
@@ -2814,7 +2742,7 @@ class MCPScanner(Scanner):
             if known is not None:
                 self._read_host_settings(files, sources, links, known)
                 self._scan_code_mcp_clients(
-                    result, sources, known, [*links, *cache_dirs], walk_complete
+                    result, sources, known, [*links, *skipped], walk_complete
                 )
 
         if not found_any and not result.scan_failures and not result.surfaces_excluded:
@@ -2994,11 +2922,14 @@ class MCPScanner(Scanner):
                 continue
             values.extend(_shape_credentials(config, shape))
             if cls._server_problem(config, shape) is not None:
-                declared = _refused_server_view(config)
-                hits = _declared_hits(declared)
+                for field in ("env", "headers", "http_headers"):
+                    mapping = config.get(field)
+                    if isinstance(mapping, dict):
+                        values.extend(secret_values(mapping))
+                hits = _declared_hits(config)
+                values.extend(_literals([hit for hit in hits if hit[0] != "argument"]))
                 if server_hits is not None:
                     server_hits[id(config)] = hits
-                values.extend(_server_secrets(declared, Launch(), hits))
                 continue
             try:
                 launch = _server_launch(config)
