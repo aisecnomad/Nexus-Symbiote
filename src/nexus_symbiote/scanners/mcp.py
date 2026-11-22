@@ -67,6 +67,7 @@ from nexus_symbiote.scanners.base import (
 )
 from nexus_symbiote.scanners.mcp_credentials import (
     NAMED_CLASS,
+    SCHEME_CLASS,
     SHAPE_CLASS,
     Hit,
     WrappedKeySearchLimitError,
@@ -100,6 +101,7 @@ from nexus_symbiote.utils.secrets import (
     is_reference,
     redact_descriptor,
     redact_text,
+    scheme_credential_like,
     scheme_credentials,
     secret_like,
     secret_values,
@@ -1035,7 +1037,12 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
                 values.extend(_shape_secrets(value))
                 # cmd's `set API_TOKEN=Bearer <token>` leaves the credential in the next word.
                 if index + 1 < len(words) and secret_like(name, f"{value} {words[index + 1]}"):
-                    values.extend(scheme_credentials(f"{value} {words[index + 1]}"))
+                    if value.lower() in _ASSIGNMENT_SCHEMES:
+                        values.extend(
+                            literal for _, literal in _assignment_word_hits(word, words[index + 1])
+                        )
+                    else:
+                        values.extend(scheme_credentials(f"{value} {words[index + 1]}"))
         if index > 0:
             flag = words[index - 1]
             if (
@@ -1059,7 +1066,9 @@ _ASSIGNMENT_FLAGS = frozenset({"env", "e", "build-arg"})
 # The scheme words _AUTH reads, after which cmd's `set NAME=<scheme> <credential>` splits.
 _ASSIGNMENT_SCHEMES = frozenset({"bearer", "basic", "token", "bot", "apikey", "api-key"})
 _SCHEME_DESCRIPTORS = frozenset({"type", "mode", "scheme", "method", "transport", "strategy"})
-_PUBLIC_TOKEN_SELECTORS = frozenset({"format", "source", "profile"})
+_PUBLIC_TOKEN_SELECTORS = frozenset({"format", "source", "profile", "output", "kind"})
+_LOWER_LONG_OPTION = re.compile(r"--[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
+_SCHEME_NUMBER = re.compile(r"[+]?[0-9]+(?:[.][0-9]+)?")
 _SCHEME_ASSIGNMENT_OPERAND = re.compile(r"[A-Za-z0-9_-]+=[A-Za-z0-9_+=-]+")
 # curl's `-u user:password`, also in a cluster of short flags (`-su`), and httpie's `-a`
 # (`--auth`) only under a fetcher. Under another command (docker -u www-data:www-data) the
@@ -1122,26 +1131,27 @@ def _scheme_assignment_name(name: str) -> bool:
     )
 
 
-def _following_option(word: str) -> bool:
-    """An option after a bare scheme can also be a dash-prefixed, padded token."""
-    flag, equals, argument = word.partition("=")
-    if not flag.startswith("--") or _CLI_FLAG.fullmatch(flag) is None:
+def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
+    """Distinguish an authentication operand from another option or setting."""
+    if len(word) < MIN_SECRET_LENGTH or is_reference(word):
         return False
-    if equals and argument not in {"", "="}:
-        return True
-    body = flag[2:]
-    if not equals and len(body) >= MIN_SECRET_LENGTH and body.isalpha() and body.islower():
-        return False
-    # Padding or mixed case and digits distinguish an opaque value from CLI
-    # labels such as --enable-automatic-updates= and common short switches.
-    has_digit = any(c.isdigit() for c in body)
-    opaque = len(body) >= 16 and (
-        argument == "="
-        or (equals and "-" not in body)
-        or (has_digit and not body.islower() and not body.isupper())
-        or (has_digit and re.fullmatch("[a-fA-F0-9]+", body) is not None)
-    )
-    return not opaque
+    key, equals, argument = word.partition("=")
+    if word.startswith("--") and _CLI_FLAG.fullmatch(key):
+        if equals and argument not in {"", "="}:
+            return literal_value(argument)
+        if not _LOWER_LONG_OPTION.fullmatch(key):
+            return credential_binding or literal_value(word)
+        # A single long dash-prefixed word can be the value of a named
+        # credential. A scheme selector followed by a switch is ordinary argv.
+        body = key[2:]
+        return (credential_binding and len(body) >= MIN_SECRET_LENGTH and body.isalpha()) or (
+            len(body) >= 16 and (argument == "=" or (equals == "=" and "-" not in body))
+        )
+    if equals and _SCHEME_ASSIGNMENT_OPERAND.fullmatch(word):
+        return literal_value(argument)
+    if _SCHEME_NUMBER.fullmatch(word):
+        return credential_binding
+    return literal_value(word)
 
 
 def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
@@ -1152,8 +1162,10 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     name, equals, value = word.partition("=")
     if not equals or _requirement(name, value):
         return []
+    variable = not name.startswith("-")
     name = name.lstrip("-").strip(" \"'")
     if name.lower() in _ASSIGNMENT_FLAGS and "=" in value:
+        variable = True
         name, _, value = value.strip(" \"'").partition("=")
         name = name.strip(" \"'")
         if _requirement(name, value):
@@ -1162,18 +1174,17 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     if not name or not value or name.lower() in {"h", "header"}:
         return []
     hits = value_hits(name, value)
-    if (
-        following is not None
-        and value.lower() in _ASSIGNMENT_SCHEMES
-        and not (value.lower() == "token" and name.lower() in _PUBLIC_TOKEN_SELECTORS)
-        and not _following_option(following)
-        and (
-            literal_value(following)
-            or (following.isascii() and following.isdecimal())
-            or _SCHEME_ASSIGNMENT_OPERAND.fullmatch(following) is not None
-        )
-    ):
-        hits.extend(value_hits(name, f"{value} {following}"))
+    if following is None or value.lower() not in _ASSIGNMENT_SCHEMES:
+        return hits
+    words = name_words(name)
+    if value.lower() == "token" and words and words[-1] in _PUBLIC_TOKEN_SELECTORS:
+        return hits
+    credential_binding = variable and _scheme_assignment_name(name)
+    if _scheme_operand(following, credential_binding=credential_binding):
+        paired = value_hits(name, f"{value} {following}")
+        if credential_binding and not paired and scheme_credential_like(following, value):
+            paired = [(SCHEME_CLASS, following)]
+        hits.extend(paired)
     return hits
 
 
@@ -1349,30 +1360,29 @@ def _declared_hits(config: dict[str, Any]) -> PositionHits:
 
 def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
     """Select credentials by their field or value even when a server is refused."""
-    pending = [(field, node)]
+    pending = [(field, node, False)]
     while pending:
-        name, item = pending.pop()
+        name, item, inferred = pending.pop()
         if isinstance(item, dict):
-            named_credential = any(
+            credential_label = any(
                 isinstance(item.get(key), str) and _scheme_assignment_name(item[key])
                 for key in ("name", "key")
             )
-            label = "auth" if named_credential else ""
-            if (
-                not named_credential
-                and not {"name", "key"}.intersection(item)
+            unlabelled = not {"name", "key"}.intersection(item)
+            value_record = credential_label or (
+                unlabelled
                 and (
                     name.lower() in {"auth", "oauth", "headers", "http_headers"}
                     or _scheme_assignment_name(name)
                 )
-            ):
-                # A value-only record inherits its credential container. An explicit
-                # public label above continues to describe its own value.
-                label = "auth"
-            pending.extend(
-                (label if label and key in {"value", "values"} else str(key), value)
-                for key, value in item.items()
             )
+            for key, value in item.items():
+                # A refused record supplies context, but a public package name
+                # can also occupy its value slot. Preserve explicit metadata labels.
+                use_shape = (value_record and key in {"value", "values"}) or (
+                    unlabelled and (inferred or credential_name(name))
+                )
+                pending.append((str(key), value, use_shape))
         elif isinstance(item, list):
             if name in {"args", "command"}:
                 for index, word in enumerate(item):
@@ -1388,11 +1398,13 @@ def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
                             )
                         )
             if len(item) == 2 and isinstance(item[0], str) and _scheme_assignment_name(item[0]):
-                pending.extend(((name, item[0]), ("auth", item[1])))
+                pending.extend(((name, item[0], False), ("value", item[1], True)))
             else:
-                pending.extend((name, value) for value in item)
+                pending.extend((name, value, inferred) for value in item)
         elif isinstance(item, str) and not is_reference(item):
-            if secret_like(name, item) or (_scheme_assignment_name(name) and literal_value(item)):
+            if secret_like(name, item) or (
+                (inferred or _scheme_assignment_name(name)) and literal_value(item)
+            ):
                 yield item
             yield from _text_credentials(item)
             yield from _shape_secrets(item)
