@@ -1,0 +1,1539 @@
+{
+ "generator": "Claude Code 2.1.42 (its bundled marked lexer and @-import extractor, run verbatim) and Claude Code 2.1.330 (its marked subclass and extractor, from the binary's source text), with path resolution removed. imports is the list both versions return for source; they agree on every row. Rows named fuzz are seeded random documents.",
+ "rows": [
+  {
+   "name": "R331-01 reference link, code span after the import",
+   "source": "See [the guide][g] and follow @notes.md`.`\n\n[g]: https://example.com/guide\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-01 leading definition, code span around the import",
+   "source": "[d]: https://e.example\nAlso follow `x`@notes.md`.` See [d].\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-02 bullet item code span",
+   "source": "- Team conventions: ` @notes.md `\n- Run the tests before pushing.\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-02 ordered item code span",
+   "source": "1. ` @notes.md `\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-02 nested item code span",
+   "source": "- a\n  - ` @notes.md `\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-02 quoted item code span",
+   "source": "> - ` @notes.md `\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-02 task item code span",
+   "source": "- [ ] see ` @notes.md `\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-02 loose item code span",
+   "source": "- a\n\n- ` @notes.md `\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-02 item continuation code span",
+   "source": "- a\n  b ` @notes.md `\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-02 line marked keeps in the item",
+   "source": "1. <!-- x -->\n  ` @notes.md `\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-03 backtick fence closed by a tilde tail",
+   "source": "```\nexample\n```~\nFollow @notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-03 tilde fence closed by a backtick tail",
+   "source": "~~~\nx\n~~~```\n@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-03 backtick fence closed by a tilde run",
+   "source": "```\nx\n```~~~\n@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-03 tab after a quote marker",
+   "source": "> \t```\n> @notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-03 tab after a list marker",
+   "source": "-\t**@a.md**\n  ```~\n* @notes.md\n",
+   "imports": [
+    "a.md",
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-03 fence marked holds in a list item",
+   "source": "* x\n> y\n   ```\n@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-03 fence after a blank in a list item",
+   "source": "- see ` @a.md `\n>\t<details>\n\n  ````\n+ <b>x</b> @notes.md\n",
+   "imports": [
+    "a.md",
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 fragment",
+   "source": "Follow @notes.md#rules\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 escaped space",
+   "source": "Follow @my\\ notes.md\n",
+   "imports": [
+    "my notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 strong",
+   "source": "**@notes.md**\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 emphasis",
+   "source": "_@notes.md_\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 trailing punctuation",
+   "source": "Follow @notes.md.\n",
+   "imports": [
+    "notes.md."
+   ]
+  },
+  {
+   "name": "R331-04 link text",
+   "source": "[@notes.md](x)\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 after a link",
+   "source": "[x](u)@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 after an escape",
+   "source": "\\#@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 after raw HTML",
+   "source": "x <span>@notes.md</span>\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 no-break space",
+   "source": "x\u00a0@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 byte order mark",
+   "source": "x\ufeff@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 after an escaped backtick",
+   "source": "x \\`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 after an inline tag inside a name",
+   "source": "@a.md<b>@notes.md</b>\n",
+   "imports": [
+    "a.md",
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 before an inline tag",
+   "source": "Follow @notes.md<br>\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 backslash before a line break",
+   "source": "x <b>@notes.md\\  \nnext\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 closing pre tag read as text",
+   "source": "</pre>\nx `y`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R331-04 fence opener on an unterminated last line",
+   "source": "Rules\n~~~ @notes.md",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "code span",
+   "source": "- [ ] run `@notes.md`\n",
+   "imports": []
+  },
+  {
+   "name": "fenced example",
+   "source": "```\n@notes.md\n```\n",
+   "imports": []
+  },
+  {
+   "name": "fence in a list item",
+   "source": "- step\n  ```\n  @notes.md\n  ```\n",
+   "imports": []
+  },
+  {
+   "name": "fence after a list item at its margin",
+   "source": "- a\n```\n@notes.md\n```\n",
+   "imports": []
+  },
+  {
+   "name": "fence in a quote",
+   "source": "> ```\n> @notes.md\n> ```\n",
+   "imports": []
+  },
+  {
+   "name": "longer fence",
+   "source": "````\n```\n@notes.md\n````\n",
+   "imports": []
+  },
+  {
+   "name": "code span across lines",
+   "source": "Use `npm install\n@notes.md` first.\n",
+   "imports": []
+  },
+  {
+   "name": "escaped at sign",
+   "source": "x\\@notes.md\n",
+   "imports": []
+  },
+  {
+   "name": "email address",
+   "source": "mail a@notes.md\n",
+   "imports": []
+  },
+  {
+   "name": "HTML comment",
+   "source": "<!-- @notes.md -->\n",
+   "imports": []
+  },
+  {
+   "name": "HTML block",
+   "source": "<div>\nnotes\n`n`@notes.md\n</div>\n",
+   "imports": []
+  },
+  {
+   "name": "fence opener with a line end",
+   "source": "Rules\n~~~ @notes.md\n",
+   "imports": []
+  },
+  {
+   "name": "fuzz 000",
+   "source": "  *a*@f1.md\n> ` @f2.md `\n- [ ] \ufeff@f3.md\n+ x  \n@f4.md\n  - *a*@f5.md\n  - @f6.md[x]",
+   "imports": [
+    "f1.md",
+    "f3.md",
+    "f4.md",
+    "f5.md",
+    "f6.md[x]"
+   ]
+  },
+  {
+   "name": "fuzz 003",
+   "source": "-\t@f1.md[x]\n```  ~~\n",
+   "imports": [
+    "f1.md[x]"
+   ]
+  },
+  {
+   "name": "fuzz 007",
+   "source": "> <span>@f1.md</span>\n``` ~\n \t@f2.md.\n \t[r]: /u\n- [ ] ```  ~~\n- > @f4.md <!--\n  - see @my\\ f5.md\n  - </details>",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 008",
+   "source": "- ```` \n>\t\u00a0@f1.md\n> > [a]: /u\n\t_@f3.md_\n> ```\n+ 1. `x` @f4.md\n-\t---\n",
+   "imports": [
+    "f1.md",
+    "f4.md"
+   ]
+  },
+  {
+   "name": "fuzz 009",
+   "source": " \t![i](u)@f1.md\n+ a`b` @f2.md\n>\t>\t```\n>\ta @f3.md`.`\n",
+   "imports": [
+    "f2.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 011",
+   "source": "1. *a*@f1.md\n2) > - ` @f2.md `\n- [ ] > \t```\n-\t[l][r] @f3.md`.`\n+ ````\n  - **a** @f4.md**",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f3.md",
+    "f3.md`.`"
+   ]
+  },
+  {
+   "name": "fuzz 012",
+   "source": ">\t<!-- @f1.md -->\n-\t[x](u)@f2.md\n\ufeff@f3.md\n- [ ] ---\n-\t</pre>\n",
+   "imports": [
+    "f2.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 013",
+   "source": "- [ ] <span>@f1.md</span>\n+ \t```\n> </details>\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 015",
+   "source": ">\t@f1.md),",
+   "imports": [
+    "f1.md),"
+   ]
+  },
+  {
+   "name": "fuzz 017",
+   "source": ">\t- see ` @f1.md `\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 020",
+   "source": "2) \\#@f1.md\n> > ````",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 022",
+   "source": "- [ ] \ufeff@f1.md\n1. <!-- @f2.md -->\n> @f3.md),\n- <b>x</b> @f4.md\n",
+   "imports": [
+    "f1.md",
+    "f3.md),",
+    "f4.md"
+   ]
+  },
+  {
+   "name": "fuzz 023",
+   "source": "* \\#@f1.md",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 024",
+   "source": "\t</details>\n-\t1. ```\n\t# @f2.md\n- @f3.md#frag\n- > [a]: /u\n> ```\n  @f5.md),\n@f6.md.\n",
+   "imports": [
+    "f2.md",
+    "f3.md",
+    "f5.md),",
+    "f6.md."
+   ]
+  },
+  {
+   "name": "fuzz 025",
+   "source": "    1. ```\n-\t[r]: /u\n\u3000@f2.md",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 026",
+   "source": "* - see ` @f1.md `\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 027",
+   "source": "* \u3000@f1.md\n1. @f2.md#frag\n",
+   "imports": [
+    "f1.md",
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 028",
+   "source": "- ```\t\n- [ ] ```  ~~\n>\t**@f1.md**\n   \\#@f2.md\n",
+   "imports": [
+    "f1.md",
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 030",
+   "source": "  - _@f1.md_",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 031",
+   "source": "> -\t```\n   x  \n@f1.md\n* ~~~ ~\n   ~~~~\n1. | a | @f2.md |\n* @f3.md\n    ``` py",
+   "imports": [
+    "f2.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 032",
+   "source": "+ ```\t\n \t*@f1.md*\n>    ```\n    > - ` @f2.md `\n- ```\n-     @f3.md\n  - `` @f4.md ``\n> @f5.md\\\n",
+   "imports": [
+    "f4.md",
+    "f5.md"
+   ]
+  },
+  {
+   "name": "fuzz 033",
+   "source": "+ # @f1.md\n***\n \tsee `x` @f3.md\n  `` @f4.md ``\n* </pre>\n \t**@f6.md**\n  - > ```",
+   "imports": [
+    "f1.md",
+    "f6.md"
+   ]
+  },
+  {
+   "name": "fuzz 034",
+   "source": "  ===\n   ***\n\t` @f3.md `\n   <span>@f4.md</span>\n~~@f5.md~~",
+   "imports": [
+    "f4.md"
+   ]
+  },
+  {
+   "name": "fuzz 035",
+   "source": "- > ``` ~\n```x`\n  *a*@f1.md\n    see `x` @f2.md\n1.     @f3.md\n> > ``` py\n+ <pre>\n- [x]: /u \"t\"",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 036",
+   "source": "***\na @f2.md`.`\n+ ```x`\n>\t`a` `@f3.md`",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 039",
+   "source": "`` @f1.md ``\n+ ````\n- > @f2.md\\\n```\n\t@f3.md`",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 041",
+   "source": "-    ```\n  - ![i](u)@f1.md\n-->\nx ` @f3.md `",
+   "imports": [
+    "f1.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 043",
+   "source": "  &#64;f1.md\n> ```x`\n  [x](u)@f2.md\n",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 044",
+   "source": "- ~~~\n+ Follow @f1.md",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 047",
+   "source": "- [ ] ~~~\n* see @my\\ f1.md\n>\t- ```\n> @f2.md.",
+   "imports": [
+    "f2.md.",
+    "my f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 048",
+   "source": "-\t@f1.md`\n* *@f2.md*\n-\t<!-- @f3.md -->\n- ``` ``\n>\t```\n  - ```~\n  @f4.md\\\n<pre>",
+   "imports": [
+    "f1.md`",
+    "f2.md",
+    "f4.md"
+   ]
+  },
+  {
+   "name": "fuzz 050",
+   "source": "- [ ] [x](u)@f1.md\n- [ ] @f2.md`\n> > <pre>\n    @f4.md\n> ``` ~\n1. ````",
+   "imports": [
+    "f1.md",
+    "f2.md`",
+    "f4.md"
+   ]
+  },
+  {
+   "name": "fuzz 051",
+   "source": "- >     ```\n`` @f1.md ``\n[l][r] @f2.md`.`\n  [@f3.md](u)\n---\n\t    @f5.md\n> > see @my\\ f6.md\n* _@f7.md_",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f2.md`.`",
+    "f3.md",
+    "f7.md",
+    "my f6.md"
+   ]
+  },
+  {
+   "name": "fuzz 052",
+   "source": "\t````\n* \u3000@f1.md\n- ```` \n> > -->\n- [ ] @f3.md\n- [ ] a`b` @f4.md\n> [r]: /u",
+   "imports": [
+    "f1.md",
+    "f3.md",
+    "f4.md"
+   ]
+  },
+  {
+   "name": "fuzz 054",
+   "source": "    1. `x` @f1.md\n> > @f2.md*x*\n   > ```\n> \t```\n",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 055",
+   "source": "x ` @f1.md `\n \t```\n- [ ] [l][r] @f2.md`.`\n2) 1. `x` @f3.md\n",
+   "imports": [
+    "f2.md",
+    "f2.md`.`",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 056",
+   "source": "![i](u)@f1.md\n```  ~~\n    ```  ~~\n2) <!-- @f2.md -->\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 057",
+   "source": "+ @f1.md#frag\n***\n2) > - ` @f3.md `\n+ 1. `x` @f4.md\n  see `x` @f5.md\n+ ```~\n-     ```\n2) @f6.md),\n",
+   "imports": [
+    "f1.md",
+    "f3.md",
+    "f4.md",
+    "f5.md",
+    "f6.md),"
+   ]
+  },
+  {
+   "name": "fuzz 063",
+   "source": "- x\\@f1.md\n2) 1. `x` @f2.md\n",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 064",
+   "source": "- > @f1.md_x\n  ```\n   ~~@f2.md~~\n \t---\n\t@f4.md\n> x ` @f5.md `\n",
+   "imports": [
+    "f1.md_x"
+   ]
+  },
+  {
+   "name": "fuzz 065",
+   "source": "- [ ] x  \n@f1.md\n1. ---\n   &#64;f3.md\n>\t```\n> ```~~~",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 066",
+   "source": "* @f1.md#frag\n  - a @f2.md`.`\n   > ```\n+ x\\@f3.md\n>\t> \t```\n-\t1. ```\n-\t``` ``",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f2.md`.`"
+   ]
+  },
+  {
+   "name": "fuzz 068",
+   "source": ">\t<!-- @f1.md -->\n> ![i](u)@f2.md\n   \ufeff@f3.md\n1. ```` \n  ![i](u)@f4.md\n      @f5.md\nx\\@f6.md\n  ``` ~",
+   "imports": [
+    "f2.md",
+    "f3.md",
+    "f4.md",
+    "f5.md"
+   ]
+  },
+  {
+   "name": "fuzz 069",
+   "source": "2) \n  [@f2.md](u)\n\t***\n\n> > @f5.md_x\n- \nx ` @f7.md `\n-\t> \t```",
+   "imports": [
+    "f2.md",
+    "f5.md_x"
+   ]
+  },
+  {
+   "name": "fuzz 070",
+   "source": "- > @f1.md\n>\tFollow @f2.md\n-\tx `y`@f3.md\n",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 071",
+   "source": "@f1.md<br>\n* ```x`\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 072",
+   "source": "-\t``` py\n  text\n+ see `x` @f2.md\n",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 074",
+   "source": "- see ` @f1.md `\n<!-- @f2.md -->\n- `a` `@f3.md`\n- > see @my\\ f4.md\n- [ ] [r]: /u\n- [ ] [l][r] @f6.md`.`\n+ \ufeff@f7.md\n",
+   "imports": [
+    "f1.md",
+    "f6.md",
+    "f6.md`.`",
+    "f7.md",
+    "my f4.md"
+   ]
+  },
+  {
+   "name": "fuzz 076",
+   "source": "> ```x`\n  - *a*@f1.md\n2) see @my\\ f2.md",
+   "imports": [
+    "f1.md",
+    "my f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 079",
+   "source": " \t```\n>\t[a]: /u\n\t   ```\n- 1. `x` @f2.md\n    @f3.md`\n\t\n- > \\#@f5.md\n+ <!-- @f6.md -->\n",
+   "imports": [
+    "f2.md",
+    "f3.md`",
+    "f5.md"
+   ]
+  },
+  {
+   "name": "fuzz 080",
+   "source": "- `` @f1.md ``",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 082",
+   "source": "\t\t```\n2) ```\t\n>\t@f1.md[x]\n   ``` ``\n@f2.md),\n2) ```  ~~\n  - - ```\n- 1. `x` @f3.md\n",
+   "imports": [
+    "f1.md[x]",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 085",
+   "source": "+ a`b` @f1.md\ntext\n>\t```~\n1. @f3.md.\n",
+   "imports": [
+    "f1.md",
+    "f3.md."
+   ]
+  },
+  {
+   "name": "fuzz 086",
+   "source": "\t\n  - &#64;f2.md\n- > | a | @f3.md |\n\t@f4.md`\n  - </details>\n \t \t```\n  - ```\n",
+   "imports": [
+    "f3.md",
+    "f4.md`"
+   ]
+  },
+  {
+   "name": "fuzz 087",
+   "source": "> > Follow @f1.md\n \t@f2.md\\\n \t    ```\n  - see ` @f3.md `\n  - ``` ``\n- \\#@f4.md\n  - x ` @f5.md `\n>\t~~~ ~",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f3.md",
+    "f4.md",
+    "f5.md"
+   ]
+  },
+  {
+   "name": "fuzz 089",
+   "source": "   \\#@f1.md\n\t@f2.md`\n*@f3.md*\n1. \ufeff@f4.md\n   *@f5.md*\n",
+   "imports": [
+    "f1.md",
+    "f2.md`",
+    "f3.md",
+    "f4.md",
+    "f5.md"
+   ]
+  },
+  {
+   "name": "fuzz 090",
+   "source": "[@f1.md](u)\n> > </pre>\n- > a`b` @f3.md\n",
+   "imports": [
+    "f1.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 093",
+   "source": "* `` @f1.md ``\n-\t![i](u)@f2.md\n> > a @f3.md`.`\n- [ ] ```\n    <!-- @f4.md -->\n  - | a | @f5.md |",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f3.md",
+    "f5.md"
+   ]
+  },
+  {
+   "name": "fuzz 095",
+   "source": "2) [x](u)@f1.md\n>\t\u00a0@f2.md\n",
+   "imports": [
+    "f1.md",
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 096",
+   "source": "+ <!-- @f1.md -->\n  - 1. `x` @f2.md",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 097",
+   "source": "1. > - ` @f1.md `\n2) *@f2.md*\n",
+   "imports": [
+    "f1.md",
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 102",
+   "source": " \t``` ~\n   > - ` @f1.md `\n` @f2.md `\n  - @f3.md.\n~~~ ~\n* see @my\\ f4.md\n",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f3.md."
+   ]
+  },
+  {
+   "name": "fuzz 103",
+   "source": "   *a*@f1.md\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 104",
+   "source": "  x  \n@f1.md\n  a`b` @f2.md\n[x](u)@f3.md\n \t` @f4.md `\n+ [a]: /u\n",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 105",
+   "source": "``` ``\n- > | a | @f1.md |\n  -  \t```\n    @f2.md[x]",
+   "imports": [
+    "f1.md",
+    "f2.md[x]"
+   ]
+  },
+  {
+   "name": "fuzz 106",
+   "source": "> > >\t```\n- > >\t```\n-\t&#64;f1.md\n>\t<b>x</b> @f2.md\n  <b>x</b> @f3.md\n- > x\\@f4.md\n",
+   "imports": [
+    "f2.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 107",
+   "source": "> > @f1.md\n>\t```",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 108",
+   "source": "1. **@f1.md**\n* > \t```\n- > ---\n- ```  ~~\n\n2) `a` `@f4.md`\n[x](u)@f5.md\n",
+   "imports": [
+    "f1.md",
+    "f5.md"
+   ]
+  },
+  {
+   "name": "fuzz 109",
+   "source": "     ```\n- [ ] [x]: /u \"t\"\n-\t> - ` @f2.md `\n \t\u3000@f3.md\n    | a | @f4.md |\n- \u3000@f5.md",
+   "imports": [
+    "f2.md",
+    "f3.md",
+    "f4.md",
+    "f5.md"
+   ]
+  },
+  {
+   "name": "fuzz 110",
+   "source": "- [ ] \u3000@f1.md",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 111",
+   "source": "1. ```~\n> > **@f1.md**\n+ a @f2.md`.`\n- ```~\n",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f2.md`.`"
+   ]
+  },
+  {
+   "name": "fuzz 112",
+   "source": "2) </details>\n2) 1. `x` @f2.md",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 113",
+   "source": "  a @f1.md`.`\n2) <b>x</b> @f2.md\n> <span>@f3.md</span>\n| a | @f4.md |\n* -\t```\n  - Follow @f5.md\n",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f3.md",
+    "f4.md",
+    "f5.md"
+   ]
+  },
+  {
+   "name": "fuzz 115",
+   "source": "@f1.md[x]\n> > 1. ```\n![i](u)@f2.md\n    > - ` @f3.md `\n- [ ]  \t```\n\t<div>@f4.md</div>\n",
+   "imports": [
+    "f1.md[x]",
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 116",
+   "source": "    \u3000@f1.md\n>\t*a*@f2.md\n> > \ufeff@f3.md\n- ```  ~~\n-\t~~~\n\u3000@f4.md\n2)  \t```\n",
+   "imports": [
+    "f2.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 117",
+   "source": "+ [l][r] @f1.md`.`\n  - <span>@f2.md</span>\n+ [a]: /u\n+ @f4.md.\n",
+   "imports": [
+    "f1.md",
+    "f1.md`.`",
+    "f2.md",
+    "f4.md."
+   ]
+  },
+  {
+   "name": "fuzz 118",
+   "source": "- > @f1.md.\n> > [l][r] @f2.md`.`\n- x  \n@f3.md\n   ~~~~\n- [ ] x `y`@f4.md\n+ @f5.md.\n",
+   "imports": [
+    "f1.md.",
+    "f2.md",
+    "f3.md",
+    "f4.md",
+    "f5.md."
+   ]
+  },
+  {
+   "name": "fuzz 120",
+   "source": ">\t<span>@f1.md</span>\n\t<details>\n+ [@f3.md](u)\n",
+   "imports": [
+    "f1.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 122",
+   "source": "- [ ] ```\t\n+ <b>x</b> @f1.md\n  - - ```\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 126",
+   "source": "    > ```\n-\t-\t```\n    x `y`@f1.md\n+ <pre>\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 127",
+   "source": "> @f1.md <!--\n> ` @f2.md `\n \t# @f3.md\n",
+   "imports": [
+    "f1.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 129",
+   "source": "    &#64;f1.md\n\t```~\n* [x](u)@f2.md\n2) ```~~~\n* **@f3.md**",
+   "imports": [
+    "f2.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 130",
+   "source": "+ *a*@f1.md\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 131",
+   "source": "- \u00a0@f1.md\n  - *@f2.md*\n",
+   "imports": [
+    "f1.md",
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 134",
+   "source": "1. - ```\n   see @my\\ f1.md\n+ \\#@f2.md\n",
+   "imports": [
+    "f2.md",
+    "my f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 135",
+   "source": "> ===\n   ![i](u)@f2.md\n- <div>@f3.md</div>\n> </pre>\n",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 136",
+   "source": "  @f1.md_x\n",
+   "imports": [
+    "f1.md_x"
+   ]
+  },
+  {
+   "name": "fuzz 140",
+   "source": "- [ ] *a*@f1.md\n```  ~~\n1. ``` ``\n* @f2.md`",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 142",
+   "source": "- > a @f1.md`.`\n-\t<!-- @f2.md -->\n \t@f3.md[x]\nx ` @f4.md `\n> `` @f5.md ``\n> ~~~~\n@f6.md),\n",
+   "imports": [
+    "f1.md",
+    "f6.md),"
+   ]
+  },
+  {
+   "name": "fuzz 144",
+   "source": "> > @f1.md`\n   [x]: /u \"t\"\n- > >\t```\n1. -->\n  1. ```\n---\n> > <details>\n",
+   "imports": [
+    "f1.md`"
+   ]
+  },
+  {
+   "name": "fuzz 145",
+   "source": "> ===\n    -\t```\n    [a]: /u\n@f3.md#frag\n1. [@f4.md](u)\n   ```\n-->\n",
+   "imports": [
+    "f3.md",
+    "f4.md"
+   ]
+  },
+  {
+   "name": "fuzz 146",
+   "source": "- \u00a0@f1.md\n> > \n  ` @f3.md `",
+   "imports": [
+    "f1.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 148",
+   "source": "@f1.md[x]\n>\ta`b` @f2.md",
+   "imports": [
+    "f1.md[x]",
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 151",
+   "source": "   >\t```\nsee `x` @f1.md\n      ```\n- > ~~~~\n    @f2.md\n    1. ```",
+   "imports": [
+    "f1.md",
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 152",
+   "source": "1. ```~~~\n  @f1.md`\n",
+   "imports": [
+    "f1.md`"
+   ]
+  },
+  {
+   "name": "fuzz 153",
+   "source": "\t***\n        ```\nx ` @f2.md `\n    *@f3.md*\n\t***\n   <pre>",
+   "imports": [
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 154",
+   "source": "\t[@f1.md](u)\n2) \n+ see `x` @f3.md\n- [ ] _@f4.md_\n1. x  \n@f5.md\n+ *a*@f6.md\n- > <b>x</b> @f7.md\n  [x]: /u \"t\"\n",
+   "imports": [
+    "f3.md",
+    "f4.md",
+    "f5.md",
+    "f6.md",
+    "f7.md"
+   ]
+  },
+  {
+   "name": "fuzz 155",
+   "source": "> > Follow @f1.md\n    > ```\n \t![i](u)@f2.md\n> > ` @f3.md `\n``` py\n+ \t```",
+   "imports": [
+    "f1.md",
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 158",
+   "source": "2) </details>\n* @f2.md\\\n+ x `y`@f3.md",
+   "imports": [
+    "f2.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 159",
+   "source": "- > @f1.md*x*\n````\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 160",
+   "source": "+ <span>@f1.md</span>\n- [ ] [l][r] @f2.md`.`\n- > x `y`@f3.md\n-\t[l][r] @f4.md`.`",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f2.md`.`",
+    "f3.md",
+    "f4.md",
+    "f4.md`.`"
+   ]
+  },
+  {
+   "name": "fuzz 161",
+   "source": "> > ` @f1.md `\n> - ` @f2.md `\n2) @f3.md\n- [ ]  \t```\n",
+   "imports": [
+    "f2.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 163",
+   "source": "- ===\n@f2.md),\n* `a` `@f3.md`\n \t| a | @f4.md |\n\t</details>",
+   "imports": [
+    "f2.md),",
+    "f4.md"
+   ]
+  },
+  {
+   "name": "fuzz 164",
+   "source": "> > `` @f1.md ``\n    a @f2.md`.`\n>\t```~\n2) ```\n   > ```\n1. [r]: /u\n-\t*a*@f4.md\n",
+   "imports": [
+    "f2.md",
+    "f4.md"
+   ]
+  },
+  {
+   "name": "fuzz 165",
+   "source": "- ```~~~\n  ```  ~~\n- [ ] \u3000@f1.md\ntext\n1. see `x` @f3.md\n-\t***",
+   "imports": [
+    "f1.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 166",
+   "source": "\t[@f1.md](u)\n>\t[x]: /u \"t\"\n- > - see ` @f3.md `\n>\t-->\n   **@f5.md**\n\t@f6.md.\n\t`a` `@f7.md`\n",
+   "imports": [
+    "f3.md",
+    "f5.md",
+    "f6.md."
+   ]
+  },
+  {
+   "name": "fuzz 167",
+   "source": "  > \t```\n>\t<details>\n2) ~~~~\n2) ```~\n1. *a*@f2.md\n \t~~~```\n1. </details>\n- ***\n",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 169",
+   "source": ">\t*a*@f1.md\n+ ~~~```\n1. <details>\n\t---\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 171",
+   "source": "* <b>x</b> @f1.md\n    @f2.md\\\n+ ``` py\n> > @f3.md <!--\n1. see @my\\ f4.md\n> -->\n1. ```~\n> - see ` @f6.md `\n",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f3.md",
+    "f6.md",
+    "my f4.md"
+   ]
+  },
+  {
+   "name": "fuzz 172",
+   "source": "> @f1.md),\n- see ` @f2.md `\n- @f3.md <!--\n```  ~~\n- [ ] \ufeff@f4.md\n      ```\n   *a*@f5.md",
+   "imports": [
+    "f1.md),",
+    "f2.md",
+    "f3.md"
+   ]
+  },
+  {
+   "name": "fuzz 173",
+   "source": "   > ```\n* ~~@f1.md~~\n1. a @f2.md`.`\n- [ ] ``` py",
+   "imports": [
+    "f2.md",
+    "f2.md`.`"
+   ]
+  },
+  {
+   "name": "fuzz 174",
+   "source": ">\t@f1.md<br>\n```x`\n  ~~~ ~",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 181",
+   "source": "> *@f1.md*",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 185",
+   "source": "# @f1.md\n> > ~~~\n-\t```x`\n2) ```` \n+ <span>@f2.md</span>",
+   "imports": [
+    "f1.md",
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 189",
+   "source": "see `x` @f1.md\n* \\#@f2.md\n+ @f3.md[x]\n@f4.md),\n+ - ```",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f3.md[x]",
+    "f4.md),"
+   ]
+  },
+  {
+   "name": "fuzz 190",
+   "source": "<b>x</b> @f1.md\n-\tx  \n@f2.md\n\t<b>x</b> @f3.md\n>\ta`b` @f4.md\n",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f3.md",
+    "f4.md"
+   ]
+  },
+  {
+   "name": "fuzz 192",
+   "source": "* \u00a0@f1.md\n    ``` py\n*a*@f2.md\n> > `a` `@f3.md`\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 194",
+   "source": " \t</details>\n1. ~~~~\n- - see ` @f2.md `",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 195",
+   "source": "-\t`a` `@f1.md`\n>\t- see ` @f2.md `",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 196",
+   "source": "- </details>\n1. ```  ~~\n    ```\n\u00a0@f2.md\n",
+   "imports": [
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 198",
+   "source": "> > | a | @f1.md |\n- # @f2.md\n-\t[l][r] @f3.md`.`\n>\t``` ``\n> > ```  ~~\n",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f3.md",
+    "f3.md`.`"
+   ]
+  },
+  {
+   "name": "fuzz 201",
+   "source": "@f1.md\n1.<br>\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 204",
+   "source": "@f1.md```word<br>_)@f2.md**|#x</script><p>---@f3.md@f4.md#1.",
+   "imports": [
+    "f1.md```word"
+   ]
+  },
+  {
+   "name": "fuzz 209",
+   "source": ",<br>@f1.md@f2.md#@f3.md@f4.md@f5.md-->\n\n1.@f6.md]",
+   "imports": [
+    "f1.md@f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 212",
+   "source": " ](u)@f1.md\n@f2.md( <br>\\@f3.md>\\ |`===+#x\t](u)``\\](u)\\   @f4.md===",
+   "imports": [
+    "f2.md(",
+    "f4.md==="
+   ]
+  },
+  {
+   "name": "fuzz 213",
+   "source": "@f1.md</script>\t<pre>@f2.md@f3.md)@f4.md)+)(](u)!",
+   "imports": [
+    "f1.md",
+    "f2.md@f3.md)@f4.md)+)(](u)!"
+   ]
+  },
+  {
+   "name": "fuzz 214",
+   "source": "@f1.md<p><@f2.md",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 215",
+   "source": "\n@f1.md@f2.md\t( \n<table><br><!--@f3.md[\n@f4.md```>@f5.md#x]>--><#```\\",
+   "imports": [
+    "f1.md@f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 216",
+   "source": "\n\\<x><p>@f1.md-\n<x>~~~`\\----<section>*(|@f2.md",
+   "imports": [
+    "f1.md-"
+   ]
+  },
+  {
+   "name": "fuzz 218",
+   "source": "`<meta></pre>\\ \t<!--\t@f1.md\n\n.[**[r]: /u@f2.md---_@f3.md@f4.md]@f5.md<br><p><br>#[r]: /u @f6.md#<",
+   "imports": [
+    "f1.md",
+    "f6.md"
+   ]
+  },
+  {
+   "name": "fuzz 220",
+   "source": "  @f1.md\nword<p> ===*****@f2.md@f3.md@f4.md@f5.md@f6.md(`@f7.md\n",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 224",
+   "source": "](u)</p>**!---\\>@f1.md",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 225",
+   "source": "\n+..](u)~~~~~~@f1.md#x<p>+\\ @f2.mdword<section>[r]: /u ===@f3.md|]===```@f4.md@f5.md1.@f6.md",
+   "imports": [
+    "f2.mdword"
+   ]
+  },
+  {
+   "name": "fuzz 229",
+   "source": "@f1.md[<x>-->|@f2.md![r]: /uword|\n[r]: /u-@f3.md===<script>@f4.md~~~&amp;",
+   "imports": [
+    "f1.md[",
+    "f4.md~~~&amp;"
+   ]
+  },
+  {
+   "name": "fuzz 230",
+   "source": "@f1.md<x>)](u)@f2.md<section>&amp;!@f3.md\t</script>+===",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 231",
+   "source": ",<===<</pre>@f1.md[<table>",
+   "imports": [
+    "f1.md["
+   ]
+  },
+  {
+   "name": "fuzz 232",
+   "source": "@f1.md\\ 1.``\\ #\n\n@f2.md,<x>",
+   "imports": [
+    "f1.md 1.`` ",
+    "f2.md,"
+   ]
+  },
+  {
+   "name": "fuzz 233",
+   "source": "@f1.mdword@f2.md---</p>(@f3.md\n#\n&amp;#(<meta>]~~~",
+   "imports": [
+    "f1.mdword@f2.md---"
+   ]
+  },
+  {
+   "name": "fuzz 237",
+   "source": "@f1.md<p>@f2.md<pre> `<x>#[[)@f3.md(---\n\n@f4.md@f5.md===. <!--===(_\n[r]: /u[\\",
+   "imports": [
+    "f1.md",
+    "f2.md",
+    "f4.md@f5.md===."
+   ]
+  },
+  {
+   "name": "fuzz 239",
+   "source": "*\n@f1.md",
+   "imports": [
+    "f1.md"
+   ]
+  },
+  {
+   "name": "fuzz 240",
+   "source": ".!~~~_!-->1.<script>@f1.md`@f2.md@f3.md@f4.md\\ [===@f5.md@f6.md---@f7.md<section><table>```@f8.md@f9.md",
+   "imports": [
+    "f1.md`@f2.md@f3.md@f4.md [===@f5.md@f6.md---@f7.md"
+   ]
+  },
+  {
+   "name": "fuzz 248",
+   "source": "</script></p>x_]@f1.md!!.\\ @f2.md``",
+   "imports": [
+    "f2.md``"
+   ]
+  },
+  {
+   "name": "fuzz 249",
+   "source": "@f1.md@f2.md@f3.md</pre>@f4.md[@f5.md#```@f6.md]@f7.md-\n<section>---1.@f8.md_#><-``[~~~#x",
+   "imports": [
+    "f1.md@f2.md@f3.md",
+    "f4.md[@f5.md"
+   ]
+  },
+  {
+   "name": "fuzz 250",
+   "source": "-->**x[,[\nword</p><!--<pre>]===@f1.md</script><p>``,<\\ @f2.md*@f3.md<x>@f4.md---\n<br>",
+   "imports": [
+    "f2.md",
+    "f3.md",
+    "f4.md---"
+   ]
+  },
+  {
+   "name": "fuzz 253",
+   "source": "-->\n@f1.md<p>@f2.md-",
+   "imports": [
+    "f1.md",
+    "f2.md-"
+   ]
+  },
+  {
+   "name": "fuzz 255",
+   "source": "@f1.md</p>+<pre>_<section>@f2.md",
+   "imports": [
+    "f1.md",
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 256",
+   "source": "<---<section>@f1.md</pre>\n@f2.md\n]===@f3.md@f4.md*<table>",
+   "imports": [
+    "f1.md",
+    "f2.md"
+   ]
+  },
+  {
+   "name": "fuzz 257",
+   "source": "*.@f1.md|<table></pre>1.[r]: /u\\@f2.md\n|-@f3.md<br>**<br>\\ @f4.md<script>]@f5.md~~~.",
+   "imports": [
+    "f4.md"
+   ]
+  },
+  {
+   "name": "fuzz 258",
+   "source": "!<<)#  @f1.md===<br></pre>](u)@f2.md",
+   "imports": [
+    "f1.md==="
+   ]
+  },
+  {
+   "name": "fuzz 259",
+   "source": "<br>)x\tword\\ ---.@f1.md<(~~~<@f2.md](u)<meta>~~~,-<pre>@f3.md---#@f4.md|[r]: /u],",
+   "imports": [
+    "f3.md---"
+   ]
+  },
+  {
+   "name": "fuzz 264",
+   "source": "@f1.md`@f2.md-</script>&amp;@f3.md\\@f4.md\\ @f5.md#x<x>word<section>1.+",
+   "imports": [
+    "f1.md`@f2.md-",
+    "f5.md"
+   ]
+  },
+  {
+   "name": "fuzz 266",
+   "source": "\\ @f1.md@f2.md<table></pre>**@f3.md@f4.mdx<p>-->|<p>#x]x@f5.md[r]: /u\\,|`#@f6.md*@f7.md</pre>@f8.md",
+   "imports": [
+    "f1.md@f2.md",
+    "f8.md"
+   ]
+  },
+  {
+   "name": "fuzz 269",
+   "source": "\n@f1.md[===#x<pre><section>\n```<x><section><-  ~~~>,word<.<script>@f2.md\n\n#x]+@f3.md",
+   "imports": [
+    "f1.md[==="
+   ]
+  },
+  {
+   "name": "fuzz 277",
+   "source": "@f1.md```\t](u)(@f2.md-@f3.mdx@f4.md <p>|#  ",
+   "imports": [
+    "f1.md```"
+   ]
+  }
+ ]
+}

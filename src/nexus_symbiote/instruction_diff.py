@@ -49,12 +49,13 @@ from nexus_symbiote.scanners.prompt import (
     _IMPORT,
     _IMPORTING_NAMES,
     _MAX_IMPORT_DEPTH,
-    _MAX_IMPORTS,
     _RESOURCE_DIRECTORIES,
     _TRAILING,
     INSTRUCTION_FILES,
     NESTED_INSTRUCTION_NAMES,
     _hidden_counts,
+    _import_names,
+    _import_readings,
     _import_tokens,
     _line_separator_counts,
     _resolve_import,
@@ -758,23 +759,26 @@ def _read_confined_tree(root: Path) -> tuple[dict[str, _ParsedInstruction], list
                 for inc in _INCLUDE_RE.findall(texts[importer])
                 if inc.strip() and "://" not in inc
             ]
-            tokens = [*_import_tokens(texts[importer]), *include_tokens]
-            if not tokens:
+            own, host, overflow = _import_readings(texts[importer])
+            references, too_many = _import_names([*own, *include_tokens], host, overflow)
+            if not references:
                 continue
-            if len(set(tokens)) > _MAX_IMPORTS:
+            if too_many:
                 failures.append(f"{importer}: too many @path imports to inspect")
                 continue
             if importer not in looked_up and not _spend(importer):
                 break
-            targets: list[str] = []
+            # Each target, and whether only a name Claude Code may read leads to it.
+            targets: dict[str, bool] = {}
             outside = too_long = exhausted = False
             importer_dir = PurePosixPath(importer).parent.parts
-            for token in dict.fromkeys(tok.rstrip(_TRAILING) for tok in tokens):
+            for token, speculative in references.items():
                 resolved_named, leaves, long = _resolve_import(importer_dir, token)
-                targets.extend(resolved_named)
+                for target in resolved_named:
+                    targets[target] = targets.get(target, True) and speculative
                 outside |= leaves
                 too_long |= long
-            for target in dict.fromkeys(targets):
+            for target, speculative in targets.items():
                 if target in records:
                     if target not in followed_imports and depth + 1 <= _MAX_IMPORT_DEPTH:
                         followed_imports.add(target)
@@ -786,6 +790,15 @@ def _read_confined_tree(root: Path) -> tuple[dict[str, _ParsedInstruction], list
                     exhausted = True
                     break
                 looked_up.add(target)
+                # A name only Claude Code's reading gives is looked up exactly and is
+                # silent when it names nothing, so its credential or case-variant checks
+                # cannot report a file no host loads.
+                if (
+                    speculative
+                    and not files.excluded(target)
+                    and files.regular_file(target) is None
+                ):
+                    continue
                 if len(PurePosixPath(target).parts) > files.max_depth + 1:
                     excluded.append(
                         f"{target}: imported by {importer} below the collection depth limit "
