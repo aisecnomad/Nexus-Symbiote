@@ -249,7 +249,28 @@ A way around a limit that its entry does not describe is worth a
   or `cmd` may rewrite it (quoting removed, `@` prefixes dropped, expansions empty
   or at their default, brace lists expanded, patterns matched against runner
   names), but it can miss a launch in a form it does not know, and a prose
-  argument that only reads like a launch is a gap too.
+  argument that only reads like a launch is a gap too. `pythonw`, `pyw` and
+  free-threaded names such as `python3.13t` are Python; `python -m timeit` is inline
+  code; `-` (standard input) is inline code for node, python, ruby, perl, php,
+  `bun`, `bun run`, `pwsh -File` and `pwsh -Command`.
+- **PowerShell parameters are read from a table.** `pwsh` uses its own switch and value-parameter table. Windows PowerShell
+  (`powershell` or `powershell.exe`) uses the supported 5.1 subset. Modern-only options
+  such as `-CustomPipeName` and `-WorkingDirectory` are gaps on 5.1. Use `-InputFormat` or `-OutputFormat` there. The
+  aliases `-if` and `-of` also leave a 5.1 launch unresolved. The `pwsh` table
+  matches each name from the shortest prefix pwsh 7's command-line parser accepts (`-config`,
+  `-cus`, `-settings`). A shorter word, which pwsh reads as the script path, a
+  parameter outside the table, and a prefix that may name parameters of different
+  kinds (`-co`, `-in`) are gaps, because a value may hide where `-Command` starts.
+  So are `-Version` and `-PSConsoleFile`, which pwsh 7 and Windows PowerShell 5.1
+  read differently. `-CommandWithArgs`, `-cwa` and the platform-specific
+  `-RemoveWorkingDirectoryTrailingCharacter` also leave the launch unresolved. So do `-ConfigurationName`, `-ConfigurationFile` and
+  `-SettingsFile`, which select a configuration that can run code first. The
+  prefixes were taken from pwsh 7's source, not checked against Windows PowerShell
+  5.1. `-Param:value` is not split.
+- **env is read as GNU env reads it.** Any word with `=` after a non-empty name is an
+  assignment (`BASH_FUNC_sh%%=...`, `npm_config_script-shell=...`), and its variable is
+  rated as a declared `env` entry is. At most four `-S` or `--split-string` values are
+  read in one launch; more is a gap.
 - **Text a shell reads again must read as written.** An `sh -c`, `bash -c`,
   `zsh -c` or `fish -c` script, a command line, `env -S`, `wsl` without `-e`,
   `eval`, `pwsh -Command`, the command word of `npx -p` or `npm exec --package`
@@ -318,7 +339,14 @@ A way around a limit that its entry does not describe is worth a
   rated by their written source: a mount through a link, a client variable other than `${userHome}`,
   `${env:HOME}`, `${env:USERPROFILE}`, `${workspaceFolder}` and `$PWD`, and a
   credential directory other than `.ssh`, `.aws`, `.gnupg`, `.kube`, `.docker`,
-  `.config`, `.azure` and `.gcloud` are only `host_mounts`. Variables in an
+  `.config`, `.azure` and `.gcloud` are only `host_mounts`. A `-v` source is rated
+  as cut at the first colon outside a client variable such as `${env:X}` and as cut
+  at the first colon, as an engine cuts a variable the client left unexpanded, and
+  a variable in it as one path component and, when it can be empty, as empty. The
+  scanner also checks the literal default in `${NAME:-value}`. Resolved workspace
+  and extension-installation directories are nonempty. Other unrecognized leading
+  substitutions with an embedded colon produce a coverage gap. For example,
+  `/${env:X}/..:/host` is a host root mount. Variables in an
   `--env-file`, a `--health-cmd` and a seccomp profile file are a medium finding
   without being read, and `podman --env-host` is not rated. An `--entrypoint` is a
   medium finding only beside a host mount. An image command is a medium

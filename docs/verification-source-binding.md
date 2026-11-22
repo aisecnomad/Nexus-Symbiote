@@ -74,10 +74,14 @@ verification (`NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED=0`,
 keeps its version but loses `launcher_package` and `package_url`, and carries a medium
 `package_source` risk. Setting names are exported as `resolver_settings` and digested
 only when they come from a fixed vocabulary (npm and pnpm configuration keys, the
-Yarn, bun and uv settings above, a scoped registry with a well-formed scope, or the
-`sources` entry of a launched package); any other name is `[other]`, once per setting,
-because a token pasted on its own `.npmrc` line is read as a setting name. Values
-enter only the keyed binding.
+Yarn, bun and uv settings above, a scoped registry whose well-formed scope is a
+launched package's scope or the configured `scope` npm selects, or the `sources` entry
+of a launched package); any other name is `[other]`, once per setting, because a token
+pasted on its own `.npmrc` line is read as a setting name. The same rule names a
+scoped registry in `package_sources`: `--@scope:registry` becomes `--[other]` and
+`npm_config_@scope:registry` becomes `env:npm_config_[other]` for any other scope, and
+a label that holds a value the server's scrubber knows, or a token shape, is
+`[redacted]`. Values enter only the keyed binding.
 
 For implicit project-root `deno.json` and `deno.jsonc`, the keyed binding retains
 each import specifier paired with its target and each scope paired with its
