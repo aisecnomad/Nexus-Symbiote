@@ -2115,11 +2115,11 @@ is a failure; everything below is neither a gap nor a failure.
 - **Some servers cannot be observed.** A server that offers none of the supported
   protocol revisions, or only one without `initialize`, is reported as refused. A
   stream the server closes before its reply ends the observation as incomplete.
-  `verify-live` observes stdio servers only: observe remote servers with
+  `verify-live` starts stdio servers only and checks remote ones only through attested evidence: observe them with
   `discover-mcp --record` and compare with `diff`. A WebSocket server is reported as
   `unsupported-transport`.
 - **The endpoint digest is unkeyed.** The `discover-mcp` report and `--record`
-  inventories show the origin and `observed_endpoint_hash`, an unsalted SHA-256 of the
+  inventories and the `verify-live` report show the origin and `observed_endpoint_hash`, an unsalted SHA-256 of the
   full URL. A reader can recover a short or guessable path token by hashing candidate
   URLs; a high-entropy API key is not practical to recover this way. Keep reports from
   servers with low-entropy path secrets as private as the URL.
