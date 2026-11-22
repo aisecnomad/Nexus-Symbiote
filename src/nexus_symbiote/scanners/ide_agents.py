@@ -21,6 +21,8 @@ the markers are inventoried by the `prompt` collector.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import fnmatch
 import os
 import re
@@ -1225,18 +1227,12 @@ def _assignment_end(words: list[str], index: int) -> int:
     return index + 1
 
 
-def _assignment(word: str) -> bool:
-    if not word or word.startswith("-") or "=" not in word:
-        return False
-    name, _, _value = word.partition("=")
-    return bool(name) and all(char.isalnum() or char in "_." for char in name)
-
-
 def _skip_env(words: list[str], index: int) -> int:
     while index < len(words):
         word = _decode_word(words[index], drop_ifs=True)
         if word == "--":
-            return index + 1
+            index += 1
+            break
         if word in {"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}:
             index += 1
             continue
@@ -1249,14 +1245,17 @@ def _skip_env(words: list[str], index: int) -> int:
         if word in {"--unset", "--chdir", "--split-string"}:
             index += 2
             continue
-        if _assignment(word):
-            index += 1
-            continue
-        return index
+        if word.startswith("-"):
+            return index
+        break
+    # env splits assignments at the first equals sign; they are argv data,
+    # not shell assignments. Option parsing ends at the first operand.
+    while index < len(words) and _decode_word(words[index], drop_ifs=True).find("=") > 0:
+        index += 1
     return index
 
 
-def _skip_sudo(words: list[str], index: int) -> int:
+def _skip_sudo(words: list[str], index: int, *, assignments: bool) -> int:
     arg_options = {
         "-u",
         "-g",
@@ -1295,7 +1294,7 @@ def _skip_sudo(words: list[str], index: int) -> int:
             bundle = re.match(r"-([A-Za-z]*?)([ughpUCDRTrta])", word)
             index += 2 if bundle is not None and bundle.end() == len(word) else 1
             continue
-        if _assignment(word):
+        if assignments and word.find("=") > 0:
             index += 1
             continue
         return index
@@ -1419,14 +1418,28 @@ def _executable_index(words: list[str]) -> int | None:
     index = 0
     while index < len(words):
         raw = _decode_word(words[index], drop_ifs=True).strip()
-        if raw in {"(", "{", ")", "}"}:
+        if raw in {"(", "{", ")", "}"} or words[index] == "!":
             index += 1
+            continue
+        if words[index] == "time" and (
+            index + 1 == len(words)
+            or words[index + 1] == "-p"
+            or not words[index + 1].startswith("-")
+        ):
+            index += 1
+            if index < len(words) and words[index] == "-p":
+                index += 1
             continue
         # bash reads a word as an assignment only when its name is unquoted and valid;
         # `1=/bin/sh`, `a.b=/bin/sh` and `"X"=/bin/sh` are commands, run by path.
         if _SHELL_ASSIGNMENT.match(words[index]):
             index = _assignment_end(words, index)
             continue
+        break
+
+    # A wrapper consumes a program from its own argv. Shell assignment syntax
+    # does not apply again after that command word.
+    while index < len(words):
         names = _name_variants(words[index])
         if "env" in names:
             index = _skip_env(words, index + 1)
@@ -1436,7 +1449,7 @@ def _executable_index(words: list[str]) -> int | None:
             index = _skip_wrapper(words, index + 1, wrapper)
             continue
         if names & {"sudo", "doas"}:
-            index = _skip_sudo(words, index + 1)
+            index = _skip_sudo(words, index + 1, assignments="sudo" in names)
             continue
         runner = next(iter(sorted(names & _COMMAND_OPTION_RUNNERS.keys())), None)
         if runner is not None:
@@ -2425,6 +2438,23 @@ def _output_substitution_executes(segment: str) -> bool:
 
 def _encoded_powershell(command: str) -> bool:
     """Whether a segment passes PowerShell an encoded command as its own parameter."""
+    if _encoded_in_segments(command):
+        return True
+    if "\n" not in command or _ENCODED_COMMAND.search(command) is None:
+        return False
+    # Quoted newlines can belong to one base64 argument. Preserve the existing
+    # segment reading and check that additional reading only when it differs.
+    parts: list[str] = []
+    last = 0
+    for start, end in _shell_word_spans(command):
+        word = command[start:end]
+        if "\n" in word:
+            parts.extend((command[last:start], word.replace("\n", " ")))
+            last = end
+    return bool(parts) and _encoded_in_segments("".join((*parts, command[last:])))
+
+
+def _encoded_in_segments(command: str) -> bool:
     start = 0
     for boundary in _SEGMENT_BOUNDARY.finditer(command):
         if _encoded_segment(command[start : boundary.start()]):
@@ -2518,7 +2548,7 @@ def _computed_powershell(segment: str) -> int | None:
 
     A variable or glob can select PowerShell. `-e`, `-ec`, `-en` and `-E` are shared by
     other programs (`$SED -En`, `$SHELL -ec`), so require a program-name hint, `-enc` or
-    a longer prefix of `-EncodedCommand`, or a base64 argument after the switch.
+    a longer prefix of `-EncodedCommand`, or an argument encoding UTF-16LE text.
     """
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
@@ -2534,8 +2564,10 @@ def _computed_powershell(segment: str) -> int | None:
     # `[^][]` keeps the scan linear on a run of `[`.
     literal = re.sub(r"\[[^][]*\]", "", stem)
     if re.search(r"[a-z]{2}", literal) is None and not any(
-        len(flag.group().lstrip("\"'‘’“”\\^`-/–—―")) > 2 or _encoded_payload(segment, flag.end())
-        for flag in _ENCODED_COMMAND.finditer(segment, spans[index][1])
+        len(flag.group().lstrip("\"'‘’“”\\^`-/–—―")) > 2
+        or (position + 1 < len(words) and _encoded_payload(words[position + 1]))
+        for position in range(index + 1, len(words))
+        if (flag := _ENCODED_COMMAND.match(segment, spans[position][0])) is not None
     ):
         return None
     # A longer pattern is mostly bracket expressions; it is not matched, so as not to
@@ -2548,17 +2580,45 @@ def _computed_powershell(segment: str) -> int | None:
 
 
 # An -EncodedCommand value: base64 of UTF-16LE text, so a whole number of quads.
-_BASE64_PAYLOAD = re.compile(
-    r"(?=.*[A-Z])(?:[A-Za-z0-9+/]{4}){2,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?"
-)
+_BASE64_PAYLOAD = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
 
 
-def _encoded_payload(segment: str, end: int) -> bool:
-    """Whether the argument after an encoded-command switch ending at `end` is base64."""
-    argument = _ARGUMENT.search(segment, end)
-    if argument is None:
+_ASCII_TEXT_RUN = re.compile(r"[\t\r\n -~]{8,}")
+_TEXT_PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,}[ \t\r\n]")
+_BASE64_SPACING = str.maketrans("", "", " \t\r\n")
+
+
+def _encoded_payload(word: str) -> bool:
+    """Whether a computed program's ambiguous short switch has UTF-16LE text evidence."""
+    encoded = _decode_word(word, drop_ifs=True).translate(_BASE64_SPACING)
+    if not _BASE64_PAYLOAD.fullmatch(encoded):
         return False
-    return _BASE64_PAYLOAD.fullmatch(_decode_word(argument.group(), drop_ifs=True)) is not None
+    try:
+        text = base64.b64decode(encoded, validate=True).decode("utf-16-le", errors="replace")
+    except binascii.Error:
+        return False
+    # A UTF-16 byte-order mark or a quoted string can be mostly non-ASCII.
+    # For an unmarked operand, a single printable unit in unrelated binary
+    # data is weak evidence. Count ordinary text and shell whitespace together.
+    if text.startswith("\ufeff"):
+        return len(text) > 1
+    if not text:
+        return False
+    if len(text) == 1:
+        return "!" <= text <= "~"
+    if text[0] in {"'", '"'}:
+        end_quote = text.find(text[0], 1)
+        if end_quote >= 1 and text[1:end_quote].isprintable():
+            return True
+    if _TEXT_PREFIX.match(text.lstrip()):
+        return True
+    # A multilingual comment or string elsewhere in the operand cannot
+    # dilute a whole run of UTF-16 text. Whitespace alone supplies no evidence.
+    if any(run.group().strip() for run in _ASCII_TEXT_RUN.finditer(text)):
+        return True
+    graphic = sum("!" <= char <= "~" for char in text)
+    ordinary = graphic + sum(char in " \t\r\n" for char in text)
+    return graphic > 0 and ordinary >= 2 and ordinary * 2 >= len(text)
 
 
 def _parameter_name(token: str) -> str | None:
