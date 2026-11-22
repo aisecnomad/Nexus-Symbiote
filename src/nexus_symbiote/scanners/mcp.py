@@ -1067,6 +1067,13 @@ _ASSIGNMENT_FLAGS = frozenset({"env", "e", "build-arg"})
 _ASSIGNMENT_SCHEMES = frozenset({"bearer", "basic", "token", "bot", "apikey", "api-key"})
 _SCHEME_DESCRIPTORS = frozenset({"type", "mode", "scheme", "method", "transport", "strategy"})
 _PUBLIC_TOKEN_SELECTORS = frozenset({"format", "source", "profile", "output", "kind"})
+# These common switches can follow a mode selector in a launch declaration.
+# Normalize spelling only for the comparison; exports keep the original text.
+_PUBLIC_SCHEME_SWITCHES = _names(
+    "transport stateless privileged verbose readonly dryrun version debug help quiet "
+    "interactive stdio json enablelogging color nocolor noprompt watch force loglevel "
+    "allowhttp insecure noprofile outputformat noninteractive"
+)
 _LOWER_LONG_OPTION = re.compile(r"--[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
 _SCHEME_NUMBER = re.compile(r"[+]?[0-9]+(?:[.][0-9]+)?")
 _SCHEME_ASSIGNMENT_OPERAND = re.compile(r"[A-Za-z0-9_-]+=[A-Za-z0-9_+=-]+")
@@ -1131,26 +1138,34 @@ def _scheme_assignment_name(name: str) -> bool:
     )
 
 
-def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
-    """Distinguish an authentication operand from another option or setting."""
+def _scheme_operand(word: str) -> bool:
+    """Whether the argument following an authentication scheme may be its literal value."""
     if len(word) < MIN_SECRET_LENGTH or is_reference(word):
         return False
     key, equals, argument = word.partition("=")
     if word.startswith("--") and _CLI_FLAG.fullmatch(key):
+        body = key[2:]
         if equals and argument not in {"", "="}:
             return literal_value(argument)
-        if not _LOWER_LONG_OPTION.fullmatch(key):
-            return credential_binding or literal_value(word)
-        # A single long dash-prefixed word can be the value of a named
-        # credential. A scheme selector followed by a switch is ordinary argv.
-        body = key[2:]
-        return (credential_binding and len(body) >= MIN_SECRET_LENGTH and body.isalpha()) or (
-            len(body) >= 16 and (argument == "=" or (equals == "=" and "-" not in body))
+        if (
+            not equals
+            and body.casefold().replace("-", "").replace("_", "") in _PUBLIC_SCHEME_SWITCHES
+        ):
+            return False
+        if not equals and _LOWER_LONG_OPTION.fullmatch(key) and "-" in body:
+            return False
+        if equals:
+            return len(body) >= MIN_SECRET_LENGTH and (argument == "=" or "-" not in body)
+        return len(body) >= MIN_SECRET_LENGTH and (
+            (body.isalpha() and (body.islower() or len(body) >= 16))
+            or (len(body) >= 16 and credential_shaped(body))
         )
-    if equals and _SCHEME_ASSIGNMENT_OPERAND.fullmatch(word):
+    # Padding belongs to the operand. Only a genuine assignment has a
+    # nonempty value following the separator and no further equals sign.
+    if argument and "=" not in argument and _SCHEME_ASSIGNMENT_OPERAND.fullmatch(word):
         return literal_value(argument)
     if _SCHEME_NUMBER.fullmatch(word):
-        return credential_binding
+        return True
     return literal_value(word)
 
 
@@ -1177,12 +1192,15 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     if following is None or value.lower() not in _ASSIGNMENT_SCHEMES:
         return hits
     words = name_words(name)
-    if value.lower() == "token" and words and words[-1] in _PUBLIC_TOKEN_SELECTORS:
+    if not variable and value.lower() == "token" and words and words[-1] in _PUBLIC_TOKEN_SELECTORS:
         return hits
-    credential_binding = variable and _scheme_assignment_name(name)
-    if _scheme_operand(following, credential_binding=credential_binding):
+    if _scheme_operand(following):
         paired = value_hits(name, f"{value} {following}")
-        if credential_binding and not paired and scheme_credential_like(following, value):
+        # An opaque value in a split Basic declaration can still be private
+        # when it does not decode as a complete HTTP Basic user/password pair.
+        if not paired and (
+            scheme_credential_like(following, value) or credential_shaped(following)
+        ):
             paired = [(SCHEME_CLASS, following)]
         hits.extend(paired)
     return hits
