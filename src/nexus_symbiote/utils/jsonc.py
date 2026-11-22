@@ -7,17 +7,19 @@ client files are all read with it.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 
 _JSONC_EVENT = re.compile(r'"|//|/\*|[,\]}\[{:]')
 _JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL)
 
 
-def strip_jsonc(text: str) -> str:
+def strip_jsonc(text: str, *, on_string: Callable[[int, int], None] | None = None) -> str:
     """Remove comments and trailing commas outside strings in one linear pass.
 
     Readers disagree about where a line comment ends: VS Code also ends one at a
     lone carriage return and at U+2028 or U+2029, other JSONC readers only at a
     line feed. Text that depends on the difference is rejected, never guessed.
+    An optional callback receives original character ranges of string tokens.
     """
     if "\u2028" in text or "\u2029" in text:
         raise ValueError("line or paragraph separator")
@@ -36,6 +38,8 @@ def strip_jsonc(text: str) -> str:
             string = _JSON_STRING.match(text, start)
             if string is None:
                 raise ValueError("unterminated string")
+            if on_string is not None:
+                on_string(start, string.end())
             parts.append(string.group())
             comma, can_trail, position = -1, True, string.end()
         elif mark == "//":

@@ -116,9 +116,14 @@ _NAMED_TOKEN = re.compile(rf"(?<![\w-]){_JWT}|(?<![A-Za-z0-9])(?:{_DISTINCT_SHAP
 # The same shapes with no boundary before them: a credential glued to a prefix, as in
 # "prod-sk-ant-...", "1ghp_..." or "xAKIA...". The sk- form also needs two digits, so a
 # plain name such as disk-management-service-v2 does not read as one.
+# A JWT or sk- form reads to the end of its [\w-] run, so a later start in the same run
+# meets the same end with less before it and fails wherever the first one failed. Only
+# the first start in each run is tried, from the run's start; retrying each one would
+# rescan the run per start ("sk-" * n).
 _EMBEDDED_TOKEN = re.compile(
-    rf"{_JWT}|sk-(?=(?:[\w-]*?\d){{2}})[\w-]{{20,}}+|(?:AKIA|ASIA)[A-Z0-9]{{16}}"
-    rf"|(?:{_DISTINCT_SHAPES})"
+    rf"(?<![\w-])(?>[\w-]*?eyJ)[\w-]{{8,}}+\.[\w-]{{8,}}+"
+    rf"|(?<![\w-])(?>[\w-]*?sk-)(?=(?:[\w-]*?\d){{2}})[\w-]{{20,}}+"
+    rf"|(?:AKIA|ASIA)[A-Z0-9]{{16}}|(?:{_DISTINCT_SHAPES})"
 )
 
 

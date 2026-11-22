@@ -36,6 +36,7 @@ import yaml
 from nexus_symbiote import limits
 from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.policy import PolicyError, parse_yaml_mapping
+from nexus_symbiote.scanner_catalog import INSTRUCTION_DIRECTORIES, SKILL_DIRECTORIES
 from nexus_symbiote.scanners.credential_files import (
     MARKDOWN_SUFFIXES,
     credential_gap,
@@ -50,10 +51,8 @@ from nexus_symbiote.scanners.prompt import (
     _MAX_IMPORTS,
     _RESOURCE_DIRECTORIES,
     _TRAILING,
-    INSTRUCTION_DIRECTORIES,
     INSTRUCTION_FILES,
     NESTED_INSTRUCTION_NAMES,
-    SKILL_DIRECTORIES,
     _hidden_counts,
     _import_tokens,
     _line_separator_counts,

@@ -63,7 +63,7 @@ def _anchor(inventory: Path) -> str:
 
 
 def _summary(document: Mapping[str, Any]) -> None:
-    from nexus_symbiote.trace_evidence import coverage_notes, describe
+    from nexus_symbiote.trace_evidence import _is_mismatched, coverage_notes, describe
 
     coverage = document["coverage"]
     reconciliation = document["reconciliation"]
@@ -99,6 +99,7 @@ def _summary(document: Mapping[str, Any]) -> None:
     listed = [
         *(("Undeclared", entry) for entry in reconciliation["undeclared"]),
         *(("Unidentified", entry) for entry in reconciliation["unidentified"]),
+        *(("Mismatched", entry) for entry in reconciliation["matched"] if _is_mismatched(entry)),
     ]
     for label, entry in listed[:LISTED]:
         spans = entry["span_count"]
