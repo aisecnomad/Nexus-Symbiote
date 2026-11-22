@@ -42,8 +42,17 @@ when it claims local provenance, verified assurance or internal-verified trust;
 otherwise it is listed as a supplier claim and the basis becomes
 `project-reconciled-with-supplier-claims`. A claim the supplier adds to a locally
 collected component, including one in place of a claim the collector could not
-make, is listed the same way and fails when it asserts verified assurance. A
-mismatch makes `validate` report the basis `project-reconciliation-failed` and
+make, is listed the same way and fails when it asserts verified assurance. Such a
+claim never counts toward `validate.minimum_assurance_level: observed`: a component
+that only supplier additions show as observed is judged as declared. A supplier
+cannot add a `hashes` entry the collector did not record, or a collector-owned
+property (`collection_mode`, `content_hash_withheld`, `identity_source`,
+`weight_files`, `config_hash`, or any `static_value_binding*`,
+`static_config_hash*` or `static_card_hash*` key): integrity, suppression
+fingerprints and the static binding checks read them as collected evidence, so
+reconciliation fails instead. `trifecta` and `diff` read saved inventories,
+so their conclusions depend on the provenance of those files.
+A mismatch makes `validate` report the basis `project-reconciliation-failed` and
 makes the project-backed risk command exit unsuccessfully with that basis, an
 unknown risk level and a null score. Without a project, `risk` scores the supplied claims
 and labels the result `supplied-bom`. For an operator-configured signature

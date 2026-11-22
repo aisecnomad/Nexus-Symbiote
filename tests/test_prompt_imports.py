@@ -143,6 +143,7 @@ def test_nested_imports_follow_the_rules_of_root_imports(tmp_path):
     assert sorted(result.surfaces_excluded) == [
         "pkg/a/6.md: imported more than 5 hops from a memory file and not inventoried",
         "pkg/node_modules/helper/AGENTS.md: imported by pkg/CLAUDE.md but excluded from collection",
+        "pkg/node_modules: default collection exclude; not collected",
     ]
 
 

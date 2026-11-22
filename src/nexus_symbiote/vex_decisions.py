@@ -16,24 +16,38 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
+import stat
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-import yaml
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from nexus_symbiote.core.hashing import hash_bytes, open_regular_file, parse_json_strict
+from nexus_symbiote.core.hashing import (
+    hash_bytes,
+    open_directory_nofollow,
+    open_regular_file,
+    parse_json_strict,
+)
+from nexus_symbiote.policy import parse_yaml_mapping
+from nexus_symbiote.utils.crypto import _trusted_ancestor_uids
+from nexus_symbiote.utils.terminal import UNSAFE_TEXT
 
 MAX_DECISIONS_BYTES = 4 * 1024 * 1024
 MAX_DECISIONS = 5_000
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 MAX_KEY_BYTES = 64 * 1024
+# Format characters that ordinary text needs: ZWNJ and ZWJ (Persian, Indic scripts, emoji
+# sequences), the variation selectors U+FE00-FE0F and U+E0100-E01EF (emoji presentation,
+# ideographic variants) and the soft hyphen. Output neutralization replaces them; every other
+# character UNSAFE_TEXT matches, Mongolian free variation selectors included, is refused.
+_ORDINARY_FORMAT_CHARACTERS = re.compile(r"[\xad\u200c\u200d\ufe00-\ufe0f\U000e0100-\U000e01ef]")
 
 VEXState = Literal["not_affected", "exploitable", "resolved", "false_positive", "in_triage"]
 VEXJustification = Literal[
@@ -65,20 +79,35 @@ class VEXDecisionEntry(BaseModel):
     detail: str = Field(min_length=1, max_length=2048)
     owner: str = Field(min_length=1, max_length=256)
     expires_at: datetime | None = None
+    inventory_sha256: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
+    deployment_id: str | None = Field(default=None, min_length=1, max_length=256)
 
-    @field_validator("id", "detail", "owner")
+    @field_validator("id", "detail", "owner", "deployment_id")
     @classmethod
-    def _clean_text(cls, value: str) -> str:
-        if not value.strip() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
-            raise ValueError("must be a non-empty string without control characters")
+    def _clean_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            not value.strip()
+            or "\t" in value
+            or UNSAFE_TEXT.search(_ORDINARY_FORMAT_CHARACTERS.sub("", value))
+        ):
+            raise ValueError(
+                "must be a non-empty string without control, bidirectional or invisible characters"
+            )
         return value.strip()
 
     @field_validator("expires_at")
     @classmethod
     def _require_timezone(cls, value: datetime | None) -> datetime | None:
-        if value is not None and value.tzinfo is None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
             raise ValueError("expires_at must include an explicit UTC or timezone offset")
-        return value.astimezone(UTC) if value is not None else None
+        try:
+            return value.astimezone(UTC)
+        except OverflowError:
+            raise ValueError("expires_at must be within the supported UTC range") from None
 
     @model_validator(mode="after")
     def _validate_policy_rules(self) -> VEXDecisionEntry:
@@ -103,9 +132,7 @@ class VEXDecisionSet(BaseModel):
         for entry in self.decisions:
             key = (entry.id, entry.component_ref)
             if key in seen:
-                raise ValueError(
-                    f"duplicate VEX decision for ({entry.id!r}, {entry.component_ref!r})"
-                )
+                raise ValueError("duplicate VEX decision")
             seen.add(key)
         return self
 
@@ -140,6 +167,7 @@ class ExecutionEvidence:
     shadowed_refs: frozenset[str]
     sha256: str
     attested: bool = False
+    attestation_sha256: str | None = None
 
     def outcome_for(self, component_ref: str) -> str | None:
         """Return 'shadowed', 'invoked', 'declared-never-loaded', 'unobserved', or None."""
@@ -210,13 +238,63 @@ def _ensure_outside_project(
             raise VEXDecisionError(msg)
 
 
+def _check_operator_directory(path: Path, trusted: set[int]) -> None:
+    # Walk top down. A writable directory is safe for traversal only if its
+    # trusted owner enforces sticky protection on the next, also checked entry.
+    absolute = path.absolute()
+    if ".." in absolute.parts:
+        raise VEXDecisionError("Operator material must use a path without parent traversal")
+    for directory in reversed(absolute.parents):
+        try:
+            fd = open_directory_nofollow(directory)
+        except PermissionError:
+            # Earlier ancestors passed the trust checks. A traverse-only entry can
+            # still be inspected without following it or opening it for reading.
+            info = directory.lstat()
+            owner_trusted = stat.S_ISDIR(info.st_mode) and info.st_uid in trusted
+        else:
+            try:
+                info = os.fstat(fd)
+                owner_trusted = info.st_uid in trusted
+                if (
+                    not owner_trusted
+                    and directory == Path(absolute.anchor)
+                    and len(absolute.parts) > 2
+                ):
+                    # An unprivileged writer cannot rename a direct mount under
+                    # a read-only namespace root with an unmapped UID.
+                    owner_trusted = bool(os.fstatvfs(fd).f_flag & os.ST_RDONLY) and (
+                        os.stat(absolute.parts[1], dir_fd=fd, follow_symlinks=False).st_dev
+                        != info.st_dev
+                    )
+            finally:
+                os.close(fd)
+        if not owner_trusted or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
+            raise VEXDecisionError("Operator material has a writable or untrusted ancestor")
+
+
 def _read_regular_bytes(
     path: Path, max_bytes: int, label: str, *, single_link: bool = False
 ) -> bytes:
     try:
+        trusted = (
+            _trusted_ancestor_uids(os.geteuid())
+            if single_link and hasattr(os, "geteuid")
+            else set()
+        )
+        if single_link:
+            if not trusted:
+                raise VEXDecisionError("Cannot establish ownership of operator material")
+            _check_operator_directory(path, trusted)
         with open_regular_file(path) as handle:
-            if single_link and os.name == "posix" and os.fstat(handle.fileno()).st_nlink != 1:
-                raise VEXDecisionError(f"{label} must not have additional hard links")
+            if single_link:
+                info = os.fstat(handle.fileno())
+                if info.st_nlink != 1:
+                    raise VEXDecisionError(f"{label} must not have additional hard links")
+                if info.st_uid not in trusted or info.st_mode & 0o022:
+                    raise VEXDecisionError(
+                        f"{label} has an untrusted owner or is group/world writable"
+                    )
             raw = handle.read(max_bytes + 1)
     except OSError as exc:
         raise VEXDecisionError(f"Cannot safely read {label.lower()}: {exc}") from exc
@@ -240,15 +318,17 @@ def load_vex_decisions(
         label="Operator VEX decisions file",
     )
     raw = _read_regular_bytes(path, MAX_DECISIONS_BYTES, "VEX decisions file", single_link=True)
-    text = raw.decode("utf-8")
     try:
+        text = raw.decode("utf-8")
+        # Aliases expand into repeated validation work, and a repeated key (a second
+        # ``state:``) would silently replace the first: both are refused.
         payload: Any = (
             parse_json_strict(text, max_bytes=MAX_DECISIONS_BYTES)
             if path.suffix.lower() == ".json" or text.lstrip().startswith("{")
-            else yaml.safe_load(text)
+            else parse_yaml_mapping(text, max_nodes=100_000)
         )
-    except (ValueError, yaml.YAMLError) as exc:
-        raise VEXDecisionError(f"Invalid VEX decisions syntax: {exc}") from exc
+    except (ValueError, RecursionError) as exc:
+        raise VEXDecisionError("Invalid VEX decisions syntax or complexity") from exc
     if not isinstance(payload, dict):
         raise VEXDecisionError(
             "VEX decisions file must be a mapping with 'version' and 'decisions'"
@@ -257,8 +337,14 @@ def load_vex_decisions(
         raise VEXDecisionError(f"VEX decisions file exceeds {MAX_DECISIONS} entries")
     try:
         model = VEXDecisionSet.model_validate(payload)
-    except Exception as exc:
-        raise VEXDecisionError(f"Invalid VEX decisions schema: {exc}") from exc
+    except ValidationError as exc:
+        duplicate = any(
+            e["msg"] == "Value error, duplicate VEX decision"
+            for e in exc.errors(include_input=False)
+        )
+        raise VEXDecisionError(
+            "duplicate VEX decision" if duplicate else "Invalid VEX decisions schema"
+        ) from exc
     return LoadedVEXDecisions(entries=tuple(model.decisions), sha256=hash_bytes(raw))
 
 
@@ -285,7 +371,7 @@ def _verify_trace_attestation(
     *,
     project_root: Path | None,
     inventory_path: Path | None,
-) -> None:
+) -> str:
     from nexus_symbiote.attestation import (
         MAX_ENVELOPE_BYTES,
         AttestationError,
@@ -315,6 +401,7 @@ def _verify_trace_attestation(
         )
     except AttestationError as exc:
         raise VEXDecisionError(f"Trace evidence attestation verification failed: {exc}") from exc
+    return hash_bytes(env_bytes)
 
 
 def _extract_refs(items: object) -> set[str]:
@@ -367,16 +454,15 @@ def load_execution_evidence(
         label="Trace evidence file",
     )
     raw = _read_regular_bytes(path, MAX_REPORT_BYTES, "Trace evidence file")
-    attested = False
+    attestation_digest = None
     if attestation_path is not None:
-        _verify_trace_attestation(
+        attestation_digest = _verify_trace_attestation(
             raw,
             attestation_path,
             trusted_key_paths,
             project_root=project_root,
             inventory_path=inventory_path,
         )
-        attested = True
 
     payload = parse_json_strict(raw.decode("utf-8"), max_bytes=MAX_REPORT_BYTES)
     if not isinstance(payload, dict):
@@ -410,15 +496,28 @@ def load_execution_evidence(
         unobserved_refs=frozenset(unobserved - invoked - shadowed - declared_never_loaded),
         shadowed_refs=frozenset(shadowed),
         sha256=hash_bytes(raw),
-        attested=attested,
+        attested=attestation_digest is not None,
+        attestation_sha256=attestation_digest,
     )
+
+
+@dataclass(frozen=True)
+class LoadedAdvisoryReport:
+    advisories: list[dict[str, Any]]
+    sha256: str
+    coverage: str
+    checked: int
+    skipped: int
+    excluded: int
+    errors: int
 
 
 def load_advisory_report(
     path: Path,
     *,
     expected_inventory_sha256: str | None = None,
-) -> tuple[list[dict[str, Any]], str]:
+    allow_partial: bool = False,
+) -> LoadedAdvisoryReport:
     """Load an advisory report JSON produced by ``advisories`` (live or offline)."""
     raw = _read_regular_bytes(path, MAX_REPORT_BYTES, "Advisory report")
     payload = parse_json_strict(raw.decode("utf-8"), max_bytes=MAX_REPORT_BYTES)
@@ -432,5 +531,37 @@ def load_advisory_report(
             raise VEXDecisionError(
                 "Advisory report inventory_sha256 does not match the supplied AIBOM"
             )
-    advisories = [item for item in payload["advisories"] if isinstance(item, dict)]
-    return advisories, hash_bytes(raw)
+
+    def counter(name: str) -> int:
+        value = payload.get("components_" + name)
+        if type(value) is not int or value < 0:
+            raise VEXDecisionError("Advisory report lacks valid coverage counters")
+        return value
+
+    checked, skipped, excluded = (counter(k) for k in ("checked", "skipped", "excluded"))
+    errors = payload.get("errors")
+    dry_run = payload.get("dry_run")
+    if (
+        not isinstance(errors, list)
+        or not all(isinstance(e, str) for e in errors)
+        or type(dry_run) is not bool
+    ):
+        raise VEXDecisionError("Advisory report lacks valid coverage counters")
+    coverage = "none" if dry_run or not checked else "partial" if errors else "complete"
+    if payload.get("coverage") != coverage or payload.get("complete") is not (
+        coverage == "complete"
+    ):
+        raise VEXDecisionError("Advisory report coverage is inconsistent")
+    if coverage != "complete" and not allow_partial:
+        raise VEXDecisionError("Incomplete advisory coverage requires --allow-partial-advisories")
+    advisories = payload["advisories"]
+    if not all(
+        isinstance(a, dict)
+        and isinstance(a.get("advisory_id") or a.get("id"), str)
+        and isinstance(a.get("component_ref") or a.get("bom_ref"), str)
+        for a in advisories
+    ):
+        raise VEXDecisionError("Malformed advisory report entry")
+    return LoadedAdvisoryReport(
+        advisories, hash_bytes(raw), coverage, checked, skipped, excluded, len(errors)
+    )

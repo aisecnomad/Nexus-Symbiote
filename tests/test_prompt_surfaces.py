@@ -364,7 +364,8 @@ def test_import_into_an_excluded_directory_is_a_gap(tmp_path):
     _write(tmp_path, "node_modules/helper/AGENTS.md", f"Hidden{RLO}")
     result = PromptScanner().scan(tmp_path)
     assert result.surfaces_excluded == [
-        "node_modules/helper/AGENTS.md: imported by CLAUDE.md but excluded from collection"
+        "node_modules: default collection exclude; not collected",
+        "node_modules/helper/AGENTS.md: imported by CLAUDE.md but excluded from collection",
     ]
     assert not any("node_modules" in ref for ref in _components(result))
 

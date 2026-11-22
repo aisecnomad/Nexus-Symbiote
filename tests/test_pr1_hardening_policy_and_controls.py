@@ -484,6 +484,59 @@ def test_diff_expect_upgrade_attributes_profile_transitions_and_blocks_piggyback
         attribute_expected_upgrade({"security_alerts": []}, "9.9.9")
 
 
+@pytest.mark.parametrize("from_version", ["0.1.0", "0.2.0"])
+def test_expect_upgrade_keeps_a_tool_fingerprint_version_change_as_an_alert(tmp_path, from_version):
+    # Every supported release wrote rfc8785-jcs-v2, so a relabelled profile next to a new
+    # digest is a descriptor change the upgrade does not explain.
+    def tool_bom(digest: str, version: str) -> AIBOM:
+        tool = ToolComponent(
+            bom_ref="tool:add",
+            name="add",
+            definition_hash="sha256:" + digest * 64,
+            definition_hash_version=version,
+        )
+        return AIBOM(components=[tool])
+
+    old_bom = tool_bom("a", "rfc8785-jcs-v1")
+    old_bom.metadata.tool_version = from_version
+    old_path, new_path = tmp_path / "old.json", tmp_path / "new.json"
+    old_bom.save(old_path)
+    tool_bom("b", "rfc8785-jcs-v2").save(new_path)
+    result = CliRunner().invoke(
+        main,
+        [
+            "diff",
+            str(old_path),
+            str(new_path),
+            "--expect-upgrade",
+            from_version,
+            "--detailed-exit-codes",
+            "--report-format",
+            "json",
+        ],
+    )
+    assert result.exit_code == EXIT_GATE_FAILED, result.output
+    doc = json.loads(result.output)
+    assert doc["tool_upgrade_changes"] == []
+    assert [alert["component"] for alert in doc["security_alerts"]] == ["tool:add"]
+
+
+def test_expect_upgrade_keeps_an_unsupported_spec_version_alert():
+    alerts = [
+        {
+            "severity": "high",
+            "component": "metadata",
+            "alert": f"The {label} snapshot uses a spec_version this release does not support; "
+            "the comparison can miss fields.",
+        }
+        for label in ("baseline", "candidate")
+    ]
+    for from_version in ("0.1.0", "0.2.0"):
+        attributed = attribute_expected_upgrade({"security_alerts": alerts}, from_version)
+        assert attributed["security_alerts"] == alerts
+        assert attributed["tool_upgrade_changes"] == []
+
+
 # --- R1.0.0-rc.1-1: Exit-code contract & Markdown / JUnit injection-safe rendering ---
 
 
@@ -812,3 +865,40 @@ def test_default_signed_operator_policy_empty_tool_version_step_summary_and_exit
         ],
     )
     assert bad_att.exit_code == EXIT_GATE_FAILED, bad_att.output
+
+
+@pytest.mark.parametrize("git_root", [False, True])
+def test_policy_key_cannot_come_from_explicit_target(tmp_path, monkeypatch, git_root):
+    from nexus_symbiote.operator_policy import OperatorPolicyError, _verify_policy_attestation
+
+    project = tmp_path / "project"
+    project.mkdir()
+    if git_root:
+        (project / ".git").mkdir()
+    target = project / "subproject" if git_root else project
+    target.mkdir(exist_ok=True)
+    independent = tmp_path / "operator"
+    independent.mkdir()
+    monkeypatch.chdir(independent)
+    envelope = independent / "policy.dsse"
+    envelope.write_bytes(b"{}")
+    key = project / "trust.pem"
+    key.write_bytes(b"fixture")
+    with pytest.raises(OperatorPolicyError, match="outside the target checkout"):
+        _verify_policy_attestation(b"{}", independent / "policy.yaml", target, envelope, (key,))
+
+
+def test_step_summary_preserves_hard_linked_file(tmp_path):
+    import os
+
+    import click
+
+    from nexus_symbiote.operator_policy import append_step_summary
+
+    original = tmp_path / "original"
+    original.write_bytes(b"existing")
+    summary = tmp_path / "summary"
+    os.link(original, summary)
+    with pytest.raises(click.ClickException):
+        append_step_summary(summary, "report")
+    assert original.read_bytes() == b"existing"

@@ -1,10 +1,10 @@
 """Default-excluded names inside agent directories, and instruction files below the root.
 
 `.git`, `node_modules`, `__pycache__`, `.venv` and `venv` are skipped at any depth so that
-dependency trees stay out of collection. Inside a skill, command, rule, instruction or
-subagent directory such a name holds files a host reads, so skipping it silently let a
-skill named `venv` pass every gate. Nested `GEMINI.md` and `.cursorrules`, which hosts
-started in a subdirectory load, were not collected either.
+dependency trees stay out of collection. A non-empty one outside an agent directory is a
+coverage gap. Inside a skill, command, rule, instruction or subagent directory the prompt
+collector names that gap itself, so a skill named `venv` cannot pass every gate. Nested
+`GEMINI.md` and `.cursorrules`, which hosts started in a subdirectory load, are collected.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from tests.support import scaling_ratio
 RLO = "\u202e"
 AGENT_DIRECTORIES = sorted({*INSTRUCTION_DIRECTORIES, *SKILL_DIRECTORIES})
 GAP = "default-excluded name inside an agent configuration directory; not collected"
+GENERIC_GAP = "default collection exclude; not collected"
 
 
 def _write(root: Path, relative: str, text: str) -> None:
@@ -103,13 +104,24 @@ def test_the_reported_skill_and_subagent_fail_the_default_gate(runner, tmp_path)
     run = runner.invoke(main, ["scan", str(project), "--no-project-policy", "-o", str(output)])
     assert run.exit_code == 1, run.output
     assert "Scan gate failed" in run.output
-    assert f"excluded: .claude/skills/venv: {GAP} (from prompt)" in run.output
+    marker = f"excluded: .claude/skills/venv: {GAP} (from "
+    matching = [line for line in run.output.splitlines() if marker in line]
+    assert len(matching) == 1
+    assert "prompt" in matching[0].split(marker, 1)[1].removesuffix(")").split(", ")
     completeness = json.loads(output.read_text(encoding="utf-8"))["metadata"]["completeness"]
     assert completeness["scanner_status"]["prompt"] == "partial"
     assert sorted(completeness["surfaces_excluded"]) == [
         f".claude/agents/node_modules: {GAP}",
         f".claude/skills/venv: {GAP}",
     ]
+
+
+def _excluded_prefix(relative: str) -> str:
+    parts = Path(relative).parts
+    for index, part in enumerate(parts):
+        if part in DEFAULT_EXCLUDES:
+            return Path(*parts[: index + 1]).as_posix()
+    raise AssertionError(relative)
 
 
 @pytest.mark.parametrize(
@@ -126,11 +138,13 @@ def test_the_reported_skill_and_subagent_fail_the_default_gate(runner, tmp_path)
         "pkg/node_modules/.claude/settings.json",
     ],
 )
-def test_excluded_names_outside_agent_directories_stay_skipped_without_a_gap(tmp_path, relative):
+def test_a_default_exclude_outside_an_agent_directory_is_a_collection_gap(tmp_path, relative):
     _write(tmp_path, relative, f"Hidden{RLO}")
+    prefix = _excluded_prefix(relative)
     for scanner in (PromptScanner(), IDEAgentScanner()):
         result = scanner.scan(tmp_path)
-        assert not result.scan_failures and not result.surfaces_excluded
+        assert not result.scan_failures
+        assert result.surfaces_excluded == [f"{prefix}: {GENERIC_GAP}"]
         parts = {part for ref in _refs(result) for part in re.split(r"[:/]", ref)}
         assert not parts & DEFAULT_EXCLUDES, parts & DEFAULT_EXCLUDES
 

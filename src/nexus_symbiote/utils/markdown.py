@@ -48,7 +48,7 @@ _CODE_INDENT = 4
 _SPACE_OR_TAB = (" ", "\t")
 _MAYBE_SPECIAL = re.compile(r"[#`~*+_=<>0-9-]")
 _ATX_HEADING = re.compile(r"#{1,6}(?:[ \t]+|$)")
-_OPENING_FENCE = re.compile(r"`{3,}(?!.*`)|~{3,}")
+_OPENING_FENCE = re.compile(r"(?>`{3,})(?!.*`)|~{3,}")
 _CLOSING_FENCE = re.compile(r"(?:`{3,}|~{3,})(?=[ \t]*$)")
 _THEMATIC_BREAK = re.compile(r"(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})$")
 _SETEXT_UNDERLINE = re.compile(r"(?:=+|-+)[ \t]*$")

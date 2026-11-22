@@ -11,6 +11,7 @@ from nexus_symbiote.control_plane_audit import (
     audit_project_control_plane,
     compute_identity_blast_radius,
 )
+from nexus_symbiote.utils.secrets import redact_metadata
 from nexus_symbiote.utils.terminal import (
     echo_line,
     json_text,
@@ -87,6 +88,9 @@ def register_control_plane_commands(main: click.Group) -> None:
                 "compromised_ref": neutralize(compromised_ref),
                 "reachable_identities": compute_identity_blast_radius(summary, compromised_ref),
             }
+        # Names, paths and rules come from the checkout and can hold a credential; every
+        # output, JSON, file and text, is rendered from this redacted copy.
+        payload = redact_metadata(payload)
 
         rendered = json_text(json.dumps(payload, indent=2, sort_keys=True))
         if output is not None:
@@ -102,11 +106,11 @@ def register_control_plane_commands(main: click.Group) -> None:
                 f"{len(summary.ci_agents)} CI agents, {len(summary.identities)} identities, {len(summary.findings)} findings."
             )
             echo_line(msg)
-            for fl in summary.findings:
+            for fl in payload["security_flags"]:
                 echo_line(
                     "  [", fl["severity"].upper(), "] ", fl["category"], ": ", fl["description"]
                 )
-            for al in summary.reach_alerts:
+            for al in payload["reach_alerts"]:
                 targets = ", ".join(al["affected_refs"]) or al["changed_ref"]
                 echo_line(
                     f"  [ALERT:{al['severity'].upper()}:{al['reachability_tier']}] {al['root_cause']} -> {targets}"
