@@ -432,12 +432,14 @@ def parse_yaml_mapping(text: str, *, max_nodes: int | None = None) -> dict[str, 
 def _parse_policy_with_digest(path: Path) -> tuple[Policy, str]:
     from pydantic import ValidationError
 
+    from nexus_symbiote.core.hashing import stat_input_file
+
     try:
         fd = os.open(
             path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         )
         try:
-            info = os.fstat(fd)
+            info = stat_input_file(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
                 raise PolicyError("policy must be a regular file no larger than 1 MiB")
             stream = os.fdopen(fd, "rb")
