@@ -26,9 +26,11 @@ MAX_JSON_DEPTH = 32
 MAX_JSON_NODES = 20_000
 # Each same-value applicator consumes several interpreter frames. Limit the
 # longest path and total expansion before dispatching an output-validated call.
-_MAX_OUTPUT_APPLICATOR_DEPTH = 96
+_MAX_OUTPUT_IN_PLACE_DEPTH = 96
+_MAX_OUTPUT_APPLICATOR_DEPTH = 160
 _MAX_OUTPUT_APPLICATOR_STEPS = 1024
 _MAX_OUTPUT_UNION_STEPS = 4096
+_MAX_OUTPUT_REPEATED_STEPS = 32768
 MAX_SAFE_INTEGER = 2**53 - 1
 # Interpreter start-up and imports get their own budget, so a slow or throttled
 # host does not spend the evaluation budget before the untrusted input arrives.
@@ -1052,6 +1054,8 @@ def _in_place_evaluation_exceeds_budget(schema: dict[str, Any], resolver: Any) -
     descends: dict[int, list[int]] = {}
     annotations: set[int] = set()
     alternatives: set[int] = set()
+    widths: dict[int, int] = {}
+    repeated: list[tuple[int, int]] = []
     value_keywords = {
         "additionalItems",
         "additionalProperties",
@@ -1067,7 +1071,19 @@ def _in_place_evaluation_exceeds_budget(schema: dict[str, Any], resolver: Any) -
         node = pending.pop()
         if not isinstance(node, dict) or id(node) in graph:
             continue
-        in_place = [child for child in _applied_in_place(node, resolver) if isinstance(child, dict)]
+        applied = _applied_in_place(node, resolver)
+        in_place = [child for child in applied if isinstance(child, dict)]
+        # A repeated reference repeats the keyword's width too. Checking a
+        # singleton property or tag lists no more entries than one graph visit.
+        widths[id(node)] = (
+            1
+            + sum(isinstance(child, bool) for child in applied)
+            + sum(
+                max(0, len(value) - 1)
+                for keyword in ("properties", "patternProperties", "required", "enum")
+                if isinstance(value := node.get(keyword), (list, dict))
+            )
+        )
         graph[id(node)] = [id(child) for child in in_place]
         pending.extend(in_place)
         if "unevaluatedItems" in node or "unevaluatedProperties" in node:
@@ -1088,6 +1104,20 @@ def _in_place_evaluation_exceeds_budget(schema: dict[str, Any], resolver: Any) -
                 subvalues.extend(value.values())
             elif keyword in value_keywords:
                 subvalues.extend(value if isinstance(value, list) else [value])
+            # Tuple/prefix entries and a named property each select one value.
+            # A schema for every item or matching property may run many times.
+            if keyword in {"items", "contains", "additionalItems", "unevaluatedItems"}:
+                many, bound = [value], node.get("maxItems")
+            elif keyword in {"additionalProperties", "unevaluatedProperties", "propertyNames"}:
+                many, bound = [value], node.get("maxProperties")
+            elif keyword == "patternProperties" and isinstance(value, dict):
+                many, bound = list(value.values()), node.get("maxProperties")
+            else:
+                continue
+            count = (
+                min(MAX_JSON_NODES, bound) if type(bound) is int and bound >= 0 else MAX_JSON_NODES
+            )
+            repeated.extend((id(child), count) for child in many if isinstance(child, dict))
         value_schemas = [child for child in subvalues if isinstance(child, dict)]
         descends[id(node)] = [id(child) for child in value_schemas]
         pending.extend(value_schemas)
@@ -1110,37 +1140,64 @@ def _in_place_evaluation_exceeds_budget(schema: dict[str, Any], resolver: Any) -
     depths: dict[int, int] = {}
     steps: dict[int, int] = {}
     limits: dict[int, int] = {}
+    validation_steps: dict[int, int] = {}
+    annotation_steps: dict[int, int] = {}
     for current in reversed(topological):
         children = graph[current]
         depth = 1 + max((depths[c] for c in children), default=0)
         # Each reference can evaluate the shared child again. Saturate by
         # refusing as soon as a subproblem exceeds the budget.
         # Collecting evaluated locations can visit the same applicators again.
-        work = 1 + (2 if current in annotations else 1) * sum(steps[c] for c in children)
+        visits = sum(steps[c] for c in children)
+        work = widths[current] + (2 if current in annotations else 1) * visits
         limit = _MAX_OUTPUT_APPLICATOR_STEPS
-        if current not in annotations:
-            if current in alternatives and all(steps[c] <= 32 for c in children):
+        if current in alternatives and all(steps[c] <= 32 for c in children):
+            limit = _MAX_OUTPUT_UNION_STEPS
+        else:
+            unions = [c for c in children if limits[c] > _MAX_OUTPUT_APPLICATOR_STEPS]
+            if len(unions) == 1 and visits - steps[unions[0]] <= 32:
                 limit = _MAX_OUTPUT_UNION_STEPS
-            elif len(children) == 1:
-                limit = limits[children[0]]
-        if depth > _MAX_OUTPUT_APPLICATOR_DEPTH or work > limit:
+        if depth > _MAX_OUTPUT_IN_PLACE_DEPTH or work > limit:
             return True
+        # Collecting evaluated locations can validate a branch and then walk its
+        # annotations. Keep that walk separate so a chain between two annotated
+        # nodes is charged to every caller. Saturate unused estimates on a DAG.
+        validation = widths[current] + sum(validation_steps[c] for c in children)
+        annotation = validation + sum(annotation_steps[c] for c in children)
+        if current in annotations:
+            validation += annotation
+        if validation > 4 * limit:
+            return True
+        validation_steps[current] = validation
+        annotation_steps[current] = min(annotation, 4 * _MAX_OUTPUT_UNION_STEPS + 1)
         depths[current], steps[current] = depth, work
         limits[current] = limit
     # Recursion through a child of the instance is permitted. Account for the
     # frames it adds across every possible level of the bounded JSON input.
+    # Keep headroom for the worker and the validator's helper frames. Ordinary
+    # recursive records need more total hops than the limit at one location.
+    stack_limit = min(_MAX_OUTPUT_APPLICATOR_DEPTH, (sys.getrecursionlimit() - 128) // 5)
+    peak_work = validation_steps
     for _ in range(MAX_JSON_DEPTH):
-        previous = depths
-        depths = {}
+        previous, prior_work = depths, peak_work
+        depths, peak_work = {}, {}
         for current in reversed(topological):
             at_value = max((depths[c] for c in graph[current]), default=0)
             below_value = max((previous[c] for c in descends[current]), default=0)
             depths[current] = 1 + max(at_value, below_value)
-            if depths[current] > _MAX_OUTPUT_APPLICATOR_DEPTH:
+            if depths[current] > stack_limit:
                 return True
-        if depths == previous:
+            peak_work[current] = max(
+                validation_steps[current],
+                max((peak_work[c] for c in graph[current]), default=0),
+                max((prior_work[c] for c in descends[current]), default=0),
+            )
+        if depths == previous and peak_work == prior_work:
             break
-    return False
+    return any(
+        peak_work[c] > 32 and count * peak_work[c] > _MAX_OUTPUT_REPEATED_STEPS
+        for c, count in repeated
+    )
 
 
 def _contains_meets_unevaluated_items(nodes: list[dict[str, Any]], resolver: Any) -> bool:
