@@ -351,7 +351,12 @@ def check(root: Path = ROOT) -> list[str]:
     except (OSError, KeyError, TypeError, ValueError, tomllib.TOMLDecodeError) as exc:
         return [f"locks could not be checked: {exc}"]
     ci, action, floor = locks[CI_LOCK], locks[ACTION_LOCK], locks[FLOOR_LOCK]
-    errors = [
+    errors = []
+    if "uv" in pyproject.get("tool", {}):
+        # The locks resolve from INDEX only. uv settings in the checkout can name other
+        # indexes or sources, and are outside the declarations the lock inputs digest.
+        errors.append("pyproject.toml: [tool.uv] is not allowed; the locks resolve from PyPI only")
+    errors += [
         *_inputs_issues(ci, digest, f"{FLOOR_PYTHON}+"),
         *_inputs_issues(action, digest, f"{FLOOR_PYTHON}+"),
         *_inputs_issues(floor, digest, FLOOR_PYTHON),
@@ -495,6 +500,9 @@ def regenerate(root: Path, cutoff: str | None, upgrade: bool) -> None:
         INDEX,
         "--generate-hashes",
         "--no-emit-index-url",
+        # `--no-config` ignores uv.toml and [tool.uv] settings but not [tool.uv.sources],
+        # which can send one package to an index or git host that pyproject.toml names.
+        "--no-sources",
         "--only-binary",
         ":all:",
         "--exclude-newer",

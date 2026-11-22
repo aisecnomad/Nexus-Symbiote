@@ -259,6 +259,32 @@ def test_a_failed_resolution_leaves_every_lock_and_its_cutoff_as_it_was(checkout
     assert sorted(path.name for path in checkout.iterdir()) == sorted(FILES)
 
 
+def test_regeneration_ignores_package_sources_from_the_checkout(checkout, monkeypatch):
+    calls = fake_uv(monkeypatch)
+    locks.regenerate(checkout, "2001-02-03T00:00:00Z", False)
+    assert calls
+    for command, _ in calls:
+        assert "--no-config" in command
+        assert "--no-sources" in command
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        '[tool.uv.sources]\nclick = { index = "mirror" }\n',
+        '[[tool.uv.index]]\nname = "mirror"\nurl = "https://mirror.invalid/simple"\nexplicit = true\n',
+        '[tool.uv]\nindex-url = "https://mirror.invalid/simple"\n',
+    ],
+)
+def test_uv_settings_in_pyproject_fail_the_lock_check(checkout, table):
+    with (checkout / "pyproject.toml").open("a") as handle:
+        handle.write("\n" + table)
+    assert (
+        "pyproject.toml: [tool.uv] is not allowed; the locks resolve from PyPI only"
+        in locks.check(checkout)
+    )
+
+
 def test_a_successful_resolution_replaces_all_three_locks_stamped(checkout, monkeypatch):
     recorded = _record_cutoff(checkout, "2001-02-03T00:00:00Z")
     fake_uv(monkeypatch)
