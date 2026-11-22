@@ -131,7 +131,9 @@ def test_import_foreign_sbom_conflicts_local_binding_privacy_and_census(
         encoding="utf-8",
     )
     (tmp_path / "rust-worker" / "Cargo.lock").write_text(
-        '[[package]]\nname = "candle-core"\nversion = "0.8.1"\n',
+        '[[package]]\nname = "w"\ndependencies = ["candle-core"]\n'
+        '[[package]]\nname = "candle-core"\nversion = "0.8.1"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n',
         encoding="utf-8",
     )
     (tmp_path / "go-svc").mkdir()
@@ -560,7 +562,8 @@ def test_nested_cdx_spdx3_format_validation_and_lockfile_membership(tmp_path: Pa
         encoding="utf-8",
     )
     (proj / "py_uv" / "uv.lock").write_text(
-        '[[package]]\nname = "litellm"\nversion = "1.50.2"\n',
+        '[[package]]\nname = "sub"\nsource = { virtual = "." }\ndependencies = [{name = "litellm"}]\n'
+        '[[package]]\nname = "litellm"\nversion = "1.50.2"\nsource = {registry = "https://pypi.org/simple"}\n',
         encoding="utf-8",
     )
 
@@ -1653,3 +1656,315 @@ def test_import_marks_an_unresolved_conflict_when_version_sampling_is_incomplete
     assert imported.conflict_count == 0
     assert imported.unresolved_conflict_count == 1
     assert imported.aibom.components[-1].risks[0].category == "source_conflict_unresolved"
+
+
+def test_hidden_identity_survives_serialized_sequential_imports(tmp_path, monkeypatch):
+    from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV
+
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, "r" * 40)
+
+    def write_version(version):
+        p = tmp_path / "private-workstream.json"
+        p.write_text(
+            json.dumps(
+                {
+                    "bomFormat": "CycloneDX",
+                    "specVersion": "1.7",
+                    "components": [
+                        {
+                            "type": "library",
+                            "name": "private-package",
+                            "version": version,
+                            "purl": f"pkg:pypi/private-package@{version}",
+                        }
+                    ],
+                }
+            )
+        )
+        return p
+
+    first = import_foreign_sbom(write_version("1.0.0"))
+    serialized = first.aibom.to_native_json()
+    second = import_foreign_sbom(
+        write_version("2.0.0"), target_aibom=AIBOM.from_native(json.loads(serialized))
+    )
+    assert second.conflict_count == 1
+    assert "private-package" not in second.aibom.to_native_json()
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, "t" * 40)
+    rotated = import_foreign_sbom(write_version("3.0.0"), target_aibom=first.aibom)
+    assert rotated.unresolved_conflict_count == 1
+    legacy = first.aibom.model_copy(deep=True)
+    for field in ("identity_context", "identity_bindings"):
+        legacy.components[0].properties.pop(field)
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, "r" * 40)
+    assert import_foreign_sbom(write_version("4.0.0"), target_aibom=legacy).conflict_count == 1
+
+
+def test_shareable_supplier_import_withholds_filenames_and_requires_key(tmp_path, monkeypatch):
+    from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV
+
+    path = tmp_path / "private-workstream.json"
+    digest = hashlib.sha256(b"sample supplier artifact").hexdigest()
+    path.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.7",
+                "components": [
+                    {
+                        "type": "library",
+                        "name": "private-name",
+                        "version": "1.0.0",
+                        "hashes": [{"alg": "SHA-256", "content": digest}],
+                    }
+                ],
+            }
+        )
+    )
+    monkeypatch.delenv(SOURCE_BINDING_KEY_ENV, raising=False)
+    runner = CliRunner()
+    assert runner.invoke(main, ["import-sbom", str(path), "--shareable"]).exit_code != 0
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, "q" * 40)
+    result = runner.invoke(main, ["import-sbom", str(path), "--shareable"])
+    assert result.exit_code == 0, result.output
+    assert "private-workstream" not in result.output and "private-name" not in result.output
+    assert hashlib.sha256(path.read_bytes()).hexdigest() not in result.output
+    assert digest not in result.output
+    assert (
+        runner.invoke(main, ["import-sbom", str(path), "--shareable", "--reveal-names"]).exit_code
+        == 2
+    )
+
+
+def test_nested_manifest_does_not_bind_transitive_package_or_partial_oci_digest(tmp_path):
+    root = tmp_path / "sub"
+    root.mkdir()
+    (root / "package.json").write_text(json.dumps({"dependencies": {"openai": "^4.0.0"}}))
+    (root / "package-lock.json").write_text(
+        json.dumps({"packages": {"node_modules/peer/node_modules/openai": {"version": "5.0.0"}}})
+    )
+    (root / "devcontainer.json").write_text(json.dumps({"image": "openai/image@sha256:abc"}))
+    components, _ = walk_nested_manifests(tmp_path)
+    assert components and all(c.properties["pinning_state"] == "manifest-only" for c in components)
+
+
+def _supplier_library(path, name, version, purl=None):
+    path.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.7",
+                "components": [{"type": "library", "name": name, "version": version, "purl": purl}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_supplier_pypi_conflict_preserves_separator_equivalence(tmp_path):
+    base = AIBOM(
+        components=[
+            RegistryEntryComponent(
+                bom_ref="registry:example",
+                name="sample_widget",
+                version="2.0.0",
+                registry_type="pypi",
+            )
+        ]
+    )
+    path = _supplier_library(tmp_path / "sample.json", "sample-widget", "1.0.0")
+    result = import_foreign_sbom(path, target_aibom=base)
+    assert result.conflict_count == 1
+    assert all(
+        component.risks[0].category == "source_conflict" for component in result.aibom.components
+    )
+
+
+@pytest.mark.parametrize(
+    ("supplier_suffix", "conflicts"),
+    [
+        ("", 1),
+        ("?repository_url=https://mirror.example.test", 1),
+        ("?repository_url=https://packages.example.test:443/&arch=x64#docs/api", 1),
+        ("?checksum=sha256:abc&repository_url=https://packages.example.test", 1),
+        ("?=unknown", 1),
+    ],
+)
+def test_supplier_partial_purl_identity_preserves_known_qualifiers(
+    tmp_path, supplier_suffix, conflicts
+):
+    stem = "pkg:npm/%40example/widget"
+    base = AIBOM(
+        components=[
+            RegistryEntryComponent(
+                bom_ref="registry:widget",
+                name="@example/widget",
+                version="2.0.0",
+                registry_type="npm",
+                package_url=f"{stem}@2.0.0?repository_url=https://packages.example.test",
+            )
+        ]
+    )
+    path = _supplier_library(
+        tmp_path / "sample.json", "widget", "1.0.0", f"{stem}@1.0.0{supplier_suffix}"
+    )
+    assert import_foreign_sbom(path, target_aibom=base).conflict_count == conflicts
+
+
+@pytest.mark.parametrize(
+    ("manifest", "contents", "lock", "dependency"),
+    [
+        (
+            "pyproject.toml",
+            '[project]\nname = "worker"\ndependencies = ["litellm>=1"]\n',
+            "uv.lock",
+            "litellm",
+        ),
+        (
+            "Cargo.toml",
+            '[package]\nname = "worker"\n[dependencies]\ncandle-core = "0.8"\n',
+            "Cargo.lock",
+            "candle-core",
+        ),
+    ],
+)
+def test_nested_manifest_survives_an_invalid_lock(tmp_path, manifest, contents, lock, dependency):
+    nested = tmp_path / "worker"
+    nested.mkdir()
+    (nested / manifest).write_text(contents, encoding="utf-8")
+    (nested / lock).write_text("[incomplete-table", encoding="utf-8")
+    components, failures = walk_nested_manifests(tmp_path)
+    [component] = components
+    assert component.name == dependency
+    assert component.properties["pinning_state"] == "manifest-only"
+    assert any(f"worker/{lock}" in failure for failure in failures)
+
+
+def test_nested_go_require_accepts_adjacent_parenthesis(tmp_path):
+    nested = tmp_path / "worker"
+    nested.mkdir()
+    (nested / "go.mod").write_text(
+        "module example.test/worker\nrequire(\n github.com/sashabaranov/go-openai v1.32.0\n)\n",
+        encoding="utf-8",
+    )
+    components, failures = walk_nested_manifests(tmp_path)
+    assert not failures
+    [component] = components
+    assert component.version == "v1.32.0"
+    assert component.properties["pinning_state"] == "manifest-only"
+
+
+@pytest.mark.parametrize(
+    ("requirement", "version", "conflicts"),
+    [("=2.1", "2.1.1", 0), ("=2.1", "2.0.0", 1), ("==2.1.0", "2.1.1", 1), (">=2.1.0", "2.1.1", 0)],
+)
+def test_nested_conda_checks_supplier_version_without_lock(
+    tmp_path, requirement, version, conflicts
+):
+    (tmp_path / "environment.yml").write_text(
+        f"dependencies:\n  - pytorch{requirement}\n", encoding="utf-8"
+    )
+    components, failures = walk_nested_manifests(tmp_path)
+    assert not failures
+    path = _supplier_library(tmp_path / "sample.json", "pytorch", version)
+    result = import_foreign_sbom(path, target_aibom=AIBOM(components=components))
+    assert result.conflict_count == conflicts
+    assert result.unresolved_conflict_count == 0
+
+
+@pytest.mark.parametrize(
+    ("ecosystem", "requirement", "within", "outside"),
+    [
+        ("conda", "==2.1.0", "2.1.0", "2.1.1"),
+        ("cargo", "0.8.1", "0.8.6", "0.9.0"),
+        ("npm", "4.8", "4.8.6", "4.9.0"),
+        ("npm", "^4.0.0 || ^5.0.0", "5.2.0", "6.0.0"),
+        ("npm", ">=4.0.0 <5.0.0", "4.8.0", "5.0.0"),
+        ("npm", "4.0.0 - 4.9.0", "4.9.0", "4.9.1"),
+    ],
+)
+def test_supported_nested_ranges_keep_definite_conflicts(
+    tmp_path, ecosystem, requirement, within, outside
+):
+    for foreign_version, conflicts in ((within, 0), (outside, 1)):
+        peer = RegistryEntryComponent(
+            bom_ref="registry:sample-lib",
+            name="sample-lib",
+            version=requirement,
+            registry_type=ecosystem,
+            properties={"manifest_path": "project/manifest", "pinning_state": "manifest-only"},
+        )
+        path = _supplier_library(tmp_path / "sample.json", peer.name, foreign_version)
+        result = import_foreign_sbom(path, target_aibom=AIBOM(components=[peer]))
+        assert result.conflict_count == conflicts
+        assert result.unresolved_conflict_count == 0
+        reconciled = result.aibom.get_component(peer.bom_ref)
+        assert reconciled is not None
+        assert any(risk.category == "source_conflict" for risk in reconciled.risks) == bool(
+            conflicts
+        )
+
+
+def test_nested_locks_resolve_supported_partial_npm_and_cargo_versions(tmp_path):
+    npm = tmp_path / "node"
+    npm.mkdir()
+    dependencies = {"openai": "4.8"}
+    (npm / "package.json").write_text(json.dumps({"dependencies": dependencies}), encoding="utf-8")
+    (npm / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"dependencies": dependencies},
+                    "node_modules/openai": {"version": "4.8.2"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cargo = tmp_path / "rust"
+    cargo.mkdir()
+    (cargo / "Cargo.toml").write_text(
+        '[package]\nname = "worker"\n[dependencies]\ncandle-core = "0.8"\n',
+        encoding="utf-8",
+    )
+    (cargo / "Cargo.lock").write_text(
+        '[[package]]\nname = "worker"\ndependencies = ["candle-core"]\n'
+        '[[package]]\nname = "candle-core"\nversion = "0.8.1"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n',
+        encoding="utf-8",
+    )
+
+    components, failures = walk_nested_manifests(tmp_path)
+    assert not failures
+    assert {
+        component.name: (component.version, component.properties["pinning_state"])
+        for component in components
+    } == {"openai": ("4.8.2", "locked"), "candle-core": ("0.8.1", "locked")}
+
+
+@pytest.mark.parametrize(
+    "problem",
+    ["wrong-version", "duplicate", "no-direct-edge", "different-source", "enclosing-workspace"],
+)
+def test_nested_uv_lock_demands_applicable_unique_direct_registry_record(tmp_path, problem):
+    if problem == "enclosing-workspace":
+        (tmp_path / "pyproject.toml").write_text('[tool.uv.workspace]\nmembers = ["python"]\n')
+    directory = tmp_path / "python"
+    directory.mkdir()
+    (directory / "pyproject.toml").write_text(
+        '[project]\nname = "local"\ndependencies = ["openai>=2"]\n'
+    )
+    root = '[[package]]\nname = "local"\nsource = { virtual = "." }\n'
+    if problem != "no-direct-edge":
+        root += 'dependencies = [{ name = "openai" }]\n'
+    version = "1.2.0" if problem == "wrong-version" else "2.2.0"
+    source = (
+        'path = "lib"' if problem == "different-source" else 'registry = "https://pypi.org/simple"'
+    )
+    record = f'[[package]]\nname = "openai"\nversion = "{version}"\nsource = {{ {source} }}\n'
+    (directory / "uv.lock").write_text(root + record * (2 if problem == "duplicate" else 1))
+    packages, gaps = walk_nested_manifests(tmp_path)
+    assert not gaps and len(packages) == 1
+    assert packages[0].properties["pinning_state"] == "manifest-only"
