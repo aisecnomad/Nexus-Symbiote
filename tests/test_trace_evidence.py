@@ -2034,3 +2034,75 @@ def test_a_caller_span_reports_its_own_identity_and_gates_an_unreadable_one(tmp_
     hidden = _evidence(tmp_path, [agent], otlp_span({**own, "spiffe.id": secret}, kind=kind))
     assert hidden["reconciliation"]["matched"][0]["workload_identity_matched"] is False
     assert hidden["gate"]["passed"] is False
+
+
+def _two_servers_one_tool_name() -> list[AnyComponent]:
+    return [
+        _server("mcp:a", "a"),
+        _server("mcp:b", "b"),
+        ToolComponent(
+            bom_ref="tool:a/search",
+            name="search",
+            mcp_server_ref="mcp:a",
+            definition_hash="sha256:" + "aa" * 32,
+        ),
+        ToolComponent(
+            bom_ref="tool:b/search",
+            name="search",
+            mcp_server_ref="mcp:b",
+            definition_hash="sha256:" + "bb" * 32,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "reported",
+    ["sha256:" + "cc" * 32, "sha256:" + "x" * 600],
+    ids=["foreign", "unreadable"],
+)
+def test_an_ambiguous_tool_reporting_a_hash_no_candidate_declares_fails_the_gate(
+    tmp_path, reported
+):
+    # Two servers that share a tool name make every stdio call ambiguous; the hash check
+    # must not end where the single-candidate match does.
+    span = _tool("search", **{"gen_ai.tool.definition_hash": reported})
+    evidence = _evidence(tmp_path, _two_servers_one_tool_name(), span)
+    (entry,) = _entries(evidence, "ambiguous")
+    assert entry["definition_hash_matched"] is False
+    assert entry["span_count"] == 1
+    assert evidence["gate"]["passed"] is False
+    assert any("several inventory entries" in reason for reason in evidence["gate"]["reasons"])
+    sarif = sarif_document(evidence, "bom.json")
+    assert sarif["runs"][0]["results"]
+
+
+def test_an_ambiguous_tool_reporting_one_candidates_hash_passes(tmp_path):
+    span = _tool("search", **{"gen_ai.tool.definition_hash": "BB" * 32})
+    evidence = _evidence(tmp_path, _two_servers_one_tool_name(), span)
+    (entry,) = _entries(evidence, "ambiguous")
+    assert entry["definition_hash_matched"] is True
+    assert "span_count" not in entry
+    assert evidence["gate"]["passed"] is True
+
+
+def test_an_ambiguous_agent_reporting_a_foreign_spiffe_id_fails_the_gate(tmp_path):
+    agents = [
+        AgentComponent(
+            bom_ref=ref,
+            name="planner",
+            workload_identity="spiffe://example.org/ns/prod/sa/planner",
+            properties={"identity_source": "agent.yaml"},
+        )
+        for ref in ("agent:x1", "agent:x2")
+    ]
+    span = otlp_span(
+        {
+            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.agent.name": "planner",
+            "spiffe.id": "spiffe://evil.example/ns/prod/sa/rogue",
+        }
+    )
+    evidence = _evidence(tmp_path, agents, span)
+    (entry,) = _entries(evidence, "ambiguous", "agent")
+    assert entry["workload_identity_matched"] is False
+    assert evidence["gate"]["passed"] is False

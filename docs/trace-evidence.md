@@ -155,7 +155,10 @@ Every rule is an exact comparison after trimming; nothing is matched by similari
 | `prompt` | `prompt-template` components with the same name | `name` |
 
 One candidate is a match. Several are `ambiguous`: listed with up to 10 candidate
-references and a count of the rest, neither matched nor undeclared. No candidate makes a
+references and a count of the rest, neither matched nor undeclared. An ambiguous item
+that reports a workload identity or tool definition hash is still compared: it passes
+when at least one candidate declares exactly what it reports, and fails the gate as a
+mismatch when none does or the value could not be read. No candidate makes a
 tool, model, agent or MCP endpoint `undeclared`. A skill, data source, memory store or
 prompt without a candidate is an `unmatched_identifier`, for information only, because
 the inventory has no reliable key for them yet. An item whose identity includes a value

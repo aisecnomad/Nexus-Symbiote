@@ -555,6 +555,63 @@ def _is_mismatched(entry: Mapping[str, Any]) -> bool:
     )
 
 
+def _declared_evidence(
+    candidates: Iterable[AnyComponent],
+) -> tuple[frozenset[str], frozenset[str | None], bool]:
+    """The workload identities and tool definition hashes a candidate list declares."""
+    identities: set[str] = set()
+    hashes: set[str | None] = set()
+    tools = False
+    for component in candidates:
+        if declared := _trimmed(getattr(component, "workload_identity", None)):
+            identities.add(declared)
+        if isinstance(component, ToolComponent):
+            tools = True
+            if component.definition_hash:
+                hashes.add(_normalized_sha256(component.definition_hash))
+    return frozenset(identities), frozenset(hashes), tools
+
+
+def _compare_with_candidates(
+    entry: dict[str, Any],
+    item: Any,
+    declared: tuple[frozenset[str], frozenset[str | None], bool],
+) -> None:
+    """Compare what an ambiguous item reports with every candidate it could be.
+
+    Without this the hash and identity checks would apply only to single matches, so a
+    tool name two servers share would carry any definition hash or SPIFFE ID through the
+    gate. The reported set passes when at least one candidate declares exactly that set; a
+    candidate list that declares nothing gives no evidence either way.
+    """
+    declared_ids, declared_hashes, tools = declared
+    if item.workload_identities or item.unreadable_workload_identities:
+        entry["reported_workload_identities"] = sorted(item.workload_identities)
+        if item.unreadable_workload_identities:
+            entry["unreadable_workload_identities"] = item.unreadable_workload_identities
+            entry["workload_identity_matched"] = False
+        elif declared_ids:
+            entry["workload_identity_matched"] = any(
+                item.workload_identities == {identity} for identity in declared_ids
+            )
+        else:
+            entry["workload_identity_matched"] = None
+    if (item.definition_hashes or item.unreadable_definition_hashes) and tools:
+        entry["reported_definition_hashes"] = sorted(item.definition_hashes)
+        reported = {_normalized_sha256(h) for h in item.definition_hashes}
+        if item.unreadable_definition_hashes:
+            entry["unreadable_definition_hashes"] = item.unreadable_definition_hashes
+            entry["definition_hash_matched"] = False
+        elif None in reported:
+            entry["definition_hash_matched"] = False
+        elif declared_hashes:
+            entry["definition_hash_matched"] = any(
+                h is not None and reported == {h} for h in declared_hashes
+            )
+        else:
+            entry["definition_hash_matched"] = None
+
+
 def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str, Any]]]:
     """Sort every observed item into one reconciliation list, and list unmentioned declarations.
 
@@ -568,6 +625,7 @@ def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str
     result: dict[str, list[dict[str, Any]]] = {name: [] for name in _RECONCILIATION}
     mentioned: set[str] = set()
     marked: set[int] = set()
+    declared_by_list: dict[tuple[int, ...], tuple[frozenset[str], frozenset[str | None], bool]] = {}
     for item in observations.items.values():
         identity = _identity(item.kind, item.values)
         if "unreadable" in identity:
@@ -630,9 +688,28 @@ def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str
         elif count:
             heads = heapq.merge(*(found for found, _basis in parts), key=_ref)
             listed = [component.bom_ref for component in islice(heads, LISTED_CANDIDATES)]
-            result["ambiguous"].append(
-                {**identity, "candidates": listed, "candidates_omitted": count - len(listed)}
-            )
+            ambiguous_entry: dict[str, Any] = {
+                **identity,
+                "candidates": listed,
+                "candidates_omitted": count - len(listed),
+            }
+            if (
+                item.workload_identities
+                or item.unreadable_workload_identities
+                or item.definition_hashes
+                or item.unreadable_definition_hashes
+            ):
+                # Each candidate list is read once however many items report against it,
+                # as the marking above keeps it.
+                key = tuple(id(found) for found, _basis in parts)
+                if key not in declared_by_list:
+                    declared_by_list[key] = _declared_evidence(
+                        c for found, _basis in parts for c in found
+                    )
+                _compare_with_candidates(ambiguous_entry, item, declared_by_list[key])
+            if _is_mismatched(ambiguous_entry):
+                ambiguous_entry["span_count"] = item.spans
+            result["ambiguous"].append(ambiguous_entry)
         elif item.kind in GATING_KINDS:
             result["undeclared"].append({**identity, "span_count": item.spans})
         else:
@@ -705,6 +782,7 @@ def _gate(
             1 for entry in reconciliation["unidentified"] if entry["kind"] in GATING_KINDS
         )
         mismatched = sum(1 for entry in reconciliation["matched"] if _is_mismatched(entry))
+        unresolved = sum(1 for entry in reconciliation["ambiguous"] if _is_mismatched(entry))
         if undeclared:
             reasons.append(
                 f"{undeclared} reported tool, model, agent or MCP endpoint "
@@ -720,6 +798,12 @@ def _gate(
             reasons.append(
                 f"{mismatched} matched {'item reports' if mismatched == 1 else 'items report'} a "
                 "conflicting or unreadable workload identity or tool definition hash"
+            )
+        if unresolved:
+            reasons.append(
+                f"{unresolved} reported {'item matches' if unresolved == 1 else 'items match'} "
+                "several inventory entries and reports a workload identity or tool definition "
+                "hash that none of them declares, or that could not be read"
             )
         unclassified = coverage["spans_unclassified"]
         if unclassified:
@@ -945,6 +1029,9 @@ def _findings(document: Mapping[str, Any]) -> Iterable[tuple[str, dict[str, Any]
         if entry["kind"] in GATING_KINDS:
             yield "unidentified", entry
     for entry in reconciliation["matched"]:
+        if _is_mismatched(entry):
+            yield "mismatched", entry
+    for entry in reconciliation["ambiguous"]:
         if _is_mismatched(entry):
             yield "mismatched", entry
 
