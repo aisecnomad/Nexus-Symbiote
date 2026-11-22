@@ -29,6 +29,7 @@ from array import array
 from bisect import bisect_left
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import date
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,7 @@ from nexus_symbiote.scanners.base import (
 )
 from nexus_symbiote.scanners.mcp_credentials import (
     NAMED_CLASS,
+    SCHEME_CLASS,
     SHAPE_CLASS,
     Hit,
     WrappedKeySearchLimitError,
@@ -75,6 +77,7 @@ from nexus_symbiote.scanners.mcp_credentials import (
     endpoint_hits,
     literal_value,
     name_words,
+    placeholder,
     rewrapped_key_literals,
     strongest,
     value_hits,
@@ -1035,7 +1038,12 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
                 values.extend(_shape_secrets(value))
                 # cmd's `set API_TOKEN=Bearer <token>` leaves the credential in the next word.
                 if index + 1 < len(words) and secret_like(name, f"{value} {words[index + 1]}"):
-                    values.extend(scheme_credentials(f"{value} {words[index + 1]}"))
+                    if value.lower() in _ASSIGNMENT_SCHEMES:
+                        values.extend(
+                            literal for _, literal in _assignment_word_hits(word, words[index + 1])
+                        )
+                    else:
+                        values.extend(scheme_credentials(f"{value} {words[index + 1]}"))
         if index > 0:
             flag = words[index - 1]
             if (
@@ -1059,6 +1067,25 @@ _ASSIGNMENT_FLAGS = frozenset({"env", "e", "build-arg"})
 # The scheme words _AUTH reads, after which cmd's `set NAME=<scheme> <credential>` splits.
 _ASSIGNMENT_SCHEMES = frozenset({"bearer", "basic", "token", "bot", "apikey", "api-key"})
 _SCHEME_DESCRIPTORS = frozenset({"type", "mode", "scheme", "method", "transport", "strategy"})
+_PUBLIC_TOKEN_SELECTORS = frozenset({"format", "source", "profile", "output", "kind"})
+# These common switches can follow a mode selector in a launch declaration.
+# Normalize spelling only for the comparison; exports keep the original text.
+_PUBLIC_SCHEME_SWITCHES = _names(
+    "transport stateless privileged verbose readonly dryrun version debug help quiet "
+    "interactive stdio json enablelogging color nocolor noprompt watch force loglevel "
+    "allowhttp insecure noprofile outputformat noninteractive headless detached sandboxed "
+    "production telemetry recursive localhost maxconcurrentrequests enableautomaticupdates"
+)
+_LOWER_LONG_OPTION = re.compile(r"--[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
+_CAMEL_SWITCH = re.compile(r"[A-Za-z][a-z]+(?:[A-Z][a-z]+)+")
+# A short public version or date label after a mode selector (e.g. Workspace2,
+# WorkspaceV2, OpenAPI3, 20250618). Mixed-case tokens with multiple digits or
+# random runs stay private.
+_MODE_LABEL = re.compile(
+    r"(?:(?:[A-Z][a-z]{2,10}|OpenAPI|OAuth|HTTP|TLS|SAML|OIDC|GraphQL|JSON|YAML|GRPC)[Vv]?[0-9]|[0-9]{8})"
+)
+_SCHEME_NUMBER = re.compile(r"[+]?[0-9]+(?:[.][0-9]+)?")
+_SCHEME_ASSIGNMENT_OPERAND = re.compile(r"[A-Za-z0-9_-]+=[A-Za-z0-9_+=-]+")
 # curl's `-u user:password`, also in a cluster of short flags (`-su`), and httpie's `-a`
 # (`--auth`) only under a fetcher. Under another command (docker -u www-data:www-data) the
 # part after the colon counts only when it reads as a literal under a non-password name.
@@ -1098,11 +1125,25 @@ def _explicit_header(previous: str | None, word: str) -> bool:
     )
 
 
-def _scheme_assignment_name(name: str) -> bool:
+def _scheme_assignment_name(name: str, *, variable: bool = True) -> bool:
     words = name_words(name)
     if not words or words[-1] in _SCHEME_DESCRIPTORS:
         return False
-    auth = {"auth", "authorization", "authentication", "oauth", "bearer", "bot"}
+    # CLI flags such as --auth=token, --authentication=bearer, and --auth-header=bearer
+    # select an authentication mode or header rather than binding a credential in the next arg.
+    if not variable and (words[-1] == "header" or tuple(words) in {("auth",), ("authentication",)}):
+        return False
+    auth = {
+        "auth",
+        "authorization",
+        "authentication",
+        "authz",
+        "oauth",
+        "bearer",
+        "bot",
+        "conn",
+        "session",
+    }
     return (
         credential_name(name)
         or words[-1] in auth
@@ -1110,27 +1151,78 @@ def _scheme_assignment_name(name: str) -> bool:
     )
 
 
-def _following_option(word: str) -> bool:
-    """An option after a bare scheme can also be a dash-prefixed, padded token."""
-    flag, equals, argument = word.partition("=")
-    if not flag.startswith("--") or _CLI_FLAG.fullmatch(flag) is None:
+def _benign_selector_switch(key: str, body: str) -> bool:
+    """Whether a bare ``--option`` after a mode selector reads as a normal CLI switch."""
+    if not any(char.isdigit() for char in body):
+        if "-" in body and _LOWER_LONG_OPTION.fullmatch(key):
+            return True
+        if "_" in body and len(body) < 16 and body.replace("_", "").islower():
+            return True
+        if body.isascii() and body.isalpha():
+            if _CAMEL_SWITCH.fullmatch(body):
+                return True
+            if len(body) < 16 and (body.islower() or (body[0].isupper() and body[1:].islower())):
+                return True
+    return False
+
+
+def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
+    """Whether the argument following an authentication scheme may be its literal value."""
+    if len(word) < MIN_SECRET_LENGTH or is_reference(word):
         return False
-    if equals and argument not in {"", "="}:
+    key, equals, argument = word.partition("=")
+    if word.startswith("--") and _CLI_FLAG.fullmatch(key):
+        body = key[2:]
+        if equals and argument not in {"", "="}:
+            return literal_value(argument)
+        if (
+            not equals
+            and body.casefold().replace("-", "").replace("_", "") in _PUBLIC_SCHEME_SWITCHES
+        ):
+            return False
+        if equals:
+            return len(body) >= MIN_SECRET_LENGTH and (argument == "=" or "-" not in body)
+        if len(body) < MIN_SECRET_LENGTH or placeholder(body):
+            return False
+        if credential_binding:
+            return True
+        if _benign_selector_switch(key, body):
+            return False
+        return (
+            len(body) >= 16
+            or any(char.isdigit() for char in body)
+            or (body.isascii() and not body.islower())
+        )
+    # Padding belongs to the operand. Only a genuine assignment has a
+    # nonempty value following the separator and no further equals sign.
+    if argument and "=" not in argument and _SCHEME_ASSIGNMENT_OPERAND.fullmatch(word):
+        return literal_value(argument)
+    if _SCHEME_NUMBER.fullmatch(word):
         return True
-    body = flag[2:]
-    # Padding or mixed case and digits distinguish an opaque value from CLI
-    # labels such as --enable-automatic-updates= and common short switches.
-    has_digit = any(c.isdigit() for c in body)
-    opaque = len(body) >= 16 and (
-        argument == "="
-        or (equals and "-" not in body)
-        or (has_digit and not body.islower() and not body.isupper())
-        or (has_digit and re.fullmatch("[a-fA-F0-9]+", body) is not None)
-    )
-    return not opaque
+    if placeholder(word):
+        return False
+    if word.isascii() and word.isalpha():
+        if credential_binding or len(word) >= 16:
+            return True
+        return (
+            any(char.isupper() for char in word[1:])
+            and _CAMEL_SWITCH.fullmatch(word) is None
+            and not word.isupper()
+        )
+    if credential_binding:
+        return True
+    if (
+        word.isascii()
+        and any(char.isupper() for char in word)
+        and any(char.islower() for char in word)
+        and any(char.isdigit() for char in word)
+        and word.isalnum()
+    ):
+        return True
+    return literal_value(word)
 
 
-def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
+def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = False) -> list[Hit]:
     """The hits of a ``NAME=value`` word, ``--name=value`` and ``--env=NAME=value`` included.
 
     cmd's ``set API_TOKEN=Bearer <token>`` leaves the credential in the next word.
@@ -1138,8 +1230,10 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     name, equals, value = word.partition("=")
     if not equals or _requirement(name, value):
         return []
+    variable = not name.startswith("-")
     name = name.lstrip("-").strip(" \"'")
     if name.lower() in _ASSIGNMENT_FLAGS and "=" in value:
+        variable = True
         name, _, value = value.strip(" \"'").partition("=")
         name = name.strip(" \"'")
         if _requirement(name, value):
@@ -1148,15 +1242,38 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     if not name or not value or name.lower() in {"h", "header"}:
         return []
     hits = value_hits(name, value)
-    if (
-        following is not None
-        and value.lower() in _ASSIGNMENT_SCHEMES
-        and (words := name_words(name))
-        and words[-1] not in _SCHEME_DESCRIPTORS
-        and not _following_option(following)
-        and literal_value(following)
-    ):
-        hits.extend(value_hits(name, f"{value} {following}"))
+    if following is None or value.lower() not in _ASSIGNMENT_SCHEMES:
+        return hits
+    words = name_words(name)
+    if not variable and value.lower() == "token" and words and words[-1] in _PUBLIC_TOKEN_SELECTORS:
+        return hits
+    if in_set:
+        # cmd's SET takes the rest of the assignment, including a literal
+        # spelled like an option. The lexer supplies operators as separate words.
+        if (
+            len(following) >= MIN_SECRET_LENGTH
+            and re.fullmatch(r"[-A-Za-z0-9._~+/]+=*", following)
+            and not placeholder(following)
+            and not is_reference(following)
+        ):
+            hits.extend(value_hits(name, f"{value} {following}") or [(SCHEME_CLASS, following)])
+            return hits
+    credential_binding = in_set or _scheme_assignment_name(name, variable=variable)
+    # Only a selector can explain a short date or version label. An unfamiliar
+    # switch or an ordinary alphabetic word can itself be a bearer credential.
+    if not credential_binding and len(following) <= 12 and _MODE_LABEL.fullmatch(following):
+        if not following.isdecimal():
+            return hits
+        try:
+            date.fromisoformat(following)
+        except ValueError:
+            # Only a valid public date can account for an eight-digit mode label.
+            pass
+        else:
+            return hits
+    if _scheme_operand(following, credential_binding=credential_binding):
+        paired = value_hits(name, f"{value} {following}")
+        hits.extend(paired or [(SCHEME_CLASS, following)])
     return hits
 
 
@@ -1180,8 +1297,25 @@ def _user_hits(previous: str | None, word: str, fetcher: bool) -> list[Hit]:
     return [(NAMED_CLASS, password)]
 
 
+def _cmd_set_word(previous: str | None, before_previous: str | None) -> bool:
+    """Whether the preceding word starts a SET command in a cmd command line."""
+    return (
+        previous is not None
+        and previous.casefold() in {"set", "@set"}
+        and (
+            before_previous is None
+            or before_previous.casefold() in {"/c", "/k", "&", "&&", "|", "||", "("}
+        )
+    )
+
+
 def _word_hits(
-    previous: str | None, word: str, following: str | None, fetcher: bool = False
+    previous: str | None,
+    word: str,
+    following: str | None,
+    fetcher: bool = False,
+    *,
+    in_set: bool = False,
 ) -> list[Hit]:
     """The hits of one argument or shell word, given the words around it."""
     flagged = previous is not None and _flag_value(previous, word)
@@ -1189,7 +1323,7 @@ def _word_hits(
     if ":" in word:
         hits.extend(_header_line_hits(word, explicit=_explicit_header(previous, word)))
     if "=" in word:
-        hits.extend(_assignment_word_hits(word, following))
+        hits.extend(_assignment_word_hits(word, following, in_set=in_set))
     if (":" in word or "=" in word) and _PLAIN_ASSIGNMENT.fullmatch(word) is None:
         hits.extend(assignment_hits(word))
     hits.extend(_user_hits(previous, word, fetcher))
@@ -1197,7 +1331,13 @@ def _word_hits(
 
 
 def _argument_hits(
-    previous: str | None, argument: str, fetcher: bool = False, following: str | None = None
+    previous: str | None,
+    argument: str,
+    fetcher: bool = False,
+    following: str | None = None,
+    *,
+    cmd: bool = False,
+    before_previous: str | None = None,
 ) -> list[Hit]:
     """The hits of a launch argument.
 
@@ -1209,7 +1349,13 @@ def _argument_hits(
     is never a ``NAME=value`` or a literal.
     """
     if not any(char.isspace() for char in argument):
-        return _word_hits(previous, argument, following, fetcher)
+        return _word_hits(
+            previous,
+            argument,
+            following,
+            fetcher,
+            in_set=cmd and _cmd_set_word(previous, before_previous),
+        )
     flagged = previous is not None and _flag_value(previous, argument)
     hits = value_hits(previous if flagged and previous else "", argument)
     hits.extend(_header_line_hits(argument, explicit=_explicit_header(previous, argument)))
@@ -1219,7 +1365,8 @@ def _argument_hits(
     fetcher = fetcher or not _FETCHERS.isdisjoint(map(posixpath.basename, words))
     around: list[str | None] = [None, *words, None]
     for index, word in enumerate(words, start=1):
-        hits.extend(_word_hits(around[index - 1], word, around[index + 1], fetcher))
+        start = cmd and _cmd_set_word(around[index - 1], around[index - 2] if index > 1 else None)
+        hits.extend(_word_hits(around[index - 1], word, around[index + 1], fetcher, in_set=start))
     return hits
 
 
@@ -1248,15 +1395,23 @@ def _credential_hits(
             hits.extend(value_hits(name, value))
             hits.extend(_header_line_hits(value, explicit=False))
         yield ("env", name, hits)
+    cmd = isinstance(command, str) and posixpath.basename(
+        command.replace("\\", "/")
+    ).casefold() in {"cmd", "cmd.exe"}
+    before_previous: str | None = None
     previous: str | None = None
     for index, argument in enumerate(args, start=1):
         if isinstance(argument, str):
             after = args[index] if index < len(args) else None
             following = after if isinstance(after, str) else None
-            yield ("argument", str(index), _argument_hits(previous, argument, fetcher, following))
-            previous = argument
-        else:
-            previous = None
+            yield (
+                "argument",
+                str(index),
+                _argument_hits(
+                    previous, argument, fetcher, following, cmd=cmd, before_previous=before_previous
+                ),
+            )
+        before_previous, previous = previous, argument if isinstance(argument, str) else None
     headers = [item for mapping in header_maps for item in mapping.items()]
     for name, value in sorted(headers, key=lambda item: item[0]):
         hits = _name_hits(name)
@@ -1327,31 +1482,38 @@ def _declared_hits(config: dict[str, Any]) -> PositionHits:
     env, args = config.get("env"), config.get("args")
     maps = [m for m in (config.get("headers"), config.get("http_headers")) if isinstance(m, dict)]
     args = args if isinstance(args, list) else []
-    return list(_credential_hits(env if isinstance(env, dict) else {}, args, maps, ()))
+    return list(
+        _credential_hits(
+            env if isinstance(env, dict) else {}, args, maps, (), config.get("command", "")
+        )
+    )
 
 
 def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
     """Select credentials by their field or value even when a server is refused."""
-    pending = [(field, node)]
+    pending = [(field, node, False)]
     while pending:
-        name, item = pending.pop()
+        name, item, inferred = pending.pop()
         if isinstance(item, dict):
-            named_credential = any(
+            credential_label = any(
                 isinstance(item.get(key), str) and _scheme_assignment_name(item[key])
                 for key in ("name", "key")
             )
-            label = "auth" if named_credential else ""
-            if (
-                not named_credential
-                and not {"name", "key"}.intersection(item)
-                and name.lower() not in {"auth", "oauth", "headers", "http_headers"}
-                and _scheme_assignment_name(name)
-            ):
-                label = name
-            pending.extend(
-                (label if label and key in {"value", "values"} else str(key), value)
-                for key, value in item.items()
+            unlabelled = not {"name", "key"}.intersection(item)
+            value_record = credential_label or (
+                unlabelled
+                and (
+                    name.lower() in {"auth", "oauth", "headers", "http_headers"}
+                    or _scheme_assignment_name(name)
+                )
             )
+            for key, value in item.items():
+                # A refused record supplies context, but a public package name
+                # can also occupy its value slot. Preserve explicit metadata labels.
+                use_shape = (value_record and key in {"value", "values"}) or (
+                    unlabelled and (inferred or credential_name(name))
+                )
+                pending.append((str(key), value, use_shape))
         elif isinstance(item, list):
             if name in {"args", "command"}:
                 for index, word in enumerate(item):
@@ -1367,11 +1529,13 @@ def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
                             )
                         )
             if len(item) == 2 and isinstance(item[0], str) and _scheme_assignment_name(item[0]):
-                pending.extend(((name, item[0]), ("auth", item[1])))
+                pending.extend(((name, item[0], False), ("value", item[1], True)))
             else:
-                pending.extend((name, value) for value in item)
+                pending.extend((name, value, inferred) for value in item)
         elif isinstance(item, str) and not is_reference(item):
-            if secret_like(name, item) or (_scheme_assignment_name(name) and literal_value(item)):
+            if secret_like(name, item) or (
+                (inferred or _scheme_assignment_name(name)) and literal_value(item)
+            ):
                 yield item
             yield from _text_credentials(item)
             yield from _shape_secrets(item)
