@@ -137,7 +137,7 @@ _FLOW_BRACKETS_RE = re.compile(r"[\[\]{}]")
 # and YAML's ''. Decoding them anywhere, inside a literal string or a comment too, only
 # adds findings.
 _ESCAPE_RE = re.compile(
-    r"\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|u\{([0-9A-Fa-f]{1,6})\}"
+    r"\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|u\{([0-9A-Fa-f]++)\}"
     r"|[ \t]*\r?\n\s*|(.))|''",
     re.S,
 )
@@ -878,10 +878,12 @@ def _decoded_sources(
     if kind is not None:
         candidates.append((kind, (0, len(text))))
     elif suffix in _MARKDOWN_SUFFIXES:
+        first_nl = _FM_LINE_END_RE.search(text)
+        search_from = first_nl.end() if first_nl is not None else 0
         for fm_lang, fm_raw, _body in front_matter_candidates(text):
             if not fm_raw:
                 continue
-            pos = text.find(fm_raw)
+            pos = text.find(fm_raw, search_from)
             if pos >= 0:
                 fm_kind = "TOML" if fm_lang == "toml" else "YAML"
                 candidates.append((fm_kind, (pos, pos + len(fm_raw))))
@@ -964,7 +966,8 @@ def _escape_decoded(text: str, start: int, end: int) -> tuple[str, list[int]]:
         pos = match.end()
         digits = match.group(1) or match.group(2) or match.group(3) or match.group(4)
         if digits is not None:
-            code = int(digits, 16)
+            stripped = digits.lstrip("0") or "0"
+            code = int(stripped, 16) if len(stripped) <= 6 else sys.maxunicode + 1
             decoded = chr(code) if code <= sys.maxunicode else match.group()
         elif match.group() == "''":
             decoded = "'"

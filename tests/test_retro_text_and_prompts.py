@@ -651,3 +651,85 @@ def test_d_360_01_blast_radius_keeps_subject_own_shared_credentials() -> None:
         subject.bom_ref,
         peer.bom_ref,
     }
+
+
+def test_ecmascript_leading_zero_braced_escapes_and_directional_marks_parity() -> None:
+    from nexus_symbiote.scanners.ts_tools import _decode_js_unicode_escapes
+    from nexus_symbiote.text_poisoning import _decoded_sources, _escape_decoded
+
+    # Leading zeros in ECMAScript \u{...} escapes must decode without backtracking or int DoS.
+    assert "\u202e" in _decode_js_unicode_escapes(r"\u{000000202e}")
+    assert "\U000e0049" in _decode_js_unicode_escapes(r"\u{000000000e0049}")
+    assert "\u202e" in _decode_js_unicode_escapes("\\u{" + "0" * 5000 + "202e}")
+    overflow = "\\u{" + "1" * 5000 + "}"
+    assert _decode_js_unicode_escapes(overflow) == overflow
+
+    decoded_tp, _ = _escape_decoded(r"\u{000000202e}\u{000000000e0049}", 0, 32)
+    assert "\u202e" in decoded_tp and "\U000e0049" in decoded_tp
+    decoded_over, _ = _escape_decoded(overflow, 0, len(overflow))
+    assert decoded_over == overflow
+
+    # Front-matter body matching the opener tag must resolve after the opener newline.
+    md_esc = '---yaml\nyaml: "\\u0020"\n---\n'
+    trees_esc, _spans_esc = _decoded_sources("CLAUDE.md", md_esc)
+    assert trees_esc == [{"yaml": " "}]
+    md_bad = '---yaml\nyaml: "\\u0020\n---\n'
+    _trees_bad, spans_bad = _decoded_sources("CLAUDE.md", md_bad)
+    assert spans_bad and spans_bad[0][0] >= len("---yaml\n")
+
+    # live/verify.py must preserve and clean up directional_marks alongside other text risks.
+    raw_rlm = {
+        "name": "rlm_tool",
+        "description": "hello \u200f world",
+        "inputSchema": {"type": "object"},
+    }
+    checked = check_served_tool(raw_rlm)
+    assert any(r.category == "directional_marks" for r in checked.text_risks)
+
+    srv_ref = "mcp:rlm-demo"
+    bom = AIBOM()
+    bom.add_component(
+        MCPServerComponent(
+            bom_ref=srv_ref, name="rlm-demo", transport="stdio", command="/usr/local/bin/demo-mcp"
+        )
+    )
+    launchers = {srv_ref: {"command": "/usr/local/bin/demo-mcp", "sha256": "1" * 64}}
+    rlm_obs = PinnedObservation(
+        launcher_sha256="sha256:" + "1" * 64,
+        hello={
+            "protocolVersion": "2025-06-18",
+            "serverInfo": {"name": "rlm-demo", "version": "1.0"},
+            "capabilities": {"tools": {}},
+            "instructions": "instructions \u200f mark",
+        },
+        tools=[raw_rlm],
+        prompts=[],
+        resource_templates=[],
+        teardown_confirmed=True,
+    )
+    with patch("nexus_symbiote.live.verify.fetch_observation", return_value=rlm_obs):
+        report = verify_mcp_servers(bom, trusted_launchers=launchers)
+    record_candidate(bom, report)
+    tool = next(c for c in bom.components if isinstance(c, ToolComponent))
+    srv = next(c for c in bom.components if isinstance(c, MCPServerComponent))
+    assert any(r.category == "directional_marks" for r in tool.risks)
+    assert any(r.category == "directional_marks" for r in srv.risks)
+
+    clean_obs = PinnedObservation(
+        launcher_sha256="sha256:" + "1" * 64,
+        hello={
+            "protocolVersion": "2025-06-18",
+            "serverInfo": {"name": "rlm-demo", "version": "1.0"},
+            "capabilities": {"tools": {}},
+            "instructions": "clean instructions",
+        },
+        tools=[{"name": "rlm_tool", "description": "clean", "inputSchema": {"type": "object"}}],
+        prompts=[],
+        resource_templates=[],
+        teardown_confirmed=True,
+    )
+    with patch("nexus_symbiote.live.verify.fetch_observation", return_value=clean_obs):
+        clean_report = verify_mcp_servers(bom, trusted_launchers=launchers)
+    record_candidate(bom, clean_report)
+    assert not any(r.category == "directional_marks" for r in tool.risks)
+    assert not any(r.category == "directional_marks" for r in srv.risks)

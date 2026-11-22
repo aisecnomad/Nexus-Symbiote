@@ -1459,7 +1459,7 @@ def _collect_source(
 
 
 _JS_UNICODE_ESCAPE_RE = re.compile(
-    r"\\(?:u\{([0-9a-fA-F]{1,6})\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))"
+    r"\\(?:u\{([0-9a-fA-F]++)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))"
 )
 
 
@@ -1468,7 +1468,10 @@ def _decode_js_unicode_escapes(source: str) -> str:
 
     def _replace(match: re.Match[str]) -> str:
         digits = match.group(1) or match.group(2) or match.group(3)
-        code = int(digits, 16)
+        stripped = digits.lstrip("0") or "0"
+        if len(stripped) > 6:
+            return match.group(0)
+        code = int(stripped, 16)
         return chr(code) if code <= sys.maxunicode else match.group(0)
 
     decoded = _JS_UNICODE_ESCAPE_RE.sub(_replace, source)

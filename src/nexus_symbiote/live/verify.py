@@ -52,7 +52,13 @@ from nexus_symbiote.scanners.prompt import definition_text_risks
 from nexus_symbiote.utils.secrets import redact_text
 
 _TEXT_RISK_CATEGORIES = frozenset(
-    {"bidi_override", "invisible_characters", "tag_characters", "line_separators"}
+    {
+        "bidi_override",
+        "directional_marks",
+        "invisible_characters",
+        "tag_characters",
+        "line_separators",
+    }
 )
 
 # Fixed, nonsecret explanations; reports never carry exception text or server data.
