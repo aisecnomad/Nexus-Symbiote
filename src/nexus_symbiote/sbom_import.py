@@ -356,6 +356,8 @@ def _conda_requirement(raw: str) -> tuple[_CondaTerms, bool] | None:
         build = re.fullmatch(r"([0-9]\S*)\s+([A-Za-z0-9_.+*?-]+)", text)
     if build:
         text = build[1]
+        if text.startswith("=") and not text.startswith("==") and not text.endswith("*"):
+            text = "=" + text
     comparisons: list[tuple[str, Version]] = []
     for term in text.split(","):
         match = re.fullmatch(r"(<=|>=|==|!=|=|<|>)?\s*([0-9]\S*)", term.strip())
@@ -1621,6 +1623,7 @@ def _py_req_item(
             if req.specifier.contains(Version(locked)):
                 return (req.name, locked, "pypi", "locked", {})
         except InvalidVersion:
+            # An invalid lock version cannot corroborate the manifest requirement.
             pass
     spec_s = str(req.specifier) or None
     st = "pinned-version" if is_exact_version(spec_s) else "manifest-only"

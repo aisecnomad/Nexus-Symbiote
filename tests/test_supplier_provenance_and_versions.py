@@ -33,7 +33,10 @@ from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV
         ("conda", "=2.1.*", "2.1.1", True),
         ("conda", "==2.1.*", "2.0.0", False),
         ("conda", "=2.1=py312_0", "2.0.0", False),
-        ("conda", "=2.1=py312_0", "2.1.1", None),
+        ("conda", "=2.1=py312_0", "2.1.1", False),
+        ("conda", "=2.1=py312_0", "2.1.0", None),
+        ("conda", "==2.1=py312_0", "2.1.1", False),
+        ("conda", "=2.1.*=py312_0", "2.1.1", None),
         ("conda", ">2.1", "2.1.0.post1", True),
         ("conda", "<2.2", "2.2.0rc1", True),
         ("conda", ">2.1", "2.1.0+cu118", True),
@@ -45,7 +48,9 @@ def test_version_requirement_uses_package_manager_ordering(
     assert _satisfies_nested_requirement(ecosystem, requirement, supplied) is satisfies
 
 
-@pytest.mark.parametrize(("version", "expected"), [("2.0.0", (1, 0)), ("2.1.1", (0, 1))])
+@pytest.mark.parametrize(
+    ("version", "expected"), [("2.0.0", (1, 0)), ("2.1.1", (1, 0)), ("2.1.0", (0, 1))]
+)
 def test_conda_manifest_preserves_build_pin_evidence(tmp_path, version, expected):
     nested = tmp_path / "worker"
     nested.mkdir()
