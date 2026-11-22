@@ -430,6 +430,65 @@ def test_a_literal_past_the_digit_floor_is_not_converted_on_any_walk() -> None:
     assert {segment.outcome for segment in segments} <= {"stop", "unread"}
 
 
+def _memo_call(put: bytes, other: bytes, get: bytes) -> bytes:
+    # len under memo index `put`, None under `other`, then GET `get` and call it.
+    return b"cbuiltins\nlen\np" + put + b"\n0Np" + other + b"\n0g" + get + b"\n(S'ab'\ntR."
+
+
+def test_long_memo_indexes_keep_distinct_keys() -> None:
+    import subprocess
+
+    first, second = b"1" * 5_000, b"2" * 5_000
+    payload = _memo_call(first, second, first)
+    # The pure-Python unpickler with no digit limit keys its memo by the exact integer.
+    loaded = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-X",
+            "int_max_str_digits=0",
+            "-c",
+            "import pickle, sys; print(pickle._loads(sys.stdin.buffer.read()))",
+        ],
+        input=payload,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert loaded.stdout.strip() == b"2"
+    segment = load_segment(payload, len(payload), 0, "py", Budget(65536, 64))
+    assert segment.outcome == "called"
+    assert "int-digits" in segment.differs
+    # Past LONG_MAX, the C unpickler refuses the index, as PyLong_AsSsize_t does.
+    assert load_segment(payload, len(payload), 0, "c", Budget(65536, 64)).outcome == "error"
+    # A different index under GET still misses the memo.
+    missed = _memo_call(first, second, b"3" * 5_000)
+    assert load_segment(missed, len(missed), 0, "py", Budget(65536, 64)).outcome == "error"
+
+
+@pytest.mark.parametrize(
+    ("put", "get"),
+    [
+        (b"0" * 5_000 + b"7", b"7"),
+        (b"0" * 100 + b"9" * 700, b"9" * 700),
+        (b"1_0", b"10"),
+        (b" 0" + b"0" * 4_400 + b"5 ", b"+5"),
+    ],
+    ids=["zeros-then-short", "zeros-then-long", "underscore", "whitespace-and-sign"],
+)
+def test_one_memo_index_written_two_ways_is_one_key(put: bytes, get: bytes) -> None:
+    payload = _memo_call(put, b"99", get)
+    assert load_segment(payload, len(payload), 0, "py", Budget(65536, 64)).outcome == "called"
+
+
+def test_a_negative_long_memo_index_is_refused() -> None:
+    payload = b"Np-" + b"1" * 5_000 + b"\n."
+    for flavor in ("c", "py"):
+        assert load_segment(payload, len(payload), 0, flavor, Budget(65536, 64)).outcome == (
+            "error"
+        )
+
+
 def test_a_memo_index_past_a_c_long_still_fails_the_c_unpickler() -> None:
     index = b"1" + b"0" * 5000
     payload = b"K0p" + index + b"\n0cos\ngetpid\n)R."
