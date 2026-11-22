@@ -276,16 +276,28 @@ def test_policy_exclusions_recorded_distinguishes_default_from_policy_excludes(
 # --- R-MED-15: per-entry OSError scoping in _walk ---
 
 
-def test_walk_unreadable_sibling_does_not_abort_remaining_siblings(tmp_path: Path) -> None:
-    if os.geteuid() == 0:
-        pytest.skip("root ignores directory mode 0o000")
+def test_walk_unreadable_sibling_does_not_abort_remaining_siblings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     locked = tmp_path / "000_locked"
     locked.mkdir()
     (locked / "hidden.txt").write_text("x", encoding="utf-8")
     readable = tmp_path / "zzz_readable"
     readable.mkdir()
     (readable / "ok.txt").write_text("ok", encoding="utf-8")
-    locked.chmod(0o000)
+    if os.geteuid() == 0:
+        # Root lists a mode-000 directory; its listing is refused for it instead.
+        scandir = os.scandir
+        locked_inode = locked.stat().st_ino
+
+        def refused(path: object = ".", *args: object, **kwargs: object) -> object:
+            if isinstance(path, int) and os.fstat(path).st_ino == locked_inode:
+                raise PermissionError(13, "Permission denied", str(locked))
+            return scandir(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "scandir", refused)
+    else:
+        locked.chmod(0o000)
     try:
         failures: list[str] = []
         with ConfinedCollection(tmp_path, failures) as files:
@@ -391,6 +403,7 @@ def test_check_yaml_flow_depth_blocks_deep_flow_and_allows_safe_constructs() -> 
         check_yaml_flow_depth(deep_map)
 
     # Strings, comments, CRLF, and indented block scalars must not trigger false positives.
+    # `stray: ]` is not valid YAML; the guard leaves it to the loader, as it does on main.
     safe_yaml = (
         'quoted: "' + "[" * 200 + '\\""\r\n'
         "single: '" + "{" * 200 + "''" + "'\r\n"
@@ -751,6 +764,9 @@ def test_regular_files_under_undotted_store_names_are_inventoried(tmp_path: Path
     assert credential_gap("services/docker/CLAUDE.md", "services/docker/CLAUDE.md") is None
     assert credential_gap("deploy/helm/AGENTS.md", "deploy/helm/AGENTS.md") is None
     assert link_gap("docker/Dockerfile") is None
+    # `vault/` stays a credential store for every link, as it was before the store list grew.
+    assert link_gap("vault/token") is not None
+    assert link_gap("vault/main.co", colang_rail="rails/main.co") is not None
     assert link_gap("docker/main.co", colang_rail="rails/main.co") is not None
     assert link_gap(".docker/config.json") is not None
     assert link_gap(".config/gh/hosts.yml") is not None
@@ -768,3 +784,27 @@ def test_regular_files_under_undotted_store_names_are_inventoried(tmp_path: Path
     assert not any(
         "symlink leads into a credential directory" in gap for gap in result.surfaces_excluded
     )
+
+
+@pytest.mark.parametrize("store", ["vault", ".aws", ".ssh"])
+def test_files_in_and_links_into_a_credential_store_are_withheld_as_on_main(
+    tmp_path: Path, store: str
+) -> None:
+    from nexus_symbiote.scanners.prompt import PromptScanner
+    from nexus_symbiote.scanners.registry import RegistryScanner
+
+    (tmp_path / store).mkdir()
+    (tmp_path / store / "AGENTS.md").write_text("# inside the store\n", encoding="utf-8")
+    (tmp_path / store / "notes.md").write_text("# notes\n", encoding="utf-8")
+    (tmp_path / store / "requirements.txt").write_text("openai==1.0.0\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").symlink_to(f"{store}/notes.md")
+    (tmp_path / "requirements.txt").symlink_to(f"{store}/requirements.txt")
+
+    prompts = PromptScanner().scan(tmp_path)
+    assert not any(store in surface for surface in prompts.surfaces_scanned)
+    assert not any(c.source_path == "CLAUDE.md" for c in prompts.components)
+    assert len([gap for gap in prompts.surfaces_excluded if "credential" in gap]) >= 2
+
+    registry = RegistryScanner().scan(tmp_path)
+    assert registry.components == []
+    assert any("credential" in gap for gap in registry.surfaces_excluded)

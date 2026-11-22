@@ -98,6 +98,9 @@ NON_LINUX_SKIP_REASONS = (
     ),
     re.compile(r"\Ano (?:/proc/self/cwd|/dev/fd link into /proc)\Z"),
 )
+# Expected only as root, which ignores directory modes: a test that needs the kernel to
+# refuse a traverse-only directory cannot simulate that refusal and skips.
+ROOT_SKIP_REASONS = (re.compile(r"\Aroot ignores directory mode 0o111\Z"),)
 DEFAULT_TIMEOUT_SECONDS = 300
 
 
@@ -197,6 +200,8 @@ class SkipAccounting:
         expected = EXPECTED_SKIP_REASONS + (() if os.environ.get("CI") else LOCAL_SKIP_REASONS)
         if not sys.platform.startswith("linux"):
             expected += NON_LINUX_SKIP_REASONS
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            expected += ROOT_SKIP_REASONS
         return [
             (nodeid, reason)
             for nodeid, reason in self.skips

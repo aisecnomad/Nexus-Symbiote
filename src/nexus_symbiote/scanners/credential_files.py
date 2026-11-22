@@ -73,6 +73,7 @@ _CREDENTIAL_STORE_NAMES = frozenset(
 # adjacent pair so non-credential `.config/` files (e.g. `.config/mcp.json`) are still scanned.
 _DOT_CREDENTIAL_STORES = frozenset(f".{name}" for name in _CREDENTIAL_STORE_NAMES)
 _RAIL_LINK_CREDENTIAL_STORES = _DOT_CREDENTIAL_STORES | _CREDENTIAL_STORE_NAMES
+_LINK_CREDENTIAL_STORES = _DOT_CREDENTIAL_STORES | {"vault"}
 
 
 def _has_xdg_credential_store(directories: tuple[str, ...]) -> bool:
@@ -120,25 +121,22 @@ def credential_shaped(path: str, *, colang_source: bool = False) -> bool:
 def credential_gap(path: str, target: str | None) -> str | None:
     """Why the file at ``path`` is not read, or None: its name, or the name of
     ``target``, the in-root file a symlink at ``path`` leads to, says it holds
-    credentials. A regular file names itself as its target and is judged by its
-    name alone."""
+    credentials. A regular file names itself as its target: it is withheld only
+    inside a credential store, whatever its own name."""
     if credential_shaped(path):
         return "its name says it holds credentials"
-    if target is None or PurePosixPath(target) == PurePosixPath(path):
+    if target is None:
+        return None
+    if PurePosixPath(target) == PurePosixPath(path):
+        if _in_credential_store(PurePosixPath(path), _LINK_CREDENTIAL_STORES):
+            return "lies in a credential directory"
         return None
     return link_gap(target)
 
 
-def link_gap(target: str | None, *, colang_rail: str | None = None) -> str | None:
-    """Why a symlink that leads to ``target`` is not followed, or None."""
-    if target is None:
-        return None
-    target_path = PurePosixPath(target)
+def _in_credential_store(target_path: PurePosixPath, stores: frozenset[str]) -> bool:
     directories = target_path.parts[:-1]
-    # An undotted store name (`docker/`, `helm/`) is an ordinary project directory for
-    # every file but a Colang rail reached through a link, which keeps its program role.
-    stores = _RAIL_LINK_CREDENTIAL_STORES if colang_rail is not None else _DOT_CREDENTIAL_STORES
-    if (
+    return (
         any(part.casefold() in stores for part in directories)
         or _has_xdg_credential_store(directories)
         or (
@@ -146,7 +144,19 @@ def link_gap(target: str | None, *, colang_rail: str | None = None) -> str | Non
             and directories[-1].casefold() == ".config"
             and target_path.stem.casefold() in _CREDENTIAL_STORE_NAMES
         )
-    ):
+    )
+
+
+def link_gap(target: str | None, *, colang_rail: str | None = None) -> str | None:
+    """Why a symlink that leads to ``target`` is not followed, or None."""
+    if target is None:
+        return None
+    target_path = PurePosixPath(target)
+    # An undotted store name (`docker/`, `helm/`) is an ordinary project directory for
+    # every file but a Colang rail reached through a link, which keeps its program role.
+    # `vault/` is the exception: a link into it was refused before the store names grew.
+    stores = _RAIL_LINK_CREDENTIAL_STORES if colang_rail is not None else _LINK_CREDENTIAL_STORES
+    if _in_credential_store(target_path, stores):
         return "symlink leads into a credential directory"
     # A transparent rail link keeps its declared name and program role. A
     # renamed target can be a credential store presented under a rail alias.
