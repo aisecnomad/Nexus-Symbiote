@@ -90,7 +90,9 @@ peers. An npm key is written as the package name is recorded, redacted
 selector that the declared spec matched, `yarn.lock#/openai@4.0.0`, or
 `yarn.lock#/openai@npm:4.0.0` in a Berry lockfile, whose one key lists every
 descriptor of the stanza; another selector of the stanza, which may be a tarball
-URL with a token in it, is never recorded. A pnpm package key is recorded whole when
+URL with a token in it, is never recorded. A credential-shaped selected locator is
+reduced to the lockfile name. A private resolved version is redacted and its package
+URL is withheld. A pnpm package key is recorded whole when
 its peer suffix names only packages with exact versions, and patch hashes, in
 balanced parentheses as pnpm writes them
 (`pnpm-lock.yaml#/packages/~1openai@4.0.0(react@18.2.0)`). A suffix that holds

@@ -432,9 +432,10 @@ A way around a limit that its entry does not describe is worth a
   by its shape or in a `NAME=value`, `--name=value` or `--name value` word, which
   covers cmd's `set NAME=<scheme> <credential>`.
 - **`credential_exposure` reports a precise subset of what is scrubbed.** The scrubber
-  redacts broadly on purpose; the finding is raised only for an MCP server's `env`
-  values, launch arguments, header values and endpoint URL query, and for an `env` or
-  header name in a known token shape. A credential in the `command` field itself, in
+  redacts broadly. The registry collector reports credential-shaped names, extras,
+  versions, environment markers and selected lockfile evidence. The MCP collector reports
+  literal credentials in server environment values, launch arguments, headers and endpoint
+  URL queries, and recognized token shapes in environment or header names. A credential in the `command` field itself, in
   an `oauth` or `auth` object, in a Claude Code settings `env` value, or in an A2A or
   RAG header is scrubbed or withheld as before but raises no `credential_exposure`
   finding. A password in an endpoint URL's user information stays with
@@ -1637,8 +1638,9 @@ is a failure; everything below is neither a gap nor a failure.
   `<name>@<version>(***)`, which no JSON pointer resolves; the root importer's
   `version`, or the lockfile's only record of the package, names the key. A Yarn
   Berry record is named by the one descriptor the declared spec matched, not by the
-  stanza's whole key. Exact versions are recorded as the lockfile writes them, so a
-  prerelease such as `4.0.0-<text>` keeps its text, credential-shaped or not.
+  stanza's whole key. A credential-shaped selector is reduced to the lockfile name.
+  Credential-shaped versions are redacted and their package URL is withheld. Other
+  exact versions retain their prerelease text.
 - **A Yarn Berry checksum counts as Yarn 4 checks it.** The collector models the cache
   key `10c0` that Yarn 4 computes at its default compression level, and reads Yarn's
   settings from the root `.yarnrc.yml` and the release `package.json` names for
