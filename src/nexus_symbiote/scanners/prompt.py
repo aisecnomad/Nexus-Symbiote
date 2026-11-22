@@ -31,7 +31,11 @@ from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV
 from nexus_symbiote.scanners.mcp_sources import SOURCE_SEARCH_SKIPPED
 from nexus_symbiote.scanners.source_binding import BindingError, value_binding
 from nexus_symbiote.utils.confined import CollectionError, ConfinedCollection, fold_name
-from nexus_symbiote.utils.markdown import hidden_text, text_outside_code
+from nexus_symbiote.utils.markdown import (
+    front_matter_candidates,
+    hidden_text,
+    text_outside_code,
+)
 from nexus_symbiote.utils.terminal import neutralize
 from nexus_symbiote.utils.toml import loads as toml_loads
 
@@ -119,6 +123,9 @@ _BYTE_ORDER_MARKS = (
 
 
 def _pictographic(char: str) -> bool:
+    """Whether ``char`` is in a block of pictographs or is one of the other characters
+    that Unicode's emoji-variation-sequences.txt lets a presentation selector follow;
+    unicodedata has no emoji properties, so the blocks and characters are listed."""
     point = ord(char)
     return (
         0x1F000 <= point <= 0x1FAFF
@@ -127,7 +134,8 @@ def _pictographic(char: str) -> bool:
         or 0x25A0 <= point <= 0x27BF
         or 0x2900 <= point <= 0x297F
         or 0x2B00 <= point <= 0x2BFF
-        or point in {0xA9, 0xAE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D, 0x3297, 0x3299}
+        or point
+        in {0xA9, 0xAE, 0x203C, 0x2049, 0x2122, 0x2139, 0x24C2, 0x3030, 0x303D, 0x3297, 0x3299}
     )
 
 
@@ -150,11 +158,9 @@ def _emoji_context(content: str, index: int) -> bool:
     if before < 0:
         return False
     previous = content[before]
-    return (
-        _pictographic(previous)
-        or previous in "#*0123456789"
-        or (0x2000 <= ord(previous) <= 0x2BFF or 0x3000 <= ord(previous) <= 0x32FF)
-    )
+    # Only a character that takes a presentation selector makes it ordinary: after a
+    # space, a dash or kana a run of them encodes hidden bits.
+    return _pictographic(previous) or previous in "#*0123456789"
 
 
 def _character_name(char: str) -> str:
@@ -212,9 +218,10 @@ def detect_invisible_characters(
     presentation selector after a pictograph, a byte-order mark that starts the text
     and the England, Scotland and Wales flag sequences are ordinary text.
 
-    ``decoded`` holds what a prompt template's escapes decode to (see ``_escaped_text``),
-    where an escape spells a character its raw text does not hold; each character counts
-    as often as the text that holds it more often, so one written raw counts once.
+    ``decoded`` holds what a prompt template's escapes, or those in the front matter of a
+    Markdown file, decode to (see ``_escaped_text``), where an escape spells a character
+    its raw text does not hold; each character counts as often as the text that holds it
+    more often, so one written raw counts once.
     """
     counts, tags = _hidden_counts(content, at_start=True)
     separators = _line_separator_counts(content)
@@ -499,14 +506,16 @@ def _hidden_character_risks(
 # the next word names what to run: a path, a script or executable file, a shell, or a
 # command that executes code, reads secrets or deletes files. Any punctuation that a path
 # cannot contain may come first, so `Run: ./x.sh`, `run (bash)` and `run **./x.sh**`
-# count, as do an arrow or a bullet (`->`, `- `), a prompt (`$ `), an HTML tag, a code
+# count, as do an arrow or a bullet (`->`, `- `), a prompt (`$ `), an HTML tag, also with
+# attributes (`<code class="sh">`), an environment assignment (`FOO=bar `), a code
 # fence's language and `_` emphasis. A hyphen joined to a word before it (`dry-run`) makes
 # a noun, except in `re-run`; `<!--run` does not. A separator is never a path character,
 # so a path's scan stops at the next `run`'s separator and stays linear.
 _PATH_CHARACTER = r"[\w.~$%+@-]"
 _PUNCTUATION = r"[^\w.~$%+@/\\-]"
 _RUN_SEPARATOR = (
-    rf"(?:{_PUNCTUATION}|[-$]++(?={_PUNCTUATION})|<[a-z]++>|(?<=```)[\w+-]++(?=[ \t]*\n))"
+    rf"(?:{_PUNCTUATION}|[-$]++(?={_PUNCTUATION})|<[a-z]++(?:[ \t][^<>\n]{{0,256}}+)?>"
+    rf"|(?<=```)[\w+-]++(?=[ \t]*\n))"
 )
 _RUN = rf"(?<!\w)(?:(?<=\bre-)|(?<!\w-))run{_RUN_SEPARATOR}+_{{0,2}}"
 # A name ends where a word does, or where underscores close emphasis (`_bash_`).
@@ -542,16 +551,21 @@ _LATER_TARGET = re.compile(
     re.IGNORECASE,
 )
 # `run` also counts when a target later in the same sentence starts a command: at the
-# start of a line or list item, or after `:`, `;`, `&`, `|`, `then`, `command(s)` or
-# `script`, with whitespace, quotes, brackets and emphasis between. So `run the command
-# `rm -rf /``, `run as root: rm -rf /`, `run make test && rm -rf /` and `run tests, then
-# cat .env` count, while `run them with python` does not. A sentence ends at `.`, `!` or
-# `?` before whitespace, except after a digit, as in a `1.` list marker.
+# start of a line or list item, or after `:`, `;`, `&`, `|`, `then`, `command(s)`,
+# `script`, or an example abbreviation directly after the verb. Whitespace, quotes,
+# brackets and emphasis may intervene. So
+# `run the command `rm -rf /``, `run as root: rm -rf /`, `run make test && rm -rf /`, `run
+# i.e. bash` and `run tests, then cat .env` count, while `run them with python` does not.
+# A sentence ends at `.`, `!` or `?` before whitespace, except after a digit, as in a `1.`
+# list marker, and in `e.g.` and `i.e.`.
 _RUN_VERB = re.compile(_RUN, re.IGNORECASE)
-_SENTENCE_END = re.compile(r"(?<!\d)[.!?](?=\s)")
+_ASSIGNMENT_TOKEN = re.compile(r"[^\s<>]++")
+_ASSIGNMENT_START = re.compile(r"(?<![\w=])[A-Za-z_]\w*+=", re.IGNORECASE)
+_SENTENCE_END = re.compile(r"(?<!\d)(?<!\b[eE]\.[gG])(?<!\b[iI]\.[eE])[.!?](?=\s)")
 _COMMAND_SKIP = frozenset(" \t`'\"([*_>-\u201c\u2018$")
 _COMMAND_DELIMITER = frozenset(":;&|\n")
 _COMMAND_WORD = re.compile(r"(?<!\w)(?:then|commands?|script)\Z", re.IGNORECASE)
+_EXAMPLE_WORD = re.compile(r"(?<!\w)(?:e\.g\.|i\.e\.)\Z", re.IGNORECASE)
 
 
 def _starts_command(text: str, start: int, position: int) -> bool:
@@ -572,29 +586,64 @@ def _starts_command(text: str, start: int, position: int) -> bool:
         while index > start and text[index - 1] in " \t":
             index -= 1
         return index <= start or text[index - 1] == "\n"
-    return _COMMAND_WORD.search(text, max(start, index - 8), index) is not None
+    if _COMMAND_WORD.search(text, max(start, index - 8), index) is not None:
+        return True
+    example = _EXAMPLE_WORD.search(text, max(start, index - 5), index)
+    if example is None:
+        return False
+    index = example.start()
+    while index > start and text[index - 1] in _COMMAND_SKIP:
+        index -= 1
+    return index == start
 
 
 def _run_starts_later_command(text: str) -> bool:
-    position = 0
-    while (verb := _RUN_VERB.search(text, position)) is not None:
-        end = _SENTENCE_END.search(text, verb.end())
-        stop = len(text) if end is None else end.start()
-        for target in _LATER_TARGET.finditer(text, verb.end(), stop):
-            if _starts_command(text, verb.end(), target.start()):
+    verbs = iter(_RUN_VERB.finditer(text))
+    verb = next(verbs, None)
+    while verb is not None:
+        latest_end = verb.end()
+        end = _SENTENCE_END.search(text, latest_end)
+        sentence_end = len(text) if end is None else end.start()
+        verb = next(verbs, None)
+        # Scan complete targets once. A variable or path may itself contain a verb.
+        for target in _LATER_TARGET.finditer(text, latest_end, sentence_end):
+            while verb is not None and verb.end() <= target.start():
+                latest_end = verb.end()
+                verb = next(verbs, None)
+            if _starts_command(text, latest_end, target.start()):
                 return True
-        position = max(stop, verb.end())
+        while verb is not None and verb.end() <= sentence_end:
+            verb = next(verbs, None)
     return False
 
 
-def _comment_is_instruction(text: str) -> bool:
-    """An imperative, a URL, or a home-directory path inside hidden text."""
+def _instruction_in_text(text: str) -> bool:
     if _HIDDEN_INSTRUCTION.search(text) is not None:
         return True
     reference = _RUN_REFERENCE.search(text)
     if reference is not None and _LATER_TARGET.search(text, reference.end()) is not None:
         return True
     return _run_starts_later_command(text)
+
+
+def _comment_is_instruction(text: str) -> bool:
+    """An imperative, a URL, or a home-directory path inside hidden text."""
+    if _instruction_in_text(text):
+        return True
+    if "=" not in text:
+        return False
+
+    def omit_assignment(token: re.Match[str]) -> str:
+        # Only a horizontal space ends an assignment separator. Scan each word once,
+        # so a long value with many '=' characters cannot repeatedly scan its suffix.
+        if token.end() < len(text) and text[token.end()] in " \t":
+            start = _ASSIGNMENT_START.search(text, token.start(), token.end())
+            if start is not None:
+                return text[token.start() : start.start()]
+        return token.group()
+
+    without_assignments = _ASSIGNMENT_TOKEN.sub(omit_assignment, text)
+    return without_assignments != text and _instruction_in_text(without_assignments)
 
 
 def detect_hidden_markup(content: str, source_name: str) -> list[RiskAssessment]:
@@ -790,37 +839,19 @@ _MAX_PARSED_CHARACTERS = 65_536
 # deeper is decoded by pattern.
 _MAX_YAML_FLOW_DEPTH = 64
 _FLOW_BRACKETS = re.compile(r"[\[\]{}]")
+# A backslash that ends a line continues a YAML double-quoted or TOML basic string on the
+# next line, past its indentation, so an escape there joins the one before it.
 _ESCAPE = re.compile(
-    r"\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|([LPN_e])|.)", re.S
+    r"\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|([LPN_e])"
+    r"|([ \t]*+(?:(?:\r\n|\r|\n)[ \t]*+)+)|.)",
+    re.S,
 )
 _NAMED_ESCAPES = {"L": "\u2028", "P": "\u2029", "N": "\x85", "_": "\xa0", "e": "\x1b"}
-_FRONT_MATTER = re.compile(r"---[ \t]*\r?\n(.*?)^(?:---|\.\.\.)[ \t]*\r?$", re.S | re.M)
+_FRONT_MATTER_FORMATS = {"toml": "TOML", "json": "JSON"}
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
-def _escaped_text(relative: str, text: str) -> str | None:
-    """What a JSON, YAML or TOML prompt file, or the YAML front matter of a Markdown
-    one, decodes to, or ``None`` when it holds no backslash.
-
-    YAML of at most ``_MAX_YAML_EVENTS`` events and ``_MAX_YAML_FLOW_DEPTH`` nested flow
-    collections and TOML within the dotted-key bound, each up to ``_MAX_PARSED_CHARACTERS``,
-    give the strings they parse to, one per line. JSON, which a host may read leniently,
-    with comments, duplicate keys or lone surrogates, and YAML or TOML that does not
-    parse or is past those bounds, give the text with
-    each escape that an odd run of backslashes starts decoded: ``\\xXX``, ``\\uXXXX``,
-    ``\\UXXXXXXXX``, YAML's ``\\L``, ``\\P``, ``\\N`` and ``\\_``, and ``\\e``. That
-    also decodes YAML and TOML escapes in a literal string or a comment, which only
-    adds findings. A surrogate pair is joined, as a UTF-16 reader joins it.
-    """
-    body = text.removeprefix("\ufeff")
-    if "\\" not in body:
-        return None
-    kind = _ESCAPED_FORMATS.get(PurePosixPath(relative).suffix.lower())
-    if kind is None:
-        front = _FRONT_MATTER.match(body) if _markup(relative) else None
-        if front is None or "\\" not in front.group(1):
-            return None
-        kind, body = "YAML", front.group(1)
+def _decode_escaped_payload(relative: str, kind: str, what: str, body: str, gaps: list[str]) -> str:
     if (
         kind != "JSON"
         and len(body) <= _MAX_PARSED_CHARACTERS
@@ -834,7 +865,52 @@ def _escaped_text(relative: str, text: str) -> str | None:
             pass
         else:
             return _joined_surrogates("\n".join(strings))
+    if kind != "JSON":
+        gaps.append(
+            f"{relative}: {what} that does not parse or is past the parse bounds has its "
+            "escapes decoded by pattern, which may not decode them as a host does"
+        )
     return _joined_surrogates(_ESCAPE.sub(_unescape, body))
+
+
+def _escaped_text(relative: str, text: str, gaps: list[str]) -> str | None:
+    """What a JSON, YAML or TOML prompt file, or the front matter of a Markdown
+    one, decodes to, or ``None`` when it holds no backslash.
+
+    YAML of at most ``_MAX_YAML_EVENTS`` events and ``_MAX_YAML_FLOW_DEPTH`` nested flow
+    collections and TOML within the dotted-key bound, each up to ``_MAX_PARSED_CHARACTERS``,
+    give the strings they parse to, one per line. JSON, which a host may read leniently,
+    with comments, duplicate keys or lone surrogates, and YAML or TOML that does not
+    parse or is past those bounds, give the text with
+    each escape that an odd run of backslashes starts decoded: ``\\xXX``, ``\\uXXXX``,
+    ``\\UXXXXXXXX``, YAML's ``\\L``, ``\\P``, ``\\N`` and ``\\_``, and ``\\e``. That
+    also decodes YAML and TOML escapes in a literal string or a comment, which only
+    adds findings. A backslash that ends a line is removed with the line break and the
+    indentation after it, as YAML and TOML continue a string. A surrogate pair is joined,
+    as a UTF-16 reader joins it. YAML or TOML decoded by pattern is a gap in ``gaps``.
+    """
+    body = text.removeprefix("\ufeff")
+    if "\\" not in body:
+        return None
+    kind = _ESCAPED_FORMATS.get(PurePosixPath(relative).suffix.lower())
+    if kind is not None:
+        return _decode_escaped_payload(relative, kind, kind, body, gaps)
+    if not _markup(relative):
+        return None
+    candidates = front_matter_candidates(text)
+    if not candidates:
+        return None
+    lang, first_raw, _ = candidates[0]
+    fm_kind = _FRONT_MATTER_FORMATS.get(lang, "YAML")
+    what = f"{fm_kind} front matter"
+    decoded: list[str] = []
+    if "\\" in first_raw:
+        decoded.append(_decode_escaped_payload(relative, fm_kind, what, first_raw, gaps))
+    if len(candidates) == 2:
+        wider_raw = candidates[1][1]
+        if "\\" in wider_raw[len(first_raw) :]:
+            decoded.append(_decode_escaped_payload(relative, fm_kind, what, wider_raw, gaps))
+    return "\n".join(decoded) if decoded else None
 
 
 def _flow_depth(text: str) -> int:
@@ -856,7 +932,9 @@ def _unescape(match: re.Match[str]) -> str:
         code = int(digits, 16)
         return chr(code) if code <= sys.maxunicode else match.group()
     named = match.group(4)
-    return match.group() if named is None else _NAMED_ESCAPES[named]
+    if named is not None:
+        return _NAMED_ESCAPES[named]
+    return "" if match.group(5) is not None else match.group()
 
 
 def _joined_surrogates(text: str) -> str:
@@ -1291,8 +1369,11 @@ class PromptScanner(Scanner):
                 _report_skipped(skipped, reported, files)
 
             skill_listing = self._list_skills(files)
-            walked.update(path.as_posix() for _, paths, _ in skill_listing for path in paths)
-            importers += self._variant_importers(variants, texts, set(importers), files)
+            skill_paths = {path.as_posix() for _, paths, _ in skill_listing for path in paths}
+            walked.update(skill_paths)
+            importers += self._variant_importers(
+                variants, texts, set(importers), skill_paths, files
+            )
             imported: set[str] = set()
             self._follow_imports(importers, texts, recorded, files, result, imported)
             self._scan_skills(skill_listing, files, result, reported)
@@ -1325,6 +1406,7 @@ class PromptScanner(Scanner):
         variants: list[tuple[Path, Path]],
         texts: dict[str, str],
         importers: set[str],
+        skill_paths: set[str],
         files: ConfinedCollection,
     ) -> list[str]:
         """The spellings of CLAUDE.md and GEMINI.md that a walk inventories, whose imports
@@ -1332,7 +1414,10 @@ class PromptScanner(Scanner):
 
         A subagent, rule or prompt directory walk has recorded its text already. A skill
         or command directory walk records its file after imports are followed, so the
-        text is read here; a file that cannot be read is that walk's failure.
+        text is read here; a file that cannot be read is that walk's failure. A skill walk
+        that follows a directory symlink reaches the file under the path it resolves to,
+        so ``skill_paths``, the paths those walks reach, are matched as well as the skill
+        directories.
         """
         found: dict[str, None] = {}
         for variant, canonical in variants:
@@ -1340,7 +1425,9 @@ class PromptScanner(Scanner):
             if canonical.name not in _IMPORTING_NAMES or relative in found or relative in importers:
                 continue
             if relative not in texts:
-                if not any(variant.parts[: len(parts)] == parts for parts in _SKILL_PARTS):
+                if relative not in skill_paths and not any(
+                    variant.parts[: len(parts)] == parts for parts in _SKILL_PARTS
+                ):
                     continue
                 content = _read_unless_credential(relative, files, None)
                 if content is None:
@@ -1367,7 +1454,8 @@ class PromptScanner(Scanner):
 
         ``directory`` names the rule, prompt or subagent directory whose walk reached the
         file through a directory symlink; the record keeps it. With ``escapes``, what a
-        prompt template's escapes decode to is checked for hidden characters too.
+        prompt template's escapes decode to is checked for hidden characters too, and
+        without it what the escapes in the front matter of a Markdown file decode to.
 
         Every walk reads through ``_read_unless_credential``; the check is repeated on
         the symlink the read followed, so no walk, and no import of a file a walk
@@ -1390,7 +1478,11 @@ class PromptScanner(Scanner):
             prompt_type,
             content,
             text,
-            decoded=_escaped_text(rel_path, text) if escapes else None,
+            decoded=(
+                _escaped_text(rel_path, text, result.surfaces_excluded)
+                if escapes or _markup(rel_path)
+                else None
+            ),
         )
         if target is not None:
             component.properties["symlink_target"] = target
@@ -1751,8 +1843,11 @@ class PromptScanner(Scanner):
                 *_hidden_character_risks(stream.counts, stream.tags, relative),
                 *_line_separator_risks(stream.line_separators, relative),
             ]
-        risks = detect_invisible_characters(text, relative)
-        if declaration and path.suffix.lower() in _MARKUP_SUFFIXES:
+        markup = declaration and path.suffix.lower() in _MARKUP_SUFFIXES
+        # A host reads a skill's front matter, such as its description, decoded.
+        decoded = _escaped_text(relative, text, result.surfaces_excluded) if markup else None
+        risks = detect_invisible_characters(text, relative, decoded=decoded)
+        if markup:
             risks.extend(detect_hidden_markup(text, relative))
         return hash_bytes(content), risks
 

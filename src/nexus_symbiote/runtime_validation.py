@@ -16,12 +16,21 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 MAX_SCHEMA_BYTES = 256 * 1024
 MAX_ARGUMENT_BYTES = 1024 * 1024
 MAX_JSON_DEPTH = 32
 MAX_JSON_NODES = 20_000
+# Each same-value applicator consumes several interpreter frames. Limit the
+# longest path and total expansion before dispatching an output-validated call.
+_MAX_OUTPUT_IN_PLACE_DEPTH = 96
+_MAX_OUTPUT_APPLICATOR_DEPTH = 160
+_MAX_OUTPUT_APPLICATOR_STEPS = 1024
+_MAX_OUTPUT_UNION_STEPS = 4096
+_MAX_OUTPUT_REPEATED_STEPS = 32768
 MAX_SAFE_INTEGER = 2**53 - 1
 # Interpreter start-up and imports get their own budget, so a slow or throttled
 # host does not spend the evaluation budget before the untrusted input arrives.
@@ -32,6 +41,11 @@ WORKER_CPU_SECONDS = 1
 WORKER_MEMORY_BYTES = 256 * 1024 * 1024
 WORKER_SLOTS = 4
 _WORKER_SLOTS = threading.BoundedSemaphore(WORKER_SLOTS)
+_WORKER_AVAILABILITY = threading.Condition()
+_WAITING_OUTPUTS = 0
+OUTPUT_RESERVATIONS = 4
+_OUTPUT_RESERVATIONS = threading.BoundedSemaphore(OUTPUT_RESERVATIONS)
+_OUTPUT_WAIT_SECONDS = WORKER_STARTUP_SECONDS + WORKER_TIMEOUT_SECONDS
 _WORKER_COMMAND = (sys.executable, "-I", "-m", "nexus_symbiote.runtime_validation")
 _READY = b"ready\n"
 _VALID = b"valid\n"
@@ -163,14 +177,43 @@ def validate_arguments(schema: Any, arguments: dict[str, Any]) -> None:
     reason code; crashes and malformed replies share one. No approval nonce is
     consumed here.
     """
-    if not isinstance(schema, dict):
+    if not isinstance(arguments, dict):
+        raise ValidationBudgetError("tool arguments must be an object")
+    wire = _validation_request(schema, arguments)
+    with _validation_slot():
+        _validate(wire)
+
+
+@contextmanager
+def prepare_output_validation(schema: Any) -> Iterator[Callable[[dict[str, Any]], None]]:
+    """Check schema support and reserve one pending response without holding a worker."""
+    preflight = _validation_request(schema, None)
+
+    def validate(result: dict[str, Any]) -> None:
+        wire = _validation_request(schema, result)
+        with _validation_slot(wait_for_output=True):
+            _validate(wire)
+
+    if not _OUTPUT_RESERVATIONS.acquire(blocking=False):
         raise ValidationBudgetError(
-            "served tool requires an object input schema", reason="schema-invalid"
+            "pending output validation capacity unavailable", reason="validation-capacity"
         )
+    try:
+        with _validation_slot():
+            _validate(preflight)
+        yield validate
+    finally:
+        _OUTPUT_RESERVATIONS.release()
+
+
+def _validation_request(schema: Any, instance: dict[str, Any] | None) -> bytes:
+    if not isinstance(schema, dict):
+        raise ValidationBudgetError("served tool schema must be an object", reason="schema-invalid")
     check_json_budget(schema, maximum=MAX_SCHEMA_BYTES)
-    check_json_budget(arguments, maximum=MAX_ARGUMENT_BYTES)
+    if instance is not None:
+        check_json_budget(instance, maximum=MAX_ARGUMENT_BYTES)
     wire = json.dumps(
-        {"schema": schema, "arguments": arguments},
+        {"schema": schema, "arguments": instance},
         ensure_ascii=True,
         separators=(",", ":"),
         allow_nan=False,
@@ -179,14 +222,39 @@ def validate_arguments(schema: Any, arguments: dict[str, Any]) -> None:
         raise ValidationBudgetError(
             "validation request exceeds byte budget", reason="json-budget-exceeded"
         )
-    if not _WORKER_SLOTS.acquire(blocking=False):
+    return wire
+
+
+@contextmanager
+def _validation_slot(*, wait_for_output: bool = False) -> Iterator[None]:
+    global _WAITING_OUTPUTS
+    with _WORKER_AVAILABILITY:
+        if wait_for_output:
+            _WAITING_OUTPUTS += 1
+            try:
+                acquired = _WORKER_AVAILABILITY.wait_for(
+                    lambda: _WORKER_SLOTS.acquire(blocking=False), timeout=_OUTPUT_WAIT_SECONDS
+                )
+            finally:
+                _WAITING_OUTPUTS -= 1
+        else:
+            # Once the tool has run, an arriving input must not displace a
+            # waiting response from a worker released in the meantime.
+            acquired = not _WAITING_OUTPUTS and _WORKER_SLOTS.acquire(blocking=False)
+    if not acquired:
         raise ValidationBudgetError(
             "validation worker capacity unavailable", reason="validation-capacity"
         )
     try:
-        result = _run_worker(wire)
+        yield
     finally:
-        _WORKER_SLOTS.release()
+        with _WORKER_AVAILABILITY:
+            _WORKER_SLOTS.release()
+            _WORKER_AVAILABILITY.notify_all()
+
+
+def _validate(wire: bytes) -> None:
+    result = _run_worker(wire)
     if result == _VALID:
         return
     if result == _INVALID:
@@ -910,7 +978,9 @@ def _unsupported_vocabulary(node: dict[str, Any], dialect: str, *, is_root: bool
     return False
 
 
-def _ignores_a_keyword(schema: dict[str, Any], dialect: str, validator: Any) -> bool:
+def _ignores_a_keyword(
+    schema: dict[str, Any], dialect: str, validator: Any, *, preflight: bool = False
+) -> bool:
     """Whether evaluation would skip a constraint that whoever approves the schema reads.
 
     That is a keyword the declared dialect does not define or jsonschema does not
@@ -935,6 +1005,7 @@ def _ignores_a_keyword(schema: dict[str, Any], dialect: str, validator: Any) -> 
     pending: list[Any] = [schema]
     seen: set[int] = set()
     nodes: list[dict[str, Any]] = []
+    regex = _EcmaRegex() if preflight else None
     while pending:
         node = pending.pop()
         if not isinstance(node, dict) or id(node) in seen:
@@ -953,6 +1024,11 @@ def _ignores_a_keyword(schema: dict[str, Any], dialect: str, validator: Any) -> 
             return True
         if node is not schema and _redeclares(node, dialect, identifier):
             return True
+        if regex is not None:
+            if isinstance(node.get("pattern"), str):
+                regex.compile(node["pattern"])
+            for pattern in node.get("patternProperties", {}):
+                regex.compile(pattern)
         for keyword, value in node.items():
             if keyword in _SUBSCHEMA_MAPS and isinstance(value, dict):
                 pending.extend(value.values())
@@ -966,7 +1042,338 @@ def _ignores_a_keyword(schema: dict[str, Any], dialect: str, validator: Any) -> 
                 if not isinstance(target, (dict, bool)):
                     return True
                 pending.append(target)
+    if preflight and _in_place_evaluation_exceeds_budget(schema, resolver):
+        return True
     return dialect == DIALECTS[3] and _contains_meets_unevaluated_items(nodes, resolver)
+
+
+def _in_place_evaluation_exceeds_budget(schema: dict[str, Any], resolver: Any) -> bool:
+    """Bound the evaluator stack and repeated same-value work before dispatch."""
+    pending = [schema]
+    graph: dict[int, list[int]] = {}
+    descends: dict[int, list[int]] = {}
+    nodes: dict[int, dict[str, Any]] = {}
+    annotations: set[int] = set()
+    alternatives: set[int] = set()
+    widths: dict[int, int] = {}
+    value_keywords = {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "items",
+        "prefixItems",
+        "propertyNames",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "contentSchema",
+    }
+    while pending:
+        node = pending.pop()
+        if not isinstance(node, dict) or id(node) in graph:
+            continue
+        nodes[id(node)] = node
+        applied = _applied_in_place(node, resolver)
+        in_place = [child for child in applied if isinstance(child, dict)]
+        # A repeated reference repeats the keyword's width too. Checking a
+        # singleton property or tag lists no more entries than one graph visit.
+        widths[id(node)] = (
+            1
+            + sum(isinstance(child, bool) for child in applied)
+            + sum(
+                max(0, len(value) - 1)
+                for keyword in ("properties", "patternProperties", "required", "enum")
+                if isinstance(value := node.get(keyword), (list, dict))
+            )
+        )
+        graph[id(node)] = [id(child) for child in in_place]
+        pending.extend(in_place)
+        if "unevaluatedItems" in node or "unevaluatedProperties" in node:
+            annotations.add(id(node))
+        # A wide list of explicitly written alternatives can do more linear work
+        # than a compact repeated reference. Keep a separate absolute ceiling.
+        variants = node.get("oneOf", node.get("anyOf"))
+        if (
+            isinstance(variants, list)
+            and len(variants) >= 16
+            and len(variants) == len(in_place)
+            and all(a is b for a, b in zip(variants, in_place, strict=True))
+        ):
+            alternatives.add(id(node))
+        subvalues: list[Any] = []
+        for keyword, value in node.items():
+            if keyword in {"properties", "patternProperties"} and isinstance(value, dict):
+                subvalues.extend(value.values())
+            elif keyword in value_keywords:
+                subvalues.extend(value if isinstance(value, list) else [value])
+        value_schemas = [child for child in subvalues if isinstance(child, dict)]
+        descends[id(node)] = [id(child) for child in value_schemas]
+        pending.extend(value_schemas)
+
+    incoming = dict.fromkeys(graph, 0)
+    for edges in graph.values():
+        for child_id in edges:
+            incoming[child_id] += 1
+    ready = [node_id for node_id, count in incoming.items() if count == 0]
+    topological = []
+    while ready:
+        current = ready.pop()
+        topological.append(current)
+        for child_id in graph[current]:
+            incoming[child_id] -= 1
+            if incoming[child_id] == 0:
+                ready.append(child_id)
+    if len(topological) != len(graph):
+        return True
+    depths: dict[int, int] = {}
+    steps: dict[int, int] = {}
+    limits: dict[int, int] = {}
+    validation_steps: dict[int, int] = {}
+    annotation_steps: dict[int, int] = {}
+    for current in reversed(topological):
+        children = graph[current]
+        depth = 1 + max((depths[c] for c in children), default=0)
+        # Each reference can evaluate the shared child again. Saturate by
+        # refusing as soon as a subproblem exceeds the budget.
+        # Collecting evaluated locations can visit the same applicators again.
+        visits = sum(steps[c] for c in children)
+        work = widths[current] + (2 if current in annotations else 1) * visits
+        limit = _MAX_OUTPUT_APPLICATOR_STEPS
+        if current in alternatives and all(steps[c] <= 32 for c in children):
+            limit = _MAX_OUTPUT_UNION_STEPS
+        else:
+            unions = [c for c in children if limits[c] > _MAX_OUTPUT_APPLICATOR_STEPS]
+            if len(unions) == 1 and visits - steps[unions[0]] <= 32:
+                limit = _MAX_OUTPUT_UNION_STEPS
+        if depth > _MAX_OUTPUT_IN_PLACE_DEPTH or work > limit:
+            return True
+        # Collecting evaluated locations can validate a branch and then walk its
+        # annotations. Keep that walk separate so a chain between two annotated
+        # nodes is charged to every caller. Saturate unused estimates on a DAG.
+        validation = widths[current] + sum(validation_steps[c] for c in children)
+        annotation = validation + sum(annotation_steps[c] for c in children)
+        if current in annotations:
+            validation += annotation
+        if validation > 4 * limit:
+            return True
+        validation_steps[current] = validation
+        annotation_steps[current] = min(annotation, 4 * _MAX_OUTPUT_UNION_STEPS + 1)
+        depths[current], steps[current] = depth, work
+        limits[current] = limit
+    # Recursion through a child of the instance is permitted. Account for the
+    # frames it adds across every possible level of the bounded JSON input.
+    # Keep headroom for the worker and the validator's helper frames. Ordinary
+    # recursive records need more total hops than the limit at one location.
+    stack_limit = min(_MAX_OUTPUT_APPLICATOR_DEPTH, (sys.getrecursionlimit() - 128) // 5)
+    # An unevaluated-location collector can validate an additional property or
+    # matching item again, including through a reference or an allOf wrapper.
+    annotation_levels = dict.fromkeys(graph, 0)
+    for _ in range(MAX_JSON_DEPTH):
+        previous, prior_levels = depths, annotation_levels
+        depths, annotation_levels = {}, {}
+        rechecked: dict[int, int] = {}
+        below: dict[int, int] = {}
+        for current in reversed(topological):
+            at_value = max((depths[c] for c in graph[current]), default=0)
+            below_value = max((previous[c] for c in descends[current]), default=0)
+            depths[current] = 1 + max(at_value, below_value)
+            if depths[current] > stack_limit:
+                return True
+            rechecked[current] = max((rechecked[c] for c in graph[current]), default=0)
+            below[current] = max(
+                max((below[c] for c in graph[current]), default=-1),
+                max((prior_levels[c] for c in descends[current]), default=-1),
+            )
+            # To collect a composition's annotations the validator can first
+            # validate the successful arm, including its child instances.
+            for kw in ("allOf", "anyOf", "oneOf"):
+                for arm in nodes[current].get(kw, []):
+                    if isinstance(arm, dict):
+                        rechecked[current] = max(rechecked[current], 1 + below[id(arm)])
+            for keyword in (
+                "additionalProperties",
+                "contains",
+                "unevaluatedItems",
+                "unevaluatedProperties",
+            ):
+                child = nodes[current].get(keyword)
+                if isinstance(child, dict):
+                    rechecked[current] = max(rechecked[current], 1 + prior_levels[id(child)])
+            annotation_levels[current] = max(
+                rechecked[current] if current in annotations else 0,
+                max((annotation_levels[c] for c in graph[current]), default=0),
+                max((prior_levels[c] for c in descends[current]), default=0),
+            )
+            if 2 ** annotation_levels[current] > _MAX_OUTPUT_APPLICATOR_STEPS:
+                return True
+        if depths == previous and annotation_levels == prior_levels:
+            break
+    return _collection_work_exceeds_budget(id(schema), nodes, graph, topological)
+
+
+def _collection_work_exceeds_budget(
+    root: int, nodes: dict[int, dict[str, Any]], graph: dict[int, list[int]], order: list[int]
+) -> bool:
+    """Estimate repeated validation on conforming results, bounded by their JSON nodes."""
+    work: dict[int, int] = {}
+    footprint: dict[int, int] = {}
+    branching: dict[int, bool] = {}
+    for current in reversed(order):
+        node = nodes[current]
+        enum = node.get("enum", [])
+        # Name lookups and comparisons of scalar constants are cheaper than
+        # descending into a validator. The per-location budget still counts
+        # every property, required name and enum candidate individually.
+        width = 1 + (len(node.get("properties", {})) + len(node.get("required", []))) // 8
+        width += (
+            (len(enum) + 7) // 8
+            if all(not isinstance(x, (list, dict)) for x in enum)
+            else len(enum)
+        )
+        children = graph[current]
+        work[current] = width + sum(work[c] for c in children)
+        branching[current] = any(branching[c] for c in children)
+        for keyword in ("oneOf", "anyOf"):
+            arms = node.get(keyword, [])
+            # A JSON-value union uses disjoint primitive types. At most one of
+            # its array and object branches can recurse at the current value.
+            kinds = {
+                x["type"]
+                for x in arms
+                if isinstance(x, dict)
+                and isinstance(x.get("type"), str)
+                and x.keys() <= {"type", "items", "additionalProperties"}
+            }
+            if len(kinds) < len(arms) or {"integer", "number"} <= kinds:
+                branching[current] = True
+        size = 1
+        if node.get("type") == "object":
+            size += max(len(node.get("required", [])), node.get("minProperties", 0))
+        elif node.get("type") == "array":
+            size += node.get("minItems", 0)
+        # A reference or allOf constrains the same value. Alternative or
+        # conditional branches cannot impose a common minimum individually.
+        if any(k in node for k in _REFERENCES) and len(children) == 1:
+            size = max(size, footprint[children[0]])
+        size = max(
+            size,
+            max(
+                (footprint[id(x)] for x in node.get("allOf", []) if isinstance(x, dict)), default=1
+            ),
+        )
+        for key in ("anyOf", "oneOf"):
+            if options := node.get(key):
+                size = max(
+                    size, min(footprint[id(x)] if isinstance(x, dict) else 1 for x in options)
+                )
+        footprint[current] = int(min(size, MAX_JSON_NODES))
+
+    # Keep each level separate. A recursive reference through a child advances
+    # one level, while all in-place callers are processed before their targets.
+    counts = {root: 1}
+    nested: set[int] = set()
+    fallible: set[int] = set()
+    for _ in range(MAX_JSON_DEPTH + 1):
+        following: dict[int, int] = {}
+        nested_following: set[int] = set()
+        fallible_following: set[int] = set()
+        for current in order:
+            count = counts.get(current, 0)
+            if not count:
+                continue
+            node = nodes[current]
+            # Only schemas that abort collection validation on a non-conforming
+            # value can bound repetitions by a conforming value's node footprint.
+            # Branches under contains/anyOf/oneOf/not/if can fail repeatedly on
+            # single-node values without stopping collection evaluation.
+            limit = MAX_JSON_NODES if current in fallible else MAX_JSON_NODES // footprint[current]
+            count = min(count, limit)
+            costly = work[current] > 32 or (current in nested and branching[current])
+            if costly and count * work[current] > _MAX_OUTPUT_REPEATED_STEPS:
+                return True
+            fallible_children: set[int] = set()
+            for kw in ("not", "if"):
+                if isinstance(node.get(kw), dict):
+                    fallible_children.add(id(node[kw]))
+            for kw in ("anyOf", "oneOf"):
+                for arm in node.get(kw, ()):
+                    if isinstance(arm, dict):
+                        fallible_children.add(id(arm))
+            for child in graph[current]:
+                counts[child] = max(counts.get(child, 0), count)
+                if current in nested:
+                    nested.add(child)
+                if current in fallible or child in fallible_children:
+                    fallible.add(child)
+            items = int(min(node.get("maxItems", MAX_JSON_NODES), MAX_JSON_NODES))
+            properties = int(min(node.get("maxProperties", MAX_JSON_NODES), MAX_JSON_NODES))
+            patterns = node.get("patternProperties", {})
+            comparisons = len(patterns) * min(count * properties, MAX_JSON_NODES)
+            if node.get("uniqueItems") and items:
+                # jsonschema evaluates uniqueItems independently of items and falls
+                # back to quadratic comparisons on unhashable or mixed-type arrays.
+                entries = min(count * items, MAX_JSON_NODES)
+                unique_comparisons = entries * (items - 1) // 2
+                if unique_comparisons > _MAX_OUTPUT_REPEATED_STEPS:
+                    return True
+                comparisons += unique_comparisons
+            if comparisons > 16 * _MAX_OUTPUT_REPEATED_STEPS:
+                return True
+
+            fixed_costs: list[int] = []
+            for keyword, value in node.items():
+                if (
+                    keyword == "properties"
+                    or keyword in ("prefixItems", "items")
+                    and isinstance(value, list)
+                ):
+                    choices = value.values() if isinstance(value, dict) else value[:items]
+                    cardinality = 1
+                    costs = [
+                        work[id(x)]
+                        for x in choices
+                        if isinstance(x, dict) and (branching[id(x)] or work[id(x)] > 32)
+                    ]
+                    if isinstance(value, dict) and len(costs) > properties:
+                        costs.sort(reverse=True)
+                        del costs[properties:]
+                    fixed_costs.extend(costs)
+                elif keyword == "patternProperties":
+                    choices, cardinality = value.values(), properties
+                    matching_work = sum(
+                        work[id(part)] for part in choices if isinstance(part, dict)
+                    )
+                    if (
+                        len(value) > 1
+                        and min(count * properties, MAX_JSON_NODES) * matching_work
+                        > _MAX_OUTPUT_REPEATED_STEPS
+                    ):
+                        return True
+                elif keyword in ("items", "contains", "additionalItems", "unevaluatedItems"):
+                    choices, cardinality = [value], items
+                elif keyword in ("additionalProperties", "unevaluatedProperties", "propertyNames"):
+                    choices, cardinality = [value], properties
+                else:
+                    continue
+                for part in choices:
+                    if isinstance(part, dict):
+                        child = id(part)
+                        following[child] = max(following.get(child, 0), count * cardinality)
+                        if (
+                            current in nested
+                            or keyword == "contains"
+                            or (count > 1 and cardinality > 1)
+                        ):
+                            nested_following.add(child)
+                        if current in fallible or keyword == "contains":
+                            fallible_following.add(child)
+            if len(fixed_costs) > 1 and count * sum(fixed_costs) > _MAX_OUTPUT_REPEATED_STEPS:
+                return True
+        if not following or (
+            following == counts and nested_following == nested and fallible_following == fallible
+        ):
+            break
+        counts, nested, fallible = following, nested_following, fallible_following
+    return False
 
 
 def _contains_meets_unevaluated_items(nodes: list[dict[str, Any]], resolver: Any) -> bool:
@@ -998,16 +1405,19 @@ def _contains_meets_unevaluated_items(nodes: list[dict[str, Any]], resolver: Any
 
 
 def _applied_in_place(node: dict[str, Any], resolver: Any) -> list[Any]:
-    """The subschemas that 2019-09 applies to the instance location of ``node``."""
-    children = [node[keyword] for keyword in ("not", "if", "then", "else") if keyword in node]
+    """The applicable subschemas that evaluate the same instance location as ``node``."""
+    children = [node["not"]] if "not" in node else []
+    if "if" in node:
+        children.extend(node[keyword] for keyword in ("if", "then", "else") if keyword in node)
     for keyword in ("allOf", "anyOf", "oneOf"):
         if isinstance(node.get(keyword), list):
             children.extend(node[keyword])
-    if isinstance(node.get("dependentSchemas"), dict):
-        children.extend(node["dependentSchemas"].values())
+    for keyword in ("dependencies", "dependentSchemas"):
+        if isinstance(node.get(keyword), dict):
+            children.extend(node[keyword].values())
     children.extend(
         _reference_target(resolver, keyword, node[keyword])
-        for keyword in ("$ref", "$recursiveRef")
+        for keyword in _REFERENCES
         if keyword in node
     )
     return children
@@ -1057,9 +1467,11 @@ def _evaluate(dialects: dict[str, Any], schema: dict[str, Any], arguments: Any) 
         return _SCHEMA
     try:
         validator.check_schema(schema)
-        if _ignores_a_keyword(schema, dialect, validator):
+        preflight = arguments is None
+        if _ignores_a_keyword(schema, dialect, validator, preflight=preflight):
             return _SCHEMA
-        validator(schema, registry=Registry()).validate(arguments)
+        if not preflight:
+            validator(schema, registry=Registry()).validate(arguments)
     except SchemaValidationError:
         return _INVALID
     except (SchemaError, Unresolvable, re.error):
@@ -1102,10 +1514,13 @@ def _worker() -> int:
         if not isinstance(request, dict) or set(request) != {"schema", "arguments"}:
             return 1
         schema, arguments = request["schema"], request["arguments"]
-        if not isinstance(schema, dict) or not isinstance(arguments, dict):
+        if not isinstance(schema, dict) or (
+            arguments is not None and not isinstance(arguments, dict)
+        ):
             return 1
         check_json_budget(schema, maximum=MAX_SCHEMA_BYTES)
-        check_json_budget(arguments, maximum=MAX_ARGUMENT_BYTES)
+        if arguments is not None:
+            check_json_budget(arguments, maximum=MAX_ARGUMENT_BYTES)
         sys.stdout.buffer.write(_evaluate(dialects, schema, arguments))
         return 0
     except Exception:

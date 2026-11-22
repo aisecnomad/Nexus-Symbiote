@@ -36,6 +36,17 @@ def _components(result) -> dict[str, PromptComponent]:
     return {component.bom_ref: component for component in result.components}
 
 
+def _pattern_gap(relative: str) -> list[str]:
+    """The gap for a prompt file whose escapes are decoded by pattern, not by a parser."""
+    what = {".yaml": "YAML", ".toml": "TOML", ".md": "YAML front matter"}.get(Path(relative).suffix)
+    if what is None:
+        return []
+    return [
+        f"{relative}: {what} that does not parse or is past the parse bounds has its "
+        "escapes decoded by pattern, which may not decode them as a host does"
+    ]
+
+
 def _findings(component) -> list[tuple[str, str]]:
     return sorted((risk.category, risk.severity.value) for risk in component.risks)
 
@@ -441,7 +452,8 @@ def test_a_file_a_strict_reader_refuses_still_has_its_escapes_decoded(tmp_path, 
     _write(tmp_path, relative, text)
     result = PromptScanner().scan(tmp_path)
     assert not result.scan_failures
-    assert not result.surfaces_excluded
+    # JSON is always decoded by pattern; YAML or TOML only when it does not parse.
+    assert result.surfaces_excluded == _pattern_gap(relative)
     (component,) = result.components
     assert component.prompt_type == "template"
     assert {"bidi_override", "invisible_characters"} & {risk.category for risk in component.risks}
@@ -498,10 +510,51 @@ def test_ordinary_json_a_strict_reader_refuses_is_clean(tmp_path, text):
 def test_escapes_in_keys_after_a_bom_and_in_front_matter_are_decoded(tmp_path, relative, text):
     _write(tmp_path, relative, text)
     result = PromptScanner().scan(tmp_path)
-    assert not result.surfaces_excluded
+    # The unclosed quote in the last case's front matter does not parse.
+    unparsed = relative == "prompts/a.md"
+    assert result.surfaces_excluded == (_pattern_gap(relative) if unparsed else [])
     (component,) = result.components
     assert ("tag_characters", "critical") in _findings(component)
     assert "invisible_characters" not in {risk.category for risk in component.risks}
+
+
+FLOW_TRIP = "# " + "[" * 65 + "\n"
+SPLIT_ESCAPES = 'system: "Hi \\udb40\\\n  \\udc49\\udb40\\\n  \\udc47"\n'
+
+
+@pytest.mark.parametrize(
+    ("relative", "text", "parsed"),
+    [
+        ("prompts/a.yaml", SPLIT_ESCAPES, True),
+        ("prompts/a.yaml", FLOW_TRIP + SPLIT_ESCAPES, False),
+        ("prompts/a.md", f"---\n{FLOW_TRIP}{SPLIT_ESCAPES}---\nBody.\n", False),
+        # The repeated key keeps TOML from parsing.
+        ("prompts/a.toml", 's = """Hi \\udb40\\\n   \\udc49"""\ns = 1\n', False),
+    ],
+)
+def test_an_escape_continued_on_the_next_line_is_joined(tmp_path, relative, text, parsed):
+    # A line-ending backslash continues the string; a pattern that kept it split the pair.
+    _write(tmp_path, relative, text)
+    result = PromptScanner().scan(tmp_path)
+    (component,) = result.components
+    assert ("tag_characters", "critical") in _findings(component)
+    assert result.surfaces_excluded == ([] if parsed else _pattern_gap(relative))
+
+
+@pytest.mark.parametrize(
+    "relative", ["CLAUDE.md", ".claude/rules/a.md", ".claude/skills/n/SKILL.md"]
+)
+@pytest.mark.parametrize("opener", ["---", "---yaml", "--- yaml"])
+def test_escapes_in_the_front_matter_of_an_instruction_file_are_decoded(tmp_path, relative, opener):
+    findings = []
+    for name, description in (("escaped", '"Hi \\U000E0049\\U000E0047"'), ("raw", "Hi " + TAG)):
+        _write(tmp_path / name, relative, f"{opener}\nname: n\ndescription: {description}\n---\n")
+        result = PromptScanner().scan(tmp_path / name)
+        assert not result.surfaces_excluded and not result.scan_failures
+        (component,) = [c for c in result.components if c.source_path == relative]
+        findings.append(_findings(component))
+    assert findings[0] == findings[1]
+    assert ("tag_characters", "critical") in findings[0]
 
 
 def test_escapes_in_a_markdown_body_are_text(tmp_path):

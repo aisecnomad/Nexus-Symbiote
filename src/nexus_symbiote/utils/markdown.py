@@ -23,7 +23,8 @@ returned as written too.
 
 :func:`hidden_text` reads the same blocks for what a rendered view shows nothing of:
 the link reference definitions that no link uses or that are written as comments, the
-footnotes that nothing references, and the raw HTML that HTML parsers read as comments.
+footnotes that nothing references or that repeat a label, and the raw HTML that HTML
+parsers read as comments.
 It errs the other way, toward reporting: a reference counts as a use only where every
 reader, GitHub's included, makes a link of it that shows.
 """
@@ -32,8 +33,10 @@ from __future__ import annotations
 
 import re
 from bisect import bisect_left
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from itertools import groupby
 
 _LINE_END = re.compile(r"\r\n|\r|\n")
 # Containers nested this deep, or more container lines matched than the text has
@@ -54,12 +57,6 @@ _LIST_STARTS = frozenset("*+-0123456789")
 _NON_SPACE = re.compile(r"[^ \t\f\v\r\n]")
 # Whitespace as the JavaScript readers that hosts use match it in HTML.
 _WHITESPACE = "[\t\n\x0b\x0c\r \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
-_OPEN_TAG = (
-    rf"<[A-Za-z][A-Za-z0-9-]*(?:{_WHITESPACE}+[a-zA-Z_:][a-zA-Z0-9:._-]*"
-    rf"(?:{_WHITESPACE}*={_WHITESPACE}*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?)*"
-    rf"{_WHITESPACE}*/?>"
-)
-_CLOSE_TAG = rf"</[A-Za-z][A-Za-z0-9-]*{_WHITESPACE}*>"
 _BLOCK_TAG_NAMES = (
     "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd"
     "|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset"
@@ -67,16 +64,34 @@ _BLOCK_TAG_NAMES = (
     "|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title"
     "|tr|track|ul"
 )
+
+
+def _html_block_starts(whitespace: str, tag_names: str) -> tuple[re.Pattern[str], ...]:
+    open_tag = (
+        rf"<[A-Za-z][A-Za-z0-9-]*(?:{whitespace}+[a-zA-Z_:][a-zA-Z0-9:._-]*"
+        rf"(?:{whitespace}*={whitespace}*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?)*"
+        rf"{whitespace}*/?>"
+    )
+    close_tag = rf"</[A-Za-z][A-Za-z0-9-]*{whitespace}*>"
+    return (
+        re.compile(rf"<(?:pre|script|style|textarea)(?:{whitespace}|>|$)", re.I),
+        re.compile(r"<!--"),
+        re.compile(r"<\?"),
+        re.compile(r"<![A-Za-z]"),
+        re.compile(r"<!\[CDATA\["),
+        re.compile(rf"</?(?:{tag_names})(?:{whitespace}|/?>|$)", re.I),
+        re.compile(rf"(?:{open_tag}|{close_tag}){whitespace}*$"),
+    )
+
+
 # The seven start conditions of an HTML block, and the end conditions of the first five;
 # the last two end at a blank line.
-_HTML_BLOCK_STARTS = (
-    re.compile(rf"<(?:pre|script|style|textarea)(?:{_WHITESPACE}|>|$)", re.I),
-    re.compile(r"<!--"),
-    re.compile(r"<\?"),
-    re.compile(r"<![A-Za-z]"),
-    re.compile(r"<!\[CDATA\["),
-    re.compile(rf"</?(?:{_BLOCK_TAG_NAMES})(?:{_WHITESPACE}|/?>|$)", re.I),
-    re.compile(rf"(?:{_OPEN_TAG}|{_CLOSE_TAG}){_WHITESPACE}*$"),
+_HTML_BLOCK_STARTS = _html_block_starts(_WHITESPACE, _BLOCK_TAG_NAMES)
+# The same conditions as cmark-gfm 0.29, which GitHub renders with, reads them: only ASCII
+# whitespace ends a tag name, and `search` is no block tag. Where the two readings start
+# different blocks, a definition or footnote one of them hides can be text to the other.
+_ASCII_HTML_BLOCK_STARTS = _html_block_starts(
+    "[ \t\n\x0b\x0c\r]", _BLOCK_TAG_NAMES.replace("|search", "")
 )
 _HTML_BLOCK_ENDS: tuple[re.Pattern[str] | str, ...] = (
     re.compile(r"</(?:pre|script|style|textarea)>", re.I),
@@ -86,6 +101,15 @@ _HTML_BLOCK_ENDS: tuple[re.Pattern[str] | str, ...] = (
     "]]>",
 )
 """End conditions of HTML block types 1 to 5; types 2 to 5 end at a literal string."""
+
+
+def _ascii_html_block_agrees(kind: int, line: str, at: int, parent: str, lazy: bool) -> bool:
+    """Whether cmark-gfm starts an HTML block of the same kind at ``at``: one that ends
+    where a block of ``kind`` ends, the last two kinds both at a blank line."""
+    for ascii_kind, start in enumerate(_ASCII_HTML_BLOCK_STARTS, 1):
+        if start.match(line, at) and (ascii_kind < 7 or (parent != "paragraph" and not lazy)):
+            return ascii_kind == kind or min(ascii_kind, kind) >= 6
+    return False
 
 
 def _html_block_ends(kind: int, line: str, offset: int) -> bool:
@@ -98,6 +122,7 @@ def _html_block_ends(kind: int, line: str, offset: int) -> bool:
 # Inline: what pairs backticks, and what can take one out of a code span.
 _INLINE_SPECIAL = re.compile(r"[\\`\[\]<]")
 _BACKTICKS = re.compile(r"`+")
+_IMPORT_FILENAME = re.compile(r"@\S+")
 _ESCAPABLE = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 _DEFINITION = re.compile(r"\[(?:[^\\\[\]]|\\.){0,1000}\]:", re.S)
 # After a link reference definition commonmark.js reads a line as part of its paragraph,
@@ -113,8 +138,19 @@ _PLAIN_DESTINATION = re.compile(r"\([^\s()<>\[\]\\`\"']*\)")
 _TAKEN = re.compile(r"[`\]]")
 
 
+# Front matter, which hosts take out of a file before they read the rest as Markdown: a
+# `---` line that opens the file, possibly naming a language, to the next closing delimiter
+# line. Where a reader keeps it, YAML in it can open a code fence that runs to the end.
+_FRONT_MATTER_OPEN = re.compile(r"\ufeff?---[ \t]*+(?:([A-Za-z]++)[ \t]*+)?(?:\r\n|\r|\n)")
+_FRONT_MATTER_LINE_END = re.compile(r"\r\n|\r|\n")
+
+
 class _AmbiguousError(Exception):
     """The block structure turns on what the reader does not model."""
+
+
+class _HTMLDisagreementError(_AmbiguousError):
+    """CommonMark and cmark-gfm recognize different HTML block starts."""
 
 
 @dataclass(slots=True)
@@ -133,13 +169,169 @@ class _Block:
     after_code: bool = False
 
 
+def front_matter_candidates(text: str) -> list[tuple[str, str, str]]:
+    """Return ``(language, raw_front_matter, body)`` candidates for leading front matter.
+
+    TOML and JSON front matter close only on ``---`` so a ``...`` line inside a multiline
+    string cannot end them early. YAML front matter closes on ``---`` or ``...``; when
+    ``...`` appears before a later ``---``, both readings are returned so neither a
+    YAML-stream parser nor a ``---``-only parser (such as gray-matter) can hide content.
+    """
+    opened = _FRONT_MATTER_OPEN.match(text)
+    if opened is None:
+        return []
+    language = (opened.group(1) or "").lower()
+    allow_dots = language not in {"toml", "json"}
+    candidates: list[tuple[str, str, str]] = []
+    pos = opened.end()
+    end = len(text)
+    while pos < end:
+        nl = _FRONT_MATTER_LINE_END.search(text, pos)
+        line_end = end if nl is None else nl.start()
+        next_pos = end if nl is None else nl.end()
+        line = text[pos:line_end]
+        if line.startswith("---") and not line[3:].strip(" \t"):
+            candidates.append((language, text[opened.end() : pos], text[next_pos:]))
+            break
+        if allow_dots and not candidates and line.startswith("...") and not line[3:].strip(" \t"):
+            candidates.append((language, text[opened.end() : pos], text[next_pos:]))
+        pos = next_pos
+    return candidates
+
+
+def _union(first: tuple[str, ...] | list[str], second: tuple[str, ...] | list[str]) -> list[str]:
+    """``first``, then each item of ``second`` that it holds fewer times than ``second``."""
+    missing = Counter(second)
+    missing.subtract(first)
+    merged = list(first)
+    for item in second:
+        if missing[item] > 0:
+            missing[item] -= 1
+            merged.append(item)
+    return merged
+
+
+def _read_html_dialects(
+    lines: list[str], size: int, *, include_fence: bool = False
+) -> Iterator[_Reader]:
+    """Preserve each complete, bounded block reading when the HTML dialects differ."""
+    for ascii_html in (False, True):
+        reader = _Reader(size + _SPARE_MATCHES, include_fence=include_fence, ascii_html=ascii_html)
+        try:
+            for line in lines:
+                reader.read(line)
+            reader.finish()
+        except _AmbiguousError:
+            # A nesting or work bound may end one paragraph's reading. Keep
+            # the raw file and independently read the blank-delimited sections
+            # so that this cannot discard evidence in later ordinary prose.
+            reader.parts.clear()
+            reader.blocks.clear()
+            reader.recovered_blocks = True
+            for nonblank, section in groupby(lines, key=lambda line: bool(line.strip(" \t"))):
+                if not nonblank:
+                    continue
+                fragment = list(section)
+                local = _Reader(
+                    sum(map(len, fragment)) + len(fragment) + _SPARE_MATCHES,
+                    include_fence=include_fence,
+                    ascii_html=ascii_html,
+                )
+                try:
+                    for line in fragment:
+                        local.read(line)
+                    local.finish()
+                except _AmbiguousError:
+                    literal = "\n".join(fragment)
+                    reader.parts.append(literal)
+                    reader.blocks.append(("literal", literal))
+                else:
+                    reader.parts.extend(local.parts)
+                    reader.blocks.extend(local.blocks)
+        yield reader
+
+
+def _only_html_disagrees(exc: _AmbiguousError, readers: list[_Reader]) -> bool:
+    return (
+        isinstance(exc, _HTMLDisagreementError)
+        and len(readers) == 2
+        and not any(r.recovered_blocks for r in readers)
+    )
+
+
+def _adjacent_container_imports(lines: list[str], eligible: set[str] | None = None) -> list[str]:
+    """Recover only paired spans spanning consecutive prose lines with container marks."""
+    parts: list[str] = []
+    group: list[str] = []
+
+    def finish() -> None:
+        if len(group) > 1:
+            content = "\n".join(group)
+            if "`@" in content:
+                paired = _outside_spans(content, import_boundaries_only=True)
+                if paired != content:
+                    parts.append(paired)
+        group.clear()
+
+    for line in lines:
+        mark = _CONTAINER_MARKS.match(line)
+        if mark is not None and mark[0].strip():
+            bare = line[mark.end() :]
+            if bare.strip() and (eligible is None or bare in eligible):
+                # A new list item starts its own prose. A lone tick in the
+                # previous item cannot close a code example in this one.
+                if (
+                    _LIST_MARKER.search(mark[0])
+                    and group
+                    and not (group[-1].startswith("`") and group[-1].strip("` \t"))
+                ):
+                    finish()
+                group.append(bare)
+                continue
+        finish()
+    finish()
+    return parts
+
+
+def _import_boundaries(
+    blocks: list[tuple[str, str]], lines: list[str], *, containers: bool = False
+) -> list[str]:
+    if not any("`@" in line for line in lines):
+        return []
+    parts = []
+    eligible: set[str] = set()
+    for kind, content in blocks:
+        if kind not in {"paragraph", "heading"}:
+            continue
+        if containers:
+            eligible.update(content.split("\n"))
+        if "`@" not in content:
+            continue
+        inline = _outside_spans(content, import_boundaries_only=True)
+        if inline != content:
+            parts.append(inline)
+    if containers:
+        parts.extend(_adjacent_container_imports(lines, eligible))
+    return parts
+
+
 def text_outside_code(text: str) -> list[str]:
     """The parts of ``text`` that a CommonMark reader does not read as code.
 
     Each paragraph and heading is one part, with its code spans replaced by a space;
     an HTML block or indented code line is returned as written, and fenced code is left
-    out. A file whose reading this cannot settle is returned whole.
+    out. A difference confined to HTML uses both complete block readings. Other
+    ambiguities retain the whole file and container and inline-code boundaries. A file that opens
+    with front matter is read both whole and without it, and the parts of either
+    reading are returned.
     """
+    parts = _text_outside_code(text)
+    for _, _, body in front_matter_candidates(text):
+        parts = _union(parts, _text_outside_code(body))
+    return parts
+
+
+def _text_outside_code(text: str) -> list[str]:
     lines = _LINE_END.split(text)
     if text.endswith("\n"):
         lines.pop()
@@ -148,13 +340,73 @@ def text_outside_code(text: str) -> list[str]:
         for line in lines:
             reader.read(line)
         reader.finish()
-    except _AmbiguousError:
-        return [text]
-    return reader.parts
+    except _AmbiguousError as exc:
+        readers = list(_read_html_dialects(lines, len(text)))
+        if _only_html_disagrees(exc, readers):
+            # Both readings completed. Each keeps the prose and raw HTML it
+            # sees, so a fence agreed by both cannot supply a real import.
+            parts: list[str] = []
+            for alternative in readers:
+                parts = _union(
+                    parts,
+                    _union(
+                        alternative.parts,
+                        _import_boundaries(alternative.blocks, lines, containers=True),
+                    ),
+                )
+            return parts
+        # A quote marker or a closing code span can put an import at the start of
+        # rendered text even when the raw file has no whitespace before its @.
+        # Raw HTML has no inline code spans. A repeated line that another
+        # reading places in prose must keep its possible inline boundaries.
+        html_lines = set.intersection(
+            *(
+                {
+                    line
+                    for kind, block in alt.blocks
+                    if kind == "html"
+                    for line in block.split("\n")
+                    if "`@" in line
+                }
+                for alt in readers
+            )
+        )
+        if html_lines:
+            html_lines.difference_update(
+                line
+                for alt in readers
+                for kind, block in alt.blocks
+                if kind in {"paragraph", "heading", "literal"}
+                for line in block.split("\n")
+                if "`@" in line
+            )
+        alternatives = [text]
+        for line in lines:
+            if "@" in line:
+                bare = _CONTAINER_MARKS.sub("", line, count=1)
+                if bare != line:
+                    alternatives.append(bare)
+                if "`@" in bare and line not in html_lines and bare not in html_lines:
+                    inline = _outside_spans(bare, import_boundaries_only=True)
+                    if inline != bare:
+                        alternatives.append(inline)
+                        rendered = _outside_spans(bare)
+                        if rendered != inline:
+                            alternatives.append(rendered)
+        for alternative in readers:
+            alternatives = _union(
+                alternatives,
+                _union(
+                    alternative.parts,
+                    _import_boundaries(alternative.blocks, lines, containers=True),
+                ),
+            )
+        return alternatives
+    return _union(reader.parts, _import_boundaries(reader.blocks, lines))
 
 
-def commonmark_blocks(text: str) -> list[tuple[str, str]]:
-    """Return ``(kind, content)`` for each CommonMark block in ``text``."""
+def commonmark_block_readings(text: str) -> dict[str, list[tuple[str, str]]]:
+    """Each bounded reading with its own code and container boundaries."""
     lines = _LINE_END.split(text)
     if text.endswith("\n"):
         lines.pop()
@@ -163,17 +415,33 @@ def commonmark_blocks(text: str) -> list[tuple[str, str]]:
         for line in lines:
             reader.read(line)
         reader.finish()
-    except _AmbiguousError:
-        return [("paragraph", text)]
-    return reader.blocks
+    except _AmbiguousError as exc:
+        # The raw reading keeps unmodeled evidence. A fenced example in that
+        # reading must not hide a new prose instruction in another reading.
+        readers = list(_read_html_dialects(lines, len(text), include_fence=True))
+        readings: dict[str, list[tuple[str, str]]] = {}
+        if not _only_html_disagrees(exc, readers):
+            readings["source"] = [("paragraph", "\n".join(lines))]
+            bare = "\n".join(_CONTAINER_MARKS.sub("", line, count=1) for line in lines)
+            # Removing container marks can join unrelated list items. Keep
+            # the resulting text literal rather than pairing its ticks again.
+            readings["containers"] = [("literal", bare)]
+        for alternative in readers:
+            readings["ascii" if alternative.ascii_html else "unicode"] = alternative.blocks
+        return readings
+    return {"common": reader.blocks}
 
 
 class _Reader:
     """commonmark.js block parsing, keeping only what decides code from text."""
 
-    def __init__(self, matches: int, *, include_fence: bool = False) -> None:
+    def __init__(
+        self, matches: int, *, include_fence: bool = False, ascii_html: bool | None = None
+    ) -> None:
         self.matches = matches
         self.include_fence = include_fence
+        self.ascii_html = ascii_html
+        self.recovered_blocks = False
         self.parts: list[str] = []
         # Each paragraph, heading and HTML block as written, with its kind, in order.
         self.blocks: list[tuple[str, str]] = []
@@ -193,6 +461,12 @@ class _Reader:
         # The first nonspace character after the offset, and its column; columns count
         # from the start of the line, so it stays found while the offset stays before it.
         self.found = (-1, 0)
+
+    def _block_disagreement(self) -> None:
+        """Keep raw evidence alongside a complete CommonMark reading."""
+        if self.ascii_html is None:
+            raise _AmbiguousError
+        self.recovered_blocks = True
 
     def read(self, line: str) -> None:
         self.line = line
@@ -233,7 +507,7 @@ class _Reader:
             # markdown-it measures a lazy line's indentation from the content of the
             # container it left, where it can start a block.
             if stack[-1].definition or self.indented:
-                raise _AmbiguousError
+                self._block_disagreement()
             self._add_line()
             return
         self._close_unmatched()
@@ -311,7 +585,7 @@ class _Reader:
         if kind == "quote":
             if self.indented and self._peek(self.next_nonspace) == ">":
                 # markdown-it continues a block quote at a marker indented four columns.
-                raise _AmbiguousError
+                self._block_disagreement()
             if self.indented or self._peek(self.next_nonspace) != ">":
                 return 1
             self._advance_next_nonspace()
@@ -325,7 +599,8 @@ class _Reader:
                 if last and block.children == block.definitions:
                     # commonmark.js drops a paragraph that held only link reference
                     # definitions, after which a blank line ends an empty item.
-                    raise _AmbiguousError
+                    self._block_disagreement()
+                    return 1
                 self._advance_next_nonspace()
             elif self.indent >= block.width:
                 self._advance(block.width, columns=True)
@@ -391,10 +666,15 @@ class _Reader:
                 return 2
             if char == "<":
                 lazy = not self.all_closed and not self.blank and self.stack[-1].kind == "paragraph"
-                for kind, start in enumerate(_HTML_BLOCK_STARTS, 1):
+                starts = _ASCII_HTML_BLOCK_STARTS if self.ascii_html else _HTML_BLOCK_STARTS
+                for kind, start in enumerate(starts, 1):
                     if start.match(line, at) and (
                         kind < 7 or (parent.kind != "paragraph" and not lazy)
                     ):
+                        if self.ascii_html is None and not _ascii_html_block_agrees(
+                            kind, line, at, parent.kind, lazy
+                        ):
+                            raise _HTMLDisagreementError
                         self._close_unmatched()
                         block = self._add_child("html")
                         block.html = kind
@@ -407,9 +687,11 @@ class _Reader:
             ):
                 self._close_unmatched()
                 content = "\n".join(parent.lines)
-                if _DEFINITION.match(content):
-                    # A paragraph of nothing but definitions is no heading.
-                    raise _AmbiguousError
+                if _DEFINITION.match(content) or _FOOTNOTE.search(content):
+                    # A paragraph of nothing but definitions is no heading, and cmark-gfm
+                    # ends the paragraph at a footnote. Retain the raw reading and the
+                    # complete CommonMark heading reading of the rest of the file.
+                    self._block_disagreement()
                 self.parts.append(_outside_spans(content))
                 if parent.after_code:
                     self.after_code.add(len(self.blocks))
@@ -451,7 +733,7 @@ class _Reader:
         if parent.kind == "paragraph" and not _NON_SPACE.search(line, end):
             if line[end:].strip(" \t"):
                 # A form feed or vertical tab is blank to commonmark.js, not to others.
-                raise _AmbiguousError
+                self._block_disagreement()
             return False
         self._advance_next_nonspace()
         self._advance(end - at, columns=True)
@@ -519,7 +801,7 @@ class _Reader:
                 for line in block.lines:
                     starts.append(starts[-1] + len(line) + 1)
                 if any(starts[index] >= leading for index in block.suspects):
-                    raise _AmbiguousError
+                    self._block_disagreement()
             if _DEFINITION.match(content):
                 self.stack[-1].definitions += 1
             self.parts.append(_outside_spans(content))
@@ -550,7 +832,7 @@ def _can_contain(parent: str, child: str) -> bool:
     return parent in ("document", "quote", "item") and child != "item"
 
 
-def _outside_spans(text: str) -> str:
+def _outside_spans(text: str, *, import_boundaries_only: bool = False) -> str:
     """``text`` with each code span replaced by a space, as CommonMark pairs backticks.
 
     A backslash escapes a backtick. What follows is left as written where a reader
@@ -559,15 +841,19 @@ def _outside_spans(text: str) -> str:
     link label or by a destination that is not plain; and in a paragraph that can open
     with a link reference definition.
     """
+    position = 0
     if _DEFINITION.match(text):
-        return text
+        if not import_boundaries_only:
+            return text
+        position = _leading_definitions_end(text, _definition_spans(text))
     runs: dict[int, list[int]] = {}
     for found_run in _BACKTICKS.finditer(text):
         runs.setdefault(found_run.end() - found_run.start(), []).append(found_run.start())
     last_close = text.rfind(">")
     taken = -1
     kept: list[str] = []
-    copied = position = brackets = 0
+    copied = brackets = literal_end = 0
+    positions = None
     while (found := _INLINE_SPECIAL.search(text, position)) is not None:
         position = found.start()
         char = text[position]
@@ -581,8 +867,19 @@ def _outside_spans(text: str) -> str:
             if index == len(starts):
                 position = end
             else:
-                kept += [text[copied:position], " "]
-                position = copied = starts[index] + end - position
+                span_end = starts[index] + end - position
+                # A real closing span may introduce an import. Keep any backticks
+                # in that raw filename, and mask every unrelated span in this reading.
+                keep_to = max(position, min(span_end, literal_end))
+                kept.append(text[copied:keep_to])
+                if keep_to < span_end:
+                    kept.append(" ")
+                copied = span_end
+                if import_boundaries_only and span_end >= literal_end:
+                    filename = _IMPORT_FILENAME.match(text, span_end)
+                    if filename is not None:
+                        literal_end = filename.end()
+                position = span_end
         elif char == "<":
             position += 1
             if text[position : position + 1].strip():
@@ -590,7 +887,11 @@ def _outside_spans(text: str) -> str:
                     after = _TAKEN.search(text, position)
                     taken = len(text) if after is None else after.start()
                 if taken < last_close:
-                    break
+                    if not import_boundaries_only:
+                        break
+                    if positions is None:
+                        positions = _Positions(text)
+                    position = max(position, _html_end(positions, position - 1))
         elif char == "[":
             brackets += 1
             position += 1
@@ -602,7 +903,13 @@ def _outside_spans(text: str) -> str:
                 if following == "[" or (
                     following == "(" and not _PLAIN_DESTINATION.match(text, position)
                 ):
-                    break
+                    if not import_boundaries_only:
+                        break
+                    syntax = _LINK_LABEL if following == "[" else _LENIENT_INLINE_LINK
+                    if (match := syntax.match(text, position)) is not None:
+                        position = match.end()
+    if import_boundaries_only and not literal_end:
+        return text
     kept.append(text[copied:])
     return "".join(kept)
 
@@ -613,7 +920,7 @@ class HiddenText:
 
     definitions: tuple[str, ...]
     """Link reference definitions that no link uses, every later one of a label, those
-    written as comments, and footnotes that nothing references."""
+    written as comments, and footnotes that nothing references or that repeat a label."""
     html: tuple[str, ...]
     """Processing instructions, declarations, CDATA sections and, in HTML blocks, the
     other markup that HTML parsers read as comments; not ``<!--`` comments."""
@@ -647,8 +954,21 @@ def hidden_text(text: str) -> HiddenText:
     after that code that start no block. HTML comments are left to the caller. A file
     whose blocks this cannot settle is read line by line, inside every container and
     code block, and each of its definitions and footnotes is returned, a footnote with
-    each later run of lines that starts indented four columns.
+    each later run of lines that starts indented four columns. A file that opens with
+    front matter is read both whole and without it, and what either reading hides is
+    returned, each as often as the reading that holds it more often.
     """
+    hidden = _hidden_text(text)
+    for _, _, body in front_matter_candidates(text):
+        in_body = _hidden_text(body)
+        hidden = HiddenText(
+            tuple(_union(hidden.definitions, in_body.definitions)),
+            tuple(_union(hidden.html, in_body.html)),
+        )
+    return hidden
+
+
+def _hidden_text(text: str) -> HiddenText:
     lines = _LINE_END.split(text)
     if text.endswith("\n"):
         lines.pop()
@@ -729,8 +1049,19 @@ def hidden_text(text: str) -> HiddenText:
     used_folded: set[str] = set()
     used_lowered: set[str] = set()
     unreferenced: dict[str, list[_Footnote]] = {}
+    # GitHub renders only the first footnote of a label, so each later one is hidden
+    # whatever references it, and its own references are no uses.
+    repeated: list[_Footnote] = []
+    noted_folded: set[str] = set()
+    noted_lowered: set[str] = set()
     for note in notes:
-        unreferenced.setdefault(note.keys[0], []).append(note)
+        fold, lower = note.keys
+        if fold in noted_folded or lower in noted_lowered:
+            repeated.append(note)
+        else:
+            unreferenced.setdefault(fold, []).append(note)
+        noted_folded.add(fold)
+        noted_lowered.add(lower)
     queue = readings[::-1]
     while queue:
         for label in _references(queue.pop(), is_defined):
@@ -757,6 +1088,7 @@ def hidden_text(text: str) -> HiddenText:
         seen_lowered.add(lower)
     hidden += comments
     hidden += ["\n".join(note.text) for waiting in unreferenced.values() for note in waiting]
+    hidden += ["\n".join(note.text) for note in repeated]
     return HiddenText(tuple(hidden), tuple(html))
 
 

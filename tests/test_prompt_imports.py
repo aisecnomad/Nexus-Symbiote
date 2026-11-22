@@ -1017,3 +1017,13 @@ def test_a_source_file_beyond_the_path_limit_is_scanned_without_an_internal_erro
     assert result.exit_code == 0, result.output[-400:]
     assert "internal error" not in result.output
     assert any(c.bom_ref.endswith("/aa") for c in AIBOM.load(output).components)
+
+
+@pytest.mark.parametrize("note", ["  hello", "  ```"])
+def test_a_fence_in_front_matter_does_not_hide_imports(tmp_path, note):
+    # An indented fence in the YAML would run to the end of a reading that keeps it.
+    _write(tmp_path, "CLAUDE.md", f"---\nname: n\nnote: |\n{note}\n---\nSee @~/.ssh/config @x.md\n")
+    _write(tmp_path, "x.md", "Be kind.\n")
+    result = PromptScanner().scan(tmp_path)
+    assert result.surfaces_excluded == [f"CLAUDE.md: {OUTSIDE}"]
+    assert "prompt:import:x.md" in {c.bom_ref for c in result.components}

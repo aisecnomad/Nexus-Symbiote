@@ -21,8 +21,9 @@ import selectors
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack, suppress
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -42,7 +43,13 @@ from nexus_symbiote.runtime import (
     ToolCall,
     canonical_bytes,
 )
-from nexus_symbiote.runtime_validation import MAX_ARGUMENT_BYTES
+from nexus_symbiote.runtime_validation import (
+    MAX_ARGUMENT_BYTES,
+    MAX_SCHEMA_BYTES,
+    ValidationBudgetError,
+    check_json_budget,
+    prepare_output_validation,
+)
 from nexus_symbiote.scanners.live_mcp import SUPPORTED_PROTOCOL_VERSIONS
 
 T = TypeVar("T")
@@ -99,6 +106,8 @@ class PinnedStdioSession:
         self._next_id = 1
         self._lookup_attempted = False
         self._described: str | None = None
+        self._output_schema: Any = None
+        self._validate_output: Callable[[dict[str, Any]], None] | None = None
         self._called = False
         self._used = False
 
@@ -220,10 +229,23 @@ class PinnedStdioSession:
             if cursor is None:
                 if tool_name not in tools:
                     raise AuthorizationError("approved tool missing from session")
+                definition = tools[tool_name]
+                schema = definition.get("outputSchema")
+                if schema is not None:
+                    try:
+                        check_json_budget(schema, maximum=MAX_SCHEMA_BYTES)
+                    except ValidationBudgetError as exc:
+                        reason = (
+                            "descriptor-too-large"
+                            if exc.reason == "json-budget-exceeded"
+                            else "descriptor-not-json"
+                        )
+                        raise AuthorizationError(
+                            "MCP output schema is outside the supported JSON budget", reason=reason
+                        ) from None
+                    self._output_schema = deepcopy(schema)
                 self._described = tool_name
-                return ServedTool(
-                    endpoint_identity=self.endpoint_identity, definition=tools[tool_name]
-                )
+                return ServedTool(endpoint_identity=self.endpoint_identity, definition=definition)
             if (
                 not isinstance(cursor, str)
                 or not cursor
@@ -235,6 +257,15 @@ class PinnedStdioSession:
             params = {"cursor": cursor}
         raise AuthorizationError("MCP page budget exceeded")
 
+    def _prepare_output(self, schema: Any, stack: ExitStack) -> None:
+        if schema is not None and self._validate_output is None:
+            try:
+                self._validate_output = stack.enter_context(prepare_output_validation(schema))
+            except ValidationBudgetError as exc:
+                raise AuthorizationError(
+                    "MCP output schema validation could not be prepared", reason=exc.reason
+                ) from None
+
     def execute(self, call: ToolCall) -> dict[str, Any]:
         if (
             self._described is None
@@ -243,12 +274,35 @@ class PinnedStdioSession:
             or self._called
         ):
             raise AuthorizationError("call does not match the described session")
+        with ExitStack() as stack:
+            self._prepare_output(self._output_schema, stack)
+            return self._dispatch(call)
+
+    def _dispatch(self, call: ToolCall) -> dict[str, Any]:
         self._called = True
         self._deadline = time.monotonic() + self._call_deadline_seconds
         try:
-            return self._request(
+            result = self._request(
                 "tools/call", {"name": call.tool_name, "arguments": call.arguments}
             )
+            validate_output = self._validate_output
+            if validate_output is None:
+                return result
+            is_error = result.get("isError", False)
+            if not isinstance(is_error, bool):
+                raise ValueError("MCP tool result has an invalid error flag")
+            if not is_error:
+                structured = result.get("structuredContent")
+                if not isinstance(structured, dict):
+                    raise ValueError("MCP tool result lacks structured content")
+                try:
+                    validate_output(structured)
+                except ValidationBudgetError as exc:
+                    raise ValidationBudgetError(
+                        "MCP structured result failed offline output schema validation",
+                        reason=exc.reason,
+                    ) from None
+            return result
         except ToolCallError:
             raise
         except Exception as exc:
@@ -367,7 +421,9 @@ def invoke_pinned_stdio(
         def describe(server_id: str, tool_name: str) -> ServedTool:
             return stack.enter_context(session).describe(server_id, tool_name)
 
-        # bind_adapters keeps every gateway setting (signer scopes, on_decision,
-        # allow_shared_keys, canonical_arguments) and swaps only describe/execute.
-        bound = gateway.bind_adapters(describe=describe, execute=session.execute)
+        def prepare(definition: Mapping[str, Any]) -> None:
+            # The gateway has verified this exact definition and has yet to record consent.
+            session._prepare_output(definition.get("outputSchema"), stack)
+
+        bound = gateway.bind_adapters(describe=describe, prepare=prepare, execute=session.execute)
         return bound.invoke(call, snapshot=snapshot, trust=trust, bom=bom, approval=approval)
