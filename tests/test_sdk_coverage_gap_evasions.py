@@ -63,6 +63,28 @@ def test_honest_loggers_rejects_alias_mutation_and_local_logging_shadow(tmp_path
     assert any("app.py" in gap for gap in res_shadow.surfaces_excluded)
 
 
+def test_logging_shadow_in_one_search_root_withdraws_the_getlogger_exemption() -> None:
+    # The stdlib root index sets stdlib_search_clear today; this pins the guard's own
+    # predicate, so a narrower index cannot turn an entry-directory logging.py into an
+    # exemption for a dynamically loaded server.
+    import ast
+
+    from nexus_symbiote.scanners.mcp_sources import _python_launches
+    from nexus_symbiote.scanners.python_tools import _ProjectImports
+
+    imports = _ProjectImports(
+        frozenset({Path("app/logging.py"), Path("app/server.py")}),
+        Path("app"),
+        {},
+        frozenset(),
+        frozenset(),
+        True,
+    )
+    tree = ast.parse("import logging\nmod = logging.getLogger('mcp.server.lowlevel')\n")
+    assert imports.shadows("logging")
+    assert _python_launches(tree, imports)
+
+
 def test_typescript_computed_method_non_identifier_initializer_and_loader_aliases(
     tmp_path: Path,
 ) -> None:
