@@ -333,7 +333,7 @@ def _unreachable(lock: Lock, declared: Collection[str]) -> list[str]:
         found = {
             key
             for key, wanted in pin_parents.items()
-            if key not in reached_pins and (wanted & reached_names)
+            if key not in reached_pins and ((wanted - {key[0]}) & reached_names)
         }
         reached_pins |= found
         reached_names |= {name for name, _idx in found}

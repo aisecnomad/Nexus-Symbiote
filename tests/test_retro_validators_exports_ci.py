@@ -709,7 +709,7 @@ def test_sarif_uri_rejects_backslash_nul_and_lone_surrogates(tmp_path: Path) -> 
 # --- R-MED-19(b, c): check_locks per-pin reachability & check_workflows env guards ---
 
 
-def test_check_locks_catches_unreferenced_duplicate_pin() -> None:
+def test_check_locks_catches_unreferenced_and_self_referencing_duplicate_pin() -> None:
     declared = {"click"}
     legit_pin = check_locks.Pin(
         name="click",
@@ -725,10 +725,44 @@ def test_check_locks_catches_unreferenced_duplicate_pin() -> None:
         hashes=frozenset({"1" * 64}),
         via=frozenset(),
     )
-    lock = check_locks.Lock(path="requirements-ci.lock", pins={"click": [legit_pin, injected_pin]})
+    self_ref_pin = check_locks.Pin(
+        name="click",
+        version=Version("9.9.8"),
+        marker=None,
+        hashes=frozenset({"2" * 64}),
+        via=frozenset({"click"}),
+    )
+    lock = check_locks.Lock(
+        path="requirements-ci.lock", pins={"click": [legit_pin, injected_pin, self_ref_pin]}
+    )
     issues = check_locks._unreachable(lock, declared)
-    assert len(issues) == 1
-    assert "click==9.9.9" in issues[0]
+    assert len(issues) == 2
+    assert any("click==9.9.9" in issue for issue in issues)
+    assert any("click==9.9.8" in issue for issue in issues)
+
+
+def test_clean_rfc3339_rejects_utc_overflow_and_cyclonedx_filters_noauth() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from nexus_symbiote.spdx_profiles import _clean_rfc3339
+
+    assert _clean_rfc3339("9999-12-31T23:00:00-02:00") is None
+    assert _clean_rfc3339("0001-01-01T00:00:00+02:00") is None
+    overflow_dt = datetime(9999, 12, 31, 23, 0, tzinfo=timezone(timedelta(hours=-2)))
+    assert _clean_rfc3339(overflow_dt) is None
+
+    bom = AIBOM(
+        components=[
+            A2AClientComponent(
+                bom_ref="a2a-client:noauth",
+                name="noauth-client",
+                agent_card_url="https://agent.example/card.json",
+                authentication_methods=["noauth", "no-auth", "no_auth"],
+            )
+        ]
+    )
+    doc = CycloneDXGenerator(projection_version=3).generate(bom)
+    assert doc["services"][0]["authenticated"] is False
 
 
 def test_check_workflows_blocks_new_gate_env_vars_and_keeps_coverage_json() -> None:

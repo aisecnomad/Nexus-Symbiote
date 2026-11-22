@@ -253,7 +253,9 @@ class CycloneDXGenerator(Generator):
 
     @staticmethod
     def _services(aibom: AIBOM) -> list[dict[str, Any]]:
-        anonymous = frozenset({"none", "anonymous", "unauthenticated", "public", ""})
+        anonymous = frozenset(
+            {"none", "noauth", "no-auth", "no_auth", "anonymous", "unauthenticated", "public", ""}
+        )
         used_refs = {comp.bom_ref for comp in aibom.components}
         services: list[dict[str, Any]] = []
         for comp in sorted(aibom.components, key=lambda c: c.bom_ref):
