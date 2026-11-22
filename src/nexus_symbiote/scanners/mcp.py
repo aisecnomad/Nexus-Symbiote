@@ -1077,9 +1077,13 @@ _PUBLIC_SCHEME_SWITCHES = _names(
     "production telemetry recursive localhost maxconcurrentrequests enableautomaticupdates"
 )
 _LOWER_LONG_OPTION = re.compile(r"--[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
-# A version label belongs to a selector. After a credential binding it can
-# still be private. Option spellings exclude long opaque and padded operands.
-_MODE_LABEL = re.compile(r"(?:[A-Z][a-z]+(?:[A-Z][a-z]+)*[A-Z]{0,4}[0-9]{1,3}|[0-9]{8})")
+_CAMEL_SWITCH = re.compile(r"[A-Za-z][a-z]+(?:[A-Z][a-z]+)+")
+# A short public version or date label after a mode selector (e.g. Workspace2,
+# WorkspaceV2, OpenAPI3, 20250618). Mixed-case tokens with multiple digits or
+# random runs stay private.
+_MODE_LABEL = re.compile(
+    r"(?:(?:[A-Z][a-z]{2,10}|OpenAPI|OAuth|HTTP|TLS|SAML|OIDC|GraphQL|JSON|YAML|GRPC)[Vv]?[0-9]|[0-9]{8})"
+)
 _SCHEME_NUMBER = re.compile(r"[+]?[0-9]+(?:[.][0-9]+)?")
 _SCHEME_ASSIGNMENT_OPERAND = re.compile(r"[A-Za-z0-9_-]+=[A-Za-z0-9_+=-]+")
 # curl's `-u user:password`, also in a cluster of short flags (`-su`), and httpie's `-a`
@@ -1121,9 +1125,13 @@ def _explicit_header(previous: str | None, word: str) -> bool:
     )
 
 
-def _scheme_assignment_name(name: str) -> bool:
+def _scheme_assignment_name(name: str, *, variable: bool = True) -> bool:
     words = name_words(name)
     if not words or words[-1] in _SCHEME_DESCRIPTORS:
+        return False
+    # CLI flags such as --auth=token, --authentication=bearer, and --auth-header=bearer
+    # select an authentication mode or header rather than binding a credential in the next arg.
+    if not variable and (words[-1] == "header" or tuple(words) in {("auth",), ("authentication",)}):
         return False
     auth = {
         "auth",
@@ -1143,6 +1151,21 @@ def _scheme_assignment_name(name: str) -> bool:
     )
 
 
+def _benign_selector_switch(key: str, body: str) -> bool:
+    """Whether a bare ``--option`` after a mode selector reads as a normal CLI switch."""
+    if not any(char.isdigit() for char in body):
+        if "-" in body and _LOWER_LONG_OPTION.fullmatch(key):
+            return True
+        if "_" in body and len(body) < 16 and body.replace("_", "").islower():
+            return True
+        if body.isascii() and body.isalpha():
+            if _CAMEL_SWITCH.fullmatch(body):
+                return True
+            if len(body) < 16 and (body.islower() or (body[0].isupper() and body[1:].islower())):
+                return True
+    return False
+
+
 def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
     """Whether the argument following an authentication scheme may be its literal value."""
     if len(word) < MIN_SECRET_LENGTH or is_reference(word):
@@ -1157,23 +1180,18 @@ def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
             and body.casefold().replace("-", "").replace("_", "") in _PUBLIC_SCHEME_SWITCHES
         ):
             return False
-        if (
-            not equals
-            and not credential_binding
-            and "-" in body
-            and _LOWER_LONG_OPTION.fullmatch(key)
-        ):
-            return False
         if equals:
             return len(body) >= MIN_SECRET_LENGTH and (argument == "=" or "-" not in body)
+        if len(body) < MIN_SECRET_LENGTH or placeholder(body):
+            return False
+        if credential_binding:
+            return True
+        if _benign_selector_switch(key, body):
+            return False
         return (
-            len(body) >= MIN_SECRET_LENGTH
-            and not placeholder(body)
-            and (
-                body.isalpha()
-                or credential_binding
-                or (len(body) >= 16 and credential_shaped(body))
-            )
+            len(body) >= 16
+            or any(char.isdigit() for char in body)
+            or (body.isascii() and not body.islower())
         )
     # Padding belongs to the operand. Only a genuine assignment has a
     # nonempty value following the separator and no further equals sign.
@@ -1181,8 +1199,26 @@ def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
         return literal_value(argument)
     if _SCHEME_NUMBER.fullmatch(word):
         return True
+    if placeholder(word):
+        return False
     if word.isascii() and word.isalpha():
-        return not placeholder(word)
+        if credential_binding or len(word) >= 16:
+            return True
+        return (
+            any(char.isupper() for char in word[1:])
+            and _CAMEL_SWITCH.fullmatch(word) is None
+            and not word.isupper()
+        )
+    if credential_binding:
+        return True
+    if (
+        word.isascii()
+        and any(char.isupper() for char in word)
+        and any(char.islower() for char in word)
+        and any(char.isdigit() for char in word)
+        and word.isalnum()
+    ):
+        return True
     return literal_value(word)
 
 
@@ -1222,7 +1258,7 @@ def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = Fa
         ):
             hits.extend(value_hits(name, f"{value} {following}") or [(SCHEME_CLASS, following)])
             return hits
-    credential_binding = in_set or _scheme_assignment_name(name)
+    credential_binding = in_set or _scheme_assignment_name(name, variable=variable)
     # Only a selector can explain a short date or version label. An unfamiliar
     # switch or an ordinary alphabetic word can itself be a bearer credential.
     if not credential_binding and len(following) <= 12 and _MODE_LABEL.fullmatch(following):
