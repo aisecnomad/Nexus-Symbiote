@@ -207,12 +207,18 @@ in the BOM is not trusted.
 written by the operator, never by the checkout. The CLI refuses a policy inside the
 scanned project or inside any Git working tree that encloses it, including a
 submodule's superproject, also under another name for any of these directories, or
-one with other hard links. The Action checks its input only against
-`GITHUB_WORKSPACE`: it refuses a path inside the workspace, one that passes through a
-symlink, or a hard link. It then copies the policy into a private directory under
-`RUNNER_TEMP`, or under the system temporary directory when `RUNNER_TEMP` is unset,
-and passes that copy to the CLI, which applies the rules above to the copy; a
-temporary directory inside a Git working tree therefore fails the run.
+one with other hard links. On POSIX systems it also refuses a policy that another user
+could replace: one not owned by you or root, one its group or others can write, or one
+under a directory, up to the file system root, that is owned by another user or that
+its group or others can write without the sticky bit. An `--operator-policy` file and
+its `--operator-policy-key` files follow the same rule, and a key inside the scanned
+project is refused whether or not the project is a git working tree. The Action checks the original signer policy and its trusted keys before use. In a
+container job, provision them in directories owned by the container user or root.
+A host-owned runner directory can fail this check even when its mode is 0755.
+For the private policy snapshot, the runner checks the nominated runner directory,
+then the platform temporary directory (which can come from `TMPDIR`, `TEMP` or
+`TMP`), then `/tmp` on POSIX. It uses only a writable, trusted directory outside
+the workspace and its enclosing Git working trees.
 
 ```json
 {
@@ -771,7 +777,7 @@ nexus-symbiote risk [OPTIONS] AIBOM_PATH
 | `--fail-on-unsigned-discovery` | Exit with status 1 when the BOM's ShadowScan evidence is unverified |
 | `--allow-unsigned-discovery` | Accept unverified discovery evidence explicitly (still warns); required in CI |
 | `--report-format` `text\|json\|markdown\|junit` | Gate report format (cannot disagree with `--json-output`; default: `text`). |
-| `--step-summary` `PATH` | Append a sanitized Markdown gate summary to this file. |
+| `--step-summary` `PATH` | Append to a new file or an existing singly linked report, including inside the checked project. The gate protects the files it reads. |
 | `--operator-policy` `FILE` | Signed operator policy YAML outside the scanned checkout; checkout policy may only narrow it. |
 | `--operator-policy-attestation` `FILE` | DSSE attestation envelope (`purpose: policy`) over `--operator-policy`. |
 | `--operator-policy-key` `FILE` | Trusted Ed25519 public key for `--operator-policy-attestation` (repeatable). |
@@ -903,7 +909,7 @@ nexus-symbiote runtime register [OPTIONS] SNAPSHOT_PATH
 | `--approval-key` `PATH` | Approval public key PEM the gateways trust; repeat for each. Only checked, so the gateways' signer scope map can be passed unchanged. (repeatable) |
 | `--snapshot-threshold` `INTEGER RANGE` | Minimum number of distinct snapshot signers (default: 1). |
 | `--trust-threshold` `INTEGER RANGE` | Minimum number of distinct trust-status signers (default: 1). |
-| `--signer-scopes` `PATH` | JSON object mapping key IDs to the signer scopes the gateways use. |
+| `--signer-scopes` `PATH` | Operator-owned JSON mapping of key IDs to signer scopes. Keep it outside the checkout and provision it with the same ownership, mode and single-link protections as a verification key. |
 | `--allow-shared-keys` | Accept a key in more than one ring, as gateways built with `allow_shared_keys=True` do. |
 
 The snapshot and trust status are checked as the gateway checks them, except the
@@ -1045,7 +1051,7 @@ nexus-symbiote validate [OPTIONS] AIBOM_PATH
 | `--fail-on-unsigned-discovery` | Exit with status 1 when the BOM's ShadowScan evidence is unverified |
 | `--allow-unsigned-discovery` | Accept unverified discovery evidence explicitly (still warns); required in CI |
 | `--report-format` `text\|json\|markdown\|junit` | Gate report format (cannot disagree with `--json-output`; default: `text`). |
-| `--step-summary` `PATH` | Append a sanitized Markdown gate summary to this file. |
+| `--step-summary` `PATH` | Append to a new file or an existing singly linked report, including inside the checked project. The gate protects the files it reads. |
 | `--operator-policy` `FILE` | Signed operator policy YAML outside the scanned checkout; checkout policy may only narrow it. |
 | `--operator-policy-attestation` `FILE` | DSSE attestation envelope (`purpose: policy`) over `--operator-policy`. |
 | `--operator-policy-key` `FILE` | Trusted Ed25519 public key for `--operator-policy-attestation` (repeatable). |

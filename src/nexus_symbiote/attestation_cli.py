@@ -13,7 +13,6 @@ import functools
 import json
 import os
 import re
-import stat
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -187,25 +186,12 @@ def _load_trusted_public(path: Path) -> Ed25519PublicKey:
     from cryptography.exceptions import UnsupportedAlgorithm
     from cryptography.hazmat.primitives import serialization
 
-    from nexus_symbiote.core.hashing import (
-        open_directory_nofollow,
-        open_regular_file,
-        pathname_identity,
-    )
+    from nexus_symbiote.core.hashing import open_regular_file, pathname_identity
     from nexus_symbiote.runtime_cli import MAX_KEY_BYTES
-    from nexus_symbiote.utils.crypto import _trusted_ancestor_uids
+    from nexus_symbiote.utils.crypto import _trust_anchor_error, _trusted_ancestor_uids
 
     uid = getattr(os, "geteuid", lambda: None)()
     trusted_uids = _trusted_ancestor_uids(uid) if uid is not None else set()
-    parent_fd = open_directory_nofollow(path.parent)
-    try:
-        parent_info = os.fstat(parent_fd)
-    finally:
-        os.close(parent_fd)
-    if (parent_info.st_mode & 0o002) and not (
-        (parent_info.st_mode & stat.S_ISVTX) and (uid is None or parent_info.st_uid in trusted_uids)
-    ):
-        raise _KeyFileError("trusted key directory must not be world-writable")
     with open_regular_file(path) as stream:
         info = os.fstat(stream.fileno())
         raw = stream.read(MAX_KEY_BYTES + 1)
@@ -216,6 +202,8 @@ def _load_trusted_public(path: Path) -> Ed25519PublicKey:
             or pathname_identity(path) != (info.st_dev, info.st_ino)
         ):
             raise _KeyFileError("trusted key file failed ownership, permission, or link checks")
+        if (reason := _trust_anchor_error(path, info)) is not None:
+            raise _KeyFileError(f"trusted key file {reason}")
     if len(raw) > MAX_KEY_BYTES:
         raise _InputTooLargeError
     try:
