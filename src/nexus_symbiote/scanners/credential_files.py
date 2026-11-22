@@ -50,6 +50,9 @@ _PROGRAM_SUFFIXES = frozenset(
 _CREDENTIAL_DIRECTORIES = frozenset(
     marker + plural for marker in _CREDENTIAL_MARKERS for plural in ("", "s")
 )
+_RAIL_LINK_CREDENTIAL_STORES = frozenset(
+    {".aws", ".ssh", ".gnupg", ".kube", ".docker", ".azure", ".gcloud", ".vault", "vault"}
+)
 
 
 def credential_shaped(path: str, *, colang_source: bool = False) -> bool:
@@ -96,6 +99,10 @@ def link_gap(target: str | None, *, colang_rail: str | None = None) -> str | Non
     """Why a symlink that leads to ``target`` is not followed, or None."""
     if target is None:
         return None
+    if colang_rail is not None and any(
+        part.casefold() in _RAIL_LINK_CREDENTIAL_STORES for part in PurePosixPath(target).parts[:-1]
+    ):
+        return "symlink leads into a credential directory"
     # A transparent rail link keeps its declared name and program role. A
     # renamed target can be a credential store presented under a rail alias.
     same_rail = (
