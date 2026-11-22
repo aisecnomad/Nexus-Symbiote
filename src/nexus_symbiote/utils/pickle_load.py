@@ -664,8 +664,9 @@ class _Machine:
             return
         if len(data) < 2 or not _C_FLOAT.fullmatch(data):
             raise _LoadError  # could not convert string to float
-        value = float(data.split(b"\x00")[0])
-        if value in (float("inf"), float("-inf")) and b"inf" not in data.lower():
+        head = data.split(b"\x00", 1)[0]
+        value = float(head)
+        if value in (float("inf"), float("-inf")) and b"inf" not in head.lower():
             raise _LoadError  # OverflowError
         self.push(value)
 
@@ -1012,13 +1013,22 @@ class _Machine:
         self.budget.marks -= 1
         self.marks.append(len(self.stack))
 
+    def _memo_index(self) -> int:
+        data = self.line(_numeric_text)
+        if self.c:
+            data = data.split(b"\x00", 1)[0]  # PyLong_FromString reads a C string
+        value = _py_int(data, 10)
+        if value is None or (self.c and value > _LONG_MAX):
+            raise _LoadError
+        return value
+
     def _get(self, index: int) -> None:
         if index not in self.memo:
             raise _LoadError  # Memo value not found
         self.push(self.memo[index])
 
     def op_get(self) -> None:
-        self._get(int(self.line(_numeric_text)))
+        self._get(self._memo_index())
 
     def op_binget(self) -> None:
         self._get(self.number(1, "<B"))
@@ -1032,7 +1042,7 @@ class _Machine:
         self.memo[index] = self.top()
 
     def op_put(self) -> None:
-        self._put(int(self.line(_numeric_text)))
+        self._put(self._memo_index())
 
     def op_binput(self) -> None:
         self._put(self.number(1, "<B"))
