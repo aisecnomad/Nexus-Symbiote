@@ -223,17 +223,22 @@ def load_offline_advisory_db(path: Path) -> tuple[list[_ParsedAdvisory], str]:
         records: list[_ParsedAdvisory] = []
         total_bytes = 0
         manifest_lines: list[str] = []
-        file_count = 0
-        for entry in sorted(os.scandir(path), key=lambda e: e.name):
+        # Bound directory iteration itself, including entries that are not advisory files.
+        with os.scandir(path) as listing:
+            entries: list[os.DirEntry[str]] = []
+            for entry in listing:
+                if len(entries) == MAX_DB_FILES:
+                    raise ValueError(
+                        f"Offline advisory DB exceeds {MAX_DB_FILES} directory entries"
+                    )
+                entries.append(entry)
+        for entry in sorted(entries, key=lambda e: e.name):
             if entry.is_dir():
                 raise ValueError("Offline advisory DB directory must not contain subdirectories")
             if not entry.name.endswith(".json"):
                 continue
             if entry.is_symlink():
                 raise ValueError("Offline advisory DB directory must not contain symbolic links")
-            file_count += 1
-            if file_count > MAX_DB_FILES:
-                raise ValueError(f"Offline advisory DB exceeds {MAX_DB_FILES} files")
             data = _read_bounded_bytes(Path(entry.path), MAX_DB_BYTES - total_bytes, entry.name)
             total_bytes += len(data)
             manifest_lines.append(f"{entry.name}:{hash_bytes(data)}")
@@ -400,7 +405,8 @@ def _read_range(rng: dict[str, Any]) -> _Range | None:
     """
     raw_type = rng.get("type")
     if raw_type is not None:
-        kind_of_range = raw_type.upper() if isinstance(raw_type, str) else ""
+        # Older feeds use mixed case. Unicode lookalikes are distinct range types.
+        kind_of_range = raw_type.upper() if isinstance(raw_type, str) and raw_type.isascii() else ""
         if kind_of_range in _UNMATCHED_RANGE_TYPES:
             return None
         if kind_of_range not in _SUPPORTED_RANGE_TYPES:
@@ -538,22 +544,21 @@ class _PackageMatcher:
                 try:
                     rng = _read_range(raw_range if isinstance(raw_range, dict) else {})
                 except ValueError as exc:
-                    # Evaluation never gets past this range, for any version.
                     failed = failed or str(exc)
                     failed_unparsed = failed_unparsed or str(exc)
-                    break
+                    continue
                 if rng is None:
                     continue
                 failed_unparsed = failed_unparsed or _UNCOMPARABLE
                 if any(_version_key(ecosystem, intro) is None for intro in rng.intros):
                     failed = failed or _UNCOMPARABLE
+                    continue
                 readable.append(rng)
             if failed is not None:
                 failed_parsed.append((number, failed))
-            else:
-                for rng in readable:
-                    budget.spend((len(rng.versions()) + 1) ** 2 // _CHEAP_STEPS)
-                    ranges.append((number, rng))
+            for rng in readable:
+                budget.spend((len(rng.versions()) + 1) ** 2 // _CHEAP_STEPS)
+                ranges.append((number, rng))
             if failed_unparsed is not None:
                 failed_unparsed_blocks.append((number, failed_unparsed))
         # Kept whole so a component costs nothing per error past the ones the report lists.
@@ -648,7 +653,9 @@ class _PackageMatcher:
         for number, rng in sorted(hits, key=lambda hit: hit[0]):
             fixes = () if rng is None else rng.fixes
             budget.spend(1 + len(fixes) // _CHEAP_STEPS)
-            if number in undecidable:
+            # Exact listings and readable ranges establish a hit independently of a
+            # malformed sibling. Preserve the feed error even when coverage is partial.
+            if number in undecidable and rng is not None and rng.unparsed:
                 continue
             fixed, bounds, decided = blocks.setdefault(number, ([], [], [False]))
             fixed.extend(text for at, text in fixes if at is not None and at > position)

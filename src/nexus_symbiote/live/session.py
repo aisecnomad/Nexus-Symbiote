@@ -2,7 +2,8 @@
 
 The launcher must be independently approved by the operator. By default a kernel
 PID namespace is required before execution. An explicit operator isolation_off()
-context accepts best-effort cleanup in an independently isolated worker instead.
+context accepts best-effort cleanup in an independently isolated worker instead, on
+Linux only; elsewhere it is refused before execution.
 Neither mode is a filesystem or network sandbox, and it does not authenticate the
 workload or prove backend behavior.
 

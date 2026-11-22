@@ -16,6 +16,21 @@ updates:
       github-actions:
         patterns: ["*"]
 
+  # The Dockerfile's base image, pinned by digest in both stages; move them together.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "image"
+    # Patch releases and rebuilt digests of Python 3.12 only; a new minor is a decision.
+    ignore:
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
   - package-ecosystem: pip
     directory: /
     schedule:

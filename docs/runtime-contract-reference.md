@@ -389,13 +389,17 @@ consumed; a fresh approval does not establish that a retry is safe.
     (`arguments-invalid`, `schema-invalid`, `validation-capacity`,
     `validation-timeout`, `validation-unavailable`, `validation-failed`).
 11. For a pinned tool with an `outputSchema`, preflight the schema and reserve a
-    pending-response slot. Refuse unsupported schemas, cycles at the same result
-    location, or an evaluation stack deeper than 96 schema applications across
-    the supported result depth. The usual budget is 1,024 same-location steps per
-    subschema. Annotation collection for `unevaluatedProperties` or `unevaluatedItems`
-    counts a second pass over the applicators. An explicit `oneOf` or `anyOf` with
-    at least 16 alternatives, each taking at most 32 steps, can use up to 4,096
-    steps. A single enclosing applicator can carry that allowance. A refusal is
+    pending-response slot. Refuse unsupported schemas and cycles at the same result
+    location. One location admits up to 96 nested schema applications. Across child
+    values the stack is capped at 160 applications and by interpreter headroom.
+    The usual budget is 1,024 steps per location. It counts keyword widths and
+    charges annotation walks to each caller. An explicit union of at least 16
+    alternatives costing at most 32 steps each may use 4,096 steps, including
+    through a cheap wrapper. Repeated rule costs use a 32,768-step estimate. Nested cardinalities
+    and fixed property or tuple entries count toward it. A conforming row with required
+    fields consumes multiple JSON nodes. Scalar enum comparisons and property lookups
+    cost less than validator calls. The estimate also accounts for unique-item comparisons,
+    pattern matching and repeated annotation collection. Actual validation also has independent CPU and wall-time limits. A refusal is
     reported as `schema-invalid` before approval consumption or dispatch.
     Up to four responses can be pending.
     A pending call releases its preflight worker. Its returned result takes
@@ -606,13 +610,32 @@ at start-up or from a readiness probe.
 
 `StateStore.initialize(path)` creates a new store: the parent directory with mode
 0700 if it does not exist, and the file with mode 0600, refusing an existing file
-or a symbolic link. `StateStore(path)` opens an existing store. It refuses a
-missing file or a database without a store's tables (`state-missing`), a symbolic
+or a symbolic link. Creating, opening and using a store refuse a parent directory
+that other users can write (world-writable, or group-writable without the sticky
+bit). A group-writable sticky directory is accepted for compatibility and requires
+every group member to be trusted. Its members can create files between inspection
+and SQLite opening them. Use an owner-controlled directory when consumed approvals
+and accepted serials must be protected from other group members.
+Any existing `-journal`, `-wal` or `-shm` companion must be a regular file
+with one link, owned by the service user and writable only by that user
+(`state-invalid`). `StateStore(path)` opens an existing
+store. It refuses a missing file or a database without a store's tables (`state-missing`), a symbolic
 link or anything but a regular file (`state-invalid`), and a file that is not an
 SQLite database (`state-unavailable`), and it restricts a group- or
 world-accessible file to 0600. A store removed while a gateway runs makes every
 call fail with `state-unavailable`; it is never recreated empty. Each store has a
 random `store_id`.
+
+For an existing store in a shared directory, stop every gateway that uses it.
+If the service owns a dedicated directory, make that directory private (0700).
+For a shared parent, move the trusted current database and its SQLite companions
+together into a dedicated 0700 directory owned by the service account. Check
+ownership and permissions before restarting all gateways against the same
+store. A crash can leave a journal or WAL with the database’s old group-write
+permission. With every writer stopped, verify the files’ provenance and owner,
+then remove group write permission with `chmod g-w` on those files. Keep a hot
+journal with its database so SQLite can complete recovery. Reinitializing the store or discarding a journal can lose consumed
+approvals and accepted serials.
 
 The store records, per tenant, the accepted trust status (serial, digest and
 revoked signer IDs); per tenant, deployment and agent, the current snapshot

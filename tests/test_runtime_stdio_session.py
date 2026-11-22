@@ -56,6 +56,8 @@ tool_result = {tool_result!r}
 definition = {definition!r}
 log = {str(log)!r}
 mode = {mode!r}
+# In a PID namespace only /proc/self holds the host pid; elsewhere there is no namespace.
+host = int(os.readlink("/proc/self")) if sys.platform == "linux" else os.getpid()
 for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get("method")
@@ -69,7 +71,7 @@ for line in sys.stdin:
             time.sleep(30)
     elif method == "tools/list":
         with open(log, "a") as f:
-            f.write(json.dumps([method, int(os.readlink("/proc/self"))]) + "\\n")
+            f.write(json.dumps([method, host]) + "\\n")
         if mode == "exit":
             raise SystemExit(1)
         if mode == "stall":
@@ -79,7 +81,7 @@ for line in sys.stdin:
             result["nextCursor"] = None
     elif method == "tools/call":
         with open(log, "a") as f:
-            f.write(json.dumps([method, int(os.readlink("/proc/self")), msg["params"]]) + "\\n")
+            f.write(json.dumps([method, host, msg["params"]]) + "\\n")
         result = {{"content": [{{"type": "text", "text": "ok"}}]}}
         if tool_result is not None:
             result = tool_result

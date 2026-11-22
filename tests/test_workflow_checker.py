@@ -144,6 +144,7 @@ def ci_workflow():
         ("codeql", "scripts/check_codeql_sarif.py"),
         ("floor", "requirements-floor.lock"),
         ("test", "--strict-skips"),
+        ("macos", "--strict-skips"),
         ("quality", "scripts/check_locks.py"),
         ("action", "sys.exit(bool(failures))"),
         ("action-annotations", "symbiote-injected-annotation"),
@@ -165,7 +166,11 @@ def test_a_gate_job_hollowed_out_under_its_name_is_rejected(tmp_path, job, comma
 
 @pytest.mark.parametrize(
     "job,command",
-    [("build", "--strict-skips"), ("verify", "gh attestation verify")],
+    [
+        ("build", "--strict-skips"),
+        ("verify", "gh attestation verify"),
+        ("image-verify", "gh attestation verify"),
+    ],
 )
 def test_a_release_gate_hollowed_out_under_its_name_is_rejected(tmp_path, job, command):
     workflow = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
@@ -944,6 +949,76 @@ def test_the_codeql_policy_reads_the_analysis_it_gates(tmp_path, name, job, vari
     assert any("scripts/check_codeql_sarif.py other than" in e for e in errors), errors
 
 
+def without_step(job, command):
+    def change(jobs):
+        jobs[job]["steps"].remove(step_running(jobs[job], command))
+
+    return change
+
+
+def setting(job, key, value, command=None):
+    def change(jobs):
+        (jobs[job] if command is None else step_running(jobs[job], command))[key] = value
+
+    return change
+
+
+@pytest.mark.parametrize(
+    ("name", "change", "message"),
+    [
+        (
+            "codeql.yml",
+            without_step("analyze", "scripts/check_codeql_sarif.py"),
+            "analyze no longer runs scripts/check_codeql_sarif.py in its reviewed step",
+        ),
+        (
+            "ci.yml",
+            without_step("codeql", "scripts/check_codeql_sarif.py"),
+            "codeql no longer runs scripts/check_codeql_sarif.py in its reviewed step",
+        ),
+        (
+            "codeql.yml",
+            without_step("analyze", "github/codeql-action/analyze@"),
+            "analyze no longer runs github/codeql-action/analyze@",
+        ),
+        (
+            "codeql.yml",
+            without_step("analyze", "github/codeql-action/init@"),
+            "analyze no longer runs github/codeql-action/init@",
+        ),
+        (
+            "codeql.yml",
+            setting("analyze", "continue-on-error", True),
+            "analyze must not continue on error in a gating workflow",
+        ),
+        (
+            "codeql.yml",
+            setting("analyze", "continue-on-error", True, "scripts/check_codeql_sarif.py"),
+            "analyze runs scripts/check_codeql_sarif.py only in a step that continues on error",
+        ),
+        (
+            "codeql.yml",
+            setting("analyze", "if", False, "scripts/check_codeql_sarif.py"),
+            "analyze may skip scripts/check_codeql_sarif.py",
+        ),
+        ("codeql.yml", setting("analyze", "if", "false"), "required job analyze may be skipped"),
+    ],
+    ids=[
+        "codeql-no-policy",
+        "ci-no-policy",
+        "no-analyze",
+        "no-init",
+        "job-continues",
+        "policy-continues",
+        "policy-skipped",
+        "job-skipped",
+    ],
+)
+def test_the_codeql_workflow_is_a_gate_that_cannot_be_hollowed_out(tmp_path, name, change, message):
+    errors = workflow_errors(tmp_path, name, change)
+    assert any(message in e for e in errors), errors
+
+
 @pytest.mark.parametrize("field", ["container", "services"])
 def test_a_gate_job_cannot_run_in_a_job_container(tmp_path, field):
     def change(jobs):
@@ -955,9 +1030,18 @@ def test_a_gate_job_cannot_run_in_a_job_container(tmp_path, field):
     assert any("must not run its gates in a job container" in e for e in errors), errors
 
 
-def test_non_pull_request_platform_runs_never_share_a_concurrency_group():
-    # A group keeps one pending run, and a newer queued run cancels it whatever
-    # cancel-in-progress says, so a main push or schedule needs a group of its own.
-    workflow = yaml.safe_load((ROOT / ".github/workflows/platforms.yml").read_text())
-    group = workflow["concurrency"]["group"]
-    assert "github.run_id" in group and "github.event_name == 'pull_request'" in group
+@pytest.mark.parametrize("runner", ["ubuntu-24.04", "${{ matrix.os }}", ["macos-15"]])
+def test_the_macos_suite_cannot_move_to_another_runner(tmp_path, runner):
+    def change(jobs):
+        jobs["macos"]["runs-on"] = runner
+
+    errors = workflow_errors(tmp_path, "ci.yml", change)
+    assert any("macos must run on a macos- runner" in e for e in errors), errors
+
+
+def test_the_image_push_holds_no_oidc_token(tmp_path):
+    def change(jobs):
+        jobs["image"]["permissions"]["id-token"] = "write"
+
+    errors = workflow_errors(tmp_path, "release.yml", change)
+    assert any("image may hold write permissions only for packages" in e for e in errors)
