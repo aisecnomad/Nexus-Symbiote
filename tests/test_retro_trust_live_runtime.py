@@ -859,8 +859,10 @@ def test_run_action_scratch_parent_validates_baseline_only_config(
         workspace=ws,
     )
     monkeypatch.setattr(run_action.tempfile, "gettempdir", lambda: str(bad_tmp))
-    monkeypatch.setattr(run_action.os, "name", "nt")
-    with pytest.raises(run_action.ActionError, match="reviewed-baseline"):
+    with (
+        mock.patch("nexus_symbiote.utils.crypto._trust_anchor_error", return_value="untrusted"),
+        pytest.raises(run_action.ActionError, match="reviewed-baseline"),
+    ):
         run_action._scratch_parent(cfg)  # type: ignore[arg-type]
 
 
