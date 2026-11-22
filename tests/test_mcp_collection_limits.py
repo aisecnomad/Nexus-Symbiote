@@ -84,13 +84,16 @@ def test_file_descriptor_budget_is_named(tmp_path):
     ]
 
 
+@pytest.mark.no_cover
 def test_many_secret_values_times_many_strings_stays_fast(tmp_path):
     # The redaction cost was environment values times strings, with no bound on either.
+    # Values are bounded now, so at the bound the cost grows with the strings alone;
+    # scaling both measures their accepted product, whose ratio is about 6, not 4.
     roots = {}
     for scale in (1, 4):
         root = tmp_path / f"scale_{scale}"
         root.mkdir()
-        env_count = (MAX_ENVIRONMENT // 4) * scale
+        env_count = MAX_ENVIRONMENT
         str_count = ((MAX_TOOL_NODES - 100) // 4) * scale
         env = {f"API_KEY_{i}": f"credential-value-{i:05d}" for i in range(env_count)}
         strings = [f"text {i} credential-value-00007 tail" for i in range(str_count)]
