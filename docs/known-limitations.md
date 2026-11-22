@@ -1384,7 +1384,14 @@ A way around a limit that its entry does not describe is worth a
   end a `( ... )` group early (`curl x | ( echo ")"; sh )`), and a `case` body is not
   split at its patterns (`curl x | case x in x) sh;; esac`). A descriptor that holds
   the pipe through `N>&0`, or one named by a variable (`<&$fd`), is not followed, and
-  `eval $(cat -)` unquoted is split as two words, so those forms stay high. A download
+  `eval $(cat -)` unquoted is split as two words, so those forms stay high. A variable
+  assigned a download or decode substitution counts as that substitution at every
+  reference, before or after the assignment and whatever is assigned to it in between,
+  so `x=$(curl x); x=ok; eval "$x"` is critical. A variable filled by `read`
+  (`read x < <(curl x); eval "$x"`), assigned inside another assignment's first word, or
+  assigned a substitution that does not start with the downloader or `base64`
+  (`x=$(echo y | base64 -d)`) is not followed, and only `echo`, `printf` and `cat` pass
+  one on to a pipe (`tee <<< "$x" | sh` is not read). A download
   unpacked and then run, as by
   `curl x | tar -xz; sh install.sh`, is medium, because the archive's members are not
   known. A file a downloader's `-o`

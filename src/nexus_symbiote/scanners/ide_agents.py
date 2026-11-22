@@ -2711,6 +2711,59 @@ def _fetch_exec(command: str) -> bool:
     A command or process substitution that itself downloads is the same shape
     without a pipe, as is saving the download and running that file later.
     """
+    if _runs_fetch(command) or _encoded_powershell(command):
+        return True
+    held = _held_downloads(command)
+    # Every reference to a variable a download was assigned to is read as that download,
+    # so `x=$(curl ...); eval "$x"` is `eval "$(curl ...)"`. The order of the assignment
+    # and the reference is not tracked: a reference before it is read the same way.
+    return bool(held) and _runs_fetch(
+        _VARIABLE_REFERENCE.sub(
+            lambda match: _HELD if (match.group(1) or match.group(2)) in held else match[0],
+            command,
+        )
+    )
+
+
+# The first word of a substitution that a variable is assigned, as in `x=$(curl ...`,
+# `` x=`curl ... `` or `export X="$(wget ...`. Each match consumes that word, so the
+# command is read once, and an assignment nested in that first word is not read.
+_SUBSTITUTION_ASSIGNMENT = re.compile(
+    r"(?<![\w-])([A-Za-z_]\w*)=[\"']?(\$\(|`)[ \t]*([^ \t\n)|&;`]*)"
+)
+_SUBSTITUTION_WORD = re.compile(r"(\$\(|<\(|`)[ \t]*([^ \t\n)|&;`]*)")
+_VARIABLE_REFERENCE = re.compile(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)")
+_HELD = "$(curl)"
+_TEXT_WRITERS = frozenset({"echo", "printf", "cat"})
+
+
+def _held_downloads(command: str) -> frozenset[str]:
+    """The variables assigned a download or a decoded payload by a substitution."""
+    held = set()
+    for match in _SUBSTITUTION_ASSIGNMENT.finditer(command):
+        names = _name_variants(match.group(3))
+        if names & _DOWNLOAD_NAMES or (
+            "base64" in names and _substitution_downloads(command, match.start(2))
+        ):
+            held.add(match.group(1))
+    return frozenset(held)
+
+
+def _writes_download(segment: str) -> bool:
+    """Whether `echo`, `printf` or `cat` writes a download substitution, as in
+    `echo "$(curl ...)" | sh`, which pipes the download."""
+    if not any(
+        _name_variants(match.group(2)) & _DOWNLOAD_NAMES
+        for match in _SUBSTITUTION_WORD.finditer(segment)
+    ):
+        return False
+    spans = _shell_word_spans(segment)
+    words = [segment[start:end] for start, end in spans]
+    index = _executable_index(words, _redirections(segment, spans))
+    return index is not None and bool(_name_variants(words[index]) & _TEXT_WRITERS)
+
+
+def _runs_fetch(command: str) -> bool:
     pipelines = _command_pipelines(command)
     if _substitution_exec(pipelines) or _download_then_run(pipelines):
         return True
@@ -2721,11 +2774,11 @@ def _fetch_exec(command: str) -> bool:
         for segment in segments:
             if fetched and _segment_executes(segment):
                 return True
-            if _segment_fetches(segment):
+            if _segment_fetches(segment) or _writes_download(segment):
                 fetched = True
             if fetched and _output_substitution_executes(segment):
                 return True
-    return _encoded_powershell(command)
+    return False
 
 
 def _output_substitution_executes(segment: str) -> bool:
