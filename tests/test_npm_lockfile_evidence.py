@@ -994,3 +994,109 @@ def test_a_build_requirement_is_not_held_to_the_python_lock_version(
     assert result.scan_failures == []
     (comp,) = result.components
     assert comp.version == "1.2.3" and comp.package_url == "pkg:pypi/openai@1.2.3"
+
+
+def _uv_lock(source: str, version: str = 'version = "1.30.0"') -> str:
+    return f'version = 1\n\n[[package]]\nname = "openai"\n{version}\nsource = {source}\n'
+
+
+PYPI_SOURCE = '{ registry = "https://pypi.org/simple" }'
+SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+@pytest.mark.parametrize(
+    "uv_settings",
+    [
+        '[tool.uv.sources]\nopenai = { git = "https://git.example/openai-python" }\n',
+        '[tool.uv]\noverride-dependencies = ["openai @ https://evil.example/o.whl"]\n',
+    ],
+    ids=["uv-source", "uv-override"],
+)
+def test_a_lock_record_names_no_pypi_identity_for_an_untranslated_declaration(
+    tmp_path, uv_settings
+):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["openai>=1"]\n' + uv_settings
+    )
+    (tmp_path / "uv.lock").write_text(_uv_lock(PYPI_SOURCE))
+    result = RegistryScanner().scan(tmp_path)
+    (comp,) = result.components
+    assert result.surfaces_excluded
+    assert comp.package_url is None and comp.registry_uri is None
+
+
+def test_a_poetry_git_dependency_takes_no_pypi_identity_from_poetry_lock(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.poetry.dependencies]\npython = "^3.11"\n'
+        'openai = { git = "https://git.example/openai-python" }\n'
+    )
+    (tmp_path / "poetry.lock").write_text('[[package]]\nname = "openai"\nversion = "1.30.0"\n')
+    (comp,) = RegistryScanner().scan(tmp_path).components
+    assert comp.package_url is None and comp.registry_uri is None
+
+
+def test_a_marker_qualified_package_keeps_the_lock_record_s_source_checks(tmp_path):
+    (tmp_path / "requirements.txt").write_text("openai>=1; python_version >= '3.8'\n")
+    (tmp_path / "uv.lock").write_text(
+        _uv_lock(f'{{ git = "https://git.example/openai-python?rev=main#{SHA}" }}')
+    )
+    result = RegistryScanner().scan(tmp_path)
+    (comp,) = result.components
+    assert result.surfaces_excluded == [
+        "uv.lock: non-registry package source for openai is unverified"
+    ]
+    assert comp.package_url is None and comp.registry_uri is None
+
+    (tmp_path / "uv.lock").write_text(_uv_lock('{ registry = "http://evil.example/simple" }'))
+    (comp,) = RegistryScanner().scan(tmp_path).components
+    assert ("registry_origin", "high") in {(r.category, r.severity.value) for r in comp.risks}
+    assert comp.registry_uri == "http://evil.example"
+    assert comp.package_url is None
+    assert comp.version == '>=1; python_version >= "3.8"'
+
+
+@pytest.mark.parametrize(
+    "lock",
+    [
+        _uv_lock(f'{{ git = "https://git.example/openai?rev=main#{SHA}" }}'),
+        _uv_lock(PYPI_SOURCE) + _uv_lock(PYPI_SOURCE, 'version = "1.30.1"').split("\n", 2)[2],
+        _uv_lock(PYPI_SOURCE, "version = 1"),
+    ],
+    ids=["non-registry", "ambiguous", "no-exact-version"],
+)
+def test_a_lock_record_that_is_not_taken_leaves_no_pypi_identity(tmp_path, lock):
+    (tmp_path / "requirements.txt").write_text("openai==1.30.0\n")
+    (tmp_path / "uv.lock").write_text(lock)
+    result = RegistryScanner().scan(tmp_path)
+    (comp,) = result.components
+    assert result.surfaces_excluded or result.scan_failures
+    assert comp.package_url is None and comp.registry_uri is None
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        lambda root: (
+            (root / ".env").write_text("X=1\n"),
+            (root / "uv.lock").symlink_to(".env"),
+        ),
+        lambda root: (root / "uv.lock").symlink_to("/etc/hostname"),
+    ],
+    ids=["withheld", "unreadable"],
+)
+def test_an_unread_uv_lock_does_not_let_poetry_lock_bind_alone(tmp_path, setup):
+    (tmp_path / "requirements.txt").write_text("openai>=1\n")
+    (tmp_path / "poetry.lock").write_text('[[package]]\nname = "openai"\nversion = "1.0.0"\n')
+    setup(tmp_path)
+    result = RegistryScanner().scan(tmp_path)
+    (comp,) = result.components
+    assert any("multiple Python lockfiles" in gap for gap in result.surfaces_excluded)
+    assert comp.package_url is None and "package_resolution" not in comp.claims
+
+
+def test_a_corrupt_python_lockfile_leaves_no_package_url(tmp_path):
+    (tmp_path / "requirements.txt").write_text("openai==1.0.0\n")
+    (tmp_path / "uv.lock").write_text("[[package\nname=\n")
+    result = RegistryScanner().scan(tmp_path)
+    assert result.scan_failures == ["uv.lock: invalid or unsupported lockfile"]
+    assert result.components[0].package_url is None

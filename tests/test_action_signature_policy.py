@@ -9,10 +9,13 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 import yaml
+
+from tests.support import trust_anchor_in_layout
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/sigstore-python"
@@ -55,14 +58,31 @@ def test_action_passes_the_policy_only_as_data() -> None:
     assert output["value"] == "${{ steps.scan.outputs.signature_policy_digest }}"
 
 
-def test_one_policy_snapshot_reaches_collection_validation_and_risk(tmp_path: Path) -> None:
+@pytest.mark.parametrize("foreign_runner_temp", [False, True])
+def test_one_policy_snapshot_reaches_collection_validation_and_risk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, foreign_runner_temp: bool
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     policy = tmp_path / "caller" / "signers.json"
     policy.parent.mkdir()
     policy.write_text(policy_document())
+    local_temp = tmp_path / "local-temp"
+    local_temp.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(local_temp))
+    if foreign_runner_temp:
+        runner_temp = trust_anchor_in_layout(
+            tmp_path, "foreign-owned grandparent", "runner-fixture", b"", monkeypatch
+        ).parent
+    else:
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir()
     config = runner.Config.from_env(
-        {"GITHUB_WORKSPACE": str(workspace), "SYMBIOTE_SIGNATURE_POLICY": str(policy)}
+        {
+            "GITHUB_WORKSPACE": str(workspace),
+            "RUNNER_TEMP": str(runner_temp),
+            "SYMBIOTE_SIGNATURE_POLICY": str(policy),
+        }
     )
     policy.write_text(policy_document("https://attacker.invalid/replaced-after-validation"))
     calls: list[list[str]] = []
@@ -71,7 +91,10 @@ def test_one_policy_snapshot_reaches_collection_validation_and_risk(tmp_path: Pa
     def command(args: list[str]) -> subprocess.CompletedProcess[str]:
         calls.append(args)
         if "--signature-policy" in args:
-            seen.append(Path(args[args.index("--signature-policy") + 1]).read_text())
+            snapshot = Path(args[args.index("--signature-policy") + 1])
+            if os.name == "posix":
+                assert snapshot.stat().st_mode & 0o077 == 0
+            seen.append(snapshot.read_text())
         if args[0] == "scan":
             Path(args[args.index("--output") + 1]).write_text("{}")
         return subprocess.CompletedProcess(args, 0, '{"overall_score": 0}', "")
@@ -83,6 +106,7 @@ def test_one_policy_snapshot_reaches_collection_validation_and_risk(tmp_path: Pa
     assert scan.count("--signature-policy") == validate.count("--signature-policy") == 1
     assert scan.index("--signature-policy") < scan.index("--")
     snapshot = Path(scan[scan.index("--signature-policy") + 1])
+    assert snapshot.is_relative_to((local_temp if foreign_runner_temp else runner_temp).resolve())
     assert validate[validate.index("--signature-policy") + 1] == str(snapshot)
     assert snapshot != policy and not snapshot.is_relative_to(workspace)
     assert not snapshot.exists()
@@ -261,6 +285,18 @@ def _caller_policy(tmp_path: Path, identity: str = SIGNER) -> Path:
     policy.parent.mkdir(exist_ok=True)
     policy.write_text(policy_document(identity))
     return policy
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX trust-anchor permissions")
+def test_the_action_rejects_a_group_writable_original_policy(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    policy = _caller_policy(tmp_path)
+    policy.chmod(0o664)
+    with pytest.raises(runner.InputError, match="group- or world-writable"):
+        runner.Config.from_env(
+            {"GITHUB_WORKSPACE": str(workspace), "SYMBIOTE_SIGNATURE_POLICY": str(policy)}
+        )
 
 
 def _entry_point(
@@ -495,19 +531,18 @@ def test_policy_snapshot_lives_in_runner_temp_when_tmpdir_is_in_the_checkout(
     (workspace / ".git").mkdir()
     checkout_tmp = workspace / "tmp"
     checkout_tmp.mkdir()
-    overrides = {"TMPDIR": str(checkout_tmp)}
+    overrides = {"TMPDIR": str(checkout_tmp), "RUNNER_TEMP": ""}
     if runner_temp:
         (tmp_path / "runner-temp").mkdir()
         overrides["RUNNER_TEMP"] = str(tmp_path / "runner-temp")
     result = _entry_point(tmp_path, workspace, _caller_policy(tmp_path), **overrides)
+    inventory = workspace / "result.json"
+    assert inventory.is_file(), result.stderr
+    model = _model(inventory)
+    assert model["signing_status"] == "sigstore-signed"
+    assert model["signing_identity"] == SIGNER
     if runner_temp:
-        assert "outside every repository that holds it" not in result.stderr
-        assert _model(workspace / "result.json")["signing_status"] == "sigstore-signed"
         assert not any((tmp_path / "runner-temp").iterdir())
-    else:
-        # Without RUNNER_TEMP the snapshot falls back to TMPDIR, inside the repository.
-        assert result.returncode != 0
-        assert "outside every repository that holds it" in result.stderr
     assert not any(checkout_tmp.iterdir())
 
 

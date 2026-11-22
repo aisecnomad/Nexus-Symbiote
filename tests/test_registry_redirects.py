@@ -1058,3 +1058,51 @@ def test_pip_configuration_is_read_as_configparser_reads_it(head, body):
     text = head + body
     ours = _pip_config(text)
     assert (None if ours is None else set(ours)) == _configparser_index_settings(text)
+
+
+@pytest.mark.parametrize(
+    "files, gap",
+    [
+        (
+            {
+                "pyproject.toml": '[project]\nname = "app"\nversion = "1"\n'
+                'dependencies = ["openai==1.5.0"]\n[tool.uv]\n'
+                'override-dependencies = [" openai @ https://evil.example/o-0.5.0.whl"]\n'
+            },
+            "pyproject.toml: uv override or constraint not followed",
+        ),
+        (
+            {
+                "pyproject.toml": '[project]\nname = "app"\nversion = "1"\n'
+                'dependencies = ["openai==1.5.0"]\n[tool.uv]\n'
+                'constraint-dependencies = ["\\topenai<1"]\n'
+            },
+            "pyproject.toml: uv override or constraint not followed",
+        ),
+        (
+            {"requirements.txt": PYPI, "uv.toml": 'override-dependencies = ["openai==0.5.0"]\n'},
+            "uv.toml: uv override or constraint not followed",
+        ),
+    ],
+    ids=["tool-uv-override-leading-space", "tool-uv-constraint-leading-tab", "uv-toml-override"],
+)
+def test_uv_overrides_and_constraints_are_gaps_as_uv_reads_them(tmp_path, files, gap):
+    result, _ = _collect(tmp_path, files)
+    assert gap in result.surfaces_excluded
+    (component,) = [c for c in result.components if c.name == "openai"]
+    if "constraint" not in str(files):
+        # An override replaces the declaration; a constraint only narrows it.
+        assert component.package_url is None
+
+
+@pytest.mark.parametrize("key", ["requirement", "constraint", "editable", "--Constraint"])
+def test_pip_conf_package_settings_are_gaps_named_by_key(tmp_path, key):
+    result, _ = _collect(
+        tmp_path, {"requirements.txt": PYPI, "pip.conf": f"[install]\n{key} = deps/x.txt\n"}
+    )
+    name = key.lower().removeprefix("--")
+    assert [g for g in result.surfaces_excluded if g.startswith("pip.conf:")] == [
+        f"pip.conf:{name}: {RegistryScanner._PACKAGE_OPTIONS['--' + name]}"
+    ]
+    (component,) = [c for c in result.components if c.name == "openai"]
+    assert component.package_url is None
