@@ -29,6 +29,7 @@ from array import array
 from bisect import bisect_left
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import date
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -1185,7 +1186,7 @@ def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
     return literal_value(word)
 
 
-def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
+def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = False) -> list[Hit]:
     """The hits of a ``NAME=value`` word, ``--name=value`` and ``--env=NAME=value`` included.
 
     cmd's ``set API_TOKEN=Bearer <token>`` leaves the credential in the next word.
@@ -1210,11 +1211,30 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     words = name_words(name)
     if not variable and value.lower() == "token" and words and words[-1] in _PUBLIC_TOKEN_SELECTORS:
         return hits
-    credential_binding = _scheme_assignment_name(name)
+    if in_set:
+        # cmd's SET takes the rest of the assignment, including a literal
+        # spelled like an option. The lexer supplies operators as separate words.
+        if (
+            len(following) >= MIN_SECRET_LENGTH
+            and re.fullmatch(r"[-A-Za-z0-9._~+/]+=*", following)
+            and not placeholder(following)
+            and not is_reference(following)
+        ):
+            hits.extend(value_hits(name, f"{value} {following}") or [(SCHEME_CLASS, following)])
+            return hits
+    credential_binding = in_set or _scheme_assignment_name(name)
     # Only a selector can explain a short date or version label. An unfamiliar
     # switch or an ordinary alphabetic word can itself be a bearer credential.
     if not credential_binding and len(following) <= 12 and _MODE_LABEL.fullmatch(following):
-        return hits
+        if not following.isdecimal():
+            return hits
+        try:
+            date.fromisoformat(following)
+        except ValueError:
+            # Only a valid public date can account for an eight-digit mode label.
+            pass
+        else:
+            return hits
     if _scheme_operand(following, credential_binding=credential_binding):
         paired = value_hits(name, f"{value} {following}")
         hits.extend(paired or [(SCHEME_CLASS, following)])
@@ -1241,8 +1261,25 @@ def _user_hits(previous: str | None, word: str, fetcher: bool) -> list[Hit]:
     return [(NAMED_CLASS, password)]
 
 
+def _cmd_set_word(previous: str | None, before_previous: str | None) -> bool:
+    """Whether the preceding word starts a SET command in a cmd command line."""
+    return (
+        previous is not None
+        and previous.casefold() in {"set", "@set"}
+        and (
+            before_previous is None
+            or before_previous.casefold() in {"/c", "/k", "&", "&&", "|", "||", "("}
+        )
+    )
+
+
 def _word_hits(
-    previous: str | None, word: str, following: str | None, fetcher: bool = False
+    previous: str | None,
+    word: str,
+    following: str | None,
+    fetcher: bool = False,
+    *,
+    in_set: bool = False,
 ) -> list[Hit]:
     """The hits of one argument or shell word, given the words around it."""
     flagged = previous is not None and _flag_value(previous, word)
@@ -1250,7 +1287,7 @@ def _word_hits(
     if ":" in word:
         hits.extend(_header_line_hits(word, explicit=_explicit_header(previous, word)))
     if "=" in word:
-        hits.extend(_assignment_word_hits(word, following))
+        hits.extend(_assignment_word_hits(word, following, in_set=in_set))
     if (":" in word or "=" in word) and _PLAIN_ASSIGNMENT.fullmatch(word) is None:
         hits.extend(assignment_hits(word))
     hits.extend(_user_hits(previous, word, fetcher))
@@ -1258,7 +1295,13 @@ def _word_hits(
 
 
 def _argument_hits(
-    previous: str | None, argument: str, fetcher: bool = False, following: str | None = None
+    previous: str | None,
+    argument: str,
+    fetcher: bool = False,
+    following: str | None = None,
+    *,
+    cmd: bool = False,
+    before_previous: str | None = None,
 ) -> list[Hit]:
     """The hits of a launch argument.
 
@@ -1270,7 +1313,13 @@ def _argument_hits(
     is never a ``NAME=value`` or a literal.
     """
     if not any(char.isspace() for char in argument):
-        return _word_hits(previous, argument, following, fetcher)
+        return _word_hits(
+            previous,
+            argument,
+            following,
+            fetcher,
+            in_set=cmd and _cmd_set_word(previous, before_previous),
+        )
     flagged = previous is not None and _flag_value(previous, argument)
     hits = value_hits(previous if flagged and previous else "", argument)
     hits.extend(_header_line_hits(argument, explicit=_explicit_header(previous, argument)))
@@ -1280,7 +1329,8 @@ def _argument_hits(
     fetcher = fetcher or not _FETCHERS.isdisjoint(map(posixpath.basename, words))
     around: list[str | None] = [None, *words, None]
     for index, word in enumerate(words, start=1):
-        hits.extend(_word_hits(around[index - 1], word, around[index + 1], fetcher))
+        start = cmd and _cmd_set_word(around[index - 1], around[index - 2] if index > 1 else None)
+        hits.extend(_word_hits(around[index - 1], word, around[index + 1], fetcher, in_set=start))
     return hits
 
 
@@ -1309,15 +1359,23 @@ def _credential_hits(
             hits.extend(value_hits(name, value))
             hits.extend(_header_line_hits(value, explicit=False))
         yield ("env", name, hits)
+    cmd = isinstance(command, str) and posixpath.basename(
+        command.replace("\\", "/")
+    ).casefold() in {"cmd", "cmd.exe"}
+    before_previous: str | None = None
     previous: str | None = None
     for index, argument in enumerate(args, start=1):
         if isinstance(argument, str):
             after = args[index] if index < len(args) else None
             following = after if isinstance(after, str) else None
-            yield ("argument", str(index), _argument_hits(previous, argument, fetcher, following))
-            previous = argument
-        else:
-            previous = None
+            yield (
+                "argument",
+                str(index),
+                _argument_hits(
+                    previous, argument, fetcher, following, cmd=cmd, before_previous=before_previous
+                ),
+            )
+        before_previous, previous = previous, argument if isinstance(argument, str) else None
     headers = [item for mapping in header_maps for item in mapping.items()]
     for name, value in sorted(headers, key=lambda item: item[0]):
         hits = _name_hits(name)
@@ -1388,7 +1446,11 @@ def _declared_hits(config: dict[str, Any]) -> PositionHits:
     env, args = config.get("env"), config.get("args")
     maps = [m for m in (config.get("headers"), config.get("http_headers")) if isinstance(m, dict)]
     args = args if isinstance(args, list) else []
-    return list(_credential_hits(env if isinstance(env, dict) else {}, args, maps, ()))
+    return list(
+        _credential_hits(
+            env if isinstance(env, dict) else {}, args, maps, (), config.get("command", "")
+        )
+    )
 
 
 def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
