@@ -32,7 +32,7 @@ def test_sdk_annotation_keeps_server_sensitive_operands_visible(tmp_path, annota
 
 
 @pytest.mark.parametrize("regular", [True, False])
-def test_sdk_submodule_is_checkout_code_only_with_a_regular_parent(tmp_path, regular):
+def test_qualified_sdk_import_stays_unresolved_with_either_checkout_layout(tmp_path, regular):
     agents = tmp_path / "agents"
     agents.mkdir()
     if regular:
@@ -42,7 +42,7 @@ def test_sdk_submodule_is_checkout_code_only_with_a_regular_parent(tmp_path, reg
     result = MCPScanner().scan(tmp_path)
     assert any(c.name == "notes" for c in result.components)
     gaps = [g for g in result.surfaces_excluded if "unresolved Python SDK tool import" in g]
-    assert bool(gaps) is (not regular)
+    assert gaps
 
 
 @pytest.mark.parametrize("entry", ["mcp.py", "server.py"])

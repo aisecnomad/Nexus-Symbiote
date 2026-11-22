@@ -48,7 +48,7 @@ def test_partial_search_root_cannot_exempt_a_framework_import(tmp_path, entry, l
 def test_package_entry_reports_possible_script_path_resolution(tmp_path, module, files):
     _write(tmp_path, "worker/__init__.py", "")
     for path in files:
-        _write(tmp_path, path, "def configure(): return 'sample'\n")
+        _write(tmp_path, path, "from local_config import configure\n")
     _write(
         tmp_path, "worker/server.py", f"from {module} import FastMCP\nserver = FastMCP('sample')\n"
     )
@@ -136,3 +136,25 @@ def test_plain_sibling_evidence_respects_the_python_node_budget(tmp_path, assign
         result = MCPScanner().scan(tmp_path)
     gap = "worker/server.py: Python SDK import may resolve to checkout code"
     assert (gap in result.surfaces_excluded) is (assignments == 30)
+
+
+@pytest.mark.parametrize("attr", ["__file__", "__name__", "__spec__", "__builtins__"])
+def test_passive_helper_rejects_dunder_self_import_alias(tmp_path, attr):
+    """A self-import of a pre-populated dunder attribute succeeds at import time."""
+    _write(tmp_path, "worker/__init__.py", "")
+    _write(
+        tmp_path,
+        "worker/mcp.py",
+        f"from mcp import {attr} as handle\nMARKER = handle\n",
+    )
+    _write(
+        tmp_path,
+        "worker/server.py",
+        "from mcp.server.fastmcp import FastMCP\nserver = FastMCP('sample')\n",
+    )
+    result = MCPScanner().scan(tmp_path)
+    assert (
+        "worker/server.py: Python SDK import may resolve to checkout code"
+        in result.surfaces_excluded
+    )
+    assert not result.components

@@ -1201,7 +1201,8 @@ def _plain_module_names(path: Path, source: _Source, node_limit: int) -> _Passiv
             names.add(stmt.name)
             continue
         if isinstance(stmt, (ast.Import, ast.ImportFrom)) and any(
-            (alias.asname or alias.name).startswith("__") for alias in stmt.names
+            alias.name.startswith("__") or (alias.asname or "").startswith("__")
+            for alias in stmt.names
         ):
             return None
         if isinstance(stmt, ast.Import) and all(
