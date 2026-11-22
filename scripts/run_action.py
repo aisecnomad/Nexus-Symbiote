@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -132,16 +133,20 @@ def _within(workspace: Path, value: str, name: str) -> Path:
     return path
 
 
-def _caller_owned(workspace: Path, value: str, name: str, limit: int) -> bytes:
+def _caller_owned(
+    workspace: Path, value: str, name: str, limit: int, *, trust_anchor: bool = False
+) -> bytes:
     from nexus_symbiote.core.hashing import open_regular_file
+    from nexus_symbiote.signature_policy import _repository_roots
 
     outside = f"{name} must be an absolute path outside GITHUB_WORKSPACE"
+    untrusted = [workspace, *_repository_roots(workspace)] if trust_anchor else [workspace]
     path = Path(value)
     if (
         any(c in value for c in "\r\n\x00")
         or not path.is_absolute()
         or ".." in path.parts
-        or path.is_relative_to(workspace)
+        or any(path.is_relative_to(root) for root in untrusted)
     ):
         raise InputError(outside)
     try:
@@ -149,16 +154,23 @@ def _caller_owned(workspace: Path, value: str, name: str, limit: int) -> bytes:
         # ancestors' device and inode with the workspace also catches aliases
         # that a lexical check misses: case-insensitive names and bind mounts.
         with open_regular_file(path) as stream:
+            info = os.fstat(stream.fileno())
+            ancestors = {(s.st_dev, s.st_ino) for s in map(os.stat, path.parents)}
+            untrusted_ids = {(s.st_dev, s.st_ino) for s in map(os.stat, untrusted)}
+            if untrusted_ids & ancestors:
+                raise InputError(outside)
+            if info.st_nlink != 1:
+                raise InputError(
+                    f"{name} must not be a hard link, which can alias a workspace file"
+                )
+            if trust_anchor:
+                from nexus_symbiote.utils.crypto import _trust_anchor_error
+
+                if (reason := _trust_anchor_error(path, info)) is not None:
+                    raise InputError(f"{name} {reason}")
             content = stream.read(limit + 1)
-            links = os.fstat(stream.fileno()).st_nlink
-        ancestors = {(s.st_dev, s.st_ino) for s in map(os.stat, path.parents)}
     except OSError:
         raise InputError(f"{name} must be a regular file reached without symlinks") from None
-    root = os.stat(workspace)
-    if (root.st_dev, root.st_ino) in ancestors:
-        raise InputError(outside)
-    if links != 1:
-        raise InputError(f"{name} must not be a hard link, which can alias a workspace file")
     if len(content) > limit:
         raise InputError(f"{name} exceeds the byte limit")
     return content
@@ -249,7 +261,9 @@ class Config:
 
         policy = env.get("SYMBIOTE_SIGNATURE_POLICY", "")
         signers = (
-            _caller_owned(workspace, policy, "signature-policy", MAX_POLICY_BYTES)
+            _caller_owned(
+                workspace, policy, "signature-policy", MAX_POLICY_BYTES, trust_anchor=True
+            )
             if policy
             else None
         )
@@ -349,6 +363,34 @@ class Config:
             trusted_verifiers,
             attest,
         )
+
+
+def _scratch_parent(config: Config) -> Path | None:
+    if config.signature_policy is None:
+        return config.scratch_parent
+
+    from nexus_symbiote.signature_policy import _repository_roots
+    from nexus_symbiote.utils.crypto import _trust_anchor_error
+
+    candidates = [config.scratch_parent] if config.scratch_parent is not None else []
+    with suppress(OSError):
+        candidates.append(Path(tempfile.gettempdir()))
+    if os.name == "posix":
+        # Apply the same ownership and sticky-bit checks to the system fallback.
+        candidates.append(Path("/tmp"))  # noqa: S108
+    untrusted = (config.workspace, *_repository_roots(config.workspace))
+    for candidate in dict.fromkeys(candidates):
+        try:
+            directory = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if any(directory.is_relative_to(root) for root in untrusted):
+            continue
+        if _trust_anchor_error(directory, None) is None and os.access(directory, os.W_OK | os.X_OK):
+            return directory
+    raise ActionError(
+        "signature-policy needs a writable temporary directory with trusted ancestors outside the project and its repositories"
+    )
 
 
 def _run(
@@ -620,7 +662,7 @@ def run(
 
     _announce(config)
     with tempfile.TemporaryDirectory(
-        prefix="nexus-symbiote-action-", dir=config.scratch_parent
+        prefix="nexus-symbiote-action-", dir=_scratch_parent(config)
     ) as created:
         # The CLI refuses symlinked directories, and macOS temp paths contain one.
         scratch = Path(created).resolve(strict=True)
@@ -634,9 +676,11 @@ def run(
         signers: list[str] = []
         if config.signature_policy is not None:
             # Collection, validation and risk read one snapshot of the caller's trust root.
-            snapshot = scratch / "signature-policy.json"
-            snapshot.write_bytes(config.signature_policy)
-            signers = ["--signature-policy", str(snapshot)]
+            with tempfile.NamedTemporaryFile(
+                dir=scratch, prefix="signature-policy-", suffix=".json", delete=False
+            ) as snapshot:
+                snapshot.write(config.signature_policy)
+            signers = ["--signature-policy", snapshot.name]
             digest = hashlib.sha256(config.signature_policy).hexdigest()
             out.emit(signature_policy_digest=f"sha256:{digest}")
         unsigned = ["--allow-unsigned-discovery"] if config.allow_unsigned_discovery else []
