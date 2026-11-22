@@ -785,9 +785,10 @@ def match_offline_advisories(
             ):
                 eco_dated[eco_key] = adv.dated
     db_dated = max((adv.dated for adv in records if adv.dated is not None), default=None)
-    feed_errors = [
-        _feed_age_error("offline advisory DB", "newest record", db_dated, now, max_feed_age_days)
-    ]
+    db_age_err = _feed_age_error(
+        "offline advisory DB", "newest record", db_dated, now, max_feed_age_days
+    )
+    feed_errors = [db_age_err]
 
     kev_index: dict[str, list[_KEVEntry]] = {}
     kev_provenance: list[dict[str, Any]] = []
@@ -877,19 +878,20 @@ def match_offline_advisories(
             continue
         targets.append((comp.bom_ref, eco, name, version))
 
-    queried_ecosystems: dict[str, str] = {}
-    for _, eco, _, _ in targets:
-        queried_ecosystems.setdefault(eco.lower(), eco)
-    for eco_key, eco_label in sorted(queried_ecosystems.items()):
-        eco_err = _feed_age_error(
-            f"offline advisory DB ({eco_label})",
-            "newest record",
-            eco_dated.get(eco_key),
-            now,
-            max_feed_age_days,
-        )
-        if eco_err is not None:
-            report.errors.append(eco_err)
+    if db_age_err is None:
+        queried_ecosystems: dict[str, str] = {}
+        for _, eco, _, _ in targets:
+            queried_ecosystems.setdefault(eco.lower(), eco)
+        for eco_key, eco_label in sorted(queried_ecosystems.items()):
+            eco_err = _feed_age_error(
+                f"offline advisory DB ({eco_label})",
+                "newest record",
+                eco_dated.get(eco_key),
+                now,
+                max_feed_age_days,
+            )
+            if eco_err is not None:
+                report.errors.append(eco_err)
 
     if len(targets) > MAX_OFFLINE_COMPONENTS:
         report.errors.append(
