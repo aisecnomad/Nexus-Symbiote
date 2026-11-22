@@ -20,7 +20,8 @@ from nexus_symbiote.scanners.base import sanitized_origin
 from nexus_symbiote.scanners.mcp import _MIN_SOURCE_BINDING_KEY_LENGTH, SOURCE_BINDING_KEY_ENV
 
 ORIGIN_PATHS = frozenset({"", "/"})
-_HOSTNAME = re.compile(r"[\w.-]+|[0-9a-f:.]+")
+# ASCII only: a non-ASCII host is an ambiguous authority, not a plain name.
+_HOSTNAME = re.compile(r"[\w.-]+|[0-9a-f:.]+", re.ASCII)
 # A2A 1.0 gRPC interfaces give a "hostname:port" address without a scheme.
 _HOST_PORT = re.compile(r"(?:(?:[\w-]+\.)+[\w-]+|localhost|\[[0-9a-f:.]+\]):\d{1,5}", re.I)
 _SPECIAL_SCHEME = re.compile(r"(ftp|https?|wss?):(?!//)", re.I)
