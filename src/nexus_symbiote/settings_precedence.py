@@ -13,7 +13,6 @@ repository are not observed during static scans and are outside this model.
 
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import re
 from bisect import bisect_right
@@ -327,12 +326,9 @@ def _spec_runs_arbitrary_command(spec: str) -> bool:
 
 
 def _base_matches_destructive_tool(base: str) -> bool:
-    lowered = base.strip().lower()
-    if lowered in _EXACT_DESTRUCTIVE_TOOLS:
-        return True
-    if "*" in lowered or "?" in lowered:
-        return any(fnmatch.fnmatchcase(tool, lowered) for tool in _EXACT_DESTRUCTIVE_TOOLS)
-    return False
+    # A glob in the tool name of an allow rule (`Ba*`, `*`) is skipped by Claude Code and
+    # approves nothing, so only an exact destructive tool name can carry a grant.
+    return base.strip().lower() in _EXACT_DESTRUCTIVE_TOOLS
 
 
 def _narrow_spec_is_destructive(base: str, spec: str) -> bool:
@@ -851,9 +847,20 @@ def _try_parse_frontmatter(language: str, raw: str) -> dict[str, Any] | None:
         return None
 
 
+_DOTS_LINE_RE = re.compile(r"\.\.\.[ \t]*(?:\r\n|\r|\n|\Z)")
+
+
 def _parse_frontmatter_candidates(
     candidates: list[tuple[str, str, str]],
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], bool, bool]:
+    """Parse the `...` reading, the `---` reading and, failing that, the tail after `...`.
+
+    Returns ``(metas, primary_ok, tail_ok)``. ``tail_ok`` is false when the `---` reading
+    does not parse and the text after its `...` line does not parse on its own either.
+    Such a file is reported as invalid, as a `---`-only parser refuses it, rather than
+    read as if the tail were absent: the tail is where a smuggled server or activation
+    would sit.
+    """
     metas: list[dict[str, Any]] = []
     first_lang, first_raw, _ = candidates[0]
     if not first_raw.strip():
@@ -863,6 +870,7 @@ def _parse_frontmatter_candidates(
         primary_ok = parsed is not None
         if parsed is not None:
             metas.append(parsed)
+    tail_ok = True
     if len(candidates) == 2:
         alt_lang, alt_raw, _ = candidates[1]
         if alt_raw.strip():
@@ -871,16 +879,19 @@ def _parse_frontmatter_candidates(
                 metas.append(alt_meta)
                 primary_ok = True
             elif primary_ok and len(alt_raw) > len(first_raw):
-                # Dual `...` / `---` reading: strip the `...` line to parse smuggled tail.
-                tail = alt_raw[len(first_raw) :]
-                _, _, after_dots = tail.partition("\n")
-                if not after_dots and "\r" in tail:
-                    _, _, after_dots = tail.partition("\r")
-                if after_dots.strip():
+                dots = _DOTS_LINE_RE.match(alt_raw, len(first_raw))
+                after_dots = None if dots is None else alt_raw[dots.end() :]
+                if after_dots is None:
+                    tail_ok = False
+                elif after_dots.strip():
                     tail_meta = _try_parse_frontmatter(alt_lang, after_dots)
-                    if tail_meta is not None:
+                    if tail_meta is None:
+                        tail_ok = False
+                    else:
                         metas.append(tail_meta)
-    return metas, primary_ok
+            else:
+                tail_ok = False
+    return metas, primary_ok, tail_ok
 
 
 def scan_subagent_and_rule_frontmatter(
@@ -938,8 +949,8 @@ def scan_subagent_and_rule_frontmatter(
             if not candidates:
                 continue
             first_lang = candidates[0][0]
-            metas, primary_ok = _parse_frontmatter_candidates(candidates)
-            if not primary_ok:
+            metas, primary_ok, tail_ok = _parse_frontmatter_candidates(candidates)
+            if not primary_ok or not tail_ok:
                 if scan_failures is not None:
                     label = first_lang.upper() if first_lang in {"toml", "json"} else "YAML"
                     scan_failures.append(f"{neutralize(rel)}: invalid {label} front matter")

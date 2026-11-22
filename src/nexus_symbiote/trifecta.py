@@ -384,9 +384,8 @@ _IDE_GRANT_LEGS: dict[str, frozenset[str]] = {
     "shell commands": _LEGS,
     "file edits": frozenset({"egress"}),
     "file reads": frozenset({"private"}),
-    # Cross-server wildcards (mcp__*, mcp__*__*, mcp__) auto-approve every tool
-    # of every MCP server without a prompt; single-server grants stay scoped.
-    "every MCP server tool": _LEGS,
+    # A single-server grant (`mcp__docs`, `mcp__docs__*`) stays scoped to that server's
+    # declared tools; Claude Code skips cross-server globs such as `mcp__*` entirely.
     "MCP server tools": frozenset(),
 }
 # An approval record gates its component only when it covers every action or all egress.

@@ -47,6 +47,7 @@ from nexus_symbiote.scanners.mcp import (
 )
 from nexus_symbiote.scanners.source_binding import BindingError, value_binding
 from nexus_symbiote.settings_precedence import (
+    _VERSIONED_INTERPRETER,
     evaluate_tool_oversight,
     extract_bounded_deny_rules,
     extract_bounded_sandbox_domains,
@@ -279,7 +280,6 @@ _COMMAND_RUNNERS = frozenset(
         "docker", "podman", "nerdctl", "npx", "bunx", "uvx", "uv", "pipx",
     }
 )  # fmt: skip
-_VERSIONED_INTERPRETER = re.compile(r"(?:python|pypy|ruby|php|perl|node)[0-9.]*")
 
 
 _RULE_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=\S*")
@@ -336,6 +336,8 @@ def _runs_any_command(program: str, arguments: str, wildcard: bool = False) -> b
     if " " in name and _EVAL_ARGUMENT.match(arguments):
         # A locally named interpreter such as "my python.exe" with an evaluation switch.
         name = name.rsplit(" ", 1)[-1]
+    # `Bash(python3*)` approves every python3 invocation, as `Bash(python3:*)` does.
+    name = name.rstrip("*")
     return name in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(name) is not None
 
 
@@ -356,47 +358,34 @@ def _broad_grants(allowed: list[str]) -> list[str]:
             specifier = rest[:-1].strip()
         key = tool.lower()
         if key.startswith("mcp__"):
+            # A whole-server rule is reported as a blanket grant. Its class carries no
+            # trifecta leg: Claude Code honours an allow glob only after a literal
+            # `mcp__<server>__` prefix and skips an unanchored one such as `mcp__*` or
+            # `mcp__*__*`, which auto-approves nothing (code.claude.com/docs/en/permissions,
+            # "Tool name wildcards"), and a single server's tools are its own declared ones.
             server = key.removeprefix("mcp__")
-            server_part, sep, tool_part = server.partition("__")
-            if not server_part.strip("*") and (not sep or not tool_part.strip("*")):
-                classes.add("every MCP server tool")
-            else:
-                whole_server = "__" not in server or server.endswith("__*")
-                if whole_server and specifier in (None, "", "*"):
-                    classes.add("MCP server tools")
+            whole_server = "__" not in server or server.endswith("__*")
+            if server in {"", "*"} or (whole_server and specifier in (None, "", "*")):
+                classes.add("MCP server tools")
+            continue
+        if "*" in key or "?" in key:
+            # An unanchored allow glob such as `B*` or `Ba*(node:*)` is skipped too.
             continue
         broad = specifier is None or bool(_WILDCARD_SPECIFIER.fullmatch(specifier))
-        matches_bash = key == "bash" or (
-            ("*" in key or "?" in key) and fnmatch.fnmatchcase("bash", key)
-        )
-        if matches_bash and specifier is not None:
+        if key == "bash" and specifier is not None:
             program, arguments = _rule_program(specifier)
             broad |= _runs_any_command(program, arguments, "*" in specifier) or bool(
                 _SUBSHELL_SPECIFIER.fullmatch(program + arguments)
             )
-        matches_webfetch = key == "webfetch" or (
-            ("*" in key or "?" in key) and fnmatch.fnmatchcase("webfetch", key)
-        )
-        if matches_webfetch and specifier is not None:
+        if key == "webfetch" and specifier is not None:
             # `domain:**` and `domain:*.*` match every host, as `domain:*` does.
             domain = specifier.replace(" ", "")
             broad |= domain.startswith("domain:") and not domain[7:].strip("*.")
         if key == "read" and specifier is None:
             # A bare Read grant covers the working directory, as reading does by default.
             continue
-        if broad:
-            if key in _SCOPED_TOOL_CLASSES:
-                classes.add(_SCOPED_TOOL_CLASSES[key])
-            elif "*" in key or "?" in key:
-                for tool_key, label in _SCOPED_TOOL_CLASSES.items():
-                    if tool_key == "read" and specifier is None:
-                        continue
-                    if fnmatch.fnmatchcase(tool_key, key):
-                        classes.add(label)
-                if (specifier is None or bool(_WILDCARD_SPECIFIER.fullmatch(specifier))) and all(
-                    fnmatch.fnmatchcase(probe, key) for probe in ("mcp__alpha__x", "mcp__beta__y")
-                ):
-                    classes.add("every MCP server tool")
+        if broad and key in _SCOPED_TOOL_CLASSES:
+            classes.add(_SCOPED_TOOL_CLASSES[key])
     return sorted(classes)
 
 
@@ -1863,14 +1852,24 @@ def _sudo_shell(words: list[str]) -> bool:
     return False
 
 
-def _expand_env_words(words: list[str]) -> list[str]:
+_MAX_ENV_WRAPPERS = 32
+
+
+def _expand_env_words(words: list[str]) -> list[str] | None:
+    """``words`` with each ``env`` wrapper's payload spliced in, or ``None`` past the budget.
+
+    An ``env`` wrapper left unexpanded could hide a download, so the callers treat
+    ``None`` as one rather than rate the command by the words they could see.
+    """
     if not any("env" in _name_variants(word) for word in words):
         return words
     expanded = list(words)
     idx = 0
     steps = 0
-    while idx < len(expanded) and steps < 32:
+    while idx < len(expanded):
         if "env" in _name_variants(expanded[idx]):
+            if steps >= _MAX_ENV_WRAPPERS:
+                return None
             nxt = _skip_env(expanded, idx + 1)
             idx = nxt if nxt > idx else idx + 1
             steps += 1
@@ -1880,15 +1879,17 @@ def _expand_env_words(words: list[str]) -> list[str]:
 
 
 def _segment_downloads(segment: str) -> bool:
-    return any(
-        _name_variants(word) & _DOWNLOAD_NAMES for word in _expand_env_words(_shell_words(segment))
-    )
+    words = _expand_env_words(_shell_words(segment))
+    return words is None or any(_name_variants(word) & _DOWNLOAD_NAMES for word in words)
 
 
 def _segment_fetches(segment: str) -> bool:
     """Whether a word downloads, or `base64` is given a decode flag among its arguments."""
+    words = _expand_env_words(_shell_words(segment))
+    if words is None:
+        return True
     decoder = False
-    for word in _expand_env_words(_shell_words(segment)):
+    for word in words:
         names = _name_variants(word)
         if names & _DOWNLOAD_NAMES:
             return True
