@@ -1130,15 +1130,19 @@ def _inspect_steering_surfaces(
         ):
             auto_edit_modes.append(f"{s_path}:write-allowance")
         if host == "claude":
-            claude_prompting |= mode in ("default", "plan")
             claude_allows[s_path] = sorted(
                 normalized for rule in allow if (normalized := _claude_mcp_allow(rule)) is not None
             )
-            claude_denies.update(
-                normalized
-                for rule in _as_list(perms.get("deny"))
-                if isinstance(rule, str) and (normalized := _claude_deny_rule(rule)) is not None
-            )
+            # Only committed project settings can clear a committed steering surface;
+            # developer-local overrides (.claude/settings.local.json) must not suppress
+            # findings that still trigger on fresh checkouts.
+            if s_path.rsplit("/", 1)[-1] != "settings.local.json":
+                claude_prompting |= mode in ("default", "plan")
+                claude_denies.update(
+                    normalized
+                    for rule in _as_list(perms.get("deny"))
+                    if isinstance(rule, str) and (normalized := _claude_deny_rule(rule)) is not None
+                )
         if doc.get("approvalPolicy") in ("never", "auto-edit"):
             auto_edit_modes.append(f"{s_path}:{doc['approvalPolicy']}")
 
