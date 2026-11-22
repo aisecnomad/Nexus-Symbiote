@@ -386,12 +386,53 @@ _IDE_GRANT_LEGS: dict[str, frozenset[str]] = {
 _GATING_ACTIONS = frozenset({"*", "egress"})
 _READ_ACTIONS = frozenset({"read", "query", "list", "search", "get"})
 _NAMED_RESOURCE_SCOPE = re.compile(r"[\w-]+(?:/[\w.?*-]+)*/?")
+_TABLE_SCOPE = re.compile(r"table:[^\W\d][\w-]*(?:\.[^\W\d][\w-]*)*")
 _S3_BUCKET_SCOPE = re.compile(
     r"arn:(?:aws|aws-cn|aws-us-gov):s3:::"
     r"(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])(?:/[\w.?*-]+)*/?"
 )
-_NETWORK_SCOPE_NAMES = frozenset(
-    {"api", "ftp", "http", "https", "internet", "intranet", "localhost", "network", "web", "www"}
+_UNBOUNDED_OR_NETWORK_NAMES = frozenset(
+    [
+        "all",
+        "any",
+        "everything",
+        "everywhere",
+        "global",
+        "wildcard",
+        "egress",
+        "api",
+        "cloud",
+        "dns",
+        "endpoint",
+        "external",
+        "ftp",
+        "ftps",
+        "gateway",
+        "host",
+        "http",
+        "https",
+        "imds",
+        "internal",
+        "internet",
+        "intranet",
+        "localhost",
+        "loopback",
+        "mail",
+        "metadata",
+        "network",
+        "outbound",
+        "proxy",
+        "public",
+        "remote",
+        "smtp",
+        "url",
+        "uri",
+        "vpn",
+        "web",
+        "ws",
+        "wss",
+        "www",
+    ]
 )
 _UNGATED_CLAUDE_MODES = frozenset({"bypassPermissions", "acceptEdits"})
 _UNGATED_CODEX_POLICIES = frozenset({"never"})
@@ -634,14 +675,24 @@ def _independent_read(record: AuthorizationRecord) -> bool:
     scope = unicodedata.normalize("NFKC", record.resource_scope)
     if {".", ".."}.intersection(scope.split("/")):
         return False
+    if _TABLE_SCOPE.fullmatch(scope):
+        return True
     bucket = _S3_BUCKET_SCOPE.fullmatch(scope)
     if bucket is not None:
         name = bucket["bucket"]
         return ".." not in name and re.fullmatch(r"\d+(?:\.\d+){3}", name) is None
     if _NAMED_RESOURCE_SCOPE.fullmatch(scope) is None:
         return False
-    name = scope.partition("/")[0].casefold()
-    return name not in _NETWORK_SCOPE_NAMES and any(char.isalpha() for char in name)
+    name = canonical_tool_name(scope.partition("/")[0])
+    words = (part.rstrip("0123456789") for part in name.split("_"))
+    if not _UNBOUNDED_OR_NETWORK_NAMES.isdisjoint(words):
+        return False
+    compact = name.replace("_", "")
+    if re.fullmatch(r"0x[0-9a-f]+|[0-9a-f]{1,8}", compact) and any(
+        char.isdecimal() for char in compact
+    ):
+        return False
+    return any(char.isalpha() for char in name)
 
 
 def _unexpired(record: AuthorizationRecord, now: datetime) -> bool:
