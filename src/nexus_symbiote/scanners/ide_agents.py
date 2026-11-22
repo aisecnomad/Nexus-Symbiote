@@ -1003,26 +1003,65 @@ def _shell_words(segment: str) -> list[str]:
     return [segment[start:end] for start, end in _shell_word_spans(segment)]
 
 
+_NAMED_FD = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+
+
+def _is_zero_fd(word: str) -> bool:
+    return bool(word) and word.isdigit() and set(word) == {"0"}
+
+
 def _redirections(segment: str, spans: list[tuple[int, int]]) -> list[str]:
-    """For each word, the redirection it belongs to: `<` for the target of an input
-    (`<`, `<>`, `<<<`), `>` for an output's, `&` for the descriptor number or `&` written
-    against one (`2>`, `&>`), and an empty string for a word no redirection takes.
+    """For each word, the redirection it belongs to: `<` for the target of a stdin
+    (FD 0) input redirection (`<`, `0<`, `<>`, `<<<`, `<&N` for non-zero `N`), `>` for
+    an output or non-stdin-replacing redirection (`>`, `2>`, `&>`, `3<`, `<&0`), `&` for
+    the descriptor (`2`, `0`, `&`, `{fd}`) written against one, and `""` otherwise.
     """
     marks: list[str] = []
     previous = 0
     continued = ""
-    for start, end in spans:
+    count = len(spans)
+    for idx, (start, end) in enumerate(spans):
         word = segment[start:end]
         gap = segment[previous:start].rstrip(" \t")
         if gap.endswith(("<", "<>")):
-            mark = "<"
+            prev_is_non_stdin_fd = (
+                bool(marks)
+                and marks[-1] == "&"
+                and not _is_zero_fd(segment[spans[idx - 1][0] : spans[idx - 1][1]])
+            )
+            self_dup_stdin = (
+                not gap.endswith(("<<", "<>"))
+                and start > 0
+                and segment[start - 1] == "<"
+                and (
+                    (word.startswith("&") and _is_zero_fd(word[1:]))
+                    or (
+                        word == "&"
+                        and idx + 1 < count
+                        and not segment[end : spans[idx + 1][0]].rstrip(" \t")
+                        and _is_zero_fd(segment[spans[idx + 1][0] : spans[idx + 1][1]])
+                    )
+                )
+            )
+            mark = ">" if (prev_is_non_stdin_fd or self_dup_stdin) else "<"
         elif gap.endswith(">"):
             mark = ">"
         else:
-            # `>|` leaves `|` as a word, and its target may follow after a space.
+            # `>|`, `>&`, and `<&` leave `|` or `&` as a word whose target may follow after a space.
             mark = "" if gap else continued
-        continued = mark if word == "|" else ""
-        if not mark and segment.startswith(("<", ">"), end) and (word.isdigit() or word == "&"):
+        continued = (
+            mark
+            if mark in {">", "<"}
+            and word in {"|", "&"}
+            and start > 0
+            and segment[start - 1] in "<>"
+            else ""
+        )
+        if (
+            not mark
+            and segment.startswith(("<", ">"), end)
+            and (word.isdigit() or word == "&" or _NAMED_FD.fullmatch(word) is not None)
+        ):
             mark = "&"
         marks.append(mark)
         previous = end
@@ -1413,10 +1452,31 @@ def _option_command(words: list[str], index: int, runner: str) -> int | None:
     return None
 
 
-def _executable_index(words: list[str]) -> int | None:
+def _executable_index(
+    words: list[str], marks: list[str] | None = None, *, skip_inputs: bool = False
+) -> int | None:
     """Index of the command `words` run, after wrappers and grouping. None if not run."""
+
+    def _redirection_skip(pos: int) -> int:
+        if marks is None:
+            return 0
+        mark = marks[pos]
+        if mark == ">" or (skip_inputs and mark == "<"):
+            return 1
+        if (
+            mark == "&"
+            and pos + 1 < len(marks)
+            and (marks[pos + 1] == ">" or (skip_inputs and marks[pos + 1] == "<"))
+        ):
+            return 2
+        return 0
+
     index = 0
     while index < len(words):
+        step = _redirection_skip(index)
+        if step:
+            index += step
+            continue
         raw = _decode_word(words[index], drop_ifs=True).strip()
         if raw in {"(", "{", ")", "}"} or words[index] == "!":
             index += 1
@@ -1437,44 +1497,69 @@ def _executable_index(words: list[str]) -> int | None:
             continue
         break
 
+    # Redirections may appear anywhere in a simple command, including between a wrapper
+    # and its options or target (`env 2>/dev/null sh`, `sudo >/dev/null sh`). Filter
+    # skippable redirection words out of the wrapper argv view while mapping back to the
+    # original `words` indices.
+    if marks is not None:
+        argv: list[str] = []
+        orig: list[int] = []
+        pos = index
+        while pos < len(words):
+            step = _redirection_skip(pos)
+            if step:
+                pos += step
+                continue
+            argv.append(words[pos])
+            orig.append(pos)
+            pos += 1
+    else:
+        argv = words[index:]
+        orig = list(range(index, len(words)))
+
     # A wrapper consumes a program from its own argv. Shell assignment syntax
     # does not apply again after that command word.
-    while index < len(words):
-        names = _name_variants(words[index])
+    cur = 0
+    while cur < len(argv):
+        names = _name_variants(argv[cur])
         if "env" in names:
-            index = _skip_env(words, index + 1)
+            cur = _skip_env(argv, cur + 1)
             continue
         wrapper = next(iter(names & _WRAPPERS.keys()), None)
         if wrapper is not None:
-            index = _skip_wrapper(words, index + 1, wrapper)
+            cur = _skip_wrapper(argv, cur + 1, wrapper)
             continue
         if names & {"sudo", "doas"}:
-            index = _skip_sudo(words, index + 1, assignments="sudo" in names)
+            cur = _skip_sudo(argv, cur + 1, assignments="sudo" in names)
             continue
         runner = next(iter(sorted(names & _COMMAND_OPTION_RUNNERS.keys())), None)
         if runner is not None:
-            found = _option_command(words, index + 1, runner)
+            found = _option_command(argv, cur + 1, runner)
             if found is None:
-                return index
-            index = found
+                target = orig[cur]
+                words[target] = argv[cur]
+                return target
+            cur = found
             continue
         if "command" in names:
-            nxt = index + 1
-            if nxt < len(words) and _decode_word(words[nxt], drop_ifs=True) in {"-v", "-V"}:
+            nxt = cur + 1
+            if nxt < len(argv) and _decode_word(argv[nxt], drop_ifs=True) in {"-v", "-V"}:
                 return None
-            while nxt < len(words) and _decode_word(words[nxt], drop_ifs=True) in {"-p", "--"}:
+            while nxt < len(argv) and _decode_word(argv[nxt], drop_ifs=True) in {"-p", "--"}:
                 nxt += 1
-            index = nxt
+            cur = nxt
             continue
         if "exec" in names:
-            index = _skip_exec(words, index + 1)
+            cur = _skip_exec(argv, cur + 1)
             continue
         if "busybox" in names:
-            index += 1
-            if index < len(words) and _decode_word(words[index], drop_ifs=True) == "--":
-                index += 1
+            cur += 1
+            if cur < len(argv) and _decode_word(argv[cur], drop_ifs=True) == "--":
+                cur += 1
             continue
-        return index
+        target = orig[cur]
+        words[target] = argv[cur]
+        return target
     return None
 
 
@@ -1644,7 +1729,7 @@ def _segment_executes(segment: str) -> bool:
     """Whether this pipeline segment runs a shell, `iex`, or an interpreter on stdin."""
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
-    index = _executable_index(words)
+    index = _executable_index(words, _redirections(segment, spans))
     if index is None:
         return _sudo_shell(words)
     names = _name_variants(words[index])
@@ -1922,7 +2007,7 @@ def _executes_saved(segment: str, saved: _Saved, depth: int = 0) -> bool:
         return False
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
-    index = _executable_index(words)
+    index = _executable_index(words, _redirections(segment, spans), skip_inputs=True)
     if index is None:
         return False
     names = _name_variants(words[index])
@@ -2092,9 +2177,10 @@ def _interpreter_program(interpreter: str, args: list[str], saved: set[str]) -> 
 
 def _relayed_names(segment: str) -> set[str]:
     """Files a segment fed a download writes: `tee`/`sponge` operands, `dd of=`, redirections."""
-    words = _shell_words(segment)
+    spans = _shell_word_spans(segment)
+    words = [segment[start:end] for start, end in spans]
     relayed: set[str] = set()
-    index = _executable_index(words)
+    index = _executable_index(words, _redirections(segment, spans))
     names = _name_variants(words[index]) if index is not None else set()
     if index is not None and names & {"tee", "sponge"}:
         for word in words[index + 1 : index + 65]:
@@ -2143,7 +2229,7 @@ def _copies_saved(segment: str, saved: set[str]) -> set[str] | None:
     """
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
-    index = _executable_index(words)
+    index = _executable_index(words, _redirections(segment, spans), skip_inputs=True)
     if index is None:
         return None
     names = _name_variants(words[index])
@@ -2206,7 +2292,7 @@ def _runs_saved_input(segment: str, saved: _Saved) -> bool:
         return False
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
-    index = _executable_index(words)
+    index = _executable_index(words, _redirections(segment, spans), skip_inputs=True)
     if index is None:
         return False
     names = _name_variants(words[index])
@@ -2380,7 +2466,7 @@ def _substitution_exec(pipelines: list[list[str]]) -> bool:
             return True
         spans = _shell_word_spans(segment)
         words = [segment[start:end] for start, end in spans]
-        index = _executable_index(words)
+        index = _executable_index(words, _redirections(segment, spans), skip_inputs=True)
         if index is None:
             continue
         # The command a wrapper or `su -c` runs may itself be the download.
@@ -2552,7 +2638,7 @@ def _computed_powershell(segment: str) -> int | None:
     """
     spans = _shell_word_spans(segment)
     words = [segment[start:end] for start, end in spans]
-    index = _executable_index(words)
+    index = _executable_index(words, _redirections(segment, spans), skip_inputs=True)
     if index is None:
         return None
     word = words[index]
