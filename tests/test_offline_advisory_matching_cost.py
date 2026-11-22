@@ -6,7 +6,9 @@ it cannot decide. The reference below is the pairwise matcher this module replac
 37b3cfce (unparsable upper bounds flag a match, and stop parsable ones excluding a version
 in the interval event order puts them in; limits exclude only a version at or above all of
 them; malformed blocks, an unparsable ``introduced`` and an unparsable queried version are
-errors), kept word for word apart from its names as the oracle.
+errors), kept as the oracle. It differs from that matcher in its names and in the three
+rules of #303: a run of consecutive ``introduced`` events owns the bounds after it together,
+and a range of a type OSV does not define, or with no ``introduced``, is an error.
 """
 
 from __future__ import annotations
@@ -30,8 +32,6 @@ from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.models import RegistryEntryComponent
 from tests.support import scaling_ratio
-
-_SUPPORTED_RANGE_TYPES = frozenset({"ECOSYSTEM", "SEMVER"})
 
 # #296 rates the feed's age against the caller's clock. These tests date every record
 # now, so a feed-age error never stands in for the matching behaviour under test.
@@ -66,10 +66,15 @@ def _reference_range_matches(
     below any limit is in range), or past a parsable bound of an interval with none unparsable.
     """
     raw_type = rng.get("type")
-    if raw_type is not None and (
-        not isinstance(raw_type, str) or raw_type.upper() not in _SUPPORTED_RANGE_TYPES
-    ):
-        return False, [], []
+    if raw_type is not None:
+        if isinstance(raw_type, str) and raw_type.isascii() and raw_type.lower() == "git":
+            return False, [], []
+        if (
+            not isinstance(raw_type, str)
+            or not raw_type.isascii()
+            or raw_type.lower() not in {"ecosystem", "semver"}
+        ):
+            raise ValueError("OSV range type is not supported")
     events = rng.get("events")
     if not isinstance(events, list):
         raise ValueError("OSV range events are not a list")
@@ -93,6 +98,8 @@ def _reference_range_matches(
         else:
             raise ValueError("OSV range event cannot be parsed")
     intros, fixed_versions, last_affected, limits = found.values()
+    if not has_zero_intro and not intros:
+        raise ValueError("OSV range has no introduced event")
 
     cmp(version, version)
     best_intro: str | None = None
@@ -113,12 +120,18 @@ def _reference_range_matches(
         decided = not open_interval and bound not in unparsed
         return decided and (best_intro is None or cmp(best_intro, bound) <= 0)
 
-    owner: str | None = None  # the introduced an event follows; None before the first
+    run: list[str] = []  # the consecutive introduced events an event follows; empty before any
+    bounded = False  # a fixed or last_affected has followed the run
     open_interval = False  # an unparsable bound may close the version's interval
     for kind, value in ordered:
-        owner = value if kind == "introduced" else owner
-        held = owner is None or cmp(owner, best_intro or "0") == 0
-        open_interval |= held and kind in ("fixed", "last_affected") and value in unparsed
+        if kind == "introduced":
+            run, bounded = ([value], False) if bounded else ([*run, value], False)
+            continue
+        if kind == "limit":
+            continue
+        bounded = True
+        held = not run or any(cmp(owner, best_intro or "0") == 0 for owner in run)
+        open_interval |= held and value in unparsed
     if (
         all(x != "*" and x not in unparsed and cmp(version, x) >= 0 for x in limits or ["*"])
         or any(ends_after_intro(fix) and cmp(fix, version) <= 0 for fix in fixed_versions)
@@ -131,27 +144,34 @@ def _reference_range_matches(
 
 def _reference_matches_affected_version(
     affected: dict[str, Any], ecosystem: str, version: str
-) -> tuple[bool, list[str], list[str]]:
-    """(matched, fixed, undecided bounds), empty bounds once a listing or range decides."""
-    fixed_versions: list[str] = []
+) -> tuple[bool, list[str], list[str], str | None]:
+    """Evaluate each range independently; keep a settled match alongside the first error."""
     raw_versions, raw_ranges = affected.get("versions", []), affected.get("ranges", [])
     if not isinstance(raw_versions, list) or not isinstance(raw_ranges, list):
-        raise ValueError("OSV affected versions or ranges are not a list")
-    matched = decided = any(
+        return False, [], [], "OSV affected versions or ranges are not a list"
+    listed = any(
         isinstance(ver, str)
         and (ver == version or _reference_compare(ecosystem, version, ver) == 0)
         for ver in raw_versions
     )
-    undecided: list[str] = []
+    hits = []
+    reason = None
     for rng in raw_ranges:
-        in_range, rng_fixed, rng_unparsed = _reference_range_matches(
-            ecosystem, version, rng if isinstance(rng, dict) else {}
-        )
-        if in_range:
-            matched, decided = True, decided or not rng_unparsed
-            fixed_versions.extend(rng_fixed)
-            undecided.extend(rng_unparsed)
-    return matched, sorted(set(fixed_versions)), [] if decided else sorted(set(undecided))
+        try:
+            matched, fixes, bounds = _reference_range_matches(
+                ecosystem, version, rng if isinstance(rng, dict) else {}
+            )
+        except ValueError as exc:
+            reason = reason or str(exc)
+            continue
+        if matched:
+            hits.append((fixes, bounds))
+    if reason is not None:
+        hits = [(fixes, bounds) for fixes, bounds in hits if not bounds]
+    fixes = sorted({fix for found, _ in hits for fix in found})
+    settled = listed or any(not bounds for _, bounds in hits)
+    bounds = [] if settled else sorted({bound for _, items in hits for bound in items})
+    return listed or bool(hits), fixes, bounds, reason
 
 
 _Block = tuple[str, list[str], list[str]]
@@ -168,13 +188,12 @@ def _reference_blocks(
     undecided: list[tuple[str, str]] = []
     outcomes: list[str | None] = []
     for record_id, affected in blocks:
-        try:
-            hit, fixed, bounds = _reference_matches_affected_version(affected, ecosystem, version)
-        except ValueError as exc:
-            undecided.append((record_id, str(exc)))
-            outcomes.append(str(exc))
-            continue
-        outcomes.append(None)
+        hit, fixed, bounds, reason = _reference_matches_affected_version(
+            affected, ecosystem, version
+        )
+        outcomes.append(reason)
+        if reason is not None:
+            undecided.append((record_id, reason))
         if hit:
             found.append((record_id, fixed, bounds))
     return found, undecided, outcomes
@@ -372,6 +391,8 @@ def test_the_indexed_matcher_reports_what_pairwise_matching_reported(ecosystem):
         "OSV affected versions or ranges are not a list",
         "OSV range events are not a list",
         "OSV range event cannot be parsed",
+        "OSV range has no introduced event",
+        "OSV range type is not supported",
         "OSV range version cannot be compared",
     }
 
@@ -518,17 +539,15 @@ def test_a_random_bundle_gives_the_report_pairwise_matching_gave(tmp_path, monke
                     component.name,
                 ):
                     continue
-                try:
-                    is_match, fixed, undecided = _reference_matches_affected_version(
-                        block, ecosystem, component.version
-                    )
-                except ValueError as exc:
+                is_match, fixed, undecided, reason = _reference_matches_affected_version(
+                    block, ecosystem, component.version
+                )
+                if reason is not None:
                     unlisted_errors += len(errors) >= offline.MAX_OFFLINE_ERRORS
                     if len(errors) < offline.MAX_OFFLINE_ERRORS:
                         errors.append(
-                            f"{component.bom_ref}: offline advisory {adv.record_id}: {exc}"
+                            f"{component.bom_ref}: offline advisory {adv.record_id}: {reason}"
                         )
-                    continue
                 if is_match:
                     hit = matched_by_adv.setdefault(adv.record_id, (adv, [], list(undecided)))
                     hit[1].extend(fixed)
@@ -706,3 +725,28 @@ def test_a_range_with_many_events_spends_the_budget_before_it_is_evaluated(tmp_p
     assert report.advisories == []
     assert len(report.errors) == 1
     assert report.complete is False
+
+
+def test_runs_of_introduced_that_own_unparsable_bounds_cost_what_the_budget_charges():
+    """A range is charged the square of its events, so evaluating it may cost no more.
+
+    The shape: one run of ``introduced`` events that owns many unparsable bounds, then a
+    second run the queried versions fall in. Asking each owned bound for each member of
+    its run, at each position, is cubic (a ratio near 64 at 4x) for a quadratic charge.
+    """
+
+    def run(scale: int) -> None:
+        size = 150 * scale
+        events: list[dict[str, str]] = [{"introduced": f"1.{i}"} for i in range(size)]
+        events += [{"fixed": f"junk{i}!"} for i in range(size)]
+        events += [{"introduced": f"2.{i}"} for i in range(size)]
+        budget = offline._MatchBudget(10**9)
+        matcher = offline._PackageMatcher(
+            "PyPI", [(_advisory("GHSA-run"), {"ranges": [{"events": events}]})], budget
+        )
+        for version in ("1.5", "2.5"):
+            found, undecided = _indexed_blocks(matcher, version, budget)
+            assert [record for record, _, _ in found] == ["GHSA-run"]
+            assert undecided == []
+
+    assert scaling_ratio(run) < 32

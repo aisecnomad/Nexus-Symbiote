@@ -61,22 +61,18 @@ def test_action_rejects_scanner_subset_when_validate_is_enabled(tmp_path: Path) 
     assert set(cfg_all.scanners) == run_action.SCANNERS
 
 
-def test_platforms_workflow_triggers_on_pr_and_runs_confinement_suites() -> None:
-    workflow = yaml.safe_load(
-        (ROOT / ".github/workflows/platforms.yml").read_text(encoding="utf-8")
-    )
+def test_verified_ci_requires_the_full_suite_on_macos() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
     triggers = workflow.get("on", workflow.get(True))
-    assert "pull_request" in triggers
-    macos_steps = workflow["jobs"]["macos"]["steps"]
-    pytest_cmd = next(s["run"] for s in macos_steps if "pytest" in s.get("run", ""))
-    for expected in (
-        "tests/test_confined_links_and_variants.py",
-        "tests/test_confined_bounds.py",
-        "tests/test_prompt_surfaces.py",
-        "tests/test_ide_settings_binding.py",
-        "tests/test_a2a_collection.py",
-    ):
-        assert expected in pytest_cmd
+    assert {"pull_request", "push"} <= set(triggers)
+    macos = workflow["jobs"]["macos"]
+    assert macos["runs-on"].startswith("macos-")
+    assert "macos" in workflow["jobs"]["verified"]["needs"]
+    pytest_cmd = next(s["run"] for s in macos["steps"] if "pytest" in s.get("run", ""))
+    # The whole suite: no file or directory narrows it (test_suite_infrastructure.py
+    # rejects a marker or keyword selection).
+    assert "--strict-skips" in pytest_cmd
+    assert "tests/" not in pytest_cmd and ".py" not in pytest_cmd
 
 
 def test_protect_the_gate_avoids_pull_request_target_head_checkout() -> None:

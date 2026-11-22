@@ -624,6 +624,21 @@ def test_unresolved_inputs_fail_closed_and_project_dir_resolves(tmp_path: Path) 
     assert [b["server_name"] for b in maps.bridged_servers] == ["r"]
 
 
+def test_parser_errors_do_not_copy_document_text_into_gaps(tmp_path: Path) -> None:
+    """A parser's own message can quote the document; the gap names only the failure."""
+    secret = "sk-ant-api03-" + "C" * 44
+    _write(tmp_path / "agent.yaml", f'name: "{secret}\n')
+    _write(tmp_path / ".mcp.json", "{not-json " + secret)
+    claims = tmp_path / "claims.json"
+    _write(claims, "{not-json " + secret)
+    summary = audit_project_control_plane(tmp_path, claims_path=claims)
+    rendered = "\n".join(summary.gaps)
+    assert secret not in rendered
+    assert "agent.yaml: invalid YAML" in summary.gaps
+    assert ".mcp.json: invalid JSON" in summary.gaps
+    assert "claims.json: invalid JSON" in summary.gaps
+
+
 def test_workflow_and_hook_scans_stay_linear() -> None:
     """The on-key rewrite, write classifier and YAML reader are linear in hostile input."""
     newlines = {k: "\n" * (20_000 * k) for k in (1, 4)}
@@ -673,7 +688,7 @@ def test_workspace_variables_installed_executables_and_unresolved_targets(tmp_pa
 
     _write(tmp_path / "decl/agent.yaml", "x: [" + "1, " * 20_000 + "1]\n")
     decl_gaps = audit_project_control_plane(tmp_path / "decl").gaps
-    assert decl_gaps == ["agent.yaml: YAML exceeds 20,000 tokens"]
+    assert decl_gaps == ["agent.yaml: invalid YAML"]
 
 
 def test_named_reads_lift_only_default_excludes(tmp_path: Path) -> None:
@@ -715,3 +730,31 @@ def test_installed_executable_change_is_diffed(tmp_path: Path) -> None:
     assert "[HIGH] hook_network_egress" in res.output
     assert "[ALERT:CRITICAL:declared] launch_target_changed" in res.output
     assert "[INCOMPLETE]" not in res.output
+
+
+def test_token_shaped_names_paths_and_rules_never_reach_any_output(tmp_path: Path) -> None:
+    # Names, paths and rules come from the checkout. The JSON summary copied a token in a
+    # hook target path, an MCP server name and the relationships built from them, while
+    # text mode redacted it; every output is now rendered from one redacted copy.
+    gh = "ghp_" + "C" * 36
+    rule = f"Bash(curl -H 'Authorization: Bearer {gh}' https://x.example)"
+    hook = {"hooks": [{"command": f"bash .claude/hooks/{gh}.sh"}]}
+    settings = {
+        "permissions": {"defaultMode": "acceptEdits", "allow": [rule, "Edit"]},
+        "hooks": {"PreToolUse": [hook]},
+    }
+    _write(tmp_path / "p/.claude/settings.json", json.dumps(settings))
+    _write(tmp_path / f"p/.claude/hooks/{gh}.sh", "echo hi\n")
+    server = {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]}
+    _write(tmp_path / "p/.mcp.json", json.dumps({"mcpServers": {gh: server}}))
+    summary = audit_project_control_plane(tmp_path / "p")
+    assert gh in json.dumps(summary.to_dict())
+    runner = CliRunner()
+    out = tmp_path / "out.json"
+    for extra in (["--json-output"], ["-o", str(out)], []):
+        args = ["audit-control-plane", str(tmp_path / "p"), "--fail-on-severity", "none"]
+        res = runner.invoke(main, [*args, *extra])
+        assert res.exit_code == 0, res.output
+        rendered = res.output + (out.read_text() if out.exists() else "")
+        assert gh not in rendered
+    assert json.loads(out.read_text())["steering_surfaces"]

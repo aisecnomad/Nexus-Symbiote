@@ -116,7 +116,9 @@ jobs:
       # Tests marked locked_only compare what the hash-locked set resolves or generates
       # with committed files; the newest releases differ from it by design.
       - name: Run the full suite on the newest allowed releases
-        run: python -m pytest -vv --strict-skips --durations=20 -m "not locked_only"
+        run: >-
+          python -m pytest -vv --strict-skips --durations=20 -o faulthandler_timeout=280
+          -m "not locked_only"
       - name: Retain the resolved versions
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -145,6 +147,7 @@ jobs:
       - name: Explore new inputs with the randomized Hypothesis profile
         run: >-
           python -m pytest -vv --strict-skips --hypothesis-profile=fuzz -o test_timeout=1800
+          -o faulthandler_timeout=1700
           --hypothesis-show-statistics
           tests/test_properties.py
           tests/test_parser_properties.py

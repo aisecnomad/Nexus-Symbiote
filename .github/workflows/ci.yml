@@ -52,6 +52,44 @@ jobs:
           path: ${{ runner.temp }}/pytest-python-${{ matrix.python }}.log
           if-no-files-found: error
           retention-days: 7
+  # The full suite on macOS, where confinement takes branches Linux never reaches: a
+  # case-insensitive file system and the /private root links.
+  macos:
+    name: Tests macOS Python 3.12
+    runs-on: macos-15
+    # Not yet timed on these runners. The limits give the Linux suite's slowest run
+    # (29 minutes) a margin of about 1.7 for slower process start-up on macOS. The image
+    # has no GNU coreutils, so the step's own limit replaces the Linux jobs' inner
+    # timeout and leaves time to keep the log; a hung test still fails at test_timeout.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install locked full test environment
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.lock
+          python -m pip install --no-deps --no-build-isolation -e .
+          python -m pip check
+      - name: Run full test suite with bounded diagnostics
+        timeout-minutes: 50
+        shell: bash
+        env:
+          PYTEST_LOG: ${{ runner.temp }}/pytest-macos.log
+        run: |
+          python -m pytest -vv --strict-skips --durations=20 -o test_timeout=120 \
+            2>&1 | tee "$PYTEST_LOG"
+      - name: Preserve test diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pytest-log-macos
+          path: ${{ runner.temp }}/pytest-macos.log
+          if-no-files-found: error
+          retention-days: 7
   floor:
     name: Tests at the declared dependency floors
     runs-on: ubuntu-24.04
@@ -219,7 +257,7 @@ jobs:
       - name: Enforce drift-regression and benchmark class recall floors
         env:
           PRECISION_REPORT: ${{ runner.temp }}/precision-gate.json
-        run: python scripts/check_precision_gate.py --out "$PRECISION_REPORT"
+        run: python scripts/check_precision_gate.py --fresh --out "$PRECISION_REPORT"
       - name: Run bounded parser fuzz smoke gate
         run: python scripts/fuzz_parsers.py --iterations 64
       - name: Retain per-case security evidence
@@ -584,6 +622,7 @@ jobs:
     if: always()
     needs:
       - test
+      - macos
       - floor
       - coverage
       - quality
@@ -606,7 +645,7 @@ jobs:
           import os
           import sys
           results = json.loads(os.environ["CI_RESULTS"])
-          expected = {"test", "floor", "coverage", "quality", "distribution", "security-regressions", "dependency-audit", "codeql", "action", "action-annotations", "offline-invariant"}
+          expected = {"test", "macos", "floor", "coverage", "quality", "distribution", "security-regressions", "dependency-audit", "codeql", "action", "action-annotations", "offline-invariant"}
           if not isinstance(results, dict) or set(results) != expected:
               print("Verification metadata does not contain exactly the required jobs")
               sys.exit(1)

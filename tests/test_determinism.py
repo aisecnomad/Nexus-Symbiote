@@ -8,7 +8,6 @@ of the same inventory must be byte-identical. SPDX 3.0.1 requires
 from __future__ import annotations
 
 import json
-import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -23,7 +22,6 @@ from nexus_symbiote.core.aibom import (
     native_document,
     prepare,
 )
-from nexus_symbiote.core.canonical import NAMESPACE
 from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.models import (
     AgentComponent,
@@ -184,19 +182,20 @@ def test_spdx_recover_round_trip_without_timestamp() -> None:
 
 
 def test_vex_has_deterministic_serial() -> None:
-    first = VEXGenerator().generate_json(_fixture_bom())
-    second = VEXGenerator().generate_json(_fixture_bom())
-    assert first == second
+    first_bom, second_bom = _fixture_bom(), _fixture_bom()
+    # Fix producer metadata so this vector also works after a package release.
+    for inventory in (first_bom, second_bom):
+        inventory.metadata.tool_version = "0.2.0"
+    first = VEXGenerator().generate_json(first_bom)
+    assert first == VEXGenerator().generate_json(second_bom)
     document = json.loads(first)
-    assert document["serialNumber"].startswith("urn:uuid:")
-    # The VEX document has its own identity: a uuid5 over the inventory serial
-    # namespaced by format, so it stays distinct from the CycloneDX export
-    # (whose serialNumber is the inventory serial) while remaining
-    # content-derived; the document's bom-link names that CycloneDX export.
-    inventory_serial = _fixture_bom().to_dict()["metadata"]["serial_number"]
-    assert document["serialNumber"] == "urn:uuid:" + str(
-        uuid.uuid5(NAMESPACE, "nexus-symbiote-vex:" + inventory_serial)
+    assert document["serialNumber"] == "urn:uuid:ba81bf78-55da-5d50-a929-69204e539334"
+    inventory_uuid = str(first_bom.metadata.serial_number).removeprefix("urn:uuid:")
+    assert (
+        document["externalReferences"][0]["url"]
+        == f"urn:cdx:{inventory_uuid}/{first_bom.metadata.version}"
     )
+    assert document["serialNumber"] != str(first_bom.metadata.serial_number)
 
 
 def _create_cli_project(tmp_path: Path) -> Path:
