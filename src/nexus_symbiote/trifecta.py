@@ -387,7 +387,25 @@ _GATING_ACTIONS = frozenset({"*", "egress"})
 _READ_ACTIONS = frozenset({"read", "query", "list", "search", "get"})
 _DATA_NAME = r"\w[\w-]*"
 _TABLE_NAME = re.compile(rf"{_DATA_NAME}(?:\.{_DATA_NAME})*")
-_KB_NAME = re.compile(rf"{_DATA_NAME}(?:/{_DATA_NAME})*(?:/\*)?/?")
+# Only a leaf inside a named knowledge base can carry a document extension.
+_KB_PATH = re.compile(rf"{_DATA_NAME}(?:/{_DATA_NAME})*(?:\.{_DATA_NAME})?")
+_KB_DOCUMENT_TYPES = frozenset(
+    {
+        "csv",
+        "docx",
+        "json",
+        "jsonl",
+        "markdown",
+        "md",
+        "mdc",
+        "pdf",
+        "rst",
+        "txt",
+        "xml",
+        "yaml",
+        "yml",
+    }
+)
 _S3_BUCKET_SCOPE = re.compile(
     r"arn:(?:aws|aws-cn|aws-us-gov):s3:::"
     r"(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])(?:/[\w.?*-]+)*/?"
@@ -396,19 +414,39 @@ _DYNAMODB_SCOPE = re.compile(
     r"arn:(?:aws|aws-cn|aws-us-gov):dynamodb:[a-z]{2}(?:-[a-z0-9]+)+-[1-9][0-9]*:"
     r"[0-9]{12}:table/[A-Za-z0-9_.-]{3,255}(?:/index/[A-Za-z0-9_.-]{3,255})?"
 )
+# These spellings are policy selectors, even inside a declared data namespace.
+# Their comparison is separate from tool identity and the explicit modeling API.
 _UNBOUNDED_NAMES = frozenset(
-    {"all", "any", "everyone", "everything", "everywhere", "global", "wildcard"}
-)
-# These lookalikes matter when deciding whether a declared scope names a resource.
-# Leave the shared tool-name and modeling normalization unchanged.
-_SCOPE_LOOKALIKES = str.maketrans({"ԝ": "w", "ᴡ": "w", "ᴇ": "e", "ʙ": "b", "ω": "w", "ǝ": "e"})
+    {"global", "wildcard", "whole", "world", "unrestricted", "unlimited", "universal", "total"}
+) | {
+    quantifier + noun
+    for quantifier in ("all", "any", "every")
+    for noun in (
+        "",
+        "body",
+        "one",
+        "thing",
+        "where",
+        "resource",
+        "scope",
+        "table",
+        "store",
+        "collection",
+        "dataset",
+        "record",
+        "tenant",
+        "object",
+        "item",
+    )
+}
 _NETWORK_NAMES = frozenset(
-    [
+    {
         "ip",
-        "egress",
         "api",
         "cloud",
         "dns",
+        "domain",
+        "egress",
         "endpoint",
         "external",
         "ftp",
@@ -418,6 +456,7 @@ _NETWORK_NAMES = frozenset(
         "http",
         "https",
         "imds",
+        "instancedata",
         "internal",
         "internet",
         "intranet",
@@ -430,16 +469,59 @@ _NETWORK_NAMES = frozenset(
         "proxy",
         "public",
         "remote",
+        "server",
         "smtp",
-        "url",
+        "socket",
+        "ssh",
+        "tcp",
+        "udp",
         "uri",
+        "url",
         "vpn",
         "web",
+        "webhook",
         "ws",
         "wss",
         "www",
-    ]
+    }
 )
+_SCOPE_LOOKALIKES = str.maketrans(
+    {
+        char.casefold(): replacement
+        for char, replacement in {
+            "ԝ": "w",
+            "ᴡ": "w",
+            "ᴇ": "e",
+            "ʙ": "b",
+            "ω": "w",
+            "ǝ": "e",
+            "г": "r",
+            "Ꭺ": "a",
+            "Ꮤ": "w",
+            "ꮃ": "w",
+        }.items()
+    }
+)
+_SCOPE_SPELLING = str.maketrans(
+    {"i": "l", "1": "l", "0": "o", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b"}
+)
+
+
+def _scope_selectors(names: frozenset[str]) -> frozenset[str]:
+    """Compare singular and plural selectors under the same spelling rules as the input."""
+    forms = (
+        names
+        | {name + "s" for name in names}
+        | {name[:-1] + "ies" for name in names if name.endswith("y")}
+    )
+    return frozenset(name.translate(_SCOPE_SPELLING) for name in forms)
+
+
+_BROAD_SELECTORS = _scope_selectors(
+    _UNBOUNDED_NAMES
+    | {quantifier + noun for quantifier in ("all", "any", "every") for noun in _NETWORK_NAMES}
+)
+_NETWORK_SELECTORS = _scope_selectors(_NETWORK_NAMES)
 _UNGATED_CLAUDE_MODES = frozenset({"bypassPermissions", "acceptEdits"})
 _UNGATED_CODEX_POLICIES = frozenset({"never"})
 _UNCONFINED_CODEX_SANDBOXES = frozenset({"danger-full-access", "full-access"})
@@ -674,13 +756,58 @@ def _approval_state(
     return required or broad, False
 
 
-def _scope_identifier(part: str, *, knowledge_base: bool) -> bool:
-    normalized = unicodedata.normalize("NFKD", part.casefold().translate(_SCOPE_LOOKALIKES))
-    word = "".join(ch for ch in normalized.translate(_CONFUSABLES).casefold() if ch.isalpha())
-    if not word or word in _UNBOUNDED_NAMES:
+def _scope_identifier(part: str, *, network_words: bool, nested: bool = False) -> bool:
+    if part.isdecimal():
+        # A numeric key below a named resource identifies a record or partition.
+        return nested
+    folded = unicodedata.normalize("NFKD", part).translate(_CONFUSABLES)
+    normalized = _CAMEL_BOUNDARY_RE.sub("_", folded).casefold().translate(_SCOPE_LOOKALIKES)
+    letters = "".join(ch for ch in normalized if ch.isalpha())
+    if not letters:
         return False
-    return not knowledge_base or (
-        word not in _NETWORK_NAMES and word.removesuffix("s") not in _NETWORK_NAMES
+    spelling = "".join(ch for ch in normalized if ch.isalnum())
+    # Read both version-suffixed selectors and spellings with digit substitutions.
+    forms = (letters.translate(_SCOPE_SPELLING), spelling.translate(_SCOPE_SPELLING))
+    if not _BROAD_SELECTORS.isdisjoint(forms):
+        return False
+    words = [word.translate(_SCOPE_SPELLING) for word in _SEPARATOR_RE.split(normalized) if word]
+    if len(words) > 1 and words[0] in _BROAD_SELECTORS:
+        # A quantifier separated from its object need not use a known object name.
+        return False
+    return not network_words or (
+        _NETWORK_SELECTORS.isdisjoint(forms)
+        and not all(word in _NETWORK_SELECTORS for word in words)
+    )
+
+
+def _named_data_scope(kind: str, value: str) -> bool:
+    if kind == "table":
+        if _TABLE_NAME.fullmatch(value) is None:
+            return False
+        parts = value.split(".")
+        # A qualified SQL name can legitimately use a public or internal schema.
+        network_words = len(parts) == 1
+    else:
+        path = value.removesuffix("/")
+        collection = path.endswith("/*")
+        path = path.removesuffix("/*")
+        if _KB_PATH.fullmatch(path) is None:
+            return False
+        parts = path.split("/")
+        if "." in parts[-1]:
+            stem, _, suffix = parts[-1].rpartition(".")
+            if (
+                len(parts) == 1
+                or collection
+                or value.endswith("/")
+                or suffix.casefold() not in _KB_DOCUMENT_TYPES
+            ):
+                return False
+            parts[-1] = stem
+        network_words = True
+    return all(
+        _scope_identifier(part, network_words=network_words, nested=index > 0)
+        for index, part in enumerate(parts)
     )
 
 
@@ -696,15 +823,8 @@ def _independent_read(record: AuthorizationRecord) -> bool:
     kind, colon, value = scope.partition(":")
     if not colon or not kind.isascii():
         return False
-    if kind.lower() == "table":
-        return _TABLE_NAME.fullmatch(value) is not None and all(
-            _scope_identifier(part, knowledge_base=False) for part in value.split(".")
-        )
-    if kind.lower() == "kb":
-        prefix = value.rstrip("/").removesuffix("/*")
-        return _KB_NAME.fullmatch(value) is not None and all(
-            _scope_identifier(part, knowledge_base=True) for part in prefix.split("/")
-        )
+    if kind.lower() in {"table", "kb"}:
+        return _named_data_scope(kind.lower(), value)
     bucket = _S3_BUCKET_SCOPE.fullmatch(scope)
     if bucket is not None:
         name = bucket["bucket"]
