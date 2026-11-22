@@ -1052,10 +1052,10 @@ def _in_place_evaluation_exceeds_budget(schema: dict[str, Any], resolver: Any) -
     pending = [schema]
     graph: dict[int, list[int]] = {}
     descends: dict[int, list[int]] = {}
+    nodes: dict[int, dict[str, Any]] = {}
     annotations: set[int] = set()
     alternatives: set[int] = set()
     widths: dict[int, int] = {}
-    repeated: list[tuple[int, int]] = []
     value_keywords = {
         "additionalItems",
         "additionalProperties",
@@ -1071,6 +1071,7 @@ def _in_place_evaluation_exceeds_budget(schema: dict[str, Any], resolver: Any) -
         node = pending.pop()
         if not isinstance(node, dict) or id(node) in graph:
             continue
+        nodes[id(node)] = node
         applied = _applied_in_place(node, resolver)
         in_place = [child for child in applied if isinstance(child, dict)]
         # A repeated reference repeats the keyword's width too. Checking a
@@ -1104,20 +1105,6 @@ def _in_place_evaluation_exceeds_budget(schema: dict[str, Any], resolver: Any) -
                 subvalues.extend(value.values())
             elif keyword in value_keywords:
                 subvalues.extend(value if isinstance(value, list) else [value])
-            # Tuple/prefix entries and a named property each select one value.
-            # A schema for every item or matching property may run many times.
-            if keyword in {"items", "contains", "additionalItems", "unevaluatedItems"}:
-                many, bound = [value], node.get("maxItems")
-            elif keyword in {"additionalProperties", "unevaluatedProperties", "propertyNames"}:
-                many, bound = [value], node.get("maxProperties")
-            elif keyword == "patternProperties" and isinstance(value, dict):
-                many, bound = list(value.values()), node.get("maxProperties")
-            else:
-                continue
-            count = (
-                min(MAX_JSON_NODES, bound) if type(bound) is int and bound >= 0 else MAX_JSON_NODES
-            )
-            repeated.extend((id(child), count) for child in many if isinstance(child, dict))
         value_schemas = [child for child in subvalues if isinstance(child, dict)]
         descends[id(node)] = [id(child) for child in value_schemas]
         pending.extend(value_schemas)
@@ -1177,27 +1164,194 @@ def _in_place_evaluation_exceeds_budget(schema: dict[str, Any], resolver: Any) -
     # Keep headroom for the worker and the validator's helper frames. Ordinary
     # recursive records need more total hops than the limit at one location.
     stack_limit = min(_MAX_OUTPUT_APPLICATOR_DEPTH, (sys.getrecursionlimit() - 128) // 5)
-    peak_work = validation_steps
+    # An unevaluated-location collector can validate an additional property or
+    # matching item again, including through a reference or an allOf wrapper.
+    annotation_levels = dict.fromkeys(graph, 0)
     for _ in range(MAX_JSON_DEPTH):
-        previous, prior_work = depths, peak_work
-        depths, peak_work = {}, {}
+        previous, prior_levels = depths, annotation_levels
+        depths, annotation_levels = {}, {}
+        rechecked: dict[int, int] = {}
+        below: dict[int, int] = {}
         for current in reversed(topological):
             at_value = max((depths[c] for c in graph[current]), default=0)
             below_value = max((previous[c] for c in descends[current]), default=0)
             depths[current] = 1 + max(at_value, below_value)
             if depths[current] > stack_limit:
                 return True
-            peak_work[current] = max(
-                validation_steps[current],
-                max((peak_work[c] for c in graph[current]), default=0),
-                max((prior_work[c] for c in descends[current]), default=0),
+            rechecked[current] = max((rechecked[c] for c in graph[current]), default=0)
+            below[current] = max(
+                max((below[c] for c in graph[current]), default=-1),
+                max((prior_levels[c] for c in descends[current]), default=-1),
             )
-        if depths == previous and peak_work == prior_work:
+            # To collect a composition's annotations the validator can first
+            # validate the successful arm, including its child instances.
+            for kw in ("allOf", "anyOf", "oneOf"):
+                for arm in nodes[current].get(kw, []):
+                    if isinstance(arm, dict):
+                        rechecked[current] = max(rechecked[current], 1 + below[id(arm)])
+            for keyword in (
+                "additionalProperties",
+                "contains",
+                "unevaluatedItems",
+                "unevaluatedProperties",
+            ):
+                child = nodes[current].get(keyword)
+                if isinstance(child, dict):
+                    rechecked[current] = max(rechecked[current], 1 + prior_levels[id(child)])
+            annotation_levels[current] = max(
+                rechecked[current] if current in annotations else 0,
+                max((annotation_levels[c] for c in graph[current]), default=0),
+                max((prior_levels[c] for c in descends[current]), default=0),
+            )
+            if 2 ** annotation_levels[current] > _MAX_OUTPUT_APPLICATOR_STEPS:
+                return True
+        if depths == previous and annotation_levels == prior_levels:
             break
-    return any(
-        peak_work[c] > 32 and count * peak_work[c] > _MAX_OUTPUT_REPEATED_STEPS
-        for c, count in repeated
-    )
+    return _collection_work_exceeds_budget(id(schema), nodes, graph, topological)
+
+
+def _collection_work_exceeds_budget(
+    root: int, nodes: dict[int, dict[str, Any]], graph: dict[int, list[int]], order: list[int]
+) -> bool:
+    """Estimate repeated validation on conforming results, bounded by their JSON nodes."""
+    work: dict[int, int] = {}
+    footprint: dict[int, int] = {}
+    branching: dict[int, bool] = {}
+    for current in reversed(order):
+        node = nodes[current]
+        enum = node.get("enum", [])
+        # Name lookups and comparisons of scalar constants are cheaper than
+        # descending into a validator. The per-location budget still counts
+        # every property, required name and enum candidate individually.
+        width = 1 + (len(node.get("properties", {})) + len(node.get("required", []))) // 8
+        width += (
+            (len(enum) + 7) // 8
+            if all(not isinstance(x, (list, dict)) for x in enum)
+            else len(enum)
+        )
+        children = graph[current]
+        work[current] = width + sum(work[c] for c in children)
+        branching[current] = any(branching[c] for c in children)
+        for keyword in ("oneOf", "anyOf"):
+            arms = node.get(keyword, [])
+            # A JSON-value union uses disjoint primitive types. At most one of
+            # its array and object branches can recurse at the current value.
+            kinds = {
+                x["type"]
+                for x in arms
+                if isinstance(x, dict)
+                and isinstance(x.get("type"), str)
+                and x.keys() <= {"type", "items", "additionalProperties"}
+            }
+            if len(kinds) < len(arms) or {"integer", "number"} <= kinds:
+                branching[current] = True
+        size = 1
+        if node.get("type") == "object":
+            size += max(len(node.get("required", [])), node.get("minProperties", 0))
+        elif node.get("type") == "array":
+            size += node.get("minItems", 0)
+        # A reference or allOf constrains the same value. Alternative or
+        # conditional branches cannot impose a common minimum individually.
+        if any(k in node for k in _REFERENCES) and len(children) == 1:
+            size = max(size, footprint[children[0]])
+        size = max(
+            size,
+            max(
+                (footprint[id(x)] for x in node.get("allOf", []) if isinstance(x, dict)), default=1
+            ),
+        )
+        for key in ("anyOf", "oneOf"):
+            if options := node.get(key):
+                size = max(
+                    size, min(footprint[id(x)] if isinstance(x, dict) else 1 for x in options)
+                )
+        footprint[current] = int(min(size, MAX_JSON_NODES))
+
+    # Keep each level separate. A recursive reference through a child advances
+    # one level, while all in-place callers are processed before their targets.
+    counts = {root: 1}
+    nested: set[int] = set()
+    for _ in range(MAX_JSON_DEPTH + 1):
+        following: dict[int, int] = {}
+        nested_following: set[int] = set()
+        for current in order:
+            count = counts.get(current, 0)
+            if not count:
+                continue
+            node = nodes[current]
+            count = min(count, MAX_JSON_NODES // footprint[current])
+            costly = work[current] > 32 or (current in nested and branching[current])
+            if costly and count * work[current] > _MAX_OUTPUT_REPEATED_STEPS:
+                return True
+            for child in graph[current]:
+                counts[child] = max(counts.get(child, 0), count)
+                if current in nested:
+                    nested.add(child)
+            items = int(min(node.get("maxItems", MAX_JSON_NODES), MAX_JSON_NODES))
+            properties = int(min(node.get("maxProperties", MAX_JSON_NODES), MAX_JSON_NODES))
+            patterns = node.get("patternProperties", {})
+            comparisons = len(patterns) * min(count * properties, MAX_JSON_NODES)
+            if node.get("uniqueItems") and items:
+                element = node.get("items")
+                sortable = isinstance(element, dict) and element.get("type") in (
+                    "string",
+                    "number",
+                    "integer",
+                )
+                entries = min(count * items, MAX_JSON_NODES)
+                comparisons += (
+                    entries * items.bit_length() if sortable else entries * (items - 1) // 2
+                )
+            if comparisons > 16 * _MAX_OUTPUT_REPEATED_STEPS:
+                return True
+
+            fixed_costs: list[int] = []
+            for keyword, value in node.items():
+                if (
+                    keyword == "properties"
+                    or keyword in ("prefixItems", "items")
+                    and isinstance(value, list)
+                ):
+                    choices = value.values() if isinstance(value, dict) else value[:items]
+                    cardinality = 1
+                    costs = [
+                        work[id(x)]
+                        for x in choices
+                        if isinstance(x, dict) and (branching[id(x)] or work[id(x)] > 32)
+                    ]
+                    if isinstance(value, dict) and len(costs) > properties:
+                        costs.sort(reverse=True)
+                        del costs[properties:]
+                    fixed_costs.extend(costs)
+                elif keyword == "patternProperties":
+                    choices, cardinality = value.values(), properties
+                    matching_work = sum(
+                        work[id(part)] for part in choices if isinstance(part, dict)
+                    )
+                    if (
+                        len(value) > 1
+                        and min(count * properties, MAX_JSON_NODES) * matching_work
+                        > _MAX_OUTPUT_REPEATED_STEPS
+                    ):
+                        return True
+                elif keyword in ("items", "contains", "additionalItems", "unevaluatedItems"):
+                    choices, cardinality = [value], items
+                elif keyword in ("additionalProperties", "unevaluatedProperties", "propertyNames"):
+                    choices, cardinality = [value], properties
+                else:
+                    continue
+                for part in choices:
+                    if isinstance(part, dict):
+                        child = id(part)
+                        following[child] = max(following.get(child, 0), count * cardinality)
+                        if current in nested or count > 1 and cardinality > 1:
+                            nested_following.add(child)
+            if len(fixed_costs) > 1 and count * sum(fixed_costs) > _MAX_OUTPUT_REPEATED_STEPS:
+                return True
+        if not following or (following == counts and nested_following == nested):
+            break
+        counts, nested = following, nested_following
+    return False
 
 
 def _contains_meets_unevaluated_items(nodes: list[dict[str, Any]], resolver: Any) -> bool:
