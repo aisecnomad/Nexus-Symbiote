@@ -403,12 +403,31 @@ def test_text_integers_are_read_whatever_the_int_digit_limit(payload: bytes) -> 
         input=payload,
         capture_output=True,
         check=False,
+        timeout=60,
     )
     assert loaded.stdout.strip() == b"loaded"
     for flavor in ("c", "py"):
         segment = load_segment(payload, len(payload), 0, flavor, Budget(65536, 64))
         assert segment.outcome == "called", flavor
         assert "int-digits" in segment.differs
+
+
+def test_a_literal_past_the_digit_floor_is_not_converted_on_any_walk() -> None:
+    # C-flavour walks re-read the same INT at every frame end they cross (185 walks for
+    # eight crossing stages); converting a 60,000-digit literal on each cost 3 s a file.
+    from nexus_symbiote.utils import pickle_load
+
+    beyond = pickle_load._BEYOND
+    assert pickle_load._py_int(b"1" * 60_000 + b"\n", 10) is beyond
+    assert pickle_load._py_int(b"0" * 5_000 + b"1" * 641, 10) is beyond  # past the floor
+    assert pickle_load._py_int(b"0" * 5_000 + b"1" * 641, 0) is None  # base 0: no leading 0
+    assert pickle_load._py_int(b"-" + b"1" * 5_000, 10) == -beyond
+    assert pickle_load._py_int(b"9" * 640, 10) == int("9" * 640)
+    stage = b"\x95" + (2).to_bytes(8, "little") + b"M\x01\x01N"
+    payload = stage * 8 + b"I" + b"1" * 60_000 + b"\n."
+    segments = list(pickle_load.load_segments(payload, len(payload), 0, "c", Budget(4096, 64)))
+    assert len(segments) > 100
+    assert {segment.outcome for segment in segments} <= {"stop", "unread"}
 
 
 def test_a_memo_index_past_a_c_long_still_fails_the_c_unpickler() -> None:

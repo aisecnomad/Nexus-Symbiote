@@ -101,7 +101,8 @@ VERSION_DIFFERENCES: dict[str, str] = {
         " default, 640 at least, 0 for none: PYTHONINTMAXSTRDIGITS, -X"
         " int_max_str_digits, sys.set_int_max_str_digits). INT, LONG, GET and PUT"
         " text is read as a loader with no limit reads it, whatever limit the scan"
-        " runs under."
+        " runs under; a literal of more than 640 significant digits stands for a"
+        " number past every bound, which is all a walk reads of it."
     ),
 }
 # Differences that change no step here: find_class resolves a dotted name through
@@ -350,6 +351,7 @@ def _c_int(data: bytes, base: int) -> int | None:
 
 
 _DIGIT_FLOOR = 640  # the lowest int_max_str_digits CPython accepts
+_BEYOND = 10**_DIGIT_FLOOR  # above every memo index, byte, length and C long
 
 
 def _py_int(data: bytes, base: int) -> int | None:
@@ -375,18 +377,12 @@ def _py_int(data: bytes, base: int) -> int | None:
         or (base == 0 and digits[:1] == b"0" and digits.strip(b"0"))
     ):
         return None  # not a literal: refused under any limit
-    value = _decimal(digits)
+    significant = digits.lstrip(b"0") or b"0"
+    # A walk reads a number only for its sign, whether it is zero and whether it fits a
+    # bound (a byte, an index, a C long), so a literal past the floor stands for one past
+    # every bound: no conversion, which C-flavour walks would repeat at each frame end.
+    value = _BEYOND if len(significant) > _DIGIT_FLOOR else int(significant)
     return -value if sign == b"-" else value
-
-
-def _decimal(digits: bytes) -> int:
-    # Halves of at most the floor convert under any limit this process runs with;
-    # splitting in two keeps a 64 KiB literal subquadratic.
-    if len(digits) <= _DIGIT_FLOOR:
-        return int(digits)
-    half = len(digits) // 2
-    scale: int = 10 ** (len(digits) - half)
-    return _decimal(digits[:half]) * scale + _decimal(digits[half:])
 
 
 def _digit_limited(data: bytes) -> bool:

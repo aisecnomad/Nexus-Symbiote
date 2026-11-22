@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Iterator
 
 import pytest
 
@@ -16,6 +17,7 @@ from nexus_symbiote.scanners.mcp import (
     MAX_TOOLS_PER_FILE,
     MCPScanner,
 )
+from nexus_symbiote.utils.secrets import SecretScrubber
 from tests.support import scaling_ratio
 
 
@@ -85,7 +87,7 @@ def test_file_descriptor_budget_is_named(tmp_path):
 
 
 @pytest.mark.no_cover
-def test_many_secret_values_times_many_strings_stays_fast(tmp_path):
+def test_many_secret_values_times_many_strings_stays_fast(tmp_path, monkeypatch):
     # The redaction cost was environment values times strings, with no bound on either.
     # Values are bounded now, so at the bound the cost grows with the strings alone;
     # scaling both measures their accepted product, whose ratio is about 6, not 4.
@@ -109,6 +111,35 @@ def test_many_secret_values_times_many_strings_stays_fast(tmp_path):
     server = next(c for c in result.components if isinstance(c, MCPServerComponent))
     assert "credential-value" not in server.model_dump_json()
     assert scaling_ratio(lambda scale: MCPScanner().scan(roots[scale], config_only=True)) < 10
+
+    # With values fixed at the bound, the ratio sees the strings only. Count how often the
+    # scrubber walks its values instead: a few times per scrubbed text, not once per value.
+    walks = [0]
+    covers = [0]
+
+    class _Counted(tuple[str, ...]):
+        __slots__ = ()
+
+        def __iter__(self) -> Iterator[str]:
+            walks[0] += 1
+            return super().__iter__()
+
+    init = SecretScrubber.__init__
+    covered = SecretScrubber._covered
+
+    def counted_init(self: SecretScrubber, values: Iterable[str] = ()) -> None:
+        init(self, values)
+        self._values = _Counted(self._values)
+
+    def counted_covered(self: SecretScrubber, text: str) -> bytearray | None:
+        covers[0] += 1
+        return covered(self, text)
+
+    monkeypatch.setattr(SecretScrubber, "__init__", counted_init)
+    monkeypatch.setattr(SecretScrubber, "_covered", counted_covered)
+    MCPScanner().scan(roots[1], config_only=True)
+    assert covers[0] > 1_000
+    assert walks[0] <= 4 * covers[0] + 64  # 3 per text today: the cover and two prechecks
 
 
 def test_audit_redaction_blowup_shape_fails_fast_with_a_named_limit(tmp_path):
