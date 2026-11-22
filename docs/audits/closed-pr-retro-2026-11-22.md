@@ -33,7 +33,43 @@ wrong.
   still in the same file on `main`, and whether every test function it added still exists by
   name. Every closed-unmerged pull request was measured the same way against its merge base.
 
-<!-- FINDINGS -->
+## Verdict
+
+No Critical finding survived reproduction. **19 High and 39 Medium findings reproduce on
+`main` at `e03f980e`**, most of them sibling forms of a class that a merged pull request
+claimed to close. Four are fixed on this branch with regression tests (below). The rest are
+either already fixed on an open pull request head, recorded in the table with that head, or
+open with a recommended fix. Three earlier reviews were checked independently: of the
+Medium-or-higher findings re-run, Muse's batches gave 23 confirmed, 4 partial and 1 refuted,
+and Antigravity's gave 26 confirmed, 10 partial, 4 refuted and 2 untestable.
+
+The pattern behind most findings is the same: a fix lands for the form a reviewer showed and
+its twin path keeps the old behaviour. Examples are the precision gate added to CI but not
+to the workflow checker's required commands, the trace identity gate added for one candidate
+but not several, the suppression binding added for prompts but not configuration records,
+and the hidden-character decoding added for Markdown front matter but not TOML or YAML
+commands. The structural recommendation at the end addresses that.
+
+## Fixed on this branch
+
+| Commit | Finding | Severity | Where | Test that fails before and passes after |
+| --- | --- | --- | --- | --- |
+| `eba4b73b` | `make lock` applied the checkout's `[tool.uv.sources]` despite `--no-config`, so a pull request could route one dependency to an index it names; the lock showed an ordinary pin and the offline check passed. Reproduced with uv 0.11.32 against a loopback index | High | `scripts/check_locks.py` (`regenerate`, `check`) | `test_regeneration_ignores_package_sources_from_the_checkout`, `test_uv_settings_in_pyproject_fail_the_lock_check` (3 cases) |
+| `a010e6c6` | The precision gate (`--fresh`) and the parser fuzz smoke gate were not required commands, so dropping them or scoring from a committed file kept every check green (#302) | Medium | `scripts/check_workflows.py` (`REQUIRED_COMMANDS`) | two new `test_a_gate_job_hollowed_out_under_its_name_is_rejected` cases, `test_a_precision_gate_scored_from_a_committed_file_is_rejected` |
+| `10307006` | `trace-diff` checked reported definition hashes and SPIFFE IDs only for a single candidate; with two servers sharing a tool name, a foreign or unreadable hash passed with exit 0 (#281). Reproduced on `main` and on #380's head | High | `trace_evidence.py` (`reconcile`, `_gate`, `_findings`) | `test_an_ambiguous_tool_reporting_a_hash_no_candidate_declares_fails_the_gate` (2), `test_an_ambiguous_agent_reporting_a_foreign_spiffe_id_fails_the_gate`, positive control `test_an_ambiguous_tool_reporting_one_candidates_hash_passes` |
+| `1e830999` | A suppression on an MCP, IDE, RAG or A2A record bound no content, so it kept matching after the configuration changed (#133). **Breaking:** such suppressions go stale once | High | `validators/risk.py` (`component_content_digest`) | `test_a_suppression_on_an_mcp_server_does_not_follow_a_changed_configuration` |
+
+Each of these files is also held by open pull request #380. The commits are small and
+self-contained so that #380's fixer can take them, or #380 can land first and this branch
+merges forward.
+
+## Ranked findings still open
+
+Severity and confidence are this review's. "PR status" is the result of running the lane's
+probe against each open head (see [cross-check](#cross-check-against-the-open-pull-requests)).
+
+<!-- OPEN -->
+
 
 ## Landing check, #253–#376
 
