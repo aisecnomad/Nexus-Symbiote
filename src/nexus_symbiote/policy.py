@@ -368,7 +368,11 @@ _bounded_loaders: dict[Any, Any] = {}
 
 
 def flow_depth_error() -> Any:
-    """The ``yaml.YAMLError`` subclass a bounded loader raises past ``max_depth``."""
+    """The ``yaml.YAMLError`` subclass a bounded loader raises outside its flow bounds.
+
+    That is a flow start past ``max_depth`` or a flow end at level zero; the message says
+    which.
+    """
     import yaml
 
     error = _bounded_loaders.get("error")
@@ -388,9 +392,10 @@ def bounded_flow_loader(base: Any = None, *, max_depth: int = MAX_YAML_FLOW_DEPT
     every token, so its time grows with nesting depth, and its ``fetch_flow_collection_end``
     lowers the level with no floor, so a run of ``]`` before a run of ``[`` walks the level
     negative and past any ceiling. The ceiling raises ``flow_depth_error()`` inside the
-    scanner, in PyYAML's own grammar, and the level is clamped at zero, so a stray ``]`` is
-    left for the parser to refuse as it always was. A caller's single ``scan`` or ``load``
-    with this loader is then the whole cost; nothing is scanned twice.
+    scanner, in PyYAML's own grammar, and so does a flow end at level zero: the parser refuses
+    such a token in every context, so the document fails as it always did, only before the
+    level can go negative. A caller's single ``scan`` or ``load`` with this
+    loader is then the whole cost; nothing is scanned twice.
     """
     import yaml
 
@@ -412,9 +417,11 @@ def bounded_flow_loader(base: Any = None, *, max_depth: int = MAX_YAML_FLOW_DEPT
             super().fetch_flow_collection_start(token_class)
 
         def fetch_flow_collection_end(self, token_class: Any) -> None:
+            if self.flow_level <= 0:
+                raise depth_error(
+                    None, None, "flow collection closed without being opened", self.get_mark()
+                )
             super().fetch_flow_collection_end(token_class)
-            if self.flow_level < 0:
-                self.flow_level = 0
 
     _bounded_loaders[key] = BoundedFlowLoader
     return BoundedFlowLoader
@@ -426,8 +433,9 @@ def check_yaml_flow_depth(
     """Raise ``PolicyError`` when ``text`` nests flow collections past ``max_depth``.
 
     A bounded pre-scan for callers that cannot pass ``bounded_flow_loader`` to their own
-    parser; it reads at most ``max_tokens`` tokens. Callers in this package scan or load
-    with the bounded loader directly, which costs nothing extra.
+    parser. It reads at most ``max_tokens`` tokens and refuses a longer document, which it
+    has not checked. A document that is not YAML is left to the caller's parser. Callers in
+    this package scan or load with the bounded loader directly, which costs nothing extra.
     """
     if text.count("[") + text.count("{") + text.count("]") + text.count("}") <= max_depth:
         return
@@ -436,8 +444,10 @@ def check_yaml_flow_depth(
     try:
         for index, _ in enumerate(yaml.scan(text, Loader=bounded_flow_loader(max_depth=max_depth))):
             if index >= max_tokens:
-                return
+                raise PolicyError(f"YAML exceeds the flow-depth check's {max_tokens} tokens")
     except flow_depth_error() as exc:
+        if exc.problem == "flow collection closed without being opened":
+            raise PolicyError("YAML flow collection closed without being opened") from exc
         raise PolicyError(f"YAML flow nesting exceeds depth limit ({max_depth})") from exc
     except yaml.YAMLError:
         return

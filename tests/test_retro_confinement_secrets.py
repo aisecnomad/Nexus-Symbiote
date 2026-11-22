@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -403,13 +404,13 @@ def test_check_yaml_flow_depth_blocks_deep_flow_and_allows_safe_constructs() -> 
         check_yaml_flow_depth(deep_map)
 
     # Strings, comments, CRLF, and indented block scalars must not trigger false positives.
-    # `stray: ]` is not valid YAML; the guard leaves it to the loader, as it does on main.
+    # `stray: b]` is a plain scalar; a bare `]` is not YAML and the guard refuses it.
     safe_yaml = (
         'quoted: "' + "[" * 200 + '\\""\r\n'
         "single: '" + "{" * 200 + "''" + "'\r\n"
         "# " + "[" * 200 + "\n"
         "url: https://example.com/#frag\n"
-        "stray: ]\n"
+        "stray: b]\n"
         "block: | # comment\n"
         "  " + "[" * 200 + "\n"
         "\n"
@@ -464,7 +465,7 @@ def test_rag_and_base_yaml_parsers_reject_flow_nesting_dos_in_linear_time(tmp_pa
         text = (
             "items: " + "[1, " * (MAX_YAML_FLOW_DEPTH // 2) + "1" + "]" * (MAX_YAML_FLOW_DEPTH // 2)
         )
-        check_yaml_flow_depth((text + "\n") * (200 * scale))
+        check_yaml_flow_depth((text + "\n") * (200 * scale), max_tokens=10**6)
 
     assert scaling_ratio(run_depth) < 10
 
@@ -732,12 +733,86 @@ def test_scanner_yaml_with_an_underflow_payload_is_refused_in_linear_time(tmp_pa
     from nexus_symbiote.scanners.rag import RAGScanner
 
     def run(scale: int) -> None:
-        half = 8000 * scale
-        (tmp_path / "rag_config.yaml").write_text("]" * half + "[" * half + "\n", encoding="utf-8")
-        result = RAGScanner().scan(tmp_path)
-        assert any("rag_config.yaml" in failure for failure in result.scan_failures)
+        # Inside both scanners' 20,000-token budgets at every scale, so only the floor
+        # keeps the cost linear.
+        half = 1000 * scale
+        payload = "]" * half + "[" * half + "\n"
+        result = ScanResult(scanner_name="dummy")
+        assert _DummyScanner()._parse_yaml_mapping(Path("x.yaml"), payload, result) is None
+        assert result.scan_failures
+        (tmp_path / "rag_config.yaml").write_text(payload, encoding="utf-8")
+        rag = RAGScanner().scan(tmp_path)
+        assert any("rag_config.yaml" in failure for failure in rag.scan_failures)
 
     assert scaling_ratio(run) < 10
+
+
+def test_each_yaml_scan_and_load_uses_the_bounded_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import nexus_symbiote.policy as policy_module
+    from nexus_symbiote.scanners import rag as rag_module
+
+    made: list[str] = []
+    real = policy_module.bounded_flow_loader
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        bounded = real(*args, **kwargs)
+
+        class Recorded(bounded):  # type: ignore[misc,valid-type]
+            def __init__(self, stream: Any) -> None:
+                made.append(type(self).__mro__[1].__name__)
+                super().__init__(stream)
+
+        return Recorded
+
+    monkeypatch.setattr(policy_module, "bounded_flow_loader", recording)
+    monkeypatch.setattr(rag_module, "bounded_flow_loader", recording)
+
+    result = ScanResult(scanner_name="dummy")
+    assert _DummyScanner()._parse_yaml_mapping(Path("x.yaml"), "a: [1]\n", result) == {"a": [1]}
+    # The scan instantiates the bounded class itself; the load uses a subclass of it.
+    assert made.count("BoundedFlowLoader") == 1, "the base scanner's scan must be bounded"
+
+    made.clear()
+    (tmp_path / "rag_config.yaml").write_text(
+        "vector_store:\n  type: chroma\n  path: ./db\n", encoding="utf-8"
+    )
+    rag_module.RAGScanner().scan(tmp_path)
+    assert sorted(made) == ["BoundedFlowLoader", "Recorded"], "RAG scan and load must be bounded"
+
+
+def test_the_scan_step_refuses_deep_flow_before_any_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    import nexus_symbiote.policy as policy_module
+
+    def no_load(text: str) -> Any:
+        raise AssertionError("the bounded scan should refuse the document first")
+
+    monkeypatch.setattr(policy_module, "parse_yaml_mapping", no_load)
+    depth = MAX_YAML_FLOW_DEPTH + 1
+    result = ScanResult(scanner_name="dummy")
+    payload = "a: " + "[" * depth + "]" * depth + "\n"
+    assert _DummyScanner()._parse_yaml_mapping(Path("x.yaml"), payload, result) is None
+    assert result.scan_failures
+
+
+def test_a_flow_end_at_level_zero_is_a_yaml_error_and_the_guard_refuses_past_its_budget() -> None:
+    import yaml
+
+    from nexus_symbiote.policy import bounded_flow_loader
+
+    with pytest.raises(yaml.YAMLError):
+        list(yaml.scan("a: 1\n]\n", Loader=bounded_flow_loader()))
+    loader = bounded_flow_loader()("a: b]\n")
+    try:
+        assert loader.get_single_data() == {"a": "b]"}
+    finally:
+        loader.dispose()
+    with pytest.raises(PolicyError, match="closed without being opened"):
+        check_yaml_flow_depth("]" * 70 + "\n")
+    with pytest.raises(PolicyError, match="tokens"):
+        check_yaml_flow_depth("- [1]\n" * 40, max_tokens=20)
+    check_yaml_flow_depth("- [1]\n" * 40)
 
 
 def test_deep_flow_nesting_is_refused_by_scanner_and_policy_loader(tmp_path: Path) -> None:
