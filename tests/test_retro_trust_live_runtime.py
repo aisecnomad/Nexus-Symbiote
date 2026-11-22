@@ -712,7 +712,13 @@ def test_trusted_ancestors_rejects_dotdot_and_handles_directory_mount_anchor(
         real_lstat = os.lstat
         real_fstat = os.fstat
         real_stat = os.stat
-        tmp_dir = Path("/tmp")  # noqa: S108
+        # A real two-part directory: on macOS `/tmp` and `/var` are links into
+        # `/private`, which the walk resolves to three parts, so take the first real one.
+        tmp_dir = next(
+            path
+            for path in (Path("/tmp"), Path("/private"), Path("/usr"))  # noqa: S108
+            if path.is_dir() and not path.is_symlink()
+        )
 
         class _StatWrap:
             def __init__(
