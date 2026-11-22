@@ -271,8 +271,12 @@ def run_staged_gate(
         return 2, _line("Error: ", exc)
 
     cli_policy_args: list[str] = []
+    # Collection uses the operator's settings. The checks below apply any stricter checkout floor.
+    supports_operator = _has_option("scan", "--operator-policy")
     scan_extra_args: list[str] = []
-    if _has_option("scan", "--operator-policy"):
+    if not supports_operator or _has_option("scan", "--no-project-policy"):
+        scan_extra_args.append("--no-project-policy")
+    if supports_operator:
         cli_policy_args.extend(["--operator-policy", str(operator_policy_source)])
         if attestation_source is not None:
             cli_policy_args.extend(["--operator-policy-attestation", str(attestation_source)])
@@ -286,7 +290,6 @@ def run_staged_gate(
         # Ignore untrusted checkout .nexus-symbiote.yaml during collection so a PR cannot
         # hide files via scan.exclude_paths, disable collectors via scan.scanners, or
         # trigger the CI weakened-project-policy abort before operator clamping runs.
-        scan_extra_args.append("--no-project-policy")
         for scanner_name in operator_policy.scan.scanners:
             scan_extra_args.extend(["--scanner", scanner_name])
 
@@ -326,6 +329,8 @@ def run_staged_gate(
 
         effective = clamp_operator_floor(operator_policy, project_policy)
         lines = [scan_res.output, f"Policy: operator:{policy_digest}\n"]
+        if project_policy is not None:
+            lines.append("The checkout policy was used only to tighten the operator's checks.\n")
 
         failures = validation_failures(
             bom, resolved_project, effective, accept_default_excludes=accept_default_excludes
@@ -346,8 +351,10 @@ def run_staged_gate(
         if failures or not passed:
             return 1, "".join(lines)
 
-        if _has_option("risk", "--operator-policy"):
+        if supports_operator and _has_option("risk", "--operator-policy"):
             risk_args = list(cli_policy_args)
+            if _has_option("risk", "--no-project-policy"):
+                risk_args.append("--no-project-policy")
             if _has_option("risk", "--accept-default-exclude"):
                 risk_args.extend(accept_args)
             risk_res = runner.invoke(

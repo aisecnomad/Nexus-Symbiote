@@ -46,6 +46,7 @@ from nexus_symbiote.scanners.prompt import (
     _CODEX_SPELLINGS,
     _DECLARATION_SUFFIXES,
     _FOLDED_NESTED_NAMES,
+    _IMPORT,
     _IMPORTING_NAMES,
     _MAX_IMPORT_DEPTH,
     _MAX_IMPORTS,
@@ -59,9 +60,14 @@ from nexus_symbiote.scanners.prompt import (
     _resolve_import,
 )
 from nexus_symbiote.utils.confined import ConfinedCollection, fold_name
-from nexus_symbiote.utils.markdown import commonmark_blocks, hidden_text
+from nexus_symbiote.utils.markdown import (
+    commonmark_block_readings,
+    front_matter_candidates,
+    hidden_text,
+)
 from nexus_symbiote.utils.secrets import redact_metadata, redact_text
 from nexus_symbiote.utils.terminal import echo_line, json_text, neutralize
+from nexus_symbiote.utils.toml import loads as toml_loads
 
 FORMAT = "nexus-symbiote/instruction-diff/v1"
 MAX_FILES = 2000
@@ -76,10 +82,6 @@ TEXT_WITHHELD = "[text withheld: --show-text output limit reached]"
 # in a grant out of memory and output.
 _MAX_GRANT_CHARS = 512
 
-_FRONTMATTER_RE = re.compile(
-    r"\A---[ \t]*\r?\n(?:(.*?)\r?\n)?---[ \t]*(?:\r?\n|\Z)",
-    re.DOTALL,
-)
 _URL_RE = re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{1,31}://[^\s<>\"'`\)\]]+")
 _PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_/:])"
@@ -174,6 +176,7 @@ class _ParsedInstruction:
     inline_tools: tuple[frozenset[str], dict[str, list[tuple[int, int]]]]
     imports: tuple[frozenset[str], dict[str, list[tuple[int, int]]]]
     refs: tuple[frozenset[str], dict[str, list[tuple[int, int]]]]
+    signal_readings: dict[str, tuple[frozenset[str], frozenset[str]]]
 
 
 def _mask_multiline_pem_spans(content: str, *, start_in_pem: bool = False) -> tuple[str, bool]:
@@ -320,25 +323,38 @@ def _uses_frontmatter(rel_path: str) -> bool:
     )
 
 
+def _parse_frontmatter_payload(language: str, raw: str) -> dict[str, Any]:
+    if language == "toml":
+        parsed = toml_loads(raw)
+        if not isinstance(parsed, dict):
+            raise PolicyError("TOML front matter must be a mapping")
+        return parsed
+    return parse_yaml_mapping(raw, max_nodes=MAX_FRONTMATTER_NODES)
+
+
 def _parse_frontmatter(
     rel_path: str, content: str, failures: list[str]
 ) -> tuple[dict[str, Any], str]:
     if not _uses_frontmatter(rel_path):
         return {}, content
-    # Front-matter readers such as gray-matter drop a byte order mark before the delimiter.
-    unmarked = content.removeprefix("\ufeff")
-    match = _FRONTMATTER_RE.match(unmarked)
-    if match is None:
+    candidates = front_matter_candidates(content)
+    if not candidates:
         return {}, content
-    raw_yaml = match.group(1) or ""
-    body = unmarked[match.end() :]
-    if not raw_yaml.strip():
+    language, raw_fm, body = candidates[0]
+    if not raw_fm.strip():
         return {}, body
     try:
-        parsed = parse_yaml_mapping(raw_yaml, max_nodes=MAX_FRONTMATTER_NODES)
-    except (PolicyError, yaml.YAMLError, RecursionError):
-        failures.append(f"{rel_path}: invalid YAML front matter")
-        return _fallback_frontmatter_fields(raw_yaml), body
+        parsed = _parse_frontmatter_payload(language, raw_fm)
+    except (PolicyError, ValueError, yaml.YAMLError, RecursionError):
+        if len(candidates) == 2:
+            alt_lang, alt_raw, alt_body = candidates[1]
+            try:
+                return _parse_frontmatter_payload(alt_lang, alt_raw), alt_body
+            except (PolicyError, ValueError, yaml.YAMLError, RecursionError):
+                pass
+        label = language.upper() if language in {"toml", "json"} else "YAML"
+        failures.append(f"{rel_path}: invalid {label} front matter")
+        return _fallback_frontmatter_fields(raw_fm), body
     return parsed, body
 
 
@@ -443,14 +459,15 @@ def _extract_block_signals(
             tool_locs.setdefault(tok, []).append(loc)
 
         if kind not in {"fence", "indented"}:
-            at_tokens = _import_tokens(block_text)
+            import_tokens = _IMPORT.findall if kind == "literal" else _import_tokens
+            at_tokens = import_tokens(block_text)
             token_line_map: dict[str, int] = {}
             if at_tokens and len(block_text) > MAX_SHOW_TEXT_CHARS:
                 wanted = {tok.rstrip(_TRAILING) for tok in at_tokens}
                 for l_no, l_text in enumerate(block_text.splitlines()):
                     if "@" not in l_text:
                         continue
-                    for cand in _import_tokens(l_text):
+                    for cand in import_tokens(l_text):
                         c = cand.rstrip(_TRAILING)
                         if c in wanted and c not in token_line_map:
                             token_line_map[c] = l_no
@@ -504,8 +521,24 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
     always_apply = str(meta.get("alwaysApply")).strip().lower() == "true"
     fm_grants = _frontmatter_grants(meta)
 
-    blocks = tuple(commonmark_blocks(body))
+    readings = commonmark_block_readings(body)
     hidden = hidden_text(body)
+    if _uses_frontmatter(rel_path):
+        candidates = front_matter_candidates(content)
+        if len(candidates) == 2 and body == candidates[0][2]:
+            dash_body = candidates[1][2]
+            for dash_name, dash_blocks in commonmark_block_readings(dash_body).items():
+                readings[f"frontmatter-dash-{dash_name}"] = dash_blocks
+            dash_hidden = hidden_text(dash_body)
+            hidden = type(hidden)(
+                tuple((Counter(hidden.definitions) | Counter(dash_hidden.definitions)).elements()),
+                tuple((Counter(hidden.html) | Counter(dash_hidden.html)).elements()),
+            )
+    blocks = (
+        tuple(readings["common"])
+        if len(readings) == 1 and "common" in readings
+        else tuple(dict.fromkeys(block for reading in readings.values() for block in reading))
+    )
     comments: list[str] = []
     pos = 0
     while (start := body.find("<!--", pos)) != -1:
@@ -515,6 +548,23 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
         pos = stop
     hidden_sigs = Counter([*comments, *hidden.definitions, *hidden.html])
     inline_tools, imports, refs = _extract_block_signals(blocks)
+    # The same path can be prose under one dialect and a fenced example under
+    # another. Keep the evidence for each reading comparable across revisions.
+    signals = {(blocks): (inline_tools[0], imports[0])}
+    signal_readings = {}
+    for name, reading in readings.items():
+        all_blocks = tuple(reading)
+        prose = tuple(b for b in reading if b[0] not in {"fence", "indented"})
+        # A blank line may end raw HTML and expose an instruction in prose.
+        # Keep the raw HTML signals too, since a host may act on them.
+        inline = tuple(b for b in prose if b[0] in {"paragraph", "heading"})
+        for suffix, selected in (("", all_blocks), ("-prose", prose), ("-inline", inline)):
+            if selected not in signals:
+                tool_signals, import_signals, _ = _extract_block_signals(selected)
+                signals[selected] = (tool_signals[0], import_signals[0])
+            names = ("ascii", "unicode") if name == "common" else (name,)
+            for dialect in names:
+                signal_readings[dialect + suffix] = signals[selected]
     return _ParsedInstruction(
         rel_path=rel_path,
         content=content,
@@ -528,6 +578,7 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
         inline_tools=inline_tools,
         imports=imports,
         refs=refs,
+        signal_readings=signal_readings,
     )
 
 
@@ -965,9 +1016,18 @@ def diff_instruction_trees(
             )
         base_inline_tools = base.inline_tools[0] if base is not None else frozenset()
         head_inline_tools, head_tool_locs = head.inline_tools
-        if base_inline_tools != head_inline_tools:
-            diff_tools = sorted(base_inline_tools ^ head_inline_tools)
-            blk, line_no = _pick_loc(head_tool_locs, changed_indices, changed_set, diff_tools[0])
+        diff_tools = set(base_inline_tools ^ head_inline_tools)
+        base_imports = base.imports[0] if base is not None else frozenset()
+        head_imports, head_import_locs = head.imports
+        added_imports = set(head_imports - base_imports)
+        if base is not None:
+            for name in base.signal_readings.keys() & head.signal_readings.keys():
+                old_tools, old_imports = base.signal_readings[name]
+                new_tools, new_imports = head.signal_readings[name]
+                diff_tools.update(old_tools ^ new_tools)
+                added_imports.update(new_imports - old_imports)
+        if diff_tools:
+            blk, line_no = _pick_loc(head_tool_locs, changed_indices, changed_set, min(diff_tools))
             txt = _get_text(blk, line_no)
             changes.append(
                 InstructionChange(
@@ -980,9 +1040,7 @@ def diff_instruction_trees(
             )
 
         # 3. import_added
-        base_imports = base.imports[0] if base is not None else frozenset()
-        head_imports, head_import_locs = head.imports
-        for imp in sorted(head_imports - base_imports):
+        for imp in sorted(added_imports):
             blk, line_no = _pick_loc(head_import_locs, changed_indices, changed_set, imp)
             txt = _get_text(blk, line_no)
             changes.append(

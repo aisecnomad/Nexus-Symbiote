@@ -118,6 +118,7 @@ class _IdentityBucket:
     has_unspecified_provenance: bool = False
     has_unknown_qualifiers: bool = False
     has_ambiguous_provenance: bool = False
+    has_unverified_redirect: bool = False
 
 
 def _norm_pkg(name: str) -> str:
@@ -1020,6 +1021,8 @@ def _provenance_disagrees(
     bucket = buckets.get(base)
     if bucket is None:
         return False
+    if bucket.has_unverified_redirect and (qualified is not None or unknown):
+        return True
     if bucket.has_ambiguous_provenance or (qualified is None and unknown):
         return True
     if qualified is None:
@@ -1147,6 +1150,21 @@ def import_foreign_sbom(
                 incomplete_identity = True
                 keys_for_existing = ["legacy:" + existing.name]
                 provenance = None
+        if (
+            isinstance(existing, RegistryEntryComponent)
+            and existing.registry_type in {"npm", "pypi"}
+            and not existing.package_url
+            and existing.properties.get("package_sources")
+            and "imported_source_format" not in existing.properties
+        ):
+            # The scanner withheld the installed identity because settings can redirect
+            # it. Match the ecosystem and name for this uncertainty only. A saved lock
+            # URL does not establish which configured registry supplied the package.
+            safe = "/" if existing.registry_type == "npm" else ""
+            raw = f"pkg:{existing.registry_type}/{quote(existing.name, safe=safe)}"
+            record = _purl_provenance(_purl_identity(raw), key)
+            if record is not None:
+                buckets.setdefault(record[0], _IdentityBucket()).has_unverified_redirect = True
         _record_provenance(buckets, provenance, matched_locks.get(id(existing)))
         version_ecosystem = _nested_version_ecosystem(existing)
         comparison_version = existing.version or (purl.version if purl is not None else None)

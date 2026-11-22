@@ -24,6 +24,7 @@ from nexus_symbiote.attestation import MAX_NATIVE_DEPTH, build_statement, sign_s
 from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.runtime import TrustStatus, key_id
+from tests import support as _support
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCUMENT = (ROOT / "docs" / "inventory-attestation.md").read_text(encoding="utf-8")
@@ -897,3 +898,18 @@ def test_documented_reviewer_steps_run_on_a_first_and_a_later_review(
         )
         assert checked.exit_code == 0, checked.output
         assert json.loads(checked.stdout)["source_revision"] == revision
+
+
+@pytest.mark.parametrize("layout", [*_support.REPLACEABLE_ANCHOR_LAYOUTS, "sticky grandparent"])
+def test_trusted_key_that_another_user_could_replace_is_refused(tmp_path, monkeypatch, layout):
+    pem = (
+        Ed25519PrivateKey.generate()
+        .public_key()
+        .public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    )
+    key = _support.trust_anchor_in_layout(tmp_path, layout, "trusted.pub", pem, monkeypatch)
+    if layout == "sticky grandparent":
+        assert attestation_cli._load_trusted_public(key) is not None
+        return
+    with pytest.raises(runtime_cli._KeyFileError, match="group- or world-writable"):
+        attestation_cli._load_trusted_public(key)

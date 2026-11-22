@@ -1417,3 +1417,211 @@ def test_tool_decorator_options_that_name_nothing_keep_the_tool(tmp_path):
     )
     assert [tool.name for tool in tools] == ["lookup"]
     assert not result.surfaces_excluded
+
+
+FASTMCP_SERVER = (
+    "from mcp.server.fastmcp import FastMCP, Context\n"
+    "import helper\n"
+    "mcp = FastMCP('srv')\n"
+    "@mcp.tool()\n"
+    "def ping() -> str:\n"
+    "    return 'pong'\n"
+)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "def setup(x: (Alias := Context)): pass\n",
+        "def setup(x: helper.steal(Context)): pass\n",
+        "def setup(x: 'helper.steal(Context)'): pass\n",
+        "def setup(ctx: Context | helper.steal): pass\n",
+        "from __future__ import annotations\ndef setup(ctx: Context | helper.steal): pass\n",
+    ],
+    ids=["walrus", "call", "string-call", "union-operand", "union-operand-future"],
+)
+def test_a_context_evaluated_as_code_in_an_annotation_is_a_gap(tmp_path, extra):
+    result, tools = scan(tmp_path, FASTMCP_SERVER + extra)
+    assert [tool.name for tool in tools] == ["ping"]
+    assert result.surfaces_excluded == [
+        "pkg/server.py: Python MCP server reachable through a request context"
+    ]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "def f(x: FastMCP | helper.stealer): pass\n",
+        "y: FastMCP | helper.stealer = None\n",
+        "def f(x: 'FastMCP | helper.stealer'): pass\n",
+        "def f(x: list[FastMCP] | helper.stealer): pass\n",
+    ],
+    ids=["parameter", "variable", "string", "subscript-operand"],
+)
+def test_a_server_class_in_a_union_with_code_is_a_gap(tmp_path, extra):
+    result, tools = scan(tmp_path, FASTMCP_SERVER.replace(", Context", "") + extra)
+    assert [tool.name for tool in tools] == ["ping"]
+    assert result.surfaces_excluded == [
+        "pkg/server.py: unsupported Python MCP binding or dynamic registration"
+    ]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "def f(ctx: Context | None, x: int | str) -> str | None: return None\n",
+        "from typing import Optional\ndef f(ctx: Optional[Context], s: FastMCP | None): pass\n",
+        "def f(ctx: 'Context | None'): pass\n",
+    ],
+    ids=["builtin-union", "typing-union", "string-union"],
+)
+def test_unions_of_types_stay_annotations(tmp_path, extra):
+    result, tools = scan(tmp_path, FASTMCP_SERVER.replace("import helper\n", "") + extra)
+    assert [tool.name for tool in tools] == ["ping"]
+    assert result.surfaces_excluded == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import mcp.server.lowlevel\nserver = mcp.server.lowlevel.Server('low')\n",
+        "import mcp.server.lowlevel as ll\nserver = ll.Server('low')\n",
+        "from mcp.server.lowlevel import *\nserver = Server('low')\n",
+        "from mcp.server import lowlevel\nserver = lowlevel.Server('low')\n",
+        "from mcp import server\ns = server.Server('low')\n",
+        "from mcp import server\ns = server.lowlevel.Server('low')\n",
+        "import mcp\nserver = mcp.server.lowlevel.Server('low')\n",
+        "import mcp\nserver = getattr(mcp.server, 'Server')('low')\n",
+    ],
+)
+def test_every_path_to_the_low_level_server_is_a_gap(tmp_path, source):
+    result, tools = scan(tmp_path, source)
+    assert tools == []
+    assert "pkg/server.py: low-level MCP server tool list uncollected" in (result.surfaces_excluded)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "from agents import tool\n@tool.function_tool\ndef t(): pass\n",
+            id="agents-submodule",
+        ),
+        pytest.param(
+            "from pydantic_ai import agent\nag = agent.Agent('m')\n"
+            "@ag.tool_plain\ndef t() -> str: return 'x'\n",
+            id="pydantic-ai-submodule",
+        ),
+        pytest.param(
+            "from pydantic_ai import Tool\nTool(print, name='t')\n",
+            id="tool-class",
+        ),
+        pytest.param(
+            "from langchain_core.tools import StructuredTool\n"
+            "StructuredTool.from_function(print, name='t')\n",
+            id="tool-class-factory",
+        ),
+        pytest.param(
+            "from smolagents.tools import tool as decorators\n"
+            "from smolagents.default_tools import tool\n@tool\ndef t(): pass\n",
+            id="unrecognized-module",
+        ),
+        pytest.param(
+            "from crewai.tools import *\n",
+            id="star",
+        ),
+        pytest.param(
+            "import agents.tool\n@agents.tool.function_tool\ndef t(): pass\n",
+            id="qualified-submodule",
+        ),
+        pytest.param(
+            "from pydantic_ai import agent\n",
+            id="passed-on",
+        ),
+    ],
+)
+def test_unrecognized_framework_imports_are_gaps(tmp_path, source):
+    result, _ = scan(tmp_path, source)
+    assert "pkg/server.py: unresolved Python SDK tool import" in result.surfaces_excluded
+
+
+@pytest.mark.parametrize(
+    ("module", "framework"),
+    [("langchain_core.tools.convert", "langchain"), ("crewai.tools.base_tool", "crewai")],
+)
+def test_framework_decorators_from_their_defining_modules_are_collected(
+    tmp_path, module, framework
+):
+    result, tools = scan(tmp_path, f"from {module} import tool\n@tool\ndef t():\n    '''d'''\n")
+    assert [(tool.name, tool.properties["framework"]) for tool in tools] == [("t", framework)]
+    assert result.surfaces_excluded == []
+
+
+def test_a_framework_type_used_only_in_annotations_is_not_a_gap(tmp_path):
+    result, tools = scan(
+        tmp_path,
+        "from pydantic_ai import Agent, RunContext\nag = Agent('m')\n"
+        "@ag.tool\ndef t(ctx: RunContext[None]) -> str: return 'x'\n",
+    )
+    assert [tool.name for tool in tools] == ["t"]
+    assert result.surfaces_excluded == []
+
+
+def test_a_server_class_name_alone_marks_a_file_for_collection(tmp_path):
+    result, _ = scan(
+        tmp_path,
+        "# tools for our FastMCP instance\nfrom app import srv\n@srv.tool()\ndef t(): pass\n",
+    )
+    assert result.surfaces_excluded == [
+        "pkg/server.py: Python MCP tools registered on an imported server"
+    ]
+
+
+@pytest.mark.parametrize("keyword", ["prepare_tools", "prepare_output_tools"])
+def test_an_agent_prepare_function_is_a_gap(tmp_path, keyword):
+    result, tools = scan(
+        tmp_path,
+        "from pydantic_ai import Agent\nimport helper\n"
+        f"ag = Agent('m', {keyword}=helper.rewrite)\n"
+        "@ag.tool_plain\ndef t() -> str: return 'x'\n",
+    )
+    assert tools == []
+    assert result.surfaces_excluded == [
+        "pkg/server.py: unsupported Python SDK tool binding or dynamic registration"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source", "gap"),
+    [
+        (
+            "from mcp.server.fastmcp import FastMCP\nimport helper\nmcp = FastMCP('srv')\n"
+            "@mcp.tool()\n@helper.rename('other')\ndef ping(): pass\n",
+            "pkg/server.py:4: unresolved Python MCP tool name",
+        ),
+        (
+            "from langchain_core.tools import tool\nimport helper\n"
+            "@tool\n@helper.rename('other')\ndef ping(): pass\n",
+            "pkg/server.py:3: unresolved Python SDK tool name",
+        ),
+        (
+            "from pydantic_ai import Agent\nimport helper\nag = Agent('m')\n"
+            "@ag.tool_plain\n@helper.rename('other')\ndef ping(): pass\n",
+            "pkg/server.py:4: unresolved Python SDK tool name",
+        ),
+    ],
+    ids=["mcp", "framework-decorator", "agent"],
+)
+def test_a_decorator_below_a_registration_is_a_gap(tmp_path, source, gap):
+    result, tools = scan(tmp_path, source)
+    assert tools == []
+    assert gap in result.surfaces_excluded
+
+
+def test_a_decorator_above_a_registration_keeps_the_tool(tmp_path):
+    result, tools = scan(
+        tmp_path,
+        "from mcp.server.fastmcp import FastMCP\nimport helper\nmcp = FastMCP('srv')\n"
+        "@helper.log\n@mcp.tool()\ndef ping(): pass\n",
+    )
+    assert [tool.name for tool in tools] == ["ping"]

@@ -1,9 +1,4 @@
-"""In CI a project policy that weakens a gate is a choice someone has to make.
-
-Outside CI such a policy warns, as before. With a CI variable set, `scan`, `validate`
-and `risk` refuse it unless `--no-project-policy` ignores it or `--accept-project-policy`
-accepts it, as unsigned discovery evidence needs `--allow-unsigned-discovery`.
-"""
+"""Tightening checkout policies apply automatically. Relaxations require operator consent."""
 
 from __future__ import annotations
 
@@ -13,9 +8,9 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from nexus_symbiote.cli import _gate_weakenings, main
+from nexus_symbiote.cli import main
 
-REFUSAL = "weakens the built-in gates and this run looks like CI"
+NOT_APPLIED = "was not applied"
 
 
 def _project(root: Path, policy: str) -> Path:
@@ -36,75 +31,120 @@ def _inventory(tmp_path: Path, project: Path) -> Path:
     return output
 
 
-def test_outside_ci_a_weakening_policy_still_only_warns(tmp_path: Path) -> None:
+def test_a_project_policy_is_not_applied_unless_accepted(tmp_path: Path) -> None:
     project = _project(tmp_path / "project", "scan:\n  failure_mode: report-only\n")
-    run = CliRunner().invoke(main, ["scan", str(project), "-o", str(tmp_path / "out.json")])
-    assert run.exit_code == 0, run.output
-    assert "WARNING: policy" in run.output
-    assert REFUSAL not in run.output
+    output = tmp_path / "out.json"
+    # The pickle is critical. Report-only would exit 0; the built-in gate must not.
+    held = CliRunner().invoke(main, ["scan", str(project), "-o", str(output)])
+    assert held.exit_code == 1, held.output
+    assert NOT_APPLIED in held.output
+    assert "--accept-project-policy" in held.output
+    recorded = CliRunner().invoke(main, ["scan", str(project), "--report-only", "-o", str(output)])
+    assert recorded.exit_code == 0, recorded.output
+    metadata = json.loads(output.read_text())["metadata"]
+    assert not metadata.get("policy_weakened")
+    assert metadata.get("policy_source", "built-in") == "built-in"
+    accepted = CliRunner().invoke(
+        main,
+        ["scan", str(project), "--accept-project-policy", "-o", str(tmp_path / "accepted.json")],
+    )
+    assert accepted.exit_code == 0, accepted.output
+    accepted_meta = json.loads((tmp_path / "accepted.json").read_text())["metadata"]
+    assert accepted_meta.get("policy_weakened")
 
 
-def test_in_ci_scan_refuses_a_weakening_policy_without_an_explicit_choice(
+def test_scan_refuses_an_unreadable_policy_symlink(tmp_path: Path) -> None:
+    project = tmp_path / "checkout cannot be listed"
+    project.mkdir()
+    (project / ".nexus-symbiote.yaml").symlink_to("unused.yaml")
+    (project / "AGENTS.md").write_text("Use the configured tools.\n", encoding="utf-8")
+    output = tmp_path / "inventory.json"
+
+    run = CliRunner().invoke(main, ["scan", str(project), "--report-only", "-o", str(output)])
+
+    assert run.exit_code == 1, run.output
+    assert "policy must not be a symlink" in run.stderr
+    assert not output.exists()
+
+
+def test_in_ci_a_project_policy_is_still_not_applied_without_the_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CI", "true")
     project = _project(tmp_path / "project", "scan:\n  failure_mode: report-only\n")
     output = tmp_path / "out.json"
-    run = CliRunner().invoke(main, ["scan", str(project), "-o", str(output)])
-    assert run.exit_code == 1, run.output
-    assert REFUSAL in run.output
-    assert not output.exists()
+    run = CliRunner().invoke(main, ["scan", str(project), "--report-only", "-o", str(output)])
+    assert run.exit_code == 0, run.output
+    assert NOT_APPLIED in run.output
+    assert "looks like CI" not in run.output
+    metadata = json.loads(output.read_text())["metadata"]
+    assert not metadata.get("policy_weakened")
 
 
 @pytest.mark.parametrize("flag", ["--accept-project-policy", "--no-project-policy"])
-def test_in_ci_an_explicit_choice_lets_scan_run(
+def test_an_explicit_choice_lets_scan_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str
 ) -> None:
     monkeypatch.setenv("CI", "true")
     project = _project(tmp_path / "project", "scan:\n  failure_mode: report-only\n")
     output = tmp_path / "out.json"
-    run = CliRunner().invoke(main, ["scan", str(project), flag, "-o", str(output)])
-    assert REFUSAL not in run.output
+    run = CliRunner().invoke(main, ["scan", str(project), flag, "--report-only", "-o", str(output)])
+    assert "looks like CI" not in run.output
     assert output.exists()
-    # The accepted policy is still reported as weakened; the ignored one is not applied.
     weakened = json.loads(output.read_text())["metadata"].get("policy_weakened") or []
     assert bool(weakened) == (flag == "--accept-project-policy")
+    if flag == "--no-project-policy":
+        assert NOT_APPLIED not in run.output
+    else:
+        assert "weakens the built-in gates" in run.output
 
 
 @pytest.mark.parametrize("command", ["validate", "risk"])
-def test_in_ci_validate_and_risk_refuse_a_weakening_project_policy(
+def test_validate_and_risk_ignore_a_project_policy_until_it_is_accepted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
 ) -> None:
     project = _project(tmp_path / "project", "risk:\n  fail_threshold: 1000000\n")
     inventory = _inventory(tmp_path, project)
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
-    refused = CliRunner().invoke(main, [command, str(inventory), "--project", str(project)])
-    assert refused.exit_code == 1, refused.output
-    assert REFUSAL in refused.output
+    ignored = CliRunner().invoke(main, [command, str(inventory), "--project", str(project)])
+    assert NOT_APPLIED in ignored.output
+    assert "looks like CI" not in ignored.output
     accepted = CliRunner().invoke(
         main, [command, str(inventory), "--project", str(project), "--accept-project-policy"]
     )
-    assert REFUSAL not in accepted.output
     assert "WARNING: policy" in accepted.output
+    assert "fail_threshold" in accepted.output
 
 
-def test_a_stricter_project_policy_is_never_refused_in_ci(
+def test_a_stricter_project_policy_applies_without_the_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CI", "true")
     project = _project(tmp_path / "project", "risk:\n  fail_threshold: 20\n")
-    run = CliRunner().invoke(
-        main, ["scan", str(project), "--report-only", "-o", str(tmp_path / "out.json")]
-    )
+    output = tmp_path / "out.json"
+    run = CliRunner().invoke(main, ["scan", str(project), "--report-only", "-o", str(output)])
     assert run.exit_code == 0, run.output
-    assert REFUSAL not in run.output
+    assert NOT_APPLIED not in run.output
+    metadata = json.loads(output.read_text())["metadata"]
+    assert metadata["policy_source"].startswith("project:")
+    accepted = CliRunner().invoke(
+        main,
+        [
+            "scan",
+            str(project),
+            "--report-only",
+            "--accept-project-policy",
+            "-o",
+            str(tmp_path / "accepted.json"),
+        ],
+    )
+    assert accepted.exit_code == 0, accepted.output
+    accepted_meta = json.loads((tmp_path / "accepted.json").read_text())["metadata"]
+    assert str(accepted_meta.get("policy_source", "")).startswith("project:")
 
 
-def test_only_gate_affecting_relaxations_are_refused_in_ci() -> None:
-    weaker = [
-        "output.default_format=cyclonedx",
-        "risk.fail_threshold=1000000.0",
-        "scan.failure_mode=report-only",
-    ]
-    assert _gate_weakenings(weaker) == weaker[1:]
-    assert _gate_weakenings(["output.default_format=sarif"]) == []
+def test_init_tells_the_operator_how_to_apply_the_created_policy(tmp_path: Path) -> None:
+    result = CliRunner().invoke(main, ["init", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / ".nexus-symbiote.yaml").is_file()
+    assert "--accept-project-policy" in result.output

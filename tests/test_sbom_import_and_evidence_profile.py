@@ -761,7 +761,7 @@ def test_evidence_profile_policy_corroboration_and_pinning_accuracy(tmp_path: Pa
     assert by_ref["pkg:range-with-hash"]["evidence"]["pinned"] is False
     assert by_ref["pkg:versionless-purl"]["evidence"]["pinned"] is False
     assert by_ref["sbom:pkg:unbound"]["evidence"]["digest_bound"] is False
-    assert by_ref["sbom:pkg:unbound"]["evidence"]["reported_at_runtime"] is True
+    assert by_ref["sbom:pkg:unbound"]["inventory_claims"]["runtime_observation"] is True
 
     proj_dir = tmp_path / "proj"
     (proj_dir / "models").mkdir(parents=True)
@@ -809,8 +809,9 @@ def test_evidence_profile_policy_corroboration_and_pinning_accuracy(tmp_path: Pa
     tuned_verified = next(
         c for c in verified_profile["components"] if c["bom_ref"] == "model:tuned"
     )
-    assert tuned_verified["evidence"]["signed_under_policy"] is True
-    assert "signed_under_policy" not in tuned_verified["missing_evidence"]
+    assert tuned_verified["evidence"]["signed_under_policy"] is False
+    assert tuned_verified["evidence"]["digest_pinned_under_policy"] is True
+    assert "signed_under_policy" in tuned_verified["missing_evidence"]
 
     # Mismatched digest pin MUST keep signed_under_policy=False!
     wrong_policy_path = policy_dir / "wrong-policy.json"
@@ -832,6 +833,8 @@ def test_evidence_profile_policy_corroboration_and_pinning_accuracy(tmp_path: Pa
     os.chmod(wrong_policy_path, 0o600)
     wrong_pol = load_signature_policies(wrong_policy_path, proj_dir)
     wrong_profile = build_evidence_profile(bom, project_root=proj_dir, signature_policies=wrong_pol)
+    assert wrong_profile["policy_loaded"] is True
+    assert wrong_profile["policy_verified"] is False
     assert (
         next(c for c in wrong_profile["components"] if c["bom_ref"] == "model:tuned")["evidence"][
             "signed_under_policy"
@@ -860,7 +863,7 @@ def test_evidence_profile_policy_corroboration_and_pinning_accuracy(tmp_path: Pa
     assert cli_doc["policy_verified"] is True
     assert (
         next(c for c in cli_doc["components"] if c["bom_ref"] == "model:tuned")["evidence"][
-            "signed_under_policy"
+            "digest_pinned_under_policy"
         ]
         is True
     )
@@ -907,6 +910,42 @@ def test_evidence_profile_policy_corroboration_and_pinning_accuracy(tmp_path: Pa
         ],
     )
     assert res_in_proj_pol.exit_code == 2
+
+
+def test_evidence_profile_reuses_one_artifact_budget_and_derives_model_risk(tmp_path):
+    from nexus_symbiote.utils.crypto import DigestPinPolicy, SignaturePolicySet
+
+    artifact = tmp_path / "reviewed.safetensors"
+    content = b"\x02\x00\x00\x00\x00\x00\x00\x00{}"
+    artifact.write_bytes(content)
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    model = ModelComponent(
+        bom_ref="model:a",
+        name="reviewed",
+        source_path=artifact.name,
+        hashes={"sha256": digest},
+        assurance_level=AssuranceLevel.OBSERVED,
+        trust_remote_code=True,
+    )
+    duplicate = model.model_copy(update={"bom_ref": "model:b"})
+    risky = ModelComponent(bom_ref="model:c", name="remote", trust_remote_code=True)
+    policy = SignaturePolicySet(digest_pins=[DigestPinPolicy(artifact, digest)])
+    report = build_evidence_profile(
+        AIBOM(components=[duplicate, risky, model]),
+        project_root=tmp_path,
+        signature_policies=policy,
+    )
+    first, second, third = report["components"]
+    assert report["policy_loaded"] is True
+    assert report["policy_verified"] is False
+    assert first["evidence"]["digest_bound"] is True
+    assert first["evidence"]["digest_pinned_under_policy"] is True
+    assert first["evidence"]["signed_under_policy"] is False
+    assert first["highest_finding_severity"] == "critical"
+    assert second["evidence"]["digest_bound"] is False
+    assert second["evidence"]["digest_recorded"] is True
+    assert third["finding_count"] == 1
+    assert third["highest_finding_severity"] == "critical"
 
 
 def test_scan_into_import_sbom_reconciles_cleanly_diff_idempotency_and_limits(
@@ -1208,7 +1247,7 @@ def test_re_review_regressions_n1_to_n5_and_ecosystem_ranges(tmp_path: Path) -> 
     assert not is_exact_version("1.x")
     assert not is_exact_version("1.2.x")
 
-    # N1: 1,200 broken/missing models + 1 unsigned model + 1 digest-pinned model -> ONLY the 1 pinned model is signed_under_policy!
+    # N1: only the artifact covered by the digest pin is verified under that policy.
     proj = tmp_path / "n1_proj"
     (proj / "models").mkdir(parents=True)
     good_bytes = b"\x02\x00\x00\x00\x00\x00\x00\x00{}"
@@ -1268,8 +1307,11 @@ def test_re_review_regressions_n1_to_n5_and_ecosystem_ranges(tmp_path: Path) -> 
     ep = build_evidence_profile(
         AIBOM(components=many_models), project_root=proj, signature_policies=pol
     )
-    signed_refs = {c["bom_ref"] for c in ep["components"] if c["evidence"]["signed_under_policy"]}
-    assert signed_refs == {"model:good"}
+    pinned_refs = {
+        c["bom_ref"] for c in ep["components"] if c["evidence"]["digest_pinned_under_policy"]
+    }
+    assert pinned_refs == {"model:good"}
+    assert not any(c["evidence"]["signed_under_policy"] for c in ep["components"])
     empty_ep = build_evidence_profile(
         AIBOM(components=many_models[:2]),
         project_root=proj,

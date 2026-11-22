@@ -661,7 +661,10 @@ class TestPolicyIntegration:
         (project / ".nexus-symbiote.yaml").write_text(policy)
         out = project / "output.json"
         runner = CliRunner()
-        result = runner.invoke(main, ["scan", "--report-only", str(project), "-o", str(out)])
+        result = runner.invoke(
+            main,
+            ["scan", "--report-only", "--accept-project-policy", str(project), "-o", str(out)],
+        )
         assert result.exit_code == 0
         data = json.loads(out.read_text())
         assert data.get("bomFormat") == "CycloneDX"
@@ -673,7 +676,17 @@ class TestPolicyIntegration:
         out = project / "output.json"
         runner = CliRunner()
         result = runner.invoke(
-            main, ["scan", "--report-only", str(project), "-f", "json", "-o", str(out)]
+            main,
+            [
+                "scan",
+                "--report-only",
+                "--accept-project-policy",
+                str(project),
+                "-f",
+                "json",
+                "-o",
+                str(out),
+            ],
         )
         assert result.exit_code == 0
         data = json.loads(out.read_text())

@@ -4,8 +4,7 @@ Evaluates an AgentBOM offline for three structural agentic risks:
 
 1. **Lethal trifecta (Item 15):** an agent scope combining untrusted input, private
    data access, and external egress or state mutation without an explicit approval gate
-   is rated ``critical``. An identical agent with an explicit approval gate on the
-   egress/mutating surface stays clean.
+   is rated ``critical``. Complete declared approval coverage lowers it to ``high``.
 2. **Chained toxic flows (Item 24):** a leak or state-mutation chain possible only by
    combining two distinct components (source + sink) produces one ``toxic_flow`` finding
    naming both components rather than treating each in isolation as clean.
@@ -25,9 +24,11 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from heapq import merge as merge_sorted
+from itertools import groupby, islice
 from typing import Any
 
 from nexus_symbiote.core.aibom import AIBOM
@@ -128,15 +129,19 @@ _CONFUSABLES = str.maketrans(
         "\u03c4": "t",
         "\u03c5": "u",
         "\u03c7": "x",
-        # Latin/Armenian look-alikes
+        # Latin/Armenian/Greek/Cyrillic look-alikes
         "\u0261": "g",
         "\u0578": "n",
         "\u0131": "i",
         "\u03f2": "c",
+        "\u03f9": "C",
+        "\u04c0": "L",
         "\u1d04": "c",
         "\u1d0f": "o",
+        "\u0191": "F",
         "\u0192": "f",
         "\u0251": "a",
+        "\u0555": "O",
         "\u0585": "o",
     }
 )
@@ -383,6 +388,167 @@ _IDE_GRANT_LEGS: dict[str, frozenset[str]] = {
 }
 # An approval record gates its component only when it covers every action or all egress.
 _GATING_ACTIONS = frozenset({"*", "egress"})
+_READ_ACTIONS = frozenset({"read", "query", "list", "search", "get"})
+_DATA_NAME = r"\w[\w-]*"
+_TABLE_NAME = re.compile(rf"{_DATA_NAME}(?:\.{_DATA_NAME})*")
+# Only a leaf inside a named knowledge base can carry a document extension.
+_KB_PATH = re.compile(rf"{_DATA_NAME}(?:/{_DATA_NAME})*(?:\.{_DATA_NAME})?")
+_KB_DOCUMENT_TYPES = frozenset(
+    {
+        "csv",
+        "docx",
+        "json",
+        "jsonl",
+        "markdown",
+        "md",
+        "mdc",
+        "pdf",
+        "rst",
+        "txt",
+        "xml",
+        "yaml",
+        "yml",
+    }
+)
+_S3_BUCKET_SCOPE = re.compile(
+    r"arn:(?:aws|aws-cn|aws-us-gov):s3:::"
+    r"(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])(?:/[\w.?*-]+)*/?"
+)
+_DYNAMODB_SCOPE = re.compile(
+    r"arn:(?:aws|aws-cn|aws-us-gov):dynamodb:[a-z]{2}(?:-[a-z0-9]+)+-[1-9][0-9]*:"
+    r"[0-9]{12}:table/[A-Za-z0-9_.-]{3,255}(?:/index/[A-Za-z0-9_.-]{3,255})?"
+)
+# These spellings are policy selectors, even inside a declared data namespace.
+# Their comparison is separate from tool identity and the explicit modeling API.
+_UNBOUNDED_NAMES = frozenset(
+    {"global", "wildcard", "whole", "world", "unrestricted", "unlimited", "universal", "total"}
+) | {
+    quantifier + noun
+    for quantifier in ("all", "any", "every")
+    for noun in (
+        "",
+        "body",
+        "one",
+        "thing",
+        "where",
+        "resource",
+        "scope",
+        "table",
+        "store",
+        "collection",
+        "dataset",
+        "record",
+        "tenant",
+        "object",
+        "item",
+    )
+}
+_NETWORK_NAMES = frozenset(
+    {
+        "ip",
+        "api",
+        "cloud",
+        "dns",
+        "domain",
+        "egress",
+        "endpoint",
+        "external",
+        "ftp",
+        "ftps",
+        "gateway",
+        "host",
+        "http",
+        "https",
+        "imds",
+        "instancedata",
+        "internal",
+        "internet",
+        "intranet",
+        "localhost",
+        "loopback",
+        "mail",
+        "metadata",
+        "network",
+        "outbound",
+        "proxy",
+        "public",
+        "remote",
+        "server",
+        "smtp",
+        "socket",
+        "ssh",
+        "tcp",
+        "udp",
+        "uri",
+        "url",
+        "vpn",
+        "web",
+        "webhook",
+        "ws",
+        "wss",
+        "www",
+    }
+)
+_SCOPE_LOOKALIKES = str.maketrans(
+    {
+        char.casefold(): replacement
+        for char, replacement in {
+            "ԝ": "w",
+            "ᴀ": "a",
+            "ʙ": "b",
+            "ᴄ": "c",
+            "ᴅ": "d",
+            "ᴇ": "e",
+            "ꜰ": "f",
+            "ɢ": "g",
+            "ʜ": "h",
+            "ɪ": "i",
+            "ᴊ": "j",
+            "ᴋ": "k",
+            "ʟ": "l",
+            "ᴍ": "m",
+            "ɴ": "n",
+            "ᴏ": "o",
+            "ᴑ": "o",
+            "ᴘ": "p",
+            "ʀ": "r",
+            "ᴛ": "t",
+            "ᴜ": "u",
+            "ᴠ": "v",
+            "ᴡ": "w",
+            "ʏ": "y",
+            "ᴢ": "z",
+            "\u04c0": "l",
+            "\u04cf": "l",
+            "ω": "w",
+            "ǝ": "e",
+            "г": "r",
+            "Ꭺ": "a",
+            "Ꮤ": "w",
+            "ꮃ": "w",
+        }.items()
+    }
+)
+_SCOPE_SPELLING = str.maketrans(
+    {"i": "l", "1": "l", "0": "o", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b"}
+)
+
+
+def _scope_selectors(names: frozenset[str]) -> frozenset[str]:
+    """Compare singular and plural selectors under the same spelling rules as the input."""
+    forms = (
+        names
+        | {name + "s" for name in names}
+        | {name[:-1] + "ies" for name in names if name.endswith("y")}
+    )
+    return frozenset(name.translate(_SCOPE_SPELLING) for name in forms)
+
+
+_BROAD_SELECTORS = _scope_selectors(
+    _UNBOUNDED_NAMES
+    | {quantifier + noun for quantifier in ("all", "any", "every") for noun in _NETWORK_NAMES}
+)
+_NETWORK_SELECTORS = _scope_selectors(_NETWORK_NAMES)
 _UNGATED_CLAUDE_MODES = frozenset({"bypassPermissions", "acceptEdits"})
 _UNGATED_CODEX_POLICIES = frozenset({"never"})
 _UNCONFINED_CODEX_SANDBOXES = frozenset({"danger-full-access", "full-access"})
@@ -413,6 +579,7 @@ class LegEvidence:
     locator: str | None
     assurance: AssuranceLevel
     gated: bool
+    component_approval_declared: bool
 
 
 @dataclass(frozen=True)
@@ -489,7 +656,7 @@ def _normalize_identifier(text: str) -> str:
         if unicodedata.category(ch) not in {"Cf", "Cc", "Cs", "Co", "Cn", "Mn"}
     )
     folded = cleaned.translate(_CONFUSABLES)
-    return _CAMEL_BOUNDARY_RE.sub("_", folded).strip().lower()
+    return _CAMEL_BOUNDARY_RE.sub("_", folded).strip().lower().translate(_CONFUSABLES)
 
 
 def canonical_tool_name(name: str) -> str:
@@ -584,32 +751,123 @@ def _is_explicitly_ungated(component: AnyComponent) -> bool:
     return False
 
 
-def _has_explicit_approval_gate(component: AnyComponent, now: datetime) -> bool:
-    """Fail-closed check: True only when typed approval evidence covers the component.
-
-    Untrusted ad-hoc properties (such as ``properties.requires_approval`` or
-    ``properties.effective_authorization_verified``) are ignored, and so is an IDE
-    starting mode: no collector verifies the approval a host enforces. Authorization
-    records gate only when every one requires approval and is unexpired, and one of
-    them covers every action or all egress on an unrestricted resource.
-    """
+def _approval_state(
+    component: AnyComponent, now: datetime, assume_declared_approvals: bool
+) -> tuple[bool, bool]:
+    """Return (declared gate, explicit opt-out) for the selected approval policy."""
     if _is_explicitly_ungated(component):
-        return False
-
+        return False, True
     decl = getattr(component, "capabilities", None)
-    if (
+    required = (
         isinstance(decl, CapabilityDeclaration)
         and decl.human_in_the_loop is HumanInTheLoop.REQUIRED
-    ):
-        return True
-
-    declared = getattr(component, "authorizations", None) or ()
-    records = [r for r in declared if isinstance(r, AuthorizationRecord)]
-    return (
-        bool(records)
-        and all(r.approval_required is True and _unexpired(r, now) for r in records)
-        and any(r.action in _GATING_ACTIONS and r.resource_scope in (None, "*") for r in records)
     )
+    # The explicit modeling API historically gives a required declaration precedence.
+    if assume_declared_approvals and required:
+        return True, False
+    records = [
+        r
+        for r in getattr(component, "authorizations", ()) or ()
+        if isinstance(r, AuthorizationRecord)
+    ]
+    for record in records:
+        if not assume_declared_approvals and _independent_read(record):
+            continue
+        if record.approval_required is not True or not _unexpired(record, now):
+            return False, not assume_declared_approvals
+    broad = any(
+        r.action in _GATING_ACTIONS
+        and r.resource_scope in (None, "*")
+        and (assume_declared_approvals or not r.conditions)
+        for r in records
+    )
+    return required or broad, False
+
+
+def _scope_identifier(part: str, *, network_words: bool, nested: bool = False) -> bool:
+    if part.isdecimal():
+        # A numeric key below a named resource identifies a record or partition.
+        return nested
+    # Translate confusables before NFKD so characters like Greek lunate sigma
+    # (\u03f2) are mapped before NFKD folds them to another code point, then strip
+    # combining marks so precomposed diacritics cannot split broad/network words.
+    folded = unicodedata.normalize("NFKD", part.translate(_CONFUSABLES)).translate(_CONFUSABLES)
+    folded = "".join(ch for ch in folded if unicodedata.category(ch) not in {"Mn", "Cf"})
+    normalized = (
+        _CAMEL_BOUNDARY_RE.sub("_", folded)
+        .casefold()
+        .translate(_CONFUSABLES)
+        .translate(_SCOPE_LOOKALIKES)
+    )
+    letters = "".join(ch for ch in normalized if ch.isalpha())
+    if not letters:
+        return False
+    spelling = "".join(ch for ch in normalized if ch.isalnum())
+    # Read both version-suffixed selectors and spellings with digit substitutions.
+    forms = (letters.translate(_SCOPE_SPELLING), spelling.translate(_SCOPE_SPELLING))
+    if not _BROAD_SELECTORS.isdisjoint(forms):
+        return False
+    words = [word.translate(_SCOPE_SPELLING) for word in _SEPARATOR_RE.split(normalized) if word]
+    if len(words) > 1 and any(word in _BROAD_SELECTORS for word in words):
+        # A quantifier separated from its object need not use a known object name.
+        return False
+    return not network_words or (
+        _NETWORK_SELECTORS.isdisjoint(forms)
+        and not all(word in _NETWORK_SELECTORS for word in words)
+    )
+
+
+def _named_data_scope(kind: str, value: str) -> bool:
+    if kind == "table":
+        if _TABLE_NAME.fullmatch(value) is None:
+            return False
+        parts = value.split(".")
+        # A qualified SQL name can legitimately use a public or internal schema,
+        # or dotted catalog/schema/table names that resemble DNS labels.
+        network_words = len(parts) == 1
+    else:
+        path = value.removesuffix("/")
+        collection = path.endswith("/*")
+        path = path.removesuffix("/*")
+        if _KB_PATH.fullmatch(path) is None:
+            return False
+        parts = path.split("/")
+        if "." in parts[-1]:
+            stem, _, suffix = parts[-1].rpartition(".")
+            if (
+                len(parts) == 1
+                or collection
+                or value.endswith("/")
+                or suffix.casefold() not in _KB_DOCUMENT_TYPES
+            ):
+                return False
+            parts[-1] = stem
+        network_words = True
+    return all(
+        _scope_identifier(part, network_words=network_words, nested=index > 0)
+        for index, part in enumerate(parts)
+    )
+
+
+def _independent_read(record: AuthorizationRecord) -> bool:
+    """A named read can coexist with egress approval. A network or unbounded grant cannot."""
+    if record.action.strip().casefold() not in _READ_ACTIONS or not record.resource_scope:
+        return False
+    scope = record.resource_scope
+    if {".", ".."}.intersection(scope.split("/")):
+        return False
+    # A bare identifier, host, or slash namespace cannot establish what a tool
+    # reads. Only an explicit data type or a resource-specific ARN supplies it.
+    kind, colon, value = scope.partition(":")
+    if not colon or not kind.isascii():
+        return False
+    if kind.lower() in {"table", "kb"}:
+        return _named_data_scope(kind.lower(), value)
+    bucket = _S3_BUCKET_SCOPE.fullmatch(scope)
+    if bucket is not None:
+        name = bucket["bucket"]
+        return ".." not in name and re.fullmatch(r"\d+(?:\.\d+){3}", name) is None
+    return _DYNAMODB_SCOPE.fullmatch(scope) is not None
 
 
 def _unexpired(record: AuthorizationRecord, now: datetime) -> bool:
@@ -814,10 +1072,12 @@ def _own_reach(sig: _ComponentSignals) -> _Reach:
         tags.append("untrusted")
     if sig.private_basis:
         tags.extend(("private", "source") if chained else ("private",))
-    # "egress" holds what an ungated owner leaves open; "forced" what even a gated owner
-    # does, because the component itself opts out of approval.
-    if sig.egress_basis and not sig.explicitly_gated:
+    # Keep every egress for reporting unverified declarations. Track uncovered
+    # egress separately so the display cap cannot hide a single open path.
+    if sig.egress_basis:
         tags.extend(("egress", "sink") if chained else ("egress",))
+        if not sig.explicitly_gated:
+            tags.extend(("egress_open", "sink_open") if chained else ("egress_open",))
         if sig.explicitly_ungated:
             tags.extend(("egress_forced", "sink_forced") if chained else ("egress_forced",))
     if isinstance(comp, IDEAgentComponent) and sig.explicitly_ungated:
@@ -836,6 +1096,14 @@ def _merge(into: _Reach, other: _Reach) -> None:
             into[tag] = tuple(sorted({*have, *refs})[:EVIDENCE_LIMIT])
 
 
+def _uncovered_paths(reach: _Reach, *, all_egress: bool = False) -> _Reach:
+    """The open egress reached without a directly governing approval declaration."""
+    suffix = "" if all_egress else "_open"
+    return {
+        "path_" + leg: reach[leg + suffix] for leg in ("egress", "sink") if leg + suffix in reach
+    }
+
+
 def _summarize(refs: Iterable[str], own: dict[str, _Reach]) -> _Reach:
     lists: dict[str, list[str]] = {}
     for ref in sorted(refs):
@@ -843,12 +1111,15 @@ def _summarize(refs: Iterable[str], own: dict[str, _Reach]) -> _Reach:
             found = lists.setdefault(tag, [])
             if len(found) < EVIDENCE_LIMIT:
                 found.append(ref)
-    return {tag: tuple(found) for tag, found in lists.items()}
+    reach = {tag: tuple(found) for tag, found in lists.items()}
+    # Inventory-wide, implicit workspace and unbound pools have no binding owner.
+    return {**reach, **_uncovered_paths(reach)}
 
 
 def _scopes(
     bom: AIBOM,
     signals: dict[str, _ComponentSignals],
+    assume_declared_approvals: bool,
 ) -> list[tuple[str, bool, _Reach]]:
     """Compute evaluation scopes in O(V + E) time using SCC condensation.
 
@@ -873,13 +1144,42 @@ def _scopes(
         return [("inventory:root", False, _summarize(by_ref, own))] if by_ref else []
 
     adj: dict[str, list[str]] = {ref: [] for ref in by_ref}
+    declared_bindings: set[tuple[str, str]] = set()
+    # Inventory containment is evidence of visibility. It does not introduce a
+    # second caller for a tool already directly bound by the governing agent.
+    contained: dict[str, set[str]] = {}
+    independent: set[tuple[str, str]] = set()
+
+    def containment(source: str, target: str) -> None:
+        contained.setdefault(source, set()).add(target)
+
     for dep in bom.dependencies:
         if dep.source_ref in by_ref and dep.target_ref in by_ref:
             adj[dep.source_ref].append(dep.target_ref)
+            if (
+                dep.relationship == "provides-tool"
+                and isinstance(by_ref[dep.source_ref], MCPServerComponent)
+                and isinstance(by_ref[dep.target_ref], ToolComponent)
+            ):
+                containment(dep.source_ref, dep.target_ref)
+            elif dep.relationship in {"invokes", "configured-with"}:
+                declared_bindings.add((dep.source_ref, dep.target_ref))
+            else:
+                independent.add((dep.source_ref, dep.target_ref))
 
     clients_by_host: dict[str, list[MCPClientComponent]] = {}
     for comp in bom.components:
         if isinstance(comp, AgentComponent):
+            declared_bindings.update((comp.bom_ref, ref) for ref in comp.tool_refs)
+            independent.update(
+                (comp.bom_ref, ref)
+                for ref in (
+                    *comp.data_refs,
+                    *comp.memory_refs,
+                    *comp.skill_refs,
+                    *comp.sub_agent_refs,
+                )
+            )
             for ref in (
                 *comp.tool_refs,
                 *comp.data_refs,
@@ -890,6 +1190,7 @@ def _scopes(
                 if ref in by_ref:
                     adj[comp.bom_ref].append(ref)
         elif isinstance(comp, IDEAgentComponent):
+            declared_bindings.update((comp.bom_ref, ref) for ref in comp.mcp_server_refs)
             for ref in (*comp.mcp_server_refs, *comp.prompt_refs):
                 if ref in by_ref:
                     adj[comp.bom_ref].append(ref)
@@ -899,8 +1200,12 @@ def _scopes(
             for ref in comp.server_refs:
                 if ref in by_ref:
                     adj[comp.bom_ref].append(ref)
+                    if isinstance(by_ref[ref], MCPServerComponent):
+                        containment(comp.bom_ref, ref)
         elif isinstance(comp, ToolComponent) and comp.mcp_server_ref in by_ref:
             adj[comp.mcp_server_ref].append(comp.bom_ref)
+            if isinstance(by_ref[comp.mcp_server_ref], MCPServerComponent):
+                containment(comp.mcp_server_ref, comp.bom_ref)
 
     for comp in agents:
         if isinstance(comp, IDEAgentComponent) and not comp.mcp_server_refs and comp.ide_type:
@@ -926,10 +1231,98 @@ def _scopes(
     # Condensed DAG edges between SCCs, plus agent-to-agent parent tracking.
     dag_adj: dict[int, list[int]] = {i: [] for i in range(len(sccs))}
     agent_parents: dict[int, set[int]] = {scc_id: set() for scc_id in scc_agents}
+    open_targets = {
+        ref: _uncovered_paths(tags) for ref, tags in own.items() if "egress_open" in tags
+    }
+    path_exposure: list[_Reach] = [{} for _ in sccs]
+    # A client lists servers, and a server lists tools. Those two typed layers
+    # preserve the incoming caller. An invocation or other dependency starts an
+    # independent route, even alongside a containment edge between the same refs.
+    open_members: dict[str, dict[str, list[str]]] = {}
+    for container, members in contained.items():
+        open_members[container] = {
+            tag: [v for v in sorted(members) if tag in open_targets.get(v, {})]
+            for tag in ("path_egress", "path_sink")
+        }
+    # Cache the ordinary uncovered sample. The common case of shared, unbound
+    # catalogs costs one scan, regardless of how many agents reference a client.
+    nested = {
+        ref: sorted(v for v in values if v in contained)
+        for ref, values in contained.items()
+        if isinstance(by_ref[ref], MCPClientComponent)
+    }
+    ordinary: dict[str, _Reach] = {}
+    for ref in sorted(contained, key=lambda r: isinstance(by_ref[r], MCPClientComponent)):
+        gaps = {
+            tag: tuple(values[:EVIDENCE_LIMIT])
+            for tag, values in open_members[ref].items()
+            if values
+        }
+        for server in nested.get(ref, ()):
+            _merge(gaps, ordinary[server])
+        ordinary[ref] = gaps
+
+    # Owners who cover part of the ordinary sample may need later members. Share
+    # those ordered candidates across owners and expand only as far as requested.
+    expanded: dict[tuple[str, str], tuple[list[str], Iterator[str]]] = {}
+
+    def containment_candidates(target: str, tag: str) -> Iterator[str]:
+        key = (target, tag)
+        if key not in expanded:
+            sources = [open_members[target][tag]]
+            sources.extend(open_members[server][tag] for server in nested.get(target, ()))
+            expanded[key] = ([], (ref for ref, _ in groupby(merge_sorted(*sources))))
+        known, pending = expanded[key]
+        yield from known
+        for ref in pending:
+            known.append(ref)
+            yield ref
+
+    def containment_gaps(owner: str, target: str, binding: bool) -> _Reach:
+        sample = ordinary[target]
+        if not binding:
+            return sample
+
+        def uncovered(ref: str) -> bool:
+            return (owner, ref) not in declared_bindings or signals[ref].explicitly_ungated
+
+        gaps: _Reach = {}
+        for tag, refs in sample.items():
+            if all(map(uncovered, refs)):
+                gaps[tag] = refs
+            else:
+                remaining = tuple(
+                    islice(filter(uncovered, containment_candidates(target, tag)), EVIDENCE_LIMIT)
+                )
+                if remaining:
+                    gaps[tag] = remaining
+        return gaps
+
     for u, targets in adj.items():
         su = scc_of[u]
         seen_t: set[int] = set()
+        governing_agent = u in agent_refs and signals[u].explicitly_gated
+        visited_containers: set[str] = set()
+        if u in agent_refs and u in open_targets and not assume_declared_approvals:
+            _merge(path_exposure[su], open_targets[u])
         for v in targets:
+            edge = (u, v)
+            passive_only = (
+                v in contained.get(u, ())
+                and edge not in independent
+                and edge not in declared_bindings
+            )
+            if not assume_declared_approvals and not passive_only:
+                binding = governing_agent and edge in declared_bindings and edge not in independent
+                if v in open_targets and not (
+                    binding
+                    and isinstance(by_ref[v], (ToolComponent, MCPServerComponent))
+                    and not signals[v].explicitly_ungated
+                ):
+                    _merge(path_exposure[su], open_targets[v])
+                if v in contained and v not in visited_containers:
+                    visited_containers.add(v)
+                    _merge(path_exposure[su], containment_gaps(u, v, binding))
             sv = scc_of[v]
             if sv != su and sv not in seen_t:
                 seen_t.add(sv)
@@ -964,11 +1357,13 @@ def _scopes(
     # Tarjan numbers a strongly connected component after everything it reaches.
     reach: list[_Reach] = []
     for scc_id, scc_members in enumerate(sccs):
-        merged: _Reach = {}
+        merged = path_exposure[scc_id]
         for ref in scc_members:
             _merge(merged, own[ref])
         for child in dag_adj[scc_id]:
             _merge(merged, reach[child])
+        if not assume_declared_approvals and scc_id in scc_agents and not scc_gated[scc_id]:
+            _merge(merged, _uncovered_paths(merged, all_egress=True))
         reach.append(merged)
 
     covered = set(scc_agents)
@@ -995,21 +1390,26 @@ def _scopes(
         unbound.difference_update(surface)
     pool = _summarize(unbound, own)
 
+    scope_legs = {"untrusted", "private", "egress_open"} if assume_declared_approvals else _LEGS
     result: list[tuple[str, bool, _Reach]] = []
     for scc_id in selected_sccs:
         scope = dict(reach[scc_id])
         if scc_id in inherits:
             _merge(scope, workspace)
-        if _LEGS & scope.keys():
+        if scope_legs & scope.keys():
             _merge(scope, pool)
+        if not assume_declared_approvals and not scc_gated[scc_id]:
+            _merge(scope, _uncovered_paths(scope, all_egress=True))
         result.append((scc_agents[scc_id][0].bom_ref, scc_gated[scc_id], scope))
     if unbound:
         result.append(("inventory:unscoped", False, pool))
     return result
 
 
-def _evidence_entry(leg: str, item: LegEvidence) -> dict[str, Any]:
-    return {
+def _evidence_entry(
+    leg: str, item: LegEvidence, *, egress_approval_declared: bool | None = None
+) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
         "leg": leg,
         "component_ref": item.component_ref,
         "component_name": item.component_name,
@@ -1017,7 +1417,12 @@ def _evidence_entry(leg: str, item: LegEvidence) -> dict[str, Any]:
         "locator": item.locator,
         "assurance": item.assurance.value,
         "gated": item.gated,
+        "component_approval_declared": item.component_approval_declared,
+        "approval_enforcement_verified": False,
     }
+    if egress_approval_declared is not None:
+        evidence["egress_approval_declared"] = egress_approval_declared
+    return evidence
 
 
 def _detect_shadowing(bom: AIBOM) -> tuple[list[FlowFinding], set[str]]:
@@ -1082,6 +1487,7 @@ def _scope_findings(
     owner_gated: bool,
     reach: _Reach,
     signals: dict[str, _ComponentSignals],
+    assume_declared_approvals: bool,
 ) -> list[FlowFinding]:
     # Fail closed: an IDE agent that opts out of approval overrides an owner gate.
     gated_owner = owner_gated and "ungated_ide" not in reach
@@ -1099,7 +1505,11 @@ def _scope_findings(
                     sig.untrusted_basis if tag == "untrusted" else basis,
                     sig.locator,
                     comp.assurance_level,
-                    (gated_owner or sig.explicitly_gated) and not sig.explicitly_ungated,
+                    assume_declared_approvals
+                    and tag not in {"path_egress", "path_sink"}
+                    and (gated_owner or sig.explicitly_gated)
+                    and not sig.explicitly_ungated,
+                    sig.explicitly_gated,
                 )
             )
         return found
@@ -1107,26 +1517,46 @@ def _scope_findings(
     findings: list[FlowFinding] = []
     untrusted = items("untrusted")
     private = items("private")
-    ungated_egress = items("egress_forced" if gated_owner else "egress")
-    if untrusted and private and ungated_egress:
-        involved = sorted({i.component_ref for i in (*untrusted, *private, *ungated_egress)})
-        capped = EVIDENCE_LIMIT in (len(untrusted), len(private), len(ungated_egress))
+    open_egress = (
+        items("egress_forced" if gated_owner else "egress_open")
+        if assume_declared_approvals
+        else items("path_egress")
+    )
+    egress = open_egress
+    if not egress and not assume_declared_approvals:
+        egress = items("egress")
+    if untrusted and private and egress:
+        involved = sorted({i.component_ref for i in (*untrusted, *private, *egress)})
+        capped = EVIDENCE_LIMIT in (len(untrusted), len(private), len(egress))
         findings.append(
             FlowFinding(
                 kind="lethal_trifecta",
-                severity=RiskSeverity.CRITICAL,
+                severity=RiskSeverity.CRITICAL if open_egress else RiskSeverity.HIGH,
                 scope_ref=scope_ref,
                 summary=(
                     f"Scope '{scope_ref}' combines untrusted input, private data access, "
-                    "and ungated external egress/state mutation across "
-                    f"{'at least ' if capped else ''}{len(involved)} "
-                    "component(s) without an approval gate."
+                    "and external egress/state mutation across "
+                    f"{'at least ' if capped else ''}{len(involved)} component(s). "
+                    + (
+                        "At least one egress has no applicable declared approval gate."
+                        if open_egress
+                        else "A human-approval declaration covers every egress. Runtime enforcement is unverified."
+                    )
                 ),
                 component_refs=tuple(involved),
                 evidence=(
                     *(_evidence_entry("untrusted_input", i) for i in untrusted),
                     *(_evidence_entry("private_data", i) for i in private),
-                    *(_evidence_entry("egress", i) for i in ungated_egress),
+                    *(
+                        _evidence_entry(
+                            "egress",
+                            i,
+                            egress_approval_declared=None
+                            if assume_declared_approvals
+                            else not open_egress,
+                        )
+                        for i in egress
+                    ),
                 ),
                 recommendation=(
                     "Break at least one leg of the trifecta or enforce an explicit "
@@ -1139,7 +1569,10 @@ def _scope_findings(
     # Item 24: Chained toxic flow across two distinct components where neither alone
     # is EXFIL_CAPABLE (linear time without materializing Cartesian pairs).
     chained_sources = items("source")
-    chained_sinks = items("sink_forced" if gated_owner else "sink")
+    sink_tag = (
+        ("sink_forced" if gated_owner else "sink_open") if assume_declared_approvals else "sink"
+    )
+    chained_sinks = items(sink_tag)
     source_refs = {src.component_ref for src in chained_sources}
     sink_refs = {snk.component_ref for snk in chained_sinks}
     active_sources = [
@@ -1160,7 +1593,16 @@ def _scope_findings(
                     f"Scope '{scope_ref}' enables a chained toxic flow across "
                     f"{'at least ' if capped else ''}{len(pair_refs)} distinct components "
                     f"({', '.join(pair_refs)}) where "
-                    "private data from one component can leave through an ungated sink."
+                    "private data from one component can leave through "
+                    + (
+                        "an ungated sink."
+                        if not assume_declared_approvals
+                        and any(
+                            len(source_refs) > 1 or ref not in source_refs
+                            for ref in reach.get("path_sink", ())
+                        )
+                        else "a sink with unverified approval enforcement."
+                    )
                 ),
                 component_refs=pair_refs,
                 evidence=(
@@ -1176,15 +1618,20 @@ def _scope_findings(
     return findings
 
 
-def analyze_trifecta(bom: AIBOM, *, now: datetime | None = None) -> TrifectaReport:
+def analyze_trifecta(
+    bom: AIBOM, *, now: datetime | None = None, assume_declared_approvals: bool = False
+) -> TrifectaReport:
     """Analyze an inventory for lethal trifectas, chained toxic flows, and tool shadowing.
 
     ``now`` is the time approval records' expiry is read against; the default is the clock.
+    ``assume_declared_approvals`` is for modeling a proposed design. Admission gates
+    must use the default, since an inventory cannot establish effective authorization.
     """
     moment = now or datetime.now(UTC)
     signals: dict[str, _ComponentSignals] = {}
     for comp in bom.components:
         rc = classify(comp)
+        gated, ungated = _approval_state(comp, moment, assume_declared_approvals)
         signals[comp.bom_ref] = _ComponentSignals(
             component=comp,
             risk_classification=rc,
@@ -1192,14 +1639,16 @@ def analyze_trifecta(bom: AIBOM, *, now: datetime | None = None) -> TrifectaRepo
             untrusted_basis=_untrusted_input_basis(comp, rc),
             private_basis=_private_data_basis(comp, rc),
             egress_basis=_egress_basis(comp, rc),
-            explicitly_gated=_has_explicit_approval_gate(comp, moment),
-            explicitly_ungated=_is_explicitly_ungated(comp),
+            explicitly_gated=gated,
+            explicitly_ungated=ungated,
         )
 
-    scopes = _scopes(bom, signals)
+    scopes = _scopes(bom, signals, assume_declared_approvals)
     findings: list[FlowFinding] = []
     for scope_ref, owner_gated, reach in scopes:
-        findings.extend(_scope_findings(scope_ref, owner_gated, reach, signals))
+        findings.extend(
+            _scope_findings(scope_ref, owner_gated, reach, signals, assume_declared_approvals)
+        )
 
     shadow_findings, shadowed_refs = _detect_shadowing(bom)
     findings.extend(shadow_findings)

@@ -10,8 +10,9 @@ import os
 import re
 import sys
 from collections.abc import Callable, Mapping
+from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import click
 
@@ -35,6 +36,7 @@ from nexus_symbiote.inventory_export_cli import register_inventory_export_comman
 from nexus_symbiote.live_cli import register_live_commands
 from nexus_symbiote.minimum_elements_cli import register_minimum_elements_commands
 from nexus_symbiote.policy import Policy
+from nexus_symbiote.policy import running_in_ci as _running_in_ci
 from nexus_symbiote.reporting import (
     ReportLine,
     diff_report_lines,
@@ -187,6 +189,18 @@ _LAST_CLAMPED_SETTINGS: contextvars.ContextVar[tuple[str, ...]] = contextvars.Co
 )
 
 
+def _warn_unapplied_project_policy(path: Path) -> dict[str, str]:
+    """Report a withheld relaxation without echoing untrusted contents."""
+    echo_line(
+        "WARNING: project policy ",
+        path,
+        " was not applied. Pass --accept-project-policy to apply it, or "
+        "--no-project-policy to ignore it explicitly.",
+        err=True,
+    )
+    return {"file": path.name, "reason": "not-accepted"}
+
+
 def _policy_with_source(
     root: Path,
     *,
@@ -196,8 +210,12 @@ def _policy_with_source(
     operator: Policy | None = None,
     operator_digest: str | None = None,
     operator_signers: tuple[str, ...] = (),
-) -> tuple[Policy, str, list[str]]:
-    """Load the governing policy and say where it came from and what it relaxes."""
+) -> tuple[Policy, str, list[str], dict[str, str] | None]:
+    """Load the governing policy and say where it came from and what it relaxes.
+
+    Apply each tightening even if the checkout also asks to relax a different
+    setting. An operator policy always bounds the result.
+    """
     from nexus_symbiote.operator_policy import narrow_policy
     from nexus_symbiote.policy import (
         PolicyError,
@@ -208,61 +226,63 @@ def _policy_with_source(
 
     _LAST_CLAMPED_SETTINGS.set(())
     if operator is not None and operator_digest is not None:
-        op_label = _format_operator_source(operator_digest, operator_signers)
-        if ignore_project:
-            return operator, op_label, weakened_settings(operator)
-        try:
-            loaded_proj = load_policy_file(root)
-        except PolicyError as exc:
-            raise _failure(exc) from exc
-        if loaded_proj is None:
-            return operator, op_label, weakened_settings(operator)
-        proj_policy, proj_path, _ = loaded_proj
-        narrowed, clamped = narrow_policy(operator, proj_policy)
-        _LAST_CLAMPED_SETTINGS.set(tuple(clamped))
-        if clamped and warn:
-            echo_line(
-                "WARNING: project policy ",
-                proj_path,
-                " attempted to relax operator policy; clamped: ",
-                "; ".join(clamped),
-                err=True,
-            )
-        return narrowed, op_label, weakened_settings(narrowed)
+        baseline = operator
+        source = _format_operator_source(operator_digest, operator_signers)
+    else:
+        baseline = default_policy()
+        source = "built-in"
 
+    baseline_weaker = weakened_settings(baseline)
     if ignore_project:
-        return default_policy(), "built-in", []
+        return baseline, source, baseline_weaker, None
     try:
         loaded = load_policy_file(root)
     except PolicyError as exc:
         raise _failure(exc) from exc
     if loaded is None:
-        return default_policy(), "built-in", []
-    policy, path, _ = loaded
-    weaker = weakened_settings(policy)
+        return baseline, source, baseline_weaker, None
+    project, path, _ = loaded
+    has_operator = operator is not None and operator_digest is not None
+    weaker = weakened_settings(project)
+    if has_operator or (weaker and not allow_weakening):
+        narrowed, clamped = narrow_policy(baseline, project, inherit_unspecified=True)
+        _LAST_CLAMPED_SETTINGS.set(tuple(clamped))
+        if not allow_weakening and (clamped or not has_operator):
+            if narrowed == baseline:
+                return baseline, source, baseline_weaker, _warn_unapplied_project_policy(path)
+            echo_line(
+                "WARNING: project policy ",
+                path,
+                " tightened the governing gates. Its relaxations were withheld. "
+                "Pass --accept-project-policy to accept relaxations within the operator policy.",
+                err=True,
+            )
+            if not has_operator:
+                # Attribute only effective overrides to the checkout in machine reports.
+                narrowed = type(baseline).model_validate(
+                    narrowed.model_dump(by_alias=True, exclude_defaults=True)
+                )
+                source = f"project:{path}"
+            return (
+                narrowed,
+                source,
+                weakened_settings(narrowed),
+                {"file": path.name, "reason": "relaxations-not-accepted"},
+            )
+        if clamped and warn:
+            echo_line(
+                "WARNING: project policy ",
+                path,
+                " attempted to relax operator policy; clamped: ",
+                "; ".join(clamped),
+                err=True,
+            )
+        return narrowed, source, weakened_settings(narrowed), None
     if weaker and warn:
-        # The path and the relaxed values come from the checkout, so neither may move
-        # the cursor or start a new line that hides this warning or forges a CI command.
         echo_line(
             "WARNING: policy ", path, " weakens the built-in gates: ", "; ".join(weaker), err=True
         )
-    if _gate_weakenings(weaker) and not allow_weakening and _running_in_ci():
-        raise click.ClickException(
-            "The project policy weakens the built-in gates and this run looks like CI. Pass "
-            "--no-project-policy to ignore the checkout's policy, or --accept-project-policy "
-            "to accept it explicitly."
-        )
-    return policy, f"project:{path}", weaker
-
-
-# Relaxations that change what a command reports, not whether its gate passes; they
-# are recorded and warned about like every other, but CI need not accept them.
-_REPORT_ONLY_WEAKENING_PREFIXES = ("output.",)
-
-
-def _gate_weakenings(weaker: list[str]) -> list[str]:
-    """Every relaxation but those that change only what is reported (``output.*``)."""
-    return [entry for entry in weaker if not entry.startswith(_REPORT_ONLY_WEAKENING_PREFIXES)]
+    return project, f"project:{path}", weaker, None
 
 
 def _inventory_policy(
@@ -275,7 +295,7 @@ def _inventory_policy(
     operator: Policy | None = None,
     operator_digest: str | None = None,
     operator_signers: tuple[str, ...] = (),
-) -> tuple[Policy, str, list[str]]:
+) -> tuple[Policy, str, list[str], dict[str, str] | None]:
     """Policy for a command that reads an inventory: only a named project or operator supplies one."""
     from nexus_symbiote.policy import default_policy, nearest_policy_file, weakened_settings
 
@@ -295,6 +315,7 @@ def _inventory_policy(
             operator,
             _format_operator_source(operator_digest, operator_signers),
             weakened_settings(operator),
+            None,
         )
     if not ignore_project:
         unapplied = nearest_policy_file(Path(aibom_path).resolve().parent)
@@ -303,10 +324,16 @@ def _inventory_policy(
                 "Note: ",
                 unapplied,
                 " was not applied. Without --project the built-in policy is used; "
-                "name a trusted project with --project to apply its policy.",
+                "use --project to evaluate its policy and --accept-project-policy to accept relaxations.",
                 err=True,
             )
-    return default_policy(), "built-in", []
+            return (
+                default_policy(),
+                "built-in",
+                [],
+                {"file": unapplied.name, "reason": "project-not-specified"},
+            )
+    return default_policy(), "built-in", [], None
 
 
 def _gate_sources(
@@ -412,31 +439,6 @@ def _require_binding_key() -> None:
             f"{SOURCE_BINDING_KEY_ENV} must contain at least "
             f"{_MIN_SOURCE_BINDING_KEY_LENGTH} characters"
         )
-
-
-_CI_ENVIRONMENT_VARIABLES = (
-    "CI",
-    "GITHUB_ACTIONS",
-    "GITLAB_CI",
-    "CIRCLECI",
-    "TF_BUILD",
-    "JENKINS_URL",
-    "BUILDKITE",
-    "DRONE",
-    "TRAVIS",
-)
-
-
-def _running_in_ci() -> bool:
-    """True when a well-known CI variable says this run is automated.
-
-    ``CI`` is the de-facto standard set by GitHub Actions, GitLab CI and
-    CircleCI; the rest are provider-specific markers. An empty value, ``0``
-    or ``false`` does not count as CI.
-    """
-    return any(
-        os.environ.get(name) not in (None, "", "0", "false") for name in _CI_ENVIRONMENT_VARIABLES
-    )
 
 
 def _unsigned_discovery_flags(fail_on_unsigned_discovery: bool, allow: bool) -> None:
@@ -571,6 +573,10 @@ def _get_scanners() -> dict[str, type]:
     return SCANNER_REGISTRY
 
 
+_ACCEPT_PROJECT_POLICY_HELP = (
+    "Accept checkout settings that relax a gate. Tightening settings apply automatically, "
+    "including in mixed policies. Operator policy always sets the minimum."
+)
 DETAILED_EXIT_KEY = "nexus_symbiote.detailed_exit_codes"
 _MODE_FLAGS = frozenset({"--offline", "--live"})
 # Click 8.2+ shows a group's own help, which carries no input, through this error.
@@ -652,6 +658,41 @@ def _resolve_report_format(json_output: bool, report_format: str | None) -> str:
     return "json" if json_output else (report_format or "text")
 
 
+def _refuse_step_summary_input(step_summary: Path) -> None:
+    """Refuse a step summary that is a file this command also reads, such as its inventory.
+
+    Appending Markdown to an input would corrupt it in place. Compared by identity, so a
+    hard link or a case variant of the input is refused too.
+    """
+    from nexus_symbiote.policy import POLICY_FILE_NAMES
+
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return
+    try:
+        if not step_summary.exists():
+            return
+        named: list[object] = []
+        for param in ctx.command.params:
+            if param.name == "step_summary" or not isinstance(param.type, click.Path):
+                continue
+            value = ctx.params.get(param.name or "")
+            named.extend(value if isinstance(value, tuple | list) else [value])
+        project = ctx.params.get("project")
+        if project and not ctx.params.get("no_project_policy"):
+            # The checkout policy consulted by risk and validate has no explicit file option.
+            named.extend(Path(project) / name for name in POLICY_FILE_NAMES)
+        same = any(
+            os.path.exists(source) and os.path.samefile(step_summary, source)
+            for source in named
+            if isinstance(source, str | os.PathLike)
+        )
+    except OSError as exc:
+        raise output_failure(exc) from exc
+    if same:
+        raise click.UsageError("--step-summary must not name a file this command reads")
+
+
 def _emit_gate_report(
     gate_name: str,
     report_format: str,
@@ -659,6 +700,7 @@ def _emit_gate_report(
     text_lines: Any,
     *,
     step_summary: Path | None = None,
+    project: Path | None = None,
     operator_source: str | None = None,
 ) -> None:
     from nexus_symbiote.operator_policy import (
@@ -668,7 +710,10 @@ def _emit_gate_report(
     )
 
     if step_summary is not None:
-        append_step_summary(step_summary, render_gate_markdown(gate_name, document))
+        _refuse_step_summary_input(step_summary)
+        append_step_summary(
+            step_summary, render_gate_markdown(gate_name, document), project=project
+        )
     if report_format == "json":
         click.echo(json_text(json.dumps(document, indent=2)))
     elif report_format == "markdown":
@@ -740,9 +785,32 @@ def _operator_policy_options(func: _F) -> _F:
     )
 
 
+def _step_summary_path(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> Path | None:
+    if value is None:
+        return None
+    try:
+        return cast(Path, click.Path(dir_okay=False, path_type=Path).convert(value, param, ctx))
+    except ValueError as exc:
+        raise output_failure(exc) from exc
+
+
 def _gate_report_options(func: _F) -> _F:
+    @wraps(func)
+    def gate(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("step_summary") is None:
+            return func(*args, **kwargs)
+        from nexus_symbiote.core.hashing import gate_input_files
+
+        token = gate_input_files.set(set())
+        try:
+            return func(*args, **kwargs)
+        finally:
+            gate_input_files.reset(token)
+
     return _apply_options(
-        func,
+        cast(_F, gate),
         click.option(
             "--report-format",
             type=click.Choice(["text", "json", "markdown", "junit"]),
@@ -751,9 +819,14 @@ def _gate_report_options(func: _F) -> _F:
         ),
         click.option(
             "--step-summary",
-            type=click.Path(dir_okay=False, path_type=Path),
+            type=click.STRING,
+            metavar="FILE",
+            callback=_step_summary_path,
             default=None,
-            help="Write an injection-safe Markdown gate summary to this file (for example GITHUB_STEP_SUMMARY).",
+            help=(
+                "Append a Markdown gate summary (for example GITHUB_STEP_SUMMARY) to a new file "
+                "or an existing singly linked report. Files read by this gate are protected."
+            ),
         ),
     )
 
@@ -988,15 +1061,15 @@ def _render_aibom(
     "output_format",
     type=click.Choice(["json", "cyclonedx", "spdx", "sarif"]),
     default=None,
-    help="Output format (default: json, or from .nexus-symbiote.yaml)",
+    help="Output format. Defaults to json unless the accepted policy sets a format.",
 )
 @click.option(
     "--scanner",
     "scanners",
     multiple=True,
     help=(
-        f"Collector to run, once each: {BUILTIN_SCANNERS} (default: all, or from "
-        ".nexus-symbiote.yaml). A collector left out makes coverage partial."
+        f"Collector to run, once each: {BUILTIN_SCANNERS}. Defaults to all unless the "
+        "accepted policy selects collectors. A collector left out makes coverage partial."
     ),
 )
 @click.option(
@@ -1027,10 +1100,7 @@ def _render_aibom(
 @click.option(
     "--accept-project-policy",
     is_flag=True,
-    help=(
-        "In CI, accept a project policy that weakens the built-in gates explicitly; without "
-        "it such a policy fails the command there. Interactive runs only warn."
-    ),
+    help=_ACCEPT_PROJECT_POLICY_HELP,
 )
 @click.option(
     "--accept-default-exclude",
@@ -1082,7 +1152,7 @@ def scan(
     allow_unsigned_discovery: bool = False,
     detailed_exit_codes: bool = False,
     legacy_exit_codes: bool = False,
-) -> None:
+) -> tuple[Path, Policy, list[SigstoreArtifactPolicy]] | None:
     """Scan a project and generate an AIBOM."""
     detailed = _apply_exit_code_flags(detailed_exit_codes, legacy_exit_codes)
     _unsigned_discovery_flags(fail_on_unsigned_discovery, allow_unsigned_discovery)
@@ -1111,7 +1181,7 @@ def scan(
         allow_unsigned=allow_unsigned_operator_policy,
         max_age_days=operator_policy_max_age_days,
     )
-    policy, policy_source, policy_weakened = _policy_with_source(
+    policy, policy_source, policy_weakened, _ = _policy_with_source(
         root,
         ignore_project=no_project_policy,
         allow_weakening=accept_project_policy,
@@ -1352,6 +1422,8 @@ def scan(
     report_requested = report_only or policy.scan.failure_mode == "report-only"
     report_mode = report_requested and not discovery_failures
     staged = _staged_inventory()
+    # Baseline promotion must use exactly what the scanner read from disk.
+    staged_policy = (root, policy, signature_policies) if staged else None
 
     if not check_only:
         if source_report_digest and output_format == "sarif":
@@ -1391,7 +1463,7 @@ def scan(
         print_lines([("Scan gate passed", "green")], err=True)
         if op_digest is not None:
             echo_line("  Policy: ", policy_source, err=True)
-        return
+        return staged_policy
     if report_mode:
         heading = "Scan gate failed (report only: exit status 0)"
     elif report_requested:
@@ -1417,6 +1489,7 @@ def scan(
         echo_line("  Policy: ", policy_source, err=True)
     if not report_mode:
         _gate_exit(detailed, collection_failed=bool(scan_failures))
+    return staged_policy
 
 
 @main.command("import-shadowscan")
@@ -1949,10 +2022,7 @@ def _raise_on_misplaced_attestation_key(attestation_report: Mapping[str, object]
 @click.option(
     "--accept-project-policy",
     is_flag=True,
-    help=(
-        "In CI, accept a project policy that weakens the built-in gates explicitly; without "
-        "it such a policy fails the command there. Interactive runs only warn."
-    ),
+    help=_ACCEPT_PROJECT_POLICY_HELP,
 )
 @click.option(
     "--accept-default-exclude",
@@ -2076,7 +2146,7 @@ def validate(
         allow_unsigned=allow_unsigned_operator_policy,
         max_age_days=operator_policy_max_age_days,
     )
-    policy, policy_source, policy_weakened = _inventory_policy(
+    policy, policy_source, policy_weakened, policy_unapplied = _inventory_policy(
         root,
         aibom_path,
         ignore_project=no_project_policy,
@@ -2187,6 +2257,8 @@ def validate(
         "assurance_errors": assurance_errors,
         "graph_issues": graph_issues,
     }
+    if policy_unapplied is not None:
+        document["policy_unapplied"] = policy_unapplied
     if op_digest is not None:
         document["operator_policy_digest"] = op_digest
         document["operator_policy_signers"] = list(op_signers)
@@ -2197,6 +2269,7 @@ def validate(
         document,
         lambda: validation_report_lines(document, project=root),
         step_summary=step_summary,
+        project=root,
         operator_source=policy_source if op_digest is not None else None,
     )
     if not passed:
@@ -2249,10 +2322,7 @@ def validate(
 @click.option(
     "--accept-project-policy",
     is_flag=True,
-    help=(
-        "In CI, accept a project policy that weakens the built-in gates explicitly; without "
-        "it such a policy fails the command there. Interactive runs only warn."
-    ),
+    help=_ACCEPT_PROJECT_POLICY_HELP,
 )
 @click.option(
     "--accept-default-exclude",
@@ -2379,7 +2449,7 @@ def risk(
         allow_unsigned=allow_unsigned_operator_policy,
         max_age_days=operator_policy_max_age_days,
     )
-    policy, policy_source, policy_weakened = _inventory_policy(
+    policy, policy_source, policy_weakened, policy_unapplied = _inventory_policy(
         root,
         aibom_path,
         ignore_project=no_project_policy,
@@ -2402,6 +2472,8 @@ def risk(
         "policy_weakened": policy_weakened,
         **({"attestation": attestation_report} if attestation_report is not None else {}),
     }
+    if policy_unapplied is not None:
+        context["policy_unapplied"] = policy_unapplied
     if op_digest is not None:
         context["operator_policy_digest"] = op_digest
         context["operator_policy_signers"] = list(op_signers)
@@ -2466,6 +2538,7 @@ def risk(
                 failed,
                 lambda: risk_report_lines(failed),
                 step_summary=step_summary,
+                project=root,
                 operator_source=op_source_line,
             )
             _gate_exit(detailed)
@@ -2507,6 +2580,7 @@ def risk(
             unsigned,
             lambda: risk_report_lines(unsigned),
             step_summary=step_summary,
+            project=root,
             operator_source=op_source_line,
         )
         _gate_exit(detailed)
@@ -2546,6 +2620,7 @@ def risk(
         document,
         lambda: risk_report_lines(document, failures=failures),
         step_summary=step_summary,
+        project=root,
         operator_source=op_source_line,
     )
     if not passed:
@@ -2712,7 +2787,9 @@ def init(force: bool, path: str) -> None:
 
     write_cli_output(target, DEFAULT_POLICY_YAML, overwrite=force)
     echo_line("Created ", target)
-    click.echo("  Edit this file to customize scan, risk, and validation policies.")
+    click.echo(
+        "  Tightening settings apply automatically. Use --accept-project-policy for a reviewed relaxation."
+    )
 
 
 register_runtime_commands(main)

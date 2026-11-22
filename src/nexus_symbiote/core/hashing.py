@@ -13,6 +13,7 @@ import re
 import stat
 import sys
 from collections.abc import Mapping
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, TypedDict
 
@@ -126,6 +127,20 @@ def normalize_digest(expected_hash: str, algorithm: str | None = None) -> tuple[
     if len(digest) != length or re.fullmatch(r"[a-fA-F0-9]+", digest) is None:
         raise ValueError(f"Malformed {algorithm} digest")
     return algorithm, digest.lower()
+
+
+gate_input_files: ContextVar[set[tuple[int, int]] | None] = ContextVar(
+    "gate_input_files", default=None
+)
+
+
+def stat_input_file(fd: int) -> os.stat_result:
+    """Remember the opened input's identity while a gate is preparing an output."""
+    info = os.fstat(fd)
+    inputs = gate_input_files.get()
+    if inputs is not None and stat.S_ISREG(info.st_mode):
+        inputs.add((info.st_dev, info.st_ino))
+    return info
 
 
 def descriptor_binding(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -299,7 +314,7 @@ def open_regular_file(path: Path) -> BinaryIO:
     finally:
         os.close(parent_fd)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        if not stat.S_ISREG(stat_input_file(fd).st_mode):
             raise OSError("Artifact is not a regular file")
         return os.fdopen(fd, "rb")
     except BaseException:

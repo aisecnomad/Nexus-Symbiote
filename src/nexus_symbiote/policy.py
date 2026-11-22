@@ -27,10 +27,32 @@ MAX_POLICY_LIST_ITEMS = 256
 MAX_POLICY_SUPPRESSIONS = 1000
 MAX_POLICY_ENTRY_CHARS = 1024
 _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_CI_ENVIRONMENT_VARIABLES = (
+    "CI",
+    "GITHUB_ACTIONS",
+    "GITLAB_CI",
+    "CIRCLECI",
+    "TF_BUILD",
+    "JENKINS_URL",
+    "BUILDKITE",
+    "DRONE",
+    "TRAVIS",
+)
+
+
+def running_in_ci() -> bool:
+    """Whether a recognized environment variable indicates a CI runner."""
+    return any(
+        os.environ.get(name) not in (None, "", "0", "false") for name in _CI_ENVIRONMENT_VARIABLES
+    )
 
 
 class PolicyError(ValueError):
     """An existing policy cannot be interpreted without weakening its meaning."""
+
+
+class PolicyListingError(PolicyError):
+    """The project root could not be fully listed to locate its policy."""
 
 
 class PolicySection(BaseModel):
@@ -203,13 +225,15 @@ def find_policy_path(project_root: Path) -> Path | None:
         with os.scandir(current) as stream:
             for item in stream:
                 if len(entries) >= entry_bound.value:
-                    raise PolicyError(f"project root {current}: {entry_bound.exceeded()}")
+                    raise PolicyListingError(f"project root {current}: {entry_bound.exceeded()}")
                 entries.append(item.name)
     except (FileNotFoundError, NotADirectoryError):
         return None
     except OSError as exc:
         # A directory that cannot be listed may hold a policy, so it is not "no policy".
-        raise PolicyError(f"project root {current} cannot be listed: {exc.strerror}") from None
+        raise PolicyListingError(
+            f"project root {current} cannot be listed: {exc.strerror}"
+        ) from None
     folded_targets = {fold_name(name): name for name in POLICY_FILE_NAMES}
     found: list[Path] = []
     variants: list[tuple[str, str]] = []
@@ -250,6 +274,12 @@ def load_policy_file(project_root: Path) -> tuple[Policy, Path, str] | None:
     return policy, path, digest
 
 
+def resolved_project_policy(project_root: Path) -> tuple[Policy, Path | None]:
+    """Return the governing checkout policy, or the built-in default without a source path."""
+    loaded = load_policy_file(project_root)
+    return (default_policy(), None) if loaded is None else (loaded[0], loaded[1])
+
+
 def load_policy(project_root: Path) -> Policy | None:
     loaded = load_policy_file(project_root)
     return None if loaded is None else loaded[0]
@@ -270,6 +300,11 @@ def nearest_policy_file(start: Path) -> Path | None:
             except OSError:
                 continue
     return None
+
+
+def additional_exclusions(scan: ScanPolicy) -> list[str]:
+    """Project exclusions that can narrow collection beyond the built-in exclusions."""
+    return [path for path in scan.exclude_paths if path not in _ALWAYS_EXCLUDED_NAMES]
 
 
 def weakened_settings(policy: Policy) -> list[str]:
@@ -299,12 +334,17 @@ def weakened_settings(policy: Policy) -> list[str]:
         weaker.append("scan.failure_mode=report-only")
     if set(policy.scan.scanners) < set(base.scan.scanners):
         weaker.append("scan.scanners=" + ",".join(policy.scan.scanners))
-    extra = [path for path in policy.scan.exclude_paths if path not in _ALWAYS_EXCLUDED_NAMES]
+    extra = additional_exclusions(policy.scan)
     if extra:
         weaker.append("scan.exclude_paths=" + ",".join(extra))
     if policy.output.default_format != base.output.default_format:
         weaker.append(f"output.default_format={policy.output.default_format}")
     return weaker
+
+
+def gate_weakenings(weaker: list[str]) -> list[str]:
+    """Relaxations that can change whether a check passes."""
+    return [entry for entry in weaker if not entry.startswith("output.")]
 
 
 def read_sexagesimal_integers_as_text(loader: type[Any]) -> None:
@@ -398,12 +438,14 @@ def parse_yaml_mapping(text: str, *, max_nodes: int | None = None) -> dict[str, 
 def _parse_policy_with_digest(path: Path) -> tuple[Policy, str]:
     from pydantic import ValidationError
 
+    from nexus_symbiote.core.hashing import stat_input_file
+
     try:
         fd = os.open(
             path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         )
         try:
-            info = os.fstat(fd)
+            info = stat_input_file(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
                 raise PolicyError("policy must be a regular file no larger than 1 MiB")
             stream = os.fdopen(fd, "rb")
@@ -435,8 +477,9 @@ def _parse_policy_with_digest(path: Path) -> tuple[Policy, str]:
 
 DEFAULT_POLICY_YAML = """\
 # Nexus SymBiote project policy. Every key is described in docs/policy-reference.md.
-# Malformed or unsupported settings fail closed. Settings that relax the built-in
-# gates are reported as policy_weakened; --no-project-policy ignores this file.
+# Tightening settings apply automatically. An invalid file stops the command.
+# --accept-project-policy accepts reviewed relaxations within the operator policy.
+# --no-project-policy ignores the checkout policy.
 version: "1.0"  # quote it: an unquoted 1.0 is a number and is refused
 scan:
   # Removing a collector leaves coverage partial, which fails the gates.
@@ -449,7 +492,7 @@ risk:
   fail_threshold: 50.0  # aggregate score; lowering it is stricter
   warn_threshold: 25.0  # must not exceed fail_threshold
   fail_on_severity: "critical"  # critical, high, medium, low, info or none
-  ignore_categories: []  # whole categories, everywhere; prefer suppressions
+  # ignore_categories: []  # uncomment to require every category, including operator-approved ignores
   # Accept one reviewed finding, with a reason, owner and expiry. Copy component_ref,
   # category and fingerprint from `risk --json-output`; a changed finding no longer matches.
   # suppressions:
@@ -459,7 +502,7 @@ risk:
   #     reason: "Test fixture, never loaded"
   #     owner: "security@example.test"
   #     expires: 2027-01-31
-  suppressions: []
+  suppressions: []  # operator-approved decisions are managed in the operator policy
 validate:
   require_completeness: true
   require_integrity: true

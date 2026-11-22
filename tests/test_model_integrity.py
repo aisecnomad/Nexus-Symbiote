@@ -1906,3 +1906,23 @@ def test_a_pinned_shard_with_a_bound_index_stays_verified(project: Path) -> None
     (component,) = [c for c in result.components if c.source_path == "c/" + shard.name]
     assert component.signing_status == "digest-pinned"
     assert component.trust_tier is TrustTier.INTERNAL_VERIFIED
+
+
+def test_tensor_metadata_is_checked_at_the_artifact_an_in_root_link_names(project, monkeypatch):
+    (project / "weights").mkdir()
+    write_safetensors(project / "weights" / "real.safetensors")
+    (project / "model.safetensors").symlink_to("weights/real.safetensors")
+    collected = [
+        component
+        for component in ModelScanner().scan(project).components
+        if component.source_path == "weights/real.safetensors"
+    ]
+    # The link's own path names the same bytes, as the model check locates them.
+    linked = collected[0].model_copy(update={"source_path": "model.safetensors"})
+    opened = _calls(monkeypatch, "open_regular")
+    report = IntegrityValidator(require_model_signatures=False).validate(
+        AIBOM(components=[linked]), project
+    )
+    assert opened == [Path("weights/real.safetensors")]
+    assert not [i for i in report.issues if i.category == "tensor_metadata_unverified"]
+    assert report.hashes_failed == 0

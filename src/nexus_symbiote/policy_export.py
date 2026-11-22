@@ -25,6 +25,12 @@ from nexus_symbiote.core.hashing import hash_bytes, normalize_digest
 from nexus_symbiote.core.inventory_digests import inventory_digests
 from nexus_symbiote.core.models import MCPServerComponent, ModelComponent, ToolComponent
 from nexus_symbiote.graph import validate_graph
+from nexus_symbiote.policy import (
+    PolicyError,
+    additional_exclusions,
+    resolved_project_policy,
+    running_in_ci,
+)
 from nexus_symbiote.runtime import key_id
 from nexus_symbiote.runtime_cli import (
     _check_key_placement,
@@ -43,6 +49,7 @@ if TYPE_CHECKING:
 
 _POLICY_FORMATS = frozenset({"cedar", "rego", "json"})
 _UNVERIFIED_SEVERITIES = frozenset({"critical", "error", "unknown"})
+_MAX_POLICY_DIAGNOSTIC_CHARS = 1024
 
 
 def resolve_project_root(value: str | Path, *, label: str) -> Path:
@@ -172,7 +179,7 @@ def corroborate_against_project(
     project: Path,
     signature_policy: Path | None = None,
 ) -> tuple[str, frozenset[str], frozenset[str]]:
-    """Reconcile and integrity-check ``bom`` against ``project`` under built-in gates."""
+    """Reconcile and integrity-check ``bom`` in the named project's scan scope."""
     from nexus_symbiote.validators.completeness import (
         CompletenessValidator,
         discovery_producer_check,
@@ -183,18 +190,37 @@ def corroborate_against_project(
     root = resolve_project_root(project, label="--project")
     require_binding_key()
     sig_policies = load_signer_policies(signature_policy, root)
+    try:
+        policy, _ = resolved_project_policy(root)
+    except PolicyError as exc:
+        message = neutralize(f"could not load validation settings for --project: {exc}")
+        if len(message) > _MAX_POLICY_DIAGNOSTIC_CHARS:
+            message = message[: _MAX_POLICY_DIAGNOSTIC_CHARS - 3] + "..."
+        raise click.ClickException(message) from exc
+    if extra_paths := additional_exclusions(policy.scan):
+        entries = "entry" if len(extra_paths) == 1 else "entries"
+        where = " in CI" if running_in_ci() else ""
+        raise click.ClickException(
+            f"the project policy weakens the built-in gates{where} because "
+            f"scan.exclude_paths contains {len(extra_paths)} additional {entries}"
+        )
+    excluded = policy.scan.exclude_paths
     c_report = CompletenessValidator().validate_against_project(
-        bom, root, signature_policies=sig_policies
+        bom, root, exclude_paths=excluded, signature_policies=sig_policies
     )
     if not c_report.is_complete:
         raise click.ClickException("inventory failed completeness reconciliation against --project")
     i_report = IntegrityValidator(signature_policies=sig_policies).validate(
-        bom, root, bound_imports=c_report.bound_imports
+        bom, root, exclude_paths=excluded, bound_imports=c_report.bound_imports
     )
     if i_report.status == "fail" or bool(i_report.omitted_severities & _UNVERIFIED_SEVERITIES):
         raise click.ClickException("inventory failed integrity validation against --project")
-    if discovery_signature_required(False, root, sig_policies):
-        _status, problems = discovery_producer_check(bom, root, sig_policies)
+    if discovery_signature_required(
+        policy.validation.require_discovery_signature, root, sig_policies
+    ):
+        _status, problems = discovery_producer_check(
+            bom, root, sig_policies, exclude_paths=excluded
+        )
         if problems:
             raise click.ClickException(
                 "inventory failed discovery producer verification against --project"
