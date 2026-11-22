@@ -474,13 +474,15 @@ nexus-symbiote crosswalk [OPTIONS] AIBOM_PATH
 | `--project` `DIRECTORY` | Reconcile `AIBOM_PATH` against this project to corroborate `verified_models` in `--include-evidence-pack`. |
 | `--signature-policy` `FILE` | Explicit operator signer policy JSON for `--include-evidence-pack`; requires `--project`. |
 
-The findings are those that `risk` scores under the built-in policy; no project policy
-is read. For each framework edition the report lists every entry that a finding
-references, with those findings, and the categories whose findings reference none. A
-reference means that a finding records a precondition, a weakness or evidence relevant
+The findings use the built-in `risk` policy. When corroborating an evidence pack,
+the command reads the named project's scan exclusions and discovery-signature
+requirement. For each framework edition, the report lists the entries referenced
+by findings, the findings for each entry, and the categories with no references.
+A reference means that a finding records a precondition, a weakness or evidence relevant
 to an entry, never that an attack happened, that a control fails or that an obligation
-applies. It is a report, not a gate: it exits 0 whatever the findings are, and 1 only
-when the inventory cannot be read or the report cannot be written. In Markdown, every
+applies. A written report exits 0 regardless of its findings. Reading the inventory,
+corroborating a requested evidence pack, or writing the report can fail with exit
+status 1. In Markdown, every
 ASCII punctuation character of inventory text is backslash-escaped, so a terminal shows
 the backslashes.
 [Framework crosswalk](framework-crosswalk.md) describes the report and the catalog.
@@ -640,6 +642,19 @@ nexus-symbiote export-policy [OPTIONS] INVENTORY
 | `-o`, `--output` `PATH` | Write the policy to this file instead of standard output. |
 
 By default (`--verified-only`), `export-policy` refuses uncorroborated inventories unless `--project` reconciles and integrity-validates `INVENTORY` against the project or `--require-attestation` with `--trusted-key` verifies a reviewed DSSE attestation over `INVENTORY`. Pass `--include-declared` only when exporting uncorroborated declarations intentionally. With `--require-attestation` and no `--project`, tool permits rely on the reviewer's attestation. The JSON bundle also lists attested MCP servers in `allowed_mcp_servers`. Cedar and Rego emit tool and model decisions. A model permit requires `--project` and `--signature-policy` to corroborate the model's digest and signature.
+
+`export-policy --project` and `crosswalk --include-evidence-pack --project` use the named project's
+`scan.exclude_paths` and `validate.require_discovery_signature` settings. Both commands require
+completeness, integrity and any applicable discovery-producer signature. Unknown integrity issues
+exclude the affected components from verified permits and verified model evidence. These checks
+remain mandatory for every value of `validate.require_completeness`, `validate.require_integrity`,
+`validate.minimum_assurance_level` and `scan.failure_mode`.
+
+In CI, the accepted `scan.exclude_paths` entries are exactly `node_modules`, `.git`,
+`__pycache__`, `.venv` and `venv`. All other entries, including `node_modules/` and
+`./node_modules`, cause corroboration to fail even when the path is absent. Both commands
+refuse an invalid project policy and report its cause.
+Neither command accepts `--accept-project-policy` or `--no-project-policy`.
 
 ### `graph`
 
