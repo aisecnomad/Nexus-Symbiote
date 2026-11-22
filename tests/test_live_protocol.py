@@ -6,7 +6,6 @@ All replies come from a trusted in-process fixture; nothing resolves or connects
 from __future__ import annotations
 
 import json
-import time
 from typing import Any
 
 import pytest
@@ -16,6 +15,7 @@ from jsonschema import Draft202012Validator
 
 from nexus_symbiote.scanners import live_mcp
 from nexus_symbiote.scanners.live_mcp import HTTPReply, discover_tools
+from tests.support import scaling_ratio
 from tests.test_live_mcp import (
     ENDPOINT,
     ORIGIN,
@@ -226,44 +226,62 @@ def schema_tool(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def test_quadratic_unique_items_schemas_are_refused_before_checking():
-    started = time.monotonic()
-    for schema in (
-        {"type": "object", "properties": {"x": {"type": ["a", *range(9_000)]}}},
-        {"type": "object", "dependencies": {"a": ["a", *range(9_000)]}},
-        {"type": "object", "dependencies": {"x": {"required": ["a", *range(9_000)]}}},
-        {
-            "type": "object",
-            "dependencies": {"x": {"dependentRequired": {"y": ["a", *range(9_000)]}}},
-        },
-    ):
-        result, _ = observe(
-            hello(), notification_accepted(), rpc_result(2, {"tools": [schema_tool(schema)]})
-        )
-        assert not result.complete
-        assert result.failures == ["MCP tool schema exceeds the validation budget"]
+    replies = {
+        scale: [
+            rpc_result(2, {"tools": [schema_tool(schema)]})
+            for schema in (
+                {"type": "object", "properties": {"x": {"type": ["a", *range(2_250 * scale)]}}},
+                {"type": "object", "dependencies": {"a": ["a", *range(2_250 * scale)]}},
+                {
+                    "type": "object",
+                    "dependencies": {"x": {"required": ["a", *range(2_250 * scale)]}},
+                },
+                {
+                    "type": "object",
+                    "dependencies": {
+                        "x": {"dependentRequired": {"y": ["a", *range(2_250 * scale)]}}
+                    },
+                },
+            )
+        ]
+        for scale in (1, 4)
+    }
+
+    def run(scale: int) -> None:
+        for reply in replies[scale]:
+            result, _ = observe(hello(), notification_accepted(), reply)
+            assert not result.complete
+            assert result.failures == ["MCP tool schema exceeds the validation budget"]
+
     # All fit the JSON budget; unguarded, each costs about 4e7 pairwise comparisons.
-    assert time.monotonic() - started < 5
+    assert scaling_ratio(run) < 10
 
 
 @pytest.mark.parametrize(
-    "inner",
+    "make_inner",
     [
-        {"prefixItems": list(range(10_000))},
-        {"allOf": list(range(10_000))},
-        {"properties": {f"p{index}": index for index in range(7_500)}},
-        {"dependencies": {"y": {"prefixItems": [{"type": 5}] * 7_000}}},
+        lambda scale: {"prefixItems": list(range(2_500 * scale))},
+        lambda scale: {"allOf": list(range(2_500 * scale))},
+        lambda scale: {"properties": {f"p{index}": index for index in range(1_875 * scale)}},
+        lambda scale: {"dependencies": {"y": {"prefixItems": [{"type": 5}] * (1_750 * scale)}}},
     ],
     ids=["prefix-items", "all-of", "properties", "nested-dependencies"],
 )
-def test_invalid_dependency_subschemas_are_refused_at_their_first_error(inner):
-    schema = {"type": "object", "dependencies": {"x": inner}}
-    started = time.monotonic()
-    result, _ = observe(
-        hello(), notification_accepted(), rpc_result(2, {"tools": [schema_tool(schema)]})
-    )
-    assert result.failures == ["invalid MCP tool JSON Schema"]
+def test_invalid_dependency_subschemas_are_refused_at_their_first_error(make_inner):
+    replies = {
+        scale: rpc_result(
+            2,
+            {"tools": [schema_tool({"type": "object", "dependencies": {"x": make_inner(scale)}})]},
+        )
+        for scale in (1, 4)
+    }
+
+    def run(scale: int) -> None:
+        result, _ = observe(hello(), notification_accepted(), replies[scale])
+        assert result.failures == ["invalid MCP tool JSON Schema"]
+
     # The metaschema's anyOf listed every error of such a subschema: seconds each.
-    assert time.monotonic() - started < 2
+    assert scaling_ratio(run) < 10
 
 
 SCHEMA_LEAVES = st.booleans() | st.fixed_dictionaries(

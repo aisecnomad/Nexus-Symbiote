@@ -6,7 +6,6 @@ import itertools
 import json
 import re
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -977,13 +976,22 @@ def test_directive_and_heredoc_reading_is_linear_at_the_read_limit(tmp_path):
 
 def test_pyproject_dotted_keys_are_bounded_before_parsing(tmp_path):
     # tomllib keeps every prefix of a dotted key: about 3.5 MB for 900 parts.
-    (tmp_path / "pyproject.toml").write_text(
-        "".join(f"k{i}." + ".".join(["a"] * 900) + " = 1\n" for i in range(120))
-    )
-    started = time.monotonic()
-    result = RegistryScanner().scan(tmp_path)
-    assert time.monotonic() - started < 5
-    assert result.scan_failures == ["pyproject.toml: dotted key exceeds the length limit: not read"]
+    roots = {}
+    for scale in (1, 4):
+        root = tmp_path / f"scale_{scale}"
+        root.mkdir()
+        (root / "pyproject.toml").write_text(
+            "".join(f"k{i}." + ".".join(["a"] * 900) + " = 1\n" for i in range(30 * scale))
+        )
+        roots[scale] = root
+
+    def run(scale: int) -> None:
+        result = RegistryScanner().scan(roots[scale])
+        assert result.scan_failures == [
+            "pyproject.toml: dotted key exceeds the length limit: not read"
+        ]
+
+    assert scaling_ratio(run) < 10
 
 
 @pytest.mark.parametrize(
@@ -1043,15 +1051,21 @@ def test_quoted_parts_count_toward_the_dotted_key_bound(tmp_path, key):
 
 def test_a_long_key_of_quoted_parts_is_refused_before_parsing(tmp_path):
     # tomllib keeps every prefix of a dotted key: 7.5 s and 2.3 GB for this one.
-    (tmp_path / "pyproject.toml").write_text(
-        '[project]\nname = "agent"\ndependencies = ["openai==1.0.0"]\n[tool.x]\nk'
-        + '.""' * 20_000
-        + " = 1\n"
-    )
-    started = time.monotonic()
-    result = RegistryScanner().scan(tmp_path)
-    assert time.monotonic() - started < 5
-    assert result.scan_failures == TOO_LONG
+    roots = {}
+    for scale in (1, 4):
+        root = tmp_path / f"scale_{scale}"
+        root.mkdir()
+        (root / "pyproject.toml").write_text(
+            '[project]\nname = "agent"\ndependencies = ["openai==1.0.0"]\n[tool.x]\nk'
+            + '.""' * (5_000 * scale)
+            + " = 1\n"
+        )
+        roots[scale] = root
+
+    def run(scale: int) -> None:
+        assert RegistryScanner().scan(roots[scale]).scan_failures == TOO_LONG
+
+    assert scaling_ratio(run) < 10
 
 
 def test_a_large_pyproject_is_not_parsed(tmp_path):
@@ -1085,13 +1099,20 @@ def test_an_integer_too_long_to_convert_fails_only_pyproject(tmp_path):
 
 def test_long_quoted_option_text_is_not_split_and_is_a_gap(tmp_path):
     # shlex grows a token one character at a time: minutes for a 4 MiB quoted word.
-    word = "'" + "a" * 1_500_000 + "'"
-    (tmp_path / "requirements.txt").write_text(f"openai==1.0.0 --hash {word}\n-i {word}\n")
-    started = time.monotonic()
-    result = RegistryScanner().scan(tmp_path)
-    assert time.monotonic() - started < 5
-    assert result.surfaces_excluded == ["requirements.txt: option line not parsed"]
-    assert [c.name for c in result.components] == ["openai"]
+    roots = {}
+    for scale in (1, 4):
+        root = tmp_path / f"scale_{scale}"
+        root.mkdir()
+        word = "'" + "a" * (375_000 * scale) + "'"
+        (root / "requirements.txt").write_text(f"openai==1.0.0 --hash {word}\n-i {word}\n")
+        roots[scale] = root
+
+    def run(scale: int) -> None:
+        result = RegistryScanner().scan(roots[scale])
+        assert result.surfaces_excluded == ["requirements.txt: option line not parsed"]
+        assert [c.name for c in result.components] == ["openai"]
+
+    assert scaling_ratio(run) < 10
 
 
 def test_a_deeply_nested_marker_fails_its_line_and_keeps_the_rest(tmp_path):
