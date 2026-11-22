@@ -34,14 +34,11 @@ def _relative(root: Path, path: Path, *, allow_parent: bool = False) -> Path:
 def _parent(root: Path, relative: Path, create_parents: bool) -> Iterator[int]:
     cloexec = getattr(os, "O_CLOEXEC", 0)
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec
-    o_path = getattr(os, "O_PATH", 0)
-    path_flags = (o_path | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec) if o_path else 0
-    parent: int | None = open_directory_nofollow(root)
-    prefix = root
-    dir_parts = relative.parts[:-1]
+    search_flag = getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0)
+    path_flags = (search_flag | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec) if search_flag else 0
+    parent = open_directory_nofollow(root)
     try:
-        for index, part in enumerate(dir_parts):
-            is_last = index == len(dir_parts) - 1
+        for index, part in enumerate(relative.parts[:-1]):
             if (
                 index == 0
                 and root == Path(root.anchor)
@@ -50,51 +47,27 @@ def _parent(root: Path, relative: Path, create_parents: bool) -> Iterator[int]:
                 and os.path.islink(f"/{part}")
                 and os.readlink(f"/{part}") == f"private/{part}"
             ):
-                assert parent is not None
                 priv = os.open("private", flags, dir_fd=parent)
                 os.close(parent)
                 parent = priv
-                prefix = prefix / "private"
-            prefix = prefix / part
-            if parent is not None:
-                try:
-                    # ".." of a directory opened without following links is its real
-                    # parent, so this reaches exactly what the kernel resolves.
-                    child = os.open(part, flags, dir_fd=parent)
-                except PermissionError:
-                    if path_flags:
-                        child = os.open(part, path_flags, dir_fd=parent)
-                    elif is_last:
-                        raise
-                    else:
-                        os.close(parent)
-                        parent = None
-                        if not stat.S_ISDIR(os.lstat(prefix).st_mode):
-                            raise OSError(errno.ENOTDIR, f"Not a directory: {prefix}") from None
-                        continue
-                except FileNotFoundError:
-                    if not create_parents:
-                        raise
-                    os.mkdir(part, mode=0o700, dir_fd=parent)
-                    child = os.open(part, flags, dir_fd=parent)
-                os.close(parent)
-                parent = child
-                continue
             try:
-                parent = os.open(prefix, flags)
+                # ".." of a directory opened without following links is its real
+                # parent, so this reaches exactly what the kernel resolves.
+                child = os.open(part, flags, dir_fd=parent)
+            except PermissionError:
+                if not path_flags:
+                    raise
+                child = os.open(part, path_flags, dir_fd=parent)
             except FileNotFoundError:
                 if not create_parents:
                     raise
-                os.mkdir(prefix, mode=0o700)
-                parent = os.open(prefix, flags)
-            except PermissionError:
-                if is_last or not stat.S_ISDIR(os.lstat(prefix).st_mode):
-                    raise
-        assert parent is not None
+                os.mkdir(part, mode=0o700, dir_fd=parent)
+                child = os.open(part, flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
         yield parent
     finally:
-        if parent is not None:
-            os.close(parent)
+        os.close(parent)
 
 
 def create_staging_file(path: Path, prefix: str) -> Path:

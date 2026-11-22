@@ -365,7 +365,57 @@ def _integer_or_text(loader: Any, node: Any) -> Any:
 MAX_YAML_FLOW_DEPTH = 64
 _YAML_FLOW_SPECIAL = re.compile(r"""[\[\]{}"'#\r\n]""")
 _YAML_DQ_STOP = re.compile(r'["\\]')
-_YAML_BLOCK_HEADER = re.compile(r"(?:^|[ \t:])[|>][+-]?\d?[+-]?[ \t]*(?:#[^\r\n]*)?\Z")
+_YAML_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+_YAML_BLOCK_IND_RE = re.compile(r"^[|>](?:(?P<d1>[1-9])[+-]?|[+-](?P<d2>[1-9])?)?$")
+_YAML_PROP_RE = re.compile(r"^(?:&|!)[^\s\[\]{},]+$")
+
+
+def _split_last_ws(text: str) -> tuple[str, str]:
+    idx = len(text) - 1
+    while idx >= 0 and text[idx] not in " \t":
+        idx -= 1
+    return text[: idx + 1].rstrip(" \t"), text[idx + 1 :]
+
+
+def _parse_block_scalar_header(raw_line: str) -> tuple[int, int | None] | None:
+    """Return ``(parent_indent, explicit_content_indent)`` if ``raw_line`` opens a YAML block scalar.
+
+    Matches only valid YAML block-scalar header positions (root, document start ``---``,
+    mapping value ``:``, or block sequence/key indicators ``-``/``?``, with optional
+    ``&anchor``/``!tag`` properties) in O(len(raw_line)) time without regex backtracking.
+    """
+    trimmed = raw_line.rstrip(" \t")
+    if not trimmed:
+        return None
+    prefix, token = _split_last_ws(trimmed)
+    ind = _YAML_BLOCK_IND_RE.fullmatch(token)
+    if ind is None:
+        return None
+    digit = ind.group("d1") or ind.group("d2")
+    explicit = int(digit) if digit else None
+    while prefix:
+        rest, last = _split_last_ws(prefix)
+        if _YAML_PROP_RE.fullmatch(last):
+            prefix = rest
+            continue
+        break
+    if not prefix or prefix == "---":
+        return (-1, explicit)
+    if prefix.endswith(":"):
+        pos = 0
+        end = len(raw_line)
+        while pos < end and raw_line[pos] == " ":
+            pos += 1
+        while pos + 1 < end and raw_line[pos] in "-?" and raw_line[pos + 1] in " \t":
+            pos += 1
+            while pos < end and raw_line[pos] == " ":
+                pos += 1
+        return (pos, None if explicit is None else pos + explicit)
+    parts = prefix.split()
+    if all(part in {"-", "?"} for part in parts):
+        last_col = len(prefix) - 1
+        return (last_col, None if explicit is None else last_col + explicit)
+    return None
 
 
 def check_yaml_flow_depth(text: str, *, max_depth: int = MAX_YAML_FLOW_DEPTH) -> None:
@@ -381,18 +431,47 @@ def check_yaml_flow_depth(text: str, *, max_depth: int = MAX_YAML_FLOW_DEPTH) ->
     length = len(text)
     line_start = 0
     block_indent: int | None = None
+    block_content_indent: int | None = None
+    block_max_empty = 0
 
     while pos < length:
         if block_indent is not None:
-            nl = text.find("\n", pos)
-            line_end = length if nl < 0 else nl
-            line = text[pos:line_end].rstrip("\r")
+            br = _YAML_LINE_BREAK.search(text, pos)
+            line_end = length if br is None else br.start()
+            next_pos = length if br is None else br.end()
+            line = text[pos:line_end]
             stripped = line.lstrip(" ")
-            if not stripped or (len(line) - len(stripped)) > block_indent:
-                pos = line_end + 1 if nl >= 0 else length
+            indent = len(line) - len(stripped)
+            if not stripped:
+                if block_content_indent is None:
+                    block_max_empty = max(block_max_empty, indent)
+                pos = next_pos
                 line_start = pos
                 continue
-            block_indent = None
+            is_doc_marker = indent == 0 and (
+                line in {"---", "..."} or line.startswith(("--- ", "---\t", "... ", "...\t"))
+            )
+            if is_doc_marker:
+                block_indent = None
+                block_content_indent = None
+                block_max_empty = 0
+            elif block_content_indent is not None:
+                if indent >= block_content_indent:
+                    pos = next_pos
+                    line_start = pos
+                    continue
+                block_indent = None
+                block_content_indent = None
+                block_max_empty = 0
+            elif indent > block_indent and indent >= block_max_empty:
+                block_content_indent = indent
+                pos = next_pos
+                line_start = pos
+                continue
+            else:
+                block_indent = None
+                block_content_indent = None
+                block_max_empty = 0
 
         found = _YAML_FLOW_SPECIAL.search(text, pos)
         if found is None:
@@ -402,22 +481,24 @@ def check_yaml_flow_depth(text: str, *, max_depth: int = MAX_YAML_FLOW_DEPTH) ->
         pos = found.end()
         if ch in "\r\n":
             if depth == 0:
-                raw_line = text[line_start:start]
-                if _YAML_BLOCK_HEADER.search(raw_line):
-                    block_indent = len(raw_line) - len(raw_line.lstrip(" "))
+                header = _parse_block_scalar_header(text[line_start:start])
+                if header is not None:
+                    block_indent, block_content_indent = header
+                    block_max_empty = 0
             if ch == "\r" and pos < length and text[pos] == "\n":
                 pos += 1
             line_start = pos
         elif ch == "#":
             if start == 0 or text[start - 1] in " \t\r\n":
-                nl = text.find("\n", pos)
-                if nl < 0:
-                    return
+                br = _YAML_LINE_BREAK.search(text, pos)
                 if depth == 0:
-                    raw_line = text[line_start:start]
-                    if _YAML_BLOCK_HEADER.search(raw_line):
-                        block_indent = len(raw_line) - len(raw_line.lstrip(" "))
-                pos = nl + 1
+                    header = _parse_block_scalar_header(text[line_start:start])
+                    if header is not None:
+                        block_indent, block_content_indent = header
+                        block_max_empty = 0
+                if br is None:
+                    return
+                pos = br.end()
                 line_start = pos
         elif ch == '"':
             while pos < length:

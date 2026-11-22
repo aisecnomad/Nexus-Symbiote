@@ -69,10 +69,17 @@ _CREDENTIAL_STORE_NAMES = frozenset(
         "heroku",
     }
 )
-# Dotted home-directory credential stores (plus XDG `.config`, which hosts CLI
-# credential files such as `gh/hosts.yml`, `gcloud/`, `helm/`, `sops/`).
-_DOT_CREDENTIAL_STORES = frozenset({*(f".{name}" for name in _CREDENTIAL_STORE_NAMES), ".config"})
+# Dotted home-directory credential stores; XDG `.config/<store>` is matched by
+# adjacent pair so non-credential `.config/` files (e.g. `.config/mcp.json`) are still scanned.
+_DOT_CREDENTIAL_STORES = frozenset(f".{name}" for name in _CREDENTIAL_STORE_NAMES)
 _RAIL_LINK_CREDENTIAL_STORES = _DOT_CREDENTIAL_STORES | _CREDENTIAL_STORE_NAMES
+
+
+def _has_xdg_credential_store(directories: tuple[str, ...]) -> bool:
+    return any(
+        left.casefold() == ".config" and right.casefold() in _CREDENTIAL_STORE_NAMES
+        for left, right in zip(directories, directories[1:], strict=False)
+    )
 
 
 def credential_shaped(path: str, *, colang_source: bool = False) -> bool:
@@ -89,7 +96,7 @@ def credential_shaped(path: str, *, colang_source: bool = False) -> bool:
         part.casefold().lstrip(".") in _CREDENTIAL_DIRECTORIES
         or part.casefold() in _DOT_CREDENTIAL_STORES
         for part in directories
-    ):
+    ) or _has_xdg_credential_store(directories):
         return True
     name = PurePosixPath(path).name.lower()
     suffix = PurePosixPath(name).suffix
@@ -123,15 +130,21 @@ def link_gap(target: str | None, *, colang_rail: str | None = None) -> str | Non
     """Why a symlink that leads to ``target`` is not followed, or None."""
     if target is None:
         return None
-    if any(
-        part.casefold() in _RAIL_LINK_CREDENTIAL_STORES for part in PurePosixPath(target).parts[:-1]
+    target_path = PurePosixPath(target)
+    directories = target_path.parts[:-1]
+    if (
+        any(part.casefold() in _RAIL_LINK_CREDENTIAL_STORES for part in directories)
+        or _has_xdg_credential_store(directories)
+        or (
+            bool(directories)
+            and directories[-1].casefold() == ".config"
+            and target_path.stem.casefold() in _CREDENTIAL_STORE_NAMES
+        )
     ):
         return "symlink leads into a credential directory"
     # A transparent rail link keeps its declared name and program role. A
     # renamed target can be a credential store presented under a rail alias.
-    same_rail = (
-        colang_rail is not None and PurePosixPath(colang_rail).name == PurePosixPath(target).name
-    )
+    same_rail = colang_rail is not None and PurePosixPath(colang_rail).name == target_path.name
     if credential_shaped(target, colang_source=same_rail):
         return f"a symlink leads to {target}, whose name says it holds credentials"
     return None

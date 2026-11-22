@@ -92,8 +92,15 @@ def test_markdown_and_non_store_directories_remain_permitted() -> None:
     assert not credential_shaped("docs/secrets-handling.md")
     assert not credential_shaped("vault-tools/check_secrets.co", colang_source=True)
     assert not credential_shaped("ssh-handlers/config.yml")
+    assert not credential_shaped(".config/mcp.json")
+    assert not credential_shaped(".config/agent.yaml")
+    assert not credential_shaped(".config/opencode/opencode.json")
+    assert not credential_shaped(".config/guardrails/config.yml")
     assert credential_shaped(".aws/config.yml")
     assert credential_shaped("secrets/agent.json")
+    assert credential_shaped(".config/gh/hosts.yml")
+    assert credential_shaped(".config/gcloud/credentials.json")
+    assert credential_shaped(".config/sops/age/keys.txt")
 
 
 def test_a2a_regular_card_under_dot_aws_is_withheld(tmp_path: Path) -> None:
@@ -374,6 +381,27 @@ def test_check_yaml_flow_depth_blocks_deep_flow_and_allows_safe_constructs() -> 
     with pytest.raises(PolicyError):
         check_yaml_flow_depth(escaped_block)
 
+    # All block-scalar bypass vectors must still fail closed.
+    deep = "[" * (MAX_YAML_FLOW_DEPTH + 1) + "]" * (MAX_YAML_FLOW_DEPTH + 1)
+    for bypass in (
+        f"? foo |\n : {deep}\n",
+        f"a: foo |\n  {deep}\n",
+        f"a: |2\n {deep}\n",
+        f"  a: |2\n   {deep}\n",
+        f"- a: |2\n   {deep}\n",
+        f"|2\n {deep}\n",
+        f"a: |\n    hi\n {deep}\n",
+        f"a: |\n   \n  {deep}\n",
+        f"a: |\r{deep}\r",
+    ):
+        with pytest.raises(PolicyError):
+            check_yaml_flow_depth(bypass)
+
+    # Legitimate explicit-indent and property-annotated block scalars remain allowed.
+    check_yaml_flow_depth(f"a: |2\n  {deep}\n")
+    check_yaml_flow_depth(f"  - a: &x !str |2-\n      {deep}\n")
+    check_yaml_flow_depth(f"--- |\n  {deep}\n")
+
 
 def test_rag_and_base_yaml_parsers_reject_flow_nesting_dos_in_linear_time(tmp_path: Path) -> None:
     dos_payload = "[" * 4000
@@ -445,52 +473,44 @@ def test_write_output_file_and_staging_work_under_traverse_only_ancestor(tmp_pat
     locked.chmod(0o111)
     try:
         dest = child / "report.json"
-        write_output_file(dest, '{"ok": true}\n')
-        assert dest.read_text(encoding="utf-8") == '{"ok": true}\n'
+        if getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0):
+            write_output_file(dest, '{"ok": true}\n')
+            assert dest.read_text(encoding="utf-8") == '{"ok": true}\n'
 
-        staged = create_staging_file(dest, ".stage-")
-        assert staged.exists()
-        staged.unlink()
+            staged = create_staging_file(dest, ".stage-")
+            assert staged.exists()
+            staged.unlink()
 
-        # Also exercise the non-O_PATH fallback branches cleanly.
-        dest2 = child / "sub" / "report2.json"
-        with mock.patch.object(os, "O_PATH", 0, create=True):
-            write_output_file(dest2, '{"fallback": true}\n', create_parents=True)
-        assert dest2.read_text(encoding="utf-8") == '{"fallback": true}\n'
+            dest2 = child / "sub" / "report2.json"
+            write_output_file(dest2, '{"nested": true}\n', create_parents=True)
+            assert dest2.read_text(encoding="utf-8") == '{"nested": true}\n'
 
-        # Missing directory directly below a 0o311 (write+exec, no read) ancestor.
-        locked.chmod(0o311)
-        dest3 = locked / "created_child" / "report3.json"
-        with mock.patch.object(os, "O_PATH", 0, create=True):
+            # Missing directory directly below a 0o311 (write+exec, no read) ancestor.
+            locked.chmod(0o311)
+            dest3 = locked / "created_child" / "report3.json"
             with pytest.raises(FileNotFoundError):
                 write_output_file(dest3, "x", create_parents=False)
             write_output_file(dest3, '{"created": true}\n', create_parents=True)
-        assert dest3.read_text(encoding="utf-8") == '{"created": true}\n'
+            assert dest3.read_text(encoding="utf-8") == '{"created": true}\n'
 
-        # Two consecutive traverse-only ancestors and a traverse-only leaf directory.
-        locked2 = locked / "inner_locked"
-        inner_out = locked2 / "out"
-        inner_out.mkdir(parents=True)
-        locked2.chmod(0o111)
-        try:
-            with mock.patch.object(os, "O_PATH", 0, create=True):
-                dest4 = inner_out / "report4.json"
-                write_output_file(dest4, '{"nested": true}\n')
-                assert dest4.read_text(encoding="utf-8") == '{"nested": true}\n'
-                with pytest.raises(PermissionError):
-                    write_output_file(locked2 / "leaf.json", "denied")
-                with pytest.raises(PermissionError):
-                    write_output_file(locked / "leaf.json", "denied")
-        finally:
-            locked2.chmod(0o700)
+            # Symlink beneath traverse-only ancestor is still refused descriptor-relatively.
+            target_dir = tmp_path / "outside"
+            target_dir.mkdir()
+            link_dir = locked / "link_dir"
+            link_dir.symlink_to(target_dir)
+            locked.chmod(0o111)
+            with pytest.raises(OSError):
+                write_output_file(link_dir / "escape.json", "nope")
+            with pytest.raises(PermissionError):
+                write_output_file(locked / "leaf.json", "denied")
 
-        # Symlink beneath traverse-only ancestor is still refused under O_PATH=0.
-        target_dir = tmp_path / "outside"
-        target_dir.mkdir()
-        link_dir = locked / "link_dir"
-        link_dir.symlink_to(target_dir)
+        # Without O_PATH or O_SEARCH, _parent must fail closed rather than drop dir_fd confinement.
         locked.chmod(0o111)
-        with mock.patch.object(os, "O_PATH", 0, create=True), pytest.raises(OSError):
-            write_output_file(link_dir / "escape.json", "nope")
+        with (
+            mock.patch.object(os, "O_PATH", 0, create=True),
+            mock.patch.object(os, "O_SEARCH", 0, create=True),
+            pytest.raises(PermissionError),
+        ):
+            write_output_file(child / "no_opath.json", "nope")
     finally:
         locked.chmod(0o700)
