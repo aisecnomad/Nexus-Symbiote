@@ -385,9 +385,9 @@ _IDE_GRANT_LEGS: dict[str, frozenset[str]] = {
 # An approval record gates its component only when it covers every action or all egress.
 _GATING_ACTIONS = frozenset({"*", "egress"})
 _READ_ACTIONS = frozenset({"read", "query", "list", "search", "get"})
-_DATA_NAME = r"[^\W\d][\w-]*"
+_DATA_NAME = r"\w[\w-]*"
 _TABLE_NAME = re.compile(rf"{_DATA_NAME}(?:\.{_DATA_NAME})*")
-_KB_NAME = re.compile(rf"(?P<root>{_DATA_NAME})(?:/[\w.?*-]+)*/?")
+_KB_NAME = re.compile(rf"{_DATA_NAME}(?:/{_DATA_NAME})*(?:/\*)?/?")
 _S3_BUCKET_SCOPE = re.compile(
     r"arn:(?:aws|aws-cn|aws-us-gov):s3:::"
     r"(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])(?:/[\w.?*-]+)*/?"
@@ -396,31 +396,15 @@ _DYNAMODB_SCOPE = re.compile(
     r"arn:(?:aws|aws-cn|aws-us-gov):dynamodb:[a-z]{2}(?:-[a-z0-9]+)+-[1-9][0-9]*:"
     r"[0-9]{12}:table/[A-Za-z0-9_.-]{3,255}(?:/index/[A-Za-z0-9_.-]{3,255})?"
 )
-_HOST_SUFFIXES = frozenset(
-    [
-        "arpa",
-        "com",
-        "edu",
-        "example",
-        "gov",
-        "int",
-        "internal",
-        "invalid",
-        "local",
-        "mil",
-        "net",
-        "org",
-        "test",
-    ]
+_UNBOUNDED_NAMES = frozenset(
+    {"all", "any", "everyone", "everything", "everywhere", "global", "wildcard"}
 )
-_UNBOUNDED_OR_NETWORK_NAMES = frozenset(
+# These lookalikes matter when deciding whether a declared scope names a resource.
+# Leave the shared tool-name and modeling normalization unchanged.
+_SCOPE_LOOKALIKES = str.maketrans({"ԝ": "w", "ᴡ": "w", "ᴇ": "e", "ʙ": "b", "ω": "w", "ǝ": "e"})
+_NETWORK_NAMES = frozenset(
     [
-        "all",
-        "any",
-        "everything",
-        "everywhere",
-        "global",
-        "wildcard",
+        "ip",
         "egress",
         "api",
         "cloud",
@@ -690,6 +674,16 @@ def _approval_state(
     return required or broad, False
 
 
+def _scope_identifier(part: str, *, knowledge_base: bool) -> bool:
+    normalized = unicodedata.normalize("NFKD", part.casefold().translate(_SCOPE_LOOKALIKES))
+    word = "".join(ch for ch in normalized.translate(_CONFUSABLES).casefold() if ch.isalpha())
+    if not word or word in _UNBOUNDED_NAMES:
+        return False
+    return not knowledge_base or (
+        word not in _NETWORK_NAMES and word.removesuffix("s") not in _NETWORK_NAMES
+    )
+
+
 def _independent_read(record: AuthorizationRecord) -> bool:
     """A named read can coexist with egress approval. A network or unbounded grant cannot."""
     if record.action.strip().casefold() not in _READ_ACTIONS or not record.resource_scope:
@@ -702,17 +696,15 @@ def _independent_read(record: AuthorizationRecord) -> bool:
     kind, colon, value = scope.partition(":")
     if not colon or not kind.isascii():
         return False
-    if kind.lower() == "table" and _TABLE_NAME.fullmatch(value):
-        parts = [canonical_tool_name(part) for part in value.split(".")]
-        if len(parts) > 1 and parts[-1] in _HOST_SUFFIXES:
-            return False
-        return all(
-            part not in _UNBOUNDED_OR_NETWORK_NAMES or (part == "public" and i < len(parts) - 1)
-            for i, part in enumerate(parts)
+    if kind.lower() == "table":
+        return _TABLE_NAME.fullmatch(value) is not None and all(
+            _scope_identifier(part, knowledge_base=False) for part in value.split(".")
         )
     if kind.lower() == "kb":
-        kb = _KB_NAME.fullmatch(value)
-        return kb is not None and canonical_tool_name(kb["root"]) not in _UNBOUNDED_OR_NETWORK_NAMES
+        prefix = value.rstrip("/").removesuffix("/*")
+        return _KB_NAME.fullmatch(value) is not None and all(
+            _scope_identifier(part, knowledge_base=True) for part in prefix.split("/")
+        )
     bucket = _S3_BUCKET_SCOPE.fullmatch(scope)
     if bucket is not None:
         name = bucket["bucket"]
