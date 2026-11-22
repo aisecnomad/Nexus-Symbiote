@@ -471,7 +471,7 @@ class RAGScanner(Scanner):
             if siblings:
                 contents = [files.read_bytes(rail) for rail in siblings]
                 if any(content is None for content in contents) or any(
-                    self._relinked(rail, files, result) for rail in siblings
+                    self._relinked(rail, files, result, colang_source=True) for rail in siblings
                 ):
                     continue
                 rail_files = {
@@ -580,8 +580,10 @@ class RAGScanner(Scanner):
         )
 
     @staticmethod
-    def _relinked(path: Path, files: ConfinedCollection, result: ScanResult) -> bool:
-        if not relinked(files, path.as_posix()):
+    def _relinked(
+        path: Path, files: ConfinedCollection, result: ScanResult, *, colang_source: bool = False
+    ) -> bool:
+        if not relinked(files, path.as_posix(), colang_source=colang_source):
             return False
         result.scan_failures.append(f"{path.as_posix()}: file changed during collection")
         return True
