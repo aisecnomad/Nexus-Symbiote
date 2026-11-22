@@ -499,3 +499,19 @@ def test_workflows_makefile_and_docs_security_invariants() -> None:
 
     coc = (ROOT / "CODE_OF_CONDUCT.md").read_text(encoding="utf-8")
     assert "[SECURITY.md](SECURITY.md)" in coc
+
+
+def test_dependency_health_installs_no_dependency_from_source() -> None:
+    # A floated release without a wheel would otherwise run its build code on the runner.
+    workflow = yaml.safe_load((ROOT / ".github/workflows/dependencies.yml").read_text("utf-8"))
+    installs = [
+        line
+        for job in workflow["jobs"].values()
+        for step in job["steps"]
+        for line in step.get("run", "").replace("\\\n", " ").splitlines()
+        if "pip install" in line
+    ]
+    assert installs
+    assert [
+        line for line in installs if "--only-binary=:all:" not in line and "--no-deps" not in line
+    ] == []

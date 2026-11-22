@@ -405,6 +405,71 @@ def test_a_withheld_content_digest_is_the_keyed_binding_or_unbound():
     assert component_content_digest(plain) is None and not content_unbound(plain)
 
 
+def test_a_withheld_flag_on_a_record_the_prompt_collector_did_not_write_binds_nothing():
+    from nexus_symbiote.core.models import ModelComponent, PromptComponent
+    from nexus_symbiote.validators.risk import component_content_digest
+
+    forged = {
+        "content_hash_withheld": "supplied",
+        "static_value_binding": "sha256:" + "6" * 64,
+    }
+    model = ModelComponent(
+        bom_ref="model:m.pkl", name="m.pkl", hashes={"sha256": "7" * 64}, properties=forged
+    )
+    assert component_content_digest(model) == "7" * 64
+    instruction = PromptComponent(
+        bom_ref="prompt:AGENTS.md",
+        name="AGENTS.md",
+        source_path="AGENTS.md",
+        content_hash="sha256:" + "8" * 64,
+        properties=forged,
+    )
+    assert component_content_digest(instruction) == "sha256:" + "8" * 64
+    # A supplied prompt record with the flag and no path is judged, not a crash.
+    pathless = PromptComponent(
+        bom_ref="prompt:x", name="x", prompt_type="system", properties=forged
+    )
+    assert component_content_digest(pathless) == forged["static_value_binding"]
+
+
+def test_a_forged_withheld_binding_cannot_restore_a_suppression_after_a_model_swap(
+    tmp_path, monkeypatch
+):
+    from nexus_symbiote.scanners.source_binding import SOURCE_BINDING_KEY_ENV
+
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, "suppression-key-" + "0123456789abcdef" * 2)
+    project, inventory, doc = _two_pickles(tmp_path)
+    ref = _ref(doc, "classifier.pkl")
+    reviewed = _fingerprint(inventory, project, ref, "serialization_format")
+    (project / ".nexus-symbiote.yaml").write_text(_suppression(ref, reviewed))
+    reviewed_digest = next(c for c in doc["components"] if c["bom_ref"] == ref)["hashes"]["sha256"]
+    (project / "fixtures" / "firmware.pkl").unlink()
+    (project / "models" / "classifier.pkl").write_bytes(b"\x80\x04K\x02.")
+    _scan(project, inventory)
+    swapped = json.loads(inventory.read_text())
+    model = next(c for c in swapped["components"] if c["bom_ref"] == ref)
+    assert model["hashes"]["sha256"] != reviewed_digest
+    model["properties"].update(
+        content_hash_withheld="supplied", static_value_binding=reviewed_digest
+    )
+    inventory.write_text(json.dumps(swapped))
+
+    reconciled = _risk(inventory, project)
+    assert reconciled["passed"] is False
+    assert reconciled["assessment_basis"] == "project-reconciliation-failed"
+    assert any("collector-owned properties" in r for r in reconciled["gate_reasons"])
+    # Without --project nothing reconciles the record, so the fingerprint must not take
+    # the supplier's binding as the content of a model.
+    operator = tmp_path / "operator-policy.yaml"
+    operator.write_text('version: "1.0"\n' + _suppression(ref, reviewed))
+    args = ["risk", str(inventory), "--json-output", "--operator-policy", str(operator)]
+    supplied = CliRunner().invoke(main, [*args, "--allow-unsigned-operator-policy"])
+    payload = json.loads(supplied.stdout)
+    assert supplied.exit_code == 1 and payload["passed"] is False
+    assert payload["suppressed_findings"] == []
+    assert [s["fingerprint"] for s in payload["suppressions_stale"]] == [reviewed]
+
+
 def test_a_fingerprint_binds_the_component_content_digest():
     from nexus_symbiote.core.enums import RiskSeverity
     from nexus_symbiote.core.models import ModelComponent, PromptComponent, ToolComponent

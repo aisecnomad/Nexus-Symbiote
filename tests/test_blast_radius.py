@@ -222,3 +222,55 @@ def test_assembly_does_not_search_the_inventory_per_tool(monkeypatch):
     assemble_repository_agent(bom, Path("/nonexistent-root-for-test"), failures=[])
     assert calls == 0
     assert sum(e.relationship == "provides-tool" for e in bom.dependencies) == 200 * 50
+
+
+def test_shared_credential_surfaces_and_mcp_gateways_in_blast_radius():
+    from nexus_symbiote.graph import MAX_SHARED_CREDENTIAL_HOLDERS, MAX_SHARED_CREDENTIAL_VARS
+
+    bom = AIBOM(
+        components=[
+            AgentComponent(bom_ref="agent:main", name="main", tool_refs=["server:gw"]),
+            MCPServerComponent(
+                bom_ref="server:gw",
+                name="gateway",
+                env={
+                    "SHARED_API_TOKEN": "[redacted]",
+                    "LOG_LEVEL": "info",
+                    "[redacted-1]": "[redacted]",
+                },
+                properties={
+                    "mcp_role": "gateway",
+                    "upstream_server_refs": ["server:upstream"],
+                },
+            ),
+            MCPServerComponent(
+                bom_ref="server:upstream",
+                name="upstream",
+                env={
+                    "SHARED_API_TOKEN": "[redacted]",
+                    "LOG_LEVEL": "info",
+                    "[redacted-1]": "[redacted]",
+                },
+            ),
+        ]
+    )
+    result = blast_radius(bom, "server:upstream")
+    assert result["affected_agents"] == ["agent:main"]
+    assert "server:gw" in result["dependent_components"]
+    assert result["mcp_gateways"] == ["server:gw"]
+    assert result["shared_credential_surfaces"] == {
+        "SHARED_API_TOKEN": ["server:gw", "server:upstream"]
+    }
+
+    many_env = {f"SERVICE_{idx:03d}_API_KEY": "[redacted]" for idx in range(500)}
+    large_bom = AIBOM(
+        components=[
+            MCPServerComponent(bom_ref=f"server:{i:02d}", name=f"s{i}", env=dict(many_env))
+            for i in range(50)
+        ]
+    )
+    bounded = blast_radius(large_bom, "server:00")
+    surfaces = bounded["shared_credential_surfaces"]
+    assert len(surfaces) == MAX_SHARED_CREDENTIAL_VARS
+    assert all(len(holders) == MAX_SHARED_CREDENTIAL_HOLDERS for holders in surfaces.values())
+    assert any("shared_credential_surfaces" in item for item in bounded["limitations"])

@@ -31,7 +31,7 @@
 Nexus SymBiote generates an **Agent Bill of Materials (AgentBOM)** — an evidence-backed inventory of the MCP servers, models, instructions, retrieval sources, A2A cards, IDE settings and container images an AI agent is assembled from. It reads a project **without running it**, flags supply-chain risk, fails CI on drift, and exports to CycloneDX 1.7, SPDX 3.0.1, SARIF and VEX.
 
 ```bash
-nexus-symbiote scan ./my-agent --no-project-policy -o agentbom.json    # inventory, offline
+nexus-symbiote scan ./my-agent --no-project-policy --accept-default-exclude root:.git -o agentbom.json    # inventory, offline
 nexus-symbiote risk agentbom.json --no-project-policy --threshold 50   # gate on risk
 nexus-symbiote diff reviewed.json agentbom.json --fail-on-alert        # gate on drift
 ```
@@ -115,9 +115,9 @@ nexus-symbiote validate demo.aibom.json --project examples/demo-agent --no-proje
 ### Scan your own agent
 
 ```bash
-nexus-symbiote scan /path/to/agent --no-project-policy -o agentbom.json
-nexus-symbiote validate agentbom.json --project /path/to/agent --no-project-policy
-nexus-symbiote risk agentbom.json --project /path/to/agent --no-project-policy --threshold 50
+nexus-symbiote scan /path/to/agent --no-project-policy --accept-default-exclude root:.git -o agentbom.json
+nexus-symbiote validate agentbom.json --project /path/to/agent --no-project-policy --accept-default-exclude root:.git
+nexus-symbiote risk agentbom.json --project /path/to/agent --no-project-policy --accept-default-exclude root:.git --threshold 50
 ```
 
 `--no-project-policy` stops a `.nexus-symbiote.yaml` in a checkout that is not yours from choosing your gates. With `--project`, `validate` and `risk` collect fresh evidence and fail when the BOM disagrees with it. The [public-agent tutorial](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/tutorials/scanning-a-public-agent.md) walks through a real repository end to end.
@@ -252,7 +252,7 @@ The Action installs its own hash-locked runtime off the job's `PATH`, ignores po
 
 ### Gate drift in CI
 
-Approve a baseline once on the protected branch, then compare every pull request with it. `baseline` writes an unsigned file and `diff` checks no signature, so read the baseline from a place the pull request cannot change:
+Approve a baseline once on the protected branch, then compare every pull request with it. The commands below accept the checkout's `.git` metadata. `baseline` writes an unsigned file and `diff` checks no signature, so read the baseline from a place the pull request cannot change:
 
 ```bash
 # One secret of 32 or more characters, the same for the baseline and every later scan.
@@ -260,13 +260,13 @@ export NEXUS_SYMBIOTE_SOURCE_BINDING_KEY="$AGENTBOM_BINDING_KEY"
 
 # On the protected branch, through a reviewed pull request: approve the baseline.
 mkdir -p .nexus-symbiote
-nexus-symbiote baseline . --no-project-policy -o .nexus-symbiote/reviewed.json
+nexus-symbiote baseline . --no-project-policy --accept-default-exclude root:.git -o .nexus-symbiote/reviewed.json
 
 # In the pull-request job (with fetch-depth: 0 or the base commit fetched): read the
 # baseline from the base commit, never from the pull request.
 BASE_SHA="${BASE_SHA:-origin/main}"
 git show "$BASE_SHA:.nexus-symbiote/reviewed.json" > "$RUNNER_TEMP/reviewed.json"
-nexus-symbiote scan . --no-project-policy -o "$RUNNER_TEMP/agentbom.json"
+nexus-symbiote scan . --no-project-policy --accept-default-exclude root:.git -o "$RUNNER_TEMP/agentbom.json"
 nexus-symbiote diff "$RUNNER_TEMP/reviewed.json" "$RUNNER_TEMP/agentbom.json" --fail-on-alert
 ```
 
