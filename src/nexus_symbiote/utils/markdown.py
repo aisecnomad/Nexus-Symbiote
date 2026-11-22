@@ -36,6 +36,7 @@ from bisect import bisect_left
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from itertools import groupby
 
 _LINE_END = re.compile(r"\r\n|\r|\n")
 # Containers nested this deep, or more container lines matched than the text has
@@ -121,6 +122,7 @@ def _html_block_ends(kind: int, line: str, offset: int) -> bool:
 # Inline: what pairs backticks, and what can take one out of a code span.
 _INLINE_SPECIAL = re.compile(r"[\\`\[\]<]")
 _BACKTICKS = re.compile(r"`+")
+_IMPORT_FILENAME = re.compile(r"@\S+")
 _ESCAPABLE = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 _DEFINITION = re.compile(r"\[(?:[^\\\[\]]|\\.){0,1000}\]:", re.S)
 # After a link reference definition commonmark.js reads a line as part of its paragraph,
@@ -199,8 +201,97 @@ def _read_html_dialects(
                 reader.read(line)
             reader.finish()
         except _AmbiguousError:
-            continue
+            # A nesting or work bound may end one paragraph's reading. Keep
+            # the raw file and independently read the blank-delimited sections
+            # so that this cannot discard evidence in later ordinary prose.
+            reader.parts.clear()
+            reader.blocks.clear()
+            reader.recovered_blocks = True
+            for nonblank, section in groupby(lines, key=lambda line: bool(line.strip(" \t"))):
+                if not nonblank:
+                    continue
+                fragment = list(section)
+                local = _Reader(
+                    sum(map(len, fragment)) + len(fragment) + _SPARE_MATCHES,
+                    include_fence=include_fence,
+                    ascii_html=ascii_html,
+                )
+                try:
+                    for line in fragment:
+                        local.read(line)
+                    local.finish()
+                except _AmbiguousError:
+                    literal = "\n".join(fragment)
+                    reader.parts.append(literal)
+                    reader.blocks.append(("literal", literal))
+                else:
+                    reader.parts.extend(local.parts)
+                    reader.blocks.extend(local.blocks)
         yield reader
+
+
+def _only_html_disagrees(exc: _AmbiguousError, readers: list[_Reader]) -> bool:
+    return (
+        isinstance(exc, _HTMLDisagreementError)
+        and len(readers) == 2
+        and not any(r.recovered_blocks for r in readers)
+    )
+
+
+def _adjacent_container_imports(lines: list[str], eligible: set[str] | None = None) -> list[str]:
+    """Recover only paired spans spanning consecutive prose lines with container marks."""
+    parts: list[str] = []
+    group: list[str] = []
+
+    def finish() -> None:
+        if len(group) > 1:
+            content = "\n".join(group)
+            if "`@" in content:
+                paired = _outside_spans(content, import_boundaries_only=True)
+                if paired != content:
+                    parts.append(paired)
+        group.clear()
+
+    for line in lines:
+        mark = _CONTAINER_MARKS.match(line)
+        if mark is not None and mark[0].strip():
+            bare = line[mark.end() :]
+            if bare.strip() and (eligible is None or bare in eligible):
+                # A new list item starts its own prose. A lone tick in the
+                # previous item cannot close a code example in this one.
+                if (
+                    _LIST_MARKER.search(mark[0])
+                    and group
+                    and not (group[-1].startswith("`") and group[-1].strip("` \t"))
+                ):
+                    finish()
+                group.append(bare)
+                continue
+        finish()
+    finish()
+    return parts
+
+
+def _import_boundaries(
+    blocks: list[tuple[str, str]], lines: list[str], *, containers: bool = False
+) -> list[str]:
+    if not any("`@" in line for line in lines):
+        return []
+    parts = []
+    eligible: set[str] = set()
+    for kind, content in blocks:
+        if kind not in {"paragraph", "heading"}:
+            continue
+        if containers:
+            eligible.update(content.split("\n"))
+        if "`@" not in content:
+            continue
+        inline = _outside_spans(content, import_boundaries_only=True)
+        if inline != content:
+            parts.append(inline)
+    if containers:
+        parts.extend(_adjacent_container_imports(lines, eligible))
+    return parts
 
 
 def text_outside_code(text: str) -> list[str]:
@@ -208,8 +299,8 @@ def text_outside_code(text: str) -> list[str]:
 
     Each paragraph and heading is one part, with its code spans replaced by a space;
     an HTML block or indented code line is returned as written, and fenced code is left
-    out. An ambiguous file is returned whole, with an additional reading of import
-    lines at container and inline-code boundaries. A file that opens
+    out. A difference confined to HTML uses both complete block readings. Other
+    ambiguities retain the whole file and container and inline-code boundaries. A file that opens
     with front matter is read both whole and without it, and the parts of either
     reading are returned.
     """
@@ -227,39 +318,69 @@ def _text_outside_code(text: str) -> list[str]:
         for line in lines:
             reader.read(line)
         reader.finish()
-    except _AmbiguousError:
+    except _AmbiguousError as exc:
+        readers = list(_read_html_dialects(lines, len(text)))
+        if _only_html_disagrees(exc, readers):
+            # Both readings completed. Each keeps the prose and raw HTML it
+            # sees, so a fence agreed by both cannot supply a real import.
+            parts: list[str] = []
+            for alternative in readers:
+                parts = _union(
+                    parts,
+                    _union(
+                        alternative.parts,
+                        _import_boundaries(alternative.blocks, lines, containers=True),
+                    ),
+                )
+            return parts
         # A quote marker or a closing code span can put an import at the start of
         # rendered text even when the raw file has no whitespace before its @.
+        # Raw HTML has no inline code spans. A repeated line that another
+        # reading places in prose must keep its possible inline boundaries.
+        html_lines = set.intersection(
+            *(
+                {
+                    line
+                    for kind, block in alt.blocks
+                    if kind == "html"
+                    for line in block.split("\n")
+                    if "`@" in line
+                }
+                for alt in readers
+            )
+        )
+        if html_lines:
+            html_lines.difference_update(
+                line
+                for alt in readers
+                for kind, block in alt.blocks
+                if kind in {"paragraph", "heading", "literal"}
+                for line in block.split("\n")
+                if "`@" in line
+            )
         alternatives = [text]
-        if "`@" in text:
-            across_lines = _outside_spans(text, import_boundaries_only=True)
-            if across_lines != text:
-                alternatives.append(across_lines)
-                rendered = _outside_spans(text)
-                if rendered != across_lines:
-                    alternatives.append(rendered)
         for line in lines:
             if "@" in line:
                 bare = _CONTAINER_MARKS.sub("", line, count=1)
                 if bare != line:
                     alternatives.append(bare)
-                if "`@" in bare:
+                if "`@" in bare and line not in html_lines and bare not in html_lines:
                     inline = _outside_spans(bare, import_boundaries_only=True)
                     if inline != bare:
                         alternatives.append(inline)
                         rendered = _outside_spans(bare)
                         if rendered != inline:
                             alternatives.append(rendered)
-                    else:
-                        # The opener may be on an earlier line. Keep backticks in
-                        # the filename and leave ordinary inline-code examples alone.
-                        boundary = re.sub(r"(?<=[^\s`])`++(?=@)", " ", bare)
-                        if boundary != bare:
-                            alternatives.append(boundary)
-        for alternative in _read_html_dialects(lines, len(text)):
-            alternatives = _union(alternatives, alternative.parts)
+        for alternative in readers:
+            alternatives = _union(
+                alternatives,
+                _union(
+                    alternative.parts,
+                    _import_boundaries(alternative.blocks, lines, containers=True),
+                ),
+            )
         return alternatives
-    return reader.parts
+    return _union(reader.parts, _import_boundaries(reader.blocks, lines))
 
 
 def commonmark_block_readings(text: str) -> dict[str, list[tuple[str, str]]]:
@@ -272,13 +393,18 @@ def commonmark_block_readings(text: str) -> dict[str, list[tuple[str, str]]]:
         for line in lines:
             reader.read(line)
         reader.finish()
-    except _AmbiguousError:
+    except _AmbiguousError as exc:
         # The raw reading keeps unmodeled evidence. A fenced example in that
         # reading must not hide a new prose instruction in another reading.
-        readings = {"source": [("paragraph", "\n".join(lines))]}
-        bare = "\n".join(_CONTAINER_MARKS.sub("", line, count=1) for line in lines)
-        readings["containers"] = [("paragraph", bare)]
-        for alternative in _read_html_dialects(lines, len(text), include_fence=True):
+        readers = list(_read_html_dialects(lines, len(text), include_fence=True))
+        readings: dict[str, list[tuple[str, str]]] = {}
+        if not _only_html_disagrees(exc, readers):
+            readings["source"] = [("paragraph", "\n".join(lines))]
+            bare = "\n".join(_CONTAINER_MARKS.sub("", line, count=1) for line in lines)
+            # Removing container marks can join unrelated list items. Keep
+            # the resulting text literal rather than pairing its ticks again.
+            readings["containers"] = [("literal", bare)]
+        for alternative in readers:
             readings["ascii" if alternative.ascii_html else "unicode"] = alternative.blocks
         return readings
     return {"common": reader.blocks}
@@ -293,6 +419,7 @@ class _Reader:
         self.matches = matches
         self.include_fence = include_fence
         self.ascii_html = ascii_html
+        self.recovered_blocks = False
         self.parts: list[str] = []
         # Each paragraph, heading and HTML block as written, with its kind, in order.
         self.blocks: list[tuple[str, str]] = []
@@ -312,6 +439,12 @@ class _Reader:
         # The first nonspace character after the offset, and its column; columns count
         # from the start of the line, so it stays found while the offset stays before it.
         self.found = (-1, 0)
+
+    def _block_disagreement(self) -> None:
+        """Keep raw evidence alongside a complete CommonMark reading."""
+        if self.ascii_html is None:
+            raise _AmbiguousError
+        self.recovered_blocks = True
 
     def read(self, line: str) -> None:
         self.line = line
@@ -352,7 +485,7 @@ class _Reader:
             # markdown-it measures a lazy line's indentation from the content of the
             # container it left, where it can start a block.
             if stack[-1].definition or self.indented:
-                raise _AmbiguousError
+                self._block_disagreement()
             self._add_line()
             return
         self._close_unmatched()
@@ -430,7 +563,7 @@ class _Reader:
         if kind == "quote":
             if self.indented and self._peek(self.next_nonspace) == ">":
                 # markdown-it continues a block quote at a marker indented four columns.
-                raise _AmbiguousError
+                self._block_disagreement()
             if self.indented or self._peek(self.next_nonspace) != ">":
                 return 1
             self._advance_next_nonspace()
@@ -444,7 +577,8 @@ class _Reader:
                 if last and block.children == block.definitions:
                     # commonmark.js drops a paragraph that held only link reference
                     # definitions, after which a blank line ends an empty item.
-                    raise _AmbiguousError
+                    self._block_disagreement()
+                    return 1
                 self._advance_next_nonspace()
             elif self.indent >= block.width:
                 self._advance(block.width, columns=True)
@@ -531,13 +665,11 @@ class _Reader:
             ):
                 self._close_unmatched()
                 content = "\n".join(parent.lines)
-                if self.ascii_html is None and (
-                    _DEFINITION.match(content) or _FOOTNOTE.search(content)
-                ):
+                if _DEFINITION.match(content) or _FOOTNOTE.search(content):
                     # A paragraph of nothing but definitions is no heading, and cmark-gfm
                     # ends the paragraph at a footnote. Retain the raw reading and the
                     # complete CommonMark heading reading of the rest of the file.
-                    raise _AmbiguousError
+                    self._block_disagreement()
                 self.parts.append(_outside_spans(content))
                 if parent.after_code:
                     self.after_code.add(len(self.blocks))
@@ -579,7 +711,7 @@ class _Reader:
         if parent.kind == "paragraph" and not _NON_SPACE.search(line, end):
             if line[end:].strip(" \t"):
                 # A form feed or vertical tab is blank to commonmark.js, not to others.
-                raise _AmbiguousError
+                self._block_disagreement()
             return False
         self._advance_next_nonspace()
         self._advance(end - at, columns=True)
@@ -647,7 +779,7 @@ class _Reader:
                 for line in block.lines:
                     starts.append(starts[-1] + len(line) + 1)
                 if any(starts[index] >= leading for index in block.suspects):
-                    raise _AmbiguousError
+                    self._block_disagreement()
             if _DEFINITION.match(content):
                 self.stack[-1].definitions += 1
             self.parts.append(_outside_spans(content))
@@ -687,15 +819,19 @@ def _outside_spans(text: str, *, import_boundaries_only: bool = False) -> str:
     link label or by a destination that is not plain; and in a paragraph that can open
     with a link reference definition.
     """
+    position = 0
     if _DEFINITION.match(text):
-        return text
+        if not import_boundaries_only:
+            return text
+        position = _leading_definitions_end(text, _definition_spans(text))
     runs: dict[int, list[int]] = {}
     for found_run in _BACKTICKS.finditer(text):
         runs.setdefault(found_run.end() - found_run.start(), []).append(found_run.start())
     last_close = text.rfind(">")
     taken = -1
     kept: list[str] = []
-    copied = position = brackets = 0
+    copied = brackets = literal_end = 0
+    positions = None
     while (found := _INLINE_SPECIAL.search(text, position)) is not None:
         position = found.start()
         char = text[position]
@@ -710,11 +846,17 @@ def _outside_spans(text: str, *, import_boundaries_only: bool = False) -> str:
                 position = end
             else:
                 span_end = starts[index] + end - position
-                # For an ambiguous block, only a closing span can expose a new @.
-                # Preserve later backticks that may be part of the import filename.
-                if not import_boundaries_only or text[span_end : span_end + 1] == "@":
-                    kept.extend((text[copied:position], " "))
-                    copied = span_end
+                # A real closing span may introduce an import. Keep any backticks
+                # in that raw filename, and mask every unrelated span in this reading.
+                keep_to = max(position, min(span_end, literal_end))
+                kept.append(text[copied:keep_to])
+                if keep_to < span_end:
+                    kept.append(" ")
+                copied = span_end
+                if import_boundaries_only and span_end >= literal_end:
+                    filename = _IMPORT_FILENAME.match(text, span_end)
+                    if filename is not None:
+                        literal_end = filename.end()
                 position = span_end
         elif char == "<":
             position += 1
@@ -723,7 +865,11 @@ def _outside_spans(text: str, *, import_boundaries_only: bool = False) -> str:
                     after = _TAKEN.search(text, position)
                     taken = len(text) if after is None else after.start()
                 if taken < last_close:
-                    break
+                    if not import_boundaries_only:
+                        break
+                    if positions is None:
+                        positions = _Positions(text)
+                    position = max(position, _html_end(positions, position - 1))
         elif char == "[":
             brackets += 1
             position += 1
@@ -735,7 +881,13 @@ def _outside_spans(text: str, *, import_boundaries_only: bool = False) -> str:
                 if following == "[" or (
                     following == "(" and not _PLAIN_DESTINATION.match(text, position)
                 ):
-                    break
+                    if not import_boundaries_only:
+                        break
+                    syntax = _LINK_LABEL if following == "[" else _LENIENT_INLINE_LINK
+                    if (match := syntax.match(text, position)) is not None:
+                        position = match.end()
+    if import_boundaries_only and not literal_end:
+        return text
     kept.append(text[copied:])
     return "".join(kept)
 
