@@ -727,6 +727,25 @@ def _identifier(node: Node | None) -> str | None:
 _COMPUTED_BUILTINS = frozenset({"Math", "console"})
 
 
+def _ordinary_builtin_value(value: Node | None, receiver: str) -> bool:
+    value = _operand(value)
+    if value is None:
+        return False
+    if value.type == "arrow_function":
+        parameters = value.child_by_field_name("parameters")
+        if parameters is None or parameters.named_child_count:
+            return False
+        value = _operand(value.child_by_field_name("body"))
+        return value is not None and value.type in {"number", "string", "true", "false", "null"}
+    if value.type in {"number", "string", "true", "false", "null"}:
+        return True
+    return (
+        value.type in {"member_expression", "subscript_expression"}
+        and _identifier(_operand(value.child_by_field_name("object"))) == receiver
+        and _called_method(value) is not None
+    )
+
+
 def _assigned_computed_builtins(index: _Index) -> set[str]:
     assigned: set[str] = set()
     for node in index.nodes:
@@ -741,7 +760,10 @@ def _assigned_computed_builtins(index: _Index) -> set[str]:
             continue
         receiver = _identifier(_operand(target.child_by_field_name("object")))
         if receiver is not None and receiver in _COMPUTED_BUILTINS:
-            assigned.add(receiver)
+            if node.type != "assignment_expression" or not _ordinary_builtin_value(
+                node.child_by_field_name("right"), receiver
+            ):
+                assigned.add(receiver)
         elif receiver in {"globalThis", "global", "self", "window"}:
             property_name = _called_method(target)
             if property_name is None:

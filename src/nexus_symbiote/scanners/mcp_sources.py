@@ -1246,9 +1246,10 @@ def collect_source_references(
             if len(nodes) > python_nodes.value:
                 fail(path, python_nodes.exceeded())
                 continue
-            project_imports = _ProjectImports(
-                python_paths, tuple(dict.fromkeys((path.parent, Path(), Path("src"))))
-            )
+            roots: tuple[Path, ...] = (Path(), Path("src"))
+            if path.parent / "__init__.py" not in python_paths and path.parent not in roots:
+                roots = (*roots, path.parent)
+            project_imports = _ProjectImports(python_paths, roots)
             collect_python_tools(
                 tree, nodes, text, path, result, known, project_imports=project_imports
             )
