@@ -2122,7 +2122,7 @@ def _unwrap(tokens: list[str], launch: Launch) -> list[str] | None:
     if name == "cmd":
         return _unwrap_cmd(rest, launch)
     if name in {"powershell", "pwsh"}:
-        return _unwrap_powershell(rest, launch)
+        return _unwrap_powershell(name, rest, launch)
     if name == "wsl":
         return _unwrap_wsl(rest, launch)
     if name in {"exec", "nohup"} and rest:
@@ -2341,11 +2341,11 @@ def _unwrap_cmd(rest: list[str], launch: Launch) -> list[str] | None:
 # PowerShell parameters and the shortest prefix of each that names it, as pwsh 7's
 # CommandLineParameterParser matches them. A word pwsh does not recognise starts the -File
 # path, so it fails closed here; so does -Version and -PSConsoleFile, which pwsh 7 and
-# Windows PowerShell 5.1 read differently.
+# Windows PowerShell 5.1 read differently. CommandWithArgs depends on the edition and
+# passes its arguments separately. RemoveWorkingDirectoryTrailingCharacter depends on
+# the platform. An executable name alone does not establish those semantics.
 _POWERSHELL_PARAMETERS = (
     ("command", "c", "command"),
-    ("commandwithargs", "commandwithargs", "command"),
-    ("cwa", "cwa", "command"),
     ("file", "f", "file"),
     ("encodedcommand", "e", "encoded"),
     ("ec", "e", "encoded"),
@@ -2377,24 +2377,30 @@ _POWERSHELL_PARAMETERS = (
     ("socketservermode", "so", "switch"),
     ("namedpipeservermode", "nam", "switch"),
     ("sshservermode", "sshs", "switch"),
-    (
-        "removeworkingdirectorytrailingcharacter",
-        "removeworkingdirectorytrailingcharacter",
-        "switch",
-    ),
     ("help", "h", "switch"),
     ("?", "?", "switch"),
 )
+_WINDOWS_POWERSHELL_NAMES = _set(
+    "command file encodedcommand ec encodedarguments ea executionpolicy ep configurationname "
+    "inputformat if outputformat of windowstyle noprofile nologo noninteractive noexit "
+    "mta sta help ?"
+)
+_WINDOWS_POWERSHELL_PARAMETERS = tuple(
+    item for item in _POWERSHELL_PARAMETERS if item[0] in _WINDOWS_POWERSHELL_NAMES
+)
 
 
-def _powershell_parameter(word: str) -> str | None:
+def _powershell_parameter(word: str, executable: str) -> str | None:
     """The kind of PowerShell parameter a word names; None for none, or several kinds."""
-    if word[:1] != "-":
+    if word[:1] != "-" or (executable == "powershell" and word.startswith("--")):
         return None
     name = word[2:] if word[1:2] == "-" else word[1:]
     kinds: set[str] = set()
     short: set[str] = set()
-    for full, shortest, kind in _POWERSHELL_PARAMETERS:
+    parameters = (
+        _WINDOWS_POWERSHELL_PARAMETERS if executable == "powershell" else _POWERSHELL_PARAMETERS
+    )
+    for full, shortest, kind in parameters:
         if full.startswith(name):
             if len(name) >= len(shortest):
                 kinds.add(kind)
@@ -2405,10 +2411,10 @@ def _powershell_parameter(word: str) -> str | None:
     return kinds.pop() if len(kinds) == 1 and short <= kinds else None
 
 
-def _unwrap_powershell(rest: list[str], launch: Launch) -> list[str] | None:
+def _unwrap_powershell(executable: str, rest: list[str], launch: Launch) -> list[str] | None:
     index = 0
     while index < len(rest):
-        kind = _powershell_parameter(rest[index].lower())
+        kind = _powershell_parameter(rest[index].lower(), executable)
         if kind == "command":
             break
         if kind == "file":
@@ -3134,7 +3140,10 @@ def _mount_fields(spec: str) -> dict[str, str]:
     return dict(_mount_parts(spec))
 
 
-_VOLUME_VARIABLE = re.compile(r"\$\{(?:env|input|config|command|workspaceFolder):[^{}:]+\}")
+_VOLUME_VARIABLE = re.compile(
+    r"\$\{(?:(?P<client>env|input|config|command|workspaceFolder|extensionInstallFolder):[^{}:]+"
+    r"|[A-Za-z_][A-Za-z0-9_]*:-(?P<default>[^{}]*))\}"
+)
 
 
 def _volume_source_end(spec: str) -> int:
@@ -3193,23 +3202,29 @@ def _volume_source_ends(spec: str) -> list[int]:
 
 def _host_sources(spec: str, *, mount: bool) -> list[str]:
     """Every host source a mount spec may name, under each reading of its separator."""
+    sources: list[str] = []
     if mount:
         source = _host_source(spec, mount=True)
-        return [] if source is None else [source]
-    sources: list[str] = []
-    # A client that does not expand a variable hands it to the engine, which splits the
-    # spec at its first colon; an unset variable may expand to nothing, and a set one
-    # is one component, so a following ".." climbs past it rather than into its text.
-    for end in _volume_source_ends(spec):
-        source = _host_source(spec, mount=False, end=end)
         if source is not None:
             sources.append(source)
+    else:
+        for end in _volume_source_ends(spec):
+            source = _host_source(spec, mount=False, end=end)
+            if source is not None:
+                sources.append(source)
+
+    def fallback(variable: re.Match[str]) -> str:
+        if variable["default"] is not None:
+            return variable["default"]
+        # Resolved workspace and installed-extension directories are nonempty.
+        return "v" if variable["client"] in {"workspaceFolder", "extensionInstallFolder"} else ""
+
     for source in list(sources):
         if _VOLUME_VARIABLE.search(source):
             sources.append(_VOLUME_VARIABLE.sub("v", source))
-            empty = _VOLUME_VARIABLE.sub("", source)
-            if empty:
-                sources.append(empty)
+            alternative = _VOLUME_VARIABLE.sub(fallback, source)
+            if alternative:
+                sources.append(alternative)
     return list(dict.fromkeys(sources))
 
 
@@ -3303,6 +3318,13 @@ def _container_context(options: list[tuple[str, str | None]], launch: Launch) ->
             # The engine runs a string health check with /bin/sh -c inside the container.
             launch.mark("container_command")
         elif option in {"-v", "--volume", "--mount"} and value:
+            if (
+                option != "--mount"
+                and value.startswith("${")
+                and ":" in value.partition("}")[0]
+                and _VOLUME_VARIABLE.match(value) is None
+            ):
+                launch.fail("container volume source substitution is unresolved")
             sources = _host_sources(value, mount=option == "--mount")
             if sources:
                 launch.mark("host_mounts")
