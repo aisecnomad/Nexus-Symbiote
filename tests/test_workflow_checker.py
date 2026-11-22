@@ -949,6 +949,76 @@ def test_the_codeql_policy_reads_the_analysis_it_gates(tmp_path, name, job, vari
     assert any("scripts/check_codeql_sarif.py other than" in e for e in errors), errors
 
 
+def without_step(job, command):
+    def change(jobs):
+        jobs[job]["steps"].remove(step_running(jobs[job], command))
+
+    return change
+
+
+def setting(job, key, value, command=None):
+    def change(jobs):
+        (jobs[job] if command is None else step_running(jobs[job], command))[key] = value
+
+    return change
+
+
+@pytest.mark.parametrize(
+    ("name", "change", "message"),
+    [
+        (
+            "codeql.yml",
+            without_step("analyze", "scripts/check_codeql_sarif.py"),
+            "analyze no longer runs scripts/check_codeql_sarif.py in its reviewed step",
+        ),
+        (
+            "ci.yml",
+            without_step("codeql", "scripts/check_codeql_sarif.py"),
+            "codeql no longer runs scripts/check_codeql_sarif.py in its reviewed step",
+        ),
+        (
+            "codeql.yml",
+            without_step("analyze", "github/codeql-action/analyze@"),
+            "analyze no longer runs github/codeql-action/analyze@",
+        ),
+        (
+            "codeql.yml",
+            without_step("analyze", "github/codeql-action/init@"),
+            "analyze no longer runs github/codeql-action/init@",
+        ),
+        (
+            "codeql.yml",
+            setting("analyze", "continue-on-error", True),
+            "analyze must not continue on error in a gating workflow",
+        ),
+        (
+            "codeql.yml",
+            setting("analyze", "continue-on-error", True, "scripts/check_codeql_sarif.py"),
+            "analyze runs scripts/check_codeql_sarif.py only in a step that continues on error",
+        ),
+        (
+            "codeql.yml",
+            setting("analyze", "if", False, "scripts/check_codeql_sarif.py"),
+            "analyze may skip scripts/check_codeql_sarif.py",
+        ),
+        ("codeql.yml", setting("analyze", "if", "false"), "required job analyze may be skipped"),
+    ],
+    ids=[
+        "codeql-no-policy",
+        "ci-no-policy",
+        "no-analyze",
+        "no-init",
+        "job-continues",
+        "policy-continues",
+        "policy-skipped",
+        "job-skipped",
+    ],
+)
+def test_the_codeql_workflow_is_a_gate_that_cannot_be_hollowed_out(tmp_path, name, change, message):
+    errors = workflow_errors(tmp_path, name, change)
+    assert any(message in e for e in errors), errors
+
+
 @pytest.mark.parametrize("field", ["container", "services"])
 def test_a_gate_job_cannot_run_in_a_job_container(tmp_path, field):
     def change(jobs):
