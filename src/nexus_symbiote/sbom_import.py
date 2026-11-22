@@ -1487,12 +1487,8 @@ def _npm_lock_packages(
     if (
         manifest.get("workspaces")
         or manifest.get("overrides")
-        or prefix + ".npmrc" in path_set
-        or _enclosing_manifest(
-            rel_posix,
-            path_set,
-            ("package.json", "package-lock.json", "npm-shrinkwrap.json", ".npmrc"),
-        )
+        or _settings_present(files, prefix + ".npmrc", path_set)
+        or _enclosing_manifest(rel_posix, path_set, _NPM_LOCK_SELECTORS)
         or (
             manager is not None and (not isinstance(manager, str) or not manager.startswith("npm@"))
         )
@@ -1523,6 +1519,30 @@ def _npm_lock_packages(
                 return packages
         return {}
     return {}
+
+
+# Files in an enclosing directory that make it, not the nested package, the install root.
+_NPM_LOCK_SELECTORS = (
+    "package.json",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    ".npmrc",
+    "pnpm-workspace.yaml",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lock",
+    "bun.lockb",
+)
+
+
+def _settings_present(files: ConfinedCollection, rel: str, path_set: set[str]) -> bool:
+    """Whether a settings file is in the collection, or is one the collection refused
+    to read: npm follows a symlink out of the project that the confined read does not."""
+    if rel in path_set:
+        return True
+    before = files.failures_recorded, files.exclusions_recorded
+    files.read_bytes(rel, missing_ok=True)
+    return (files.failures_recorded, files.exclusions_recorded) != before
 
 
 def _enclosing_manifest(rel: str, paths: set[str], filenames: tuple[str, ...]) -> bool:
@@ -1566,22 +1586,36 @@ def _direct_toml_lock(
     deps = root.get("dependencies")
     if not isinstance(deps, list):
         return {}
-    resolved = {}
+    resolved: dict[str, str] = {}
+    listed: set[str] = set()
     for dep in deps:
         dep_version: str | None = None
+        dep_source: str | None = None
         if uv and isinstance(dep, dict) and dep.keys() == {"name"} and isinstance(dep["name"], str):
             name = _norm_pkg(dep["name"])
         elif not uv and isinstance(dep, str):
+            # Cargo writes "name", "name version" or "name version (source)".
             parts = dep.split()
-            if not parts:
+            if not parts or len(parts) > 3:
                 continue
             name = parts[0]
             dep_version = parts[1] if len(parts) >= 2 else None
+            if len(parts) == 3:
+                if not (parts[2].startswith("(") and parts[2].endswith(")")):
+                    continue
+                dep_source = parts[2][1:-1]
         else:
             continue
+        if name in listed:
+            # Listed twice, the name has two versions or sources: neither is what installs.
+            resolved.pop(name, None)
+            continue
+        listed.add(name)
         candidates = by_name.get(name, [])
         if dep_version is not None:
             candidates = [c for c in candidates if c.get("version") == dep_version]
+        if dep_source is not None:
+            candidates = [c for c in candidates if c.get("source") == dep_source]
         if len(candidates) != 1:
             continue
         entry = candidates[0]
@@ -1629,6 +1663,7 @@ def _valid_nested_npm_record(record: Any, pkg_name: str, version: Any) -> bool:
         not isinstance(record, dict)
         or record.get("link") is True
         or record.get("inBundle") is True
+        or record.get("bundled") is True
         or record.get("name", pkg_name) != pkg_name
         or not isinstance(version, str)
         or len(version) > 128
