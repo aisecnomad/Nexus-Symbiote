@@ -76,6 +76,7 @@ from nexus_symbiote.scanners.mcp_credentials import (
     endpoint_hits,
     literal_value,
     name_words,
+    placeholder,
     rewrapped_key_literals,
     strongest,
     value_hits,
@@ -101,7 +102,6 @@ from nexus_symbiote.utils.secrets import (
     is_reference,
     redact_descriptor,
     redact_text,
-    scheme_credential_like,
     scheme_credentials,
     secret_like,
     secret_values,
@@ -1072,13 +1072,13 @@ _PUBLIC_TOKEN_SELECTORS = frozenset({"format", "source", "profile", "output", "k
 _PUBLIC_SCHEME_SWITCHES = _names(
     "transport stateless privileged verbose readonly dryrun version debug help quiet "
     "interactive stdio json enablelogging color nocolor noprompt watch force loglevel "
-    "allowhttp insecure noprofile outputformat noninteractive"
+    "allowhttp insecure noprofile outputformat noninteractive headless detached sandboxed "
+    "production telemetry recursive localhost maxconcurrentrequests enableautomaticupdates"
 )
 _LOWER_LONG_OPTION = re.compile(r"--[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
 # A version label belongs to a selector. After a credential binding it can
 # still be private. Option spellings exclude long opaque and padded operands.
-_MODE_LABEL = re.compile(r"(?:[A-Za-z]{2,}[0-9]{1,3}|[0-9]{8})")
-_MODE_OPTION = re.compile(r"--(?:[A-Za-z]{1,15}|[a-z]{2,}(?:[A-Z][a-z]{2,})+)")
+_MODE_LABEL = re.compile(r"(?:[A-Z][a-z]+(?:[A-Z][a-z]+)*[A-Z]{0,4}[0-9]{1,3}|[0-9]{8})")
 _SCHEME_NUMBER = re.compile(r"[+]?[0-9]+(?:[.][0-9]+)?")
 _SCHEME_ASSIGNMENT_OPERAND = re.compile(r"[A-Za-z0-9_-]+=[A-Za-z0-9_+=-]+")
 # curl's `-u user:password`, also in a cluster of short flags (`-su`), and httpie's `-a`
@@ -1142,7 +1142,7 @@ def _scheme_assignment_name(name: str) -> bool:
     )
 
 
-def _scheme_operand(word: str) -> bool:
+def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
     """Whether the argument following an authentication scheme may be its literal value."""
     if len(word) < MIN_SECRET_LENGTH or is_reference(word):
         return False
@@ -1156,13 +1156,23 @@ def _scheme_operand(word: str) -> bool:
             and body.casefold().replace("-", "").replace("_", "") in _PUBLIC_SCHEME_SWITCHES
         ):
             return False
-        if not equals and _LOWER_LONG_OPTION.fullmatch(key) and "-" in body:
+        if (
+            not equals
+            and not credential_binding
+            and "-" in body
+            and _LOWER_LONG_OPTION.fullmatch(key)
+        ):
             return False
         if equals:
             return len(body) >= MIN_SECRET_LENGTH and (argument == "=" or "-" not in body)
-        return len(body) >= MIN_SECRET_LENGTH and (
-            (body.isalpha() and (body.islower() or len(body) >= 16))
-            or (len(body) >= 16 and credential_shaped(body))
+        return (
+            len(body) >= MIN_SECRET_LENGTH
+            and not placeholder(body)
+            and (
+                body.isalpha()
+                or credential_binding
+                or (len(body) >= 16 and credential_shaped(body))
+            )
         )
     # Padding belongs to the operand. Only a genuine assignment has a
     # nonempty value following the separator and no further equals sign.
@@ -1170,6 +1180,8 @@ def _scheme_operand(word: str) -> bool:
         return literal_value(argument)
     if _SCHEME_NUMBER.fullmatch(word):
         return True
+    if word.isascii() and word.isalpha():
+        return not placeholder(word)
     return literal_value(word)
 
 
@@ -1198,23 +1210,14 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
     words = name_words(name)
     if not variable and value.lower() == "token" and words and words[-1] in _PUBLIC_TOKEN_SELECTORS:
         return hits
-    mode_option = not variable and (
-        name.lower() in {"auth", "authentication"}
-        or bool(words and words[-1] in _SCHEME_DESCRIPTORS)
-    )
-    if _MODE_OPTION.fullmatch(following):
+    credential_binding = _scheme_assignment_name(name)
+    # Only a selector can explain a short date or version label. An unfamiliar
+    # switch or an ordinary alphabetic word can itself be a bearer credential.
+    if not credential_binding and len(following) <= 12 and _MODE_LABEL.fullmatch(following):
         return hits
-    if (mode_option or not _scheme_assignment_name(name)) and _MODE_LABEL.fullmatch(following):
-        return hits
-    if _scheme_operand(following):
+    if _scheme_operand(following, credential_binding=credential_binding):
         paired = value_hits(name, f"{value} {following}")
-        # An opaque value in a split Basic declaration can still be private
-        # when it does not decode as a complete HTTP Basic user/password pair.
-        if not paired and (
-            scheme_credential_like(following, value) or credential_shaped(following)
-        ):
-            paired = [(SCHEME_CLASS, following)]
-        hits.extend(paired)
+        hits.extend(paired or [(SCHEME_CLASS, following)])
     return hits
 
 
