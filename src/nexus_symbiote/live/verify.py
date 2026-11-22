@@ -387,7 +387,8 @@ def _named_endpoint_hash(url: str | None) -> str | None:
     """discover-mcp's digest of an endpoint that names a path; ``None`` for a bare origin.
 
     ``""``, which matches no evidence, for a URL discover-mcp refuses: any query (even an
-    empty one on the root), dot segments, characters clients encode, or an unreadable URL.
+    empty one on the root), dot segments, characters or escapes clients rewrite, or an
+    unreadable URL.
     """
     from urllib.parse import urlsplit
 

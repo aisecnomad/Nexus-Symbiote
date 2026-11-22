@@ -1138,7 +1138,10 @@ def test_an_encoded_slash_is_compared_as_sent():
     assert _remote_reason(approved, evidence) == ("failed", "invalid-transport-evidence", False)
 
 
-@pytest.mark.parametrize(("path", "verified"), [('/m"cp', False), ("/m%22cp", True)])
+@pytest.mark.parametrize(
+    ("path", "verified"),
+    [('/m"cp', False), ("/m%22cp", True), ("/m%7bcp", False), ("/m%41cp", False)],
+)
 def test_a_path_character_clients_encode_binds_only_its_encoded_form(path, verified):
     approved, evidence, _server, _tool = _remote_case("https://mcp.example.com" + path)
     _approved_server(approved).endpoint_url = "https://mcp.example.com" + path

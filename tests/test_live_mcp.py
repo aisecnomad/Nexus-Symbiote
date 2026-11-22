@@ -529,7 +529,7 @@ SSE_HEADERS = {"Content-Type": "text/event-stream"}
 NOT_ASCII = "endpoint must be an ASCII HTTPS URL without controls"
 NOT_PLAIN = "endpoint credentials, queries, fragments or non-HTTPS scheme refused"
 NOT_DOTS = "endpoint dot segments refused"
-NOT_SENT_AS_WRITTEN = "endpoint path characters that clients encode refused"
+NOT_SENT_AS_WRITTEN = "endpoint path characters or escapes that clients rewrite refused"
 
 
 def raw_reply(
@@ -836,12 +836,24 @@ def test_a_bearer_credential_in_the_endpoint_is_refused_before_any_request(endpo
         ("https://fixture.example/mcp/..", NOT_DOTS),
         *(
             ("https://fixture.example" + path, NOT_SENT_AS_WRITTEN)
-            for path in ['/m"cp', "/m{cp}", "/m<cp>", "/m`cp", "/m|cp", "/m^cp", "/m[cp]"]
+            for path in ['/m"cp', "/m{cp", "/mcp}", "/m<cp", "/mcp>", "/m`cp", "/m|cp", "/m^cp"]
         ),
         *(
             ("https://fixture.example" + path, NOT_SENT_AS_WRITTEN)
-            for path in ["/m%zzcp", "/mcp%", "/mcp%2", "/%%2e%2e/mcp"]
+            for path in ["/m[cp", "/mcp]", "/m%zzcp", "/mcp%", "/mcp%2", "/%%2E%2E/mcp"]
         ),
+        *(
+            ("https://fixture.example" + path, NOT_SENT_AS_WRITTEN)
+            for path in [
+                "/m%7bcp",
+                "/m%41cp",
+                "/v1%2e0/mcp",
+                "/v1%2E0/mcp",
+                "/%7Euser/mcp",
+                "/%5Fmcp",
+            ]
+        ),
+        ("https://fixture.example/a/../m{cp", NOT_DOTS),
     ],
 )
 def test_endpoint_encoding_and_authority_checks_fail_before_any_request(endpoint, failure):
@@ -862,7 +874,8 @@ def test_endpoint_encoding_and_authority_checks_fail_before_any_request(endpoint
         "/v1.0/mcp",
         "/..hidden/mcp",
         "/~team/m!$&'()*+,;=:@cp",
-        "/m%7Bcp%7d",
+        "/m%7Bcp%7D",
+        "/a%2Fb/m%22cp",
     ],
 )
 def test_a_path_without_a_dot_segment_is_observed_as_written(path):

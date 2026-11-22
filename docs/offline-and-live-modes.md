@@ -153,7 +153,7 @@ server only when the inventory records that server's `https` origin; a missing o
 observation fails with reason `invalid-transport-evidence`. An inventory endpoint that names a
 path must be the observed URL as `discover-mcp` records it (lower-case scheme and host, no
 default port or fragment, the path as written); one with a query, dot segments or a path
-character that clients percent-encode, which `discover-mcp` refuses, verifies nothing.
+character or escape that clients rewrite, which `discover-mcp` refuses, verifies nothing.
 Otherwise, until `--record` stores the full-URL digest (`observed_endpoint_hash`), the binding
 is origin-only, so an observation of another path on the same origin passes.
 For tools verified through transport evidence, `--record` preserves the tool's
