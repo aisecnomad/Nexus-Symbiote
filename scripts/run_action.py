@@ -376,7 +376,11 @@ class Config:
 
 
 def _scratch_parent(config: Config) -> Path | None:
-    if config.signature_policy is None and getattr(config, "baseline_attestation", None) is None:
+    if (
+        config.signature_policy is None
+        and getattr(config, "baseline", None) is None
+        and getattr(config, "baseline_attestation", None) is None
+    ):
         return config.scratch_parent
 
     from nexus_symbiote.signature_policy import _repository_roots
@@ -401,7 +405,11 @@ def _scratch_parent(config: Config) -> Path | None:
     owner_input = (
         "signature-policy"
         if config.signature_policy is not None
-        else "reviewed-baseline-attestation"
+        else (
+            "reviewed-baseline-attestation"
+            if getattr(config, "baseline_attestation", None) is not None
+            else "reviewed-baseline"
+        )
     )
     raise ActionError(
         f"{owner_input} needs a writable temporary directory with trusted ancestors outside the project and its repositories"

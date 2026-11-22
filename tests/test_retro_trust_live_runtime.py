@@ -644,3 +644,325 @@ def test_output_schema_preflight_rejects_allof_properties_ref_dag_blowup(dialect
     }
     assert validation._evaluate(dialects, benign_tuple, None) == validation._VALID
     assert validation._evaluate(dialects, benign_tuple, ["ok", 1]) == validation._VALID
+
+    # F2: Multi-array, multi-map, and nested-object schemas sharing a $ref stay admitted.
+    two_arrays = {
+        "$defs": {"Item": {"type": "object", "properties": {"id": {"type": "string"}}}},
+        "type": "object",
+        "properties": {
+            "users": {"type": "array", "items": {"$ref": "#/$defs/Item"}},
+            "admins": {"type": "array", "items": {"$ref": "#/$defs/Item"}},
+        },
+    }
+    assert validation._evaluate(dialects, two_arrays, None) == validation._VALID
+
+    two_maps = {
+        "$defs": {"Val": {"type": "string"}},
+        "type": "object",
+        "properties": {
+            "env": {"type": "object", "additionalProperties": {"$ref": "#/$defs/Val"}},
+            "labels": {"type": "object", "additionalProperties": {"$ref": "#/$defs/Val"}},
+        },
+    }
+    assert validation._evaluate(dialects, two_maps, None) == validation._VALID
+
+    shared_prop_across_arrays = {
+        "$defs": {"Id": {"type": "string"}},
+        "type": "object",
+        "properties": {
+            "users": {
+                "type": "array",
+                "items": {"type": "object", "properties": {"id": {"$ref": "#/$defs/Id"}}},
+            },
+            "orgs": {
+                "type": "array",
+                "items": {"type": "object", "properties": {"id": {"$ref": "#/$defs/Id"}}},
+            },
+        },
+    }
+    assert validation._evaluate(dialects, shared_prop_across_arrays, None) == validation._VALID
+
+    nested_shared_prop = {
+        "$defs": {
+            "Name": {"type": "string"},
+            "Person": {"type": "object", "properties": {"name": {"$ref": "#/$defs/Name"}}},
+        },
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "author": {"$ref": "#/$defs/Person"},
+                "reviewer": {"$ref": "#/$defs/Person"},
+            },
+        },
+    }
+    assert validation._evaluate(dialects, nested_shared_prop, None) == validation._VALID
+
+
+def test_trusted_ancestors_rejects_dotdot_and_handles_directory_mount_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Unnormalized '..' must be rejected before abspath collapses intermediate directories.
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    assert crypto_mod._check_trusted_ancestors(sub / "..", {os.geteuid()}) is not None
+
+    # Directory anchor '/tmp' (len(parts) == 2) must qualify for is_mount_anchor under ro rootfs.
+    if os.name == "posix":
+        real_lstat = os.lstat
+        real_fstat = os.fstat
+        real_stat = os.stat
+        tmp_dir = Path("/tmp")  # noqa: S108
+
+        class _StatWrap:
+            def __init__(
+                self, base: os.stat_result, *, uid: int | None = None, dev: int | None = None
+            ) -> None:
+                self._base = base
+                self.st_mode = base.st_mode
+                self.st_uid = base.st_uid if uid is None else uid
+                self.st_dev = base.st_dev if dev is None else dev
+                self.st_ino = base.st_ino
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._base, name)
+
+        class _VfsWrap:
+            def __init__(self, flag: int) -> None:
+                self.f_flag = flag
+
+        root_lstat = real_lstat("/")
+        tmp_lstat = real_lstat(tmp_dir)
+        monkeypatch.setattr(
+            os,
+            "lstat",
+            lambda p, *a, **kw: (
+                _StatWrap(root_lstat, uid=65534, dev=1)
+                if Path(p) == Path("/")
+                else _StatWrap(tmp_lstat, uid=os.geteuid(), dev=2)
+            ),
+        )
+        monkeypatch.setattr(
+            os,
+            "fstat",
+            lambda fd: (
+                _StatWrap(root_lstat, uid=65534, dev=1)
+                if real_fstat(fd).st_ino == root_lstat.st_ino
+                else _StatWrap(tmp_lstat, uid=os.geteuid(), dev=2)
+            ),
+        )
+        monkeypatch.setattr(os, "fstatvfs", lambda fd: _VfsWrap(os.ST_RDONLY))
+        monkeypatch.setattr(
+            os,
+            "stat",
+            lambda p, *a, **kw: (
+                _StatWrap(tmp_lstat, uid=os.geteuid(), dev=2)
+                if kw.get("dir_fd") is not None
+                else real_stat(p, *a, **kw)
+            ),
+        )
+        assert crypto_mod._trust_anchor_error(tmp_dir, None) is None
+
+
+def test_clamp_operator_floor_preserves_unspecified_operator_risk_and_scan() -> None:
+    op = Policy(
+        scan=ScanPolicy(failure_mode="error", exclude_paths=["node_modules", ".git", "vendor"]),
+        risk=RiskPolicy(
+            fail_threshold=80.0,
+            warn_threshold=60.0,
+            fail_on_severity="none",
+            ignore_categories=["low_noise"],
+        ),
+        validate=ValidatePolicy(minimum_assurance_level="declared"),
+    )
+    tightening_checkout = Policy.model_validate(
+        {
+            "scan": {"exclude_paths": []},
+            "validate": {"minimum_assurance_level": "observed"},
+        }
+    )
+    clamped = verify_staged_policy.clamp_operator_floor(op, tightening_checkout)
+    assert clamped.risk.fail_threshold == 80.0
+    assert clamped.risk.fail_on_severity == "none"
+    assert clamped.risk.ignore_categories == ["low_noise"]
+    assert clamped.validation.minimum_assurance_level == "observed"
+    assert clamped.scan == op.scan
+
+
+def test_oms_resource_name_rejects_non_canonical_and_non_str() -> None:
+    for bad in ("sub/weights.bin/", "sub/./weights.bin", "sub//weights.bin", "sub/a\x7fb"):
+        assert crypto_mod._clean_oms_resource_name(bad) is None
+    err = crypto_mod._verify_oms_statement(
+        "application/vnd.in-toto+json",
+        json.dumps(
+            {
+                "_type": "https://in-toto.io/Statement/v1",
+                "predicateType": next(iter(crypto_mod.OMS_PREDICATE_TYPES)),
+                "subject": [{"name": "m", "digest": {"sha256": "0" * 64}}],
+                "predicate": {
+                    "resources": [
+                        {"name": "weights.bin", "algorithm": "sha256", "digest": "0" * 64}
+                    ]
+                },
+            }
+        ).encode(),
+        "0" * 64,
+        artifact_name=Path("weights.bin"),  # type: ignore[arg-type]
+    )
+    assert err is not None and "invalid" in err.lower()
+
+
+def test_inspect_outside_untrusted_rejects_checkout_symlink_pointing_outside(
+    tmp_path: Path,
+) -> None:
+    from nexus_symbiote import runtime_cli
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside.pem"
+    outside.write_text("key", encoding="utf-8")
+    link = repo / "key.pem"
+    link.symlink_to(outside)
+    failure, _ = runtime_cli._inspect_outside_untrusted((link,), (repo,))
+    assert failure == "inside"
+
+
+def test_run_action_scratch_parent_validates_baseline_only_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    bad_tmp = ws / "tmp"
+    bad_tmp.mkdir()
+    cfg = SimpleNamespace(
+        signature_policy=None,
+        baseline=tmp_path / "baseline.json",
+        baseline_attestation=None,
+        scratch_parent=bad_tmp,
+        workspace=ws,
+    )
+    monkeypatch.setattr(run_action.tempfile, "gettempdir", lambda: str(bad_tmp))
+    monkeypatch.setattr(run_action.os, "name", "nt")
+    with pytest.raises(run_action.ActionError, match="reviewed-baseline"):
+        run_action._scratch_parent(cfg)  # type: ignore[arg-type]
+
+
+def test_cgroup_remove_retries_ebusy_and_session_exit_preserves_teardown_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import errno
+
+    calls = 0
+
+    class _FakeCgroup:
+        def rmdir(self) -> None:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise OSError(errno.EBUSY, "Device or resource busy")
+
+    monkeypatch.setattr(pinned_process.time, "sleep", lambda _s: None)
+    pinned_process._remove_cgroup(_FakeCgroup())  # type: ignore[arg-type]
+    assert calls == 3
+
+    class _BadDir:
+        def cleanup(self) -> None:
+            raise OSError("cleanup failed")
+
+    def _fail_terminate(_proc: object) -> None:
+        raise PinnedProcessError("isolation-teardown-failed", "process survived")
+
+    monkeypatch.setattr(session_module, "terminate_process_group", _fail_terminate)
+    session = object.__new__(PinnedStdioSession)
+    session._process = SimpleNamespace(wait=lambda timeout=5: 0, stdin=None, stdout=None)  # type: ignore[assignment]
+    session._directory = _BadDir()  # type: ignore[assignment]
+    session._called = False
+    with pytest.raises(AuthorizationError) as exc_info:
+        session.__exit__(None, None, None)
+    assert exc_info.value.reason == "isolation-teardown-failed"
+
+    # Without a PinnedProcessError teardown failure, cleanup OSError still surfaces.
+    plain_session = object.__new__(PinnedStdioSession)
+    plain_session._process = None
+    plain_session._directory = _BadDir()  # type: ignore[assignment]
+    plain_session._called = False
+    with pytest.raises(OSError, match="cleanup failed"):
+        plain_session.__exit__(None, None, None)
+
+
+def test_single_value_multiplicity_covers_applicator_combinations_and_caps(
+    dialects: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nexus_symbiote import runtime_validation as validation
+
+    leaf = {"type": "string"}
+    combined_obj = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {"Leaf": leaf},
+        "allOf": [
+            {
+                "type": "object",
+                "maxProperties": 10,
+                "propertyNames": {"minLength": 1},
+                "properties": {"a": {"$ref": "#/$defs/Leaf"}},
+                "patternProperties": {"^x_": {"$ref": "#/$defs/Leaf"}},
+                "additionalProperties": leaf,
+            },
+            {
+                "type": "object",
+                "maxProperties": 10,
+                "properties": {"b": {"$ref": "#/$defs/Leaf"}},
+                "additionalProperties": leaf,
+            },
+            {
+                "type": "object",
+                "maxProperties": 10,
+                "properties": {"c": {"$ref": "#/$defs/Leaf"}},
+                "additionalProperties": {"type": "string"},
+            },
+        ],
+    }
+    assert validation._evaluate(dialects, combined_obj, None) == validation._VALID
+    assert validation._evaluate(dialects, combined_obj, {"a": "ok", "b": "ok"}) == validation._VALID
+
+    combined_arr = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {"Leaf": leaf},
+        "allOf": [
+            {
+                "type": "array",
+                "maxItems": 10,
+                "prefixItems": [{"$ref": "#/$defs/Leaf"}],
+                "items": leaf,
+            },
+            {
+                "type": "array",
+                "maxItems": 10,
+                "prefixItems": [{"$ref": "#/$defs/Leaf"}, {"$ref": "#/$defs/Leaf"}],
+                "items": leaf,
+            },
+            {
+                "type": "array",
+                "maxItems": 10,
+                "prefixItems": [{"$ref": "#/$defs/Leaf"}],
+                "items": {"type": "string"},
+            },
+        ],
+    }
+    assert validation._evaluate(dialects, combined_arr, None) == validation._VALID
+    assert validation._evaluate(dialects, combined_arr, ["a", "b"]) == validation._VALID
+
+    # Exponential in-place allOf DAG trips closure step_cap and fails closed.
+    defs: dict[str, object] = {"d0": {"type": "string"}}
+    for i in range(1, 20):
+        defs[f"d{i}"] = {"allOf": [{"$ref": f"#/$defs/d{i - 1}"}, {"$ref": f"#/$defs/d{i - 1}"}]}
+    dag_bomb = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": defs,
+        "$ref": "#/$defs/d19",
+    }
+    assert validation._evaluate(dialects, dag_bomb, None) == validation._SCHEMA
+
+    # Path-state budget overflow fails closed.
+    monkeypatch.setattr(validation, "_MAX_PATH_STATES", 1)
+    assert validation._evaluate(dialects, combined_obj, None) == validation._SCHEMA

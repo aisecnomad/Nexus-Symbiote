@@ -1274,80 +1274,23 @@ def _collection_work_exceeds_budget(
     # array element) and preserve exact slot keys whenever a key repeats across
     # containers or enters an in-place branching subgraph (allOf/anyOf/oneOf).
     counts = {root: 1}
-    # Maps node id -> (obj_wild, obj_named, obj_unique, arr_wild, arr_named, arr_unique)
-    slot_dups: dict[int, tuple[int, dict[str, int], int, int, dict[int, int], int]] = {
-        root: (1, {}, 0, 0, {}, 0)
-    }
     nested: set[int] = set()
     fallible: set[int] = set()
     step_cap = _MAX_OUTPUT_REPEATED_STEPS + 1
 
-    has_in_place_branch: dict[int, bool] = {}
-    for current in reversed(order):
-        children = graph[current]
-        has_in_place_branch[current] = len(children) > 1 or any(
-            has_in_place_branch[c] for c in children
-        )
-
-    obj_key_counts: dict[str, int] = {}
-    arr_key_counts: dict[int, int] = {}
-    for node in nodes.values():
-        props = node.get("properties")
-        if isinstance(props, dict):
-            for key in props:
-                obj_key_counts[key] = obj_key_counts.get(key, 0) + 1
-        for kw in ("prefixItems", "items"):
-            val = node.get(kw)
-            if isinstance(val, list):
-                for idx in range(len(val)):
-                    arr_key_counts[idx] = arr_key_counts.get(idx, 0) + 1
-    repeated_obj_slots = frozenset(k for k, c in obj_key_counts.items() if c > 1)
-    repeated_arr_slots = frozenset(k for k, c in arr_key_counts.items() if c > 1)
-
-    def _merge_slot(
-        store: dict[int, tuple[int, dict[str, int], int, int, dict[int, int], int]],
-        target: int,
-        obj_w: int,
-        obj_n: dict[str, int],
-        obj_u: int,
-        arr_w: int,
-        arr_n: dict[int, int],
-        arr_u: int,
-    ) -> None:
-        cur_ow, cur_on, cur_ou, cur_aw, cur_an, cur_au = store.get(target, (0, {}, 0, 0, {}, 0))
-        new_ow = min(step_cap, cur_ow + obj_w)
-        new_ou = min(step_cap, max(cur_ou, obj_u))
-        if obj_n:
-            merged_on = dict(cur_on)
-            for k, v in obj_n.items():
-                merged_on[k] = min(step_cap, merged_on.get(k, 0) + v)
-        else:
-            merged_on = cur_on
-        new_aw = min(step_cap, cur_aw + arr_w)
-        new_au = min(step_cap, max(cur_au, arr_u))
-        if arr_n:
-            merged_an = dict(cur_an)
-            for idx_k, v in arr_n.items():
-                merged_an[idx_k] = min(step_cap, merged_an.get(idx_k, 0) + v)
-        else:
-            merged_an = cur_an
-        store[target] = (new_ow, merged_on, new_ou, new_aw, merged_an, new_au)
+    max_dup = _max_single_value_multiplicity(root, order, graph, nodes, step_cap)
+    if max_dup is None:
+        return True
 
     for _ in range(MAX_JSON_DEPTH + 1):
         following: dict[int, int] = {}
-        following_slots: dict[int, tuple[int, dict[str, int], int, int, dict[int, int], int]] = {}
         nested_following: set[int] = set()
         fallible_following: set[int] = set()
         for current in order:
             count = counts.get(current, 0)
             if not count:
                 continue
-            cur_ow, cur_on, cur_ou, cur_aw, cur_an, cur_au = slot_dups.get(
-                current, (1, {}, 0, 0, {}, 0)
-            )
-            obj_dup = cur_ow + max(max(cur_on.values(), default=0), cur_ou)
-            arr_dup = cur_aw + max(max(cur_an.values(), default=0), cur_au)
-            dup = min(step_cap, max(1, obj_dup, arr_dup))
+            dup = min(step_cap, max(1, max_dup.get(current, 1)))
             node = nodes[current]
             # Only schemas that abort collection validation on a non-conforming
             # value can bound repetitions by a conforming value's node footprint.
@@ -1372,7 +1315,6 @@ def _collection_work_exceeds_budget(
                         fallible_children.add(id(arm))
             for child in graph[current]:
                 counts[child] = min(step_cap, counts.get(child, 0) + count)
-                _merge_slot(slot_dups, child, cur_ow, cur_on, cur_ou, cur_aw, cur_an, cur_au)
                 if current in nested:
                     nested.add(child)
                 if current in fallible or child in fallible_children:
@@ -1394,21 +1336,18 @@ def _collection_work_exceeds_budget(
 
             fixed_costs: list[int] = []
             for keyword, value in node.items():
-                is_array_kw = False
                 if (
                     keyword == "properties"
                     or keyword in ("prefixItems", "items")
                     and isinstance(value, list)
                 ):
-                    if isinstance(value, dict):
-                        entries_iter: list[tuple[str | int | None, Any]] = list(value.items())
-                    else:
-                        is_array_kw = True
-                        entries_iter = list(enumerate(value[:items]))
+                    entries_list = (
+                        list(value.values()) if isinstance(value, dict) else value[:items]
+                    )
                     cardinality = 1
                     costs = [
                         work[id(x)]
-                        for _, x in entries_iter
+                        for x in entries_list
                         if isinstance(x, dict) and (branching[id(x)] or work[id(x)] > 32)
                     ]
                     if isinstance(value, dict) and len(costs) > properties:
@@ -1416,10 +1355,10 @@ def _collection_work_exceeds_budget(
                         del costs[properties:]
                     fixed_costs.extend(costs)
                 elif keyword == "patternProperties":
-                    entries_iter = [(None, part) for part in value.values()]
+                    entries_list = list(value.values())
                     cardinality = properties
                     matching_work = sum(
-                        work[id(part)] for _, part in entries_iter if isinstance(part, dict)
+                        work[id(part)] for part in entries_list if isinstance(part, dict)
                     )
                     if (
                         len(value) > 1
@@ -1428,36 +1367,17 @@ def _collection_work_exceeds_budget(
                     ):
                         return True
                 elif keyword in ("items", "contains", "additionalItems", "unevaluatedItems"):
-                    is_array_kw = True
-                    entries_iter, cardinality = [(None, value)], items
+                    entries_list, cardinality = [value], items
                 elif keyword in ("additionalProperties", "unevaluatedProperties", "propertyNames"):
-                    entries_iter, cardinality = [(None, value)], properties
+                    entries_list, cardinality = [value], properties
                 else:
                     continue
-                for slot_key, part in entries_iter:
+                for part in entries_list:
                     if isinstance(part, dict):
                         child = id(part)
                         following[child] = min(
                             step_cap, following.get(child, 0) + count * cardinality
                         )
-                        if is_array_kw:
-                            if slot_key is None:
-                                _merge_slot(following_slots, child, 0, {}, 0, dup, {}, 0)
-                            elif isinstance(slot_key, int) and (
-                                slot_key in repeated_arr_slots or has_in_place_branch[child]
-                            ):
-                                _merge_slot(following_slots, child, 0, {}, 0, 0, {slot_key: dup}, 0)
-                            else:
-                                _merge_slot(following_slots, child, 0, {}, 0, 0, {}, dup)
-                        else:
-                            if slot_key is None:
-                                _merge_slot(following_slots, child, dup, {}, 0, 0, {}, 0)
-                            elif isinstance(slot_key, str) and (
-                                slot_key in repeated_obj_slots or has_in_place_branch[child]
-                            ):
-                                _merge_slot(following_slots, child, 0, {slot_key: dup}, 0, 0, {}, 0)
-                            else:
-                                _merge_slot(following_slots, child, 0, {}, dup, 0, {}, 0)
                         if (
                             current in nested
                             or keyword == "contains"
@@ -1469,19 +1389,174 @@ def _collection_work_exceeds_budget(
             if len(fixed_costs) > 1 and count * sum(fixed_costs) > _MAX_OUTPUT_REPEATED_STEPS:
                 return True
         if not following or (
-            following == counts
-            and following_slots == slot_dups
-            and nested_following == nested
-            and fallible_following == fallible
+            following == counts and nested_following == nested and fallible_following == fallible
         ):
             break
-        counts, slot_dups, nested, fallible = (
-            following,
-            following_slots,
-            nested_following,
-            fallible_following,
-        )
+        counts, nested, fallible = following, nested_following, fallible_following
     return False
+
+
+_MAX_PATH_STATES = 4096
+
+
+def _max_single_value_multiplicity(
+    root: int,
+    order: list[int],
+    graph: dict[int, list[int]],
+    nodes: dict[int, dict[str, Any]],
+    step_cap: int,
+) -> dict[int, int] | None:
+    """Upper bound on how many times a single JSON value can reach each schema node."""
+    closure: dict[int, dict[int, int]] = {}
+    for current in reversed(order):
+        acc: dict[int, int] = {current: 1}
+        for child in graph[current]:
+            for target, mult in closure[child].items():
+                nxt = acc.get(target, 0) + mult
+                if nxt >= step_cap:
+                    return None
+                acc[target] = nxt
+        closure[current] = acc
+
+    def _close(seed: dict[int, int]) -> dict[int, int] | None:
+        closed: dict[int, int] = {}
+        total = 0
+        for u, weight in seed.items():
+            for target, mult in closure[u].items():
+                add = weight * mult
+                nxt = closed.get(target, 0) + add
+                total += add
+                if nxt >= step_cap or total >= step_cap:
+                    return None
+                closed[target] = nxt
+        return closed
+
+    init = _close({root: 1})
+    if init is None:
+        return None
+    max_dup: dict[int, int] = dict(init)
+    init_key = tuple(sorted(init))
+    frontier: dict[tuple[int, ...], dict[int, int]] = {init_key: init}
+    seen: dict[tuple[int, ...], dict[int, int]] = {init_key: dict(init)}
+    expansions = 0
+
+    def _record(
+        seed: dict[int, int],
+        target_frontier: dict[tuple[int, ...], dict[int, int]],
+    ) -> bool:
+        if not seed:
+            return True
+        closed = _close(seed)
+        if closed is None:
+            return False
+        for nid, m in closed.items():
+            if m > max_dup.get(nid, 0):
+                max_dup[nid] = m
+        key = tuple(sorted(closed))
+        prev = seen.get(key)
+        if prev is not None and all(closed[nid] <= prev[nid] for nid in key):
+            return True
+        seen[key] = (
+            {nid: max(prev[nid], closed[nid]) for nid in key} if prev is not None else dict(closed)
+        )
+        existing = target_frontier.get(key)
+        target_frontier[key] = (
+            closed if existing is None else {nid: max(existing[nid], closed[nid]) for nid in key}
+        )
+        return True
+
+    for _ in range(MAX_JSON_DEPTH):
+        if not frontier:
+            break
+        next_frontier: dict[tuple[int, ...], dict[int, int]] = {}
+
+        for active in frontier.values():
+            expansions += 1
+            if expansions > _MAX_PATH_STATES:
+                return None
+
+            propname_seed: dict[int, int] = {}
+            obj_wild_base: dict[int, int] = {}
+            obj_key_nodes: dict[str, list[tuple[int, int]]] = {}
+            arr_wild_base: dict[int, int] = {}
+            arr_idx_nodes: dict[int, list[tuple[int, str, int]]] = {}
+
+            for u, mult in active.items():
+                node = nodes[u]
+                if isinstance(node.get("propertyNames"), dict):
+                    cid = id(node["propertyNames"])
+                    propname_seed[cid] = min(step_cap, propname_seed.get(cid, 0) + mult)
+                props = node.get("properties")
+                if isinstance(props, dict):
+                    for k in props:
+                        obj_key_nodes.setdefault(k, []).append((u, mult))
+                patterns = node.get("patternProperties")
+                if isinstance(patterns, dict):
+                    for psub in patterns.values():
+                        if isinstance(psub, dict):
+                            cid = id(psub)
+                            obj_wild_base[cid] = min(step_cap, obj_wild_base.get(cid, 0) + mult)
+                for kw in ("additionalProperties", "unevaluatedProperties"):
+                    sub = node.get(kw)
+                    if isinstance(sub, dict):
+                        cid = id(sub)
+                        obj_wild_base[cid] = min(step_cap, obj_wild_base.get(cid, 0) + mult)
+                for kw in ("prefixItems", "items"):
+                    tuple_kw = node.get(kw)
+                    if isinstance(tuple_kw, list):
+                        for idx in range(len(tuple_kw)):
+                            arr_idx_nodes.setdefault(idx, []).append((u, kw, mult))
+                for kw in ("items", "additionalItems", "contains", "unevaluatedItems"):
+                    sub = node.get(kw)
+                    if isinstance(sub, dict):
+                        cid = id(sub)
+                        arr_wild_base[cid] = min(step_cap, arr_wild_base.get(cid, 0) + mult)
+
+            if propname_seed and not _record(propname_seed, next_frontier):
+                return None
+            if obj_wild_base and not _record(obj_wild_base, next_frontier):
+                return None
+            for k, holders in obj_key_nodes.items():
+                seed = dict(obj_wild_base)
+                for u, mult in holders:
+                    node = nodes[u]
+                    addl = node.get("additionalProperties")
+                    if isinstance(addl, dict):
+                        aid = id(addl)
+                        rem = seed.get(aid, 0) - mult
+                        if rem <= 0:
+                            seed.pop(aid, None)
+                        else:
+                            seed[aid] = rem
+                    sub = node["properties"][k]
+                    if isinstance(sub, dict):
+                        cid = id(sub)
+                        seed[cid] = min(step_cap, seed.get(cid, 0) + mult)
+                if not _record(seed, next_frontier):
+                    return None
+            if arr_wild_base and not _record(arr_wild_base, next_frontier):
+                return None
+            for idx, arr_holders in arr_idx_nodes.items():
+                seed = dict(arr_wild_base)
+                for u, kw, mult in arr_holders:
+                    node = nodes[u]
+                    tail_kw = "items" if kw == "prefixItems" else "additionalItems"
+                    tail_sub = node.get(tail_kw)
+                    if isinstance(tail_sub, dict):
+                        aid = id(tail_sub)
+                        rem = seed.get(aid, 0) - mult
+                        if rem <= 0:
+                            seed.pop(aid, None)
+                        else:
+                            seed[aid] = rem
+                    sub = node[kw][idx]
+                    if isinstance(sub, dict):
+                        cid = id(sub)
+                        seed[cid] = min(step_cap, seed.get(cid, 0) + mult)
+                if not _record(seed, next_frontier):
+                    return None
+        frontier = next_frontier
+    return max_dup
 
 
 def _contains_meets_unevaluated_items(nodes: list[dict[str, Any]], resolver: Any) -> bool:

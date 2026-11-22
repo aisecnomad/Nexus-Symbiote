@@ -69,8 +69,10 @@ DEFAULT_MAX_AGE_DAYS: Final = 90
 
 def clamp_operator_floor(operator_policy: Policy, project_policy: Policy | None) -> Policy:
     """Combine operator and checkout policies so the checkout can only tighten controls."""
-    narrowed, _clamped = narrow_policy(operator_policy, project_policy)
-    return narrowed
+    narrowed, _clamped = narrow_policy(operator_policy, project_policy, inherit_unspecified=True)
+    # run_staged_gate collects the candidate BOM with --no-project-policy, so
+    # reconciliation keeps the operator's scan exclusions to avoid drift.
+    return narrowed.model_copy(update={"scan": operator_policy.scan})
 
 
 def _line(prefix: str, *values: object) -> str:

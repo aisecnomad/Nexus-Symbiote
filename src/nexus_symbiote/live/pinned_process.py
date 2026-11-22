@@ -30,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import ctypes
+import errno
 import hashlib
 import os
 import re
@@ -935,8 +936,14 @@ def _cgroup_kill(path: Path) -> None:
 
 
 def _remove_cgroup(path: Path) -> None:
-    with contextlib.suppress(OSError):
-        path.rmdir()
+    for attempt in range(5):
+        try:
+            path.rmdir()
+            return
+        except OSError as exc:
+            if exc.errno != errno.EBUSY or attempt == 4:
+                return
+            time.sleep(0.02)
 
 
 def _proc_fields(pid: int) -> list[str] | None:

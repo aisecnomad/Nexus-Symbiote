@@ -343,8 +343,13 @@ class PinnedStdioSession:
                             proc.stdout.close()
         finally:
             if self._directory is not None:
-                self._directory.cleanup()
-                self._directory = None
+                try:
+                    self._directory.cleanup()
+                except OSError:
+                    if not isinstance(teardown, PinnedProcessError):
+                        raise
+                finally:
+                    self._directory = None
         if teardown is None:
             return
         if self._called:
@@ -359,7 +364,7 @@ class PinnedStdioSession:
                 else "launcher cleanup did not complete; the tool may still be running"
             ) from teardown
         if isinstance(teardown, PinnedProcessError):
-            raise AuthorizationError(str(teardown)) from teardown
+            raise AuthorizationError(str(teardown), reason=teardown.reason) from teardown
         if exc is not None:
             return
         raise teardown

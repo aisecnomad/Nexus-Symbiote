@@ -361,8 +361,9 @@ def _check_trusted_ancestors(
     ``reason`` is one of ``"uninspectable"``, ``"symlink"``, ``"not_dir"``, ``"untrusted_owner"``,
     or ``"writable"``.
     """
+    if ".." in directory.parts or (anchor_path is not None and ".." in anchor_path.parts):
+        return "uninspectable", directory
     abs_dir = _absolute_through_root_links(directory)
-    abs_subject = _absolute_through_root_links(anchor_path) if anchor_path is not None else abs_dir
     chain = (abs_dir, *abs_dir.parents) if include_self else tuple(abs_dir.parents)
     walk = tuple(reversed(chain)) if verify_fd else chain
     for ancestor in walk:
@@ -374,7 +375,7 @@ def _check_trusted_ancestors(
             return "symlink", ancestor
         if not stat.S_ISDIR(linfo.st_mode):
             return "not_dir", ancestor
-        is_mount_anchor = ancestor == Path(abs_subject.anchor) and len(abs_subject.parts) > 2
+        is_mount_anchor = ancestor == Path(abs_dir.anchor) and len(abs_dir.parts) >= 2
         if not verify_fd:
             info = linfo
             owner_trusted = trusted_uids is None or info.st_uid in trusted_uids
@@ -404,7 +405,7 @@ def _check_trusted_ancestors(
                         # An unprivileged writer cannot rename a direct mount under
                         # a read-only namespace root with an unmapped UID.
                         owner_trusted = bool(os.fstatvfs(fd).f_flag & os.ST_RDONLY) and (
-                            os.stat(abs_subject.parts[1], dir_fd=fd, follow_symlinks=False).st_dev
+                            os.stat(abs_dir.parts[1], dir_fd=fd, follow_symlinks=False).st_dev
                             != info.st_dev
                         )
                 except OSError:
@@ -979,14 +980,19 @@ def _verify_rekor_witness(
 
 
 def _clean_oms_resource_name(raw_name: Any) -> str | None:
-    from pathlib import PurePosixPath
-
-    if not isinstance(raw_name, str) or not raw_name or len(raw_name) > 1024:
+    if (
+        not isinstance(raw_name, str)
+        or not raw_name
+        or len(raw_name) > 1024
+        or raw_name.startswith("/")
+        or raw_name.endswith("/")
+        or "\\" in raw_name
+        or "//" in raw_name
+        or any(ord(c) < 0x20 or ord(c) == 0x7F for c in raw_name)
+    ):
         return None
-    if raw_name.startswith("/") or "\\" in raw_name or any(ord(c) < 0x20 for c in raw_name):
-        return None
-    parts = PurePosixPath(raw_name).parts
-    if not parts or any(part in {"", ".", ".."} for part in parts):
+    parts = raw_name.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
         return None
     return "/".join(parts)
 
@@ -1067,6 +1073,8 @@ def _verify_oms_statement(
         parsed_resources.append((clean_name, res_hex))
 
     if artifact_name is not None:
+        if not isinstance(artifact_name, str):
+            return "Artifact name is invalid for OpenSSF Model Signing resource matching"
         normalized = artifact_name
         while normalized.startswith("./"):
             normalized = normalized[2:]
