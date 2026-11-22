@@ -156,11 +156,12 @@ MAX_PICKLE_MARKS = 64
 MIN_PICKLE_OPCODES = 16
 # A ZIP central directory is listed from the archive's end; a longer one is not read.
 MAX_ZIP_DIRECTORY_BYTES = MAX_MODEL_HEADER_BYTES
-_ZIP_END_RECORD_BYTES = 22 + 65_535 + 20 + 56
+# How far from the end miniz finds an end record: mz_zip_reader_locate_header_sig
+# steps back in 4,096-byte reads overlapping by 3 bytes (4,093-byte stride) until
+# archive_size - cur_file_ofs >= 65,535 + 22, reaching 4,096 + 16 * 4,093 = 69,584.
+_MINIZ_END_SEARCH = 4_096 + 16 * (4_096 - 3)
+_ZIP_END_RECORD_BYTES = _MINIZ_END_SEARCH + 20 + 56
 _ZIP_TAIL_BYTES = MAX_ZIP_DIRECTORY_BYTES + _ZIP_END_RECORD_BYTES
-# How far from the end miniz finds an end record: it searches back in 4 KiB reads past
-# the 65,535-byte comment, so a record up to this far back is one it can take.
-_MINIZ_END_SEARCH = 69_584
 ZIP_PICKLE_MEMBER = "ZIP archive with a pickle member; torch.load unpickles it"
 ZIP_OBJECT_ARRAY = (
     "ZIP archive with a NumPy object-dtype array member; np.load(allow_pickle=True) unpickles it"
@@ -770,29 +771,32 @@ def _zip64_location(
     """A member's compressed size and local header offset, from ZIP64 when they overflow.
 
     The ZIP64 extra field holds, in this order, each of the uncompressed size, the
-    compressed size and the offset whose 32-bit field is 0xFFFFFFFF. ``None`` when the
-    field is there but too short for them, which ``zipfile`` refuses as a corrupt
-    archive. Without the field, ``zipfile`` keeps the 32-bit values as written and reads
-    the archive, so they are kept here too.
+    compressed size and the offset whose 32-bit field is 0xFFFFFFFF (or 0xFFFFFFFFFFFFFFFF
+    for a chained uncompressed size). ``zipfile._decodeExtra`` loops through every 0x0001
+    extra field in order; ``None`` is returned when a field is truncated or too short for
+    the remaining sentinel slots, which ``zipfile`` refuses as a corrupt archive. Without
+    the field, ``zipfile`` keeps the 32-bit values as written and reads the archive, so
+    they are kept here too.
     """
     if 0xFFFFFFFF not in (uncompressed, compressed, offset):
         return compressed, offset
+    values = [uncompressed, compressed, offset]
     position = 0
     while position + 4 <= len(extra):
         length = _little(extra, position + 2, 2)
         if _little(extra, position, 2) == 1:
+            if position + 4 + length > len(extra):
+                return None
             field = extra[position + 4 : position + 4 + length]
-            values = [uncompressed, compressed, offset]
             cursor = 0
             for index, value in enumerate(values):
-                if value == 0xFFFFFFFF:
+                if value == 0xFFFFFFFF or (index == 0 and value == 0xFFFFFFFFFFFFFFFF):
                     if cursor + 8 > len(field):
                         return None
                     values[index] = _little(field, cursor, 8)
                     cursor += 8
-            return values[1], values[2]
         position += 4 + length
-    return compressed, offset
+    return values[1], values[2]
 
 
 def _reread(stream: BinaryIO, offset: int, size: int) -> bytes:
@@ -1108,7 +1112,53 @@ def inspect_model_format(
                 and len(prefix) == 8
                 and 2 <= length <= min(MAX_MODEL_HEADER_BYTES, size - 8)
             )
-            if not tensor_candidate:
+            if tensor_candidate:
+                capture = _CaptureReader(opened)
+                try:
+                    read_header(
+                        cast(BinaryIO, capture),
+                        size,
+                        prefix=prefix,
+                        max_header_bytes=MAX_MODEL_HEADER_BYTES,
+                    )
+                except HeaderLimitError:
+                    raise
+                except (ValueError, RecursionError, UnicodeError):
+                    replay = _PrefixedStream(bytes(capture.captured), opened)
+                    container = _recognized_code_container(
+                        cast(BinaryIO, replay),
+                        prefix,
+                        size,
+                        budget or InspectionBudget(),
+                        by_content=False,
+                    )
+                    if (
+                        container is not None
+                        and container[0] is SerializationSafety.UNSAFE_CODE_EXECUTION
+                    ):
+                        return container
+                    return (
+                        SerializationSafety.UNKNOWN,
+                        "Malformed or unsupported SafeTensors structure",
+                    )
+                replay = _PrefixedStream(bytes(capture.captured), opened)
+                polyglot = _recognized_code_container(
+                    cast(BinaryIO, replay),
+                    prefix,
+                    size,
+                    budget or InspectionBudget(),
+                    by_content=True,
+                )
+                if (
+                    polyglot is not None
+                    and polyglot[0] is SerializationSafety.UNSAFE_CODE_EXECUTION
+                ):
+                    return polyglot
+                return (
+                    SerializationSafety.SAFE,
+                    "Bounded SafeTensors header, shapes and offsets checked",
+                )
+            else:
                 container = _recognized_code_container(
                     opened,
                     prefix,
@@ -1229,6 +1279,56 @@ def _tar_number(field: bytes) -> int | None:
 def _loader_rated(evidence: str) -> str:
     """The rating of a pickle-family name whose content the bounds left unrated."""
     return f"Potential code-executing loader format ({evidence.removesuffix(_UNVALIDATED)})"
+
+
+class _CaptureReader:
+    """Record bytes read from ``stream`` so a failed header check can replay them once."""
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
+        self.captured = bytearray()
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._stream.read(size)
+        self.captured.extend(data)
+        return data
+
+    def reread(self, offset: int, size: int) -> bytes:
+        return _reread(self._stream, offset, size)
+
+
+class _PrefixedStream:
+    """Serve already-read bytes before continuing from ``stream``, hashing each byte once."""
+
+    def __init__(self, buffered: bytes, stream: BinaryIO) -> None:
+        self._buffered = memoryview(buffered)
+        self._pos = 0
+        self._stream = stream
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    def read(self, size: int = -1) -> bytes:
+        if size == 0:
+            return b""
+        if size < 0:
+            head = bytes(self._buffered[self._pos :])
+            self._pos = len(self._buffered)
+            return head + self._stream.read(-1)
+        if self._pos < len(self._buffered):
+            end = min(len(self._buffered), self._pos + size)
+            head = bytes(self._buffered[self._pos : end])
+            self._pos = end
+            if len(head) == size:
+                return head
+            return head + self._stream.read(size - len(head))
+        return self._stream.read(size)
+
+    def reread(self, offset: int, size: int) -> bytes:
+        return _reread(self._stream, offset, size)
 
 
 class _HeadReader:
