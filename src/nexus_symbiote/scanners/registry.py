@@ -393,10 +393,10 @@ def _identifier(text: str) -> tuple[str, bool]:
     ``llama-token:1.0`` as a credential. A token glued to other text takes the whole
     identifier with it.
     """
-    if not holds_token_shape(text):
+    if not holds_token_shape(text, require_sk_boundary=True):
         return text, False
     shown = TOKEN_SHAPE.sub(REDACTED, text)
-    return (REDACTED if holds_token_shape(shown) else shown), True
+    return (REDACTED if holds_token_shape(shown, require_sk_boundary=True) else shown), True
 
 
 def _recorded_requirement(requirement: Requirement) -> str:
