@@ -2315,7 +2315,7 @@ class RegistryScanner(Scanner):
             if consistent and not sensitive
             else None
         )
-        component.registry_uri = origin
+        component.registry_uri = None if sensitive else origin
         component.source_path = lock_name
         component.assurance_level = AssuranceLevel.DECLARED
         component.properties.update(
@@ -2610,9 +2610,17 @@ class RegistryScanner(Scanner):
                 locator = "pnpm-lock.yaml#/importers/./" + _pointer_token(comp.name)
             selected_specs = specifiers.get(comp.name, set())
             requested = next(iter(selected_specs)) if len(selected_specs) == 1 else None
-            kind = self._npm_spec(requested)[0] if requested is not None else "registry"
-            bind_identity = kind in ("registry", "alias")
-            if not bind_identity and requested is not None:
+            kind, alias_target, _ = (
+                self._npm_spec(requested) if requested is not None else ("registry", None, "")
+            )
+            unresolved_alias = kind == "alias" and alias_target != comp.name
+            bind_identity = kind == "registry" or (kind == "alias" and not unresolved_alias)
+            if unresolved_alias:
+                comp.registry_uri = None
+                result.surfaces_excluded.append(
+                    "pnpm-lock.yaml: aliased package identity is unresolved"
+                )
+            elif not bind_identity and requested is not None:
                 comp.registry_uri = None
                 risk = self._npm_source_risk(comp.name, kind, requested)
                 if risk not in comp.risks:
@@ -2756,7 +2764,13 @@ class RegistryScanner(Scanner):
                     )
                     continue
                 selected = next((spec for spec in installed if spec not in ("", "*")), installed[0])
-                kind, _, _ = self._npm_spec(selected)
+                kind, alias_target, _ = self._npm_spec(selected)
+                if kind == "alias" and alias_target != comp.name:
+                    comp.registry_uri = None
+                    result.surfaces_excluded.append(
+                        "yarn.lock: aliased package identity is unresolved"
+                    )
+                    continue
                 if kind not in ("registry", "alias"):
                     comp.registry_uri = None
                     comp.risks.append(self._npm_source_risk(comp.name, kind, selected))
@@ -2796,9 +2810,12 @@ class RegistryScanner(Scanner):
                 continue
             resolution_val = fields.get("resolution", "")
             resolved_val = fields.get("resolved", "")
-            if sel_spec.startswith("npm:") and "@" in sel_spec[4:]:
-                alias_pkg = sel_spec[4:].rsplit("@", 1)[0]
+            if sel_spec.lower().startswith("npm:") and (
+                req.lower().startswith("npm:") or sel_spec != f"npm:{req}" or "@" in sel_spec[4:]
+            ):
+                _, alias_pkg, _ = self._npm_spec(sel_spec)
                 if alias_pkg and alias_pkg != comp.name:
+                    comp.registry_uri = None
                     result.surfaces_excluded.append(
                         "yarn.lock: aliased package identity is unresolved"
                     )
