@@ -672,6 +672,14 @@ ranking and the JSON document.
 
 Import a foreign CycloneDX or SPDX SBOM as DECLARED evidence without picking silent winners. By default component names are hashed (`imported-<16hex>`): keyed HMAC-SHA256 (`hmac-sha256`) when `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` has at least 32 characters, or unsalted SHA-256 (`unsalted-sha256`) otherwise. Local digest matching (`declared_digest_local_match`) checks only non-empty, non-symlink, non-credential artifact files of matching type beneath `--project` and never sets `digest_bound`. The project is always walked, but files are hashed only when the SBOM declares a SHA-256, within the `model-bytes` and `model-total-bytes` limits; a file larger than `model-bytes` is left unbound, warned about and listed in `scan_failures`, while any other limit reached under `--project` ends the import with exit 1. Conflicts are found by purl and by name within one ecosystem, including nested manifests collected in the same run. An unknown ecosystem is compared with every record of the same name. An exhausted comparison sample can report an unresolved conflict. Multiple type-compatible local digest matches are marked ambiguous.
 
+Nested npm and Cargo manifests use SemVer ordering for supported requirements, including prerelease eligibility. Conda comparisons cover supported numeric constraints and version prefixes. An incompatible version rules out a version-and-build pin. A compatible version leaves the build unresolved when supplier build evidence is unavailable. Package URL comparisons ignore ancillary metadata such as checksums and subpaths. Different explicit registry or qualifier evidence for the same typed package remains unresolved at the same version. Incompatible versions for that package report a conflict.
+
+The default npm and Yarn registry addresses identify the same public registry. PyPI’s
+default index and file host also agree. With `--project`, a private repository path
+can be matched to the selected npm, uv or Poetry lock record. Its recorded file digest,
+package name and version must agree. Missing, changed or symlinked lockfiles leave a
+path-specific supplier claim unresolved.
+
 ```text
 nexus-symbiote import-sbom [OPTIONS] FOREIGN_BOM_PATH
 ```
@@ -681,6 +689,7 @@ nexus-symbiote import-sbom [OPTIONS] FOREIGN_BOM_PATH
 | `-o`, `--output` `PATH` | Write the resulting native AgentBOM JSON to this file (must lie outside `--project`). |
 | `--into` `PATH` | Existing native AgentBOM to merge imported SBOM claims into. |
 | `--project` `PATH` | Trusted project root for SHA-256 local file binding, nested manifests, and shape census. |
+| `--shareable` | Produce a standalone supplier export with keyed document, entry and identity bindings. Set `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` to a secret of at least 32 characters. This mode omits supplier filenames, raw declared digests and nonnumeric version labels. It requires a standalone import without local inventory or checkout inputs. |
 | `--reveal-names` | Retain plain component names from the foreign SBOM instead of hashed names. |
 | `--walk-manifests` | Walk nested manifests below `--project`. A nested npm lock must have an applicable v2 or v3 root record and agree with the effective dependency range. Nested pnpm and Yarn locks supply no lock evidence. Go versions describe requirements and remain manifest-only even with a `go.sum`. |
 | `--census` | Count unread non-control-plane artifact shapes (`*.ipynb`, `n8n/*.json`, `*.tf`, `Chart.yaml`). |
