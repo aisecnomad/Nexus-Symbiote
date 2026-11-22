@@ -441,9 +441,9 @@ def _parse_policy_with_digest(path: Path) -> tuple[Policy, str]:
 
 DEFAULT_POLICY_YAML = """\
 # Nexus SymBiote project policy. Every key is described in docs/policy-reference.md.
-# Tightening settings apply automatically. An invalid file produces a warning and
-# leaves the governing gates in effect. --accept-project-policy requires a valid
-# file when present and accepts reviewed relaxations. --no-project-policy skips it.
+# Tightening settings apply automatically. An invalid file stops the command.
+# --accept-project-policy accepts reviewed relaxations within the operator policy.
+# --no-project-policy ignores the checkout policy.
 version: "1.0"  # quote it: an unquoted 1.0 is a number and is refused
 scan:
   # Removing a collector leaves coverage partial, which fails the gates.

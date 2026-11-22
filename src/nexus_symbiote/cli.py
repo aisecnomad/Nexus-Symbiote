@@ -186,18 +186,8 @@ _LAST_CLAMPED_SETTINGS: contextvars.ContextVar[tuple[str, ...]] = contextvars.Co
 )
 
 
-def _warn_unapplied_project_policy(root: Path, path: Path | None) -> dict[str, str]:
-    """Report a withheld policy without echoing untrusted contents."""
-    if path is None:
-        echo_line(
-            "WARNING: a project policy file in ",
-            root,
-            " was not applied because it is invalid or unsafe to read. "
-            "Pass --accept-project-policy to require a valid policy and see the error, "
-            "or --no-project-policy to ignore it explicitly.",
-            err=True,
-        )
-        return {"reason": "invalid-or-ambiguous"}
+def _warn_unapplied_project_policy(path: Path) -> dict[str, str]:
+    """Report a withheld relaxation without echoing untrusted contents."""
     echo_line(
         "WARNING: project policy ",
         path,
@@ -226,7 +216,6 @@ def _policy_with_source(
     from nexus_symbiote.operator_policy import narrow_policy
     from nexus_symbiote.policy import (
         PolicyError,
-        PolicyListingError,
         default_policy,
         load_policy_file,
         weakened_settings,
@@ -245,12 +234,8 @@ def _policy_with_source(
         return baseline, source, baseline_weaker, None
     try:
         loaded = load_policy_file(root)
-    except PolicyListingError as exc:
-        raise _failure(exc) from exc
     except PolicyError as exc:
-        if allow_weakening:
-            raise _failure(exc) from exc
-        return baseline, source, baseline_weaker, _warn_unapplied_project_policy(root, None)
+        raise _failure(exc) from exc
     if loaded is None:
         return baseline, source, baseline_weaker, None
     project, path, _ = loaded
@@ -260,7 +245,7 @@ def _policy_with_source(
         narrowed, clamped = narrow_policy(baseline, project, inherit_unspecified=True)
         if not allow_weakening and (clamped or not has_operator):
             if narrowed == baseline:
-                return baseline, source, baseline_weaker, _warn_unapplied_project_policy(root, path)
+                return baseline, source, baseline_weaker, _warn_unapplied_project_policy(path)
             _LAST_CLAMPED_SETTINGS.set(tuple(clamped))
             echo_line(
                 "WARNING: project policy ",
@@ -589,6 +574,10 @@ def _get_scanners() -> dict[str, type]:
     return SCANNER_REGISTRY
 
 
+_ACCEPT_PROJECT_POLICY_HELP = (
+    "Accept checkout settings that relax a gate. Tightening settings apply automatically, "
+    "including in mixed policies. Operator policy always sets the minimum."
+)
 DETAILED_EXIT_KEY = "nexus_symbiote.detailed_exit_codes"
 _MODE_FLAGS = frozenset({"--offline", "--live"})
 # Click 8.2+ shows a group's own help, which carries no input, through this error.
@@ -1026,11 +1015,7 @@ def _render_aibom(
 @click.option(
     "--accept-project-policy",
     is_flag=True,
-    help=(
-        "Accept a checkout policy that relaxes a gate. Tightening-only policies apply "
-        "automatically. A policy that includes a relaxation is withheld as a unit "
-        "unless accepted. Operator policy always sets the minimum."
-    ),
+    help=_ACCEPT_PROJECT_POLICY_HELP,
 )
 @click.option(
     "--fail-on-unsigned-discovery",
@@ -1799,11 +1784,7 @@ def verify_discovery(
 @click.option(
     "--accept-project-policy",
     is_flag=True,
-    help=(
-        "Accept a checkout policy that relaxes a gate. Tightening-only policies apply "
-        "automatically. A policy that includes a relaxation is withheld as a unit "
-        "unless accepted. Operator policy always sets the minimum."
-    ),
+    help=_ACCEPT_PROJECT_POLICY_HELP,
 )
 @click.option(
     "--skip-integrity",
@@ -2042,11 +2023,7 @@ def validate(
 @click.option(
     "--accept-project-policy",
     is_flag=True,
-    help=(
-        "Accept a checkout policy that relaxes a gate. Tightening-only policies apply "
-        "automatically. A policy that includes a relaxation is withheld as a unit "
-        "unless accepted. Operator policy always sets the minimum."
-    ),
+    help=_ACCEPT_PROJECT_POLICY_HELP,
 )
 @click.option(
     "--require-discovery-signature",

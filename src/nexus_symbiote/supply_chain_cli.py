@@ -339,8 +339,8 @@ def register_supply_chain_commands(main: click.Group) -> None:
         "--accept-project-policy",
         is_flag=True,
         help=(
-            "Accept a checkout policy that relaxes collection gates. Tightening-only policies "
-            "apply automatically. The built-in gates still check the staged inventory."
+            "Accept checkout settings that relax collection gates. Tightening settings apply "
+            "automatically, including in mixed policies. The built-in gates still check the staged inventory."
         ),
     )
     @click.option(
