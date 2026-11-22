@@ -214,7 +214,7 @@ def test_coexisting_case_variants_fail_closed_for_claude_and_prompts(tmp_path: P
     probe = tmp_path / "CaseProbe"
     probe.mkdir()
     if (tmp_path / "caseprobe").exists():
-        pytest.skip("requires case-sensitive filesystem")
+        pytest.skip("needs a case-sensitive file system to hold both spellings")
 
     (tmp_path / ".claude").mkdir()
     (tmp_path / ".claude" / "settings.json").write_text('{"permissions": {}}', encoding="utf-8")
@@ -238,7 +238,7 @@ def test_coexisting_case_variant_respects_variants_read(tmp_path: Path) -> None:
     probe = tmp_path / "CaseProbe"
     probe.mkdir()
     if (tmp_path / "caseprobe").exists():
-        pytest.skip("requires case-sensitive filesystem")
+        pytest.skip("needs a case-sensitive file system to hold both spellings")
 
     (tmp_path / "codex.md").write_text("# a\n", encoding="utf-8")
     (tmp_path / "CODEX.md").write_text("# b\n", encoding="utf-8")
