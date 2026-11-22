@@ -108,7 +108,8 @@ _SUMMARY_KEYS = _tup(
 )
 _MAX_BRIDGE_DEPTH = 4
 _SPLIT_SEPARATORS = _words("&& || ; | & ( )") | frozenset({"\n"})
-_REDIR_OPERATORS = _words("> >> < << <<< >& <& &> 2>")
+_REDIR_OP_RE = re.compile(r"^(?:[0-9]+)?(?:>>?|<<?<?|>&|<&|&>>?|>\||<>)$")
+_SELF_CONTAINED_REDIR_RE = re.compile(r"^(?:[0-9]+)?(?:>&|<&)(?:[0-9]+|-)$")
 
 _EGRESS_RE = re.compile(
     r"\b(?:curl|wget|nc|ncat|axios\.|requests\.(?:get|post|put|request)|httpx\.|urllib\.request)\b"
@@ -130,8 +131,10 @@ _HEX_40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _ON_KEY_RE = re.compile(r"(?m)^([ \t]*)on([ \t]*:)")
 _PROJECT_DIR_RE = re.compile(r"^(?:\$\{?CLAUDE_PROJECT_DIR\}?|\$\{workspace(?:Folder|Root)\})/")
 _STEERING_ROOT_VAR_RE = re.compile(
-    r"^(?:\$\{?(?:CLAUDE_PROJECT_DIR|PWD)\}?|\$\{workspace(?:Folder|Root)\})(?:/(.*))?$"
+    r"^(?:\$\{(?:CLAUDE_PROJECT_DIR|PWD|workspaceFolder|workspaceRoot)(?::?[-=+][^}]*)?\}|"
+    r"\$(?:CLAUDE_PROJECT_DIR|PWD))(?:/(.*))?$"
 )
+_UNRESOLVED_VAR_RE = re.compile(r"\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*")
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _VERSIONED_PYTHON_RE = re.compile(r"^python[0-9]+(?:\.[0-9]+)?$")
 # A bare Node import can name a package and subpath. Relative paths, schemes,
@@ -466,21 +469,30 @@ def _package_runner_target(
 def _split_token_segments(tokens: list[str]) -> list[list[str]]:
     segments: list[list[str]] = []
     current: list[str] = []
-    skip_redir_target = False
-    for tok in tokens:
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
         if tok in _SPLIT_SEPARATORS:
             if current:
                 segments.append(current)
                 current = []
-            skip_redir_target = False
+            idx += 1
             continue
-        if skip_redir_target:
-            skip_redir_target = False
+        if _SELF_CONTAINED_REDIR_RE.match(tok):
+            idx += 1
             continue
-        if tok in _REDIR_OPERATORS:
-            skip_redir_target = True
+        if tok.isdigit() and idx + 1 < len(tokens) and _REDIR_OP_RE.match(tokens[idx + 1]):
+            idx += 2
+            if idx < len(tokens) and tokens[idx] not in _SPLIT_SEPARATORS:
+                idx += 1
+            continue
+        if _REDIR_OP_RE.match(tok):
+            idx += 1
+            if idx < len(tokens) and tokens[idx] not in _SPLIT_SEPARATORS:
+                idx += 1
             continue
         current.append(tok)
+        idx += 1
     if current:
         segments.append(current)
     return segments
@@ -520,6 +532,65 @@ def _split_shlex_safe(text: str) -> list[str]:
         return text.split()
 
 
+def _unwrap_env_tokens(cur: list[str]) -> list[str]:
+    """Strip GNU/POSIX ``env`` options (including attached/bundled ``-S``, ``-u``, ``-C``) and assignments."""
+    idx = 1
+    split_extra: list[str] = []
+    while idx < len(cur):
+        arg = cur[idx]
+        if arg == "--":
+            idx += 1
+            break
+        if arg in {"-S", "--split-string"} and idx + 1 < len(cur):
+            split_extra = _split_shlex_safe(cur[idx + 1])
+            idx += 2
+            break
+        if arg.startswith("--split-string="):
+            split_extra = _split_shlex_safe(arg.split("=", 1)[1])
+            idx += 1
+            break
+        if arg in {"-u", "--unset", "-C", "--chdir"} and idx + 1 < len(cur):
+            idx += 2
+            continue
+        if arg.startswith(("--unset=", "--chdir=")):
+            idx += 1
+            continue
+        if arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
+            pos = 1
+            handled = False
+            while pos < len(arg):
+                flag = arg[pos]
+                if flag in {"i", "0", "v"}:
+                    pos += 1
+                    continue
+                if flag == "S":
+                    rest = arg[pos + 1 :]
+                    if rest:
+                        split_extra = _split_shlex_safe(rest)
+                        idx += 1
+                    elif idx + 1 < len(cur):
+                        split_extra = _split_shlex_safe(cur[idx + 1])
+                        idx += 2
+                    else:
+                        idx += 1
+                    return split_extra + cur[idx:]
+                if flag in {"u", "C"}:
+                    rest = arg[pos + 1 :]
+                    idx += 1 if rest else (2 if idx + 1 < len(cur) else 1)
+                    handled = True
+                    break
+                break
+            if handled or pos == len(arg):
+                continue
+            idx += 1
+            continue
+        if arg.startswith("-") or _ENV_ASSIGN_RE.match(arg):
+            idx += 1
+            continue
+        break
+    return split_extra + cur[idx:]
+
+
 def _unwrap_command_tokens(tokens: list[str]) -> list[str]:
     """Strip leading shell assignments and standard OS command wrappers (never local paths)."""
     cur = list(tokens)
@@ -533,29 +604,7 @@ def _unwrap_command_tokens(tokens: list[str]) -> list[str]:
             return cur
         base = first.rsplit("/", 1)[-1]
         if base == "env":
-            idx = 1
-            split_extra: list[str] = []
-            while idx < len(cur):
-                arg = cur[idx]
-                if arg == "--":
-                    idx += 1
-                    break
-                if arg in {"-S", "--split-string"} and idx + 1 < len(cur):
-                    split_extra = _split_shlex_safe(cur[idx + 1])
-                    idx += 2
-                    break
-                if arg.startswith("--split-string="):
-                    split_extra = _split_shlex_safe(arg.split("=", 1)[1])
-                    idx += 1
-                    break
-                if arg in {"-u", "--unset", "-C", "--chdir"} and idx + 1 < len(cur):
-                    idx += 2
-                    continue
-                if arg.startswith("-") or _ENV_ASSIGN_RE.match(arg):
-                    idx += 1
-                    continue
-                break
-            cur = split_extra + cur[idx:]
+            cur = _unwrap_env_tokens(cur)
             continue
         spec = _SIMPLE_WRAPPERS.get(base)
         if spec is None:
@@ -1005,6 +1054,15 @@ def _find_bridge_package(tokens: list[str]) -> tuple[str, int] | None:
     return None
 
 
+def _is_http_url(url: str) -> bool:
+    return url.lower().startswith(("http://", "https://"))
+
+
+def _insecure_http_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    return parsed.scheme.lower() == "http" or "@" in parsed.netloc
+
+
 def _audit_mcp_server(
     files: ConfinedCollection,
     checkout: _CheckoutScripts,
@@ -1042,7 +1100,7 @@ def _audit_mcp_server(
         config_arg: str | None = None
         for j in range(b_idx + 1, len(tokens)):
             tok = tokens[j]
-            if tok.startswith(("http://", "https://")) and endpoint_url is None:
+            if _is_http_url(tok) and endpoint_url is None:
                 endpoint_url = tok
             elif tok == "--config" and j + 1 < len(tokens):
                 config_arg = tokens[j + 1]
@@ -1115,7 +1173,7 @@ def _audit_mcp_server(
                 cfg_path,
                 srv_name,
             )
-            if endpoint_url.startswith("http://") or "@" in endpoint_url.split("//", 1)[-1]:
+            if _insecure_http_url(endpoint_url):
                 summary.flag(
                     "transport_security",
                     RiskSeverity.HIGH,
@@ -1160,13 +1218,12 @@ def _audit_mcp_server(
         (
             str(srv_cfg[k]).strip()
             for k in ("url", "serverUrl", "httpUrl")
-            if isinstance(srv_cfg.get(k), str)
-            and str(srv_cfg[k]).strip().startswith(("http://", "https://"))
+            if isinstance(srv_cfg.get(k), str) and _is_http_url(str(srv_cfg[k]).strip())
         ),
         None,
     )
     if not cmd and direct_url is not None:
-        if direct_url.startswith("http://") or "@" in direct_url.split("//", 1)[-1]:
+        if _insecure_http_url(direct_url):
             summary.flag(
                 "transport_security",
                 RiskSeverity.HIGH,
@@ -1515,6 +1572,15 @@ def _inspect_steering_surfaces(
             # launcher text is not an access-control decision by a filesystem.
             r_arg = raw_root.removesuffix(":ro")
             if not _covers_steering_path(r_arg, project_roots, files=files):
+                normalized_root = _STEERING_ROOT_VAR_RE.sub(
+                    lambda match: match.group(1) or ".", r_arg.strip().strip("'\"")
+                )
+                if _UNRESOLVED_VAR_RE.search(normalized_root):
+                    _add_gap(
+                        summary.gaps,
+                        f"{cfg_path}: filesystem server '{_clean(srv_name)}' root '{_clean(r_arg)}' "
+                        "uses unresolved variable expansion",
+                    )
                 continue
             summary.steering_surfaces.append(
                 _rec(
@@ -2007,7 +2073,8 @@ def diff_control_plane_audits(
         return out
 
     base_targets = _target_map(baseline)
-    for key, curr_sha in sorted(_target_map(current).items()):
+    curr_targets = _target_map(current)
+    for key, curr_sha in sorted(curr_targets.items()):
         base_sha = base_targets.get(key)
         if base_sha is None:
             _emit(
@@ -2023,27 +2090,53 @@ def diff_control_plane_audits(
                 f"agent-control:{key}",
                 f"Launch target '{key}' digest changed from {base_sha[:12]} to {curr_sha[:12]}.",
             )
+    for key, base_sha in sorted(base_targets.items()):
+        if key not in curr_targets:
+            _emit(
+                "launch_target_removed",
+                RiskSeverity.CRITICAL,
+                f"agent-control:{key}",
+                f"Launch target '{key}' (baseline digest {base_sha[:12]}) was removed.",
+            )
 
     def _hook_keys(s: ControlPlaneAuditSummary) -> set[tuple[str, str, str]]:
         return {(h["source_file"], h["event"], h["command_digest"]) for h in s.hook_commands}
 
-    for src, event, digest in sorted(_hook_keys(current) - _hook_keys(baseline)):
+    base_hooks = _hook_keys(baseline)
+    curr_hooks = _hook_keys(current)
+    for src, event, digest in sorted(curr_hooks - base_hooks):
         _emit(
             "hook_command_changed",
             RiskSeverity.CRITICAL,
             f"hook-command:{src}:{event}:{digest[:12]}",
             f"Hook command for '{event}' in {src} (digest {digest[:12]}) is not in the baseline.",
         )
+    for src, event, digest in sorted(base_hooks - curr_hooks):
+        _emit(
+            "hook_command_removed",
+            RiskSeverity.CRITICAL,
+            f"hook-command:{src}:{event}:{digest[:12]}",
+            f"Hook command for '{event}' in {src} (baseline digest {digest[:12]}) was removed.",
+        )
 
     def _preamble_keys(s: ControlPlaneAuditSummary) -> set[tuple[str, str]]:
         return {(p["skill_path"], p["command_digest"]) for p in s.skill_preambles}
 
-    for skill_path, digest in sorted(_preamble_keys(current) - _preamble_keys(baseline)):
+    base_preambles = _preamble_keys(baseline)
+    curr_preambles = _preamble_keys(current)
+    for skill_path, digest in sorted(curr_preambles - base_preambles):
         _emit(
             "skill_preamble_changed",
             RiskSeverity.CRITICAL,
             f"skill-preamble:{skill_path}:{digest[:12]}",
             f"Skill shell preamble in {skill_path} (digest {digest[:12]}) is not in the baseline.",
+        )
+    for skill_path, digest in sorted(base_preambles - curr_preambles):
+        _emit(
+            "skill_preamble_removed",
+            RiskSeverity.CRITICAL,
+            f"skill-preamble:{skill_path}:{digest[:12]}",
+            f"Skill shell preamble in {skill_path} (baseline digest {digest[:12]}) was removed.",
         )
 
     base_writable = {s["server_name"] for s in baseline.steering_surfaces if s.get("writable")}
