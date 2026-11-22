@@ -8,6 +8,7 @@ import json
 import posixpath
 import re
 import shlex
+import weakref
 from bisect import bisect_left, bisect_right
 from collections import deque
 from dataclasses import dataclass, field
@@ -115,6 +116,7 @@ _MAX_BRIDGE_DEPTH = 4
 _MAX_BRIDGE_EXPANSIONS = 64  # per top-level server declaration
 _MAX_SYMLINK_HOPS = 8
 _MAX_STEERING_COMPONENTS = 256
+_STEERING_STEPS: weakref.WeakKeyDictionary[ConfinedCollection, int] = weakref.WeakKeyDictionary()
 _SPLIT_SEPARATORS = _words("&& || ; | & ( )") | frozenset({"\n"})
 _SPLIT_CHAR_SET = frozenset(";|&()\n")
 _REDIR_OP_RE = re.compile(r"^(?:[0-9]+)?(?:>>?|<<?<?|>&|<&|&>>?|>\||<>)$")
@@ -1630,14 +1632,9 @@ def _is_steering_rel(rel: str) -> bool:
 def _resolve_steering_symlinks(
     raw_rel: str, files: ConfinedCollection, unresolved: list[str] | None = None
 ) -> bool:
-    """Walk ``raw_rel`` component-by-component, resolving in-root symlinks before ``..``.
-
-    Each step inspects the prefix walked so far, so the walk is bounded by component
-    count: every collection lookup costs the prefix's length, and an unbounded root would
-    cost quadratic time. A root that exceeds the bound, or that enters a directory the
-    collection excludes (whose symlinks are never resolved), is reported through
-    ``unresolved`` and returns ``False`` so the caller records a coverage gap.
-    """
+    """Walk ``raw_rel`` resolving in-root symlinks before ``..``; a lookup costs the prefix's
+    length, so steps are bounded per root and per audit, and what cannot be resolved is
+    reported through ``unresolved`` with ``False``, for the caller's coverage gap."""
     queue: deque[str] = deque(seg for seg in raw_rel.split("/") if seg and seg != ".")
     resolved: list[str] = []
     above = 0
@@ -1645,9 +1642,12 @@ def _resolve_steering_symlinks(
     steps = 0
     while queue:
         steps += 1
-        if steps > _MAX_STEERING_COMPONENTS:
+        _STEERING_STEPS[files] = spent = _STEERING_STEPS.get(files, 0) + 1
+        if steps > _MAX_STEERING_COMPONENTS or spent > 16 * _MAX_STEERING_COMPONENTS:
             if unresolved is not None:
-                unresolved.append(f"more than {_MAX_STEERING_COMPONENTS} path components")
+                unresolved.append(
+                    f"more than {_MAX_STEERING_COMPONENTS} path components, or the audit's steering lookups are spent"
+                )
             return False
         seg = queue.popleft()
         if seg == "..":
@@ -1702,6 +1702,10 @@ def _resolve_steering_symlinks(
         if files.path_identity(candidate) is not None:
             # Symlink refused by ConfinedCollection (escapes root, loops, or points to root).
             return True
+        if steps + len(queue) <= _MAX_STEERING_COMPONENTS:
+            # Nothing below a missing component can be a link, so the rest is read lexically.
+            rest = posixpath.normpath("/".join([*resolved, seg, *queue]))
+            return rest == "." or (rest.split("/")[0] != ".." and _is_steering_rel(rest))
         resolved.append(seg)
     if above > 0:
         return False
@@ -1980,7 +1984,10 @@ def _inspect_steering_surfaces(
             if not a.startswith("-")
             and "server-filesystem" not in a
             and a not in {"-y", "npx", "uvx"}
-        ] or ["."]
+        ]
+        # A runtime launcher's first operand is the server's script, not a root.
+        base = cmd.rsplit("/", 1)[-1]
+        roots = roots[base not in PACKAGE_RUNNERS and _is_runtime_launcher(base) :] or ["."]
         for raw_root in roots:
             # MCP stdio has no standard readOnly field or CLI switch. Positional
             # launcher text is not an access-control decision by a filesystem.

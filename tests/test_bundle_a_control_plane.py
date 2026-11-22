@@ -1063,3 +1063,66 @@ def test_dangerous_env_values_that_are_not_scripts_are_not_preloads(tmp_path: Pa
     assert {ht["target_path"] for ht in summary.hook_targets} == {"hook.sh"}
     assert not any(g.startswith("src:") for g in summary.gaps)
     assert any("environment override 'NODE_PATH'" in g for g in summary.gaps)
+
+
+def test_many_deep_steering_roots_share_one_audit_budget(tmp_path: Path) -> None:
+    """Distinct roots through real deep directories cannot multiply the per-root bound."""
+    _write_bypass_settings(tmp_path)
+    deep = tmp_path.joinpath(*["a"] * 250)
+    deep.mkdir(parents=True)
+
+    def run(scale: int) -> None:
+        roots = [f"./{'a/' * 250}r{i}" for i in range(50 * scale)]
+        _write_json(
+            tmp_path / ".mcp.json",
+            {
+                "mcpServers": {
+                    "filesystem": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-filesystem", *roots],
+                    }
+                }
+            },
+        )
+        summary = audit_project_control_plane(tmp_path)
+        assert any("steering lookups are spent" in gap for gap in summary.gaps)
+
+    assert scaling_ratio(run) < 10
+
+
+def test_a_missing_component_ends_the_walk_and_the_rest_is_read_lexically(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".claude").mkdir()
+    _write_bypass_settings(tmp_path)
+    for root, steering in (
+        ("./missing/../.claude", True),
+        ("./missing/x/../../CLAUDE.md", True),
+        ("./missing/" + "b/" * 300, False),
+        ("./missing/../..", True),
+        ("./missing/../docs", False),
+    ):
+        _write_filesystem_server(tmp_path, root)
+        summary = audit_project_control_plane(tmp_path)
+        assert bool(summary.steering_surfaces) is steering, root
+
+
+def test_a_launcher_script_under_an_excluded_directory_is_not_a_root(tmp_path: Path) -> None:
+    _write_bypass_settings(tmp_path)
+    script = tmp_path / "node_modules/fs-server/index.js"
+    script.parent.mkdir(parents=True)
+    script.write_text("// server\n", encoding="utf-8")
+    _write_json(
+        tmp_path / ".mcp.json",
+        {
+            "mcpServers": {
+                "filesystem": {
+                    "command": "node",
+                    "args": ["node_modules/fs-server/index.js", "/data"],
+                }
+            }
+        },
+    )
+    summary = audit_project_control_plane(tmp_path)
+    assert not any("below an excluded directory" in gap for gap in summary.gaps)
+    assert not any("index.js" in str(surface) for surface in summary.steering_surfaces)
