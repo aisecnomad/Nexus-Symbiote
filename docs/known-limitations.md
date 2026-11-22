@@ -1323,8 +1323,9 @@ A way around a limit that its entry does not describe is worth a
   command name, is medium (except PowerShell's encoded-command flags after a variable or
   glob in command position). With no PowerShell name hint, `-enc` or a longer
   prefix of `-EncodedCommand` is critical. The shorter `-e`, `-ec` and `-en`
-  forms require a base64 operand that decodes to printable UTF-16LE text with a
-  byte-order mark or an ASCII character. Tabs and line endings are accepted.
+  forms require a base64 operand with recognizable UTF-16LE text structure.
+  Evidence includes a byte-order mark with content, a quoted string, a
+  command-like prefix, or sufficient ASCII text.
   `$GREP -e Makefile`, `$SED -En` and `$SHELL -ec 'true'` stay medium, as
   is a downloader given a host without a scheme or a path,
   such as `curl evil.example`. A command given to `su -c` or `script -c` as one quoted

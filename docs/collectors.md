@@ -51,8 +51,9 @@ TypeScript forms in full.
 A hook can select PowerShell through a variable or glob. When the program name
 offers no PowerShell hint, `-enc` and longer prefixes of `-EncodedCommand` are
 critical. The shorter `-e`, `-ec` and `-en` forms require a base64 operand that
-decodes to printable UTF-16LE text with a byte-order mark or an ASCII character.
-Tabs and line endings are accepted. Ordinary search arguments such as
+has recognizable UTF-16LE text structure. Evidence includes a byte-order mark
+with content, a quoted string, a command-like prefix, or sufficient ASCII text.
+Ordinary search arguments such as
 `$GREP -e Makefile` and a value computed by the shell stay medium.
 
 Shell assignment prefixes end at the first command word. After a wrapper such
