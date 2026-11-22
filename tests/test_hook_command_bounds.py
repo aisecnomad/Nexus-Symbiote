@@ -33,10 +33,12 @@ def test_obfuscated_download_pipelines_scale_linearly() -> None:
 
 
 # Re-review of #242, round 8: walking an interpreter's option bundle copied the rest of
-# the word for each letter, which took about a minute for one 1.6 MB option word. A
-# quarter of that size still quadruples between the two runs, and keeps the larger one
-# clear of the per-test time limit under coverage tracing on a shared runner, where the
-# 1.6 MB word took 146 s of 240 s in one run and passed the limit in another.
+# the word for each letter, which took about a minute for one 1.6 MB option word. The
+# word stays this long: at a quarter of the size the per-letter loop outweighs the copy,
+# and a reintroduced copy measured 7.6 against the bound of 10. Under coverage tracing
+# on a shared runner the larger size took 146 s of the coverage job's 240 s limit in one
+# run and passed it in two, so this test carries its own limit.
+@pytest.mark.timeout(600)
 @pytest.mark.parametrize(
     "shape",
     ["curl x | python3 -{} ", "curl x | perl -{} ", "curl x > a && python3 -{} a"],
@@ -45,7 +47,7 @@ def test_a_long_option_bundle_scales_linearly(shape: str) -> None:
     letter = "w" if "perl" in shape else "u"
 
     def run(scale: int) -> None:
-        command = shape.format(letter * (100_000 * scale))
+        command = shape.format(letter * (400_000 * scale))
         assert _command_severity(command) is RiskSeverity.CRITICAL
 
     assert scaling_ratio(run) < 10
