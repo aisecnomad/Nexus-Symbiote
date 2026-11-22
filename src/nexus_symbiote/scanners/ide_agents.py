@@ -1019,9 +1019,9 @@ def _redirections(segment: str, spans: list[tuple[int, int]]) -> list[str]:
         elif gap.endswith(">"):
             mark = ">"
         else:
-            # `>|` leaves `|` as a word, and its target may follow after a space.
+            # `>|`, `>&`, and `<&` leave `|` or `&` as a word, and their target may follow after a space.
             mark = "" if gap else continued
-        continued = mark if word == "|" else ""
+        continued = mark if word in {"|", "&"} else ""
         if not mark and segment.startswith(("<", ">"), end) and (word.isdigit() or word == "&"):
             mark = "&"
         marks.append(mark)
@@ -1413,83 +1413,139 @@ def _option_command(words: list[str], index: int, runner: str) -> int | None:
     return None
 
 
+def _filtered_command_words(
+    words: list[str], marks: list[str], *, skip_inputs: bool
+) -> tuple[list[str], list[int]]:
+    """Return command words and original indices with non-blocking redirections removed."""
+    filtered: list[str] = []
+    indices: list[int] = []
+    pos = 0
+    count = len(words)
+    while pos < count:
+        mark = marks[pos]
+        if mark == ">":
+            pos += 1
+            continue
+        if mark == "<":
+            if skip_inputs or words[pos] == "&0":
+                pos += 1
+                continue
+            if (
+                words[pos] == "&"
+                and pos + 1 < count
+                and marks[pos + 1] == "<"
+                and words[pos + 1] == "0"
+            ):
+                pos += 2
+                continue
+        if mark == "&" and pos + 1 < count:
+            nxt = marks[pos + 1]
+            if nxt == ">":
+                pos += 2
+                continue
+            if nxt == "<":
+                is_nonzero_fd = words[pos].isdigit() and words[pos].lstrip("0") != ""
+                is_zero_fd = words[pos].isdigit() and words[pos].lstrip("0") == ""
+                if skip_inputs or is_nonzero_fd:
+                    if words[pos + 1] == "&" and pos + 2 < count and marks[pos + 2] == "<":
+                        pos += 3
+                    else:
+                        pos += 2
+                    continue
+                if is_zero_fd and words[pos + 1] == "&0":
+                    pos += 2
+                    continue
+                if (
+                    is_zero_fd
+                    and words[pos + 1] == "&"
+                    and pos + 2 < count
+                    and marks[pos + 2] == "<"
+                    and words[pos + 2] == "0"
+                ):
+                    pos += 3
+                    continue
+        filtered.append(words[pos])
+        indices.append(pos)
+        pos += 1
+    return filtered, indices
+
+
 def _executable_index(
     words: list[str], marks: list[str] | None = None, *, skip_inputs: bool = False
 ) -> int | None:
     """Index of the command `words` run, after wrappers and grouping. None if not run."""
+    orig_indices: list[int] | None = None
+    active = words
+    if marks is not None:
+        active, orig_indices = _filtered_command_words(words, marks, skip_inputs=skip_inputs)
     index = 0
-    while index < len(words):
-        if marks is not None:
-            mark = marks[index]
-            if mark == ">" or (skip_inputs and mark == "<"):
-                index += 1
-                continue
-            if (
-                mark == "&"
-                and index + 1 < len(marks)
-                and (marks[index + 1] == ">" or (skip_inputs and marks[index + 1] == "<"))
-            ):
-                index += 2
-                continue
-        raw = _decode_word(words[index], drop_ifs=True).strip()
-        if raw in {"(", "{", ")", "}"} or words[index] == "!":
+    while index < len(active):
+        raw = _decode_word(active[index], drop_ifs=True).strip()
+        if raw in {"(", "{", ")", "}"} or active[index] == "!":
             index += 1
             continue
-        if words[index] == "time" and (
-            index + 1 == len(words)
-            or words[index + 1] == "-p"
-            or not words[index + 1].startswith("-")
+        if active[index] == "time" and (
+            index + 1 == len(active)
+            or active[index + 1] == "-p"
+            or not active[index + 1].startswith("-")
         ):
             index += 1
-            if index < len(words) and words[index] == "-p":
+            if index < len(active) and active[index] == "-p":
                 index += 1
             continue
         # bash reads a word as an assignment only when its name is unquoted and valid;
         # `1=/bin/sh`, `a.b=/bin/sh` and `"X"=/bin/sh` are commands, run by path.
-        if _SHELL_ASSIGNMENT.match(words[index]):
-            index = _assignment_end(words, index)
+        if _SHELL_ASSIGNMENT.match(active[index]):
+            index = _assignment_end(active, index)
             continue
         break
 
     # A wrapper consumes a program from its own argv. Shell assignment syntax
     # does not apply again after that command word.
-    while index < len(words):
-        names = _name_variants(words[index])
+    while index < len(active):
+        names = _name_variants(active[index])
         if "env" in names:
-            index = _skip_env(words, index + 1)
+            index = _skip_env(active, index + 1)
             continue
         wrapper = next(iter(names & _WRAPPERS.keys()), None)
         if wrapper is not None:
-            index = _skip_wrapper(words, index + 1, wrapper)
+            index = _skip_wrapper(active, index + 1, wrapper)
             continue
         if names & {"sudo", "doas"}:
-            index = _skip_sudo(words, index + 1, assignments="sudo" in names)
+            index = _skip_sudo(active, index + 1, assignments="sudo" in names)
             continue
         runner = next(iter(sorted(names & _COMMAND_OPTION_RUNNERS.keys())), None)
         if runner is not None:
-            found = _option_command(words, index + 1, runner)
+            found = _option_command(active, index + 1, runner)
             if found is None:
-                return index
+                break
             index = found
             continue
         if "command" in names:
             nxt = index + 1
-            if nxt < len(words) and _decode_word(words[nxt], drop_ifs=True) in {"-v", "-V"}:
+            if nxt < len(active) and _decode_word(active[nxt], drop_ifs=True) in {"-v", "-V"}:
                 return None
-            while nxt < len(words) and _decode_word(words[nxt], drop_ifs=True) in {"-p", "--"}:
+            while nxt < len(active) and _decode_word(active[nxt], drop_ifs=True) in {"-p", "--"}:
                 nxt += 1
             index = nxt
             continue
         if "exec" in names:
-            index = _skip_exec(words, index + 1)
+            index = _skip_exec(active, index + 1)
             continue
         if "busybox" in names:
             index += 1
-            if index < len(words) and _decode_word(words[index], drop_ifs=True) == "--":
+            if index < len(active) and _decode_word(active[index], drop_ifs=True) == "--":
                 index += 1
             continue
+        break
+    else:
+        return None
+    if orig_indices is None:
         return index
-    return None
+    orig = orig_indices[index]
+    if active[index] != words[orig]:
+        words[orig] = active[index]
+    return orig
 
 
 # Interpreters that run a program read from standard input when given no script: the
