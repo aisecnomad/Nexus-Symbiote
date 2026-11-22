@@ -18,7 +18,6 @@ import os
 import re
 import string
 import tempfile
-import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -522,35 +521,59 @@ def test_any_content_in_a_collected_file_yields_an_inventory_not_a_crash(name, d
 
 
 NESTING = 1_000
+
+
+def _nested_input(name: str, depth: int) -> str:
+    return {
+        "requirements.txt": (
+            "torch; " + "(" * depth + 'python_version >= "3"' + ")" * depth + "\nopenai==1.0\n"
+        ),
+        ".mcp.json": '{"mcpServers": ' + '{"a": ' * depth + "1" + "}" * depth + "}",
+        "package.json": '{"dependencies": ' + "[" * depth + "]" * depth + "}",
+        "pyproject.toml": (
+            "[project]\nname = 'x'\nversion = '1'\ndependencies = ["
+            + "[" * depth
+            + "]" * depth
+            + "]\n"
+        ),
+        ".well-known/agent.json": "[" * depth + "]" * depth,
+        "rag_config.json": '{"vector_store": ' + "[" * depth + "]" * depth + "}",
+    }[name]
+
+
 NESTED_INPUTS = {
-    "requirements.txt": (
-        "torch; " + "(" * NESTING + 'python_version >= "3"' + ")" * NESTING + "\nopenai==1.0\n"
-    ),
-    ".mcp.json": '{"mcpServers": ' + '{"a": ' * NESTING + "1" + "}" * NESTING + "}",
-    "package.json": '{"dependencies": ' + "[" * NESTING + "]" * NESTING + "}",
-    "pyproject.toml": (
-        "[project]\nname = 'x'\nversion = '1'\ndependencies = ["
-        + "[" * NESTING
-        + "]" * NESTING
-        + "]\n"
-    ),
-    ".well-known/agent.json": "[" * NESTING + "]" * NESTING,
-    "rag_config.json": '{"vector_store": ' + "[" * NESTING + "]" * NESTING + "}",
+    name: _nested_input(name, NESTING)
+    for name in (
+        "requirements.txt",
+        ".mcp.json",
+        "package.json",
+        "pyproject.toml",
+        ".well-known/agent.json",
+        "rag_config.json",
+    )
 }
 
 
 @pytest.mark.parametrize("name", sorted(NESTED_INPUTS))
 def test_deeply_nested_input_fails_closed_in_bounded_time(tmp_path, name):
-    path = tmp_path / "project" / name
-    path.parent.mkdir(parents=True)
-    path.write_text(NESTED_INPUTS[name])
-    output = tmp_path / "inventory.json"
-    started = time.perf_counter()
-    result = CliRunner().invoke(
-        main, ["scan", str(tmp_path / "project"), "--report-only", "-f", "json", "-o", str(output)]
-    )
-    assert time.perf_counter() - started < 30
+    cases = {}
+    for scale in (1, 4):
+        project = tmp_path / f"scale_{scale}" / "project"
+        path = project / name
+        path.parent.mkdir(parents=True)
+        path.write_text(_nested_input(name, (NESTING // 4) * scale))
+        cases[scale] = (project, tmp_path / f"scale_{scale}" / "inventory.json")
+
+    def run(scale: int):
+        project, output = cases[scale]
+        return CliRunner().invoke(
+            main, ["scan", str(project), "--report-only", "-f", "json", "-o", str(output)]
+        )
+
+    result = run(4)
     assert_no_crash(result)
+    assert scaling_ratio(run) < 10
+    output = cases[4][1]
     if not output.exists():
         assert result.exit_code != 0
         return

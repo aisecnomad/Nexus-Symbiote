@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 import tracemalloc
 from datetime import UTC, datetime
 from pathlib import Path
@@ -577,23 +576,29 @@ def test_tool_shadowing_detects_camelcase_zwsp_and_homoglyphs() -> None:
 
 def test_trifecta_linear_time_on_large_tool_set_and_agent_graphs() -> None:
     """2,000+2,000 tools, a 2,000-agent cycle, and an alternating-gate chain stay linear."""
-    tools = [
-        ToolComponent(bom_ref=f"tool:priv-{i}", name=f"read_secret_{i}") for i in range(2000)
-    ] + [
-        ToolComponent(
-            bom_ref=f"tool:sink-{i}",
-            name=f"send_report_{i}",
-            capabilities=CapabilityDeclaration(
-                capabilities=[CapabilityClass.NETWORK],
-                egress_domains=["reports.example.org"],
-            ),
+    tool_boms = {
+        scale: AIBOM(
+            components=[
+                ToolComponent(bom_ref=f"tool:priv-{i}", name=f"read_secret_{i}")
+                for i in range(500 * scale)
+            ]
+            + [
+                ToolComponent(
+                    bom_ref=f"tool:sink-{i}",
+                    name=f"send_report_{i}",
+                    capabilities=CapabilityDeclaration(
+                        capabilities=[CapabilityClass.NETWORK],
+                        egress_domains=["reports.example.org"],
+                    ),
+                )
+                for i in range(500 * scale)
+            ]
         )
-        for i in range(2000)
-    ]
-    t0 = time.perf_counter()
-    report_tools = analyze_trifecta(AIBOM(components=tools))
-    assert time.perf_counter() - t0 < 2.0
+        for scale in (1, 4)
+    }
+    report_tools = analyze_trifecta(tool_boms[4])
     assert any(f.kind == "toxic_flow" for f in report_tools.findings)
+    assert scaling_ratio(lambda scale: analyze_trifecta(tool_boms[scale])) < 10
 
     t_in = ToolComponent(bom_ref="tool:in", name="fetch_url")
     t_priv = ToolComponent(bom_ref="tool:priv", name="read_secret")
@@ -604,36 +609,43 @@ def test_trifecta_linear_time_on_large_tool_set_and_agent_graphs() -> None:
             capabilities=[CapabilityClass.NETWORK, CapabilityClass.WRITE]
         ),
     )
-    cycle_agents = [
-        AgentComponent(
-            bom_ref=f"agent:c{i}",
-            name=f"c{i}",
-            sub_agent_refs=[f"agent:c{(i + 1) % 2000}"],
-        )
-        for i in range(2000)
-    ]
-    cycle_agents[0].tool_refs = ["tool:in", "tool:priv", "tool:out"]
-    t1 = time.perf_counter()
-    report_cycle = analyze_trifecta(AIBOM(components=[*cycle_agents, t_in, t_priv, t_out]))
-    assert time.perf_counter() - t1 < 1.5
-    assert report_cycle.has_critical
 
-    chain_agents = [
-        AgentComponent(
-            bom_ref=f"agent:k{i}",
-            name=f"k{i}",
-            sub_agent_refs=[f"agent:k{i + 1}"] if i < 1999 else [],
-            capabilities=CapabilityDeclaration(
-                human_in_the_loop=HumanInTheLoop.REQUIRED if i % 2 == 0 else None
-            ),
-        )
-        for i in range(2000)
-    ]
-    chain_agents[-1].tool_refs = ["tool:in", "tool:priv", "tool:out"]
-    t2 = time.perf_counter()
-    report_chain = analyze_trifecta(AIBOM(components=[*chain_agents, t_in, t_priv, t_out]))
-    assert time.perf_counter() - t2 < 1.5
+    def _cycle_bom(count: int) -> AIBOM:
+        cycle_agents = [
+            AgentComponent(
+                bom_ref=f"agent:c{i}",
+                name=f"c{i}",
+                sub_agent_refs=[f"agent:c{(i + 1) % count}"],
+            )
+            for i in range(count)
+        ]
+        cycle_agents[0].tool_refs = ["tool:in", "tool:priv", "tool:out"]
+        return AIBOM(components=[*cycle_agents, t_in, t_priv, t_out])
+
+    cycle_boms = {scale: _cycle_bom(500 * scale) for scale in (1, 4)}
+    report_cycle = analyze_trifecta(cycle_boms[4])
+    assert report_cycle.has_critical
+    assert scaling_ratio(lambda scale: analyze_trifecta(cycle_boms[scale])) < 10
+
+    def _chain_bom(count: int) -> AIBOM:
+        chain_agents = [
+            AgentComponent(
+                bom_ref=f"agent:k{i}",
+                name=f"k{i}",
+                sub_agent_refs=[f"agent:k{i + 1}"] if i < count - 1 else [],
+                capabilities=CapabilityDeclaration(
+                    human_in_the_loop=HumanInTheLoop.REQUIRED if i % 2 == 0 else None
+                ),
+            )
+            for i in range(count)
+        ]
+        chain_agents[-1].tool_refs = ["tool:in", "tool:priv", "tool:out"]
+        return AIBOM(components=[*chain_agents, t_in, t_priv, t_out])
+
+    chain_boms = {scale: _chain_bom(500 * scale) for scale in (1, 4)}
+    report_chain = analyze_trifecta(chain_boms[4])
     assert report_chain.has_critical
+    assert scaling_ratio(lambda scale: analyze_trifecta(chain_boms[scale])) < 10
 
 
 def test_trifecta_cli_gate_and_determinism(tmp_path: Path) -> None:

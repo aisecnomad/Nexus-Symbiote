@@ -6,7 +6,6 @@ import base64
 import json
 import random
 import string
-import time
 import tracemalloc
 from pathlib import Path
 
@@ -394,25 +393,32 @@ def test_non_string_env_values_never_crash_or_leak(tmp_path, env):
 
 
 @pytest.mark.parametrize(
-    "value,literal",
+    "make_value,literal",
     [
-        ("ab:" * 3000 + "x", True),
+        (lambda scale: "ab:" * (750 * scale) + "x", True),
         # A run of one character over half the value reads as a placeholder (xxxxxxxx).
-        ("ab:" * 900 + "y" * 200_000, False),
+        (lambda scale: "ab:" * (225 * scale) + "y" * (50_000 * scale), False),
         # A value with white space is never one generic literal; it is still scrubbed.
-        ("X-A: " * 2000 + PASSWORD, False),
+        (lambda scale: "X-A: " * (500 * scale) + PASSWORD, False),
     ],
 )
 @pytest.mark.parametrize("field", ["env", "args", "headers"])
-def test_colon_chains_keep_the_server_inventoried_and_stay_fast(tmp_path, field, value, literal):
-    server: dict = {"command": "npx", "args": ["x@1.0.0"]}
-    if field == "args":
-        server["args"] = ["x@1.0.0", "--token", value]
-    else:
-        server[field] = {"API_TOKEN": value}
-    start = time.monotonic()
-    result = _scan(tmp_path, {"api": server})
-    assert time.monotonic() - start < 10
+def test_colon_chains_keep_the_server_inventoried_and_stay_fast(
+    tmp_path, field, make_value, literal
+):
+    roots = {}
+    for scale in (1, 4):
+        root = tmp_path / f"scale_{scale}"
+        root.mkdir()
+        value = make_value(scale)
+        server: dict = {"command": "npx", "args": ["x@1.0.0"]}
+        if field == "args":
+            server["args"] = ["x@1.0.0", "--token", value]
+        else:
+            server[field] = {"API_TOKEN": value}
+        _project(root, {"api": server})
+        roots[scale] = root
+    result = MCPScanner().scan(roots[4])
     findings = _findings(_servers(result)["api"])
     if literal:
         (finding,) = findings
@@ -420,6 +426,7 @@ def test_colon_chains_keep_the_server_inventoried_and_stay_fast(tmp_path, field,
     else:
         assert findings == []
     assert PASSWORD not in _dump(result)
+    assert scaling_ratio(lambda scale: MCPScanner().scan(roots[scale])) < 10
 
 
 @pytest.mark.parametrize(

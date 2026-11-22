@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 import pytest
@@ -14,23 +13,29 @@ from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.models import MAX_REFERENCE_CHARS, MCPServerComponent
 from nexus_symbiote.graph import MAX_GRAPH_ISSUES, validate_graph
 from nexus_symbiote.validators.completeness import MAX_REPORTED_ISSUES, CompletenessValidator
+from tests.support import scaling_ratio
 
 
 def test_one_long_reference_cannot_be_multiplied_into_every_graph_message():
-    hostile = MCPServerComponent(
-        bom_ref="s" * MAX_REFERENCE_CHARS,
-        name="s",
-        tool_refs=[f"t{index}" for index in range(100_000)],
-    )
-    bom = AIBOM(components=[hostile])
-    started = time.monotonic()
-    issues = validate_graph(bom)
-    assert time.monotonic() - started < 10
+    boms = {
+        scale: AIBOM(
+            components=[
+                MCPServerComponent(
+                    bom_ref="s" * MAX_REFERENCE_CHARS,
+                    name="s",
+                    tool_refs=[f"t{index}" for index in range(25_000 * scale)],
+                )
+            ]
+        )
+        for scale in (1, 4)
+    }
+    issues = validate_graph(boms[4])
     assert len(issues) == MAX_GRAPH_ISSUES + 1
     assert issues[-1] == f"{100_000 - MAX_GRAPH_ISSUES} further graph issues not shown"
     assert max(len(issue) for issue in issues) < 600
-    report = CompletenessValidator().validate(bom)
+    report = CompletenessValidator().validate(boms[4])
     assert not report.is_complete and len(report.issues) <= MAX_REPORTED_ISSUES
+    assert scaling_ratio(lambda scale: validate_graph(boms[scale])) < 10
 
 
 def _scan(project: Path, target: Path) -> None:

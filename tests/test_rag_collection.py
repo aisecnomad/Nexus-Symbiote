@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +15,7 @@ from nexus_symbiote.cli import main
 from nexus_symbiote.core.models import RAGSourceComponent
 from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV
 from nexus_symbiote.scanners.rag import SOURCE_STRUCTURE_PROFILE, RAGScanner
+from tests.support import scaling_ratio
 
 KEY = "rag-binding-key-" + "0123456789abcdef" * 2
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -631,16 +631,26 @@ def test_uri_shown_in_findings_is_neutralised(tmp_path):
 
 
 def test_shared_endpoint_origins_are_derived_once_per_file(tmp_path):
-    endpoints = [f"https://h{index}.example" for index in range(1000)]
-    config = {"endpoints": endpoints, "sources": [{} for _ in range(1000)]}
-    start = time.perf_counter()
-    components = _scan_config(tmp_path, config)
-    assert time.perf_counter() - start < 5
+    roots = {}
+    for scale in (1, 4):
+        root = tmp_path / f"scale_{scale}"
+        root.mkdir()
+        count = 250 * scale
+        config = {
+            "endpoints": [f"https://h{index}.example" for index in range(count)],
+            "sources": [{} for _ in range(count)],
+        }
+        (root / "rag_config.json").write_text(json.dumps(config), encoding="utf-8")
+        roots[scale] = root
+    components = [
+        c for c in RAGScanner().scan(roots[4]).components if isinstance(c, RAGSourceComponent)
+    ]
     assert len(components) == 1000
-    origins = sorted(endpoints)
+    origins = sorted(f"https://h{index}.example" for index in range(1000))
     assert all(c.properties["configuration_endpoint_origins"] == origins for c in components)
     shared = [c.properties["configuration_endpoint_origins"] for c in components[:2]]
     assert shared[0] is not shared[1]
+    assert scaling_ratio(lambda scale: RAGScanner().scan(roots[scale])) < 10
 
 
 @pytest.mark.parametrize(
