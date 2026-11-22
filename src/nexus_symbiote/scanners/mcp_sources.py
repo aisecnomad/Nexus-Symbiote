@@ -1143,8 +1143,10 @@ def _python_launches(tree: ast.Module, project_imports: _ProjectImports) -> list
                         if not star:
                             unused.add(alias.asname or name)
     loaders = _loader_aliases(nodes, loaders, bound_names)
+    # A local logging module in any first search root shadows the standard one:
+    # has_module() asks for one in every root, which is what a local exemption needs.
     stdlib_clear = project_imports is None or (
-        project_imports.stdlib_search_clear and not project_imports.has_module("logging")
+        project_imports.stdlib_search_clear and not project_imports.shadows("logging")
     )
     logging_module, loggers = _honest_loggers(nodes, loggers, stdlib_clear=stdlib_clear)
     annotations = _annotation_names(nodes, project_imports=project_imports)
