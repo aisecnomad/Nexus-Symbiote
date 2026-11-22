@@ -1075,6 +1075,10 @@ _PUBLIC_SCHEME_SWITCHES = _names(
     "allowhttp insecure noprofile outputformat noninteractive"
 )
 _LOWER_LONG_OPTION = re.compile(r"--[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
+# A version label belongs to a selector. After a credential binding it can
+# still be private. Option spellings exclude long opaque and padded operands.
+_MODE_LABEL = re.compile(r"(?:[A-Za-z]{2,}[0-9]{1,3}|[0-9]{8})")
+_MODE_OPTION = re.compile(r"--(?:[A-Za-z]{1,15}|[a-z]{2,}(?:[A-Z][a-z]{2,})+)")
 _SCHEME_NUMBER = re.compile(r"[+]?[0-9]+(?:[.][0-9]+)?")
 _SCHEME_ASSIGNMENT_OPERAND = re.compile(r"[A-Za-z0-9_-]+=[A-Za-z0-9_+=-]+")
 # curl's `-u user:password`, also in a cluster of short flags (`-su`), and httpie's `-a`
@@ -1193,6 +1197,14 @@ def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
         return hits
     words = name_words(name)
     if not variable and value.lower() == "token" and words and words[-1] in _PUBLIC_TOKEN_SELECTORS:
+        return hits
+    mode_option = not variable and (
+        name.lower() in {"auth", "authentication"}
+        or bool(words and words[-1] in _SCHEME_DESCRIPTORS)
+    )
+    if _MODE_OPTION.fullmatch(following):
+        return hits
+    if (mode_option or not _scheme_assignment_name(name)) and _MODE_LABEL.fullmatch(following):
         return hits
     if _scheme_operand(following):
         paired = value_hits(name, f"{value} {following}")
