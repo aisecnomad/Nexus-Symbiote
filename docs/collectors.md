@@ -21,6 +21,12 @@ An optional [`agent.yaml` manifest](agent-manifest.md) at the project root names
 
 ## MCP servers declared in source
 
+The collector treats a standard-library logger name such as
+`logging.getLogger("mcp.server.demo")` as a logging label when it can establish
+that `logging` is used only for attribute reads. Passing the module as a value,
+including a default such as `def configure(mod=logging)`, produces a coverage gap
+for that call. Other server and tool declarations in the file are still inventoried.
+
 The `mcp` collector names a server it finds in Python, TypeScript or JavaScript
 source by the name its constructor declares as a string literal, the name clients
 see: the first argument or `name=` of `FastMCP("analytics-mcp")` or `MCPServer`,
@@ -45,6 +51,9 @@ it is given. A Python server's reference stays `mcp-python:<path>:<variable>`,
 because a file binds each variable once while two servers in it can declare the same
 name. The [TypeScript inventory](typescript-inventory.md) page covers the
 TypeScript forms in full.
+
+For Python SDK imports, the collector considers both script-directory and module-launch search roots. A local framework import must resolve to a regular module in each applicable first search root before it can suppress a coverage gap. A checkout module that could supply an SDK import produces a gap. The SDK’s standard session and request types can appear directly in a Context annotation. SDK subscriptions receiving a server or agent class and unions combining SDK objects remain visible to registration analysis. Runtime changes to import paths are unverified.
+Qualified SDK module imports remain unresolved when an installed or isolated launcher can skip a checkout package. An SDK-named helper inside a regular package can be ruled out when its bounded source contains only passive definitions and cannot supply the imported name or submodule. A same-stem alternate module, an adjacent excluded bytecode cache, or a directory link beneath the package leaves the import unresolved. Common standard-library imports before the helper definition are allowed only when the applicable search roots contain no candidate that could shadow the standard library.
 
 ## Coding-agent settings
 

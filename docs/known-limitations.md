@@ -517,7 +517,8 @@ A way around a limit that its entry does not describe is worth a
   `--package=srv@1.2.3 -- srv` skips this lookup, though not the `node_modules` one.
 - **Servers started from code are gaps, not records.** Application code that starts
   or reaches a server leaves no component for it, only a gap that fails the default
-  gates: in Python, `StdioServerParameters`, `sse_client`, `streamablehttp_client` and
+  gates: in Python, `StdioServerParameters`, `stdio_client` (whatever parameters it is
+  given), `sse_client`, `streamablehttp_client`, `streamable_http_client` and
   `websocket_client` of the MCP SDK, `MCPServerStdio`, `MCPServerSse` and
   `MCPServerStreamableHttp` of the OpenAI Agents SDK, `MCPServerStdio`,
   `MCPServerSSE`, `MCPServerHTTP` and `MCPServerStreamableHTTP` of PydanticAI, and
@@ -633,7 +634,9 @@ A way around a limit that its entry does not describe is worth a
   from `mcp.server`, `mcp.server.fastmcp`, `mcp.server.fastmcp.server`, `fastmcp`,
   `fastmcp.server` or `fastmcp.server.server`, and from `MCPServer` imported from
   `mcp.server.mcpserver`. Forms the collector recognizes but cannot follow are
-  gaps: the low-level `Server`, a constructor given `tools=`, `tool_serializer=`,
+  gaps: the low-level `Server`, by any import of `mcp.server.lowlevel`, of `Server`,
+  `lowlevel` or `*` from `mcp.server`, or any attribute path to them from `mcp` or
+  `mcp.server`, a constructor given `tools=`, `tool_serializer=`,
   `providers=`, `mount=`, `lifespan=`, `middleware=`, `tool_transformations=`,
   `transforms=`, `extensions=`, `resources=`, `**` arguments, or more positional
   arguments than the name and instructions (seven for `FastMCP` from `mcp.server` or
@@ -663,7 +666,9 @@ A way around a limit that its entry does not describe is worth a
   `title`, `description`, `tags`, `annotations`, `output_schema`, `exclude_args`,
   `meta`, `structured_output`, `icons`, `enabled`, `version`, `app`, `task`,
   `timeout`, `auth` and `run_in_thread`, is an unresolved tool name gap,
-  because `fastmcp` also takes the name as `name_or_fn`. A tool given `enabled=False`
+  because `fastmcp` also takes the name as `name_or_fn`. So is a registration with any
+  other decorator below it, which hands the registration whatever function, name and
+  signature it returns. A tool given `enabled=False`
   is still inventoried.
   Besides its `tool` decorator on a module-level function, which is inventoried, a
   server may be used without a gap only in these ways: reading its `name`,
@@ -753,11 +758,15 @@ A way around a limit that its entry does not describe is worth a
   the server) passed to code the collector does not read, an SDK module object
   passed to code the collector does not read, or a context reached by reflection in a file that
   names no MCP SDK or framework, which is not read, is not seen. A type in an annotation is the whole annotation,
-  a member of a `|` union, or an argument of a generic of `typing`,
-  `typing_extensions` or `collections.abc`, such as `Optional[FastMCP]`, or of a
-  built-in generic such as `list[FastMCP]`. Any other part of an annotation, such
-  as a call or another subscript, is analyzed as code, because annotations are
-  evaluated. So is a string literal wherever `typing.get_type_hints` and the SDKs
+  a member of a `|` union whose members are all type syntax (constants, names of
+  `typing`, of builtin classes or of classes imported from an SDK or framework
+  package, and subscripts and unions of those), or an argument of a generic of
+  `typing`, `typing_extensions` or `collections.abc`, such as `Optional[FastMCP]`, of
+  a built-in generic such as `list[FastMCP]`, or of an SDK class such as
+  `Context[...]`. Any other part of an annotation, such as a call, a walrus, another
+  subscript or both members of `Context | helper.steal`, is analyzed as code,
+  because annotations are evaluated, with or without `from __future__ import
+  annotations`, and evaluating `A | B` hands each member to the other. So is a string literal wherever `typing.get_type_hints` and the SDKs
   evaluate it as a forward reference: the whole annotation, a member of a `|` union,
   an element of a tuple or list, or an argument of any subscript, since a generic
   defined anywhere turns a string argument into a forward reference. The arguments of
@@ -818,7 +827,11 @@ A way around a limit that its entry does not describe is worth a
   position, a keyword or an element of a list, tuple, set or dict argument, also
   behind `*` or `**`, so `functools.partial`, `map` and a thread target's `args` or
   `kwargs` are covered too. A call to another
-  function with such a literal is a gap as well, except `logging.getLogger`, a
+  function with such a literal is a gap as well, except `logging.getLogger` while
+  `logging` can only be the standard library's (bound only by `import logging`, read
+  only for plain attributes, none of them stored, and no star import from another
+  module, `globals`, `vars`, `setattr` or similar in the file), `getLogger` imported
+  from `logging` and bound no other way, a
   server class imported from its own module, such as `FastMCP("mcp")`, and the
   attribute name of an unshadowed `getattr` call, such as `getattr(ns, "mcp")`. A literal is a string or an
   f-string without placeholders. A dynamic import (`importlib.import_module`,
@@ -885,8 +898,15 @@ A way around a limit that its entry does not describe is worth a
   decorated with `@tool` (LangChain, CrewAI, smolagents), `@function_tool` (OpenAI
   Agents SDK) or PydanticAI's `@agent.tool` are collected by name; the descriptor is
   not. A decorated function that is not at module level, a rebound decorator, a
-  qualified import and a star import are gaps. So is a PydanticAI agent given `tools=`,
-  `toolsets=`, `builtin_tools=`, `mcp_servers=` or `*` or `**` arguments, or used
+  decorator below the registration, a qualified import and a star import are gaps. So
+  is an import from `agents`, `pydantic_ai`, `langchain_core.tools`, `langchain.tools`,
+  `crewai.tools` or `smolagents`, or a submodule of one, other than an `mcp` client
+  module, of a name the collector does not read tools from that is a submodule or
+  function, such as `from agents import tool`, or a tool or toolset class, unless it is
+  only used as a type in annotations. `tool` is also read from
+  `langchain_core.tools.convert` and `crewai.tools.base_tool`. So is a PydanticAI
+  agent given `tools=`, `toolsets=`, `builtin_tools=`, `mcp_servers=`,
+  `prepare_tools=`, `prepare_output_tools=` or `*` or `**` arguments, or used
   other than through its `tool` and `tool_plain` decorators, reading its `name`,
   calling `run`, `run_sync`, `run_stream` or `iter` and using the result anywhere,
   also inside a `try` statement, applying its `system_prompt`, `instructions` or
@@ -897,8 +917,8 @@ A way around a limit that its entry does not describe is worth a
   `with agent as alias`, and the reflection listed under **Python server forms**
   are gaps. Each agent's tools are named per agent, so two agents
   of a file can each have a tool of the same name. Class-based tools, such as
-  `BaseTool` subclasses and `StructuredTool.from_function`, are neither collected
-  nor reported.
+  `BaseTool` subclasses and `StructuredTool.from_function`, are not collected; the
+  import of the class is the gap.
 - **Tool definitions are fingerprinted only when declared or observed.** A static
   scan fingerprints the tools in a server's `tools` array, a Nexus SymBiote
   convention that MCP clients do not write. Tools in server source are recorded by
