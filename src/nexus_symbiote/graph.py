@@ -39,6 +39,7 @@ NonemptyString = Annotated[str, Field(min_length=1)]
 MANIFEST = "agent.yaml"
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_MANIFEST_YAML_TOKENS = 20_000
+MAX_MANIFEST_NESTING_DEPTH = 64
 # Without a declared id the agent is "this repository", wherever it is checked out:
 # the same tree scanned at two locations must yield the same inventory.
 INFERRED_AGENT_IDENTITY = "."
@@ -115,28 +116,6 @@ def _root_relative(source_path: str | None, relative: Callable[[str], str]) -> s
     return path.as_posix()
 
 
-def _yaml_flow_depth_exceeded(text: str, *, limit: int = 64) -> bool:
-    """Linear-time bracket depth guard so yaml.scan cannot blow Python recursion stack."""
-    from nexus_symbiote import policy as policy_mod
-
-    checker = getattr(policy_mod, "check_yaml_flow_depth", None)
-    if callable(checker):
-        try:
-            checker(text, max_depth=limit)
-            return False
-        except ValueError:
-            return True
-    depth = 0
-    for ch in text:
-        if ch in "[{":
-            depth += 1
-            if depth > limit:
-                return True
-        elif ch in "]}":
-            depth = max(0, depth - 1)
-    return False
-
-
 def _parse_manifest(text: str, problems: list[str]) -> AgentDeclaration | None:
     from nexus_symbiote.policy import parse_yaml_mapping
 
@@ -145,15 +124,30 @@ def _parse_manifest(text: str, problems: list[str]) -> AgentDeclaration | None:
     except ImportError:
         problems.append(f"{MANIFEST}: YAML parser unavailable")
         return None
+    nesting_starts = (
+        yaml.FlowSequenceStartToken,
+        yaml.FlowMappingStartToken,
+        yaml.BlockSequenceStartToken,
+        yaml.BlockMappingStartToken,
+    )
+    nesting_ends = (yaml.FlowSequenceEndToken, yaml.FlowMappingEndToken, yaml.BlockEndToken)
     try:
-        if _yaml_flow_depth_exceeded(text):
-            raise ValueError("unsupported YAML nesting depth")
-        # The manifest comes from the checkout: refuse YAML graphs and unbounded documents.
+        # The manifest comes from the checkout: refuse YAML graphs, unbounded documents
+        # and nesting past what the recursive composer takes. The scanner's tokens,
+        # which know a bracket in a comment or a string from a collection, count the
+        # depth in one pass.
+        depth = 0
         for index, token in enumerate(yaml.scan(text)):
             if index >= MAX_MANIFEST_YAML_TOKENS or isinstance(
                 token, (yaml.AliasToken, yaml.AnchorToken, yaml.TagToken)
             ):
                 raise ValueError("unsupported YAML graph")
+            if isinstance(token, nesting_starts):
+                depth += 1
+                if depth > MAX_MANIFEST_NESTING_DEPTH:
+                    raise ValueError("unsupported YAML nesting depth")
+            elif isinstance(token, nesting_ends):
+                depth -= 1
         data = parse_yaml_mapping(text)
         # A YAML escape can produce a lone surrogate, which no path or digest can encode.
         json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")

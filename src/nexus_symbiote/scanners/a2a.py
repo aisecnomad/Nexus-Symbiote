@@ -1123,7 +1123,9 @@ class A2AScanner(Scanner):
             )
         from nexus_symbiote.scanners.prompt import definition_text_risks
 
-        risks.extend(definition_text_risks(data, f"{rel_path}: A2A agent '{shown}'"))
+        risks.extend(
+            definition_text_risks(data, f"{rel_path}: A2A agent '{shown}'", include_name=True)
+        )
         return A2AServerComponent(
             bom_ref=bom_ref,
             name=name,

@@ -830,10 +830,14 @@ def _flow_depth(text: str) -> int:
 
 
 _FM_LINE_END_RE = re.compile(r"\r\n|\r|\n")
+_FM_DASH_OPENER_RE = re.compile(r"-{3,}[ \t]*([A-Za-z]*)")
+_FM_FORMATS = {"toml": "TOML", "json": "JSON"}
 
 
 def _extra_front_matter_candidates(text: str) -> list[tuple[str, tuple[int, int]]]:
-    """Linear-time fallback for Hugo ``+++`` TOML and leading-space/wider ``----`` YAML fences."""
+    """Linear-time fallback for Hugo ``+++`` TOML and for fences a strict reader skips:
+    leading blank lines or spaces before the opener, a wider ``----`` opener or closer,
+    and a ``...`` YAML closer. Decoding one a host does not read only adds findings."""
     stripped = text.removeprefix("\ufeff")
     offset = len(text) - len(stripped)
     pos = offset
@@ -844,10 +848,12 @@ def _extra_front_matter_candidates(text: str) -> list[tuple[str, tuple[int, int]
     if nl is None:
         return []
     first = text[pos : nl.start()].rstrip(" \t")
+    literal_closers: tuple[str, ...]
     if first == "+++":
-        kind, closer = "TOML", "+++"
-    elif len(first) >= 3 and set(first) == {"-"}:
-        kind, closer = "YAML", first
+        kind, literal_closers, dash_closer = "TOML", ("+++",), False
+    elif (opener := _FM_DASH_OPENER_RE.fullmatch(first)) is not None:
+        kind = _FM_FORMATS.get(opener.group(1).lower(), "YAML")
+        literal_closers, dash_closer = (("...",) if kind == "YAML" else ()), True
     else:
         return []
     body_start = nl.end()
@@ -856,7 +862,8 @@ def _extra_front_matter_candidates(text: str) -> list[tuple[str, tuple[int, int]
         nxt = _FM_LINE_END_RE.search(text, cur)
         line_end = end if nxt is None else nxt.start()
         next_pos = end if nxt is None else nxt.end()
-        if text[cur:line_end].strip(" \t") == closer:
+        line = text[cur:line_end].strip(" \t")
+        if line in literal_closers or (dash_closer and len(line) >= 3 and not line.strip("-")):
             return [(kind, (body_start, cur))]
         cur = next_pos
     return []
@@ -878,15 +885,14 @@ def _decoded_sources(
     if kind is not None:
         candidates.append((kind, (0, len(text))))
     elif suffix in _MARKDOWN_SUFFIXES:
+        # Each candidate's raw text starts right after the opener line, which is the
+        # first line of the text.
         first_nl = _FM_LINE_END_RE.search(text)
-        search_from = first_nl.end() if first_nl is not None else 0
+        fm_start = first_nl.end() if first_nl is not None else 0
         for fm_lang, fm_raw, _body in front_matter_candidates(text):
-            if not fm_raw:
-                continue
-            pos = text.find(fm_raw, search_from)
-            if pos >= 0:
-                fm_kind = "TOML" if fm_lang == "toml" else "YAML"
-                candidates.append((fm_kind, (pos, pos + len(fm_raw))))
+            if fm_raw:
+                fm_kind = _FM_FORMATS.get(fm_lang, "YAML")
+                candidates.append((fm_kind, (fm_start, fm_start + len(fm_raw))))
         if not candidates:
             candidates.extend(_extra_front_matter_candidates(text))
     if not candidates:

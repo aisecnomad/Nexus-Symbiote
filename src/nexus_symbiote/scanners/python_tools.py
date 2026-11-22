@@ -6,7 +6,7 @@ import ast
 import re
 import warnings
 from collections import Counter, deque
-from collections.abc import Container, Sequence
+from collections.abc import Container, Iterable, Sequence
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import quote
@@ -454,7 +454,15 @@ _TOOL_OPTIONS = frozenset(
 )
 
 
-_MAX_DECORATOR_TEXT_NODES = 256
+def _string_constants(roots: Iterable[ast.AST]) -> list[str]:
+    """Every string literal under ``roots``; the trees are parsed already, so walking
+    them whole stays linear and no literal is left behind a node budget."""
+    return [
+        node.value
+        for root in roots
+        for node in ast.walk(root)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
 
 
 def _declaration_text_risks(
@@ -462,23 +470,18 @@ def _declaration_text_risks(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef | None,
     source_name: str,
 ) -> list[RiskAssessment]:
-    """Rate hidden Unicode characters in a Python tool's docstring and decorator literals."""
+    """Rate hidden Unicode characters in a Python tool's docstring, decorator literals and
+    parameter annotations and defaults, which the SDKs put in its description and schema."""
     payload: dict[str, object] = {}
     if func_node is not None:
         doc = ast.get_docstring(func_node, clean=False)
         if doc:
             payload["docstring"] = doc
+        parameters = _string_constants([func_node.args])
+        if parameters:
+            payload["parameters"] = parameters
     if isinstance(deco, ast.Call):
-        strings: list[str] = []
-        pending: list[ast.AST] = [*deco.args, *(kw.value for kw in deco.keywords)]
-        visited = 0
-        while pending and visited < _MAX_DECORATOR_TEXT_NODES:
-            node = pending.pop()
-            visited += 1
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                strings.append(node.value)
-            else:
-                pending.extend(ast.iter_child_nodes(node))
+        strings = _string_constants([*deco.args, *(kw.value for kw in deco.keywords)])
         if strings:
             payload["decorator"] = strings
     if not payload:
@@ -881,6 +884,8 @@ def _reaches_low_level(nodes: list[ast.AST]) -> bool:
     name_nodes: dict[str, list[ast.AST]] = {}
     attr_children: dict[ast.AST, list[tuple[ast.AST, str]]] = {}
     assign_targets: dict[ast.AST, list[str]] = {}
+    # A walrus expression carries its value's state: ``(a := mcp).server``.
+    carriers: dict[ast.AST, list[ast.AST]] = {}
     for node in nodes:
         if isinstance(node, ast.Import):
             for a in node.names:
@@ -905,9 +910,25 @@ def _reaches_low_level(nodes: list[ast.AST]) -> bool:
             targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
             if targets:
                 assign_targets.setdefault(node.value, []).extend(targets)
+            for target in node.targets:
+                # ``a, b = mcp, x`` binds each name to the value at its position.
+                if (
+                    isinstance(target, (ast.Tuple, ast.List))
+                    and isinstance(node.value, (ast.Tuple, ast.List))
+                    and len(target.elts) == len(node.value.elts)
+                    and not any(
+                        isinstance(e, ast.Starred) for e in (*target.elts, *node.value.elts)
+                    )
+                ):
+                    for bound_name, value in zip(target.elts, node.value.elts, strict=True):
+                        if isinstance(bound_name, ast.Name):
+                            assign_targets.setdefault(value, []).append(bound_name.id)
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
             if isinstance(node.target, ast.Name):
                 assign_targets.setdefault(node.value, []).append(node.target.id)
+        elif isinstance(node, ast.NamedExpr):
+            assign_targets.setdefault(node.value, []).append(node.target.id)
+            carriers.setdefault(node.value, []).append(node)
     if not bound:
         return False
     node_states: dict[ast.AST, set[str]] = {}
@@ -930,6 +951,11 @@ def _reaches_low_level(nodes: list[ast.AST]) -> bool:
                 if stepped not in seen:
                     seen.add(stepped)
                     pending_nodes.append((attr_node, stepped))
+        for carrier in carriers.get(expr, ()):
+            seen = node_states.setdefault(carrier, set())
+            if state not in seen:
+                seen.add(state)
+                pending_nodes.append((carrier, state))
         for target_name in assign_targets.get(expr, ()):
             existing = bound.setdefault(target_name, set())
             if state not in existing:
@@ -1091,10 +1117,20 @@ def _server_from_assignment(
     # The variable is bound once in this file, so path and variable identify the
     # server, where a declared name can repeat; the line is informational and moving
     # it is not a new server.
+    constructor = _string_constants([*call.args, *(kw.value for kw in call.keywords)])
+    risks: list[RiskAssessment] = []
+    if constructor:
+        # The name and instructions a constructor declares reach the model as served.
+        from nexus_symbiote.scanners.prompt import definition_text_risks
+
+        risks = definition_text_risks(
+            {"constructor": constructor}, f"{path.as_posix()}:{stmt.lineno} ({target.id})"
+        )
     server = MCPServerComponent(
         bom_ref=f"mcp-python:{quote(path.as_posix(), safe='')}:{target.id}",
         name=_declared_python_name(call, known) or target.id,
         source_path=path.as_posix(),
+        risks=risks,
         properties={
             "binding": target.id,
             "method": "python-ast",

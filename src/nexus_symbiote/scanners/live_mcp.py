@@ -799,12 +799,15 @@ def _bounded_unique_items(schema: dict[str, Any]) -> None:
                 ):
                     raise DiscoveryError("MCP tool schema exceeds the validation budget")
             enum_values = item.get("enum")
+            # jsonschema sorts a uniqueItems list and falls back to a pairwise scan when
+            # the sort raises TypeError, so only values that sort together are admitted:
+            # bool, None and a str/number mix each force the quadratic path.
             if (
                 isinstance(enum_values, list)
                 and len(enum_values) > _UNIQUE_ITEMS_PAIRWISE_LIMIT
-                and not all(
-                    isinstance(element, (str, int, float, bool, type(None)))
-                    for element in enum_values
+                and not (
+                    all(type(element) is str for element in enum_values)
+                    or all(type(element) in (int, float) for element in enum_values)
                 )
             ):
                 raise DiscoveryError("MCP tool schema exceeds the validation budget")
@@ -1050,7 +1053,7 @@ def check_served_tool(raw: Any, secrets: Iterable[str] = ()) -> CheckedDescripto
     shown_name = (
         display.get("name") if isinstance(display.get("name"), str) else redact_text(name, secrets)
     )
-    text_risks = tuple(definition_text_risks(raw, f"served tool {shown_name}"))
+    text_risks = tuple(definition_text_risks(raw, f"served tool {shown_name}", include_name=True))
     return CheckedDescriptor(
         name=name,
         fingerprint=fingerprint,
@@ -1080,7 +1083,7 @@ def check_listed_item(raw: Any, identity: str, secrets: Iterable[str] = ()) -> O
     shown_id = redact_text(value, secrets)
     item_risks = [
         risk.model_dump(mode="json")
-        for risk in definition_text_risks(raw, f"served {identity} {shown_id}")
+        for risk in definition_text_risks(raw, f"served {identity} {shown_id}", include_name=True)
     ]
     return ObservedItem(identity=value, descriptor=display, digest=digest, text_risks=item_risks)
 
@@ -1442,6 +1445,12 @@ def discover_tools(
         result.server_info, result.server_capabilities = server_info, capabilities
         raw["serverInfo"] = _mask_exact(hello["serverInfo"], secrets)
         raw["capabilities"] = _mask_exact(hello["capabilities"], secrets)
+        result.server_text_risks.extend(
+            risk.model_dump(mode="json")
+            for risk in definition_text_risks(
+                {"serverInfo": hello["serverInfo"]}, "served server identity"
+            )
+        )
         if instructions is not None:
             result.server_text_risks.extend(
                 risk.model_dump(mode="json")

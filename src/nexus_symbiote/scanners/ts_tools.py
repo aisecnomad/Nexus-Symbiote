@@ -725,7 +725,11 @@ class _Resolver:
                 for name in names:
                     active[name].pop()
                 continue
-            if node.type in {"identifier", "shorthand_property_identifier"}:
+            if node.type in {
+                "identifier",
+                "shorthand_property_identifier",
+                "shorthand_property_identifier_pattern",
+            }:
                 stack = active.get(_name(node))
                 if stack:
                     self._targets[node.id] = stack[-1]
@@ -824,10 +828,40 @@ def _collect_arg_builtin_refs(arg: Node, assigned: set[str]) -> None:
                 pending.append(rhs)
 
 
+_VALUE_WRAPPERS = _WRAPPERS - {"sequence_expression"}
+
+
+def _builtin_escapes(node: Node, index: _Index) -> bool:
+    """Whether a bare builtin name is read as a value, which an alias, a closure, a
+    container or a callee can then mutate or replace, rather than as the object of a
+    member access, a callee or a ``typeof`` operand."""
+    child = node
+    parent = index.parent(child)
+    while parent is not None and parent.type in _VALUE_WRAPPERS:
+        child, parent = parent, index.parent(parent)
+    if parent is None:
+        return True
+    if parent.type in {"member_expression", "subscript_expression"}:
+        obj = parent.child_by_field_name("object")
+        return obj is None or obj.id != child.id
+    if parent.type == "call_expression":
+        callee = parent.child_by_field_name("function")
+        return callee is None or callee.id != child.id
+    return parent.type != "unary_expression"
+
+
 def _assigned_computed_builtins(index: _Index) -> set[str]:
     assigned: set[str] = set()
     for node in index.nodes:
         if node.id in index.erased:
+            continue
+        if node.type in {"identifier", "shorthand_property_identifier"}:
+            name = _name(node)
+            if name in _COMPUTED_BUILTINS:
+                if _builtin_escapes(node, index):
+                    assigned.add(name)
+            elif name in _GLOBAL_OBJECTS and _builtin_escapes(node, index):
+                assigned.update(_COMPUTED_BUILTINS)
             continue
         if node.type == "call_expression":
             arguments = node.child_by_field_name("arguments")
@@ -1313,7 +1347,11 @@ def _collect_source(
             part = _operand(pending_lhs.pop())
             if part is None:
                 continue
-            if part.type in {"identifier", "shorthand_property_identifier"}:
+            if part.type in {
+                "identifier",
+                "shorthand_property_identifier",
+                "shorthand_property_identifier_pattern",
+            }:
                 resolved = resolver.lookup(part)
                 if isinstance(resolved, int):
                     reassigned_declarators.add(resolved)
@@ -1458,8 +1496,10 @@ def _collect_source(
     result.components.extend(components)
 
 
+# An escaped backslash is consumed first, so the ``\\u202e`` of a literal backslash
+# followed by ``u202e`` is not read as an escape.
 _JS_UNICODE_ESCAPE_RE = re.compile(
-    r"\\(?:u\{([0-9a-fA-F]++)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))"
+    r"\\(?:(\\)|u\{([0-9a-fA-F]++)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))"
 )
 
 
@@ -1467,7 +1507,9 @@ def _decode_js_unicode_escapes(source: str) -> str:
     """Decode JS/TS hex and Unicode escapes (joining surrogate pairs) for hidden-char checks."""
 
     def _replace(match: re.Match[str]) -> str:
-        digits = match.group(1) or match.group(2) or match.group(3)
+        if match.group(1) is not None:
+            return match.group(0)
+        digits = match.group(2) or match.group(3) or match.group(4)
         stripped = digits.lstrip("0") or "0"
         if len(stripped) > 6:
             return match.group(0)

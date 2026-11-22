@@ -204,6 +204,15 @@ class ServerVerifyResult:
             "identity_hash": self.identity_hash,
             "identity_status": self.identity_status,
             **({"transport_evidence": self.transport_evidence} if self.transport_evidence else {}),
+            **(
+                {
+                    "declaration_text_risks": [
+                        risk.model_dump(mode="json") for risk in self.declaration_text_risks
+                    ]
+                }
+                if self.declaration_text_risks
+                else {}
+            ),
             "teardown": self.teardown,
             "tools": [
                 {
@@ -215,6 +224,11 @@ class ServerVerifyResult:
                     **(
                         {"fields_outside_profile": list(f.unprofiled_fields)}
                         if f.unprofiled_fields
+                        else {}
+                    ),
+                    **(
+                        {"text_risks": [risk.model_dump(mode="json") for risk in f.text_risks]}
+                        if f.text_risks
                         else {}
                     ),
                 }
@@ -350,6 +364,11 @@ def _declaration(observation: PinnedObservation) -> _Declaration:
         instructions,
         {},
         identity,
+    )
+    declaration.text_risks.extend(
+        definition_text_risks(
+            {"serverInfo": observation.hello["serverInfo"]}, "served server identity"
+        )
     )
     if instructions is not None:
         declaration.text_risks.extend(

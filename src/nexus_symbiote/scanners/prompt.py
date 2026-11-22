@@ -238,23 +238,30 @@ def detect_invisible_characters(
     ]
 
 
-def definition_text_risks(definition: object, source_name: str) -> list[RiskAssessment]:
+def definition_text_risks(
+    definition: object, source_name: str, *, include_name: bool = False
+) -> list[RiskAssessment]:
     """Rate the hidden characters in a tool definition as in an instruction file.
 
     A host puts a tool's description and schema text in front of the model as it does an
     instruction file, so the same characters hide the same text. Every string and key
     of the definition is read except the tool's own name, which is reported as an
-    identifier. A byte-order mark is never ordinary here: no string of a definition
-    starts a file.
+    identifier unless ``include_name`` is set, as for a served descriptor whose name a
+    host shows the model unredacted. A byte-order mark is never ordinary here: no
+    string of a definition starts a file.
     """
     counts: dict[str, int] = {}
     separators: dict[str, int] = {}
     tags = 0
-    pending = (
-        [value for key, value in definition.items() if key != "name"]
-        if isinstance(definition, dict)
-        else [definition]
-    )
+    if isinstance(definition, dict):
+        pending = [
+            item
+            for key, value in definition.items()
+            if include_name or key != "name"
+            for item in (key, value)
+        ]
+    else:
+        pending = [definition]
     while pending:
         value = pending.pop()
         if isinstance(value, dict):

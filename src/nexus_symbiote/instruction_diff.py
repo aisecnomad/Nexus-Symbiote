@@ -588,6 +588,11 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
                 tuple((Counter(hidden.html) | Counter(dash_hidden.html)).elements()),
             )
     fm_leaves = _frontmatter_text_leaves(metas)
+    hidden_unicode = _hidden_unicode_map(content)
+    if fm_leaves:
+        # A host decodes front matter, so an escaped hidden character counts as a raw one.
+        for char, count in _hidden_unicode_map("\n".join(fm_leaves)).items():
+            hidden_unicode[char] = max(hidden_unicode.get(char, 0), count)
     blocks = (
         tuple(readings["common"])
         if len(readings) == 1 and "common" in readings
@@ -630,12 +635,12 @@ def _parse_instruction(rel_path: str, content: str, failures: list[str]) -> _Par
         rel_path=rel_path,
         content=content,
         globs=frozenset(globs),
-        path_scoped=bool(globs),
+        path_scoped=any(not g.startswith("!") for g in globs),
         always_apply=always_apply,
         frontmatter_grants=fm_grants,
         blocks=blocks,
         hidden_signatures=hidden_sigs,
-        hidden_unicode=_hidden_unicode_map(content),
+        hidden_unicode=hidden_unicode,
         inline_tools=inline_tools,
         imports=imports,
         refs=refs,
@@ -909,12 +914,20 @@ def _read_confined_tree(root: Path) -> tuple[dict[str, _ParsedInstruction], list
     return records, safe_failures, safe_excluded
 
 
+_BROAD_GLOB_RE = re.compile(r"(?:\*{1,2}/)*\*{1,2}")
+
+
+def _broad_glob(pattern: str) -> bool:
+    """Whether ``pattern`` activates on every path, as ``**``, ``**/*`` or ``**/**`` do."""
+    return _BROAD_GLOB_RE.fullmatch(pattern) is not None
+
+
 def _glob_covered_by(candidate: str, existing: frozenset[str]) -> bool:
     if candidate in existing:
         return True
-    if ".." in PurePosixPath(candidate).parts:
+    if ".." in re.split(r"[\\/]", candidate):
         return False
-    if any(pat in {"*", "**", "**/*"} for pat in existing):
+    if any(_broad_glob(pat) for pat in existing):
         return True
     for pat in existing:
         for suffix in ("/**/*", "/**"):
@@ -924,10 +937,13 @@ def _glob_covered_by(candidate: str, existing: frozenset[str]) -> bool:
                     return True
         if "/**/" in pat:
             prefix, tail = pat.split("/**/", 1)
-            if (not prefix or candidate.startswith(prefix + "/")) and candidate.endswith(
-                tail.lstrip("*")
-            ):
-                return True
+            if not prefix or candidate.startswith(prefix + "/"):
+                stem = tail.lstrip("*")
+                # Without a leading star the tail names whole path segments.
+                if candidate.endswith(stem if stem != tail else "/" + tail) or (
+                    not prefix and candidate == tail
+                ):
+                    return True
     return False
 
 
@@ -1021,10 +1037,12 @@ def diff_instruction_trees(
         # 1. scope_widened
         if base is None:
             in_rule_dir = any(rel_path.startswith(d + "/") for d in _RULE_DIRECTORIES)
+            # Only Cursor reads alwaysApply; other hosts load an unscoped rule file always.
+            opted_out = head.always_apply_false and rel_path.startswith(".cursor/rules/")
             if (
                 head.always_apply
-                or any(g in {"*", "**", "**/*"} for g in head.globs)
-                or (in_rule_dir and not head.path_scoped and not head.always_apply_false)
+                or any(_broad_glob(g) for g in head.globs)
+                or (in_rule_dir and not head.path_scoped and not opted_out)
             ):
                 changes.append(
                     InstructionChange(
