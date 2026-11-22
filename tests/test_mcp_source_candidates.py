@@ -8,7 +8,6 @@ import encodings
 import json
 import re
 import shutil
-import time
 import tracemalloc
 from dataclasses import replace
 from pathlib import Path
@@ -252,12 +251,19 @@ def test_a_declaration_static_reading_cannot_follow_is_a_failure(tmp_path, locat
 
 
 def test_a_hostile_declaration_is_refused_without_decoding(tmp_path):
-    payload = b"a" * 2_000_000 + b"-" + b"b" * 2_000_000
-    _write(tmp_path, "slow.py", b"# coding: punycode\n" + payload)
-    started = time.monotonic()
-    failures = MCPScanner().scan(tmp_path).scan_failures
-    assert time.monotonic() - started < 5
-    assert failures == ["slow.py: unsupported source encoding declaration"]
+    roots = {}
+    for scale in (1, 4):
+        root = tmp_path / f"scale_{scale}"
+        payload = b"a" * (500_000 * scale) + b"-" + b"b" * (500_000 * scale)
+        _write(root, "slow.py", b"# coding: punycode\n" + payload)
+        roots[scale] = root
+
+    def run(scale: int) -> None:
+        assert MCPScanner().scan(roots[scale]).scan_failures == [
+            "slow.py: unsupported source encoding declaration"
+        ]
+
+    assert scaling_ratio(run) < 10
 
 
 def test_an_import_spelled_with_compatibility_characters_is_a_gap(tmp_path):
@@ -347,19 +353,21 @@ def test_a_qualified_or_star_framework_import_with_compatibility_characters_is_a
 def test_compatibility_characters_cannot_inflate_the_search(tmp_path, character):
     # U+FDFA has an 18-character compatibility form; folding the whole text at once
     # held about 150 MiB and took seconds for this 4 MiB file.
-    body = "# " + character * ((4 * limits.MIB - 16) // len(character.encode()))
-    _write(tmp_path, "wide.py", body + "\n")
+    roots = {}
+    for scale in (1, 4):
+        root = tmp_path / f"scale_{scale}"
+        body = "# " + character * ((scale * limits.MIB - 16) // len(character.encode()))
+        _write(root, "wide.py", body + "\n")
+        roots[scale] = root
     tracemalloc.start()
     try:
-        started = time.monotonic()
-        failures = MCPScanner().scan(tmp_path).scan_failures
-        elapsed = time.monotonic() - started
+        failures = MCPScanner().scan(roots[4]).scan_failures
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
     assert failures == []
     assert peak < 32 * limits.MIB
-    assert elapsed < 10
+    assert scaling_ratio(lambda scale: MCPScanner().scan(roots[scale]).scan_failures) < 10
 
 
 def test_unrelated_sources_larger_than_file_bytes_are_searched_as_a_stream(tmp_path):
@@ -496,17 +504,20 @@ def test_a_declaration_python_x_reads_after_a_line_of_code_is_a_failure(tmp_path
 def test_a_name_too_long_for_any_codec_is_refused_without_a_lookup(tmp_path):
     # The codec registry spends time per character on a name and keeps every name
     # it failed to find; 63 such 4 MiB names left 252 MiB behind after a scan.
-    for index in range(3):
-        name = f"n{index}" + "x" * limits.MIB
-        _write(tmp_path, f"long{index}.py", b"# coding: " + name.encode() + b"\n")
-    _write(tmp_path, "pkg/second.py", b"#!/usr/bin/env python\n# coding: " + b"y" * 65 + b"\n")
-    _write(tmp_path, "pkg/skipped.py", b"x = 1\n# coding: " + b"z" * 65 + b"\n")
-    _write(tmp_path, "pkg/utf8.py", b"# coding: utf-8-" + b"u" * limits.MIB + b"\nVALUE = 1\n")
+    roots = {}
+    for scale in (1, 4):
+        root = tmp_path / f"scale_{scale}"
+        span = (limits.MIB // 4) * scale
+        for index in range(3):
+            name = f"n{index}" + "x" * span
+            _write(root, f"long{index}.py", b"# coding: " + name.encode() + b"\n")
+        _write(root, "pkg/second.py", b"#!/usr/bin/env python\n# coding: " + b"y" * 65 + b"\n")
+        _write(root, "pkg/skipped.py", b"x = 1\n# coding: " + b"z" * 65 + b"\n")
+        _write(root, "pkg/utf8.py", b"# coding: utf-8-" + b"u" * span + b"\nVALUE = 1\n")
+        roots[scale] = root
     cache = getattr(encodings, "_cache", {})
     before = sum(len(key) for key in cache)
-    started = time.monotonic()
-    failures = MCPScanner().scan(tmp_path).scan_failures
-    assert time.monotonic() - started < 5
+    failures = MCPScanner().scan(roots[4]).scan_failures
     assert sum(len(key) for key in cache) - before < 1_000
     assert sorted(failures) == [
         "long0.py: unsupported source encoding declaration",
@@ -515,6 +526,7 @@ def test_a_name_too_long_for_any_codec_is_refused_without_a_lookup(tmp_path):
         "pkg/second.py: unsupported source encoding declaration",
         "pkg/skipped.py: unsupported source encoding declaration",
     ]
+    assert scaling_ratio(lambda scale: MCPScanner().scan(roots[scale]).scan_failures) < 10
 
 
 def test_failures_of_the_source_search_are_listed_within_the_listing_bounds(tmp_path):

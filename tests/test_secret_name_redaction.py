@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from nexus_symbiote.utils.secrets import (
@@ -64,10 +62,8 @@ def test_unrelated_assignments_are_unchanged(text):
 
 
 def test_long_adversarial_input_stays_fast():
-    text = "token " * 100_000 + "a" * 1_000_000
-    started = time.monotonic()
-    redact_text(text)
-    assert time.monotonic() - started < 5
+    samples = {scale: "token " * (25_000 * scale) + "a" * (250_000 * scale) for scale in (1, 4)}
+    assert scaling_ratio(lambda scale: redact_text(samples[scale])) < 10
 
 
 # Spelled in parts so the source never holds a token-shaped literal, which secret scanners

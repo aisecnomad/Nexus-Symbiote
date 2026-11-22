@@ -976,21 +976,25 @@ def test_workspace_commands_that_fetch_are_unknown(tmp_path, command, args, reas
     assert detail is not None and reason in detail
 
 
-# Coverage tracing alone nearly reaches the bound, so the coverage job runs this untraced.
-@pytest.mark.no_cover
 def test_argument_scan_cost_is_bounded_by_characters_not_steps():
-    import time
-
     from nexus_symbiote.scanners.mcp_launch import analyze
 
     # The re-review shape: one argument of 64,000 words inflates the step budget,
-    # then interpreter names rescan long words; it must fail closed quickly.
-    args = ["a " * 64_000, *(["ruby"] * 300), *(["A" * 5801] * 699)]
-    start = time.perf_counter()
-    launch = analyze("x", args)
-    elapsed = time.perf_counter() - start
-    assert launch.unknown == "arguments exceed the launcher scan limit"
-    assert elapsed < 3.0, elapsed
+    # then interpreter names rescan long words; it must fail closed in linear time.
+    samples = {
+        scale: [
+            "a " * (16_000 * scale),
+            *(["ruby"] * (75 * scale)),
+            *(["A" * 5801] * (175 * scale)),
+        ]
+        for scale in (1, 4)
+    }
+
+    def run(scale: int) -> None:
+        launch = analyze("x", samples[scale])
+        assert launch.unknown == "arguments exceed the launcher scan limit"
+
+    assert scaling_ratio(run) < 10
 
 
 @pytest.mark.parametrize("runner,cluster", [("sh", "e"), ("npm", "y"), ("python", "u")])

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import json
-import time
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +14,7 @@ from nexus_symbiote.cli import main
 from nexus_symbiote.core.models import A2AClientComponent, A2AServerComponent
 from nexus_symbiote.scanners.a2a import A2AScanner, _scope
 from nexus_symbiote.utils.secrets import REDACTED
+from tests.support import scaling_ratio
 
 CARD: dict[str, Any] = {
     "name": "billing-agent",
@@ -40,25 +40,34 @@ def _jws_header(header: dict[str, Any]) -> str:
 
 
 def test_scope_beyond_the_length_bound_is_redacted_without_a_search():
-    started = time.perf_counter()
-    assert _scope("eyJ" * 400_000) == REDACTED
-    assert _scope("a" + "eyJ" * 400_000) == REDACTED
-    assert time.perf_counter() - started < 1
+    samples = {
+        scale: ("eyJ" * (100_000 * scale), "a" + "eyJ" * (100_000 * scale)) for scale in (1, 4)
+    }
+
+    def run(scale: int) -> None:
+        first, second = samples[scale]
+        assert _scope(first) == REDACTED
+        assert _scope(second) == REDACTED
+
+    assert scaling_ratio(run) < 10
 
 
 def test_card_with_a_huge_scope_is_collected_quickly(tmp_path):
-    card = {
-        **CARD,
-        "securitySchemes": {"o": {"type": "oauth2"}},
-        "security": [{"o": ["eyJ" * 100_000, "read"]}],
-    }
-    _write(tmp_path, ".well-known/agent.json", card)
-    started = time.perf_counter()
-    result = A2AScanner().scan(tmp_path)
-    assert time.perf_counter() - started < 5
+    roots: dict[int, Path] = {}
+    for scale in (1, 4):
+        root = tmp_path / f"scale_{scale}"
+        card = {
+            **CARD,
+            "securitySchemes": {"o": {"type": "oauth2"}},
+            "security": [{"o": ["eyJ" * (25_000 * scale), "read"]}],
+        }
+        _write(root, ".well-known/agent.json", card)
+        roots[scale] = root
+    result = A2AScanner().scan(roots[4])
     (server,) = _servers(result)
     assert server.capabilities is not None
     assert server.capabilities.oauth_scopes == [REDACTED, "read"]
+    assert scaling_ratio(lambda scale: A2AScanner().scan(roots[scale])) < 10
 
 
 @pytest.mark.parametrize(

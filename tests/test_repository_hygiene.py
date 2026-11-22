@@ -407,6 +407,48 @@ def test_escaped_invisible_characters_and_detection_fixtures_are_accepted(tmp_pa
     assert hygiene.hidden_character_issues(tmp_path, files) == []
 
 
+def test_wall_clock_cost_bound_hygiene_rejects_unmarked_cost_bounds_and_allows_deadlines(tmp_path):
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    sample = tests_dir / "test_sample.py"
+    sample.write_text(
+        "import time\n\n"
+        "def test_parser_stays_fast():\n"
+        "    started = time.monotonic()\n"
+        "    assert time.monotonic() - started < 5\n\n"
+        "def test_query_runs_linearly():\n"
+        "    t0 = time.perf_counter()\n"
+        "    elapsed = time.perf_counter() - t0\n"
+        "    assert elapsed < 2.0\n\n"
+        "def test_reversed_bound_scales():\n"
+        "    started = time.monotonic()\n"
+        "    assert 5 > time.monotonic() - started\n\n"
+        "def test_chained_bound_scaling():\n"
+        "    started = time.monotonic()\n"
+        "    elapsed = time.monotonic() - started\n"
+        "    assert 0 <= elapsed < 2.0\n\n"
+        "def test_timeout_is_bounded():\n"
+        "    started = time.monotonic()\n"
+        "    assert time.monotonic() - started < 3  # deadline check\n\n"
+        "def test_stalled_peer_bounded_by_deadline():\n"
+        "    started = time.monotonic()\n"
+        "    assert time.monotonic() - started < 10\n\n"
+        "def test_relative_ratio_stays_linear():\n"
+        "    t0 = time.perf_counter()\n"
+        "    small = time.perf_counter() - t0\n"
+        "    t1 = time.perf_counter()\n"
+        "    large = time.perf_counter() - t1\n"
+        "    assert large < small * 20\n",
+        encoding="utf-8",
+    )
+    issues = hygiene.wall_clock_cost_bound_issues(tmp_path, [Path("tests/test_sample.py")])
+    assert len(issues) == 4
+    assert "test_parser_stays_fast" in issues[0]
+    assert "test_query_runs_linearly" in issues[1]
+    assert "test_reversed_bound_scales" in issues[2]
+    assert "test_chained_bound_scaling" in issues[3]
+
+
 def test_tracked_repository_passes_its_own_owner_check():
     root = Path(__file__).parents[1]
     if not (root / ".git").exists():
@@ -420,3 +462,4 @@ def test_tracked_repository_passes_its_own_owner_check():
     files = [Path(value) for value in listing.stdout.decode().split("\0") if value]
     assert hygiene.owner_issues(root, files) == []
     assert hygiene.hidden_character_issues(root, files) == []
+    assert hygiene.wall_clock_cost_bound_issues(root, files) == []
