@@ -531,19 +531,18 @@ def test_policy_snapshot_lives_in_runner_temp_when_tmpdir_is_in_the_checkout(
     (workspace / ".git").mkdir()
     checkout_tmp = workspace / "tmp"
     checkout_tmp.mkdir()
-    overrides = {"TMPDIR": str(checkout_tmp)}
+    overrides = {"TMPDIR": str(checkout_tmp), "RUNNER_TEMP": ""}
     if runner_temp:
         (tmp_path / "runner-temp").mkdir()
         overrides["RUNNER_TEMP"] = str(tmp_path / "runner-temp")
     result = _entry_point(tmp_path, workspace, _caller_policy(tmp_path), **overrides)
+    inventory = workspace / "result.json"
+    assert inventory.is_file(), result.stderr
+    model = _model(inventory)
+    assert model["signing_status"] == "sigstore-signed"
+    assert model["signing_identity"] == SIGNER
     if runner_temp:
-        assert "outside every repository that holds it" not in result.stderr
-        assert _model(workspace / "result.json")["signing_status"] == "sigstore-signed"
         assert not any((tmp_path / "runner-temp").iterdir())
-    else:
-        # Without RUNNER_TEMP the snapshot falls back to TMPDIR, inside the repository.
-        assert result.returncode != 0
-        assert "outside every repository that holds it" in result.stderr
     assert not any(checkout_tmp.iterdir())
 
 

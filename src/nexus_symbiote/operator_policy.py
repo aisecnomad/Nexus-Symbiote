@@ -146,6 +146,7 @@ def _verify_policy_attestation(
         _check_key_placement,
         _InputTooLargeError,
         _KeyFileError,
+        _verify_outside_checkout,
     )
 
     if not trusted_keys:
@@ -164,6 +165,8 @@ def _verify_policy_attestation(
         )
         ring: dict[str, Ed25519PublicKey] = {}
         for key_path in trusted_keys:
+            if root is not None:
+                _verify_outside_checkout(key_path, (root,), label="--operator-policy-key")
             pub = _load_trusted_public(key_path)
             if not isinstance(pub, Ed25519PublicKey):
                 raise _KeyFileError("only Ed25519 public keys are supported")

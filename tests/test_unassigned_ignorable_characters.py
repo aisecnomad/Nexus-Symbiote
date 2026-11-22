@@ -282,7 +282,11 @@ def test_every_unassigned_default_ignorable_code_point_is_neutralized():
 def test_hostile_names_reach_no_output_line_raw(runner, tmp_path):
     project = tmp_path / "project"
     hidden = f"pkg{PAYLOAD[:3]}\u2065\ufff0x"
-    _write(project, f"{hidden}/CLAUDE.md", "Be helpful.\u202e\n")
+    try:
+        _write(project, f"{hidden}/CLAUDE.md", "Be helpful.\u202e\n")
+    except OSError:
+        # APFS refuses names with unassigned code points.
+        pytest.skip("file system rejects the name")
     output = tmp_path / "bom.json"
     scanned = runner.invoke(
         main, ["scan", str(project), "--no-project-policy", "--report-only", "-o", str(output)]

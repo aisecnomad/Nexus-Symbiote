@@ -20,7 +20,7 @@ Keep credentials, private inventories and customer data out of public reports. U
 
 Use Python 3.11 to 3.14 on Linux in an isolated environment and follow the [verified-release installation](README.md#install-a-verified-release) or the [source-first installation](README.md#install-from-reviewed-source). A package-index install that skips attestation verification is not a verification path.
 
-Confined file operations and pinned stdio launchers require POSIX descriptor-relative and no-follow primitives. Unsupported platforms fail closed. The configured hosted matrix targets Ubuntu/Python 3.11–3.14; it does not qualify macOS or Windows. A platform classifier or a successful package import is not evidence that all security primitives work on that platform.
+Confined file operations and pinned stdio launchers require POSIX descriptor-relative and no-follow primitives. Unsupported platforms fail closed. CI runs the full suite on Ubuntu with Python 3.11–3.14 and on macOS with Python 3.12; on Windows every command exits with status 1 ([platforms](SECURITY.md#platforms)). A platform classifier or a successful package import is not evidence that all security primitives work on that platform.
 
 If an optional integration is missing, source extras are `.[sigstore]`, `.[cyclonedx]` and `.[all]`. The locked development environment installs the reviewed optional test/integration dependencies:
 

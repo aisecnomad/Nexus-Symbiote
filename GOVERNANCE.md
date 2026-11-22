@@ -123,6 +123,7 @@ Every gate prints each of its failure reasons. How many findings the console lis
 | `trifecta` | Experimental | offline | Lethal trifectas, chained toxic flows and tool shadowing in an inventory |
 | `import-sbom` | Experimental | offline | Foreign CycloneDX or SPDX SBOM imported as declared evidence |
 | `evidence-profile` | Experimental | offline | Evidence attributes per component, without a scalar trust score |
+| `export-policy` | Experimental | offline | Default-deny Cedar, Rego v1 or JSON runtime allowlist from an inventory |
 | `discover-mcp` | Experimental | **live** | Opt-in HTTPS MCP tool listing without calling tools |
 | `advisories` | Experimental | **live** | Opt-in OSV lookup for exact PyPI and npm package versions |
 | `verify-live` | Experimental | **live** | Opt-in namespace-isolated stdio MCP verification against operator launch policy |

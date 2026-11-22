@@ -19,7 +19,9 @@ from pathlib import Path
 from typing import TypeVar, cast
 
 import click
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from nexus_symbiote.attestation import MAX_SUBJECT_BYTES
 from nexus_symbiote.runtime_cli import (
     _check_key_placement,
     _InputTooLargeError,
@@ -27,11 +29,10 @@ from nexus_symbiote.runtime_cli import (
     _load_private,
     _passphrase,
     _read,
+    _refuse_source_overwrite,
 )
-from nexus_symbiote.supply_chain_cli import _refuse_source_overwrite
 from nexus_symbiote.utils.terminal import echo_line, json_text, write_cli_output
 
-MAX_SUBJECT_BYTES = 64 * 1024 * 1024
 MAX_AGE_DAYS = 36500
 _PURPOSES = ["generated", "reviewed", "policy"]
 _REVISION = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
@@ -181,10 +182,9 @@ def attest(
     click.echo(json_text(json.dumps(result)))
 
 
-def _load_trusted_public(path: Path) -> object:
+def _load_trusted_public(path: Path) -> Ed25519PublicKey:
     from cryptography.exceptions import UnsupportedAlgorithm
     from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
     from nexus_symbiote.core.hashing import open_regular_file, pathname_identity
     from nexus_symbiote.runtime_cli import MAX_KEY_BYTES
@@ -234,18 +234,14 @@ def _verify_core(
     max_age_days: int | None,
     subject_bytes: bytes | None = None,
 ) -> tuple[object, dict[str, object]]:
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
     from nexus_symbiote import attestation
     from nexus_symbiote.runtime import key_id
 
     ring: dict[str, Ed25519PublicKey] = {}
     for path in trusted_keys:
-        public = cast(
-            Ed25519PublicKey,
-            _load(
-                "verification", "trusted key file", functools.partial(_load_trusted_public, path)
-            ),
+        public = _load(
+            "verification", "trusted key file", functools.partial(_load_trusted_public, path)
         )
         ring[key_id(public)] = public
     if threshold > len(ring):
