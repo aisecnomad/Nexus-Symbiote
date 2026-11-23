@@ -166,39 +166,29 @@ def _is_blanket_specifier(base: str, spec: str) -> bool:
     return base.lower() == "webfetch" and compact.lower() in {"domain:*", "domain:"}
 
 
-def _norm_mcp_prefix(base: str) -> str:
-    """Normalize the leading ``mcp__`` prefix to lowercase while preserving server/tool casing."""
-    if base.lower().startswith("mcp__"):
-        return "mcp__" + base[5:]
-    return base
-
-
 def _mcp_server_name(rule: str) -> str | None:
     """Return the named server when ``rule`` is a whole-server MCP rule.
 
-    Matches ``mcp__server``, ``mcp__server__*``, and ``mcp__server__**``.
-    Returns ``None`` for unanchored globs, per-tool rules, parenthesized rules,
-    or whitespace-bearing heads.
+    Claude Code matches ``mcp`` and a tool token with ``===``. ``mcp__server``
+    and ``mcp__server__*`` name that server. ``mcp__server__**`` does not: only
+    the single token ``*`` is the whole-server wildcard. The prefix is
+    case-sensitive, so ``MCP__server`` is not a rule Claude honours.
     """
     text = rule.strip()
     if "(" in text or ")" in text or any(char.isspace() for char in text):
         return None
-    if not text.lower().startswith("mcp__"):
+    if not text.startswith("mcp__"):
         return None
     server, separator, tool = text[5:].partition("__")
     if not server or any(char in "*?" for char in server):
         return None
-    if separator and (not tool or not set(tool) <= {"*"}):
+    if separator and tool != "*":
         return None
     return server
 
 
 def _whole_mcp_server_allow(rule: str) -> bool:
-    """Whether ``rule`` auto-approves every tool of one named MCP server.
-
-    ``mcp__server``, ``mcp__server__*``, and ``mcp__server__**`` are the same
-    grant. An unanchored ``mcp__*`` is not: Claude Code skips it.
-    """
+    """Whether ``rule`` auto-approves every tool of one named MCP server."""
     return _mcp_server_name(rule) is not None
 
 
@@ -215,7 +205,7 @@ def _claude_skips_mcp_allow(rule: str) -> bool:
     text = rule.strip()
     head, opened, rest = text.partition("(")
     head = head.strip()
-    if not head.lower().startswith("mcp__"):
+    if not head.startswith("mcp__"):
         return False
     if any(char.isspace() for char in head):
         return True
@@ -310,7 +300,7 @@ class _RuleBucket:
         if parsed is None:
             return None
         base, spec, is_blanket = parsed
-        norm_base = _norm_mcp_prefix(base)
+        norm_base = base
         if is_blanket:
             whole_server = _mcp_server_name(norm_base)
             if whole_server is not None:
@@ -360,7 +350,7 @@ class _RuleBucket:
             return True
         if base == "*":
             return False
-        norm_base = _norm_mcp_prefix(base)
+        norm_base = base
         whole_server = _mcp_server_name(norm_base)
         if whole_server is not None:
             server_rule = f"mcp__{whole_server}"
@@ -382,7 +372,7 @@ class _RuleBucket:
             spec
         ):
             return True
-        norm_base = _norm_mcp_prefix(base)
+        norm_base = base
         trie = self.narrow_prefix_specs.get(spec)
         if norm_base.endswith("*"):
             return trie is not None and trie.matches_any_prefix_of(norm_base[:-1])

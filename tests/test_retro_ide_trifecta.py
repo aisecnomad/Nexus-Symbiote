@@ -60,9 +60,7 @@ def test_external_272_scoped_mcp_rules_grant_no_server(rule: str) -> None:
     assert _broad_grants([rule]) == []
 
 
-@pytest.mark.parametrize(
-    "rule", ["mcp__docs", "mcp__docs__*", "mcp__docs__**", "mcp__server", "mcp__server__*"]
-)
+@pytest.mark.parametrize("rule", ["mcp__docs", "mcp__docs__*", "mcp__server", "mcp__server__*"])
 def test_per_server_mcp_allow_is_that_servers_grant_only(tmp_path: Path, rule: str) -> None:
     """A whole server is auto-approved. Its trifecta legs come from its declared tools."""
     assert _broad_grants([rule]) == ["MCP server tools"]
@@ -155,10 +153,6 @@ def test_narrow_or_skipped_mcp_deny_does_not_drop_permission_scope(
     [
         ("mcp__evil", "mcp__evil__*"),
         ("mcp__evil__*", "mcp__evil"),
-        ("mcp__evil__*", "mcp__evil__**"),
-        ("mcp__evil__**", "mcp__evil"),
-        ("MCP__DOCS", "mcp__*"),
-        ("mcp__evil", "MCP__*"),
     ],
 )
 def test_whole_server_mcp_rules_are_symmetric_in_precedence(
@@ -186,8 +180,7 @@ def test_bare_and_double_star_mcp_allow_match_concrete_server_tools() -> None:
         == HumanInTheLoop.NONE
     )
     assert (
-        resolve_tool_approval("mcp__evil__delete", permissions={"allow": ["mcp__evil__**"]})
-        == HumanInTheLoop.NONE
+        resolve_tool_approval("mcp__evil__delete", permissions={"allow": ["mcp__evil__**"]}) is None
     )
     assert (
         resolve_tool_approval(
@@ -198,6 +191,59 @@ def test_bare_and_double_star_mcp_allow_match_concrete_server_tools() -> None:
     assert (
         resolve_tool_approval("mcp__evil_two__delete", permissions={"allow": ["mcp__evil"]}) is None
     )
+
+
+def test_uppercase_mcp_deny_does_not_hide_a_real_server_allow(tmp_path: Path) -> None:
+    """Claude matches ``mcp`` exactly, so ``MCP__*`` does not deny ``mcp__server``."""
+    _write(
+        tmp_path,
+        ".claude/settings.json",
+        json.dumps({"permissions": {"allow": ["mcp__server"], "deny": ["MCP__*"]}}),
+    )
+    result = IDEAgentScanner().scan(tmp_path)
+    risks = [risk for component in result.components for risk in component.risks]
+    scopes = [risk for risk in risks if risk.category == "permission_scope"]
+    assert any(
+        risk.severity == RiskSeverity.MEDIUM and "MCP server tools" in risk.detail
+        for risk in scopes
+    )
+    assert any(risk.category == "oversight_gap" and "mcp__server" in risk.detail for risk in risks)
+
+
+def test_double_star_tool_segment_is_not_a_whole_server_deny() -> None:
+    from nexus_symbiote.core.models import HumanInTheLoop
+    from nexus_symbiote.settings_precedence import resolve_tool_approval
+
+    assert (
+        resolve_tool_approval(
+            "mcp__evil__delete",
+            permissions={"allow": ["mcp__evil"], "deny": ["mcp__evil__**"]},
+        )
+        == HumanInTheLoop.NONE
+    )
+
+
+def test_uppercase_mcp_allow_is_not_a_grant(tmp_path: Path) -> None:
+    assert _broad_grants(["MCP__evil"]) == []
+    _write(
+        tmp_path,
+        ".claude/settings.json",
+        json.dumps({"permissions": {"allow": ["MCP__evil"]}}),
+    )
+    result = IDEAgentScanner().scan(tmp_path)
+    risks = [risk for component in result.components for risk in component.risks]
+    assert not [
+        risk
+        for risk in risks
+        if risk.category == "permission_scope" and risk.severity == RiskSeverity.MEDIUM
+    ]
+    notes = [
+        risk
+        for risk in risks
+        if risk.category == "permission_scope" and risk.severity == RiskSeverity.INFO
+    ]
+    assert len(notes) == 1
+    assert "not lowercase" in notes[0].detail
 
 
 @pytest.mark.parametrize("rule", ["mcp__ *", "mcp__\t*", "mcp__docs  __*"])

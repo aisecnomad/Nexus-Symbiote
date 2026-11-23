@@ -350,9 +350,15 @@ def _runs_any_command(program: str, arguments: str, wildcard: bool = False) -> b
     return name in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(name) is not None
 
 
+def _misspelled_mcp_allow(rule: str) -> bool:
+    """Whether ``rule`` uses ``mcp__`` with the wrong case, which Claude Code ignores."""
+    head = rule.strip().partition("(")[0].strip()
+    return head.lower().startswith("mcp__") and not head.startswith("mcp__")
+
+
 def _deny_covers_every_mcp_server(rules: list[str]) -> bool:
     """Whether a deny list blocks every MCP server, as ``*`` or ``mcp__*`` does."""
-    return any(rule.strip().lower() in {"*", "mcp__*"} for rule in rules)
+    return any(rule.strip() in {"*", "mcp__*"} for rule in rules)
 
 
 def _broad_grants(allowed: list[str]) -> list[str]:
@@ -371,14 +377,15 @@ def _broad_grants(allowed: list[str]) -> list[str]:
                 continue
             specifier = rest[:-1].strip()
         key = tool.lower()
-        if key.startswith("mcp__"):
+        if tool.startswith("mcp__"):
             # Claude Code skips an unanchored allow glob (`mcp__*`, `mcp__*__*`) and
             # an `mcp__` rule with parentheses. A bare `mcp__server` and
-            # `mcp__server__*` (or `mcp__server__**`) auto-approve that server's own tools.
+            # `mcp__server__*` auto-approve that server's own tools. The prefix is
+            # case-sensitive, and only the single token `*` is the server wildcard.
             if not _claude_skips_mcp_allow(rule) and "(" not in rule and ")" not in rule:
-                server, sep, tool_glob = key.removeprefix("mcp__").partition("__")
-                whole_server = not sep or (bool(tool_glob) and set(tool_glob) == {"*"})
-                if whole_server and specifier in (None, "", "*"):
+                server, sep, tool_glob = tool[5:].partition("__")
+                whole_server = not sep or tool_glob == "*"
+                if whole_server and server and specifier in (None, "", "*"):
                     classes.add("MCP server tools")
             continue
         if "*" in key or "?" in key:
@@ -3511,6 +3518,24 @@ class IDEAgentScanner(Scanner):
             mode = properties.get("approval_policy")
             toml_mode = True
         broad = self._broad_permissions(settings or {}, ide_type, result)
+        permissions = (settings or {}).get("permissions")
+        allowed = permissions.get("allow") if isinstance(permissions, dict) else None
+        if (
+            ide_type == "claude-code"
+            and isinstance(allowed, list)
+            and any(isinstance(rule, str) and _misspelled_mcp_allow(rule) for rule in allowed)
+        ):
+            risks.append(
+                RiskAssessment(
+                    severity=RiskSeverity.INFO,
+                    category="permission_scope",
+                    detail=(
+                        f"IDE agent '{ide_type}' declares an allow rule whose mcp__ prefix "
+                        "is not lowercase, so Claude Code does not honour it."
+                    ),
+                    recommendation="Spell the MCP prefix as mcp__.",
+                )
+            )
         if broad:
             risks.insert(
                 0,
