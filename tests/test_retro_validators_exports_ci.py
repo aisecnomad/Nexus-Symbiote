@@ -989,3 +989,156 @@ def test_ambiguous_checks_summarize_identity_rich_candidates_once(
     assert scaling_ratio(run) < 10
     # Every item shares one candidate list, so no item copies its identities.
     assert not merges
+
+
+def _trace_of(tmp_path: Path, spans: list[dict[str, Any]], name: str = "trace.json") -> Path:
+    trace_file = tmp_path / name
+    trace_file.write_text(
+        json.dumps(
+            {"resourceSpans": [{"resource": {"attributes": []}, "scopeSpans": [{"spans": spans}]}]}
+        ),
+        encoding="utf-8",
+    )
+    return trace_file
+
+
+def _span(attributes: dict[str, str]) -> dict[str, Any]:
+    return {
+        "name": "s",
+        "startTimeUnixNano": "1700000000000000000",
+        "endTimeUnixNano": "1700000000100000000",
+        "attributes": [{"key": k, "value": {"stringValue": v}} for k, v in attributes.items()],
+    }
+
+
+def _split_candidate_lists(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Serve every candidate list as two parts, as the ``Candidates`` type allows."""
+    from nexus_symbiote import trace_evidence
+
+    original = trace_evidence._Inventory.candidates
+    halves: dict[int, tuple[list[Any], list[Any]]] = {}
+
+    def split(self: Any, kind: str, values: Any) -> Any:
+        parts = []
+        for found, basis in original(self, kind, values):
+            if len(found) < 2:
+                parts.append((found, basis))
+                continue
+            # One stable pair of lists per original list, so repeated items share parts.
+            first, second = halves.setdefault(id(found), (found[:1], found[1:]))
+            parts.extend([(first, basis), (second, basis)])
+        return parts
+
+    monkeypatch.setattr(trace_evidence._Inventory, "candidates", split)
+
+
+def test_ambiguous_checks_merge_candidates_split_across_lists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Identities and hashes from every part count; a part that omits one leaves it open."""
+    _split_candidate_lists(monkeypatch)
+    h1, h2 = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+    bom = AIBOM(
+        components=[
+            AgentComponent(bom_ref="agent:a", name="planner", workload_identity="spiffe://p/a"),
+            AgentComponent(bom_ref="agent:b", name="planner", workload_identity="spiffe://p/b"),
+            ToolComponent(bom_ref="tool:a", name="search", definition_hash=h1),
+            ToolComponent(bom_ref="tool:b", name="search", definition_hash=h2),
+            AgentComponent(bom_ref="agent:c", name="helper", workload_identity="spiffe://p/c"),
+            AgentComponent(bom_ref="agent:d", name="helper"),
+            ToolComponent(bom_ref="tool:c", name="ping", definition_hash=h1),
+            ToolComponent(bom_ref="tool:d", name="ping"),
+        ]
+    )
+    bom_path = tmp_path / "aibom.json"
+    bom.save(bom_path)
+    agent = {"gen_ai.operation.name": "invoke_agent"}
+    tool = {"gen_ai.operation.name": "execute_tool"}
+    spans = [
+        # The second part's identity and hash match: every part is consulted.
+        _span({**agent, "gen_ai.agent.name": "planner", "spiffe.id": "spiffe://p/b"}),
+        _span({**tool, "gen_ai.tool.name": "search", "gen_ai.tool.definition_hash": h2}),
+        # One part declares nothing: the reported value cannot be confirmed.
+        _span({**agent, "gen_ai.agent.name": "helper", "spiffe.id": "spiffe://p/c"}),
+        _span({**tool, "gen_ai.tool.name": "ping", "gen_ai.tool.definition_hash": h1}),
+    ]
+    doc = collect(bom_path, [_trace_of(tmp_path, spans)], fail_on="undeclared")
+    entries = {e["name"]: e for e in doc["reconciliation"]["ambiguous"]}
+    assert entries["planner"]["workload_identity_matched"] is True
+    assert entries["search"]["definition_hash_matched"] is True
+    assert entries["helper"]["workload_identity_matched"] is None
+    assert entries["ping"]["definition_hash_matched"] is None
+
+
+def test_items_over_the_same_split_lists_reuse_one_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nexus_symbiote import trace_evidence
+
+    _split_candidate_lists(monkeypatch)
+    merges: list[int] = []
+    merge = trace_evidence._merge_runtime
+
+    def counted(summaries: Any) -> Any:
+        merges.append(1)
+        return merge(summaries)
+
+    monkeypatch.setattr(trace_evidence, "_merge_runtime", counted)
+    bom = AIBOM(
+        components=[
+            AgentComponent(
+                bom_ref=f"agent:{i}", name="planner", workload_identity=f"spiffe://p/{i}"
+            )
+            for i in range(3)
+        ]
+    )
+    bom_path = tmp_path / "aibom.json"
+    bom.save(bom_path)
+    spans = [
+        _span(
+            {
+                "gen_ai.operation.name": "invoke_agent",
+                "gen_ai.agent.id": f"x{i}",
+                "gen_ai.agent.name": "planner",
+                "spiffe.id": "spiffe://p/2",
+            }
+        )
+        for i in range(5)
+    ]
+    doc = collect(bom_path, [_trace_of(tmp_path, spans)], fail_on="undeclared")
+    ambiguous = doc["reconciliation"]["ambiguous"]
+    assert len(ambiguous) == 5
+    assert all(entry["workload_identity_matched"] is True for entry in ambiguous)
+    assert merges == [1]
+
+
+def test_a_malformed_definition_hash_never_confirms_a_reported_hash(tmp_path: Path) -> None:
+    good = "sha256:" + "1" * 64
+    bom = AIBOM(
+        components=[
+            ToolComponent(bom_ref="tool:a", name="search", definition_hash="sha256:zz"),
+            ToolComponent(bom_ref="tool:b", name="search", definition_hash="sha256:zz"),
+        ]
+    )
+    bom_path = tmp_path / "aibom.json"
+    bom.save(bom_path)
+    spans = [
+        _span(
+            {
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.name": "search",
+                "gen_ai.tool.definition_hash": good,
+            }
+        )
+    ]
+    doc = collect(bom_path, [_trace_of(tmp_path, spans)], fail_on="undeclared")
+    (entry,) = doc["reconciliation"]["ambiguous"]
+    assert entry["definition_hash_matched"] is False
+
+
+def test_an_inventory_without_a_content_digest_is_recorded_as_none() -> None:
+    from nexus_symbiote.trace_evidence import _inventory_input
+
+    recorded = _inventory_input(Path("aibom.json"), b"{}")
+    assert recorded["content_digest"] is None
+    assert recorded["size"] == 2
