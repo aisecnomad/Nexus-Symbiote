@@ -23,9 +23,11 @@ from nexus_symbiote.control_plane_audit import (
     audit_project_control_plane,
     diff_control_plane_audits,
 )
+from nexus_symbiote.utils.confined import ConfinedCollection
 from tests.support import scaling_ratio
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -1233,3 +1235,125 @@ def test_steering_root_naming_a_real_excluded_directory_stays_quiet(
     summary = audit_project_control_plane(tmp_path)
     assert summary.steering_surfaces == []
     assert summary.gaps == []
+
+
+def _write_always_allowed_filesystem_server(tmp_path: Path, root_arg: str) -> None:
+    # Settings under a linked `.claude` are not walked, so approval comes from the server.
+    _write_json(
+        tmp_path / ".mcp.json",
+        {
+            "mcpServers": {
+                "filesystem": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", root_arg],
+                    "alwaysAllow": ["write_file"],
+                }
+            }
+        },
+    )
+
+
+def _link_claude_to_config(tmp_path: Path) -> None:
+    (tmp_path / "config" / "claude").mkdir(parents=True)
+    (tmp_path / ".claude").symlink_to("config/claude", target_is_directory=True)
+
+
+def _link_claude_md_to_docs(tmp_path: Path) -> None:
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "agent.md").write_text("# rules\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").symlink_to("docs/agent.md")
+
+
+def _chain_claude_through_two_links(tmp_path: Path) -> None:
+    (tmp_path / "b" / "claude").mkdir(parents=True)
+    (tmp_path / "a").symlink_to("b/claude", target_is_directory=True)
+    (tmp_path / ".claude").symlink_to("a", target_is_directory=True)
+
+
+def _link_cursor_rules_to_docs(tmp_path: Path) -> None:
+    (tmp_path / ".cursor").mkdir()
+    (tmp_path / "docs" / "rules").mkdir(parents=True)
+    (tmp_path / ".cursor" / "rules").symlink_to("../docs/rules", target_is_directory=True)
+
+
+@pytest.mark.parametrize(
+    ("layout", "root_arg"),
+    [
+        (_link_claude_to_config, "./config"),
+        (_link_claude_to_config, "./config/claude"),
+        (_link_claude_to_config, "./config/claude/agents"),
+        (_link_claude_to_config, "$PWD/config"),
+        (_link_claude_md_to_docs, "./docs"),
+        (_chain_claude_through_two_links, "./b"),
+        (_link_cursor_rules_to_docs, "./docs"),
+    ],
+)
+def test_steering_root_holding_a_steering_link_target_is_writable(
+    tmp_path: Path, layout: Callable[[Path], None], root_arg: str
+) -> None:
+    layout(tmp_path)
+    _write_always_allowed_filesystem_server(tmp_path, root_arg)
+    summary = audit_project_control_plane(tmp_path)
+    assert [s["writable"] for s in summary.steering_surfaces] == [True]
+    assert any(
+        f["category"] == "steering_surface_writable" and f["severity"] == "critical"
+        for f in summary.findings
+    )
+
+
+@pytest.mark.parametrize("layout", [_link_claude_to_config, _chain_claude_through_two_links])
+def test_steering_root_unrelated_to_a_steering_link_target_stays_quiet(
+    tmp_path: Path, layout: Callable[[Path], None]
+) -> None:
+    layout(tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "configs").mkdir()
+    _write_always_allowed_filesystem_server(tmp_path, "./data")
+    summary = audit_project_control_plane(tmp_path)
+    assert summary.steering_surfaces == []
+    assert not any("filesystem server" in gap for gap in summary.gaps)
+    _write_always_allowed_filesystem_server(tmp_path, "./configs")
+    assert audit_project_control_plane(tmp_path).steering_surfaces == []
+
+
+def test_steering_link_that_cannot_be_resolved_makes_a_root_a_coverage_gap(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "data").mkdir()
+    (tmp_path / ".cursor").symlink_to(tmp_path / "data", target_is_directory=True)
+    _write_always_allowed_filesystem_server(tmp_path, "./data")
+    summary = audit_project_control_plane(tmp_path)
+    assert summary.steering_surfaces == []
+    assert any(
+        "root './data' could not be resolved: steering path .cursor is a symlink" in gap
+        for gap in summary.gaps
+    )
+
+
+def test_linked_steering_targets_are_resolved_once_per_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _link_claude_to_config(tmp_path)
+    original = ConfinedCollection.entry_link
+    calls: list[str] = []
+
+    def counting(self: ConfinedCollection, path: str | Path) -> Path | None:
+        calls.append(str(path))
+        return original(self, path)
+
+    monkeypatch.setattr(ConfinedCollection, "entry_link", counting)
+
+    def lookups(count: int) -> int:
+        calls.clear()
+        servers = {
+            f"filesystem-{index}": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem", f"./data/{index}"],
+            }
+            for index in range(count)
+        }
+        _write_json(tmp_path / ".mcp.json", {"mcpServers": servers})
+        assert audit_project_control_plane(tmp_path).steering_surfaces == []
+        return len(calls)
+
+    assert lookups(1) == lookups(50) > 0

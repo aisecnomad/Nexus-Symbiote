@@ -1625,6 +1625,85 @@ def _is_steering_rel(rel: str) -> bool:
     )
 
 
+_STEERING_SURFACES = tuple(
+    dict.fromkeys(
+        path
+        for path in (
+            *STEERING_PREFIXES,
+            *HOOK_CONFIG_FILES,
+            *MCP_CONFIG_FILES,
+            *PERMISSION_CONFIG_FILES,
+            *_tup(".cursor/rules .claude/commands .claude/agents .claude/skills .claude/hooks"),
+        )
+        if _is_steering_rel(path)
+    )
+)
+_SURFACE_TARGETS: weakref.WeakKeyDictionary[
+    ConfinedCollection, tuple[tuple[str, ...], tuple[str, ...]]
+] = weakref.WeakKeyDictionary()
+
+
+def _surface_target(surface: str, files: ConfinedCollection) -> str:
+    """Where writes to ``surface`` land, following every in-root link on it as the client does."""
+    queue: deque[str] = deque(surface.split("/"))
+    resolved: list[str] = []
+    hops = 0
+    while queue:
+        seg = queue.popleft()
+        target = files.entry_link("/".join([*resolved, seg]))
+        if target is None:
+            resolved.append(seg)
+            continue
+        hops += 1
+        if hops > _MAX_SYMLINK_HOPS:
+            raise CollectionError(f"more than {_MAX_SYMLINK_HOPS} symlinks")
+        resolved = []
+        queue.extendleft(reversed(target.parts))
+    return "/".join(resolved)
+
+
+def _linked_steering_targets(files: ConfinedCollection) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Folded targets of steering surfaces that are links, and why any could not be resolved,
+    computed once per audit so each root costs one pass over a fixed set of surfaces."""
+    cached = _SURFACE_TARGETS.get(files)
+    if cached is None:
+        targets: list[str] = []
+        refused: list[str] = []
+        for surface in _STEERING_SURFACES:
+            try:
+                target = _surface_target(surface, files)
+            except CollectionError as exc:
+                refused.append(
+                    f"steering path {surface} is a symlink that cannot be resolved: {exc}"
+                )
+                continue
+            if target != surface:
+                targets.append(target.casefold())
+        cached = _SURFACE_TARGETS[files] = (tuple(dict.fromkeys(targets)), tuple(refused))
+    return cached
+
+
+def _reaches_steering(rel: str, files: ConfinedCollection, unresolved: list[str] | None) -> bool:
+    if _is_steering_rel(rel):
+        return True
+    # `.claude -> config/claude` makes `config/claude/settings.json` the file Claude Code
+    # reads, so a root holding a surface's target, or inside it, writes that surface.
+    folded = "" if rel == "." else rel.casefold()
+    targets, refused = _linked_steering_targets(files)
+    if any(
+        not folded
+        or not target
+        or target == folded
+        or target.startswith(folded + "/")
+        or folded.startswith(target + "/")
+        for target in targets
+    ):
+        return True
+    if refused and unresolved is not None:
+        unresolved.append(refused[0])
+    return False
+
+
 def _resolve_steering_symlinks(
     raw_rel: str, files: ConfinedCollection, unresolved: list[str] | None = None
 ) -> bool:
@@ -1716,12 +1795,14 @@ def _resolve_steering_symlinks(
         if steps + len(queue) <= _MAX_STEERING_COMPONENTS:
             # Nothing below a missing component can be a link, so the rest is read lexically.
             rest = posixpath.normpath("/".join([*resolved, seg, *queue]))
-            return rest == "." or (rest.split("/")[0] != ".." and _is_steering_rel(rest))
+            return rest == "." or (
+                rest.split("/")[0] != ".." and _reaches_steering(rest, files, unresolved)
+            )
         resolved.append(seg)
     if above > 0:
         return False
     final = "/".join(resolved)
-    return not final or _is_steering_rel(final)
+    return not final or _reaches_steering(final, files, unresolved)
 
 
 def _covers_steering_path(
