@@ -52,6 +52,11 @@ _MAYBE_SPECIAL = re.compile(r"[#`~*+_=<>0-9-]")
 _ATX_HEADING = re.compile(r"#{1,6}(?:[ \t]+|$)")
 _OPENING_FENCE = re.compile(r"(?>`{3,})(?!.*`)|~{3,}")
 _CLOSING_FENCE = re.compile(r"(?:`{3,}|~{3,})(?=[ \t]*$)")
+_MARKED_FENCE_TAIL = re.compile(r"[~`]* *$")
+_MARKED_FENCE_BREAK = re.compile(r" *(?:```|~~~)")
+_MARKED_HTML_DISAGREES = re.compile(
+    r"</(?:script|pre|style|textarea)|<(?:script|pre|style|textarea)[\w-]|</?meta\b", re.I
+)
 _THEMATIC_BREAK = re.compile(r"(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})$")
 _SETEXT_UNDERLINE = re.compile(r"(?:=+|-+)[ \t]*$")
 _LIST_MARKER = re.compile(r"[*+-]|(\d{1,9})[.)]")
@@ -217,11 +222,13 @@ def _union(first: tuple[str, ...] | list[str], second: tuple[str, ...] | list[st
 
 
 def _read_html_dialects(
-    lines: list[str], size: int, *, include_fence: bool = False
+    lines: list[str], size: int, *, include_fence: bool = False, marked: bool = False
 ) -> Iterator[_Reader]:
     """Preserve each complete, bounded block reading when the HTML dialects differ."""
     for ascii_html in (False, True):
-        reader = _Reader(size + _SPARE_MATCHES, include_fence=include_fence, ascii_html=ascii_html)
+        reader = _Reader(
+            size + _SPARE_MATCHES, include_fence=include_fence, ascii_html=ascii_html, marked=marked
+        )
         try:
             for line in lines:
                 reader.read(line)
@@ -241,6 +248,7 @@ def _read_html_dialects(
                     sum(map(len, fragment)) + len(fragment) + _SPARE_MATCHES,
                     include_fence=include_fence,
                     ascii_html=ascii_html,
+                    marked=marked,
                 )
                 try:
                     for line in fragment:
@@ -328,25 +336,41 @@ def text_outside_code(text: str) -> list[str]:
     out. A difference confined to HTML uses both complete block readings. Other
     ambiguities retain the whole file and container and inline-code boundaries. A file that opens
     with front matter is read both whole and without it, and the parts of either
-    reading are returned.
+    reading are returned. What Claude Code's marked reads as text is kept too: list item
+    text as written, and the whole file where marked may read its blocks differently.
     """
     parts = _text_outside_code(text)
     for _, _, body in front_matter_candidates(text):
         parts = _union(parts, _text_outside_code(body))
+    if (last := _unterminated_fence(text)) is not None:
+        parts.append(last)
     return parts
+
+
+def _unterminated_fence(text: str) -> str | None:
+    """A last line with no line end that opens a fence and holds an @, as written.
+
+    marked opens no fence there after a paragraph and reads the line as its text.
+    """
+    last = text[text.rfind("\n") + 1 :]
+    if "@" in last and "\r" not in last:
+        bare = _CONTAINER_MARKS.sub("", last, count=1).lstrip(" \t")
+        if bare.startswith(("```", "~~~")):
+            return last
+    return None
 
 
 def _text_outside_code(text: str) -> list[str]:
     lines = _LINE_END.split(text)
     if text.endswith("\n"):
         lines.pop()
-    reader = _Reader(len(text) + _SPARE_MATCHES)
+    reader = _Reader(len(text) + _SPARE_MATCHES, marked=True)
     try:
         for line in lines:
             reader.read(line)
         reader.finish()
     except _AmbiguousError as exc:
-        readers = list(_read_html_dialects(lines, len(text)))
+        readers = list(_read_html_dialects(lines, len(text), marked=True))
         if _only_html_disagrees(exc, readers):
             # Both readings completed. Each keeps the prose and raw HTML it
             # sees, so a fence agreed by both cannot supply a real import.
@@ -362,18 +386,23 @@ def _text_outside_code(text: str) -> list[str]:
             return parts
         # A quote marker or a closing code span can put an import at the start of
         # rendered text even when the raw file has no whitespace before its @.
-        # Raw HTML has no inline code spans. A repeated line that another
-        # reading places in prose must keep its possible inline boundaries.
-        html_lines = set.intersection(
-            *(
-                {
-                    line
-                    for kind, block in alt.blocks
-                    if kind == "html"
-                    for line in block.split("\n")
-                    if "`@" in line
-                }
-                for alt in readers
+        # Raw HTML has no inline code spans, unless marked reads it as text. A
+        # repeated line that another reading places in prose must keep its possible
+        # inline boundaries.
+        html_lines = (
+            set()
+            if any(alt.marked_html for alt in readers)
+            else set.intersection(
+                *(
+                    {
+                        line
+                        for kind, block in alt.blocks
+                        if kind == "html"
+                        for line in block.split("\n")
+                        if "`@" in line
+                    }
+                    for alt in readers
+                )
             )
         )
         if html_lines:
@@ -415,7 +444,7 @@ def commonmark_block_readings(text: str) -> dict[str, list[tuple[str, str]]]:
     lines = _LINE_END.split(text)
     if text.endswith("\n"):
         lines.pop()
-    reader = _Reader(len(text) + _SPARE_MATCHES, include_fence=True)
+    reader = _Reader(len(text) + _SPARE_MATCHES, include_fence=True, marked=True)
     try:
         for line in lines:
             reader.read(line)
@@ -423,7 +452,7 @@ def commonmark_block_readings(text: str) -> dict[str, list[tuple[str, str]]]:
     except _AmbiguousError as exc:
         # The raw reading keeps unmodeled evidence. A fenced example in that
         # reading must not hide a new prose instruction in another reading.
-        readers = list(_read_html_dialects(lines, len(text), include_fence=True))
+        readers = list(_read_html_dialects(lines, len(text), include_fence=True, marked=True))
         readings: dict[str, list[tuple[str, str]]] = {}
         if not _only_html_disagrees(exc, readers):
             readings["source"] = [("paragraph", "\n".join(lines))]
@@ -434,6 +463,8 @@ def commonmark_block_readings(text: str) -> dict[str, list[tuple[str, str]]]:
         for alternative in readers:
             readings["ascii" if alternative.ascii_html else "unicode"] = alternative.blocks
         return readings
+    if (last := _unterminated_fence(text)) is not None:
+        return {"common": [*reader.blocks, ("literal", last)]}
     return {"common": reader.blocks}
 
 
@@ -441,9 +472,16 @@ class _Reader:
     """commonmark.js block parsing, keeping only what decides code from text."""
 
     def __init__(
-        self, matches: int, *, include_fence: bool = False, ascii_html: bool | None = None
+        self,
+        matches: int,
+        *,
+        include_fence: bool = False,
+        ascii_html: bool | None = None,
+        marked: bool = False,
     ) -> None:
         self.matches = matches
+        # Also keep what Claude Code's marked reads as text, for @path imports.
+        self.marked = marked
         self.include_fence = include_fence
         self.ascii_html = ascii_html
         self.recovered_blocks = False
@@ -456,6 +494,9 @@ class _Reader:
         # paragraph and these blocks as its lazy lines.
         self.after_code: set[int] = set()
         self.code_text = self.after_code_text = self.opened = False
+        self.prior_text = self.marked_item = self.marked_html = False
+        self.marked_margin = -1
+        self.marked_width = 1
         self.stack = [_Block("document")]
         self.line = ""
         self.offset = self.column = 0
@@ -474,6 +515,7 @@ class _Reader:
         self.recovered_blocks = True
 
     def read(self, line: str) -> None:
+        prior_text, self.prior_text = self.prior_text, bool(line.strip(" \t"))
         self.line = line
         self.offset = self.column = 0
         self.blank = self.partial = self.opened = False
@@ -495,6 +537,20 @@ class _Reader:
             container = depth
         self.all_closed = container == old_tip
         self.matched = container
+        # marked keeps the lines after a list item in it where CommonMark ends the item,
+        # up to a blank line and then while lines are indented to the item's content,
+        # unless a line opens a fence at the margin of the last item opened, when that
+        # item is outside any container.
+        if self.prior_text and not prior_text:
+            self.marked_item &= len(line) - len(line.lstrip(" ")) >= self.marked_width
+        if prior_text and self.prior_text and any(b.kind == "item" for b in stack[container + 1 :]):
+            self.marked_item = True
+        if (
+            self.marked_item
+            and (fence_break := _MARKED_FENCE_BREAK.match(line)) is not None
+            and fence_break.end() - 3 <= self.marked_margin
+        ):
+            self.marked_item = False
         leaf = stack[container].kind in ("fence", "indented", "html")
         while not leaf:
             self._find_next_nonspace()
@@ -617,6 +673,14 @@ class _Reader:
                 if closing is not None and len(closing.group()) >= len(block.fence):
                     self._finalize()
                     return 2
+                if (
+                    self.marked
+                    and self.line.startswith(block.fence, self.next_nonspace)
+                    and _MARKED_FENCE_TAIL.match(self.line, self.next_nonspace + len(block.fence))
+                ):
+                    # Claude Code's marked also closes on the opening run followed by any
+                    # ~ or backticks, as in ```~, where CommonMark keeps reading code.
+                    self._block_disagreement()
             skip = block.fence_offset
             while skip > 0 and self._peek(self.offset) in _SPACE_OR_TAB:
                 self._advance(1, columns=True)
@@ -662,6 +726,11 @@ class _Reader:
                 return 2
             fence = _OPENING_FENCE.match(line, at) if char in ("`", "~") else None
             if fence is not None:
+                if self.marked and ("\t" in line[:at] or self.marked_item):
+                    # marked widens each leading tab to four spaces, so it may read
+                    # indented code here, or it may read this fence in a list item that
+                    # ends it, and prose in what CommonMark fences.
+                    self._block_disagreement()
                 self._close_unmatched()
                 block = self._add_child("fence")
                 block.fence = fence.group()
@@ -670,6 +739,15 @@ class _Reader:
                 self._advance(len(block.fence), columns=False)
                 return 2
             if char == "<":
+                if (
+                    self.marked
+                    and self.ascii_html is not True
+                    and _MARKED_HTML_DISAGREES.match(line, at)
+                ):
+                    # marked, which matches JavaScript's white space, reads these tags as
+                    # text, or meta as a block, where CommonMark does the opposite.
+                    self.marked_html = True
+                    self._block_disagreement()
                 lazy = not self.all_closed and not self.blank and self.stack[-1].kind == "paragraph"
                 starts = _ASCII_HTML_BLOCK_STARTS if self.ascii_html else _HTML_BLOCK_STARTS
                 for kind, start in enumerate(starts, 1):
@@ -767,6 +845,10 @@ class _Reader:
             self._add_child("list").marker = kind
         item = self._add_child("item")
         item.marker, item.width = kind, self.indent + padding
+        # marked measures a tab after the marker differently.
+        top = len(self.stack) == 3 and "\t" not in line[: self.offset]
+        self.marked_margin = min(3, item.width - 1) if top else -1
+        self.marked_width = item.width if top else 1
         return True
 
     def _add_line(self) -> None:
@@ -776,6 +858,10 @@ class _Reader:
             if not tip.lines:
                 tip.definition = _may_open_with_definition(content)
             tip.lines.append(content)
+            if self.marked and self.marked_item and "`" in content and "@" in content:
+                # The raw text of the list item marked still reads, as in _finalize.
+                self.parts.append(content)
+                self.blocks.append(("literal", content))
         elif tip.kind in ("indented", "html"):
             self.parts.append(content)
             tip.lines.append(content)
@@ -816,8 +902,30 @@ class _Reader:
                 self.stack[-1].definitions += 1
             self.parts.append(_outside_spans(content))
             self.blocks.append(("paragraph", content))
+            if (
+                self.marked
+                and "`" in content
+                and "@" in content
+                and any(b.kind == "item" for b in self.stack)
+            ):
+                # Claude Code reads imports from a list item's raw text, code spans and
+                # all, where CommonMark and GitHub show code.
+                self.parts.append(content)
+                self.blocks.append(("literal", content))
         elif block.kind in ("html", "indented") or (self.include_fence and block.kind == "fence"):
-            self.blocks.append((block.kind, "\n".join(block.lines)))
+            content = "\n".join(block.lines)
+            self.blocks.append((block.kind, content))
+            if (
+                self.marked
+                and block.kind == "html"
+                and "`@" in content
+                and (self.marked_item or any(b.kind == "item" for b in self.stack))
+            ):
+                # marked may read this as list item text, whose code spans can end
+                # right before an import.
+                inline = _outside_spans(content, import_boundaries_only=True)
+                self.parts.append(inline)
+                self.blocks.append(("literal", inline))
 
 
 def _may_open_with_definition(line: str) -> bool:

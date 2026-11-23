@@ -6,13 +6,18 @@ import ast
 import re
 import warnings
 from collections import Counter, deque
-from collections.abc import Container, Sequence
+from collections.abc import Container, Iterable, Sequence
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import quote
 
 from nexus_symbiote.core.hashing import hash_bytes
-from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolComponent
+from nexus_symbiote.core.models import (
+    ClaimEvidence,
+    MCPServerComponent,
+    RiskAssessment,
+    ToolComponent,
+)
 from nexus_symbiote.scanners.base import KnownValues, ScanResult, declared_server_name
 
 PYTHON_TOOL_HINTS = (
@@ -449,6 +454,43 @@ _TOOL_OPTIONS = frozenset(
 )
 
 
+def _string_constants(roots: Iterable[ast.AST]) -> list[str]:
+    """Every string literal under ``roots``; the trees are parsed already, so walking
+    them whole stays linear and no literal is left behind a node budget."""
+    return [
+        node.value
+        for root in roots
+        for node in ast.walk(root)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+
+
+def _declaration_text_risks(
+    deco: ast.AST,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef | None,
+    source_name: str,
+) -> list[RiskAssessment]:
+    """Rate hidden Unicode characters in a Python tool's docstring, decorator literals and
+    parameter annotations and defaults, which the SDKs put in its description and schema."""
+    payload: dict[str, object] = {}
+    if func_node is not None:
+        doc = ast.get_docstring(func_node, clean=False)
+        if doc:
+            payload["docstring"] = doc
+        parameters = _string_constants([func_node.args])
+        if parameters:
+            payload["parameters"] = parameters
+    if isinstance(deco, ast.Call):
+        strings = _string_constants([*deco.args, *(kw.value for kw in deco.keywords)])
+        if strings:
+            payload["decorator"] = strings
+    if not payload:
+        return []
+    from nexus_symbiote.scanners.prompt import definition_text_risks
+
+    return definition_text_risks(payload, source_name)
+
+
 def _record_decorator(
     deco: ast.Call | ast.Attribute,
     default_name: str,
@@ -456,6 +498,7 @@ def _record_decorator(
     path: Path,
     source_digest: str,
     result: ScanResult,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None,
 ) -> None:
     keywords = deco.keywords if isinstance(deco, ast.Call) else []
     options = {kw.arg: kw.value for kw in keywords}
@@ -481,12 +524,14 @@ def _record_decorator(
             f"{path.as_posix()}:{deco.lineno}: duplicate Python MCP tool declaration"
         )
         return
+    risks = _declaration_text_risks(deco, func_node, f"{path.as_posix()}:{deco.lineno} ({name})")
     result.components.append(
         ToolComponent(
             bom_ref=ref,
             name=name,
             mcp_server_ref=server.bom_ref,
             source_path=path.as_posix(),
+            risks=risks,
             claims={
                 "tool_definition": ClaimEvidence(
                     method="not-collected",
@@ -515,6 +560,7 @@ def _record_sdk_decorator(
     seen_refs: set[str],
     result: ScanResult,
     owner: str | None = None,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None,
 ) -> None:
     """Record one decorated tool; ``owner`` names the agent it is registered on."""
     lineno = getattr(deco, "lineno", 1)
@@ -553,11 +599,13 @@ def _record_sdk_decorator(
         )
         return
     seen_refs.add(ref)
+    risks = _declaration_text_risks(deco, func_node, f"{path.as_posix()}:{lineno} ({name})")
     result.components.append(
         ToolComponent(
             bom_ref=ref,
             name=name,
             source_path=path.as_posix(),
+            risks=risks,
             claims={
                 "tool_definition": ClaimEvidence(
                     method="not-collected",
@@ -625,7 +673,7 @@ def _collect_sdk_decorators(
                 )
                 continue
             _record_sdk_decorator(
-                deco, stmt.name, framework, path, source_digest, seen_refs, result
+                deco, stmt.name, framework, path, source_digest, seen_refs, result, func_node=stmt
             )
     load_uses = {
         node
@@ -746,7 +794,15 @@ def _collect_agent_decorators(
                     )
                     continue
                 _record_sdk_decorator(
-                    deco, stmt.name, framework, path, source_digest, seen_refs, result, owner
+                    deco,
+                    stmt.name,
+                    framework,
+                    path,
+                    source_digest,
+                    seen_refs,
+                    result,
+                    owner,
+                    func_node=stmt,
                 )
     candidates: set[ast.AST] = set(calls)
     candidates.update(
@@ -818,12 +874,18 @@ def _reaches_low_level(nodes: list[ast.AST]) -> bool:
     """Whether the file imports the low-level server or reaches it as an attribute.
 
     Any import of the low-level module, of ``Server``, ``lowlevel`` or ``*`` from
-    ``mcp.server``, and any attribute path (including via simple variable aliases such as
-    ``s = mcp.server; s.Server(...)``) from a name bound to ``mcp`` or ``mcp.server`` to
-    ``lowlevel`` or ``Server`` counts. Earlier bindings are never erased by unrelated
-    imports of the same local name in dead branches.
+    ``mcp.server``, and any attribute path (including via arbitrary-length variable
+    alias chains such as ``a = mcp; b = a; ...; z.server.Server(...)``) from a name
+    bound to ``mcp`` or ``mcp.server`` to ``lowlevel`` or ``Server`` counts. Earlier
+    bindings are never erased by unrelated imports of the same local name in dead
+    branches. Runs in O(N) time via a bounded two-state worklist.
     """
     bound: dict[str, set[str]] = {}
+    name_nodes: dict[str, list[ast.AST]] = {}
+    attr_children: dict[ast.AST, list[tuple[ast.AST, str]]] = {}
+    assign_targets: dict[ast.AST, list[str]] = {}
+    # A walrus expression carries its value's state: ``(a := mcp).server``.
+    carriers: dict[ast.AST, list[ast.AST]] = {}
     for node in nodes:
         if isinstance(node, ast.Import):
             for a in node.names:
@@ -840,46 +902,69 @@ def _reaches_low_level(nodes: list[ast.AST]) -> bool:
                     return True
                 if state is not None:
                     bound.setdefault(a.asname or a.name, set()).add(state)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            name_nodes.setdefault(node.id, []).append(node)
+        elif (access := _attribute_access(node)) is not None:
+            attr_children.setdefault(access[0], []).append((node, access[1]))
+        elif isinstance(node, ast.Assign):
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if targets:
+                assign_targets.setdefault(node.value, []).extend(targets)
+            for target in node.targets:
+                # ``a, b = mcp, x`` binds each name to the value at its position.
+                if (
+                    isinstance(target, (ast.Tuple, ast.List))
+                    and isinstance(node.value, (ast.Tuple, ast.List))
+                    and len(target.elts) == len(node.value.elts)
+                    and not any(
+                        isinstance(e, ast.Starred) for e in (*target.elts, *node.value.elts)
+                    )
+                ):
+                    for bound_name, value in zip(target.elts, node.value.elts, strict=True):
+                        if isinstance(bound_name, ast.Name):
+                            assign_targets.setdefault(value, []).append(bound_name.id)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            if isinstance(node.target, ast.Name):
+                assign_targets.setdefault(node.value, []).append(node.target.id)
+        elif isinstance(node, ast.NamedExpr):
+            assign_targets.setdefault(node.value, []).append(node.target.id)
+            carriers.setdefault(node.value, []).append(node)
     if not bound:
         return False
-    for _ in range(4):
-        states: dict[ast.AST, set[str]] = {}
-        for node in reversed(nodes):
-            if isinstance(node, ast.Name):
-                if node.id in bound:
-                    states[node] = set(bound[node.id])
-            elif (access := _attribute_access(node)) is not None:
-                parent_states = states.get(access[0])
-                if parent_states:
-                    next_states: set[str] = set()
-                    for st in parent_states:
-                        stepped = _low_level_step(st, access[1])
-                        if stepped == _LOW_LEVEL_MODULE:
-                            return True
-                        if stepped is not None:
-                            next_states.add(stepped)
-                    if next_states:
-                        states[node] = next_states
-        grew = False
-        for node in nodes:
-            if isinstance(node, ast.Assign):
-                val_states = states.get(node.value)
-                if val_states:
-                    for target in node.targets:
-                        if isinstance(target, ast.Name):
-                            existing = bound.setdefault(target.id, set())
-                            before = len(existing)
-                            existing.update(val_states)
-                            grew = grew or len(existing) > before
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                val_states = states.get(node.value)
-                if val_states and isinstance(node.target, ast.Name):
-                    existing = bound.setdefault(node.target.id, set())
-                    before = len(existing)
-                    existing.update(val_states)
-                    grew = grew or len(existing) > before
-        if not grew:
-            break
+    node_states: dict[ast.AST, set[str]] = {}
+    pending_nodes: deque[tuple[ast.AST, str]] = deque()
+    for var_name, initial_states in bound.items():
+        for state in initial_states:
+            for expr in name_nodes.get(var_name, ()):
+                seen = node_states.setdefault(expr, set())
+                if state not in seen:
+                    seen.add(state)
+                    pending_nodes.append((expr, state))
+    while pending_nodes:
+        expr, state = pending_nodes.popleft()
+        for attr_node, attr_name in attr_children.get(expr, ()):
+            stepped = _low_level_step(state, attr_name)
+            if stepped == _LOW_LEVEL_MODULE:
+                return True
+            if stepped is not None:
+                seen = node_states.setdefault(attr_node, set())
+                if stepped not in seen:
+                    seen.add(stepped)
+                    pending_nodes.append((attr_node, stepped))
+        for carrier in carriers.get(expr, ()):
+            seen = node_states.setdefault(carrier, set())
+            if state not in seen:
+                seen.add(state)
+                pending_nodes.append((carrier, state))
+        for target_name in assign_targets.get(expr, ()):
+            existing = bound.setdefault(target_name, set())
+            if state not in existing:
+                existing.add(state)
+                for next_expr in name_nodes.get(target_name, ()):
+                    seen = node_states.setdefault(next_expr, set())
+                    if state not in seen:
+                        seen.add(state)
+                        pending_nodes.append((next_expr, state))
     return False
 
 
@@ -1032,10 +1117,20 @@ def _server_from_assignment(
     # The variable is bound once in this file, so path and variable identify the
     # server, where a declared name can repeat; the line is informational and moving
     # it is not a new server.
+    constructor = _string_constants([*call.args, *(kw.value for kw in call.keywords)])
+    risks: list[RiskAssessment] = []
+    if constructor:
+        # The name and instructions a constructor declares reach the model as served.
+        from nexus_symbiote.scanners.prompt import definition_text_risks
+
+        risks = definition_text_risks(
+            {"constructor": constructor}, f"{path.as_posix()}:{stmt.lineno} ({target.id})"
+        )
     server = MCPServerComponent(
         bom_ref=f"mcp-python:{quote(path.as_posix(), safe='')}:{target.id}",
         name=_declared_python_name(call, known) or target.id,
         source_path=path.as_posix(),
+        risks=risks,
         properties={
             "binding": target.id,
             "method": "python-ast",
@@ -1109,7 +1204,9 @@ def _record_decorated_tools(
                 f"{path.as_posix()}:{deco.lineno}: unresolved Python MCP tool name"
             )
             continue
-        _record_decorator(node, stmt.name, servers[receiver], path, source_digest, result)
+        _record_decorator(
+            node, stmt.name, servers[receiver], path, source_digest, result, func_node=stmt
+        )
 
 
 class _Helper(NamedTuple):

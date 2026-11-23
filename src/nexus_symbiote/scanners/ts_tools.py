@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import codecs
 import re
+import sys
 import time
 import warnings
 from collections.abc import Callable, Collection, Iterator
@@ -724,7 +725,11 @@ class _Resolver:
                 for name in names:
                     active[name].pop()
                 continue
-            if node.type in {"identifier", "shorthand_property_identifier"}:
+            if node.type in {
+                "identifier",
+                "shorthand_property_identifier",
+                "shorthand_property_identifier_pattern",
+            }:
                 stack = active.get(_name(node))
                 if stack:
                     self._targets[node.id] = stack[-1]
@@ -770,30 +775,139 @@ def _ordinary_builtin_value(value: Node | None, receiver: str) -> bool:
     )
 
 
+_GLOBAL_OBJECTS = frozenset({"globalThis", "global", "self", "window"})
+
+
+def _collect_arg_builtin_refs(arg: Node, assigned: set[str]) -> None:
+    """Record computed builtins passed by reference directly or through value containers."""
+    pending: list[Node] = [arg]
+    while pending:
+        operand = _operand(pending.pop())
+        if operand is None:
+            continue
+        name = _identifier(operand)
+        if name is not None:
+            if name in _COMPUTED_BUILTINS:
+                assigned.add(name)
+            elif name in _GLOBAL_OBJECTS:
+                assigned.update(_COMPUTED_BUILTINS)
+            continue
+        if operand.type in {"member_expression", "subscript_expression"}:
+            if _identifier(_operand(operand.child_by_field_name("object"))) in _GLOBAL_OBJECTS:
+                prop = _called_method(operand)
+                if prop is None:
+                    assigned.update(_COMPUTED_BUILTINS)
+                elif prop in _COMPUTED_BUILTINS:
+                    assigned.add(prop)
+            continue
+        if operand.type in {"array", "object", "spread_element", "sequence_expression"}:
+            pending.extend(operand.named_children)
+        elif operand.type == "pair":
+            val = operand.child_by_field_name("value")
+            if val is not None:
+                pending.append(val)
+        elif operand.type == "shorthand_property_identifier":
+            shorthand = _name(operand)
+            if shorthand in _COMPUTED_BUILTINS:
+                assigned.add(shorthand)
+            elif shorthand in _GLOBAL_OBJECTS:
+                assigned.update(_COMPUTED_BUILTINS)
+        elif operand.type == "ternary_expression":
+            for field in ("consequence", "alternative"):
+                branch = operand.child_by_field_name(field)
+                if branch is not None:
+                    pending.append(branch)
+        elif operand.type == "binary_expression":
+            for field in ("left", "right"):
+                side = operand.child_by_field_name(field)
+                if side is not None:
+                    pending.append(side)
+        elif operand.type == "assignment_expression":
+            rhs = operand.child_by_field_name("right")
+            if rhs is not None:
+                pending.append(rhs)
+
+
+_VALUE_WRAPPERS = _WRAPPERS - {"sequence_expression"}
+
+
+def _builtin_escapes(node: Node, index: _Index) -> bool:
+    """Whether a bare builtin name is read as a value, which an alias, a closure, a
+    container or a callee can then mutate or replace, rather than as the object of a
+    member access, a callee or a ``typeof`` operand."""
+    child = node
+    parent = index.parent(child)
+    while parent is not None and parent.type in _VALUE_WRAPPERS:
+        child, parent = parent, index.parent(parent)
+    if parent is None:
+        return True
+    if parent.type in {"member_expression", "subscript_expression"}:
+        obj = parent.child_by_field_name("object")
+        return obj is None or obj.id != child.id
+    if parent.type == "call_expression":
+        callee = parent.child_by_field_name("function")
+        return callee is None or callee.id != child.id
+    return parent.type != "unary_expression"
+
+
+def _builtin_aliases(index: _Index) -> tuple[dict[str, set[str]], set[int]]:
+    """Names declared as ``const out = console``, transitively, with the builtins each may
+    hold, and the declarators' name and value nodes. The names are matched by spelling,
+    not scope, so a same-named variable elsewhere over-reports rather than hides."""
+    held_by: dict[str, set[str]] = {}
+    declarators: list[tuple[str, str, int, int]] = []
+    for node in index.nodes:
+        if node.type != "variable_declarator" or node.id in index.erased:
+            continue
+        target = node.child_by_field_name("name")
+        value = _operand(node.child_by_field_name("value"))
+        name, source = _identifier(target), _identifier(value)
+        if target is None or value is None or name is None or source is None:
+            continue
+        if name not in _COMPUTED_BUILTINS:
+            held_by.setdefault(source, set()).add(name)
+            declarators.append((name, source, target.id, value.id))
+    aliases: dict[str, set[str]] = {}
+    pending = [(builtin, builtin) for builtin in _COMPUTED_BUILTINS]
+    while pending:
+        source, builtin = pending.pop()
+        for name in held_by.get(source, ()):
+            if builtin not in aliases.setdefault(name, set()):
+                aliases[name].add(builtin)
+                pending.append((name, builtin))
+    positions = {
+        node_id
+        for name, source, target_id, value_id in declarators
+        if source in _COMPUTED_BUILTINS or source in aliases
+        for node_id in (target_id, value_id)
+    }
+    return aliases, positions
+
+
 def _assigned_computed_builtins(index: _Index) -> set[str]:
     assigned: set[str] = set()
+    # Copying a builtin into a name cannot change it; the copy is followed instead, and
+    # counts once it escapes or a property is assigned through it.
+    aliases, alias_positions = _builtin_aliases(index)
     for node in index.nodes:
         if node.id in index.erased:
+            continue
+        if node.type in {"identifier", "shorthand_property_identifier"}:
+            name = _name(node)
+            held = {name} if name in _COMPUTED_BUILTINS else aliases.get(name, set())
+            if node.type == "identifier" and node.id in alias_positions:
+                continue
+            if held:
+                if _builtin_escapes(node, index):
+                    assigned.update(held)
+            elif name in _GLOBAL_OBJECTS and _builtin_escapes(node, index):
+                assigned.update(_COMPUTED_BUILTINS)
             continue
         if node.type == "call_expression":
             arguments = node.child_by_field_name("arguments")
             if arguments is not None and arguments.type == "arguments":
                 for arg in _parts(arguments):
-                    operand = _operand(arg)
-                    name = _identifier(operand)
-                    if name is not None and name in _COMPUTED_BUILTINS:
-                        assigned.add(name)
-                    elif (
-                        operand is not None
-                        and operand.type in {"member_expression", "subscript_expression"}
-                        and _identifier(_operand(operand.child_by_field_name("object")))
-                        in {"globalThis", "global", "self", "window"}
-                    ):
-                        prop = _called_method(operand)
-                        if prop is None:
-                            assigned.update(_COMPUTED_BUILTINS)
-                        elif prop in _COMPUTED_BUILTINS:
-                            assigned.add(prop)
+                    _collect_arg_builtin_refs(arg, assigned)
             continue
         if node.type not in {"assignment_expression", "augmented_assignment_expression"}:
             continue
@@ -802,12 +916,12 @@ def _assigned_computed_builtins(index: _Index) -> set[str]:
         if target is None or target.type not in {"member_expression", "subscript_expression"}:
             continue
         receiver = _identifier(_operand(target.child_by_field_name("object")))
-        if receiver is not None and receiver in _COMPUTED_BUILTINS:
+        if receiver is not None and (receiver in _COMPUTED_BUILTINS or receiver in aliases):
             if node.type != "assignment_expression" or not _ordinary_builtin_value(
                 node.child_by_field_name("right"), receiver
             ):
-                assigned.add(receiver)
-        elif receiver in {"globalThis", "global", "self", "window"}:
+                assigned.update(aliases.get(receiver, {receiver}))
+        elif receiver in _GLOBAL_OBJECTS:
             property_name = _called_method(target)
             if property_name is None:
                 assigned.update(_COMPUTED_BUILTINS)
@@ -1257,12 +1371,55 @@ def _collect_source(
     scalar_literals = frozenset(
         {"number", "string", "template_string", "true", "false", "null", "undefined", "regex"}
     )
+    reassigned_declarators: set[int] = set()
+    for node in index.nodes:
+        if node.id in index.erased:
+            continue
+        lhs: Node | None = None
+        if node.type in {"assignment_expression", "augmented_assignment_expression"} or (
+            node.type == "for_in_statement" and node.child_by_field_name("kind") is None
+        ):
+            lhs = node.child_by_field_name("left")
+        if lhs is None:
+            continue
+        pending_lhs: list[Node] = [lhs]
+        while pending_lhs:
+            part = _operand(pending_lhs.pop())
+            if part is None:
+                continue
+            if part.type in {
+                "identifier",
+                "shorthand_property_identifier",
+                "shorthand_property_identifier_pattern",
+            }:
+                resolved = resolver.lookup(part)
+                if isinstance(resolved, int):
+                    reassigned_declarators.add(resolved)
+            elif part.type in {
+                "array_pattern",
+                "object_pattern",
+                "rest_pattern",
+                "object_assignment_pattern",
+                "assignment_pattern",
+                "pair_pattern",
+            }:
+                if part.type in {"assignment_pattern", "object_assignment_pattern"}:
+                    target_part = part.child_by_field_name("left")
+                    if target_part is not None:
+                        pending_lhs.append(target_part)
+                elif part.type == "pair_pattern":
+                    val_part = part.child_by_field_name("value")
+                    if val_part is not None:
+                        pending_lhs.append(val_part)
+                else:
+                    pending_lhs.extend(part.named_children)
     aliases = {
         node.id
         for node in index.nodes
         if node.type == "variable_declarator"
         and (
-            (rhs := _operand(node.child_by_field_name("value"))) is None
+            node.id in reassigned_declarators
+            or (rhs := _operand(node.child_by_field_name("value"))) is None
             or rhs.type not in scalar_literals
         )
     }
@@ -1343,11 +1500,21 @@ def _collect_source(
                 f"{location}:{node.start_point.row + 1} (duplicate MCP tool registration)"
             )
             continue
+        from nexus_symbiote.scanners.prompt import detect_invisible_characters
+
+        raw_source = _registration_literal_text(arguments)
+        decoded_source = _decode_js_unicode_escapes(raw_source) if "\\" in raw_source else None
+        tool_risks = detect_invisible_characters(
+            raw_source,
+            f"{location}:{node.start_point.row + 1} ({name})",
+            decoded=decoded_source,
+        )
         tool = ToolComponent(
             bom_ref=ref,
             name=name,
             mcp_server_ref=server.bom_ref,
             source_path=location,
+            risks=tool_risks,
             properties={
                 "declaration_line": node.start_point.row + 1,
                 "method": "typescript-ast",
@@ -1367,3 +1534,53 @@ def _collect_source(
         server.tool_count += 1
         components.append(tool)
     result.components.extend(components)
+
+
+def _registration_literal_text(arguments: Node | None) -> str:
+    """The text of a registration's name and config, without any function in them.
+
+    A handler is code, not text a host shows the model: a sanitizer may name the very
+    characters it strips. Skipping functions also keeps each byte in at most one
+    registration's text, so registrations nested in handlers are read in linear time.
+    """
+    if arguments is None or arguments.text is None:
+        return ""
+    source, base = arguments.text, arguments.start_byte
+    pieces: list[bytes] = []
+    cursor = base
+    pending = [arguments]
+    while pending:
+        part = pending.pop()
+        if part.type in _FUNCTIONS:
+            pieces.append(source[cursor - base : part.start_byte - base])
+            cursor = part.end_byte
+        else:
+            pending.extend(reversed(part.children))
+    pieces.append(source[cursor - base :])
+    return b"".join(pieces).decode("utf-8", "replace")
+
+
+# An escaped backslash is consumed first, so the ``\\u202e`` of a literal backslash
+# followed by ``u202e`` is not read as an escape.
+_JS_UNICODE_ESCAPE_RE = re.compile(
+    r"\\(?:(\\)|u\{([0-9a-fA-F]++)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))"
+)
+
+
+def _decode_js_unicode_escapes(source: str) -> str:
+    """Decode JS/TS hex and Unicode escapes (joining surrogate pairs) for hidden-char checks."""
+
+    def _replace(match: re.Match[str]) -> str:
+        if match.group(1) is not None:
+            return match.group(0)
+        digits = match.group(2) or match.group(3) or match.group(4)
+        stripped = digits.lstrip("0") or "0"
+        if len(stripped) > 6:
+            return match.group(0)
+        code = int(stripped, 16)
+        return chr(code) if code <= sys.maxunicode else match.group(0)
+
+    decoded = _JS_UNICODE_ESCAPE_RE.sub(_replace, source)
+    if any("\ud800" <= ch <= "\udfff" for ch in decoded):
+        decoded = decoded.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+    return decoded
