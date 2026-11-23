@@ -558,3 +558,15 @@ def test_entry_link_reads_an_excluded_link_without_following_it(tmp_path):
         with pytest.raises(CollectionError):
             files.entry_link("node_modules/inner")
     assert failures == []
+
+
+def test_entry_link_enforces_depth_bound_and_reports_non_directory_parent(tmp_path):
+    (tmp_path / "file.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "deep").symlink_to("a/b/c/d/e", target_is_directory=True)
+    failures: list[str] = []
+    with ConfinedCollection(tmp_path, failures, max_depth=2) as files:
+        with pytest.raises(CollectionError, match="not a directory"):
+            files.entry_link("file.txt/child")
+        with pytest.raises(CollectionError, match="too deep"):
+            files.entry_link("deep")
+    assert failures == []

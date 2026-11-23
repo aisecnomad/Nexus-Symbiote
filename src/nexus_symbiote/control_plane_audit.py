@@ -122,6 +122,9 @@ _STEERING_STEPS: weakref.WeakKeyDictionary[ConfinedCollection, int] = weakref.We
 _CONFIG_ALIASES: weakref.WeakKeyDictionary[ConfinedCollection, dict[str, str]] = (
     weakref.WeakKeyDictionary()
 )
+_WALKED_SYMLINKS: weakref.WeakKeyDictionary[ConfinedCollection, tuple[str, ...]] = (
+    weakref.WeakKeyDictionary()
+)
 _SPLIT_SEPARATORS = _words("&& || ; | & ( )") | frozenset({"\n"})
 _SPLIT_CHAR_SET = frozenset(";|&()\n")
 _REDIR_OP_RE = re.compile(r"^(?:[0-9]+)?(?:>>?|<<?<?|>&|<&|&>>?|>\||<>)$")
@@ -163,9 +166,12 @@ _VERSIONED_PYTHON_RE = re.compile(r"^python[0-9]+(?:\.[0-9]+)?$")
 _NODE_PACKAGE_IMPORT = re.compile(
     r"((?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*)(?:/[A-Za-z0-9_][\w.-]*)*", re.ASCII
 )
+# Only `[A-Za-z0-9_|]+` split on `|` is an exact-name list across Claude Code versions
+# and events (including `FileChanged` and `StopFailure`); spaces, commas and `-` are regexes.
 _PLAIN_MATCHER_RE = re.compile(r"[A-Za-z0-9_|]+")
-_MATCHER_SPLIT_RE = re.compile(r"\|")
-_SPIFFE_RE = re.compile(r"^spiffe://[a-z0-9.-]+/[A-Za-z0-9._/-]+$")
+_IF_TOOL_EVENTS = frozenset(
+    {"PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "PermissionDenied"}
+)
 _KNOWN_EVENTS = frozenset(
     [
         "PreToolUse",
@@ -181,9 +187,7 @@ _KNOWN_EVENTS = frozenset(
         "SubagentTurn",
     ]
 )
-_TOOL_EVENTS = frozenset(
-    ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "PermissionDenied"]
-)
+_SPIFFE_RE = re.compile(r"^spiffe://[a-z0-9.-]+/[A-Za-z0-9._/-]+$")
 
 
 def _clean(val: Any) -> str:
@@ -1211,39 +1215,45 @@ def _setting_digest(value: Any) -> str:
     return _sha256_hex(text.encode())
 
 
+def _hook_event_key(raw_event: str) -> tuple[str, bool]:
+    """Neutralized event key that never collides across raw whitespace or control variants."""
+    cleaned = _clean(raw_event)
+    if cleaned != raw_event:
+        digest = _sha256_hex(raw_event.encode("utf-8", errors="replace"))[:12]
+        return f"{cleaned}:{digest}", True
+    return cleaned, False
+
+
 def _hook_state(
-    matcher: Any,
-    hook_type: Any,
-    condition: Any,
-    disabled: bool,
-    event: str = "",
+    matcher: Any, hook_type: Any, condition: Any, disabled: bool, event_name: str
 ) -> dict[str, Any]:
     """What decides whether a hook still runs, as digests so no configuration text is copied.
 
     An absent, empty or `*` matcher matches every tool. A matcher of letters, digits,
-    `_` and `|` is a list of exact tool names separated by `|`; any other matcher
-    (including one with commas, spaces or hyphens) is an unanchored regular expression
-    to Claude Code, so it is compared by digest alone, as the `if` filter always is.
-
-    An ``if`` filter is evaluated only on tool events. On other events a hook with
-    ``if`` set never runs, so ``runs_command`` is False.
+    `_` and `|` (with non-empty segments) is a list of exact names, recorded so a later
+    matcher can be shown to match everything it matched; any other matcher (including
+    spaces, commas or `-`) is compared by digest alone, as the `if` filter always is.
+    An `if` filter on a non-tool event never runs. An unrecognized event name
+    also sets ``runs_command`` to False, failing closed.
     """
     digest: str | None = None
     names: list[str] | None = None
     if matcher not in (None, "", "*"):
         digest = _setting_digest(matcher)
         if isinstance(matcher, str) and _PLAIN_MATCHER_RE.fullmatch(matcher):
-            items = set(_MATCHER_SPLIT_RE.split(matcher)) - {""}
-            names = sorted(_sha256_hex(item.encode()) for item in items) or None
+            parts = matcher.split("|")
+            if all(parts):
+                names = sorted(_sha256_hex(item.encode()) for item in set(parts))
     is_command = hook_type is None or hook_type == "command"
-    if_blocks = condition is not None and event not in _TOOL_EVENTS
-    known = event in _KNOWN_EVENTS or not event
+    if_ok = condition is None or event_name in _IF_TOOL_EVENTS
+    known = event_name in _KNOWN_EVENTS or not event_name
+    runs_command = is_command and if_ok and known
     return _rec(
         matcher_digest=digest,
         matcher_names=names,
         if_digest=None if condition is None else _setting_digest(condition),
         hook_type=None if hook_type is None else _clean(hook_type)[:64],
-        runs_command=is_command and not if_blocks and known,
+        runs_command=runs_command,
         hooks_disabled=disabled,
     )
 
@@ -1267,10 +1277,18 @@ def _inspect_hooks_and_preambles(
             else doc.get("disableAllHooks") is True
         )
         for raw_event, cmd_str, matcher, hook_type, condition in _iter_hook_commands(doc):
-            event_name = str(raw_event)
+            event_name, altered = _hook_event_key(raw_event)
+            if altered:
+                _add_gap(
+                    summary.gaps,
+                    f"{cfg_path}: hook event '{event_name}' contains whitespace or non-printable characters",
+                )
             if event_name not in _KNOWN_EVENTS:
-                _add_gap(summary.gaps, f"{cfg_path}: unrecognized hook event '{_clean(raw_event)}'")
-            state = _hook_state(matcher, hook_type, condition, disabled, event=event_name)
+                _add_gap(
+                    summary.gaps,
+                    f"{cfg_path}: unrecognized hook event '{_clean(raw_event)}'",
+                )
+            state = _hook_state(matcher, hook_type, condition, disabled, event_name)
             summary.hook_commands.append(
                 _rec(
                     source_file=cfg_path,
@@ -1723,7 +1741,10 @@ _STEERING_SURFACES = tuple(
             *HOOK_CONFIG_FILES,
             *MCP_CONFIG_FILES,
             *PERMISSION_CONFIG_FILES,
-            *_tup(".cursor/rules .claude/commands .claude/agents .claude/skills .claude/hooks"),
+            *_tup(
+                ".cursor/rules .claude/commands .claude/agents .claude/skills "
+                ".claude/hooks .claude/rules .claude/CLAUDE.md"
+            ),
         )
         if _is_steering_rel(path)
     )
@@ -1750,6 +1771,12 @@ def _surface_target(surface: str, files: ConfinedCollection) -> str:
         resolved = []
         queue.extendleft(reversed(target.parts))
     return "/".join(resolved)
+
+
+def _format_surface_refusal(surface: str, exc: CollectionError) -> str:
+    if isinstance(exc.__cause__, NotADirectoryError):
+        return f"steering path {surface} cannot be resolved: {exc}"
+    return f"steering path {surface} is a symlink that cannot be resolved: {exc}"
 
 
 def _alias_linked_claude(files: ConfinedCollection, all_paths: list[str], gaps: list[str]) -> None:
@@ -1783,22 +1810,64 @@ def _alias_linked_claude(files: ConfinedCollection, all_paths: list[str], gaps: 
 
 def _linked_steering_targets(files: ConfinedCollection) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Folded targets of steering surfaces that are links, and why any could not be resolved,
-    computed once per audit so each root costs one pass over a fixed set of surfaces."""
+    computed once per audit across the fixed surfaces and every walked symlink beneath them."""
     cached = _SURFACE_TARGETS.get(files)
     if cached is None:
         targets: list[str] = []
+        target_set: set[str] = set()
         refused: list[str] = []
+        checked: set[str] = set()
         for surface in _STEERING_SURFACES:
+            checked.add(surface)
             try:
                 target = _surface_target(surface, files)
             except CollectionError as exc:
-                refused.append(
-                    f"steering path {surface} is a symlink that cannot be resolved: {exc}"
-                )
+                refused.append(_format_surface_refusal(surface, exc))
                 continue
             if target != surface:
-                targets.append(target.casefold())
-        cached = _SURFACE_TARGETS[files] = (tuple(dict.fromkeys(targets)), tuple(refused))
+                folded_target = target.casefold()
+                if folded_target not in target_set:
+                    target_set.add(folded_target)
+                    targets.append(folded_target)
+        walked_links = _WALKED_SYMLINKS.get(files, ())
+        walked_resolved = 0
+        budget_exceeded = False
+        frontier = tuple(targets)
+        for pass_index in range(_MAX_SYMLINK_HOPS):
+            new_targets: list[str] = []
+            for link in walked_links:
+                if link in checked:
+                    continue
+                folded_link = link.casefold()
+                under_steering = pass_index == 0 and _is_steering_rel(link)
+                if not under_steering and not any(
+                    not t or folded_link == t or folded_link.startswith(t + "/") for t in frontier
+                ):
+                    continue
+                checked.add(link)
+                if walked_resolved >= _MAX_STEERING_COMPONENTS:
+                    refused.append(
+                        f"more than {_MAX_STEERING_COMPONENTS} steering symlinks; "
+                        "remaining links were not resolved"
+                    )
+                    budget_exceeded = True
+                    break
+                walked_resolved += 1
+                try:
+                    target = _surface_target(link, files)
+                except CollectionError as exc:
+                    refused.append(_format_surface_refusal(link, exc))
+                    continue
+                if target != link:
+                    folded_target = target.casefold()
+                    if folded_target not in target_set:
+                        target_set.add(folded_target)
+                        targets.append(folded_target)
+                        new_targets.append(folded_target)
+            if budget_exceeded or not new_targets:
+                break
+            frontier = tuple(new_targets)
+        cached = _SURFACE_TARGETS[files] = (tuple(targets), tuple(refused))
     return cached
 
 
@@ -2968,7 +3037,10 @@ def audit_project_control_plane(
             summary.gaps.append(f"{neutralize(claims_path.name)}: invalid JSON")
 
     with ConfinedCollection(project_root, summary.gaps) as files:
-        all_paths = sorted(p.as_posix() for p in files.iter_files())
+        walked_symlinks: list[Path] = []
+        all_paths = sorted(p.as_posix() for p in files.iter_files(symlinks=walked_symlinks))
+        if walked_symlinks:
+            _WALKED_SYMLINKS[files] = tuple(dict.fromkeys(p.as_posix() for p in walked_symlinks))
         # Directories carry a trailing '/', so an operand naming one is not read as a script.
         project_paths = frozenset(all_paths).union(
             p[: i + 1] for p in all_paths for i, c in enumerate(p) if c == "/"
