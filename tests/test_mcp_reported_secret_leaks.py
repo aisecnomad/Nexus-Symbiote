@@ -135,6 +135,43 @@ def test_a_left_to_right_mark_inside_base64_does_not_hide_the_key(tmp_path: Path
     assert MARKED.replace("\u200e", "") not in exported
 
 
+def test_flags_between_a_scheme_and_its_token_are_all_skipped(tmp_path: Path) -> None:
+    bad = {
+        "command": "npx",
+        "args": ["-y", "x@1", "--auth", "bearer", "--tls", "--insecure", SECRET],
+    }
+    assert SECRET not in _mcp(tmp_path, bad, SECRET)
+
+
+def test_an_env_list_of_any_length_withholds_its_value(tmp_path: Path) -> None:
+    bad = {
+        "command": "npx",
+        "args": ["-y", "x@1"],
+        "env": ["API_TOKEN", SECRET, "1", "extra"],
+    }
+    assert SECRET not in _mcp(tmp_path, bad, SECRET)
+
+
+@pytest.mark.parametrize("mark", ["\u200b", "\u202e"])
+def test_a_password_mark_does_not_hide_the_unmarked_token(tmp_path: Path, mark: str) -> None:
+    marked = SECRET[:8] + mark + SECRET[8:]
+    bad = {"command": "npx", "args": ["-y", "x@1", "--password", marked]}
+    assert marked not in _mcp(tmp_path, bad, SECRET)
+    assert SECRET not in _mcp(tmp_path, bad, SECRET)
+
+
+def test_password_decoys_past_the_position_cap_do_not_publish_the_real_secret(
+    tmp_path: Path,
+) -> None:
+    args: list[str] = []
+    for index in range(70):
+        args.extend(["--password", f"DecoySecret{index:04d}Xx"])
+    args.extend(["--password", SECRET])
+    args.extend(["pad"] * (1001 - len(args)))
+    assert len(args) > 1000
+    assert SECRET not in _mcp(tmp_path, {"command": "npx", "args": args}, SECRET)
+
+
 def test_whitespace_only_command_changes_the_static_config_hash(tmp_path: Path) -> None:
     def digest(command: str) -> str:
         text = _scan(
@@ -153,6 +190,8 @@ def test_whitespace_only_command_changes_the_static_config_hash(tmp_path: Path) 
     assert digest(" npx") != plain
     assert digest("npx\t") != plain
     assert digest("npx ") != digest(" npx")
+    assert digest("npx\u00a0") != plain
+    assert digest("npx\u200b") != plain
 
 
 @pytest.mark.parametrize(

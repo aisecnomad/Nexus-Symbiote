@@ -331,6 +331,20 @@ def name_words(name: str) -> list[str]:
     return [word.lower() for word in _NAME_PARTS.split(name) if word and not word.isdigit()]
 
 
+def credential_spellings(value: str) -> tuple[str, ...]:
+    """``value`` and the same credential with format, bidi and zero-width characters removed.
+
+    A sibling can repeat ``--password`` text without the U+200B or U+202E that the
+    launch value used to disguise it. Those characters are category Cf, as are the
+    other bidi controls and zero-width marks, so the plain spelling is what matching
+    compares.
+    """
+    plain = "".join(char for char in value if unicodedata.category(char) != "Cf")
+    if plain and plain != value and len(plain) >= MIN_SECRET_LENGTH:
+        return (value, plain)
+    return (value,)
+
+
 def credential_name(name: str) -> bool:
     """Whether ``name`` names a credential, by its words rather than by a substring.
 
