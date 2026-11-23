@@ -1239,11 +1239,11 @@ A way around a limit that its entry does not describe is worth a
   right before an import, so a fenced example there can count as an import. A name that only Claude Code's reading gives and that names
   no file is skipped silently: it is looked up only by its exact spelling, so it
   raises no credential or case-variant gap, and a case variant of it on a
-  case-insensitive file system is not found. Nor does such a name raise a gap when it
-  leaves the project root or is too long to look up, since it may name nothing Claude
-  Code reads: `See (https://unpkg.com/@../../x.md).` passes `scan --check`, and so
-  does `**@../x.md**`, though Claude Code imports `../x.md` from it, while
-  `Follow @../x.md.` fails. A name is cut at each markup character
+  case-insensitive file system is not found. Such a name that leaves the project root
+  or is too long to look up is a gap, as Claude Code imports `../x.md` from
+  `**@../x.md**`; where marked may start a reference after markup but does not, as in
+  `a*@../x.md`, the gap is a false one and fails closed. An `@` inside a URL path, as
+  in `(https://unpkg.com/@../../x.md)`, starts no reference. A name is cut at each markup character
   except a run of `_` between two letters or digits, where marked opens no emphasis,
   so `**@a_b_c.md**` imports `a_b_c.md`. A file with more than 2,000 places where such
   a reference can start, or whose references yield more than 32,000 names or more

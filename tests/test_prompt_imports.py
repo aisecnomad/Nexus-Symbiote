@@ -800,20 +800,35 @@ def test_reading_markdown_grows_with_the_text_not_with_its_nesting(shape):
     assert scaling_ratio(lambda scale: prompt._import_tokens(texts[scale])) < 2.5 * growth
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "See the docs (https://unpkg.com/@../../x.md).\n",
-        "Use a*@../../x.md for it.\n",
-        "Use a*@" + "x" * 300 + ".md for it.\n",
-    ],
-    ids=["URL path", "after an asterisk", "long name after an asterisk"],
-)
-def test_a_name_only_claude_codes_reading_gives_raises_no_gap(tmp_path, text):
-    # Claude Code 2.1.42 and 2.1.330 import nothing from these.
-    _write(tmp_path, "CLAUDE.md", text)
+def test_an_at_sign_inside_a_url_path_raises_no_gap(tmp_path):
+    # Claude Code 2.1.42 and 2.1.330 import nothing here: marked starts no text token at
+    # an `@` after `/`.
+    _write(tmp_path, "CLAUDE.md", "See the docs (https://unpkg.com/@../../x.md).\n")
     result = PromptScanner().scan(tmp_path)
     assert not result.scan_failures and not result.surfaces_excluded
+
+
+@pytest.mark.parametrize("text", ["**@../x.md**\n", "**@~/x.md**\n", "_@../x.md_\n"])
+def test_a_name_after_markup_that_leaves_the_root_raises_its_gap(tmp_path, text):
+    # Claude Code imports `../x.md` and `~/x.md` from these, from outside the root.
+    _write(tmp_path, "CLAUDE.md", text)
+    result = PromptScanner().scan(tmp_path)
+    assert result.surfaces_excluded == [
+        "CLAUDE.md: imports a file outside the project root, which is not inventoried"
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Use a*@../../x.md for it.\n", "Use a*@" + "x" * 300 + ".md for it.\n"],
+    ids=["after an asterisk", "long name after an asterisk"],
+)
+def test_a_name_marked_may_start_after_markup_fails_closed(tmp_path, text):
+    # Claude Code imports nothing here, but an `@` after `*` can open a text token, so
+    # the name is a gap rather than a silent miss.
+    _write(tmp_path, "CLAUDE.md", text)
+    result = PromptScanner().scan(tmp_path)
+    assert result.surfaces_excluded
 
 
 def test_a_name_both_readings_give_still_raises_its_gap(tmp_path):

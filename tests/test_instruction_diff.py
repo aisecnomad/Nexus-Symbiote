@@ -861,9 +861,7 @@ def test_a_name_with_more_than_sixteen_markup_characters_is_an_added_import(
 
 
 @pytest.mark.parametrize(
-    "text",
-    ["See the docs (https://unpkg.com/@../../x.md).\n", "Use a*@" + "x" * 300 + ".md for it.\n"],
-    ids=["URL path", "long name after an asterisk"],
+    "text", ["See the docs (https://unpkg.com/@../../x.md).\n"], ids=["URL path"]
 )
 def test_a_name_only_claude_codes_reading_gives_raises_no_gap(tmp_path: Path, text: str) -> None:
     base = tmp_path / "base"
