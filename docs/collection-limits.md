@@ -26,7 +26,12 @@ Raising a limit moves the point where collection stops. It never turns a reporte
 stop into a silent one and never relaxes a gate, and lowering one can only add
 failures.
 
-Project-policy discovery uses the same operator `entries` budget. It must finish listing the project root before selecting a policy or applying defaults. If that listing exceeds the bound, the command refuses before writing an inventory; it does not silently assume there is no policy. `--no-project-policy` bypasses policy discovery while collectors retain their own entry budgets.
+Project-policy discovery has its own directory-listing budget, using the same
+operator `entries` value. It must finish listing the project root before selecting
+a policy or applying defaults. If that listing exceeds the bound, the command
+refuses before writing an inventory; it does not silently assume there is no
+policy. An operator who explicitly chooses `--no-project-policy` bypasses policy
+discovery, while the collectors retain their own entry budgets.
 
 - [Set a limit](#set-a-limit)
 - [Limits](#limits)
@@ -98,8 +103,8 @@ for a budget of `N` entries, an overflowing listing observes at most `N + 1`
 entries. Partial exact-name indexes are never used. Complete indexes can be reused
 without another listing; listing a changed directory spends the shared budget
 again. Entries observed before an I/O error still spend that budget. These are
-input and work bounds, not a process sandbox or a wall-clock deadline. Keep an
-external job timeout.
+input and work bounds, not a process sandbox or a wall-clock
+deadline. Keep an external job timeout for the complete operation.
 
 ### Source files the mcp collector searches
 
@@ -185,8 +190,8 @@ inventory.
 
 ## Why these defaults
 
-Most defaults match earlier releases. Five changed because ordinary projects
-exceeded them:
+Most defaults are the values earlier releases used. Five changed because
+ordinary projects exceeded them:
 
 - `entries` was 20,000. Mid-size monorepos, and working trees with tool caches
   such as `.tox`, `.nox` or a vendored `site-packages`, have more files and

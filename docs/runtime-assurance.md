@@ -19,17 +19,15 @@ surrounding runtime, credentials, sandbox and network policy.
 Every authorization denial raises `AuthorizationError` with a stable `reason`
 code. Exceptions raised by the operator's adapters propagate unchanged. Before
 admission, a failure prevents the gateway from calling `execute`. After admission,
-`execute` can perform an external action and then raise, for example when its
-response times out. That is an admitted attempt with an unknown execution outcome;
-the exception does not prove denial or the absence of side effects, even if its type
-is `AuthorizationError`.
-
-An `admitted` decision records authorization, not execution success. Record the
-executor's outcome separately and reconcile it before retrying, using
-executor-supported idempotency where available. The approval nonce remains consumed;
-obtaining a fresh approval alone does not make a retry safe. The
-[worked example](runtime-contract-reference.md#worked-example) shows this distinction
-with a synthetic side effect.
+`execute` can perform an external action and then raise, for example when its response times out. That
+is an admitted attempt with an unknown execution outcome; the exception does not
+prove denial or the absence of side effects, even if its type is
+`AuthorizationError`. An `admitted` decision records authorization, not execution
+success. Record the executor's outcome separately and reconcile it before
+retrying, using executor-supported idempotency where available. The approval
+nonce remains consumed; obtaining a fresh approval alone does not make a retry
+safe. The [worked example](runtime-contract-reference.md#worked-example) shows
+this distinction with a synthetic side effect.
 
 `invoke_pinned_stdio` starts the pinned launcher and completes the MCP `initialize`
 handshake when the gateway first asks for the served descriptor, after it has checked
@@ -101,45 +99,43 @@ revocation lists use, and `runtime key-id` prints a key ID. The
 [contract reference](runtime-contract-reference.md#contracts) shows the fields of
 `approved-snapshot.json` and the other contracts.
 
-The sign command accepts an explicit contract rather than granting authority to a scan
-result automatically. It refuses a contract that could never verify (validity window
-longer than the purpose allows or already ended), refuses a private key file that
-gives its group or others any permission or that the user running the command does not
-own (even when that user is root), and prints the contract digest.
-
-`--passphrase-file` encrypts a new private key or unlocks an encrypted one; a
-passphrase file is refused on the same terms, and `runtime keygen` keeps neither key
-if either cannot be written. Keys held in a KMS, an HSM or an agent sign through
-`sign_contract` with any object that has `sign(data)` and `public_key()`.
+The sign command accepts an explicit contract rather than granting authority
+to a scan result automatically. It refuses a contract that could never verify,
+because its validity window is longer than its purpose allows or has already
+ended, refuses a private key file that gives its group or others any permission or that the
+user running the command does not own, even when that user is root, and prints
+the contract digest. `--passphrase-file` encrypts a new private key or unlocks an
+encrypted one; a passphrase file is refused on the same terms, and
+`runtime keygen` keeps neither key if either cannot be written. Keys held in a
+KMS, an HSM or an agent sign through `sign_contract` with any object that has
+`sign(data)` and `public_key()`.
 
 Outputs use DSSE pre-authentication encoding and in-toto statements. Complete
 companion content is digest-bound; selective disclosure is not supported by this
-profile. Existing files are not overwritten.
-
-Verification requires the expected purpose, an authorized key set, distinct signers,
-subject consistency, schema validity and the current validity window. Envelopes may
-use the standard or the URL-safe base64 alphabet in canonical form, and a signature
-without a matching `keyid` is tried against each trusted key.
-
+profile. Existing files are not overwritten. Verification requires the expected
+purpose, an authorized key set, distinct signers, subject consistency, schema
+validity and the current validity window. Envelopes may use the standard or the
+URL-safe base64 alphabet in canonical form, and a signature without a matching
+`keyid` is tried against each trusted key.
 Predicates must be in canonical contract form, the form `runtime sign` emits
 (`model_dump(mode="json")`): an envelope from another DSSE signer whose predicate
-encodes the same contract differently is rejected, so one contract has exactly one
-digest. `revoked_snapshots` entries and `ActionApproval.snapshot_digest` use that
-digest, which `runtime sign`, `runtime verify` and `runtime digest` print as `digest`.
-
+encodes the same contract differently is rejected, so one contract has exactly
+one digest. `revoked_snapshots` entries and `ActionApproval.snapshot_digest` use
+that digest, which `runtime sign`, `runtime verify` and `runtime digest` print as
+`digest`.
 `sign_contract` re-validates a contract before signing it and refuses one that does
 not validate or is not already in canonical form, such as a copy made with
 `model_copy(update=...)` that holds a non-UTC timestamp. The signer's digest of the
 contract it holds is therefore the digest the envelope binds.
-
 `revoked_snapshots` and `revoked_tools` entries must be `sha256:` followed by 64
-lowercase hexadecimal digits, `revoked_signers` entries must be a 64-digit lowercase
-key ID, and `revoked_endpoints` entries, like a grant's `endpoint_identity`, must be a
-pinned launcher identity or a canonical URL as the
-[reference](runtime-contract-reference.md#endpoint-identities) defines it. Revocation
-entries are compared verbatim, so any other form is rejected when the trust status is
-signed or verified instead of being ignored. The CLI reports contract verification
-separately from invocation authorization, and every failure ends with its reason code.
+lowercase hexadecimal digits, `revoked_signers` entries must be a 64-digit
+lowercase key ID, and `revoked_endpoints` entries, like a grant's
+`endpoint_identity`, must be a pinned launcher identity or a canonical URL as the
+[reference](runtime-contract-reference.md#endpoint-identities) defines it.
+Revocation entries are compared verbatim, so any other form is rejected when the
+trust status is signed or verified instead of being ignored.
+The CLI reports contract verification separately from invocation authorization,
+and every failure ends with its reason code.
 
 `ReferenceGateway` accepts independent `snapshot_threshold`, `approval_threshold`
 and `trust_threshold` keyword arguments. Each defaults to `1`; set a larger value
@@ -186,50 +182,46 @@ Construct `ReferenceGateway` with these callbacks:
   argument values. Send it to an audit log.
 
 The gateway checks exact grants, endpoint identity, descriptor digest, offline
-input-schema validity, request-bound approval and revocation before execution. The
-descriptor digest covers `name`, `description`, `inputSchema`, `annotations`, `title`,
-`outputSchema` and `_meta`; a descriptor with any other field, such as `icons`, fails
-closed until the digest profile is upgraded.
-
-Arguments and the served descriptor are copied before checking, so validation uses the
-same descriptor that was digested; schema references cannot trigger network retrieval.
-The workload identity is checked again before admission, and contract and signer-scope
-validity and the approver quorum are rechecked in the admission transaction. The
-decision callback runs after admission and before execution.
-
-The executor and scope resolver receive the RFC 8785 canonical JSON value that the
-approval binds by default (`canonical_arguments=True`), with keys in RFC 8785 order
-and integral floats between -(2^53 - 1) and 2^53 - 1 converted to integers,
-eliminating parser-differential ambiguities between approval digesting and backend
-execution. If a backend explicitly requires the caller's original key order or
-float-vs-integer Python type, construct the gateway with `canonical_arguments=False`
-and enforce argument canonicality in `resolve_scope`. Integers and integral floats
-must lie between -(2^53 - 1) and 2^53 - 1 in all modes; pass larger values, such as
-64-bit IDs, as strings.
+input-schema validity, request-bound approval and revocation before execution.
+The descriptor digest covers `name`, `description`, `inputSchema`,
+`annotations`, `title`, `outputSchema` and `_meta`; a descriptor with any other
+field, such as `icons`, fails closed until the digest profile is upgraded.
+Arguments and the served descriptor are copied before checking, so validation uses
+the same descriptor that was digested; schema references cannot trigger network
+retrieval. The workload identity is checked again before admission, and contract
+and signer-scope validity and the approver quorum are rechecked in the admission
+transaction. The decision callback runs after admission and before execution.
+The executor and scope resolver receive the RFC 8785 canonical JSON value that
+the approval binds by default (`canonical_arguments=True`), with keys in RFC
+8785 order and integral floats between -(2^53 - 1) and 2^53 - 1 converted to
+integers, eliminating parser-differential ambiguities between approval digesting
+and backend execution. If a backend explicitly requires the caller's original
+key order or float-vs-integer Python type, construct the gateway with
+`canonical_arguments=False` and enforce argument canonicality in
+`resolve_scope`. Integers and integral floats must lie between -(2^53 - 1) and
+2^53 - 1 in all modes; pass larger values, such as 64-bit IDs, as strings.
 
 Schema validity does not bound validation cost. Approved tool schemas and hostile
 arguments are checked in disposable isolated Python workers with a 256 MiB
-address-space limit. macOS refuses that limit, so workers there run without it; on
-every other platform a worker that cannot set it fails closed.
-
-Interpreter start-up and imports have their own budget of ten seconds of wall time and
-ten CPU seconds; the evaluation then gets a two-second wall deadline and at least one
-CPU second, so a slow or throttled host does not spend the evaluation budget on
-start-up. Call `check_validation_worker()` at start-up or from a readiness probe to
-find a host where the worker cannot run.
-
-Validation requires POSIX resource limits and fails closed if a worker cannot start,
-crashes, times out or returns an invalid result. At most four validations run
-concurrently in one gateway process. A capacity refusal or timeout during
-authorization leaves the approval available for a retry. Validation errors after
-dispatch leave an unknown execution outcome.
-
-JSON input is bounded to 32 levels and 20,000 nodes per value, 256 KiB per served
-descriptor/schema and 1 MiB per argument object. Deployments must also rate-limit
-requests and bound the trusted authentication, description, scope and execution
-adapters. Workers load the reviewed package installed in the gateway's Python
-environment using isolated mode; a source tree available only through `PYTHONPATH` is
-insufficient and fails closed.
+address-space limit. macOS refuses that limit, so workers there run without it;
+on every other platform a worker that cannot set it fails closed. Interpreter
+start-up and imports have their own budget of
+ten seconds of wall time and ten CPU seconds; the evaluation then gets a
+two-second wall deadline and at least one CPU second, so a slow or throttled
+host does not spend the evaluation budget on start-up. Call
+`check_validation_worker()` at start-up or from a readiness probe to find a host
+where the worker cannot run. Validation requires POSIX resource limits and fails
+closed if a worker cannot start, crashes, times out or returns an invalid result.
+At most four validations run concurrently in one gateway process. A capacity
+refusal or timeout during authorization leaves the approval available for a
+retry. Validation errors after dispatch leave an unknown execution outcome.
+JSON input is bounded to 32
+levels and 20,000 nodes per value, 256 KiB per served descriptor/schema and 1 MiB
+per argument object. Deployments must also rate-limit requests and bound the
+trusted authentication, description, scope and execution adapters. Workers load
+the reviewed package installed in the gateway's Python environment using isolated
+mode; a source tree available only through `PYTHONPATH` is insufficient and fails
+closed.
 
 Schemas are evaluated in the dialect their `$schema` declares: draft-04, draft-06,
 draft-07, 2019-09 or 2020-12. A schema without `$schema` is evaluated as 2020-12.
@@ -292,24 +284,21 @@ retrying. Tool errors (`isError: true`) are returned as error data. Treat all
 returned content as untrusted input.
 
 `nexus_symbiote.live.session.invoke_pinned_stdio` is an opt-in POSIX adapter that
-starts a private copy of an independently pinned standalone launcher, enumerates its
-tools, authorizes the requested operation, and sends `tools/call` through the same
-still-running process and streams. The approved `ToolGrant.endpoint_identity` must be
-`stdio+launcher:sha256:<64 lowercase hex characters>` for that launcher. The pin and
-launcher path come from operator-controlled configuration, not the scanned project.
-
-The adapter refuses arguments, project environment and working directory, reconnects,
-repeated calls, invalid JSON-RPC and list pagination beyond its limits. Log and
-progress notifications that arrive before a reply are skipped within the same frame
-and byte limits. The session accepts MCP protocol revisions 2024-11-05, 2025-03-26,
-2025-06-18 and 2025-11-25.
-
-The handshake and tool listing share one 20-second deadline starting after launcher
-staging and process startup; `tools/call` gets its own `call_deadline_seconds`
-(default 20, at most 3,600), counted from when the call is sent. This does not bound
-staging, authentication, scope resolution, state storage or other synchronous gateway
-work. Operators must impose an external end-to-end deadline on the invocation and its
-adapters.
+starts a private copy of an independently pinned standalone launcher, enumerates
+its tools, authorizes the requested operation, and sends `tools/call` through the
+same still-running process and streams. The approved `ToolGrant.endpoint_identity`
+must be `stdio+launcher:sha256:<64 lowercase hex characters>` for that launcher.
+The pin and launcher path come from operator-controlled configuration, not the
+scanned project. The adapter refuses arguments, project environment and working
+directory, reconnects, repeated calls, invalid JSON-RPC and list pagination beyond
+its limits. Log and progress notifications that arrive before a reply are skipped
+within the same frame and byte limits. The session accepts MCP protocol revisions
+2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25. The handshake and tool listing
+share one 20-second deadline starting after launcher staging and process startup;
+`tools/call` gets its own `call_deadline_seconds` (default 20, at most 3,600),
+counted from when the call is sent. This does not bound staging, authentication,
+scope resolution, state storage or other synchronous gateway work. Operators
+must impose an external end-to-end deadline on the invocation and its adapters.
 
 Use `invoke_pinned_stdio(gateway, call, command=..., sha256=..., snapshot=...,
 trust=..., bom=..., approval=..., call_deadline_seconds=...)`. It binds a
@@ -349,11 +338,12 @@ marks and consumes approval nonces. One-use approvals and rollback protection
 hold per state file: every gateway that serves the same tenants must share one
 store.
 
-A snapshot that passes its signature, validity, context, revocation and signer-scope
-checks becomes the current snapshot for its tenant, deployment and agent as soon as it
-is seen, even if that call is denied later; a lower serial is then denied with
-`snapshot-superseded`. To retire a superseded snapshot before the agent presents its
-replacement, register the replacement when you issue it, on the host of each store:
+A snapshot that passes its signature, validity, context, revocation and
+signer-scope checks becomes the current snapshot for its tenant, deployment and
+agent as soon as it is seen, even if that call is denied later; a lower serial is
+then denied with `snapshot-superseded`. To retire a superseded snapshot before
+the agent presents its replacement, register the replacement when you issue it,
+on the host of each store:
 
 ```sh
 nexus-symbiote runtime register snapshot.dsse.json --trust trust.dsse.json --state state.sqlite --snapshot-key snapshot.pub --trust-key trust.pub
@@ -378,17 +368,16 @@ the store's timeout denies the call with `state-unavailable`. Size and monitor t
 gateway fleet for this shared-store contention, and retry only in accordance with
 the operation's idempotency and approval semantics.
 
-Fresh authenticated revocation knowledge is retained even when the current operation
-is denied. Failed signature or binding checks cannot advance snapshot state.
-
-After the final identity check, the gateway takes the database write lock, confirms
-the current trust head and snapshot head, and checks contract validity, signer scopes
-and the distinct approver quorum against its clock before committing the nonce. The
-commit admits the call. A newer trust status or snapshot committed before admission
-denies the stale call and preserves its nonce. A later revocation applies to
-subsequent admissions. Cancellation of work already admitted requires executor
-support. Execution failure after admission consumes the approval. Use a fast, local
-clock for the validity check.
+Fresh authenticated revocation knowledge is retained even when the current
+operation is denied. Failed signature or binding checks cannot advance snapshot
+state. After the final identity check, the gateway takes the database write lock,
+confirms the current trust head and snapshot head, and checks contract validity,
+signer scopes and the distinct approver quorum against its clock before committing
+the nonce. The commit admits the call. A newer trust
+status or snapshot committed before admission denies the stale call and preserves
+its nonce. A later revocation applies to subsequent admissions. Cancellation of
+work already admitted requires executor support. Execution failure after
+admission consumes the approval. Use a fast, local clock for the validity check.
 
 Each tenant's accepted trust status records its revoked signer IDs in the same
 transaction as the serial and digest. The gateway checks the signers on the next
@@ -397,19 +386,18 @@ key, a still-authorized trust issuer must sign a higher serial that removes the
 key from the list. Remove a compromised key from the configured trust ring on
 every gateway. Keep a separately protected recovery issuer available.
 
-Before upgrading an existing gateway fleet, stop writers to the shared database, back
-it up, and retain each tenant's last accepted trust predicate. Older databases contain
-only the serial and digest. The upgraded gateway can recover the revoked signer IDs by
-replaying the exact, still-valid signed status.
-
-For an expired status, load the archived predicate with
-`StateStore(path).restore_trust_status(TrustStatus.model_validate(predicate))`. This
-matches the tenant, serial and canonical digest already on disk and restores only its
-signer list. A currently valid signed status is required to authorize a call. If the
-archive is missing, restore it from a trusted backup before advancing that tenant.
-Preserve the original database and its consumed nonces throughout the migration.
-Existing databases need no initialization; opening one adds the new columns and a
-store ID.
+Before upgrading an existing gateway fleet, stop writers to the shared database,
+back it up, and retain each tenant's last accepted trust predicate. Older databases
+contain only the serial and digest. The upgraded gateway can recover the revoked
+signer IDs by replaying the exact, still-valid signed status. For an expired
+status, load the archived predicate with
+`StateStore(path).restore_trust_status(TrustStatus.model_validate(predicate))`.
+This matches the tenant, serial and canonical digest already on disk and restores
+only its signer list. A currently valid signed status is required to authorize a
+call. If the archive is missing, restore it from a trusted backup before advancing
+that tenant. Preserve the original database and its consumed nonces throughout
+the migration. Existing databases need no initialization; opening one adds the
+new columns and a store ID.
 
 Protect the database against modification, deletion and rollback, and place it
 outside scanned repositories. Database backup/restore must preserve monotonic
@@ -443,15 +431,14 @@ index = LineageIndex.from_snapshot(snapshot_dict)
 ```
 
 `LineageIndex(tenant)` followed by `add` is also for genuinely new records.
-`from_new_versions` is an explicit assertion that the supplied versions have no prior
-revisions; do not use it, or `add`, to restore existing records.
-
-The existing `LineageIndex(tenant, versions)` constructor imports versions with
-**unknown ACL history**: retrieval still applies each imported record's current ACL,
-but `update_acl` refuses changes to it. This is a behavior change for callers that
-previously created a graph from `versions` and then updated ACLs. Unknown history
-remains unknown after a snapshot round trip, including when the graph mixes imported
-versions and newly added records.
+`from_new_versions` is an explicit assertion that the supplied versions have no
+prior revisions; do not use it, or `add`, to restore existing records. In contrast,
+the existing `LineageIndex(tenant, versions)` constructor imports versions with
+**unknown ACL history**: retrieval still applies each imported record's current
+ACL, but `update_acl` refuses changes to it. This is a behavior change for callers
+that previously created a graph from `versions` and then updated ACLs. Unknown
+history remains unknown after a snapshot round trip, including when the graph mixes
+imported versions and newly added records.
 
 To migrate a versions-only store, obtain every revision used for each version from
 an authoritative audit log and pass the complete mapping (including each current
@@ -464,11 +451,10 @@ invent a history containing only the current revision.
 
 Snapshots are data, not signatures or an anti-rollback store. An older, modified or
 forged snapshot can reinstate an old ACL and its prior state. The operator must
-authenticate and protect the full snapshot, select the latest committed state, and
-persist it atomically with the authoritative ACL update.
-
-Coordinate concurrent readers and writers externally; the helper is not thread-safe or
-a transaction manager. A crash between an ACL update and snapshot persistence can lose
+authenticate and protect the full snapshot, select the latest committed state,
+and persist it atomically with the authoritative ACL update. Coordinate concurrent
+readers and writers externally; the helper is not thread-safe or a transaction
+manager. A crash between an ACL update and snapshot persistence can otherwise lose
 the update and revision history. Connect these helpers to the actual datastore's
 transaction/snapshot and ACL enforcement APIs. They do not themselves delete remote
 content or authorize access to a live vector database.

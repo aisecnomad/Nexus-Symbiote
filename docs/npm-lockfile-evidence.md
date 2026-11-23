@@ -1,8 +1,14 @@
 # Lockfile evidence
 
-The registry collector reads direct AI-related dependencies from `package.json` (`peerDependencies`, `dependencies`, `optionalDependencies` and `devDependencies`) and, when present, their exact `node_modules/<name>` records in the `packages` map of the lockfile npm installs from: `npm-shrinkwrap.json` when it exists, otherwise `package-lock.json` (versions 2 and 3, or a compatible map without a version field). An unreadable `npm-shrinkwrap.json` is a collection failure, never replaced by `package-lock.json`.
-
-Which packages count as AI-related, and the findings below, are described in [the registry collector](registry-collector.md).
+The registry collector reads direct AI-related dependencies from `package.json`
+(`peerDependencies`, `dependencies`, `optionalDependencies` and `devDependencies`)
+and, when present, their exact `node_modules/<name>` records in the `packages` map
+of the lockfile npm installs from: `npm-shrinkwrap.json` when it exists, otherwise
+`package-lock.json` (npm lockfile versions 2 and 3, or a compatible map without a
+version field). An unreadable `npm-shrinkwrap.json` is a collection failure, never
+replaced by `package-lock.json`. Which packages count as AI-related, and the
+findings below, are described with the rest of the collector in
+[the registry collector](registry-collector.md).
 
 From a record the collector retains the requested range, the lockfile-declared
 version, the sanitized origin of its `resolved` URL, the record's JSON pointer, a
@@ -218,6 +224,14 @@ reference names, whatever `url` the record shows. Otherwise the record is an
 exclusion and no package URL is bound. `[build-system]` requires are not compared, because neither lockfile locks
 them.
 
-These are declared resolution claims with unknown trust. The collector does not fetch packages, establish their presence, verify registry ownership or publisher identity, or prove that package bytes match the lockfile. Raw download paths, userinfo, tokens and signed URL parameters are omitted from both recorded origins and record positions.
-
-A manifest without a supported lock record does not establish a registry origin. An exact version in `package.json` names a package URL without a record only when the project root has no npm lockfile, or the one read has no record of the package: a lockfile that is ambiguous, refused or not parsed may install it from elsewhere. `bun.lock`, `bun.lockb`, `Pipfile.lock` and `pdm.lock` are not read; when one exists, each package of its ecosystem gets a low `lockfile_unread` finding.
+These are declared resolution claims with unknown trust. The collector does not
+fetch packages, establish their presence, verify registry ownership or publisher
+identity, or prove that package bytes match the lockfile. Raw download paths,
+userinfo, tokens and signed URL parameters are omitted, from the recorded origins and
+record positions alike. A manifest without a supported lock record does not
+establish a registry origin. An exact version in
+`package.json` names a package URL without a record only when the project root has
+no npm lockfile, or the one read has no record of the package: a lockfile that is
+ambiguous, refused or not parsed may install it from elsewhere. `bun.lock`,
+`bun.lockb`, `Pipfile.lock` and `pdm.lock` are not read; when one exists, each
+package of its ecosystem gets a low `lockfile_unread` finding.

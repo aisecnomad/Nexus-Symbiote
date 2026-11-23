@@ -1,27 +1,29 @@
 # Glossary
 
-Each term below has one meaning across this documentation. Where the code or CLI
-uses a different word, the entry says so.
+The documentation uses each term below with one meaning. Where the code, the CLI or
+another format uses a different word for the same thing, the entry says so.
 
 ## The document
 
 ### AgentBOM
 
-The agent bill of materials Nexus SymBiote writes: components, relationships,
-findings and coverage. Native form is JSON, format 1.1.0
-([schemas](../schemas/README.md)); CycloneDX, SPDX, SARIF and VEX are exports of it.
+The agent bill of materials that Nexus SymBiote writes: an agent's components, the
+relationships between them, findings and coverage. The native form is JSON, format
+1.1.0 ([schemas](../schemas/README.md)); CycloneDX, SPDX, SARIF and VEX output are
+exports of it.
 
 ### AIBOM
 
-The same document under the name the code and CLI use: the `AIBOM` class,
-`AIBOM_PATH` arguments, the schema file `nexus-symbiote-aibom-1.0.schema.json` and
-the Action's `aibom-path` output. Other tools use AIBOM for a bill of materials of
-models and datasets; here it is not a separate artifact.
+The same document under the name the code and the CLI use: the `AIBOM` class,
+`AIBOM_PATH` arguments, "Scan a project and generate an AIBOM", the schema file
+`nexus-symbiote-aibom-1.0.schema.json` and the Action's `aibom-path` output. Other
+tools use AIBOM or AI BOM for a bill of materials of models and datasets; here it
+is not a separate artifact.
 
 ### Inventory, snapshot
 
-An inventory is an AgentBOM or the components it lists. A snapshot is an inventory
-saved at a point in time for later comparison.
+An inventory is an AgentBOM, or the components it lists. A snapshot is an inventory
+saved at one time so that a later one can be compared with it.
 
 ### Content digest
 
@@ -47,25 +49,25 @@ that anything about the extension was verified.
 
 ### Collector, scanner
 
-A module that reads one class of declarations from a checkout. Documentation says
-collector; code and CLI say scanner (`--scanner`, `scanners/`, `scanner_status`).
-There are eight: `mcp`, `model`, `prompt`, `rag`, `registry`, `a2a`, `ide_agents`
-and `shadowscan`.
+One module that reads one class of declarations from a checkout. The documentation
+says collector; the code and the CLI say scanner (`--scanner`, `scanners/`,
+`scanner_status`, "Running mcp scanner..."). There are eight: `mcp`, `model`,
+`prompt`, `rag`, `registry`, `a2a`, `ide_agents` and `shadowscan`.
 
 ### Coverage gap
 
 An input a collector recognizes but cannot collect, such as an MCP client file it
-only detects or a path the policy excludes. Listed in `surfaces_excluded`; the
-collector's status becomes `partial` and the default gates fail. What no collector
-recognizes is not a gap — it is not recorded at all
+only detects, or a path the policy excludes. Gaps are listed in
+`surfaces_excluded`, the collector's status becomes `partial`, and the default
+gates fail. What no collector recognizes is not a gap: it is not recorded at all
 ([known limitations](known-limitations.md)).
 
 ### Scan failure
 
-A read, parse or limit problem that stopped collection of a file or a whole
-collector, such as a file over a [collection limit](collection-limits.md). Listed
-in `scan_failures`; the collector's status becomes `failed` and the default gates
-fail.
+A read, parse or limit problem that stopped the collection of a file or of a whole
+collector, such as a file over a [collection limit](collection-limits.md). Failures
+are listed in `scan_failures`, the collector's status becomes `failed`, and the
+default gates fail. Also called a collection failure.
 
 ### Coverage words
 
@@ -90,29 +92,32 @@ counts what was read from the traces, such as files and spans.
 
 ### Declared, observed, verified
 
-How a component or claim was established. **Declared**: a file, manifest, supplier
-or report says so. **Observed**: a collector measured it from bytes in a stated
-scope, such as a weight file's digest. **Verified**: a check under operator policy
-succeeded, such as a signer-policy signature on a model's weights. Collection
-never makes a component's identity verified, and an inventory's own `verified`
-labels are not trusted. The [security model](security-model.md)'s four states add
-two more: approved configuration (a signed runtime approval) and mediated execution
-(a gateway decision).
+The assurance level of a component or claim says how it was established.
+**Declared**: a file, manifest, supplier or report says so. **Observed**: a named
+collector measured it from bytes in a stated scope, such as a weight file's digest.
+**Verified**: a check under operator policy succeeded, such as a signer-policy
+signature or digest pin on a model's weights. Collection never makes a component's
+identity verified, and an inventory's own `verified` labels are not trusted. The
+[security model](security-model.md)'s four states add two that are not assurance
+levels: approved configuration, a signed runtime approval, and mediated execution,
+a gateway decision.
 
 ### Reported
 
-What an agent's own telemetry states. `trace-diff` labels tools, models, agents and
-MCP endpoints named in OpenTelemetry traces as `reported` — a fourth evidence kind
-beside declared, observed and verified. Instrumentation can omit, sample or forge
-spans, so reported use never raises assurance and a missing span proves nothing
+What an agent's own telemetry states. `trace-diff` labels the tools, models, agents
+and MCP endpoints that OpenTelemetry traces name as `reported`, a fourth kind of
+evidence beside declared, observed and verified. The instrumentation can omit, sample
+or forge spans, so reported use never raises a component's assurance, and a missing
+span proves nothing
 ([trace evidence](trace-evidence.md#trust-model-reported-not-observed)).
 
 ### Trust tier
 
 Who stands behind a component: `internal-verified`, `internal-unverified`,
-`third-party-signed`, `third-party-unsigned`, `untrusted-public` or `unknown`.
-Collectors record the tier their evidence supports. In a supplied inventory a tier
-is a claim, and `diff` rates a raised tier as a medium alert.
+`third-party-signed`, `third-party-unsigned`, `untrusted-public` or `unknown`. A
+collector records the tier its evidence supports, such as `third-party-signed` for
+a model whose weights are Sigstore-signed under the signer policy. In a supplied
+inventory a tier is a claim, and `diff` rates a raised tier as a medium alert.
 
 ### Binding key
 
@@ -132,12 +137,12 @@ baseline and every scan compared with it
 
 ### Inventory attestation
 
-A DSSE envelope `attest` writes: an in-toto Statement v1, signed with Ed25519,
-binding a file's SHA-256 (and, for a native inventory, its content digest) to a
-purpose (`generated` or `reviewed`). `verify-attestation` checks it against
-operator-trusted keys. Establishes who signed which bytes for which purpose; does
-not make the inventory accurate or complete, or show it is the newest one
-([inventory attestation](inventory-attestation.md#what-an-attestation-establishes)).
+A DSSE envelope that `attest` writes: an in-toto Statement v1, signed with Ed25519,
+that binds a file's SHA-256 and, for a native inventory, its content digest to a
+purpose, `generated` or `reviewed`. `verify-attestation` checks it against keys the
+operator trusts. It establishes who signed which bytes or content for which purpose;
+it does not make the inventory accurate or complete, or show that it is the newest
+one ([inventory attestation](inventory-attestation.md#what-an-attestation-establishes)).
 
 ### Supplied inventory, reconciliation
 
@@ -153,45 +158,47 @@ inventory's own claims were checked.
 
 ### Finding, alert, issue
 
-A finding is a categorized observation about one component, listed in the
-[finding catalog](finding-catalog.md). An alert is a change `diff` rates medium or
-higher ([drift gate](drift-gate.md#what-the-alerts-mean)). An issue is a problem
-`validate` reports in its completeness or integrity check.
+A finding, or risk, is a categorized observation about one component, listed in the
+[finding catalog](finding-catalog.md). An alert is a change between two snapshots
+that `diff` rates medium or higher ([drift gate](drift-gate.md#what-the-alerts-mean)).
+An issue is a problem that `validate` reports in its completeness or integrity check.
 
 ### Severity
 
-`critical`, `high`, `medium`, `low` or `info`. `diff` rates each change with the
-same words.
+How serious one finding is: `critical`, `high`, `medium`, `low` or `info`. `diff`
+rates each change with the same words.
 
 ### Risk level
 
 The label `risk` prints beside the aggregate score, as in `Risk Score: 41.0 (high)`.
-Reuses severity words with different meaning: `critical` for a critical finding or
-score at or above the fail threshold, `high` for score at or above the warning
-threshold (25), `moderate` for any score above 0, `clean` for 0, and `unknown` when
-there are no findings and coverage is not reported or when reconciliation failed. A
-`high` risk level can come with a passing gate — the demo agent scores 41, below the
-default fail threshold of 50.
+It reuses severity words with another meaning: `critical` for a critical finding or
+a score at or above the fail threshold, `high` for a score at or above the warning
+threshold (25 by default), `moderate` for any other score above 0, `clean` for 0,
+and `unknown` when there are no findings and coverage is not reported, or when
+`--project` reconciliation failed. A `high` risk level can therefore come with a
+passing gate, as on the demo agent, whose score of 41 is below the default fail
+threshold of 50.
 
 ### Gate
 
-A check whose failure makes a command exit 1: the scan gate (`scan`, `baseline`),
-completeness and integrity checks (`validate`), risk gate (`risk`), drift gate
-(`diff --fail-on-alert`), trace gate (`trace-diff`, off with `--fail-on none`) and
-coverage gate (`minimum-elements`, on with `--fail-under`). The GitHub Action runs
-all but trace and coverage gates, reporting them as `collection`, `completeness`,
-`integrity`, `risk` and `drift`. By default, gates fail on unknown or incomplete
-coverage, and the drift gate fails when coverage regresses.
+A check whose failure makes a command exit 1: the scan gate of `scan` and
+`baseline`, the completeness and integrity checks of `validate`, the risk gate of
+`risk`, the drift gate of `diff --fail-on-alert`, the trace gate of `trace-diff`,
+which `--fail-on none` turns off, and the coverage gate of `minimum-elements`, which
+only `--fail-under` turns on. The GitHub Action runs all but the trace and coverage
+gates and reports them as `collection`, `completeness`, `integrity`, `risk` and
+`drift`. By default the scan, `validate` and `risk` gates fail on unknown or
+incomplete coverage, and the drift gate fails when coverage regresses.
 
 ### Baseline, candidate
 
-A baseline is a reviewed snapshot that later snapshots (candidates) are compared
-with by `diff`. `baseline` writes one only when both the scan gate and the built-in
-gate pass; a project policy cannot relax the built-in gate. Written unsigned — `diff`
-checks no signature — so the gate is only as strong as the place the baseline is
-read from ([trust anchor](drift-gate.md#the-trust-anchor-is-the-baseline)). Verifying
-an [inventory attestation](#inventory-attestation) first shows that trusted keys
-signed exactly that file, not that it is the newest one they signed.
+A baseline is a reviewed snapshot that later snapshots, the candidates, are compared
+with by `diff`. The `baseline` command writes one only when the scan gate passes,
+and the built-in gate too, which a project policy cannot relax. A baseline is written
+unsigned and `diff` checks no signature, so the gate is only as strong as the place
+the baseline is read from ([trust anchor](drift-gate.md#the-trust-anchor-is-the-baseline)).
+Verifying an [inventory attestation](#inventory-attestation) of it first shows that
+trusted keys signed exactly that file, not that it is the newest one they signed.
 
 ### Policy kinds
 
@@ -202,36 +209,39 @@ signed exactly that file, not that it is the newest one they signed.
 | Signer policy | The operator, outside the project | Names the Sigstore signers or digest pins that verify model artifacts and ShadowScan reports ([signer policy](cli-reference.md#signer-policy)) |
 | Launch policy | The operator, outside the project and its repository | Pins the stdio launchers `verify-live` may start ([launch policy](cli-reference.md#launch-policy)) |
 
-Collection limits and the binding key are operator settings, not policies — nothing
-in a checkout can change them. Runtime contracts and gateway configuration are in
-the [runtime contract reference](runtime-contract-reference.md).
+Collection limits and the binding key are operator settings, not policies: nothing
+in a checkout can change them. Runtime contracts and gateway configuration are
+described in the [runtime contract reference](runtime-contract-reference.md).
 
 ## Reports and views
 
 ### Risk class, exposure path
 
 A risk class (`code-exec`, `write-capable`, `exfil-capable`, `network-egress` or
-`secret-access`) restates recorded evidence about what one component may do. The
-`graph` view computes classes at display time and never writes them to the inventory.
-Unclassified means unknown, not safe. An exposure path is the shortest association
-chain from an agent to a component with one of those classes or a high/critical
-finding — potential reach, not proof of invocability
+`secret-access`) restates recorded evidence about what one component may do, with the
+field that produced it. The `graph` view computes classes and never writes them to the
+inventory. A component whose record holds nothing the rules read is unclassified:
+unknown, not safe. An exposure path is the shortest chain of recorded associations
+from an agent or IDE agent to a component with a `code-exec`, `write-capable`,
+`exfil-capable` or `secret-access` class or a high or critical finding: potential
+reach, not proof that the agent can invoke the component
 ([graph view](graph-view.md#risk-classes)).
 
 ### Framework crosswalk, reference
 
-The catalog mapping each finding category to framework entries: OWASP Top 10 for LLM
-Applications (2025, 2026), OWASP Top 10 for Agentic Applications, MITRE ATLAS, NIST
-AI RMF, EU AI Act, ISO/IEC 42001 and CWE. A reference means a finding records a
-precondition, weakness or relevant evidence — never that an attack happened or an
-obligation applies. SARIF rule tags come from it
-([framework crosswalk](framework-crosswalk.md#what-a-reference-means)).
+The catalog that ties each finding category to entries of framework editions: the
+OWASP Top 10 for LLM Applications 2025 and 2026, the OWASP Top 10 for Agentic
+Applications, MITRE ATLAS, the NIST AI RMF, the EU AI Act, ISO/IEC 42001 and CWE. A
+reference means that a finding records a precondition, a weakness or evidence relevant
+to an entry, never that an attack happened, that a control fails or that an obligation
+applies. SARIF rule tags come from it, and `crosswalk` applies it to an inventory's
+findings ([framework crosswalk](framework-crosswalk.md#what-a-reference-means)).
 
 ### Minimum element
 
-One of the 50 elements of the G7 "Software Bill of Materials for AI — Minimum
+One of the 50 elements of the G7 "Software Bill of Materials for AI – Minimum
 Elements" (12 May 2026). `minimum-elements` reports whether an inventory's CycloneDX
-export carries each in a standard field: present, missing, explicit unknown, needs
-producer input or not applicable. Coverage is not compliance: elements are
-non-binding, and a present element is recorded, not verified
-([G7 minimum elements](minimum-elements.md#how-each-element-is-evaluated)).
+export carries each one in a standard field: present, missing, explicit unknown, needs
+producer input or not applicable. Coverage is shown with its denominator and is not
+compliance: the elements are non-binding, and a present element is recorded, not
+verified ([G7 minimum elements](minimum-elements.md#how-each-element-is-evaluated)).

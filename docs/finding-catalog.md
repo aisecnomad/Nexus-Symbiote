@@ -1,10 +1,10 @@
 # Finding catalog
 
-A finding is a security-relevant observation about one component: its category,
-severity, detail and recommendation. Findings describe declarations in the
-repository; they are not confirmed vulnerabilities. This page lists every category
-this version emits, which collector raises it, what it means and what to do about it.
-Use these names in `ignore_categories` and in
+A finding, or risk, is a security-relevant observation about one component: its
+category, severity, detail and recommendation. Findings describe declarations in
+the repository; they are not confirmed vulnerabilities. This page lists every
+category this version emits, which collector raises it, what it means and what to
+do about it. Use these names in `ignore_categories` and in
 [suppressions](policy-reference.md#suppressions).
 
 - [How findings affect the gates](#how-findings-affect-the-gates)
@@ -103,7 +103,7 @@ fields call for one that its findings no longer carry, as in an edited inventory
 explains how some of these are classified, such as when a `.bin` file is critical and
 which characters count as hidden.
 
-For MCP `credential_exposure`, a named credential can span two arguments, including a numeric or option-shaped value. Separate CLI switches and option assignments after an authentication-mode selector remain options and are evaluated under their own flag names. In a refused server record, a value-only field can supply credential evidence when its value is credential-shaped.
+For MCP `credential_exposure`, a named credential can span two arguments, including a numeric or option-shaped value. Separate CLI switches and option assignments after an authentication-mode selector remain options and are evaluated under their own flag names. A bare word after such a selector is a public label only from a short vocabulary: a version of OpenAPI, OAuth, GraphQL, HTTP, TLS, SAML, OIDC, JSON, YAML, GRPC or Workspace, an ISO date, a known switch or mode word, or a host whose last label is a public suffix; `Summer24` raises the finding, and `sunshine` or `db.internal.example` is withheld from exports without one. A selector and its scheme in separate words (`--auth bearer <operand>`) are read as the `=` form. In a refused server record, a value-only field can supply credential evidence when its value is credential-shaped.
 
 For registry identifiers, a complete ordinary component such as `desk`, `risk`, `kiosk` or `task` can end in the letters `sk`. The collector preserves those package identities when the suffix lacks specific provider evidence. A qualified provider key can still be withheld at the same boundary.
 

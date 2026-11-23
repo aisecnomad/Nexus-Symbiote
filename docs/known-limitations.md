@@ -138,9 +138,7 @@ A way around a limit that its entry does not describe is worth a
   `scan_failures` are replaced the same way without a finding. A tab or line break
   in a description or supplier becomes a space without a finding. References
   derived from an A2A card, A2A client or RAG source name percent-encode those
-  characters instead.
-
-  Kept as collected: a tool's `description_text`, which its
+  characters instead. Kept as collected: a tool's `description_text`, which its
   definition digest binds, so a control character in it reaches the native export
   and the native document embedded in CycloneDX and SPDX as an escape such as
   `\u001b`; values derived from a path, such as a prompt import's `bom_ref`,
@@ -160,7 +158,6 @@ A way around a limit that its entry does not describe is worth a
   and one that joins backward, such as Persian's `می` U+200C `خواهم`, by the joining
   types of Unicode 16.0, with marks between them skipped. A zero-width joiner between
   a letter and a virama of its script, as in Bengali's ra with ya-phala, is kept too.
-
   Elsewhere they are replaced and reported: a selector after a dash, dot or digit; a
   joiner between Latin letters or between Hebrew letters; a zero-width joiner between
   Arabic letters, where CONTEXTJ allows only U+200C; U+200C after a letter that does
@@ -334,9 +331,7 @@ A way around a limit that its entry does not describe is worth a
   fuzz of 120,000 random argument lists for each of `npx` and `npm exec`, compared with
   the real `npx-cli.js` and nopt, found no list the reader records as a package other
   than the one npm installs, or as a command other than the one npm runs, without a
-  gap; a sample of it is a regression test.
-
-  The `bunx` and `pnpm dlx` readers are not
+  gap; a sample of it is a regression test. The `bunx` and `pnpm dlx` readers are not
   ports and were not fuzzed this way; `bunx` and `bun x` keep only the last `-p` or
   `--package`, the one bun installs.
   The `yarn dlx` options were not checked against a running Yarn 2 or later.
@@ -351,9 +346,7 @@ A way around a limit that its entry does not describe is worth a
   scanner also checks the literal default in `${NAME:-value}`. Resolved workspace
   and extension-installation directories are nonempty. Other unrecognized leading
   substitutions with an embedded colon produce a coverage gap. For example,
-  `/${env:X}/..:/host` is a host root mount.
-
-  Variables in an
+  `/${env:X}/..:/host` is a host root mount. Variables in an
   `--env-file`, a `--health-cmd` and a seccomp profile file are a medium finding
   without being read, and `podman --env-host` is not rated. An `--entrypoint` is a
   medium finding only beside a host mount. An image command is a medium
@@ -371,9 +364,7 @@ A way around a limit that its entry does not describe is worth a
   file without a script suffix (`/w/server`, `/db/app.sqlite`, `/cfg/config.json`), a
   relative path without `-w` (resolved against the image's own working directory) and
   a link from the image into the mount are not rated, so that an argument such as
-  `mcp/filesystem /data` is not a finding.
-
-  A mount over a directory on the default
+  `mcp/filesystem /data` is not a finding. A mount over a directory on the default
   `PATH` (`/usr/local/bin`, `/usr/bin`, `/bin` and their `sbin` and parents), or over
   one program in it (`-v ./node:/usr/local/bin/node`), is rated; a mount over another
   directory of the image's own code (`-v .:/app` or `/usr/local/lib/node_modules`) is
@@ -384,7 +375,6 @@ A way around a limit that its entry does not describe is worth a
   `python -I -m srv` beside such a mount is rated too. A command that loads the mounted working directory by a
   word without a `/` or a script suffix (`node .`, `node server`, `python app`,
   `ruby -I. /app/x.rb`) is not rated either.
-
   `HOME`, `ZDOTDIR`, `XDG_CONFIG_HOME` and `PYTHONUSERBASE` passed with `-e` count as
   code-loading only beside a host mount, whatever their value, and `PATH` only when an
   entry is empty, relative or under a mount target. Any path component named like a credential
@@ -453,9 +443,7 @@ A way around a limit that its entry does not describe is worth a
   (`https://hooks.slack.test/services/T0/B0/<token>`), a URL fragment or a
   `;name=value` path parameter is not reported, and neither is a literal at a position
   with no credential name, such as a value after `-t`, a positional argument or
-  `echo <token> | docker login --password-stdin`.
-
-  Names are read as words: `TOTP_SEED`
+  `echo <token> | docker login --password-stdin`. Names are read as words: `TOTP_SEED`
   and `PIN` do not name a credential, and `VAULT_SECRET_ID` ends in the descriptor
   `id`, so it is not reported although an AppRole secret ID is a credential; an index
   key other than a primary or routing key (`SORT_KEY`, `RECAPTCHA_SITE_KEY`) holds none,
@@ -465,9 +453,7 @@ A way around a limit that its entry does not describe is worth a
   seed phrase counts only under a mnemonic or seed phrase name (not `WALLET_SEED`),
   httpie's `-a` only under a fetcher, and elsewhere `-u user:secret` only with a literal
   after the colon. A Discord token's first part starts with M, N or O, and the header
-  lines one value injects count toward the 4,096 values of one file.
-
-  Values
+  lines one value injects count toward the 4,096 values of one file. Values
   are read for what they most likely are, so a real credential that looks like a
   reference, a placeholder or a label is missed: a value that holds `${` or `$(`
   anywhere (the default or alternate text of a shell expansion, `${TOKEN:-<value>}`,
@@ -488,9 +474,7 @@ A way around a limit that its entry does not describe is worth a
   (`correct horse battery staple 1`) that is not a scheme credential, a header line, a
   cookie, a connection string, a JSON object, an assignment or a `password <value>`
   pair. An argument longer than 64 KiB is split into words at white space only,
-  without shell quoting.
-
-  The other way, weak and documented values still count where they read as
+  without shell quoting. The other way, weak and documented values still count where they read as
   literals: `admin123` or `passw0rd` under a password name, `Basic dXNlcjpwYXNz` under
   `Authorization`, `correct horse battery staple` under a passphrase name, a repeated
   pattern such as `deadbeefdeadbeef...` or `ab12ab12ab12`, a UUID under `--key`, the
@@ -583,7 +567,6 @@ A way around a limit that its entry does not describe is worth a
   `oauth`, stays literal text. An opening `{env:` or `{file:` whose closing brace is
   not in the same string value, or one in a comment or a key, can change the strings
   opencode reads, so the file is a collection failure.
-
   Zed's `env` may be `null`, as Zed reads it as optional, so a Zed server with
   `"env": null` is inventoried where the same server in `.mcp.json` is refused; a
   `null` `args` is refused. A Zed entry with no source and no launch is read as one
@@ -591,9 +574,7 @@ A way around a limit that its entry does not describe is worth a
   An opencode `remote` server's transport is read from its endpoint, as for a server
   that declares no type; one without an endpoint is read as Streamable HTTP, so a
   command beside it is a `transport_ambiguity` finding rather than a launch, as
-  opencode starts no command for a remote server.
-
-  A `.continue/mcpServers/` file
+  opencode starts no command for a remote server. A `.continue/mcpServers/` file
   whose top level is a server rather than a block holding a `mcpServers` list, a
   `.json` file there whose name is not a client file name, and a `.yaml` or `.yml` file in a directory below it or below an agent
   directory are gaps: the collector does not read them there. A Continue entry that
@@ -615,7 +596,6 @@ A way around a limit that its entry does not describe is worth a
   recursively and keeps `.yaml` and `.yml` files at any depth there; the collector
   reads only the files directly in them, so a deeper one is a gap. Whether Continue
   reads a `.yml` file in `.continue/mcpServers/` is not confirmed; one is inventoried.
-
   Continue loads `config.json` only from its global `~/.continue` directory and
   reads no file named `config.yml`, so a workspace `.continue/config.json` or
   `.continue/config.yml` is not read and leaves no gap. Continue merges a workspace
@@ -677,7 +657,6 @@ A way around a limit that its entry does not describe is worth a
   `pydantic_ai.mcp`, a client base class there, is not a gap. So a
   server built from a class a project module re-exports is a gap on the file that
   builds it, even when the re-exporting module's own server is inventoried.
-
   A server whose declared name is computed, such as an f-string or a variable, or
   outside the [supported form](collectors.md#mcp-servers-declared-in-source) is
   named by its variable without a gap, so its inventory name can differ from the
@@ -691,7 +670,6 @@ A way around a limit that its entry does not describe is worth a
   other decorator below it, which hands the registration whatever function, name and
   signature it returns. A tool given `enabled=False`
   is still inventoried.
-
   Besides its `tool` decorator on a module-level function, which is inventoried, a
   server may be used without a gap only in these ways: reading its `name`,
   `instructions` or `settings`, as in `server.settings.port = 8000`; calling a run
@@ -713,7 +691,6 @@ A way around a limit that its entry does not describe is worth a
   its name or as an attribute, as in `object.__setattr__(configure, "__code__",
   code)` or `module.configure = swap`, since that can replace the body the call
   runs.
-
   Any other use is a gap, such as saving, passing or dereferencing a bound method
   (`method = server.run`, `anyio.run(server.run_stdio_async)`), keeping a
   decorator, or naming the server in an annotation. An app or run coroutine still
@@ -740,9 +717,7 @@ A way around a limit that its entry does not describe is worth a
   module, of a name imported from one or of a name assigned from either, as in
   `extensions._extension_dispatch_scope` or `ext._hook` after `ext = extensions`, is a
   gap too; a private name reached any other way, such as through a dynamic import, is
-  not seen.
-
-  Only `mcp.server.fastmcp` reached by attributes alone from a name bound only
+  not seen. Only `mcp.server.fastmcp` reached by attributes alone from a name bound only
   by `import mcp...`, as in `mcp.server.fastmcp.exceptions`, is a module path and not a
   gap; `fastmcp` on any other object is, such as a settings object's `config.fastmcp`,
   `getattr(mcp, "missing", ctx).fastmcp`, whose default can be any object, or
@@ -755,9 +730,7 @@ A way around a limit that its entry does not describe is worth a
   of a literal `getattr(...)` counts as its object, as it is returned when the
   attribute is missing; an SDK module or name reached through any other expression,
   such as `(obj or fastmcp).FastMCP.__init__ = hook`, and a method call that changes an
-  SDK object are not seen.
-
-  In a file that imports from `mcp` or
+  SDK object are not seen. In a file that imports from `mcp` or
   `fastmcp`, a parameter typed as the SDK `Context` (a `Context` imported from an
   SDK module, a qualified `Context` of an SDK module, `getattr(..., "Context")`, or
   a string forward-reference annotation naming or computing one), and a name bound in
@@ -784,9 +757,7 @@ A way around a limit that its entry does not describe is worth a
   a coroutine a context method returns, an HTTP request or app (whose state holds
   the server) passed to code the collector does not read, an SDK module object
   passed to code the collector does not read, or a context reached by reflection in a file that
-  names no MCP SDK or framework, which is not read, is not seen.
-
-  A type in an annotation is the whole annotation,
+  names no MCP SDK or framework, which is not read, is not seen. A type in an annotation is the whole annotation,
   a member of a `|` union whose members are all type syntax (constants, names of
   `typing`, of builtin classes or of classes imported from an SDK or framework
   package, and subscripts and unions of those), or an argument of a generic of
@@ -801,9 +772,7 @@ A way around a limit that its entry does not describe is worth a
   defined anywhere turns a string argument into a forward reference. The arguments of
   `Literal` and the metadata of `Annotated` are values and are not parsed, each
   recognized by the name it is imported as from `typing`, `typing_extensions` or
-  `collections.abc`, not the name it is bound to.
-
-  A string is parsed as
+  `collections.abc`, not the name it is bound to. A string is parsed as
   `typing.ForwardRef` compiles it, a leading `*` unpacked, so
   `x: "*(mcp.add_tool(hidden) or [str])"` is code. In a file with a recognized server,
   an `mcp` or `fastmcp` import, or a PydanticAI agent, such a string that does not
@@ -848,7 +817,6 @@ A way around a limit that its entry does not describe is worth a
   imports itself by its own literal name, as `import server` does in `server.py`, `gc`, or reflection in another file,
   including on the traceback of an exception that propagated out of a server's run,
   so a completed scan cannot prove that a server or agent never escaped.
-
   Any
   call whose first argument, or `name` keyword, is a literal that names `mcp`,
   `mcp.server` or `fastmcp`, or a submodule of the last two, is a gap whatever the
@@ -1128,9 +1096,7 @@ A way around a limit that its entry does not describe is worth a
   gap; those names match exactly, as in the source search, so `Tests/prompts` is
   read. Neither is a file under another spelling of the directory name, such as
   `Prompts/a.md`, while the `*.prompt.*` suffix matches in any case, so
-  `src/Review.PROMPT.MD` is recorded.
-
-  Under `prompts`, only the text suffixes the
+  `src/Review.PROMPT.MD` is recorded. Under `prompts`, only the text suffixes the
   [collector reference lists](collectors.md#what-each-collector-reads) and names
   without a suffix are read: code such as `prompts/__init__.py`, images and dotfiles
   such as `.DS_Store` are not, while `prompts/LICENSE` and `prompts/README.md` are
@@ -1143,9 +1109,7 @@ A way around a limit that its entry does not describe is worth a
   `prompts/eval_set.json`, is a failure; and prompt templates are read after every
   other file the collector reads, so templates past the
   [`total-bytes`](collection-limits.md#limits) limit fail while skills keep their
-  budget.
-
-  A directory symlink under which a file would be a
+  budget. A directory symlink under which a file would be a
   prompt template, such as `app/prompts -> ../data` or `agent -> examples/agent` with
   `examples/agent/prompts/a.md`, is a gap when no walk inventories that file: the walk
   reads the directory a symlink leads to once, under that directory's own name, and a
@@ -1173,7 +1137,6 @@ A way around a limit that its entry does not describe is worth a
   spelling of either that a subagent, rule, prompt, skill or command directory holds,
   resolved from that file's directory. The imports of other instruction files, such
   as `AGENTS.md` or a rule file, are followed only when a memory file imports them.
-
   Imports are read from the text outside fenced code and code spans as CommonMark
   reads it, across lines and inside block quotes and list items, and also from what
   Claude Code reads as text. When the only
@@ -1188,7 +1151,6 @@ A way around a limit that its entry does not describe is worth a
   cause `scan --check` to fail.
   A host using GitHub's table or autolink extensions can still import a
   file from text read here as code.
-
   An import that leaves the project root, names an excluded path or lies deeper than
   the `depth` limit is a gap, so write a path alias such as `@/components` as code. An
   import of a file named as holding credentials, as the next entry lists them, is a
@@ -1197,9 +1159,7 @@ A way around a limit that its entry does not describe is worth a
   inventoried without a content hash unless both the path imported and the file a
   symlink there leads to, if any, have a Markdown suffix (`.md`, `.mdc` or
   `.markdown`): its exact bytes may hold configuration or secrets, and an unkeyed
-  digest of them could be confirmed by guessing.
-
-  The same holds for every other file
+  digest of them could be confirmed by guessing. The same holds for every other file
   the collector records: an instruction, nested memory, rule, prompt or subagent file
   keeps its content hash only when its name is Markdown, or is an instruction file name
   without one (`.cursorrules`, `.clinerules`, `.windsurfrules`, `system_prompt.txt`),
@@ -1283,9 +1243,7 @@ A way around a limit that its entry does not describe is worth a
   `.bash`, `.zsh`, `.ps1`, `.js`, `.mjs`, `.cjs`, `.ts`, `.rb` or `.go` whose name is
   more than one of those words, such as `rotate_api_key.py`, which is read and
   inventoried; a program named only for what it holds, such as `secrets.py` or
-  `credentials.rb`, is still not read.
-
-  A credential written into a program that this
+  `credentials.rb`, is still not read. A credential written into a program that this
   rule reads, such as `client_secret.js` or `local_secrets.py`, or into a `.env`
   template, is not withheld by it), or that lies in a directory named exactly one of those words,
   singular or plural, with or without a leading dot, such as `secrets/token.txt`. Such a
@@ -1295,9 +1253,8 @@ A way around a limit that its entry does not describe is worth a
   skill or command directory holds it; the directory's other files are inventoried. The
   `model` collector does not read a model directory's configuration, tokenizer or chat
   template file that is, or is a symlink to, such a file, such as `config.json` linked
-  to `../.env`; it is a gap too.
-
-  A script whose name contains one of those words, such as `scripts/rotate_password.py`,
+  to `../.env`; it is a gap too. A
+  script whose name contains one of those words, such as `scripts/rotate_password.py`,
   is therefore a gap too, and so is every file without a Markdown suffix in a skill
   directory named exactly one of them, such as `.claude/skills/secrets/`. A Markdown
   file is read whatever its name or directory, such as `docs/secrets-handling.md`, so a
@@ -1408,9 +1365,7 @@ A way around a limit that its entry does not describe is worth a
   destination nests parentheses twice, or than a link that only markdown-it reads,
   with tabs between its parts, and that holds a backtick or `<`. A definition used
   only there is reported as unused, and so is a footnote referenced only there or
-  from a footnote that is not referenced.
-
-  A line inside a paragraph that has the form
+  from a footnote that is not referenced. A line inside a paragraph that has the form
   of a definition is counted, though CommonMark shows it as text, and so is a
   definition in the most lenient form a reader takes: cmark-gfm takes a destination
   with unbalanced parentheses and markdown-it a title right after a pointy
@@ -1419,9 +1374,7 @@ A way around a limit that its entry does not describe is worth a
   takes as its continuation the indented code after it and, as cmark-gfm does, the
   lines right after that code that start no block, such as a paragraph line or an
   HTML tag that cannot interrupt a paragraph, even when that code ends with a heading
-  or a closed fence, after which GitHub shows them.
-
-  Where CommonMark readers
+  or a closed fence, after which GitHub shows them. Where CommonMark readers
   disagree about the block structure, as when a line after the definitions that open
   a paragraph is indented four columns or starts with `2.`, a block quote is
   followed by a `>` indented four columns, an HTML block start that cmark-gfm 0.29
@@ -1454,9 +1407,7 @@ A way around a limit that its entry does not describe is worth a
   command-like prefix, or sufficient ASCII text.
   `$GREP -e Makefile`, `$SED -En` and `$SHELL -ec 'true'` stay medium, as
   is a downloader given a host without a scheme or a path,
-  such as `curl evil.example`.
-
-  A command given to `su -c` or `script -c` as one quoted
+  such as `curl evil.example`. A command given to `su -c` or `script -c` as one quoted
   string is read as one word, which names a shell but no interpreter, so
   `curl x | su -c 'python3 -'` is medium too; a saved file named in such a string, or
   in a shell's `-c` script or `eval`'s arguments (`su -c 'sh a'`, `sh -c 'sh a'`),
@@ -1465,9 +1416,7 @@ A way around a limit that its entry does not describe is worth a
   `bash -c -- 'sh a'`, `sh -c 'cat a | sh'` and a command line given to `env -S`
   (`env -S 'sh a'`) are medium. A download unpacked and then run, as by
   `curl x | tar -xz; sh install.sh`, is medium, because the archive's members are not
-  known.
-
-  A file a downloader's `-o`
+  known. A file a downloader's `-o`
   wrote counts as run when it is any argument of a shell, `python` or `perl`, as it did
   before, so `curl -o d x && bash run.sh d` and `curl -o d x && python3 -m json.tool d`
   are critical though they may only read it; a file saved under its URL's name
@@ -1488,9 +1437,7 @@ A way around a limit that its entry does not describe is worth a
   (`bash deploy.sh < c.json`, `bash deploy.sh <<< "$(cat c.json)"`) is critical, as a
   download piped into a shell is, though the script may only read it. A saved file is
   matched by its path and by its base name, so `sh /tmp/i.sh` counts a saved `i.sh`
-  wherever it was written.
-
-  A file only `base64 -d` decoded, not
+  wherever it was written. A file only `base64 -d` decoded, not
   from a download, counts as run only as a program. A copy of a saved file made by
   `cat`, `cp`, `mv`, `ln`, `dd`, `tee`, `install`, `rsync` or `sponge` counts as the file
   at its destination (the last operand of `cp`, `mv`, `ln`, `install` or `rsync`,
@@ -1789,7 +1736,6 @@ is a failure; everything below is neither a gap nor a failure.
   of a package whose name Yarn 4 hashes as it hashes the declared one, such as
   `@op/enai` for `openai`, binds neither, even for another range that Yarn would keep
   apart.
-
   A pnpm record whose key's peer suffix holds anything but package names, exact
   versions and patch hashes in balanced parentheses is recorded as
   `<name>@<version>(***)`, which no JSON pointer resolves; the root importer's

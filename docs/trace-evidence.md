@@ -1,17 +1,21 @@
 # Trace evidence
 
-`trace-diff` compares an agent's inventory declarations with the runtime use its own
-OpenTelemetry traces report: used but undeclared, and declared but unseen. It reads
-trace files offline and never runs the agent.
+`trace-diff` compares what an agent's inventory declares with the runtime use that the
+agent's own OpenTelemetry traces report: what was used but never declared, and what was
+declared but never seen in these traces. It reads trace files that you already
+collected, offline, and never runs the agent.
 
 ## Why
 
-A static inventory records what a repository's files declare. An agent can use more:
-tools from remote MCP servers no file lists, models chosen at runtime, endpoints
-configured outside the repository. SymBiote never executes what it inventories. Operators
-who run agents can export traces following the OpenTelemetry GenAI and MCP semantic
-conventions. `trace-diff` reconciles those reported names with the inventory, so a CI
-job can fail when traces show undeclared tools, models, agents or MCP endpoints.
+A static inventory records declared composition: the MCP servers, models, prompts and
+tools that a repository's files name. An agent can use more than it declares: a tool
+that a remote MCP server serves but no file lists, a model chosen at run time, an MCP
+endpoint configured outside the repository. Nexus SymBiote never executes what it
+inventories, so it cannot watch an agent run. Operators who run agents can export
+traces that follow the OpenTelemetry GenAI and MCP semantic conventions, and those
+traces name the tools, models, agents and MCP endpoints that each run used.
+`trace-diff` reconciles those names with the inventory, so that a CI job can fail when
+the traces show a tool, model, agent or MCP endpoint that the inventory does not declare.
 
 ## Trust model: reported, not observed
 
@@ -26,27 +30,33 @@ apart. Telemetry is a fourth kind, and the evidence document labels it `reported
 | Reported | The agent's own instrumentation, in its traces | That the instrumentation reported an operation that names these identifiers |
 
 Traces come from code inside the process they describe. They can be incomplete,
-sampled or forged, and an exporter can drop spans before you read them. A span shows
-at most that the instrumentation reported an operation; a missing span proves nothing.
-Matching is by name and reported endpoint, never by cryptographic identity.
+sampled, or forged by that code, and an exporter or a person can drop spans before you
+read them. A span therefore shows at most that the instrumentation reported an
+operation, and a missing span proves nothing: a declaration that no span mentions may
+still be used, and use that no span reports may still occur. Matching is by name and
+reported endpoint, never by cryptographic identity, so a tool that reports a declared
+name, at a declared endpoint when the span names one, is matched whatever it does.
 
-Trace evidence never raises assurance. `trace-diff` reads the inventory and never
-changes it; a match does not make a component observed or verified. An `undeclared`
-item is a finding to review, not a judgment. Exit 0 means nothing undeclared appeared
-in these traces — not that the agent is safe or the traces are complete.
+Trace evidence never raises the assurance of anything. `trace-diff` reads the
+inventory and never changes it; a match does not make a component observed or
+verified, and an `undeclared` item is a finding to review, not a judgment that the
+agent is malicious. Exit status 0 means that nothing undeclared appeared in these
+traces; it does not mean that the agent is safe or that the traces are complete.
 
 ## What is read
 
-Each trace file is an OTLP/JSON trace export: one `ExportTraceServiceRequest` object
-(`{"resourceSpans": [...]}`) or JSON Lines with one per line (as the OpenTelemetry
-Collector's `file` exporter writes). Detection is automatic: a file whose first
-non-blank line is a complete JSON value with more lines following is JSON Lines.
-
-Files are opened without symlinks and parsed as strict JSON (duplicate keys, `NaN`,
-`Infinity`, lone surrogates and integers beyond 2^53 are refused). 64-bit integers
-like `startTimeUnixNano` must be decimal strings, not bare JSON numbers. Every read
-level is type-checked; malformed structures name the position and JSON path, never a
-value.
+Each trace file is an OTLP/JSON trace export: either one `ExportTraceServiceRequest`
+object (`{"resourceSpans": [...]}`) or JSON Lines with one such object per line, as the
+OpenTelemetry Collector's `file` exporter writes. The form is detected from the bytes: a
+file whose first non-blank line is a complete JSON value and which has more non-blank
+lines is JSON Lines; any other file must be one JSON document. Files are opened like
+inventories (no symbolic link, FIFO, device or directory) and parsed as strict JSON:
+duplicate keys, `NaN` and `Infinity`, lone surrogates and integers beyond 2^53 are
+refused. OTLP/JSON writes 64-bit integers such as `startTimeUnixNano` as decimal
+strings; a file that writes a nanosecond timestamp as a bare JSON number is refused.
+Every level that is read is type-checked, and a malformed structure is an error that
+names the file's position, the line for JSON Lines and the JSON path of the problem,
+never a value from the file.
 
 Only these attributes are read, from span attributes and, beneath them, from resource
 attributes; a span's own value wins:
@@ -233,14 +243,13 @@ it. Coverage gaps appear as tool execution notifications.
 
 Traces that carry content are sensitive: messages, system instructions, tool arguments
 and tool results can hold personal data and secrets. `trace-diff` never reads them, but
-the files you pass it still hold them. Restrict who can read them and how long you
-keep them. Prefer exporting identifiers only.
-
-The GenAI semantic conventions ask instrumentations not to capture content by default,
-naming `OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT` for the opt-in with `NO_CONTENT`
-as the default. Keep that default for traces you compare here. With `EVENT_ONLY` or
-`SPAN_AND_EVENT`, content goes to span events, which `trace-diff` does not read, so
-its count of spans with content attributes does not include that content.
+the files you pass it still hold them; restrict who can read them and how long you keep
+them. Prefer exporting identifiers only. The GenAI semantic conventions (Development
+status) ask instrumentations not to capture content by default, and name the
+environment variable `OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT` for the opt-in, with
+`NO_CONTENT` as the default; keep that default for traces you compare here. With
+`EVENT_ONLY` or `SPAN_AND_EVENT`, content goes to span events, which `trace-diff` does
+not read, so its count of spans with content attributes does not include that content.
 
 The evidence document and the SARIF file hold the identifiers that the traces report,
 such as MCP endpoint host names, model names and agent ids, and the inventory's

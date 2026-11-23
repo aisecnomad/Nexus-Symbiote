@@ -10,54 +10,51 @@ rendered and no repository code is imported.
 The collector inventories every file whose name has one of these suffixes:
 `.safetensors`, `.onnx`, `.gguf`, `.ggml`, `.h5`, `.hdf5`, `.keras`, `.tflite`,
 `.mlmodel`, `.pte`, and the pickle family `.pkl`, `.pickle`, `.pck`, `.dill`,
-`.cloudpickle`, `.pt`, `.pth`, `.bin`, `.joblib`, `.ckpt` and `.pdparams`.
-
-A pickle-family name inside one or two archive or compression suffixes (`.tar`, `.gz`,
+`.cloudpickle`, `.pt`, `.pth`, `.bin`, `.joblib`, `.ckpt` and `.pdparams`. A
+pickle-family name inside one or two archive or compression suffixes (`.tar`, `.gz`,
 `.bz2`, `.xz`, `.lzma`, `.zst`, `.z`, `.lz4`, `.zip`), such as `checkpoint.pth.tar`,
 `model.pkl.gz`, joblib's `clf.joblib.z` and `clf.joblib.lz4`, or pandas'
-`frame.pkl.zip` and `frame.pkl.tar.gz`, counts as pickle family too. Such a file
+`frame.pkl.zip` and `frame.pkl.tar.gz`, counts as pickle family too, and such a file
 is `unsafe-code-execution` whatever it holds unless it is empty, since its content is
 not decompressed. A third wrapper suffix, which no loader unwraps by name, does not.
-TensorFlow graphs named `saved_model.pb` or `saved_model.pbtxt` are collected;
-other `.pb` files are not.
+TensorFlow graphs named
+`saved_model.pb` or `saved_model.pbtxt` are collected; other `.pb` files are not.
 
 A file that no name above rates is inventoried by its content when it is named
 `.npy`, `.npz` or `.dat`, or has any name below a directory named `model`, `models`,
-`weights`, `checkpoint` or `checkpoints`. Configuration, tokenizer and chat template
-files such as `config.json` or `tokenizer.json`, and Python and Jinja sources, are
-not checked this way. Such a file is a component when its content is rated
+`weights`, `checkpoint` or `checkpoints`. A file named as the configuration,
+tokenizer and chat template files that a model directory's readers open are, such
+as `config.json` or `tokenizer.json`, and Python and Jinja sources are not checked
+this way. Such a file is a component when its content is rated
 `unsafe-code-execution` by the checks in the table below, or when the content is a
-NumPy array, a ZIP archive or a pickle that those checks' bounds left unread (rated
-`unknown`).
+NumPy array, a ZIP archive or a pickle that those checks' bounds left unread, which
+is rated `unknown`.
 
 A pickle is rated by what `pickle.load` does with it. The check reads the first
 64 KiB as `pickle.load` reads them from `io.BytesIO`, in a loop, as `torch.load` reads
 the three header pickles of `torch.save`'s legacy format before the main one: once as
 the C unpickler and once as the pure-Python one, opcode by opcode, with the same
 frame handling, stack, MARK and memo rules and the same errors, for at most 4,096
-opcodes and 64 MARKs over all the pickles read.
-
-Where the unpicklers of CPython 3.11 to 3.14 differ, the check takes every reading
-one of them takes: `INT` and `LONG` text in base 0, as up to 3.13 (`I0x1f`), and in
-base 10, as from 3.14 (`I08`), and, for the C unpickler of 3.11 and 3.12, a read
-past the end of a frame, which goes on from where the pickle stands or from the
-frame's end. It also takes every reading that a loader's `encoding` gives a `STRING`,
-`BINSTRING` or `SHORT_BINSTRING` with a byte over 0x7f, which the default `"ASCII"`
-fails: `torch.load` passes `"utf-8"`, `np.load` and `pandas.read_pickle` `"latin1"`,
-and `"bytes"` keeps the bytes, which `READONLY_BUFFER` takes. A call that one
-supported version or encoding reaches is rated whatever version runs the scan.
-
-The check never imports, calls or builds an object: what `find_class` returns is a
-placeholder that stands for any attribute of a module, a class or a function as well
-as `os.environ`, `sys.path` or `builtins.__dict__`. `find_class` imports the module
-before it looks the name up, and `importlib` imports a file of any name, such as
-`ev-il.py` or `evil x.py`, so only a module that no finder can name fails as the
-import does: an empty one, one with a NUL, or one with a `/` in a dotted part.
-
-A pickle ends where `pickle.load` would stop: at STOP, where the next one starts, or
-at the first error, such as a byte that is no opcode, PROTO above 5, a stack
-underflow, a MARK that is missing, a read of a memo slot never stored, an unhashable
-key or the end of the file, after which nothing is read. The ratings are:
+opcodes and 64 MARKs over all the pickles read. Where the unpicklers of CPython 3.11
+to 3.14 differ, it takes every reading one of them takes: `INT` and `LONG` text in
+base 0, as up to 3.13 (`I0x1f`), and in base 10, as from 3.14 (`I08`), and, for the C
+unpickler of 3.11 and 3.12, a read past the end of a frame, which goes on from where
+the pickle stands or from the frame's end. It also takes every reading that a loader's
+`encoding` gives a `STRING`, `BINSTRING` or `SHORT_BINSTRING` with a byte over 0x7f,
+which the default `"ASCII"` fails: `torch.load` passes `"utf-8"`, `np.load` and
+`pandas.read_pickle` `"latin1"`, and `"bytes"` keeps the bytes, which `READONLY_BUFFER`
+takes. A call that one supported version or encoding reaches is rated whatever version
+runs the scan. It never imports, calls or builds an
+object: what `find_class` returns is a placeholder that stands for any attribute of a
+module, a class or a function as well as `os.environ`, `sys.path` or
+`builtins.__dict__`. `find_class` imports the module before it looks the name up, and
+`importlib` imports a file of any name, such as `ev-il.py` or `evil x.py`, so only a
+module that no finder can name fails as the import does: an empty one, one with a NUL,
+or one with a `/` in a dotted part. A pickle
+ends where `pickle.load` would stop: at STOP, where the next one starts, or at the
+first error, such as a byte that is no opcode, PROTO above 5, a stack underflow, a
+MARK that is missing, a read of a memo slot never stored, an unhashable key or the end
+of the file, after which nothing is read. The ratings are:
 
 - A pickle that hands what `find_class` returned to anything but the stack and the
   memo before it ends is `unsafe-code-execution`, wherever it starts and whatever
@@ -102,63 +99,58 @@ A pickle whose STOP falls inside a protocol 4 or 5 FRAME with bytes left in the 
 is read on from both places a loader resumes: after the frame, as `io.BytesIO` and an
 unbuffered file give the bytes, and right after the STOP, as the C unpickler reading a
 buffered file, such as the one `torch.load` opens for a path, does. The worse reading
-counts, and such a file is rated `unknown` at least.
-
-Under a model suffix (the pickle family included), content is also recognized by its
-shape: a binary pickle with PROTO and 16 well-formed opcodes in its first 64 KiB, or
-a stream that passes `pickletools` checks to its first STOP, is
-`unsafe-code-execution`.
-
-A pickle-family name rates no content but a pickle, a compressed or archived stream
-and a file that starts with the GGUF magic. A pickle opcode stream that a bound cuts
-short before a recognized shape or a call is `unsafe-code-execution` under such a
-name, with the evidence `Potential code-executing loader format (...)` around the
-bounded verdict, as the loader unpickles whatever it holds. A readable file whose
-first 64 KiB start no pickle, NumPy array, ZIP archive, compressed or archived stream
-or GGUF magic is `unknown`, with the evidence `Named pickle-family format; no pickle
-evidence in the inspected prefix` (`empty file` for a zero-length one). A file that
-cannot be read keeps the loader's `unsafe-code-execution` rating by name.
-
-Under a pickle-family name, a ZIP archive whose directory is malformed or over 1 MiB,
-or with a member that was not checked, and a NumPy array whose header is past the
-inspection limits are `unsafe-code-execution` with the evidence `Potential
-code-executing loader format (...)` around that verdict, as `torch.load` and `np.load`
-still read past the bound. So is a compressed or archived stream, named with a wrapper
-suffix (`.tar`, `.gz`, `.bz2`, `.xz`, `.lzma`, `.zst`, `.z`, `.lz4`, `.zip`) or
-starting with gzip, zlib, bzip2, xz, Zstandard, LZ4 frame or joblib `ZF` magic, an
-LZMA-alone header after joblib's `5d 00`, the ustar magic at offset 257, or a tar
-header that `tarfile` reads without that magic, which pandas, joblib and `torch.load`
-unwrap before they unpickle, with the evidence `Potential code-executing loader format
-(compressed or archived stream; decompressed content not inspected)`.
-
-An LZMA-alone header is read from the first 14 bytes: joblib's `5d 00`, which it
-detects whatever dictionary size follows, an uncompressed size that is unknown or
-below 2^63, and a zero byte after it, where the range coder starts. A tar header is a
-first 512-byte block whose checksum `tarfile` accepts and whose mode, owner, size,
-time and device numbers it parses, whatever its name and type. A raw array whose first
-bytes happen to form such a header is rated critical by it: a little-endian integer
-array whose first value is 93, such as a `labels.bin` of 32-bit integers 93 to 156,
-opens with an LZMA-alone header, and, rarely, a float32 array, such as one upcast from
-bfloat16, opens with a tar header that `tarfile` reads.
-
-A file that starts with the GGUF magic, whatever follows, is `unsafe-code-execution`
-too under a pickle-family name, with the evidence `Potential code-executing loader
-format (GGUF content under a pickle-family name; its chat templates are not inspected
-under this name)`: llama.cpp opens a model by its magic, not its name, and the
-chat-template check below runs only under a `.gguf` name. Only a ZIP archive whose
-directory was read whole and lists no pickle-family member or object-dtype array keeps
-its `unknown` verdict.
-Any other content, such as a numeric NumPy array or a ZIP archive with neither a
-pickle-family member nor an object-dtype array, is not a component. Each such file is
-opened once, after every model-bound and directory-configured file has been read, and
-only if it is not one of those files.
-
-Reading stops as soon as its content is known not to be a payload: after the first 8
-bytes when they can start no pickle, NumPy array or ZIP archive, after at most 64 KiB
-when they can start a pickle, and after the header of a NumPy array; a ZIP archive is
-read to its end. A component is digested from the same read, so each byte is charged
-once to the `model-total-bytes` limit. A file larger than the `model-bytes` limit is a
-collection failure, as a model file is.
+counts, and such a file is rated `unknown` at least. Under a model suffix, the pickle
+family included, content is also recognized by its shape: a binary
+pickle with PROTO and 16 well-formed opcodes in its first 64 KiB, or a stream that
+passes `pickletools` checks to its first STOP, is `unsafe-code-execution`. A
+pickle-family name rates no content but a pickle, a compressed or archived stream
+and a file that starts with the GGUF magic: a pickle opcode stream that a
+bound cuts short before a recognized shape or a call is `unsafe-code-execution`
+under such a name, with the evidence `Potential code-executing loader format (...)`
+around the bounded verdict, as the loader unpickles whatever it holds; a readable
+file whose first 64 KiB start no pickle, NumPy array, ZIP archive, compressed or
+archived stream or GGUF magic is `unknown`,
+with the evidence `Named pickle-family format; no pickle evidence in the inspected
+prefix` (`empty file` for a zero-length one); and a file that cannot be read keeps
+the loader's `unsafe-code-execution` rating by name. Under a pickle-family name, a
+ZIP archive whose directory is malformed or over 1 MiB, or with a member that was
+not checked, and a NumPy array whose header is past the inspection limits are
+`unsafe-code-execution` with the evidence `Potential code-executing loader format
+(...)` around that verdict, as `torch.load` and `np.load` still read past the bound;
+so is a compressed or archived stream, named with a wrapper suffix (`.tar`, `.gz`,
+`.bz2`, `.xz`, `.lzma`, `.zst`, `.z`, `.lz4`, `.zip`) or starting with gzip, zlib, bzip2, xz, Zstandard,
+LZ4 frame or joblib `ZF` magic, an LZMA-alone header after joblib's `5d 00`, the
+ustar magic at offset 257, or a tar header that `tarfile` reads without that magic,
+which pandas, joblib and `torch.load` unwrap before they unpickle, with the evidence
+`Potential code-executing loader format (compressed or archived stream; decompressed
+content not inspected)`. An LZMA-alone header is read from the first 14 bytes:
+joblib's `5d 00`, which it detects whatever dictionary size follows, an uncompressed
+size that is unknown or below 2^63, and a zero byte after it, where the range coder
+starts. A tar header is a first 512-byte block whose checksum `tarfile` accepts and
+whose mode, owner, size, time and device numbers it parses, whatever its name and
+type. A raw array whose first bytes happen to form such a header is rated critical
+by it: a little-endian integer array whose first value is 93, such as a `labels.bin`
+of 32-bit integers 93 to 156, opens with an LZMA-alone header, and, rarely, a float32
+array, such as one upcast from bfloat16, opens with a tar header that `tarfile`
+reads. A file that starts with the GGUF magic, whatever follows,
+as with the wrapper magics, is `unsafe-code-execution` too under a pickle-family
+name, with the evidence `Potential code-executing loader format
+(GGUF content under a pickle-family name; its chat templates are not inspected under
+this name)`: llama.cpp opens a model by its magic, not its name, and the chat-template
+check below runs only under a `.gguf` name. Only a ZIP archive whose directory was
+read whole and lists no pickle-family member or object-dtype array keeps its
+`unknown` verdict.
+Any other content, such as a numeric NumPy array or a ZIP archive with
+neither a pickle-family member nor an object-dtype array as a member, is not a
+component. Each such file is opened once, after every file that the models with a
+name bind and their directories configure has been read, and only if it is not one
+of those files. Reading stops as soon as its content is known not to be a payload:
+after the first 8 bytes when they can start no pickle, NumPy array or ZIP archive,
+after at most 64 KiB when they can start a pickle, and after the header of a NumPy
+array; a ZIP archive is read to its end, as a model archive is. A component is
+digested from the same read, so each byte is charged once to the `model-total-bytes`
+limit. A file larger than the `model-bytes` limit is a collection failure, as a
+model file is.
 
 Each model file is one component. Its `bom_ref` is `model:` followed by the
 file's path relative to the scanned root, and its `name` and `source_path` are
@@ -318,44 +310,41 @@ these lists, `tokenizer_hash` or `chat_template_hash`.
 
 `trust_remote_code` is `true` when any configuration file says so, so an empty
 `config.json` cannot hide it in a later file. A configuration that declares
-`auto_map` or `custom_pipelines` declares custom code, which the loader imports only
-with `trust_remote_code`: the model gets a high `custom_code` finding, and
+`auto_map` or `custom_pipelines` declares custom code, which the loader imports
+only with `trust_remote_code`: the model gets a high `custom_code` finding, and
 `properties.custom_code` records which files declare it, the well-formed module
-references, whether any reference names another repository, and the digests of the
-directory's `.py` files and the referenced modules below it.
-
-A module named as holding credentials, such as `secrets.py` or `token_utils.py`, is
-not read and is a coverage gap instead, as a change to it would raise no drift alert.
-Without such a declaration, Python files are not recorded, so adding an unrelated
-script does not change the inventory. The `base_model_name_or_path` of an
-`adapter_config.json` is recorded as `properties.base_model` when it is a Hugging
-Face model identifier.
+references, whether any reference names another repository, and the digests of
+the directory's `.py` files and the referenced modules below it. A module named as
+holding credentials, such as `secrets.py` or `token_utils.py`, is not read and is a
+coverage gap instead, as a change to it would raise no drift alert. Without such a declaration, Python files are not
+recorded, so adding an unrelated script does not change the inventory. The
+`base_model_name_or_path` of an `adapter_config.json` is recorded as
+`properties.base_model` when it is a Hugging Face model identifier.
 
 In `diff`, a change to `tokenizer_hash` or `chat_template_hash` is a high alert,
 and a change to a bound weight file, a configuration file or custom code is a
 high alert naming the property that records its digest.
 
 Every chat template that `properties.chat_templates` lists is checked for potential
-Python-internals access patterns: a dunder attribute (named or subscripted), a dunder
-name as a string such as an `attribute=` argument, the `attr` filter, a
-Python-mangled private name such as `self._TemplateReference__context` (read as an
-attribute or written as a string), or an underscore string repeated with `*`. The
-heuristic decodes string escapes such as `\x5f`, removes a backslash before a line
-break, and folds adjacent constant strings joined with `~` or `+`, or written next to
-each other, inside Jinja expressions. It does not evaluate templates.
-
-Matches may be harmless in the actual context; a correctly configured sandbox can deny
-the access. Other ways to construct names may not match. A Hugging Face template that
-matches gives every model in its directory a critical `serialization_format` finding
-that names up to three matching templates and counts the rest, and a model that would
-otherwise be rated `safe` is rated `unsafe-template-injection`.
-
-A model rated `unknown` or `unsafe-code-execution` keeps its rating and the findings
-that come with it, such as `invalid_safetensors` for a SafeTensors file that does not
-validate, so suppressing the template finding does not accept them. `validate` checks
-each model file's own structure again, not its directory's templates: its completeness
-check (on by default) and `risk --project` compare the rating and the finding with a
-new collection. A template file larger than the `file-bytes` limit is digested but not
+Python-internals access patterns: a dunder attribute, named or subscripted, a
+dunder name as a string such as an `attribute=` argument, the `attr` filter, a
+Python-mangled private name such as `self._TemplateReference__context`, read as an
+attribute or written as a string, or an underscore string repeated with `*`.
+The heuristic decodes string escapes such as `\x5f`, removes a backslash before a
+line break, and folds adjacent constant strings joined with `~` or `+`, or written
+next to each other, inside Jinja expressions. It does not evaluate templates.
+Matches may be harmless in the actual context; a correctly configured sandbox can
+deny the access. Other ways to construct names may not match. A Hugging Face template
+that matches gives every
+model in its directory a critical `serialization_format` finding that names up to
+three matching templates and counts the rest, and a model that would otherwise be
+rated `safe` is rated `unsafe-template-injection`. A model rated `unknown` or
+`unsafe-code-execution` keeps its rating and the findings that come with it, such as
+`invalid_safetensors` for a SafeTensors file that does not validate, so a suppression
+of the template finding does not accept them. `validate` checks each model file's own
+structure again, not its directory's templates: its completeness check, on by
+default, and `risk --project` compare the rating and the finding with a new
+collection. A template file larger than the `file-bytes` limit is digested but not
 checked, and is a coverage gap in `surfaces_excluded`.
 
 A GGUF file whose metadata exceeds the reader's bounds (65,536 keys, 16 MiB
@@ -372,23 +361,21 @@ and the files bound to it) verifies under a signature policy you own. Pass the
 same policy to `scan`, `validate --project`, `risk --project` and `baseline`
 with `--signature-policy`, or to the GitHub Action with `signature-policy`.
 
-Keep the policy outside the checkout: the commands refuse a policy file inside the
-scanned project or anywhere in any enclosing Git working tree, including a superproject
-above a nested checkout or submodule (so a monorepo's `ci/signers.json` is refused
-when you scan `services/agent`), or in any Git working tree that holds the directory
-the command runs from (so a pull request's checkout cannot supply the policy for an
-artifact scanned elsewhere), also under another name for any of these directories such
-as a case variant or a bind mount (compared by device and inode), or one with other
-hard links. The commands resolve the project path first, so a symlinked `--project`
-path works for every command.
-
-Every directory at or above the project with a `.git` entry counts as an enclosing
-repository, so two layouts cannot hold the policy: a trusted base checkout that
-encloses the pull request's checkout (the base at the workspace root, the pull request
-in `pr/`), and a home directory that is itself a repository (`~/.git`) when the
-project is below it. Every entry must name a file beneath the project, spelled as its
-directory spells it: another case is refused on every file system, also where file
-names fold case.
+Keep the policy outside the checkout: the commands refuse a policy file inside
+the scanned project or anywhere in any enclosing Git working tree, including a
+superproject above a nested checkout or submodule (so a
+monorepo's `ci/signers.json` is refused when you scan `services/agent`), or in
+any Git working tree that holds the directory the command runs from (so a
+pull request's checkout cannot supply the policy for an artifact scanned elsewhere), also
+under another name for any of these directories such as a case variant or a bind mount
+(compared by device and inode), or one with other hard links, and they resolve the project path first, so a symlinked `--project`
+path works for every command. Every directory at or above the project with a `.git`
+entry counts as an enclosing repository, so two layouts cannot hold the policy: a
+trusted base checkout that encloses the pull request's checkout (the base at the
+workspace root, the pull request in `pr/`), and a home directory that is itself a
+repository (`~/.git`) when the project is below it. Every entry must name a file beneath the project,
+spelled as its directory spells it: another case is refused on every file system,
+also where file names fold case.
 An entry that names neither a collected model weight file nor the ShadowScan
 report makes the `model` collector fail, and `validate --project` reports it as
 the integrity error `unused_policy_entry` even when the completeness check does

@@ -47,23 +47,21 @@ are checked only when a scan reads the manifest.
 The exported `name`, `version`, `framework` and `owner` use the name rule of the
 shared [redaction](security-model.md#known-false-positive-and-false-negative-classes),
 which keeps an ordinary name such as `sk-research-assistant`, and `purpose` uses
-free-text redaction. Recognized credentials are removed before these values enter any
-inventory or export. Redaction does not recognize every possible secret, so keep
-credentials out of these fields and review earlier exports before sharing them.
+free-text redaction. Recognized credentials are removed before these values enter
+any inventory or export. Redaction does not recognize every possible secret, so keep credentials
+out of these fields and review earlier exports before sharing them.
 
-Redaction keeps only the origin of a URL, so
-`owner: https://github.com/acme-platform` is exported as `https://github.com`. The
-agent record binds the written value of each field that redaction changed, and only
-of those: with `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` set, `static_value_binding` is an
-HMAC-SHA256 (profile `nexus-symbiote/agent-manifest-values/v1`) over them, so a
-change to one of them changes it, while a change to a field exported as written shows
-in that field.
-
-Without the key the record carries a low `completeness` finding that names the
-fields, and `diff` raises its unbound-values alert on every comparison, as it does
-for the other records with withheld values. A manifest whose fields are all exported
-as written carries neither. A URL written with an upper-case host or a trailing slash
-counts as changed, since the export normalizes it.
+Redaction also keeps only the origin of a URL, so `owner: https://github.com/acme-platform`
+is exported as `https://github.com`. The agent record binds the written value of each
+field that redaction changed, and only of those: with
+`NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` set, `static_value_binding` is an HMAC-SHA256
+(profile `nexus-symbiote/agent-manifest-values/v1`) over them, so a change to one of
+them changes it, while a change to a field exported as written shows in that field.
+Without the key the record carries a low `completeness` finding that names the fields,
+and `diff` raises its unbound-values alert on every comparison, as it does for the
+other records with withheld values. A manifest whose fields are all exported as written
+carries neither. A URL written with an upper-case host or a trailing slash counts as
+changed, since the export normalizes it.
 
 ## What it changes
 

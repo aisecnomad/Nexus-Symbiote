@@ -79,7 +79,7 @@ from nexus_symbiote.scanners.mcp_credentials import (
     name_words,
     placeholder,
     private_key_forms,
-    public_value,
+    public_scheme_operand,
     rewrapped_key_literals,
     strongest,
     value_hits,
@@ -1091,6 +1091,17 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
                         name, value, following, variable=variable, in_set=in_set
                     ):
                         values.extend(scheme_credentials(f"{value} {following}"))
+        assigned = _assigned(word) if following is not None else None
+        if assigned is not None and following is not None:
+            # The same floor whatever the name: MODE=Bearer <operand> names no credential
+            # but may still carry one.
+            values.extend(_withheld_operand(*assigned, following, in_set=in_set))
+        spaced = _spaced_scheme_pair(words[index - 1], word) if index > 0 else None
+        if spaced is not None and following is not None:
+            values.extend(
+                literal for _, literal in _scheme_pair_hits(*spaced, following, in_set=False)
+            )
+            values.extend(_withheld_operand(*spaced, following, in_set=False))
         if index > 0:
             flag = words[index - 1]
             if (
@@ -1112,7 +1123,9 @@ MAX_CREDENTIAL_POSITIONS = 64
 _ENDPOINT_QUERY_POSITION = "endpoint URL query"
 _ASSIGNMENT_FLAGS = frozenset({"env", "e", "build-arg"})
 # The scheme words _AUTH reads, after which cmd's `set NAME=<scheme> <credential>` splits.
-_ASSIGNMENT_SCHEMES = frozenset({"bearer", "basic", "token", "bot", "apikey", "api-key"})
+_ASSIGNMENT_SCHEMES = frozenset(
+    {"bearer", "basic", "token", "bot", "apikey", "api-key", "dpop", "hoba", "mutual"}
+)
 _SCHEME_DESCRIPTORS = frozenset({"type", "mode", "scheme", "method", "transport", "strategy"})
 _PUBLIC_TOKEN_SELECTORS = frozenset({"format", "source", "profile", "output", "kind"})
 # These common switches can follow a credential binding in a launch declaration.
@@ -1123,6 +1136,9 @@ _PUBLIC_SCHEME_SWITCHES = _names(
     "allowhttp insecure noprofile outputformat noninteractive headless detached sandboxed "
     "production telemetry recursive localhost maxconcurrentrequests enableautomaticupdates"
 )
+# Bare words that name a mode's setting (`--auth-type=bearer required`). Any other
+# alphabetic word of secret length after a mode stays out of exports.
+_PUBLIC_MODE_WORDS = _names("workspace required optional disabled")
 _LOWER_LONG_OPTION = re.compile(r"--[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
 _LOWER_CLI_DIGIT_SEGMENT = re.compile(r"(?:[a-z]{1,10}[0-9]{1,3}|[a-z][0-9]{1,2}[a-z])")
 _CAMEL_SWITCH = re.compile(r"[A-Za-z][a-z]+(?:[A-Z][a-z]+)+")
@@ -1137,10 +1153,10 @@ _ACRONYM_CLI_SWITCH = re.compile(
     rf"|{_CLI_ACRONYMS}(?:[A-Z][a-z]+)+)"
 )
 # A short public version or date label after a mode selector (e.g. Workspace2,
-# Workspace10, WorkspaceV2, OpenAPI3, OpenAPI3.1, 20250618). Mixed-case tokens
-# or random alphanumeric runs stay private.
+# WorkspaceV10, OpenAPI3.1, OAuth2.1, 20250618). Only these vocabularies qualify: a
+# capitalized word and digits is also the most common weak-password shape (Summer24).
 _MODE_LABEL = re.compile(
-    r"(?:(?:[A-Z][a-z]{2,10}|OpenAPI|OAuth|HTTP|TLS|SAML|OIDC|GraphQL|JSON|YAML|GRPC)"
+    r"(?:(?:OpenAPI|OAuth|GraphQL|HTTP|TLS|SAML|OIDC|JSON|YAML|GRPC|Workspace)"
     r"[Vv]?[0-9]{1,2}(?:\.[0-9]{1,2})?|[0-9]{8})"
 )
 _BENIGN_ENV_KEY = re.compile(r"[A-Z]{2,15}(?:_[A-Z0-9]{1,15}){0,4}")
@@ -1400,7 +1416,9 @@ def _scheme_operand_kind(word: str, *, credential_binding: bool) -> _OperandKind
         return "credential"
     if placeholder(word):
         # A launcher's own package (@example/server@1.0.0) holds a placeholder word too.
-        return "public" if not credential_binding and public_value(word) else "unclassified"
+        return (
+            "public" if not credential_binding and public_scheme_operand(word) else "unclassified"
+        )
     if word.isascii() and word.isalpha():
         if credential_binding or len(word) >= 16:
             return "credential"
@@ -1409,7 +1427,13 @@ def _scheme_operand_kind(word: str, *, credential_binding: bool) -> _OperandKind
             and _CAMEL_SWITCH.fullmatch(word) is None
             and not word.isupper()
         )
-        return "credential" if unusual_case else "public"
+        if unusual_case:
+            return "credential"
+        # A dictionary word of secret length (sunshine) is a common password; only a
+        # known switch or mode word reads as a setting of its own.
+        folded = word.casefold()
+        known = folded in _PUBLIC_SCHEME_SWITCHES or folded in _PUBLIC_MODE_WORDS
+        return "public" if known else "unclassified"
     if credential_binding:
         return "credential"
     if (
@@ -1422,7 +1446,7 @@ def _scheme_operand_kind(word: str, *, credential_binding: bool) -> _OperandKind
         return "credential"
     if literal_value(word):
         return "credential"
-    return "public" if public_value(word) else "unclassified"
+    return "public" if public_scheme_operand(word) else "unclassified"
 
 
 def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
@@ -1457,7 +1481,7 @@ def _public_scheme_following(
         following.startswith("-")
         or "=" in following
         or _PUBLIC_UUID.fullmatch(following) is not None
-        or public_value(following)
+        or public_scheme_operand(following)
     )
 
 
@@ -1486,6 +1510,8 @@ def _assigned(word: str) -> tuple[str, str, bool] | None:
 def _withheld_scheme_operands(words: Sequence[str], *, cmd: bool) -> Iterator[str]:
     """What the pairing rule reads after each ``NAME=<scheme>`` word of one command line.
 
+    A flag and its scheme in separate words (``--auth bearer``) pair as their ``=`` form.
+
     ``_assignment_word_hits`` narrows the pairing to operands that read as credentials,
     which decides the finding. Withholding fails closed: an operand it leaves unflagged
     stays out of exports unless it is positively a public launch word. ``words`` are the
@@ -1493,6 +1519,8 @@ def _withheld_scheme_operands(words: Sequence[str], *, cmd: bool) -> Iterator[st
     """
     for index in range(len(words) - 1):
         assigned = _assigned(words[index])
+        if assigned is None and index:
+            assigned = _spaced_scheme_pair(words[index - 1], words[index])
         if assigned is None:
             continue
         name, value, variable = assigned
@@ -1506,6 +1534,25 @@ def _withheld_scheme_operands(words: Sequence[str], *, cmd: bool) -> Iterator[st
             yield from (literal for _, literal in value_hits(name, f"{value} {following}"))
 
 
+def _withheld_operand(
+    name: str, value: str, variable: bool, following: str, *, in_set: bool
+) -> list[str]:
+    """The operand after ``NAME=<scheme>`` unless it is positively a public launch word.
+
+    A public selector (``--source=token <id>``) chooses a value, not an authentication
+    mode, so the word after it is its own.
+    """
+    operand = scheme_credentials(f"{value} {following}")
+    if (
+        not operand
+        or _classify_scheme_assignment(name, value, variable=variable, in_set=in_set)
+        == "public_selector"
+        or _public_scheme_following(name, value, following, variable=variable, in_set=in_set)
+    ):
+        return []
+    return operand
+
+
 def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = False) -> list[Hit]:
     """The hits of a ``NAME=value`` word, ``--name=value`` and ``--env=NAME=value`` included.
 
@@ -1516,7 +1563,33 @@ def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = Fa
         return []
     name, value, variable = assigned
     hits = value_hits(name, value)
-    if following is None or value.lower() not in _ASSIGNMENT_SCHEMES:
+    if following is not None:
+        hits.extend(_scheme_pair_hits(name, value, variable, following, in_set=in_set))
+    return hits
+
+
+def _spaced_scheme_pair(flag: str | None, word: str) -> tuple[str, str, bool] | None:
+    """``--auth bearer <operand>`` as the ``--auth=bearer <operand>`` it spells.
+
+    A flag and its scheme in separate words are the same mode selector or binding as
+    the ``=`` form, so the operand after them gets the same reading.
+    """
+    if (
+        flag is None
+        or "=" in flag
+        or _CLI_FLAG.fullmatch(flag) is None
+        or word.lower() not in _ASSIGNMENT_SCHEMES
+    ):
+        return None
+    return _assigned(f"{flag}={word}")
+
+
+def _scheme_pair_hits(
+    name: str, value: str, variable: bool, following: str, *, in_set: bool
+) -> list[Hit]:
+    """The hits of the operand after ``NAME=<scheme>``, read by how the name uses it."""
+    hits: list[Hit] = []
+    if value.lower() not in _ASSIGNMENT_SCHEMES:
         return hits
     kind = _classify_scheme_assignment(name, value, variable=variable, in_set=in_set)
     if kind == "public_selector":
@@ -1593,6 +1666,9 @@ def _word_hits(
         hits.extend(_header_line_hits(word, explicit=_explicit_header(previous, word)))
     if "=" in word:
         hits.extend(_assignment_word_hits(word, following, in_set=in_set))
+    spaced = _spaced_scheme_pair(previous, word) if following is not None else None
+    if spaced is not None and following is not None:
+        hits.extend(_scheme_pair_hits(*spaced, following, in_set=False))
     if (":" in word or "=" in word) and _PLAIN_ASSIGNMENT.fullmatch(word) is None:
         hits.extend(assignment_hits(word))
     hits.extend(_user_hits(previous, word, fetcher))

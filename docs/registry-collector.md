@@ -2,7 +2,7 @@
 
 The `registry` collector records the AI-related packages and container images a project declares in its root manifests. It reads files only: it runs no package manager, builds no image and fetches nothing. A record is a declaration with unknown trust, not proof of what is installed.
 
-It inventories only packages and images in the [AI package catalog](#ai-package-catalog) below. Every other dependency, including a malicious package outside the catalog or a look-alike name such as `langchian`, produces no component and no finding: the collector does not detect typosquats and is not a full SBOM. "registry (no AI-related dependencies found)" means no declaration matched the catalog, not that the project has no dependencies. The catalog changes between releases, so a newer release can inventory packages an older baseline left out.
+It inventories only the packages and images in the [AI package catalog](#ai-package-catalog) below. Every other dependency, including a malicious package outside the catalog or a look-alike name such as `langchian`, produces no component and no finding: the collector does not detect typosquats and is not a full software bill of materials. "registry (no AI-related dependencies found)" means that no declaration matched the catalog, not that the project has no dependencies. The catalog changes between releases, so a scan with a newer release can inventory packages an older baseline left out.
 
 ## What it reads
 
@@ -20,7 +20,7 @@ The collector also reads the project's [registry and index settings](#registry-a
 
 ## Registry and index settings
 
-A project file can redirect a package manager to a non-default registry or index, where the same name and version need not be the public package. For every inventoried npm package fetched from a registry, and every inventoried PyPI package not declared only by URL, the collector reads these settings from the project root:
+A project file can send a package manager to a registry or index other than the default one, where a package of the same name and version need not be the public one. For every inventoried npm package that is fetched from a registry, and every inventoried PyPI package that is not declared only by URL, the collector reads these settings from the project root:
 
 | Ecosystem | File | Settings |
 | --- | --- | --- |
@@ -56,7 +56,7 @@ with the finding "npm package 'openai' may resolve from a registry that the proj
 
 ## Coverage gaps
 
-These gaps make the collector partial, so `scan`, `validate` and `risk` fail by default. Gaps never name the causing value, which can hold a credential.
+These make the collector partial, so `scan`, `validate` and `risk` fail by default. Gaps never name the value that caused them, which can hold a credential.
 
 | Gap | Cause |
 | --- | --- |
@@ -117,9 +117,7 @@ A file that cannot be read or parsed, such as invalid TOML, JSON or YAML, a Comp
 | `lockfile_unread` | low | `Pipfile.lock` or `pdm.lock` (PyPI), or `bun.lock` or `bun.lockb` (npm) exists: the package manager resolves the package from a file the collector does not read. Coverage stays complete, because the declarations are read |
 | `version_pinning`, `mutable_image_tag` | high, medium | An image has no digest Docker pulls, which is `sha256`, `sha384` or `sha512` in lower-case hex of that algorithm's length: high without a tag or with `latest`, medium with another tag |
 
-A PyPI package's rating follows from all its declarations across every file, in any read order. The first exact pin without a marker is the reported version, and it resolves every range it satisfies in any root file, under any marker or group, as a compiled `requirements.txt` resolves `pyproject.toml` ranges. An unsatisfied range is a `version_pinning` finding; declarations under the same markers and group that cannot both hold are a conflict; a URL declaration anywhere is a finding.
-
-The collector cannot tell which file is installed, so a pin in `requirements-docs.txt` also resolves a range in `requirements.txt`; the `declarations` property lists every declaration with its file.
+The rating of a PyPI package follows from all of its declarations, in every file, whatever order they are read in. The first exact pin without a marker is the version reported, and it resolves every range it satisfies, in any root file, under any marker or group, as a compiled `requirements.txt` resolves the ranges of `pyproject.toml`. A range it does not satisfy is a `version_pinning` finding that names its files, declarations under the same markers and group that cannot both hold are a conflict, and a URL declaration anywhere is a finding. The collector cannot tell which file is installed, so a pin in a file that never is, such as `requirements-docs.txt`, also resolves a range in `requirements.txt`; the `declarations` property lists every declaration with its file.
 
 ## Identities
 
@@ -169,7 +167,7 @@ An image is inventoried when its reference, in lower case, contains one of `chro
 
 ## Not read
 
-These declare or change what is installed but are not read and leave no gap. Review them by other means.
+These declare or change what is installed but are not read, and leave no gap. Review changes to them by other means.
 
 - Manifests outside the project root: workspace members (a gap when `workspaces`, a `pnpm-workspace.yaml` or `[tool.uv.workspace]` lists them), other `package.json` files, `requirements*.txt` files in subdirectories and pip-tools `*.in` files.
 - `setup.py`, `setup.cfg` and dependencies declared dynamic in `pyproject.toml`; conda `environment.yml`; `[tool.hatch.envs]` environments.

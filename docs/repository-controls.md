@@ -1,15 +1,14 @@
 # Repository verification controls
 
-The `Verified CI` job summarizes the full test matrix, the full suite on macOS, the
-tests at the declared dependency floors, quality checks (including the lock check),
-coverage, distribution checks, security regressions, dependency-advisory acceptance,
-CodeQL security policy, and the composite Action run end to end on passing, failing
-and hostile fixtures, with a check that the hostile fixture created no annotation.
-CodeQL is part of this same CI run rather than an independent green badge.
-
+The `Verified CI` job summarizes the full test matrix, the full suite on macOS, the tests
+at the declared dependency floors, quality checks (including the lock check), coverage, distribution
+checks, security regressions, dependency-advisory acceptance, CodeQL security
+policy, and the composite Action run end to end on passing, failing and hostile
+fixtures, with a check that the hostile fixture created no annotation. CodeQL is
+part of this same CI run rather than an independent green badge.
 It fails if any prerequisite fails, is skipped or is cancelled. Make this exact
 context a required status check on `main`; running a workflow alone does not enforce
-it.
+it. CI runs on pull requests that target `main`.
 
 `config/github-main-protection.json` is a proposed GitHub branch-protection
 configuration. It binds `Verified CI` to the GitHub Actions app (ID 15368) and
@@ -71,52 +70,40 @@ preflight.
 
 With `--publish testpypi` or `--publish pypi`, as the release workflow passes, it
 also requires an active ruleset that stops `refs/tags/v*` from being updated or
-deleted and that the checking token itself cannot bypass. It refuses such a ruleset
-that also restricts tag creation (no one could then create a release tag; creation
-belongs to the separate creation-only ruleset described
-[below](#apply-the-outstanding-controls)). It requires the named environment to have
-a required reviewer, administrator bypass turned off and deployments limited to
-`main` by a single branch policy (the *Protected branches* option admits every
-protected branch, so it is refused).
-
-GitHub returns a ruleset's bypass actors only to a caller that may edit the ruleset,
-so the release workflow's read-only token cannot tell whether an administrator, a
-team or an app may bypass it: the run prints a notice instead of treating the unseen
-list as empty. Only the
+deleted and that the checking token itself cannot bypass, refuses such a ruleset that
+also restricts tag creation (no one could then create a release tag; creation belongs
+to the separate creation-only ruleset described [below](#apply-the-outstanding-controls)),
+and requires the named
+environment to have a required reviewer, administrator bypass turned off and
+deployments limited to `main` by a single branch policy (the *Protected branches*
+option admits every protected branch, so it is refused). GitHub returns a ruleset's
+bypass actors only to a caller that may edit the ruleset, so the release workflow's
+read-only token cannot tell whether an administrator, a team or an app may bypass
+it: the run prints a notice saying so, in its log and job summary, instead of
+treating the unseen list as empty. Only the
 [administrator check](#apply-the-outstanding-controls), run with
 `--verify-bypass-actors` and an administrator's token, verifies that the list is
-empty, and it fails when the list cannot be read.
-
-With `--publish pypi` it further requires the release commit to have been on `main`
-for 24 hours, measured from the later of its commit time and the first `push` run
-GitHub created for it, unless the `SOAK_OVERRIDE` variable states a reason of at
-least 20 characters, which is printed. A commit with no `push` run, such as one
-pushed with `[skip ci]`, has no landing time and needs that override.
-
-It also requires the signed, annotated tag `v<version>` (the version in
-`pyproject.toml`) to point at the source commit with a signature GitHub reports as
-verified; when `ALLOWED_RELEASE_TAG_SIGNERS` lists comma-separated tagger emails,
-the tag's `tagger.email` must also match that allowlist. The release workflow passes
-the repository variable `ALLOWED_RELEASE_TAG_SIGNERS` to this preflight; a value
-that names no signer fails.
-
-All GitHub API calls ignore ambient proxy environment variables, verify certificates
-with TLS 1.2 or later without reading `SSLKEYLOGFILE`, and reject duplicate JSON
-keys and non-finite numbers (`NaN`, `Infinity` and overflowing literals such as
-`1e999`).
+empty, and it fails when the list cannot be read. With
+`--publish pypi` it further requires the release commit to have been on `main` for
+24 hours, measured from the later of its commit time and the first `push` run GitHub
+created for it, unless the `SOAK_OVERRIDE` variable states a reason of at least 20
+characters, which is printed. A commit with no `push` run, such as one pushed with
+`[skip ci]`, has no landing time and needs that override: a `workflow_dispatch` run
+names its ref only by name, which a tag can share with the branch. It also requires
+the signed, annotated tag `v<version>` (the version in `pyproject.toml`) to point at
+the source commit with a signature GitHub reports as verified; when `ALLOWED_RELEASE_TAG_SIGNERS` lists comma-separated tagger emails, the tag's `tagger.email` must also match that allowlist. The release workflow passes the repository variable `ALLOWED_RELEASE_TAG_SIGNERS` to this preflight; a value that names no signer fails. All GitHub API calls ignore ambient proxy environment variables, verify certificates with TLS 1.2 or later without reading `SSLKEYLOGFILE`, and reject duplicate JSON keys and non-finite numbers (`NaN`, `Infinity` and overflowing literals such as `1e999`).
 
 Missing or truncated run, job, ruleset or environment data, an API failure,
 redirects and an unprotected branch fail closed; the one exception is the bypass list
-described above, which the workflow token is never shown. The SHA defaults to
-`GITHUB_SHA`; local invocations must supply their reviewed commit explicitly.
-
-The preflight does not audit approval counts, force-push and deletion settings or
-package-index ownership; an administrator must review those separately, for example
-with `gh api repos/aisecnomad/Nexus-Symbiote/branches/main/protection`. It checks
-live state during the build; it does not lock GitHub settings or cancel a candidate
-after later administrative changes. Review the exact run and current controls at the
-environment approval. Candidate builds remain available while controls are being
-configured; publication requires a successful preflight.
+described above, which the workflow token is never shown. The SHA defaults to `GITHUB_SHA`;
+local invocations must supply their reviewed commit explicitly. The preflight does
+not audit approval counts, force-push and deletion settings or package-index
+ownership; an administrator must review those separately, for example with
+`gh api repos/aisecnomad/Nexus-Symbiote/branches/main/protection`. It checks live state
+during the build; it does not lock GitHub settings or cancel a candidate after later
+administrative changes. Review the exact run and current controls at the environment
+approval. Candidate builds remain available while controls are being configured;
+publication requires a successful preflight.
 
 If GitHub reports an unavailable plan feature or insufficient Administration
 permission, resolve that account setting before claiming branch protection is
@@ -191,21 +178,18 @@ scheduled run notifies the maintainer through GitHub's workflow notifications.
 in the workflows and in `action.yml`, and in any local action they reference, to be
 pinned to a commit with a full-version comment (`# v1.2.3`) that agrees wherever the
 same commit is used and is not older than the floor recorded for that action; a local
-action that does not exist fails.
-
-It rejects `${{ }}` expressions in shell source, triggers other than `push`,
-`pull_request`, `workflow_dispatch`, `schedule` and `branch_protection_rule` (so
-`pull_request_target` and `workflow_run` cannot appear), missing or writable
-top-level permissions, jobs without `timeout-minutes`, and checkouts that persist
-credentials, and it checks a file in `.github/workflows` as a workflow whatever its
-name.
-
-In `ci.yml`, `release.yml` and `codeql.yml` it rejects `continue-on-error` on a job,
-and on a step unless a later step that runs reads that step's outcome (naming it in
-the later step's name does not count), and requires each verification job, `Verified
-CI` and the release attestation check among them, to still run the command that makes
-it a gate as a command of its own, under errexit, in `bash` (GitHub's default or
-`shell: bash`) and in the checkout's root: a gate command that is quoted,
+action that does not exist fails. It rejects `${{ }}` expressions in shell source,
+triggers other than `push`, `pull_request`, `workflow_dispatch`, `schedule` and
+`branch_protection_rule` (so `pull_request_target` and `workflow_run` cannot appear),
+missing or writable top-level permissions, jobs without `timeout-minutes`, and
+checkouts that persist credentials, and it checks a file in `.github/workflows` as a
+workflow whatever its name. In `ci.yml`, `release.yml` and `codeql.yml` it rejects `continue-on-error`
+on a job, and on a step unless a later step that runs reads that step's outcome (naming
+it in the later step's name does not count), and
+requires each verification job, `Verified CI` and the release attestation check among
+them, to still run the command
+that makes it a gate as a command of its own, under errexit, in `bash` (GitHub's
+default or `shell: bash`) and in the checkout's root: a gate command that is quoted,
 in an `if` or loop condition, negated, joined with `&&` or `||` (other than
 `|| exit N` for an N that is not a multiple of 256), in the background or in a pipeline
 without `pipefail`, that follows `set +e`, `set -n`, `set -t`, `shopt -u -o errexit`,
