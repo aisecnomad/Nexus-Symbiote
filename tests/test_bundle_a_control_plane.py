@@ -1400,6 +1400,14 @@ def _guard_alerts(
     [
         (_guard_settings(matcher="NeverMatchesAnyTool"), None),
         (_guard_settings(matcher="Bas.*"), None),
+        (_guard_settings(matcher="Bash.*"), None),
+        (_guard_settings(matcher="Bash "), None),
+        (_guard_settings(matcher=" Bash"), None),
+        (_guard_settings(matcher="Bash,Edit"), None),
+        (_guard_settings(matcher="Bash, Edit"), None),
+        (_guard_settings(matcher=" Edit ,Bash|"), None),
+        (_guard_settings(matcher="Bash|"), None),
+        (_guard_settings(matcher="my-tool"), None),
         (_guard_settings(matcher="Edit|Write"), None),
         (_guard_settings(matcher="Edit, Write"), None),
         (_guard_settings(condition="Bash(never-matches *)"), None),
@@ -1423,8 +1431,6 @@ def test_baseline_diff_alerts_when_a_kept_hook_no_longer_runs(
         (_guard_settings(matcher=""), None),
         (_guard_settings(matcher=None), None),
         (_guard_settings(matcher="Bash|Edit"), None),
-        (_guard_settings(matcher="Bash, Edit"), None),
-        (_guard_settings(matcher=" Edit ,Bash|"), None),
         (_guard_settings(disableAllHooks=True), {"disableAllHooks": False}),
         (_guard_settings(disableAllHooks=False), None),
     ],
@@ -1490,7 +1496,7 @@ def test_hook_run_comparison_scales_linearly_with_matchers(tmp_path: Path) -> No
         (_guard_settings(condition="Bash(git *)"), _guard_settings(condition="Bash(gi *)"), True),
         (_guard_settings(condition="Bash(git *)"), _guard_settings(), False),
         (
-            _guard_settings(matcher="Bash, Edit", condition="Bash(git *)"),
+            _guard_settings(matcher="Bash|Edit", condition="Bash(git *)"),
             {
                 "hooks": {
                     "PreToolUse": [
@@ -1508,6 +1514,26 @@ def test_hook_run_comparison_scales_linearly_with_matchers(tmp_path: Path) -> No
                 }
             },
             False,
+        ),
+        (
+            _guard_settings(matcher="Bash, Edit", condition="Bash(git *)"),
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{"type": "command", "command": "./guard.sh"}],
+                        },
+                        {
+                            "matcher": "Edit",
+                            "hooks": [
+                                {"type": "command", "command": "./guard.sh", "if": "Bash(git *)"}
+                            ],
+                        },
+                    ]
+                }
+            },
+            True,
         ),
         (_guard_settings(), _guard_settings(condition="Bash(never-matches *)"), True),
     ],
@@ -1623,6 +1649,9 @@ _ENABLED = frozenset({"hook_command_changed", "launch_target_added"})
         (_guard_settings(disableAllHooks=True), _guard_settings()),
         (_guard_settings(hook_type="prompt"), _guard_settings()),
         (_guard_settings(matcher="NeverMatchesAnyTool"), _guard_settings()),
+        (_guard_settings(matcher="Bash "), _guard_settings()),
+        (_guard_settings(matcher="Bash,Edit"), _guard_settings()),
+        (_guard_settings(matcher="my-tool"), _guard_settings()),
         (
             _guard_settings(condition="Bash(never-matches *)"),
             _guard_settings(condition="Bash(git *)"),
@@ -1641,7 +1670,7 @@ def test_baseline_diff_alerts_when_a_kept_hook_starts_running(
     [
         (_guard_settings(), _guard_settings()),
         (_guard_settings(), _guard_settings(matcher="*")),
-        (_guard_settings(), _guard_settings(matcher="Bash, Edit")),
+        (_guard_settings(), _guard_settings(matcher="Bash|Edit")),
         (_guard_settings(condition="Bash(git *)"), _guard_settings()),
         (_guard_settings(disableAllHooks=True), _guard_settings(disableAllHooks=True)),
     ],
@@ -1696,3 +1725,157 @@ def test_hook_start_comparison_scales_linearly() -> None:
         assert diff_control_plane_audits(summary(count, False), summary(count, False)) == []
 
     assert scaling_ratio(run) < 10
+
+
+@pytest.mark.parametrize("event_name", ["SessionStart", "UserPromptSubmit", "Stop"])
+def test_dropping_if_on_non_tool_event_alerts_as_enabling_dormant_hook(
+    tmp_path: Path, event_name: str
+) -> None:
+    baseline = {
+        "hooks": {
+            event_name: [
+                {"hooks": [{"type": "command", "command": "./guard.sh", "if": "Bash(git *)"}]}
+            ]
+        }
+    }
+    current = {"hooks": {event_name: [{"hooks": [{"type": "command", "command": "./guard.sh"}]}]}}
+    causes = _guard_alerts(tmp_path, current, baseline=baseline)
+    assert causes >= _ENABLED
+    # Reverse direction: adding `if` on a non-tool event stops it from running.
+    rev_dir = tmp_path / "rev"
+    rev_dir.mkdir()
+    reverse = _guard_alerts(rev_dir, baseline, baseline=current)
+    assert {"hook_command_removed", "launch_target_removed"} <= reverse
+
+
+@pytest.mark.parametrize("raw_event", ["PreToolUse ", "\tPreToolUse", "PreToolUse\xa0"])
+def test_event_name_with_whitespace_is_keyed_distinctly_and_records_gap(
+    tmp_path: Path, raw_event: str
+) -> None:
+    decoy = {
+        "hooks": {
+            raw_event: [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "./guard.sh"}]}
+            ]
+        }
+    }
+    causes = _guard_alerts(tmp_path, decoy)
+    assert {"hook_command_removed", "hook_command_changed", "launch_target_removed"} <= causes
+    decoy_summary = audit_project_control_plane(tmp_path / "curr")
+    assert any("contains whitespace or non-printable" in gap for gap in decoy_summary.gaps)
+
+
+def _link_nested_skill(tmp_path: Path) -> None:
+    (tmp_path / ".claude" / "skills").mkdir(parents=True)
+    (tmp_path / "shared" / "foo").mkdir(parents=True)
+    (tmp_path / ".claude" / "skills" / "foo").symlink_to(
+        "../../shared/foo", target_is_directory=True
+    )
+
+
+def _link_claude_rules(tmp_path: Path) -> None:
+    (tmp_path / ".claude").mkdir(parents=True)
+    (tmp_path / "docs" / "rules").mkdir(parents=True)
+    (tmp_path / ".claude" / "rules").symlink_to("../docs/rules", target_is_directory=True)
+
+
+def _link_claude_nested_md(tmp_path: Path) -> None:
+    (tmp_path / ".claude").mkdir(parents=True)
+    (tmp_path / "docs").mkdir(parents=True)
+    (tmp_path / "docs" / "agent.md").write_text("# rules\n", encoding="utf-8")
+    (tmp_path / ".claude" / "CLAUDE.md").symlink_to("../docs/agent.md")
+
+
+def _link_nested_hook_script(tmp_path: Path) -> None:
+    (tmp_path / ".claude" / "hooks").mkdir(parents=True)
+    (tmp_path / "scripts").mkdir(parents=True)
+    (tmp_path / "scripts" / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    (tmp_path / ".claude" / "hooks" / "guard.sh").symlink_to("../../scripts/guard.sh")
+
+
+def _link_chained_nested_skill(tmp_path: Path) -> None:
+    (tmp_path / "config" / "claude" / "skills").mkdir(parents=True)
+    (tmp_path / "shared" / "foo").mkdir(parents=True)
+    (tmp_path / "config" / "claude" / "skills" / "foo").symlink_to(
+        "../../../shared/foo", target_is_directory=True
+    )
+    (tmp_path / ".claude").symlink_to("config/claude", target_is_directory=True)
+
+
+@pytest.mark.parametrize(
+    ("layout", "root_arg"),
+    [
+        (_link_nested_skill, "./shared"),
+        (_link_nested_skill, "./shared/foo/sub"),
+        (_link_claude_rules, "./docs"),
+        (_link_claude_nested_md, "./docs"),
+        (_link_nested_hook_script, "./scripts"),
+        (_link_chained_nested_skill, "./shared"),
+    ],
+)
+def test_steering_root_holding_nested_steering_symlink_target_is_writable(
+    tmp_path: Path, layout: Callable[[Path], None], root_arg: str
+) -> None:
+    layout(tmp_path)
+    _write_always_allowed_filesystem_server(tmp_path, root_arg)
+    summary = audit_project_control_plane(tmp_path)
+    assert [s["writable"] for s in summary.steering_surfaces] == [True]
+    assert any(
+        f["category"] == "steering_surface_writable" and f["severity"] == "critical"
+        for f in summary.findings
+    )
+
+
+def test_regular_file_at_claude_reports_non_directory_message_not_symlink(tmp_path: Path) -> None:
+    (tmp_path / ".claude").write_text("not a directory\n", encoding="utf-8")
+    (tmp_path / "data").mkdir()
+    _write_always_allowed_filesystem_server(tmp_path, "./data")
+    summary = audit_project_control_plane(tmp_path)
+    assert summary.steering_surfaces == []
+    assert any(
+        "cannot be resolved: entry's parent is not a directory" in gap for gap in summary.gaps
+    )
+    assert not any("is a symlink that cannot be resolved" in gap for gap in summary.gaps)
+
+
+def test_claude_link_to_excluded_directory_records_settings_gap(tmp_path: Path) -> None:
+    (tmp_path / "node_modules").mkdir()
+    _write_json(tmp_path / "node_modules" / "settings.json", _LINKED_CLAUDE_SETTINGS)
+    (tmp_path / ".claude").symlink_to("node_modules", target_is_directory=True)
+    summary = audit_project_control_plane(tmp_path)
+    assert summary.hook_commands == []
+    assert any(
+        gap == ".claude: symlink target is excluded, so its settings were not read"
+        for gap in summary.gaps
+    )
+
+
+def test_claude_link_to_project_root_makes_any_root_a_steering_surface(tmp_path: Path) -> None:
+    (tmp_path / "data").mkdir()
+    (tmp_path / ".claude").symlink_to(".", target_is_directory=True)
+    _write_always_allowed_filesystem_server(tmp_path, "./data")
+    summary = audit_project_control_plane(tmp_path)
+    assert [s["writable"] for s in summary.steering_surfaces] == [True]
+
+
+def test_linked_steering_target_matching_is_casefolded(tmp_path: Path) -> None:
+    (tmp_path / "Config" / "Claude").mkdir(parents=True)
+    (tmp_path / ".claude").symlink_to("Config/Claude", target_is_directory=True)
+    _write_always_allowed_filesystem_server(tmp_path, "./config/claude")
+    summary = audit_project_control_plane(tmp_path)
+    assert [s["writable"] for s in summary.steering_surfaces] == [True]
+
+
+def test_disable_all_hooks_outside_claude_is_scoped_to_that_file(tmp_path: Path) -> None:
+    (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    _write_json(
+        tmp_path / ".cursor" / "hooks.json",
+        {
+            "disableAllHooks": True,
+            "hooks": {"beforeShellExecution": [{"command": "./guard.sh"}]},
+        },
+    )
+    _write_json(tmp_path / ".claude" / "settings.json", _guard_settings())
+    summary = audit_project_control_plane(tmp_path)
+    by_src = {h["source_file"]: h["hooks_disabled"] for h in summary.hook_commands}
+    assert by_src == {".cursor/hooks.json": True, ".claude/settings.json": False}
