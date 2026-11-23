@@ -21,6 +21,7 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 from nexus_symbiote.utils.secrets import (
     MIN_SECRET_LENGTH,
     TOKEN_SHAPE,
+    SecretScrubber,
     authorization_header,
     credential_shaped,
     private_key_block,
@@ -310,10 +311,16 @@ _ASSIGNMENT = re.compile(
     r"(\"[^\"\n]{0,8192}\"|'[^'\n]{0,8192}'|[^\s,;\"'&|]{1,8192})"
 )
 _NETRC_WORDS = frozenset({"password", "passwd"})
-_BASE64 = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
+# URL-safe base64 uses "-" and "_" where the standard alphabet uses "+" and "/".
+_BASE64 = re.compile(r"[A-Za-z0-9+/_-]{40,}={0,2}")
 _ENCODED_LIMIT = 65536
-_KEY_WRAP_CHARS = frozenset("\u200b\ufeff\u2060\u200c\u200d\u00ad")
-_KEY_WRAP = re.compile(r"[\s\u200b\ufeff\u2060\u200c\u200d\u00ad]+")
+# Format characters that can be dropped from a wrapped key without changing its text,
+# including U+200E and the other bidi controls.
+_KEY_WRAP_CHARS = frozenset(
+    "\u00ad\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e"
+    "\u2060\u2066\u2067\u2068\u2069\ufeff"
+)
+_KEY_WRAP = re.compile("[" + re.escape("".join(sorted(_KEY_WRAP_CHARS))) + r"\s]+")
 _KEY_PREFIX_LENGTH = 16
 _WRAP_COMPARISON_FACTOR = 64
 JSON_LIMIT = 65536
@@ -323,6 +330,153 @@ JSON_DEPTH = 8
 def name_words(name: str) -> list[str]:
     """The lower-case words of ``name``, digits dropped: X-Api-Key reads as x, api, key."""
     return [word.lower() for word in _NAME_PARTS.split(name) if word and not word.isdigit()]
+
+
+def _ignored_credential_char(char: str) -> bool:
+    """Format characters, variation selectors, and Unicode or ASCII whitespace."""
+    if char.isspace() or unicodedata.category(char) in {"Cf", "Zs"}:
+        return True
+    code = ord(char)
+    return 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF
+
+
+def _normalize_credential_map(value: str) -> tuple[str, list[tuple[int, int]]]:
+    """Normalized text and the original ``(start, end)`` slice of each kept character."""
+    chars: list[str] = []
+    mapping: list[tuple[int, int]] = []
+    length = len(value)
+    index = 0
+    while index < length:
+        if _ignored_credential_char(value[index]):
+            index += 1
+            continue
+        cluster_start = index
+        index += 1
+        while index < length and (
+            unicodedata.combining(value[index]) != 0
+            or unicodedata.category(value[index]) in {"Mn", "Mc", "Me"}
+            or 0x1100 <= ord(value[index]) <= 0x11FF
+        ):
+            index += 1
+        cluster_end = index
+        for piece in unicodedata.normalize("NFKC", value[cluster_start:cluster_end]):
+            if _ignored_credential_char(piece):
+                continue
+            chars.append(piece)
+            mapping.append((cluster_start, cluster_end))
+    return "".join(chars), mapping
+
+
+def _merged_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not spans:
+        return []
+    spans.sort()
+    merged = [spans[0]]
+    for start, end in spans[1:]:
+        if start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def normalize_credential(value: str) -> str:
+    """NFKC, then drop Cf, variation selectors and whitespace.
+
+    Applied to a stored credential and to the text it is matched against, so a clean
+    password scrubs a marked sibling and a marked password scrubs the clean spelling.
+    """
+    text = unicodedata.normalize("NFKC", value)
+    return "".join(char for char in text if not _ignored_credential_char(char))
+
+
+def credential_spellings(value: str) -> tuple[str, ...]:
+    """``value`` and its normalized spelling, when that spelling still reads as a secret."""
+    plain = normalize_credential(value)
+    if plain and plain != value and len(plain) >= MIN_SECRET_LENGTH:
+        return (value, plain)
+    return (value,)
+
+
+def _text_needs_credential_normalize(text: str) -> bool:
+    """Whether matching ``text`` has to ignore marks or compatibility characters."""
+    if not unicodedata.is_normalized("NFKC", text):
+        return True
+    for char in text:
+        code = ord(char)
+        if code < 128:
+            if char.isspace() and char != " ":
+                return True
+            continue
+        if _ignored_credential_char(char):
+            return True
+    return False
+
+
+class CredentialScrubber(SecretScrubber):
+    """A scrubber that matches credentials after :func:`normalize_credential` on both sides."""
+
+    __slots__ = ("_all", "_plain")
+
+    def __init__(self, values: Iterable[str] = ()) -> None:
+        super().__init__(values)
+        self._bind_plain()
+
+    def _bind_plain(self) -> None:
+        # Only spellings that differ: ASCII text keeps the parent's linear search.
+        self._plain = SecretScrubber(
+            plain
+            for value in self._values
+            if (plain := normalize_credential(value)) != value and len(plain) >= MIN_SECRET_LENGTH
+        )
+        self._all: SecretScrubber | None = None
+
+    def _all_plain(self) -> SecretScrubber:
+        cached = self._all
+        if cached is None:
+            cached = SecretScrubber(
+                plain
+                for value in self._values
+                if len(plain := normalize_credential(value)) >= MIN_SECRET_LENGTH
+            )
+            self._all = cached
+        return cached
+
+    def extended(self, values: Iterable[str]) -> CredentialScrubber:
+        base = super().extended(values)
+        if base is self:
+            return self
+        created = CredentialScrubber()
+        created._values = base._values
+        created._periods = base._periods
+        created._shortest = base._shortest
+        created._bind_plain()
+        return created
+
+    def contains(self, text: str) -> bool:
+        if super().contains(text):
+            return True
+        if self._plain.contains(text):
+            return True
+        if not _text_needs_credential_normalize(text):
+            return False
+        normalized = normalize_credential(text)
+        return bool(normalized) and self._all_plain().contains(normalized)
+
+    def spans(self, text: str) -> list[tuple[int, int]]:
+        found = list(super().spans(text))
+        if self._plain:
+            found.extend(self._plain.spans(text))
+        if not _text_needs_credential_normalize(text):
+            return _merged_spans(found) if found else found
+        normalized, mapping = _normalize_credential_map(text)
+        if not normalized or not mapping:
+            return found
+        for start, end in self._all_plain().spans(normalized):
+            if start < len(mapping) and end <= len(mapping):
+                found.append((mapping[start][0], mapping[end - 1][1]))
+        return _merged_spans(found)
 
 
 def credential_name(name: str) -> bool:
@@ -669,7 +823,7 @@ def _private_key(value: str) -> str | None:
     if len(compact) > _ENCODED_LIMIT or _BASE64.fullmatch(compact) is None:
         return None
     try:
-        decoded = base64.b64decode(compact + "=" * (-len(compact) % 4))
+        decoded = base64.urlsafe_b64decode(compact + "=" * (-len(compact) % 4))
     except (binascii.Error, ValueError):
         return None
     text = decoded.decode("utf-8", "replace")
@@ -960,7 +1114,11 @@ def _default_hits(name: str, value: str) -> list[Hit]:
     for match in _SHELL_DEFAULT.finditer(value):
         var_name = match.group(1)
         default = match.group(2).strip(" \"'")
-        if "$" in default or "`" in default:
+        # A default that is only another expansion is not a committed literal.
+        # A literal that contains "$" (``Hunte$r2...``) still is.
+        if "`" in default or "$(" in default:
+            continue
+        if _REFERENCE.fullmatch(default) or _SHELL_VARIABLE.fullmatch(default):
             continue
         found = _named_hits(name, default)
         if not found and credential_name(var_name):

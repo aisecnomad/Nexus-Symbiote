@@ -34,27 +34,261 @@ def _write(root: Path, rel: str, content: str) -> Path:
 # ---------------------------------------------------------------------------
 # External #272: cross-server `mcp__*` allow globs. Claude Code honours an allow glob
 # only after a literal `mcp__<server>__` prefix and skips an unanchored one, so these
-# rules auto-approve nothing and must not raise a trifecta (docs: "Tool name wildcards").
+# rules auto-approve nothing. They are not a grant and must not raise a trifecta
+# (docs: "Tool name wildcards").
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("rule", ["mcp__*", "mcp__**", "mcp__*__*", "mcp__", "mcp__*(*)"])
 def test_external_272_unanchored_mcp_allow_globs_grant_nothing(tmp_path: Path, rule: str) -> None:
-    # Reported as a blanket grant, as on main, but never as a cross-server capability.
-    assert "every MCP server tool" not in _broad_grants([rule])
+    assert _broad_grants([rule]) == []
     _write(
         tmp_path,
         ".claude/settings.json",
         json.dumps({"permissions": {"allow": [rule]}}),
     )
-    bom = AIBOM(components=IDEAgentScanner().scan(tmp_path).components)
-    report = analyze_trifecta(bom)
+    result = IDEAgentScanner().scan(tmp_path)
+    risks = [risk for component in result.components for risk in component.risks]
+    assert not [risk for risk in risks if risk.category == "permission_scope"]
+    assert not [risk for risk in risks if risk.category == "oversight_gap"]
+    report = analyze_trifecta(AIBOM(components=result.components))
     assert not [f for f in report.findings if f.kind == "lethal_trifecta"]
 
 
 @pytest.mark.parametrize("rule", ["mcp__docs(read_doc)", "mcp__docs__get_*"])
 def test_external_272_scoped_mcp_rules_grant_no_server(rule: str) -> None:
     assert _broad_grants([rule]) == []
+
+
+@pytest.mark.parametrize("rule", ["mcp__docs", "mcp__docs__*", "mcp__server", "mcp__server__*"])
+def test_per_server_mcp_allow_is_that_servers_grant_only(tmp_path: Path, rule: str) -> None:
+    """A whole server is auto-approved. Its trifecta legs come from its declared tools."""
+    assert _broad_grants([rule]) == ["MCP server tools"]
+    _write(
+        tmp_path,
+        ".claude/settings.json",
+        json.dumps({"permissions": {"allow": [rule]}}),
+    )
+    result = IDEAgentScanner().scan(tmp_path)
+    bom = AIBOM(components=result.components)
+    report = analyze_trifecta(bom)
+    assert not [f for f in report.findings if f.kind == "lethal_trifecta"]
+    scopes = [
+        risk
+        for component in result.components
+        for risk in component.risks
+        if risk.category == "permission_scope"
+    ]
+    assert len(scopes) == 1
+    assert "MCP server tools" in scopes[0].detail
+    gaps = [
+        risk
+        for component in result.components
+        for risk in component.risks
+        if risk.category == "oversight_gap"
+    ]
+    assert len(gaps) == 1
+    assert gaps[0].severity == RiskSeverity.HIGH
+    assert rule in gaps[0].detail
+    server = rule.split("__", 2)[1]
+    assert f"every tool on MCP server '{server}'" in gaps[0].detail
+    assert "Destructive or shell tool" not in gaps[0].detail
+
+
+def test_deny_mcp_star_drops_the_whole_server_permission_scope(tmp_path: Path) -> None:
+    """``deny: ["mcp__*"]`` blocks the whole-server allow, so the medium scope does not stay."""
+    _write(
+        tmp_path,
+        ".claude/settings.json",
+        json.dumps({"permissions": {"allow": ["mcp__server", "Bash"], "deny": ["mcp__*"]}}),
+    )
+    result = IDEAgentScanner().scan(tmp_path)
+    scopes = [
+        risk
+        for component in result.components
+        for risk in component.risks
+        if risk.category == "permission_scope"
+    ]
+    assert len(scopes) == 1
+    assert "MCP server tools" not in scopes[0].detail
+    assert "shell commands" in scopes[0].detail
+    assert scopes[0].severity == RiskSeverity.MEDIUM
+
+
+@pytest.mark.parametrize(
+    "deny_rule",
+    [
+        "mcp__",
+        "mcp__docs__",
+        "mcp__innocent(*)",
+        "mcp__innocent(read",
+        "mcp__a*",
+        "mcp__?",
+        "mcp__*__*",
+        "mcp__**",
+    ],
+)
+def test_narrow_or_skipped_mcp_deny_does_not_drop_permission_scope(
+    tmp_path: Path, deny_rule: str
+) -> None:
+    """Skipped, malformed, or partial deny globs must not hide an active MCP server allow."""
+    _write(
+        tmp_path,
+        ".claude/settings.json",
+        json.dumps({"permissions": {"allow": ["mcp__evil_server"], "deny": [deny_rule]}}),
+    )
+    result = IDEAgentScanner().scan(tmp_path)
+    scopes = [
+        risk
+        for component in result.components
+        for risk in component.risks
+        if risk.category == "permission_scope"
+    ]
+    assert len(scopes) == 1
+    assert "MCP server tools" in scopes[0].detail
+
+
+@pytest.mark.parametrize(
+    ("allow_rule", "deny_rule"),
+    [
+        ("mcp__evil", "mcp__evil__*"),
+        ("mcp__evil__*", "mcp__evil"),
+    ],
+)
+def test_whole_server_mcp_rules_are_symmetric_in_precedence(
+    allow_rule: str, deny_rule: str
+) -> None:
+    """Whole-server forms ``mcp__s``, ``mcp__s__*``, and ``mcp__s__**`` match symmetrically."""
+    from nexus_symbiote.core.models import HumanInTheLoop
+    from nexus_symbiote.settings_precedence import evaluate_tool_oversight, resolve_tool_approval
+
+    perms = {"allow": [allow_rule], "deny": [deny_rule]}
+    assert resolve_tool_approval("mcp__evil__delete", permissions=perms) in {
+        HumanInTheLoop.REQUIRED,
+        None,
+    }
+    _states, gaps, _total, _trunc = evaluate_tool_oversight(perms)
+    assert gaps == []
+
+
+def test_bare_and_double_star_mcp_allow_match_concrete_server_tools() -> None:
+    from nexus_symbiote.core.models import HumanInTheLoop
+    from nexus_symbiote.settings_precedence import resolve_tool_approval
+
+    assert (
+        resolve_tool_approval("mcp__evil__delete", permissions={"allow": ["mcp__evil"]})
+        == HumanInTheLoop.NONE
+    )
+    assert (
+        resolve_tool_approval("mcp__evil__delete", permissions={"allow": ["mcp__evil__**"]}) is None
+    )
+    assert (
+        resolve_tool_approval(
+            "mcp__evil__delete", permissions={"allow": ["mcp__evil__*"], "deny": ["mcp__evil"]}
+        )
+        == HumanInTheLoop.REQUIRED
+    )
+    assert (
+        resolve_tool_approval("mcp__evil_two__delete", permissions={"allow": ["mcp__evil"]}) is None
+    )
+
+
+def test_uppercase_mcp_deny_does_not_hide_a_real_server_allow(tmp_path: Path) -> None:
+    """Claude matches ``mcp`` exactly, so ``MCP__*`` does not deny ``mcp__server``."""
+    _write(
+        tmp_path,
+        ".claude/settings.json",
+        json.dumps({"permissions": {"allow": ["mcp__server"], "deny": ["MCP__*"]}}),
+    )
+    result = IDEAgentScanner().scan(tmp_path)
+    risks = [risk for component in result.components for risk in component.risks]
+    scopes = [risk for risk in risks if risk.category == "permission_scope"]
+    assert any(
+        risk.severity == RiskSeverity.MEDIUM and "MCP server tools" in risk.detail
+        for risk in scopes
+    )
+    assert any(risk.category == "oversight_gap" and "mcp__server" in risk.detail for risk in risks)
+
+
+def test_double_star_tool_segment_is_not_a_whole_server_deny() -> None:
+    from nexus_symbiote.core.models import HumanInTheLoop
+    from nexus_symbiote.settings_precedence import resolve_tool_approval
+
+    assert (
+        resolve_tool_approval(
+            "mcp__evil__delete",
+            permissions={"allow": ["mcp__evil"], "deny": ["mcp__evil__**"]},
+        )
+        == HumanInTheLoop.NONE
+    )
+
+
+@pytest.mark.parametrize("rule", ["MCP__evil", "MCP__*", "MCP__evil__*", "MCP__shell"])
+def test_uppercase_mcp_allow_is_not_a_grant(tmp_path: Path, rule: str) -> None:
+    assert _broad_grants([rule]) == []
+    _write(
+        tmp_path,
+        ".claude/settings.json",
+        json.dumps({"permissions": {"allow": [rule]}}),
+    )
+    result = IDEAgentScanner().scan(tmp_path)
+    risks = [risk for component in result.components for risk in component.risks]
+    assert not [
+        risk
+        for risk in risks
+        if risk.category == "permission_scope" and risk.severity == RiskSeverity.MEDIUM
+    ]
+    assert not [risk for risk in risks if risk.category == "oversight_gap"]
+    notes = [
+        risk
+        for risk in risks
+        if risk.category == "permission_scope" and risk.severity == RiskSeverity.INFO
+    ]
+    assert len(notes) == 1
+    assert "not lowercase" in notes[0].detail
+
+
+@pytest.mark.parametrize("rule", ["mcp__evil__**", "mcp__evil__***"])
+def test_multi_star_mcp_tool_wildcard_is_skipped_in_allow(tmp_path: Path, rule: str) -> None:
+    _write(tmp_path, ".claude/settings.json", json.dumps({"permissions": {"allow": [rule]}}))
+    result = IDEAgentScanner().scan(tmp_path)
+    risks = [risk for component in result.components for risk in component.risks]
+    assert [risk for risk in risks if risk.category in {"permission_scope", "oversight_gap"}] == []
+
+
+@pytest.mark.parametrize("rule", ["mcp__ *", "mcp__\t*", "mcp__docs  __*"])
+def test_whitespace_in_mcp_allow_head_is_skipped(tmp_path: Path, rule: str) -> None:
+    _write(tmp_path, ".claude/settings.json", json.dumps({"permissions": {"allow": [rule]}}))
+    result = IDEAgentScanner().scan(tmp_path)
+    risks = [risk for component in result.components for risk in component.risks]
+    assert [risk for risk in risks if risk.category in {"permission_scope", "oversight_gap"}] == []
+
+
+def test_oversight_gap_wording_distinguishes_narrow_policy_and_redacted_mcp_rules() -> None:
+    from nexus_symbiote.settings_precedence import evaluate_tool_oversight
+
+    _states, narrow_gaps, _, _ = evaluate_tool_oversight({"allow": ["mcp__docs(rm -rf *)"]})
+    assert len(narrow_gaps) == 1
+    assert "every tool on MCP server" not in narrow_gaps[0].detail
+
+    _states, policy_gaps, _, _ = evaluate_tool_oversight(
+        {"deny": ["mcp__docs(foo)"]}, approval_policy="bypassPermissions"
+    )
+    assert len(policy_gaps) == 1
+    assert "every tool on MCP server" not in policy_gaps[0].detail
+
+    secret_rule = "mcp__ghp_" + "a1B2" * 9
+    _states, redacted_gaps, _, _ = evaluate_tool_oversight({"allow": [secret_rule]})
+    assert len(redacted_gaps) == 1
+    assert "every tool on MCP server" in redacted_gaps[0].detail
+    assert secret_rule not in redacted_gaps[0].detail
+
+
+def test_star_allow_is_still_a_lethal_trifecta(tmp_path: Path) -> None:
+    assert _broad_grants(["*"]) == ["every tool"]
+    _write(tmp_path, ".claude/settings.json", json.dumps({"permissions": {"allow": ["*"]}}))
+    bom = AIBOM(components=IDEAgentScanner().scan(tmp_path).components)
+    assert [f.kind for f in analyze_trifecta(bom).findings] == ["lethal_trifecta"]
 
 
 @pytest.mark.parametrize("rule", ["mcp__docs", "mcp__docs__*", "mcp__docs__read_doc"])
