@@ -368,6 +368,17 @@ def _edges(bom: AIBOM, components: Sequence[AnyComponent]) -> tuple[Edge, ...]:
             target = index.get(ref)
             if target is not None and (component.bom_ref, ref) not in recorded:
                 found.add((index[component.bom_ref], target, 1, field_name, "", False))
+        upstreams = component.properties.get("upstream_server_refs")
+        if isinstance(upstreams, list):
+            for srv_ref in upstreams:
+                if (
+                    isinstance(srv_ref, str)
+                    and (target := index.get(srv_ref)) is not None
+                    and (component.bom_ref, srv_ref) not in recorded
+                ):
+                    found.add(
+                        (index[component.bom_ref], target, 1, "upstream_server_refs", "", False)
+                    )
     return tuple(
         Edge(
             index=position,

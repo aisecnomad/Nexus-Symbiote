@@ -144,16 +144,27 @@ def test_missing_directory_reports_its_case_variants(tmp_path):
     assert [failure.split(":")[0] for failure in failures] == [".cursor/Rules"]
 
 
-def test_exact_name_is_read_without_a_variant_report(tmp_path):
+def test_exact_name_is_read_and_reports_coexisting_variant_unless_read(tmp_path):
     (tmp_path / "CLAUDE.md").write_text("upper")
-    lower = tmp_path / "claude.md"
-    if not lower.exists():
-        lower.write_text("lower")
-    else:
-        (tmp_path / "CLAUDE.md.").write_text("lower")
     failures: list[str] = []
     with ConfinedCollection(tmp_path, failures) as files:
         assert files.read_text("CLAUDE.md", missing_ok=True) == "upper"
+    assert failures == []
+
+    lower = tmp_path / "claude.md"
+    variant_name = "claude.md" if not lower.exists() else "CLAUDE.md."
+    (tmp_path / variant_name).write_text("lower")
+
+    failures = []
+    with ConfinedCollection(tmp_path, failures) as files:
+        assert files.read_text("CLAUDE.md", missing_ok=True) == "upper"
+    assert [failure.split(":")[0] for failure in failures] == [variant_name]
+
+    failures = []
+    with ConfinedCollection(tmp_path, failures) as files:
+        assert (
+            files.read_text("CLAUDE.md", missing_ok=True, variants_read={variant_name}) == "upper"
+        )
     assert failures == []
 
 

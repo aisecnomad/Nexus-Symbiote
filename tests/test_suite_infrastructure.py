@@ -424,7 +424,12 @@ def test_the_scaling_check_tells_linear_from_quadratic_work():
     # milliseconds catches their load unevenly: two samples of a 1,000-square loop once
     # measured 9.9 for a 16. Longer and more samples average it out.
     assert scaling_ratio(linear) < 10
-    assert scaling_ratio(quadratic, repeats=3) > 10
+    # scaling_ratio returns the smaller of two ratios when the first is high, which suits
+    # the upper bounds its callers assert. This bound is a lower one, and load during the
+    # smaller size alone still depresses a ratio (9.1 for a 16, three samples of a
+    # 2,000-square loop, on a hosted runner), so quadratic work has to measure quadratic
+    # in one of three ratios, not in the first.
+    assert any(scaling_ratio(quadratic, repeats=3) > 10 for _ in range(3))
 
 
 def test_a_ratio_skewed_by_a_burst_of_load_is_measured_once_more(monkeypatch):

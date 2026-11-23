@@ -7,9 +7,11 @@ import tomllib
 from collections.abc import Callable
 from typing import Any
 
-# tomllib retains every dotted-key prefix, making allocation quadratic in its parts.
-# A fixed per-key bound makes this work linear in the already bounded source size.
+# tomllib retains every dotted-key prefix, making allocation quadratic in its parts,
+# and recurses on nested inline tables and arrays. Fixed bounds keep pre-parse
+# verification strictly linear in the bounded source size.
 _MAX_DOTTED_KEY = 16
+_MAX_BRACKET_DEPTH = 128
 
 
 class TOMLBoundsError(ValueError):
@@ -55,19 +57,21 @@ def _toml_string_end(text: str, position: int, quote_char: str) -> int:
         position = run
 
 
-def _longest_dotted_key(text: str, on_string: Callable[[int, int], None] | None = None) -> int:
-    """The most dots between two TOML structure characters outside strings and
-    comments, in one linear pass: a dotted key or table name has that many.
+def _scan_toml_bounds(
+    text: str, on_string: Callable[[int, int], None] | None = None
+) -> tuple[int, int]:
+    """Return ``(longest_dotted_key, max_bracket_depth)`` outside strings and comments
+    in one linear pass.
 
-    A string is skipped without ending the count, since a quoted part such as
+    A string is skipped without ending a dotted-key count, since a quoted part such as
     "" or 'a' is still one part of a dotted key.
     """
-    longest = dots = 0
+    longest = dots = depth = max_depth = 0
     position = 0
     while True:
         found = _TOML_SPECIAL.search(text, position)
         if found is None:
-            return max(longest, dots)
+            return max(longest, dots), max_depth
         char, position = found.group(), found.end()
         if char == ".":
             dots += 1
@@ -80,6 +84,16 @@ def _longest_dotted_key(text: str, on_string: Callable[[int, int], None] | None 
             if char == "#":
                 newline = text.find("\n", position)
                 position = len(text) if newline < 0 else newline
+            elif char in "[{":
+                depth += 1
+                if depth > max_depth:
+                    max_depth = depth
+            elif char in "]}" and depth > 0:
+                depth -= 1
+
+
+def _longest_dotted_key(text: str, on_string: Callable[[int, int], None] | None = None) -> int:
+    return _scan_toml_bounds(text, on_string)[0]
 
 
 def loads(
@@ -88,10 +102,13 @@ def loads(
     parse_float: Callable[[str], Any] = float,
     on_string: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
-    """Parse TOML only after bounding dotted keys, including quoted parts.
+    """Parse TOML only after bounding dotted keys and bracket/brace nesting depth.
 
     ``parse_float`` is passed to ``tomllib``, so a caller can refuse nonfinite numbers.
     """
-    if _longest_dotted_key(text, on_string) > _MAX_DOTTED_KEY:
+    longest_dotted, max_depth = _scan_toml_bounds(text, on_string)
+    if longest_dotted > _MAX_DOTTED_KEY:
         raise TOMLBoundsError("dotted key exceeds the length limit")
+    if max_depth > _MAX_BRACKET_DEPTH:
+        raise TOMLBoundsError("TOML nesting exceeds the depth limit")
     return tomllib.loads(text, parse_float=parse_float)

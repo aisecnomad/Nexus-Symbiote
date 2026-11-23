@@ -32,7 +32,10 @@ def _relative(root: Path, path: Path, *, allow_parent: bool = False) -> Path:
 
 @contextlib.contextmanager
 def _parent(root: Path, relative: Path, create_parents: bool) -> Iterator[int]:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec
+    search_flag = getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0)
+    path_flags = (search_flag | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec) if search_flag else 0
     parent = open_directory_nofollow(root)
     try:
         for index, part in enumerate(relative.parts[:-1]):
@@ -51,6 +54,10 @@ def _parent(root: Path, relative: Path, create_parents: bool) -> Iterator[int]:
                 # ".." of a directory opened without following links is its real
                 # parent, so this reaches exactly what the kernel resolves.
                 child = os.open(part, flags, dir_fd=parent)
+            except PermissionError:
+                if not path_flags:
+                    raise
+                child = os.open(part, path_flags, dir_fd=parent)
             except FileNotFoundError:
                 if not create_parents:
                     raise
@@ -74,7 +81,7 @@ def create_staging_file(path: Path, prefix: str) -> Path:
     relative = _relative(root, path, allow_parent=True)
     if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
         raise OSError("Secure output requires descriptor-relative no-symlink file operations")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     with _parent(root, relative, create_parents=False) as parent:
         name = f"{prefix}{secrets.token_hex(16)}.tmp"
         os.close(os.open(name, flags, 0o600, dir_fd=parent))
