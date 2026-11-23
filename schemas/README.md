@@ -1,6 +1,6 @@
 # AgentBOM schemas
 
-These JSON Schemas (draft 2020-12) describe the native Nexus SymBiote formats. They are generated from the package's Pydantic models, and tests fail when a schema and its model disagree.
+JSON Schemas (draft 2020-12) for the native Nexus SymBiote formats. Generated from Pydantic models; tests fail when a schema and its model disagree.
 
 | File | Describes | Kept in sync by |
 | --- | --- | --- |
@@ -11,13 +11,13 @@ These JSON Schemas (draft 2020-12) describe the native Nexus SymBiote formats. T
 
 ## Validate a document
 
-The schemas check structure. The Python model additionally enforces cross-field rules, rejects duplicate JSON keys, checks the format version and bounds input size, so prefer the CLI for anything you rely on. `summary` loads a document exactly as every other command does and exits 1, naming the class of problem, when it cannot:
+Schemas check structure only. The Python model additionally enforces cross-field rules, rejects duplicate JSON keys, checks the format version and bounds input size — prefer the CLI for anything you rely on. `summary` loads a document as every other command does and exits 1, naming the problem class, when it cannot:
 
 ```bash
 nexus-symbiote summary agentbom.json
 ```
 
-That is a structural check only. To check a document's claims, reconcile it with the checkout it describes: `nexus-symbiote validate agentbom.json --project /reviewed/checkout --no-project-policy`. Without `--project`, `validate` can only check the document against itself (its assessment basis is `supplied-bom`), and integrity cannot pass for prompts, models and tool descriptors, because nothing local corroborates them.
+That is structural only. To check claims, reconcile with the checkout: `nexus-symbiote validate agentbom.json --project /reviewed/checkout --no-project-policy`. Without `--project`, `validate` checks the document against itself (`supplied-bom`), and integrity cannot pass for prompts, models and tool descriptors because nothing local corroborates them.
 
 To check structure alone, for example in another toolchain, validate with any draft 2020-12 validator. With the `jsonschema` package that the CLI already depends on:
 
@@ -33,11 +33,11 @@ sys.exit(bool(errors))
 PY
 ```
 
-A schema-valid document is not a verified one. Validity says nothing about whether collection was complete, whether digests match the project, or whether a signer is trusted. See [what results do and do not establish](../docs/security-model.md#what-results-do-and-do-not-establish).
+Schema validity says nothing about whether collection was complete, whether digests match the project or whether a signer is trusted. See [what results do and do not establish](../docs/security-model.md#what-results-do-and-do-not-establish).
 
 ## Compatibility
 
-Unknown fields are rejected rather than ignored, on every object including dependency edges, so a producer cannot smuggle unreviewed semantics into a document. Booleans, integers and timestamps are as strict as the schema: the model refuses `"no"` or `0` for a boolean, `"3"` for an integer and a number, or a string of digits such as `"1700000000"`, for a timestamp. Missing security values mean **unknown**, not `false`; see the [security defaults migration](../docs/security-defaults-migration.md). Standard exports (CycloneDX 1.7 and SPDX 3.0.1) are validated against the official schemas vendored under `src/nexus_symbiote/generators/schemas/vendor/`, whose provenance digests the hygiene check and the package verify. [Standard exports](../docs/standard-exports.md#extension-properties) lists the properties that carry the native semantics.
+Unknown fields are rejected on every object, including dependency edges, so a producer cannot smuggle unreviewed semantics into a document. Types are strict: the model refuses `"no"` or `0` for a boolean, `"3"` for an integer and a number, or a string of digits such as `"1700000000"` for a timestamp. Missing security values mean **unknown**, not `false`; see [security defaults migration](../docs/security-defaults-migration.md). Standard exports (CycloneDX 1.7, SPDX 3.0.1) validate against official schemas vendored under `src/nexus_symbiote/generators/schemas/vendor/`, whose provenance digests the hygiene check and the package verify. [Standard exports](../docs/standard-exports.md#extension-properties) lists the extension properties.
 
 ### Format versions
 

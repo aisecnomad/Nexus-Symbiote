@@ -67,13 +67,15 @@ report is written, and the command runs offline.
   HTML.
 
 The command exits 0 when the report was produced, whatever it says. `--fail-under
-PERCENT` (a decimal number from 0 to 100) is an opt-in gate: the report then states
-the gate's verdict (a `Gate:` line after the `Overall:` line in text, a `**Gate:**`
-line in Markdown, the `gate` object in JSON), and the command exits 1, and lists the
-missing elements on standard error, when the ratio below is under `PERCENT`. The ratio is compared exactly, not as the rounded figure. An inventory that
-cannot be read, that is nested too deeply to export, or whose CycloneDX export fails
-its schema or consistency checks exits 1 without a report; an invalid option, or an
-output path that names the inventory itself, exits 2.
+PERCENT` (a decimal number from 0 to 100) is an opt-in gate: the report states the
+gate's verdict (a `Gate:` line after the `Overall:` line in text, a `**Gate:**` line
+in Markdown, the `gate` object in JSON), and the command exits 1, and lists the
+missing elements on standard error, when the ratio below is under `PERCENT`. The
+ratio is compared exactly, not as the rounded figure.
+
+An inventory that cannot be read, that is nested too deeply to export, or whose
+CycloneDX export fails its schema or consistency checks exits 1 without a report; an
+invalid option, or an output path that names the inventory itself, exits 2.
 
 ## How each element is evaluated
 
@@ -108,15 +110,18 @@ The rules:
    export substitutes this build's version or a serial number derived from the content,
    so those elements are missing. Without the inventory's own timestamp, which a scan
    records only when `SOURCE_DATE_EPOCH` is set, the export writes none, and the SBOM
-   timestamp is missing. The name
-   `repository` that a scan gives an agent without an `agent.yaml` name is a
+   timestamp is missing.
+
+   The name `repository` that a scan gives an agent without an `agent.yaml` name is a
    placeholder, and so is the checkout directory's name that release 0.1.0 gave such
-   an agent (a format 1.0 inventory records `identity_source: repository-path`). A label that the ShadowScan importer derives from a digest is not a
-   model name. Infrastructure software counts the npm and PyPI packages and the
-   container images that the inventory records as registry entries; tool definitions,
-   which the export also types `library`, and other registry entries, such as a Hugging
-   Face model reference, do not count. A model or dataset counts only when a standard
-   field identifies it as one (`type` `machine-learning-model`; a `data[]` entry of type
+   an agent (a format 1.0 inventory records `identity_source: repository-path`). A
+   label that the ShadowScan importer derives from a digest is not a model name.
+
+   Infrastructure software counts the npm and PyPI packages and the container images
+   that the inventory records as registry entries; tool definitions, which the export
+   also types `library`, and other registry entries, such as a Hugging Face model
+   reference, do not count. A model or dataset counts only when a standard field
+   identifies it as one (`type` `machine-learning-model`; a `data[]` entry of type
    `dataset` or a `dataset` tag).
 6. **No inference.** The BOM timestamp is not the system timestamp. A hosting provider
    is not the model producer. A `bom-ref` is not an identifier. `NEXUS-` findings are
@@ -382,14 +387,16 @@ Key Performance Indicators: no element is assessable from the BOM; missing 0, ex
 
 Eleven of the 39 assessable elements are present. The scan ran without
 `SOURCE_DATE_EPOCH`, so the inventory records no timestamp and the SBOM timestamp is
-missing; with the variable set, it is present and twelve are. The demo declares no
-`agent.yaml`, so the system name is the placeholder and no producer or version is
-declared; its ten
-relationships are conditional repository associations, so the export carries none of
-them; its one model is a local weight file, so its name and SHA-256 digest are present
-and nothing else about it is; its retrieval source is not marked as a dataset; and its
-registry entry, a container image, is the one infrastructure component. With
-`--fail-under 50` the report gains one line after its `Overall:` line:
+missing; with the variable set, it is present and twelve are.
+
+The demo declares no `agent.yaml`, so the system name is the placeholder and no
+producer or version is declared; its ten relationships are conditional repository
+associations, so the export carries none of them; its one model is a local weight
+file, so its name and SHA-256 digest are present and nothing else about it is; its
+retrieval source is not marked as a dataset; and its registry entry, a container
+image, is the one infrastructure component.
+
+With `--fail-under 50` the report gains one line after its `Overall:` line:
 
 ```text
 Gate: failed: 11 of 39 present (28.2%), below the required 50%
