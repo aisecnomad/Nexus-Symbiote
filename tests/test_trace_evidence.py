@@ -250,6 +250,27 @@ def test_a_malformed_structure_is_named_by_its_path_never_by_its_value(
     assert MARKER not in message
 
 
+@pytest.mark.parametrize(
+    "key", ["scope_spans", "instrumentationLibrarySpans", "instrumentation_library_spans"]
+)
+def test_spans_under_a_container_the_reader_does_not_read_are_refused(tmp_path, key):
+    # Beside an entry the reader does read, skipped spans would let the gate pass.
+    hidden = otlp_span({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "shell"})
+    document = _valid()
+    document["resourceSpans"].append({key: [{"spans": [hidden]}]})
+    with pytest.raises(TraceInputError, match=rf"resourceSpans\[1\] holds {key}, which is not"):
+        _read(_trace(tmp_path, document))
+
+
+def test_a_second_resource_spans_array_under_the_proto_name_is_refused(tmp_path):
+    document = _valid()
+    document["resource_spans"] = copy.deepcopy(document["resourceSpans"])
+    with pytest.raises(
+        TraceInputError, match="holds resource_spans, which is not read; use resourceSpans"
+    ):
+        _read(_trace(tmp_path, document))
+
+
 def test_json_lines_problems_name_the_line(tmp_path):
     good = json.dumps(_valid())
     path = tmp_path / "trace.jsonl"

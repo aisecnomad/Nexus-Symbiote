@@ -908,7 +908,7 @@ def test_a_deeply_nested_native_value_cannot_exhaust_the_stack():
     assert licence.native.items == ("/components/0/properties/license",)
 
 
-@pytest.mark.parametrize("value", ["unknown⠀", "⠀Unknown", "unknownㅤ"])
+@pytest.mark.parametrize("value", ["unknown\u2800", "\u2800Unknown", "unknown\u3164"])
 def test_a_blank_filler_does_not_turn_unknown_into_a_value(value):
     model = ModelComponent(bom_ref="model:w", name="w", version=value)
     report = me.assess(inventory(subject(version=value), model))
@@ -917,7 +917,7 @@ def test_a_blank_filler_does_not_turn_unknown_into_a_value(value):
     licence = ModelComponent(bom_ref="model:w", name="w")
     bom = inventory(licence)
     export = export_of(bom)
-    export["components"][0]["licenses"] = [{"license": {"id": "NOASSERTION⠀"}}]
+    export["components"][0]["licenses"] = [{"license": {"id": "NOASSERTION\u2800"}}]
     assert result(me.evaluate(bom, export), "model-license").status == me.MISSING
 
 

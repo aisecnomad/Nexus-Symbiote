@@ -768,6 +768,8 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         lambda scale: ("\\" * 50 + "@a ") * 2_000 * scale,
         lambda scale: "- x\n" + "> `y` @z\n" * 20_000 * scale,
         lambda scale: "- x\n> y\n" + "   ```\n" * 20_000 * scale,
+        # A no-break space both separates attributes and continues an unquoted value.
+        lambda scale: "<a b=" + "c\xa0" * 4_000 * scale + "\n",
     ],
     ids=[
         "blank lines under nested items",
@@ -778,12 +780,27 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         "escapes before a reference",
         "lines marked keeps in an item",
         "fences marked keeps in an item",
+        "unicode spaces in a tag",
     ],
 )
 def test_reading_markdown_grows_with_the_text_not_with_its_nesting(shape):
     texts = {scale: shape(scale) for scale in (1, 4)}
     growth = len(texts[4]) / len(texts[1])
     assert scaling_ratio(lambda scale: prompt._import_tokens(texts[scale])) < 2.5 * growth
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<!doctype html\n```\n>\n```\n@docs/style.md\n```\nhello\n```\n",
+        "<!x hello\n>@docs/style.md\n",
+    ],
+    ids=["doctype before fences", "lower-case declaration"],
+)
+def test_a_lower_case_declaration_cannot_hide_an_import(text):
+    # CommonMark 0.31 starts a declaration block at any letter, markdown-it and cmark-gfm
+    # 0.29 at an upper-case one; the import is text to the second reading.
+    assert "docs/style.md" in prompt._import_tokens(text)
 
 
 def test_credential_shaped_imports_are_never_read_or_hashed(tmp_path):

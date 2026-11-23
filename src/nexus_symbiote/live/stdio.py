@@ -32,6 +32,15 @@ MAX_LINE = 1024 * 1024
 MAX_BYTES = 8 * MAX_LINE
 MAX_TOOLS = 4096
 DEADLINE_SECONDS = 20.0
+# The server's own statement that a list it serves has changed. Read during the capture,
+# it means what was recorded may already be stale, so the observation is not complete.
+LIST_CHANGED = frozenset(
+    {
+        "notifications/tools/list_changed",
+        "notifications/prompts/list_changed",
+        "notifications/resources/list_changed",
+    }
+)
 
 
 class LaunchPolicyError(OSError):
@@ -146,6 +155,8 @@ def _capture(binary: Path, work: Path) -> PinnedObservation:
             send({"id": next_id, "method": method, "params": params})
             for msg in frames:
                 if "id" not in msg and isinstance(msg.get("method"), str):
+                    if msg["method"] in LIST_CHANGED:
+                        raise StdioProtocolError("MCP server changed a list during observation")
                     continue
                 if optional and msg.get("id") == next_id and is_method_not_found(msg):
                     return None

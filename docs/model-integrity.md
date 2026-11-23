@@ -364,7 +364,9 @@ with `--signature-policy`, or to the GitHub Action with `signature-policy`.
 Keep the policy outside the checkout: the commands refuse a policy file inside
 the scanned project or anywhere in any enclosing Git working tree, including a
 superproject above a nested checkout or submodule (so a
-monorepo's `ci/signers.json` is refused when you scan `services/agent`), also
+monorepo's `ci/signers.json` is refused when you scan `services/agent`), or in
+any Git working tree that holds the directory the command runs from (so a
+pull request's checkout cannot supply the policy for an artifact scanned elsewhere), also
 under another name for any of these directories such as a case variant or a bind mount
 (compared by device and inode), or one with other hard links, and they resolve the project path first, so a symlinked `--project`
 path works for every command. Every directory at or above the project with a `.git`
