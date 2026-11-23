@@ -6,6 +6,7 @@ import json
 import time
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from nexus_symbiote.cli import main
@@ -927,3 +928,23 @@ def test_projected_text_parity_leaves_no_adjacent_scheme_pin_in_inventory(tmp_pa
     assert "482913" not in json.dumps(
         extract_sandbox_allowed_domains({"sandbox": {"network": {"allowedDomains": [sneaky]}}})
     )
+
+
+@pytest.mark.parametrize(
+    "rule", ["Bash(ba*)", "Bash(ba*:*)", "Bash(bas*)", "Bash(b?sh:*)", "Bash(pyth*)"]
+)
+def test_a_glob_that_names_a_shell_or_interpreter_is_an_oversight_gap(rule: str) -> None:
+    # Claude Code expands `*` anywhere in a Bash rule, so these approve bash or python.
+    _, risks, _, _ = evaluate_tool_oversight({"allow": [rule]})
+    assert [risk.severity for risk in risks] == [RiskSeverity.HIGH]
+
+
+@pytest.mark.parametrize("rule", ["Bash(git*)", "Bash(ls*)", "Bash(npm test*)", "Bash(make ch*)"])
+def test_a_glob_that_names_no_runner_is_not_an_oversight_gap(rule: str) -> None:
+    _, risks, _, _ = evaluate_tool_oversight({"allow": [rule]})
+    assert risks == []
+
+
+def test_an_over_long_program_glob_fails_closed() -> None:
+    _, risks, _, _ = evaluate_tool_oversight({"allow": ["Bash(" + "[ab]" * 20 + "*)"]})
+    assert [risk.severity for risk in risks] == [RiskSeverity.HIGH]

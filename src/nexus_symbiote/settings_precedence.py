@@ -13,6 +13,7 @@ repository are not observed during static scans and are outside this model.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import re
 from bisect import bisect_right
@@ -98,6 +99,17 @@ _COMMAND_RUNNERS = frozenset(
 )
 _VERSIONED_INTERPRETER = re.compile(r"(?:python|pypy|ruby|php|perl|node)[0-9.]*|py")
 _SHELL_META_RE = re.compile(r"(?:&&|\|\||[;|`]|\$\()")
+# Names a glob in a rule's program word is matched against: the runners, and the common
+# spellings of the versioned interpreters, which `_VERSIONED_INTERPRETER` reads exactly.
+_RUNNER_NAMES = tuple(
+    sorted(
+        _COMMAND_RUNNERS
+        | {"python", "python3", "python3.12", "python3.13", "pypy", "pypy3", "py", "node22"}
+    )
+)
+_GLOB_CHARACTERS = frozenset("*?[")
+# A program glob longer than this is not compiled and is read as a runner, failing closed.
+_MAX_PROGRAM_GLOB = 64
 _FORCE_FLAG_RE = re.compile(
     r"(?:^|[\s:])--force(?:[\s:=]|$)|(?:^|[\s:])-rf(?:[\s:]|$)", re.IGNORECASE
 )
@@ -322,7 +334,15 @@ def _spec_runs_arbitrary_command(spec: str) -> bool:
     if program.startswith("*"):
         return True
     stripped = program.rstrip("*")
-    return stripped in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(stripped) is not None
+    if stripped in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(stripped):
+        return True
+    if not _GLOB_CHARACTERS.intersection(program):
+        return False
+    # Claude Code matches `*` anywhere in a Bash rule, so `ba*` or `b?sh` approves bash
+    # as surely as `bash:*` does.
+    if len(program) > _MAX_PROGRAM_GLOB:
+        return True
+    return any(fnmatch.fnmatchcase(name, program) for name in _RUNNER_NAMES)
 
 
 def _base_matches_destructive_tool(base: str) -> bool:
