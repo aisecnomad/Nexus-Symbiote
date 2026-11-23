@@ -33,7 +33,13 @@ def test_obfuscated_download_pipelines_scale_linearly() -> None:
 
 
 # Re-review of #242, round 8: walking an interpreter's option bundle copied the rest of
-# the word for each letter, which took about a minute for one 1.6 MB option word.
+# the word for each letter, which took about a minute for one 1.6 MB option word. The
+# per-letter loop is linear and dominates a short word, so a 4x step between short words
+# hides that copy (a reintroduced one measured 7.6 against 10). A 16x step from 25 KB
+# shows it while the largest word stays at 400 KB: the walk reads about 16, the copy 34
+# to 64. Under coverage tracing the loop's share grows (16 against 21 to 27), so it is
+# the jobs without coverage that catch the copy; the 1.6 MB word took about 250 s per
+# case under coverage, past that job's limits.
 @pytest.mark.parametrize(
     "shape",
     ["curl x | python3 -{} ", "curl x | perl -{} ", "curl x > a && python3 -{} a"],
@@ -42,10 +48,10 @@ def test_a_long_option_bundle_scales_linearly(shape: str) -> None:
     letter = "w" if "perl" in shape else "u"
 
     def run(scale: int) -> None:
-        command = shape.format(letter * (400_000 * scale))
+        command = shape.format(letter * (25_000 * scale))
         assert _command_severity(command) is RiskSeverity.CRITICAL
 
-    assert scaling_ratio(run) < 10
+    assert scaling_ratio(run, factor=16) < 24
 
 
 # Review of #251: a decode flag and a sudo shell flag were each matched by two repeats

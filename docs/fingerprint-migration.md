@@ -87,6 +87,19 @@ conditional relationships remain in the native extension, and the
 `"conditional": true`. CycloneDX and SPDX recovery check the standard projection
 against the embedded document.
 
+## Suppression content digests
+
+A `risk` suppression's fingerprint includes the component's content digest. An MCP
+server, IDE agent, A2A server or client, or RAG source that records no
+`schema_hash`, `definition_hash`, `content_hash` or `hashes.sha256` is now bound by
+the binding values its collector wrote (`static_value_binding`,
+`static_config_hash`, `static_card_hash`, `config_hash`, `settings_hashes`): the one
+value, or a SHA-256 over all of them. A guardrail is bound by its `config_hash`.
+These components had no content digest before, so their fingerprints change once
+and each suppression entry for them is reported under `suppressions_stale` with
+its `current_fingerprints`. Review the finding again before you copy the new
+fingerprint into the policy; a model's fingerprint is unchanged.
+
 ## MCP resolver binding v3
 
 `nexus-symbiote/mcp-static-values/v3` retains the complete Deno import-name-to-target

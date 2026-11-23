@@ -148,7 +148,7 @@ _CONFUSABLES = str.maketrans(
 # Zero-width boundaries: a capturing run such as ([A-Z]+) rescans a long run of capitals
 # from every start position, which is quadratic on a hostile tool name.
 _CAMEL_BOUNDARY_RE = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])|(?<=[a-z0-9])(?=[A-Z])")
-_SEPARATOR_RE = re.compile(r"[\s\-_.]+")
+_SEPARATOR_RE = re.compile(r"[\s\-_.:/\u2010-\u2015\u2212\uff0d]+")
 _IDENT_SPLIT_RE = re.compile(r"[^a-z0-9]+")
 _WITHHELD_ENV_NAME_RE = re.compile(r"\[redacted-[1-9][0-9]{0,5}\]")
 
@@ -384,6 +384,8 @@ _IDE_GRANT_LEGS: dict[str, frozenset[str]] = {
     "shell commands": _LEGS,
     "file edits": frozenset({"egress"}),
     "file reads": frozenset({"private"}),
+    # A single-server grant (`mcp__docs`, `mcp__docs__*`) stays scoped to that server's
+    # declared tools; Claude Code skips cross-server globs such as `mcp__*` entirely.
     "MCP server tools": frozenset(),
 }
 # An approval record gates its component only when it covers every action or all egress.
