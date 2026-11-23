@@ -536,3 +536,37 @@ def test_a_case_variant_is_reported_once_however_many_paths_lead_to_it(tmp_path)
             f"q/.claude/Settings.json: case variant of q/.claude/settings.json {variant}",
         ]
     )
+
+
+def test_entry_link_reads_an_excluded_link_without_following_it(tmp_path):
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / "node_modules").symlink_to(".claude", target_is_directory=True)
+    (tmp_path / "venv").symlink_to(tmp_path / ".claude", target_is_directory=True)
+    (tmp_path / ".git").symlink_to("..", target_is_directory=True)
+    (tmp_path / "self").symlink_to(".", target_is_directory=True)
+    failures: list[str] = []
+    with ConfinedCollection(tmp_path, failures) as files:
+        assert files.excluded("node_modules")
+        assert files.entry_link("node_modules") == Path(".claude")
+        assert files.entry_link("self") == Path()
+        assert files.entry_link(".venv") is None
+        assert files.entry_link("missing") is None
+        for refused in ("venv", ".git"):
+            with pytest.raises(CollectionError):
+                files.entry_link(refused)
+        with pytest.raises(CollectionError):
+            files.entry_link("node_modules/inner")
+    assert failures == []
+
+
+def test_entry_link_enforces_depth_bound_and_reports_non_directory_parent(tmp_path):
+    (tmp_path / "file.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "deep").symlink_to("a/b/c/d/e", target_is_directory=True)
+    failures: list[str] = []
+    with ConfinedCollection(tmp_path, failures, max_depth=2) as files:
+        with pytest.raises(CollectionError, match="not a directory"):
+            files.entry_link("file.txt/child")
+        with pytest.raises(CollectionError, match="too deep"):
+            files.entry_link("deep")
+    assert failures == []

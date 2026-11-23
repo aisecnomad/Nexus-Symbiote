@@ -324,6 +324,7 @@ class _WalkScope:
         unlisted: _Unlisted,
         skipped: list[Path] | None = None,
         observed_excludes: list[Path] | None = None,
+        symlinks: list[Path] | None = None,
     ) -> None:
         self.top = top
         self.walked = {top}
@@ -331,6 +332,7 @@ class _WalkScope:
         self.unlisted = unlisted
         self.skipped = skipped
         self.observed_excludes = observed_excludes
+        self.symlinks = symlinks
 
     def covers(self, target: Path) -> bool:
         """Whether the walk reaches ``target`` already, under its own name."""
@@ -1286,10 +1288,13 @@ class ConfinedCollection:
         directory_links: list[Path] | None = None,
         skipped: list[Path] | None = None,
         observed_excludes: list[Path] | None = None,
+        symlinks: list[Path] | None = None,
     ) -> Iterator[Path]:
         """Yield root-relative file paths, never through more than one symlink.
 
         ``observed_excludes`` collects excluded paths without changing who reports them.
+        ``symlinks`` collects every symlink entry encountered during the walk (files and
+        directories), even when refused or met beneath a followed directory link.
 
         A ``directory`` reached through one in-root symlink is walked under its
         target's name. Inside a walk that did not start through a symlink, a symlink
@@ -1340,7 +1345,9 @@ class ConfinedCollection:
         # count before and after a walk sees every walk that met a failure. Once the
         # entry budget is spent, a later walk lists nothing and records nothing: the
         # one failure that spent it names where collection stopped.
-        scope = _WalkScope(walked, directory_links, _Unlisted(), skipped, observed_excludes)
+        scope = _WalkScope(
+            walked, directory_links, _Unlisted(), skipped, observed_excludes, symlinks
+        )
         try:
             if relative.parts:
                 self._report_case_variants(relative, ())
@@ -1436,6 +1443,8 @@ class ConfinedCollection:
                 self._record(child, "cross-filesystem mount excluded", scope.unlisted)
                 continue
             if stat.S_ISLNK(metadata.st_mode):
+                if scope.symlinks is not None:
+                    scope.symlinks.append(child)
                 if followed:
                     self._record(child, "symlink reached through another symlink", scope.unlisted)
                     continue
@@ -1614,6 +1623,40 @@ class ConfinedCollection:
             return False
         os.close(fd)
         return True
+
+    def entry_link(self, path: str | Path) -> Path | None:
+        """The root-relative target of the symlink at ``path``, even when ``path`` is excluded.
+
+        Only the entry is inspected, without following it, from a parent reached without
+        symlinks; the empty path names the root itself. Returns ``None`` when the entry is
+        absent or not a symlink, and raises ``CollectionError`` with the reason when a
+        link cannot be placed beneath the root.
+        """
+        relative = self._relative(path)
+        if self._root_fd is None or not relative.parts:
+            return None
+        try:
+            parent = self._open_parent(relative)
+        except FileNotFoundError:
+            return None
+        except NotADirectoryError as exc:
+            raise CollectionError("entry's parent is not a directory") from exc
+        except OSError as exc:
+            raise CollectionError("entry's directory is or passes through a symlink") from exc
+        try:
+            info = self._stat_exact_no_follow(parent, relative.name)
+            if not stat.S_ISLNK(info.st_mode):
+                return None
+            text = os.readlink(relative.name, dir_fd=parent)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise CollectionError("symlink could not be read") from exc
+        finally:
+            os.close(parent)
+        target = _lexical_target(relative.parent, text)
+        self._check_target_depth(target)
+        return target
 
     def _open_no_follow(self, relative: Path) -> int:
         parent = self._open_parent(relative)

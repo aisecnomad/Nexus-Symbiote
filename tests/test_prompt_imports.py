@@ -1252,6 +1252,42 @@ def test_exponential_spaced_attribute_backtracking_stays_linear():
     assert scaling_ratio(lambda scale: prompt._import_readings(texts[scale])) < 10
 
 
+# Attribute lists whose spaces the old pattern could assign to more than one part of the
+# grammar. Each is read in a child process, so a regression fails at the timeout instead
+# of hanging the suite.
+_SPACED_ATTRIBUTE_LINES = [
+    "<a " + "b=\xa0\xa0\xa0" * 600 + "!",
+    "<a" + "\xa0b\xa0=\xa0c\xa0" * 600 + "!",
+    "<a" + "\xa0b=\xa0c\xa0c" * 600 + "!",
+    "<a" + "\xa0b=c\xa0c\xa0c\xa0c" * 600 + "!",
+]
+_READ_SPACED_LINES = """
+import time
+from nexus_symbiote.scanners import prompt
+from tests.test_prompt_imports import _SPACED_ATTRIBUTE_LINES
+for line in _SPACED_ATTRIBUTE_LINES:
+    started = time.process_time()
+    assert "notes.md" in prompt._import_tokens(line + "\\n\\nFollow @notes.md\\n")
+    print(round(time.process_time() - started, 3))
+"""
+
+
+def test_spaced_attribute_lists_read_in_bounded_time():
+    root = Path(__file__).resolve().parents[1]
+    measured = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", _READ_SPACED_LINES],
+        cwd=root,
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=60,
+    ).stdout.split()
+    # Each line takes milliseconds; the old pattern needed seconds at 70 characters
+    # and did not finish at about 100.
+    assert len(measured) == len(_SPACED_ATTRIBUTE_LINES)
+    assert all(float(seconds) < 5 for seconds in measured)
+
+
 def test_unicode_kind7_nfa_matches_the_commonmark_grammar_exactly():
     import random
 

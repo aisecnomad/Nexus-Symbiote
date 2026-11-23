@@ -34,12 +34,13 @@ from nexus_symbiote.core.models import (
 from nexus_symbiote.policy import PolicyError, parse_yaml_mapping
 from nexus_symbiote.scanners.credential_files import credential_gap, credential_shaped
 from nexus_symbiote.scanners.mcp_launch import npm_spec, python_spec
-from nexus_symbiote.utils.confined import ConfinedCollection
+from nexus_symbiote.utils.confined import CollectionError, ConfinedCollection
 from nexus_symbiote.utils.jsonc import strip_jsonc
 from nexus_symbiote.utils.secrets import redact_text
 from nexus_symbiote.utils.terminal import neutralize
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -118,6 +119,12 @@ _MAX_BRIDGE_EXPANSIONS = 64  # per top-level server declaration
 _MAX_SYMLINK_HOPS = 8
 _MAX_STEERING_COMPONENTS = 256
 _STEERING_STEPS: weakref.WeakKeyDictionary[ConfinedCollection, int] = weakref.WeakKeyDictionary()
+_CONFIG_ALIASES: weakref.WeakKeyDictionary[ConfinedCollection, dict[str, str]] = (
+    weakref.WeakKeyDictionary()
+)
+_WALKED_SYMLINKS: weakref.WeakKeyDictionary[ConfinedCollection, tuple[str, ...]] = (
+    weakref.WeakKeyDictionary()
+)
 _SPLIT_SEPARATORS = _words("&& || ; | & ( )") | frozenset({"\n"})
 _SPLIT_CHAR_SET = frozenset(";|&()\n")
 _REDIR_OP_RE = re.compile(r"^(?:[0-9]+)?(?:>>?|<<?<?|>&|<&|&>>?|>\||<>)$")
@@ -158,6 +165,68 @@ _VERSIONED_PYTHON_RE = re.compile(r"^python[0-9]+(?:\.[0-9]+)?$")
 # environment expansions and parent segments cannot be classified this way.
 _NODE_PACKAGE_IMPORT = re.compile(
     r"((?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*)(?:/[A-Za-z0-9_][\w.-]*)*", re.ASCII
+)
+# Only `[A-Za-z0-9_|]+` split on `|` is an exact-name list across Claude Code versions
+# and events (including `FileChanged` and `StopFailure`); spaces, commas and `-` are regexes.
+_PLAIN_MATCHER_RE = re.compile(r"[A-Za-z0-9_|]+")
+_IF_TOOL_EVENTS = frozenset(
+    {"PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "PermissionDenied"}
+)
+_CLAUDE_HOOK_EVENTS = frozenset(
+    {
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "PostToolBatch",
+        "PermissionRequest",
+        "PermissionDenied",
+        "SessionStart",
+        "SessionEnd",
+        "UserPromptSubmit",
+        "UserPromptExpansion",
+        "MessageDisplay",
+        "Stop",
+        "StopFailure",
+        "Notification",
+        "SubagentStart",
+        "SubagentStop",
+        "PreCompact",
+        "PostCompact",
+        "Setup",
+        "TeammateIdle",
+        "TaskCreated",
+        "TaskCompleted",
+        "ConfigChange",
+        "WorktreeCreate",
+        "WorktreeRemove",
+        "FileChanged",
+        "CwdChanged",
+        "DirectoryAdded",
+        "PreModelSwitch",
+        "PostModelSwitch",
+        "Elicitation",
+        "ElicitationResult",
+        "InstructionsLoaded",
+    }
+)
+_CURSOR_HOOK_EVENTS = frozenset(
+    {
+        "beforeShellExecution",
+        "afterShellExecution",
+        "beforeMCPExecution",
+        "afterMCPExecution",
+        "beforeReadFile",
+        "afterFileEdit",
+        "beforeSubmitPrompt",
+        "beforeTabFileRead",
+        "afterTabFileEdit",
+        "stop",
+        "sessionStart",
+        "sessionEnd",
+        "preCompact",
+        "subagentStart",
+        "subagentStop",
+    }
 )
 _SPIFFE_RE = re.compile(r"^spiffe://[a-z0-9.-]+/[A-Za-z0-9._/-]+$")
 
@@ -242,7 +311,8 @@ def _load_json_docs(
     for rel_path in candidates:
         if rel_path not in path_set:
             continue
-        text = _read_confined_text(files, rel_path, gaps)
+        source = _CONFIG_ALIASES.get(files, {}).get(rel_path, rel_path)
+        text = _read_confined_text(files, source, gaps)
         if text is None:
             continue
         try:
@@ -1158,19 +1228,78 @@ def _bind_script_target(
     )
 
 
-def _iter_hook_commands(doc: dict[str, Any]) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
+def _iter_hook_commands(doc: dict[str, Any]) -> list[tuple[str, str, Any, Any, Any]]:
+    """Each hook command with the matcher, type and `if` filter that decide whether it runs."""
+    out: list[tuple[str, str, Any, Any, Any]] = []
     for event_name, entries in _as_dict(doc.get("hooks")).items():
         for entry in _as_list(entries):
             if isinstance(entry, str):
-                out.append((str(event_name), entry))
+                out.append((str(event_name), entry, None, None, None))
             elif isinstance(entry, dict):
-                if isinstance(entry.get("command"), str):
-                    out.append((str(event_name), entry["command"]))
-                for sub in _as_list(entry.get("hooks")):
-                    if isinstance(sub, dict) and isinstance(sub.get("command"), str):
-                        out.append((str(event_name), sub["command"]))
+                matcher = entry.get("matcher")
+                for handler in [entry, *_as_list(entry.get("hooks"))]:
+                    if isinstance(handler, dict) and isinstance(handler.get("command"), str):
+                        out.append(
+                            (
+                                str(event_name),
+                                handler["command"],
+                                matcher,
+                                handler.get("type"),
+                                handler.get("if"),
+                            )
+                        )
     return out
+
+
+def _setting_digest(value: Any) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+    return _sha256_hex(text.encode())
+
+
+def _hook_event_key(raw_event: str) -> tuple[str, bool]:
+    """Neutralized event key that never collides across raw whitespace or control variants."""
+    cleaned = _clean(raw_event)
+    if cleaned != raw_event:
+        digest = _sha256_hex(raw_event.encode("utf-8", errors="replace"))[:12]
+        return f"{cleaned}:{digest}", True
+    return cleaned, False
+
+
+def _hook_state(
+    matcher: Any,
+    hook_type: Any,
+    condition: Any,
+    disabled: bool,
+    event_name: str,
+) -> dict[str, Any]:
+    """What decides whether a hook still runs, as digests so no configuration text is copied.
+
+    An absent, empty or `*` matcher matches every tool. A matcher of letters, digits,
+    `_` and `|` with at least one non-empty segment is a list of exact names (empty
+    segments such as a trailing `|` are ignored; an all-empty matcher such as `|` is
+    digest-only), recorded so a later matcher can be shown to match everything it
+    matched; any other matcher (including spaces, commas or `-`) is compared by digest
+    alone, as the `if` filter always is. An `if` filter on a non-tool event never runs.
+    """
+    digest: str | None = None
+    names: list[str] | None = None
+    if matcher not in (None, "", "*"):
+        digest = _setting_digest(matcher)
+        if isinstance(matcher, str) and _PLAIN_MATCHER_RE.fullmatch(matcher):
+            items = {item for item in matcher.split("|") if item}
+            if items:
+                names = sorted(_sha256_hex(item.encode()) for item in items)
+    is_command = hook_type is None or hook_type == "command"
+    if_ok = condition is None or event_name in _IF_TOOL_EVENTS
+    runs_command = is_command and if_ok
+    return _rec(
+        matcher_digest=digest,
+        matcher_names=names,
+        if_digest=None if condition is None else _setting_digest(condition),
+        hook_type=None if hook_type is None else _clean(hook_type)[:64],
+        runs_command=runs_command,
+        hooks_disabled=disabled,
+    )
 
 
 def _inspect_hooks_and_preambles(
@@ -1179,14 +1308,40 @@ def _inspect_hooks_and_preambles(
     checkout: _CheckoutScripts,
     summary: ControlPlaneAuditSummary,
 ) -> None:
-    for cfg_path, doc in _load_json_docs(files, all_paths, HOOK_CONFIG_FILES, summary.gaps):
-        for raw_event, cmd_str in _iter_hook_commands(doc):
-            event_name = _clean(raw_event)
+    hook_docs = _load_json_docs(files, all_paths, HOOK_CONFIG_FILES, summary.gaps)
+    # The local layer overrides the shared one, so its explicit value decides.
+    claude_disabled = False
+    for cfg_path, doc in hook_docs:
+        if cfg_path.startswith(".claude/settings") and "disableAllHooks" in doc:
+            claude_disabled = doc["disableAllHooks"] is True
+    for cfg_path, doc in hook_docs:
+        disabled = (
+            claude_disabled
+            if cfg_path.startswith(".claude/")
+            else doc.get("disableAllHooks") is True
+        )
+        known_events = (
+            _CURSOR_HOOK_EVENTS if cfg_path.startswith(".cursor/") else _CLAUDE_HOOK_EVENTS
+        )
+        for raw_event, cmd_str, matcher, hook_type, condition in _iter_hook_commands(doc):
+            event_name, altered = _hook_event_key(raw_event)
+            if altered:
+                _add_gap(
+                    summary.gaps,
+                    f"{cfg_path}: hook event '{event_name}' contains whitespace or non-printable characters",
+                )
+            if event_name not in known_events:
+                _add_gap(
+                    summary.gaps,
+                    f"{cfg_path}: unrecognized hook event '{event_name}'",
+                )
+            state = _hook_state(matcher, hook_type, condition, disabled, event_name)
             summary.hook_commands.append(
                 _rec(
                     source_file=cfg_path,
                     event=event_name,
                     command_digest=_sha256_hex(cmd_str.encode()),
+                    **state,
                 )
             )
             _, targets = _audit_command_segments(
@@ -1203,7 +1358,7 @@ def _inspect_hooks_and_preambles(
                     event_or_server=event_name,
                 )
                 if rec is not None:
-                    summary.hook_targets.append(rec)
+                    summary.hook_targets.append({**rec, **state})
 
     for skill_path in [
         p for p in all_paths if p == "SKILL.md" or p.endswith(("/SKILL.md", ".skill.md"))
@@ -1625,6 +1780,165 @@ def _is_steering_rel(rel: str) -> bool:
     )
 
 
+_STEERING_SURFACES = tuple(
+    dict.fromkeys(
+        path
+        for path in (
+            *STEERING_PREFIXES,
+            *HOOK_CONFIG_FILES,
+            *MCP_CONFIG_FILES,
+            *PERMISSION_CONFIG_FILES,
+            *_tup(
+                ".cursor/rules .claude/commands .claude/agents .claude/skills "
+                ".claude/hooks .claude/rules .claude/CLAUDE.md"
+            ),
+        )
+        if _is_steering_rel(path)
+    )
+)
+_SURFACE_TARGETS: weakref.WeakKeyDictionary[
+    ConfinedCollection, tuple[tuple[str, ...], tuple[str, ...]]
+] = weakref.WeakKeyDictionary()
+
+
+def _surface_target(surface: str, files: ConfinedCollection) -> str:
+    """Where writes to ``surface`` land, following every in-root link on it as the client does."""
+    queue: deque[str] = deque(surface.split("/"))
+    resolved: list[str] = []
+    hops = 0
+    while queue:
+        seg = queue.popleft()
+        target = files.entry_link("/".join([*resolved, seg]))
+        if target is None:
+            resolved.append(seg)
+            continue
+        hops += 1
+        if hops > _MAX_SYMLINK_HOPS:
+            raise CollectionError(f"more than {_MAX_SYMLINK_HOPS} symlinks")
+        resolved = []
+        queue.extendleft(reversed(target.parts))
+    return "/".join(resolved)
+
+
+def _format_surface_refusal(surface: str, exc: CollectionError) -> str:
+    if isinstance(exc.__cause__, NotADirectoryError):
+        return f"steering path {surface} cannot be resolved: {exc}"
+    return f"steering path {surface} is a symlink that cannot be resolved: {exc}"
+
+
+def _alias_linked_claude(files: ConfinedCollection, all_paths: list[str], gaps: list[str]) -> None:
+    """Name the configuration under a linked `.claude` by the paths Claude Code reads.
+
+    A walk does not descend a directory link, so `.claude -> config/claude` left its
+    settings, permission modes and hooks unread. Each file is read at its in-root target.
+    """
+    try:
+        target = _surface_target(".claude", files)
+    except CollectionError as exc:
+        _add_gap(gaps, f".claude: symlink cannot be resolved, so its settings were not read: {exc}")
+        return
+    if target == ".claude":
+        return
+    if target and files.excluded(target):
+        _add_gap(gaps, ".claude: symlink target is excluded, so its settings were not read")
+        return
+    present = set(all_paths)
+    aliases: dict[str, str] = {}
+    for logical in dict.fromkeys((*HOOK_CONFIG_FILES, *MCP_CONFIG_FILES, *PERMISSION_CONFIG_FILES)):
+        if logical.startswith(".claude/") and logical not in present:
+            physical = posixpath.join(target, logical.removeprefix(".claude/"))
+            if physical in present:
+                aliases[logical] = physical
+    if aliases:
+        _CONFIG_ALIASES[files] = aliases
+        all_paths.extend(aliases)
+        all_paths.sort()
+
+
+def _linked_steering_targets(files: ConfinedCollection) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Folded targets of steering surfaces that are links, and why any could not be resolved,
+    computed once per audit across the fixed surfaces and every walked symlink beneath them."""
+    cached = _SURFACE_TARGETS.get(files)
+    if cached is None:
+        targets: list[str] = []
+        target_set: set[str] = set()
+        refused: list[str] = []
+        checked: set[str] = set()
+        for surface in _STEERING_SURFACES:
+            checked.add(surface)
+            try:
+                target = _surface_target(surface, files)
+            except CollectionError as exc:
+                refused.append(_format_surface_refusal(surface, exc))
+                continue
+            if target != surface:
+                folded_target = target.casefold()
+                if folded_target not in target_set:
+                    target_set.add(folded_target)
+                    targets.append(folded_target)
+        walked_links = _WALKED_SYMLINKS.get(files, ())
+        walked_resolved = 0
+        budget_exceeded = False
+        frontier = tuple(targets)
+        for pass_index in range(_MAX_SYMLINK_HOPS):
+            new_targets: list[str] = []
+            for link in walked_links:
+                if link in checked:
+                    continue
+                folded_link = link.casefold()
+                under_steering = pass_index == 0 and _is_steering_rel(link)
+                if not under_steering and not any(
+                    not t or folded_link == t or folded_link.startswith(t + "/") for t in frontier
+                ):
+                    continue
+                checked.add(link)
+                if walked_resolved >= _MAX_STEERING_COMPONENTS:
+                    refused.append(
+                        f"more than {_MAX_STEERING_COMPONENTS} steering symlinks; "
+                        "remaining links were not resolved"
+                    )
+                    budget_exceeded = True
+                    break
+                walked_resolved += 1
+                try:
+                    target = _surface_target(link, files)
+                except CollectionError as exc:
+                    refused.append(_format_surface_refusal(link, exc))
+                    continue
+                if target != link:
+                    folded_target = target.casefold()
+                    if folded_target not in target_set:
+                        target_set.add(folded_target)
+                        targets.append(folded_target)
+                        new_targets.append(folded_target)
+            if budget_exceeded or not new_targets:
+                break
+            frontier = tuple(new_targets)
+        cached = _SURFACE_TARGETS[files] = (tuple(targets), tuple(refused))
+    return cached
+
+
+def _reaches_steering(rel: str, files: ConfinedCollection, unresolved: list[str] | None) -> bool:
+    if _is_steering_rel(rel):
+        return True
+    # `.claude -> config/claude` makes `config/claude/settings.json` the file Claude Code
+    # reads, so a root holding a surface's target, or inside it, writes that surface.
+    folded = "" if rel == "." else rel.casefold()
+    targets, refused = _linked_steering_targets(files)
+    if any(
+        not folded
+        or not target
+        or target == folded
+        or target.startswith(folded + "/")
+        or folded.startswith(target + "/")
+        for target in targets
+    ):
+        return True
+    if refused and unresolved is not None:
+        unresolved.append(refused[0])
+    return False
+
+
 def _resolve_steering_symlinks(
     raw_rel: str, files: ConfinedCollection, unresolved: list[str] | None = None
 ) -> bool:
@@ -1657,6 +1971,21 @@ def _resolve_steering_symlinks(
             continue
         candidate = "/".join([*resolved, seg])
         if files.excluded(candidate):
+            # An excluded name is only collection policy: a committed `node_modules`
+            # link to `.claude` still lets a server rooted there write `.claude`.
+            try:
+                excluded_target = files.entry_link(candidate)
+            except CollectionError as exc:
+                if unresolved is not None:
+                    unresolved.append(f"names an excluded symlink that cannot be resolved: {exc}")
+                return False
+            if excluded_target is not None:
+                hops += 1
+                if hops > _MAX_SYMLINK_HOPS:
+                    return True
+                resolved = []
+                queue.extendleft(reversed(excluded_target.parts))
+                continue
             # A root that is an excluded directory names that tree. A root below one
             # names an entry the collection never inspects, which may be a link.
             if queue:
@@ -1701,12 +2030,14 @@ def _resolve_steering_symlinks(
         if steps + len(queue) <= _MAX_STEERING_COMPONENTS:
             # Nothing below a missing component can be a link, so the rest is read lexically.
             rest = posixpath.normpath("/".join([*resolved, seg, *queue]))
-            return rest == "." or (rest.split("/")[0] != ".." and _is_steering_rel(rest))
+            return rest == "." or (
+                rest.split("/")[0] != ".." and _reaches_steering(rest, files, unresolved)
+            )
         resolved.append(seg)
     if above > 0:
         return False
     final = "/".join(resolved)
-    return not final or _is_steering_rel(final)
+    return not final or _reaches_steering(final, files, unresolved)
 
 
 def _covers_steering_path(
@@ -2440,6 +2771,66 @@ def _backward_affected_refs(summary: ControlPlaneAuditSummary, target_ref: str) 
     return sorted(visited)
 
 
+def _hook_runs(rec: dict[str, Any]) -> bool:
+    return bool(rec.get("runs_command", True)) and not rec.get("hooks_disabled")
+
+
+def _hooks_stop_running(base_recs: list[dict[str, Any]], curr_recs: list[dict[str, Any]]) -> bool:
+    """Whether some tool a running baseline hook matched is matched by no running current one.
+
+    The records share one command and event, so the union of the matchers of current
+    hooks with the baseline's `if` filter or none decides: dropping the filter only
+    widens, while an added or changed `if` may match nothing. Each baseline hook looks
+    up those two groups. A summary written before these fields existed runs everywhere.
+    """
+    live: dict[str | None, tuple[list[bool], set[str], set[str]]] = {}
+    for rec in curr_recs:
+        if _hook_runs(rec):
+            matches_all, digests, names = live.setdefault(
+                rec.get("if_digest"), ([False], set(), set())
+            )
+            if rec.get("matcher_digest") is None:
+                matches_all[0] = True
+            else:
+                digests.add(rec["matcher_digest"])
+                names.update(rec.get("matcher_names") or ())
+    for base in base_recs:
+        if not _hook_runs(base):
+            continue
+        groups = [live[key] for key in {base.get("if_digest"), None} if key in live]
+        if any(matches_all[0] for matches_all, _, _ in groups) or any(
+            base.get("matcher_digest") in digests for _, digests, _ in groups
+        ):
+            continue
+        base_names = base.get("matcher_digest") is not None and base.get("matcher_names")
+        if not base_names or not all(
+            any(name in names for _, _, names in groups) for name in base_names
+        ):
+            return True
+    return False
+
+
+def _hooks_start_running(base_recs: list[dict[str, Any]], curr_recs: list[dict[str, Any]]) -> bool:
+    """Whether a current hook runs where its baseline counterpart did not, beyond a widening.
+
+    A hook that did not run, through `disableAllHooks`, its type, a matcher or an `if`,
+    was never exercised, so enabling it is as new as adding it. Widening a hook that
+    already ran keeps its reviewed behaviour and is not reported.
+    """
+    return _hooks_stop_running(curr_recs, base_recs) and (
+        not any(_hook_runs(rec) for rec in base_recs) or _hooks_stop_running(base_recs, curr_recs)
+    )
+
+
+def _group_hooks(
+    recs: list[dict[str, Any]], key: Callable[[dict[str, Any]], tuple[str, ...]]
+) -> dict[tuple[str, ...], list[dict[str, Any]]]:
+    groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for rec in recs:
+        groups.setdefault(key(rec), []).append(rec)
+    return groups
+
+
 def diff_control_plane_audits(
     baseline: ControlPlaneAuditSummary,
     current: ControlPlaneAuditSummary,
@@ -2514,6 +2905,46 @@ def diff_control_plane_audits(
                 f"Launch target '{key}' (baseline digest {base_sha[:12]}) was removed.",
             )
 
+    def _target_event(rec: dict[str, Any]) -> tuple[str, ...]:
+        return (f"hook-target:{rec['target_path']}", str(rec.get("context", "")))
+
+    # A disabled layer, a non-command type or a narrower matcher keeps the target
+    # bound while it no longer runs, which is a removal for the guard it implemented.
+    curr_target_hooks = _group_hooks(current.hook_targets, _target_event)
+    stopped_targets = sorted(
+        {
+            group[0]
+            for group, recs in _group_hooks(baseline.hook_targets, _target_event).items()
+            if group[0] in curr_targets
+            and _hooks_stop_running(recs, curr_target_hooks.get(group, []))
+        }
+    )
+    for key in stopped_targets:
+        _emit(
+            "launch_target_removed",
+            RiskSeverity.CRITICAL,
+            f"agent-control:{key}",
+            f"Launch target '{key}' (baseline digest {base_targets[key][:12]}) "
+            "is still bound but its hook no longer runs where it did.",
+        )
+    base_target_hooks = _group_hooks(baseline.hook_targets, _target_event)
+    started_targets = sorted(
+        {
+            group[0]
+            for group, recs in curr_target_hooks.items()
+            if group[0] in base_targets
+            and _hooks_start_running(base_target_hooks.get(group, []), recs)
+        }
+    )
+    for key in started_targets:
+        _emit(
+            "launch_target_added",
+            RiskSeverity.CRITICAL,
+            f"agent-control:{key}",
+            f"Launch target '{key}' (digest {curr_targets[key][:12]}) "
+            "now runs from a hook that did not run where it does in the baseline.",
+        )
+
     def _hook_keys(s: ControlPlaneAuditSummary) -> set[tuple[str, str, str]]:
         return {(h["source_file"], h["event"], h["command_digest"]) for h in s.hook_commands}
 
@@ -2533,6 +2964,34 @@ def diff_control_plane_audits(
             f"hook-command:{src}:{event}:{digest[:12]}",
             f"Hook command for '{event}' in {src} (baseline digest {digest[:12]}) was removed.",
         )
+
+    def _hook_key(rec: dict[str, Any]) -> tuple[str, ...]:
+        return (rec["source_file"], rec["event"], rec["command_digest"])
+
+    curr_hook_recs = _group_hooks(current.hook_commands, _hook_key)
+    for (src, event, digest), recs in sorted(
+        _group_hooks(baseline.hook_commands, _hook_key).items()
+    ):
+        curr_recs = curr_hook_recs.get((src, event, digest))
+        if curr_recs is not None and _hooks_stop_running(recs, curr_recs):
+            _emit(
+                "hook_command_removed",
+                RiskSeverity.CRITICAL,
+                f"hook-command:{src}:{event}:{digest[:12]}",
+                f"Hook command for '{event}' in {src} (baseline digest {digest[:12]}) "
+                "is still declared but no longer runs where it did.",
+            )
+    base_hook_recs = _group_hooks(baseline.hook_commands, _hook_key)
+    for (src, event, digest), recs in sorted(curr_hook_recs.items()):
+        base_recs = base_hook_recs.get((src, event, digest))
+        if base_recs is not None and _hooks_start_running(base_recs, recs):
+            _emit(
+                "hook_command_changed",
+                RiskSeverity.CRITICAL,
+                f"hook-command:{src}:{event}:{digest[:12]}",
+                f"Hook command for '{event}' in {src} (digest {digest[:12]}) "
+                "now runs where the baseline hook did not.",
+            )
 
     def _preamble_keys(s: ControlPlaneAuditSummary) -> set[tuple[str, str]]:
         return {(p["skill_path"], p["command_digest"]) for p in s.skill_preambles}
@@ -2625,7 +3084,10 @@ def audit_project_control_plane(
             summary.gaps.append(f"{neutralize(claims_path.name)}: invalid JSON")
 
     with ConfinedCollection(project_root, summary.gaps) as files:
-        all_paths = sorted(p.as_posix() for p in files.iter_files())
+        walked_symlinks: list[Path] = []
+        all_paths = sorted(p.as_posix() for p in files.iter_files(symlinks=walked_symlinks))
+        if walked_symlinks:
+            _WALKED_SYMLINKS[files] = tuple(dict.fromkeys(p.as_posix() for p in walked_symlinks))
         # Directories carry a trailing '/', so an operand naming one is not read as a script.
         project_paths = frozenset(all_paths).union(
             p[: i + 1] for p in all_paths for i, c in enumerate(p) if c == "/"
@@ -2638,6 +3100,7 @@ def audit_project_control_plane(
                         decl_sources.append((decl_path, _parse_yaml(text), AssuranceLevel.DECLARED))
                     except (PolicyError, ValueError, RecursionError):
                         summary.gaps.append(f"{decl_path}: invalid YAML")
+        _alias_linked_claude(files, all_paths, summary.gaps)
         checkout = _CheckoutScripts(files, project_paths)
         _inspect_hooks_and_preambles(files, all_paths, checkout, summary)
         bridged_steering = _inspect_mcp_launchers_and_bridges(
