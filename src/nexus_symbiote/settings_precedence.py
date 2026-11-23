@@ -166,6 +166,21 @@ def _is_blanket_specifier(base: str, spec: str) -> bool:
     return base.lower() == "webfetch" and compact.lower() in {"domain:*", "domain:"}
 
 
+def _whole_mcp_server_allow(rule: str) -> bool:
+    """Whether ``rule`` auto-approves every tool of one named MCP server.
+
+    ``mcp__server`` and ``mcp__server__*`` are the same grant. An unanchored
+    ``mcp__*`` is not: Claude Code skips it.
+    """
+    text = rule.strip()
+    if "(" in text or ")" in text or _claude_skips_mcp_allow(text):
+        return False
+    if not text.lower().startswith("mcp__"):
+        return False
+    _server, separator, tool = text[5:].partition("__")
+    return not separator or set(tool) <= {"*"}
+
+
 def _claude_skips_mcp_allow(rule: str) -> bool:
     """Whether this allow rule names no MCP server, so Claude Code auto-approves nothing.
 
@@ -639,7 +654,8 @@ def evaluate_tool_oversight(
             raw_states[safe_tool] = state
 
         has_gap = (
-            resolved == HumanInTheLoop.NONE and is_destructive_tool(tool_name)
+            resolved == HumanInTheLoop.NONE
+            and (is_destructive_tool(tool_name) or _whole_mcp_server_allow(tool_name))
         ) or index.uncovered_destructive_narrow_allow(tool_name)
         if has_gap and safe_tool not in seen_gap_tools:
             seen_gap_tools.add(safe_tool)

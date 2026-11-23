@@ -81,6 +81,15 @@ def test_per_server_mcp_allow_is_that_servers_grant_only(tmp_path: Path, rule: s
     ]
     assert len(scopes) == 1
     assert "MCP server tools" in scopes[0].detail
+    gaps = [
+        risk
+        for component in result.components
+        for risk in component.risks
+        if risk.category == "oversight_gap"
+    ]
+    assert len(gaps) == 1
+    assert gaps[0].severity == RiskSeverity.HIGH
+    assert rule in gaps[0].detail
 
 
 def test_star_allow_is_still_a_lethal_trifecta(tmp_path: Path) -> None:
