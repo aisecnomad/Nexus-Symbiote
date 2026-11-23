@@ -88,3 +88,41 @@ def test_mode_vocabulary_switches_and_locators_stay_public(tmp_path, word, layou
     )
     assert not has_exposure(result)
     assert all(word in document for document in exports(inventory))
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("selector", ["MODE=Bearer", "--env=MODE=Bearer"])
+@pytest.mark.parametrize("word", ["sunshine", "db.internal.example", "Summer24"])
+def test_operand_is_withheld_after_a_mode_without_a_credential_name(
+    tmp_path, selector, word, layout
+):
+    result, inventory = _scan(
+        tmp_path, {"source": _launch(selector, word, layout), "sibling": _echo(word)}
+    )
+    assert not result.scan_failures
+    # Withholding does not depend on the name; only the shape decides the finding.
+    assert has_exposure(result) is (word == "Summer24")
+    assert all(word not in document for document in _documents(inventory))
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("selector", ["MODE=Bearer", "--env=MODE=Bearer"])
+@pytest.mark.parametrize(
+    "word",
+    [
+        "Workspace10",
+        "required",
+        "api.github.com",
+        "PORT=8080",
+        "20250618",
+        "MODEL=claude-sonnet-4-20250514",
+    ],
+)
+def test_public_words_stay_public_after_a_mode_without_a_credential_name(
+    tmp_path, selector, word, layout
+):
+    result, inventory = _scan(
+        tmp_path, {"source": _launch(selector, word, layout), "sibling": _echo(word)}
+    )
+    assert not has_exposure(result)
+    assert all(word in document for document in exports(inventory))

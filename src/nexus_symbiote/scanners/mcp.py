@@ -1091,6 +1091,11 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
                         name, value, following, variable=variable, in_set=in_set
                     ):
                         values.extend(scheme_credentials(f"{value} {following}"))
+        assigned = _assigned(word) if following is not None else None
+        if assigned is not None and following is not None:
+            # The same floor whatever the name: MODE=Bearer <operand> names no credential
+            # but may still carry one.
+            values.extend(_withheld_operand(*assigned, following, in_set=in_set))
         if index > 0:
             flag = words[index - 1]
             if (
@@ -1515,6 +1520,25 @@ def _withheld_scheme_operands(words: Sequence[str], *, cmd: bool) -> Iterator[st
         following = words[index + 1]
         if not _public_scheme_following(name, value, following, variable=variable, in_set=in_set):
             yield from (literal for _, literal in value_hits(name, f"{value} {following}"))
+
+
+def _withheld_operand(
+    name: str, value: str, variable: bool, following: str, *, in_set: bool
+) -> list[str]:
+    """The operand after ``NAME=<scheme>`` unless it is positively a public launch word.
+
+    A public selector (``--source=token <id>``) chooses a value, not an authentication
+    mode, so the word after it is its own.
+    """
+    operand = scheme_credentials(f"{value} {following}")
+    if (
+        not operand
+        or _classify_scheme_assignment(name, value, variable=variable, in_set=in_set)
+        == "public_selector"
+        or _public_scheme_following(name, value, following, variable=variable, in_set=in_set)
+    ):
+        return []
+    return operand
 
 
 def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = False) -> list[Hit]:
