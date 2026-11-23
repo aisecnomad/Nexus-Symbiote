@@ -1212,11 +1212,24 @@ A way around a limit that its entry does not describe is worth a
     paragraph is text. The closing tags `</pre>`, `</script>`, `</style>` and
     `</textarea>`, and tags whose names only begin with those words, such as
     `<pretty>`, are text; `<meta>` opens an HTML block.
+  - An HTML block starts only where a space, a line end or `>` follows the tag name
+    and spaces alone separate its attributes, so after a tag with a tab or a no-break
+    space in it, such as `<div` and a tab before `class="team">`, the next line is
+    text and ``` `x`@notes.md ``` there imports `notes.md`. A tag name may hold an underscore, so
+    `<a_b>` opens a block. Only an unindented block tag, `<script`, `<pre`, `<style`,
+    `<textarea` or `<!--` ends a paragraph, so an indented `<div>` or a `<!X`
+    declaration after a paragraph is text. A processing instruction, declaration or
+    CDATA section ends right after it closes and the rest of its line is a new block
+    (``<?x?>`x`@notes.md`` imports `notes.md`); a `<pre>`, `<script>`, `<style>` or
+    `<textarea>` block ends only at its own closing tag; a block quote that holds an
+    HTML block continues on the next line without `>`; and a setext underline after
+    an HTML block that ended a paragraph makes both one heading.
 
   Where these readings may give a different block structure (a marked fence close,
   a tab before a fence, a fence or those HTML tags among lines marked keeps in a list
-  item), the raw text is retained as for other ambiguities, so a fenced example there
-  can count as an import. A name that only Claude Code's reading gives and that names
+  item, or an HTML block that marked starts or ends elsewhere, as above), the raw
+  text is retained as for other ambiguities, and a code span on each line may end
+  right before an import, so a fenced example there can count as an import. A name that only Claude Code's reading gives and that names
   no file is skipped silently: it is looked up only by its exact spelling, so it
   raises no credential or case-variant gap, and a case variant of it on a
   case-insensitive file system is not found. Each reference yields at most 16 names

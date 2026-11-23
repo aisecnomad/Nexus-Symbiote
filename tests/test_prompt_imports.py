@@ -768,6 +768,9 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         lambda scale: ("\\" * 50 + "@a ") * 2_000 * scale,
         lambda scale: "- x\n" + "> `y` @z\n" * 20_000 * scale,
         lambda scale: "- x\n> y\n" + "   ```\n" * 20_000 * scale,
+        lambda scale: "x\n <div>\n`y`@z\n" * 10_000 * scale,
+        lambda scale: "<a" + " b=c" * 50_000 * scale + "\t>\n",
+        lambda scale: "> <p>\n x `y`@z\n" * 10_000 * scale,
     ],
     ids=[
         "blank lines under nested items",
@@ -778,6 +781,9 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         "escapes before a reference",
         "lines marked keeps in an item",
         "fences marked keeps in an item",
+        "HTML starts marked reads as text",
+        "attributes marked does not take",
+        "lazy lines after quoted HTML",
     ],
 )
 def test_reading_markdown_grows_with_the_text_not_with_its_nesting(shape):

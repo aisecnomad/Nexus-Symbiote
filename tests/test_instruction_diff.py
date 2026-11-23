@@ -815,6 +815,8 @@ def test_other_schemes_and_system_paths_are_references(tmp_path: Path, added: st
         "* x\n> y\n   ```\n@notes.md\n",
         "Follow @notes.md#rules\n",
         "**@notes.md**\n",
+        '<div\tclass="team">\n`x`@notes.md\n',
+        "<?x?>`x`@notes.md\n",
     ],
     ids=[
         "list item code span",
@@ -823,6 +825,8 @@ def test_other_schemes_and_system_paths_are_references(tmp_path: Path, added: st
         "held",
         "fragment",
         "strong",
+        "tab in a block tag",
+        "text after a processing instruction",
     ],
 )
 def test_an_import_claude_code_reads_is_an_added_import(tmp_path: Path, text: str) -> None:

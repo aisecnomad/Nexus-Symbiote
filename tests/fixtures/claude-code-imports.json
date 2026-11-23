@@ -1,5 +1,5 @@
 {
- "generator": "Claude Code 2.1.42 (its bundled marked lexer and @-import extractor, run verbatim) and Claude Code 2.1.330 (its marked subclass and extractor, from the binary's source text), with path resolution removed. imports is the list both versions return for source; they agree on every row. Rows named fuzz are seeded random documents.",
+ "generator": "Claude Code 2.1.42 (its bundled marked lexer and @-import extractor, run verbatim) and Claude Code 2.1.330 (its marked subclass and extractor, from the binary's source text), with path resolution removed. imports is the list both versions return for source; they agree on every row. Rows named fuzz are seeded random documents. The rows after the last fuzz row were added later, from the same two versions, for the findings their names give.",
  "rows": [
   {
    "name": "R331-01 reference link, code span after the import",
@@ -1534,6 +1534,127 @@
    "imports": [
     "f1.md```"
    ]
+  },
+  {
+   "name": "R399 tab after a block tag name",
+   "source": "<div\tclass=\"team\">\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 tab between tag and attribute",
+   "source": "<a\thref=x>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 vertical tab in a tag",
+   "source": "<a\u000bhref=x>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 no-break space after an attribute value",
+   "source": "<a href=x\u00a0>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 indented block tag after a paragraph",
+   "source": "See the notes.\n <div>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 indented comment after a paragraph",
+   "source": "See the notes.\n <!-- c -->\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 declaration closed on a later line",
+   "source": "<!X\n>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 text after a processing instruction",
+   "source": "<?x?>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 text after a CDATA section",
+   "source": "<![CDATA[x]]>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 declaration after a paragraph",
+   "source": "See the notes.\n<!X\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 tab in a quoted block tag",
+   "source": "> <div\tclass=\"team\">\n> `x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 underscore in a tag name",
+   "source": "<a_b>\n```\n\n@notes.md\n```\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 raw block closed by another tag",
+   "source": "<pre>\n</style>\n```\n</pre>\n@notes.md\n```\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 setext heading over an HTML block",
+   "source": "x `y`@a.md\n<!--x `y`@notes.md\n- \n",
+   "imports": [
+    "a.md",
+    "notes.md"
+   ]
+  },
+  {
+   "name": "R399 lazy line after a quoted HTML block",
+   "source": "> <p>x</p>\n <!--\n- `x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "HTML block with spaced attributes",
+   "source": "<div class=\"team\">\n`x`@notes.md\n",
+   "imports": []
+  },
+  {
+   "name": "text after a closed HTML element",
+   "source": "<div>x</div>`x`@notes.md\n",
+   "imports": []
+  },
+  {
+   "name": "text after a comment",
+   "source": "<!-- c -->`x`@notes.md\n",
+   "imports": []
   }
  ]
 }
