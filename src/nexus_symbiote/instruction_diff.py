@@ -882,6 +882,8 @@ def _read_confined_tree(root: Path) -> tuple[dict[str, _ParsedInstruction], list
                 resolved_named, leaves, long = _resolve_import(importer_dir, token)
                 for target in resolved_named:
                     targets[target] = targets.get(target, True) and speculative
+                # Claude Code imports a name past the root after markup too (`**@../x.md**`),
+                # so a name only its reading gives still marks a gap no lookup can clear.
                 outside |= leaves
                 too_long |= long
             for target, speculative in targets.items():
