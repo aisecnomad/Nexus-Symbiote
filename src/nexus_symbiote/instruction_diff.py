@@ -776,8 +776,11 @@ def _read_confined_tree(root: Path) -> tuple[dict[str, _ParsedInstruction], list
                 resolved_named, leaves, long = _resolve_import(importer_dir, token)
                 for target in resolved_named:
                     targets[target] = targets.get(target, True) and speculative
-                outside |= leaves
-                too_long |= long
+                # A name only Claude Code's reading gives may name nothing it reads, so
+                # only a name the collector's own reading gives is a gap it cannot look up.
+                if not speculative:
+                    outside |= leaves
+                    too_long |= long
             for target, speculative in targets.items():
                 if target in records:
                     if target not in followed_imports and depth + 1 <= _MAX_IMPORT_DEPTH:

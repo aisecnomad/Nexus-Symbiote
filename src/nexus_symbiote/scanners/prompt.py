@@ -1639,8 +1639,11 @@ class PromptScanner(Scanner):
                 named, leaves, long = _resolve_import(directory, token)
                 for target in named:
                     targets[target] = targets.get(target, True) and speculative
-                outside |= leaves
-                too_long |= long
+                # A name only Claude Code's reading gives may name nothing it reads, so
+                # only a name the collector's own reading gives is a gap it cannot look up.
+                if not speculative:
+                    outside |= leaves
+                    too_long |= long
             for target, speculative in targets.items():
                 known = paths.get(target)
                 if known is not None:

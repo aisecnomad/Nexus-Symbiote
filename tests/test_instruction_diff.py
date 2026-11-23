@@ -858,3 +858,18 @@ def test_a_name_with_more_than_sixteen_markup_characters_is_an_added_import(
     assert f"'CLAUDE.md' added import '{name}'" in {
         change["summary"] for change in report["changes"] if change["class"] == "import_added"
     }
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["See the docs (https://unpkg.com/@../../x.md).\n", "Use a*@" + "x" * 300 + ".md for it.\n"],
+    ids=["URL path", "long name after an asterisk"],
+)
+def test_a_name_only_claude_codes_reading_gives_raises_no_gap(tmp_path: Path, text: str) -> None:
+    base = tmp_path / "base"
+    head = tmp_path / "head"
+    _write(base, "CLAUDE.md", "# P\n")
+    _write(head, "CLAUDE.md", f"# P\n\n{text}")
+    report = diff_instruction_trees(base, head)
+    assert report["summary"]["total_failures"] == 0
+    assert report["excluded"]["head"] == []

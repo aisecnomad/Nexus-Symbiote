@@ -798,6 +798,30 @@ def test_reading_markdown_grows_with_the_text_not_with_its_nesting(shape):
     assert scaling_ratio(lambda scale: prompt._import_tokens(texts[scale])) < 2.5 * growth
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "See the docs (https://unpkg.com/@../../x.md).\n",
+        "Use a*@../../x.md for it.\n",
+        "Use a*@" + "x" * 300 + ".md for it.\n",
+    ],
+    ids=["URL path", "after an asterisk", "long name after an asterisk"],
+)
+def test_a_name_only_claude_codes_reading_gives_raises_no_gap(tmp_path, text):
+    # Claude Code 2.1.42 and 2.1.330 import nothing from these.
+    _write(tmp_path, "CLAUDE.md", text)
+    result = PromptScanner().scan(tmp_path)
+    assert not result.scan_failures and not result.surfaces_excluded
+
+
+def test_a_name_both_readings_give_still_raises_its_gap(tmp_path):
+    _write(tmp_path, "CLAUDE.md", "Follow @../x.md.\n")
+    result = PromptScanner().scan(tmp_path)
+    assert result.surfaces_excluded == [
+        "CLAUDE.md: imports a file outside the project root, which is not inventoried"
+    ]
+
+
 def test_a_name_is_not_cut_at_underscores_inside_a_word():
     name = "a_" * 1_000 + "b.md"
     assert name in prompt._import_tokens(f"**@{name}**\n")
