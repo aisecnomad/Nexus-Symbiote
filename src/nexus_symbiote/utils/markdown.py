@@ -180,13 +180,18 @@ def _html_block_starts(
     kind7: _StartMatcher | None = None,
 ) -> tuple[_StartMatcher, ...]:
     if kind7 is None:
+        # Atomic attribute groups and possessive quantifiers avoid pushing one CPython
+        # sre backtrack frame per attribute on tags with tens of thousands of attributes;
+        # valid because ``whitespace`` here is strictly disjoint from unquoted values.
         open_tag = (
-            rf"<[A-Za-z][A-Za-z0-9-]*(?:{whitespace}+[a-zA-Z_:][a-zA-Z0-9:._-]*"
-            rf"(?:{whitespace}*={whitespace}*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?)*"
-            rf"{whitespace}*/?>"
+            rf"<[A-Za-z][A-Za-z0-9-]*+"
+            rf"(?>{whitespace}++[a-zA-Z_:][a-zA-Z0-9:._-]*+"
+            rf"(?:(?={whitespace}*+=)(?>{whitespace}*+={whitespace}*+"
+            rf"(?:[^\"'=<>`\x00-\x20]++|'[^']*+'|\"[^\"]*+\")))?)*+"
+            rf"{whitespace}*+/?>"
         )
-        close_tag = rf"</[A-Za-z][A-Za-z0-9-]*{whitespace}*>"
-        kind7 = re.compile(rf"(?:{open_tag}|{close_tag}){whitespace}*$")
+        close_tag = rf"</[A-Za-z][A-Za-z0-9-]*+{whitespace}*+>"
+        kind7 = re.compile(rf"(?:{open_tag}|{close_tag}){whitespace}*+$")
     return (
         re.compile(rf"<(?:pre|script|style|textarea)(?:{whitespace}|>|$)", re.I),
         re.compile(r"<!--"),
@@ -249,8 +254,8 @@ def _marked_html_block_starts() -> tuple[re.Pattern[str], ...]:
     """
     flags = re.I | re.A
     attribute = (
-        r"(?: +[a-zA-Z:_][\w.:-]*"
-        rf"(?: *= *\"[^\"]*\"| *= *'[^']*'| *= *[^{_JS_WHITESPACE}\"'=<>`]+)?)"
+        r"(?> ++[a-zA-Z:_][\w.:-]*+"
+        rf"(?:(?= *=)(?> *= *(?:\"[^\"]*+\"|'[^']*+'|[^{_JS_WHITESPACE}\"'=<>`]++)))?)"
     )
     raw = "script|pre|style|textarea"
     return (
@@ -261,8 +266,8 @@ def _marked_html_block_starts() -> tuple[re.Pattern[str], ...]:
         re.compile(r"<!\[CDATA\["),
         re.compile(rf"</?(?:{_BLOCK_TAG_NAMES}|meta)(?: +|/?>|$)", flags),
         re.compile(
-            rf"(?:<(?!{raw})[a-z][\w-]*{attribute}*? */?>(?=[ \t]*$)"
-            rf"|</(?!{raw})[a-z][\w-]*[{_JS_WHITESPACE}]*(?:>[ \t]*)?$)",
+            rf"(?:<(?!{raw})[a-z][\w-]*+{attribute}*+ *+/?>(?=[ \t]*$)"
+            rf"|</(?!{raw})[a-z][\w-]*+[{_JS_WHITESPACE}]*+(?:>[ \t]*+)?$)",
             flags,
         ),
     )
