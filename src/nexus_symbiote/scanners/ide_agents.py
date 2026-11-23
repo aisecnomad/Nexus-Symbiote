@@ -350,6 +350,17 @@ def _runs_any_command(program: str, arguments: str, wildcard: bool = False) -> b
     return name in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(name) is not None
 
 
+def _deny_covers_every_mcp_server(rules: list[str]) -> bool:
+    """Whether a deny list blocks every MCP server, as ``mcp__*`` does."""
+    for rule in rules:
+        text = rule.strip()
+        if text == "*":
+            return True
+        if text.lower().startswith("mcp__") and _claude_skips_mcp_allow(text):
+            return True
+    return False
+
+
 def _broad_grants(allowed: list[str]) -> list[str]:
     """Capability classes that the allow list grants without a narrowing specifier."""
     classes: set[str] = set()
@@ -4246,7 +4257,17 @@ class IDEAgentScanner(Scanner):
         if not isinstance(allowed, list) or not all(isinstance(value, str) for value in allowed):
             result.scan_failures.append(f"{ide_type}: invalid declared permission allow-list")
             return []
-        return _broad_grants(allowed)
+        grants = _broad_grants(allowed)
+        denied = permissions.get("deny", [])
+        if (
+            isinstance(denied, list)
+            and all(isinstance(value, str) for value in denied)
+            and _deny_covers_every_mcp_server(denied)
+        ):
+            # `deny: ["mcp__*"]` blocks the whole-server allow, so the medium
+            # "MCP server tools" allowance is not what the file leaves in force.
+            grants = [item for item in grants if item != "MCP server tools"]
+        return grants
 
     def _scan_extensions(self, files: ConfinedCollection, result: ScanResult) -> None:
         relative = ".vscode/extensions.json"

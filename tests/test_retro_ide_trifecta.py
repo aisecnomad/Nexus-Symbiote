@@ -92,6 +92,29 @@ def test_per_server_mcp_allow_is_that_servers_grant_only(tmp_path: Path, rule: s
     assert len(gaps) == 1
     assert gaps[0].severity == RiskSeverity.HIGH
     assert rule in gaps[0].detail
+    server = rule.split("__", 2)[1]
+    assert f"every tool on MCP server '{server}'" in gaps[0].detail
+    assert "Destructive or shell tool" not in gaps[0].detail
+
+
+def test_deny_mcp_star_drops_the_whole_server_permission_scope(tmp_path: Path) -> None:
+    """``deny: ["mcp__*"]`` blocks the whole-server allow, so the medium scope does not stay."""
+    _write(
+        tmp_path,
+        ".claude/settings.json",
+        json.dumps({"permissions": {"allow": ["mcp__server", "Bash"], "deny": ["mcp__*"]}}),
+    )
+    result = IDEAgentScanner().scan(tmp_path)
+    scopes = [
+        risk
+        for component in result.components
+        for risk in component.risks
+        if risk.category == "permission_scope"
+    ]
+    assert len(scopes) == 1
+    assert "MCP server tools" not in scopes[0].detail
+    assert "shell commands" in scopes[0].detail
+    assert scopes[0].severity == RiskSeverity.MEDIUM
 
 
 def test_star_allow_is_still_a_lethal_trifecta(tmp_path: Path) -> None:

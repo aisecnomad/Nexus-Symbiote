@@ -697,15 +697,28 @@ def evaluate_tool_oversight(
             )
         )
     for safe_tool in gap_tools[:MAX_OVERSIGHT_GAP_FINDINGS]:
+        if _whole_mcp_server_allow(safe_tool):
+            server = safe_tool.strip()[5:].split("__", 1)[0]
+            detail = (
+                f"Allow rule '{safe_tool}' auto-approves every tool on MCP server "
+                f"'{server}' without human-in-the-loop in '{safe_source}'."
+            )
+            recommendation = (
+                f"Replace '{safe_tool}' with a per-tool allow, or add an ask or deny rule "
+                "for that server."
+            )
+        else:
+            detail = (
+                f"Destructive or shell tool '{safe_tool}' resolves to auto-approval "
+                f"without human-in-the-loop in '{safe_source}'."
+            )
+            recommendation = f"Move '{safe_tool}' from allow/alwaysAllow to ask or deny rules."
         assessments.append(
             RiskAssessment(
                 severity=RiskSeverity.HIGH,
                 category="oversight_gap",
-                detail=(
-                    f"Destructive or shell tool '{safe_tool}' resolves to auto-approval "
-                    f"without human-in-the-loop in '{safe_source}'."
-                ),
-                recommendation=(f"Move '{safe_tool}' from allow/alwaysAllow to ask or deny rules."),
+                detail=detail,
+                recommendation=recommendation,
             )
         )
     overflow = len(gap_tools) - MAX_OVERSIGHT_GAP_FINDINGS
