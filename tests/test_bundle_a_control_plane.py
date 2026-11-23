@@ -1360,20 +1360,29 @@ def test_linked_steering_targets_are_resolved_once_per_audit(
 
 
 def _guard_settings(
-    matcher: str | None = "Bash", hook_type: str = "command", **layer: object
+    matcher: str | None = "Bash",
+    hook_type: str = "command",
+    condition: str | None = None,
+    **layer: object,
 ) -> dict[str, object]:
-    entry: dict[str, object] = {"hooks": [{"type": hook_type, "command": "./guard.sh"}]}
+    handler: dict[str, object] = {"type": hook_type, "command": "./guard.sh"}
+    if condition is not None:
+        handler["if"] = condition
+    entry: dict[str, object] = {"hooks": [handler]}
     if matcher is not None:
         entry["matcher"] = matcher
     return {"hooks": {"PreToolUse": [entry]}, **layer}
 
 
 def _guard_alerts(
-    tmp_path: Path, current: dict[str, object], local: dict[str, object] | None = None
+    tmp_path: Path,
+    current: dict[str, object],
+    local: dict[str, object] | None = None,
+    baseline: dict[str, object] | None = None,
 ) -> set[str]:
     summaries = []
     for side, settings, local_settings in (
-        ("base", _guard_settings(), None),
+        ("base", baseline or _guard_settings(), None),
         ("curr", current, local),
     ):
         root = tmp_path / side
@@ -1392,6 +1401,8 @@ def _guard_alerts(
         (_guard_settings(matcher="NeverMatchesAnyTool"), None),
         (_guard_settings(matcher="Bas.*"), None),
         (_guard_settings(matcher="Edit|Write"), None),
+        (_guard_settings(matcher="Edit, Write"), None),
+        (_guard_settings(condition="Bash(never-matches *)"), None),
         (_guard_settings(disableAllHooks=True), None),
         (_guard_settings(), {"disableAllHooks": True}),
         (_guard_settings(hook_type="prompt"), None),
@@ -1412,6 +1423,8 @@ def test_baseline_diff_alerts_when_a_kept_hook_no_longer_runs(
         (_guard_settings(matcher=""), None),
         (_guard_settings(matcher=None), None),
         (_guard_settings(matcher="Bash|Edit"), None),
+        (_guard_settings(matcher="Bash, Edit"), None),
+        (_guard_settings(matcher=" Edit ,Bash|"), None),
         (_guard_settings(disableAllHooks=True), {"disableAllHooks": False}),
         (_guard_settings(disableAllHooks=False), None),
     ],
@@ -1430,6 +1443,7 @@ def test_hook_records_carry_the_state_that_decides_whether_they_run(tmp_path: Pa
     (hook,) = summary.hook_commands
     assert hook["hooks_disabled"] is True
     assert hook["runs_command"] is True
+    assert hook["if_digest"] is None
     assert hook["matcher_digest"] and len(hook["matcher_names"]) == 1
     assert "Bash" not in json.dumps(hook)
     (target,) = summary.hook_targets
@@ -1458,3 +1472,24 @@ def test_hook_run_comparison_scales_linearly_with_matchers(tmp_path: Path) -> No
         assert [a["root_cause"] for a in alerts] == ["hook_command_removed"]
 
     assert scaling_ratio(run) < 10
+
+
+@pytest.mark.parametrize(
+    ("baseline", "current", "stops"),
+    [
+        (_guard_settings(condition="Bash(git *)"), _guard_settings(condition="Bash(git *)"), False),
+        (
+            _guard_settings(condition="Bash(git *)"),
+            _guard_settings(matcher="*", condition="Bash(git *)"),
+            False,
+        ),
+        (_guard_settings(condition="Bash(git *)"), _guard_settings(condition="Bash(gi *)"), True),
+        (_guard_settings(), _guard_settings(condition="Bash(never-matches *)"), True),
+    ],
+)
+def test_baseline_diff_compares_the_hook_if_filter(
+    tmp_path: Path, baseline: dict[str, object], current: dict[str, object], stops: bool
+) -> None:
+    causes = _guard_alerts(tmp_path, current, baseline=baseline)
+    removal = {"hook_command_removed", "launch_target_removed"}
+    assert (removal <= causes) if stops else not (causes & removal)

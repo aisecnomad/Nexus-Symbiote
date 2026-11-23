@@ -160,7 +160,8 @@ _VERSIONED_PYTHON_RE = re.compile(r"^python[0-9]+(?:\.[0-9]+)?$")
 _NODE_PACKAGE_IMPORT = re.compile(
     r"((?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*)(?:/[A-Za-z0-9_][\w.-]*)*", re.ASCII
 )
-_PLAIN_MATCHER_RE = re.compile(r"[A-Za-z0-9_-]+(?:\|[A-Za-z0-9_-]+)*")
+_PLAIN_MATCHER_RE = re.compile(r"[A-Za-z0-9_\- ,|]+")
+_MATCHER_SPLIT_RE = re.compile(r"[|,]")
 _SPIFFE_RE = re.compile(r"^spiffe://[a-z0-9.-]+/[A-Za-z0-9._/-]+$")
 
 
@@ -1160,40 +1161,53 @@ def _bind_script_target(
     )
 
 
-def _iter_hook_commands(doc: dict[str, Any]) -> list[tuple[str, str, Any, Any]]:
-    """Each hook command with the matcher and type that decide whether it runs."""
-    out: list[tuple[str, str, Any, Any]] = []
+def _iter_hook_commands(doc: dict[str, Any]) -> list[tuple[str, str, Any, Any, Any]]:
+    """Each hook command with the matcher, type and `if` filter that decide whether it runs."""
+    out: list[tuple[str, str, Any, Any, Any]] = []
     for event_name, entries in _as_dict(doc.get("hooks")).items():
         for entry in _as_list(entries):
             if isinstance(entry, str):
-                out.append((str(event_name), entry, None, None))
+                out.append((str(event_name), entry, None, None, None))
             elif isinstance(entry, dict):
                 matcher = entry.get("matcher")
-                if isinstance(entry.get("command"), str):
-                    out.append((str(event_name), entry["command"], matcher, entry.get("type")))
-                for sub in _as_list(entry.get("hooks")):
-                    if isinstance(sub, dict) and isinstance(sub.get("command"), str):
-                        out.append((str(event_name), sub["command"], matcher, sub.get("type")))
+                for handler in [entry, *_as_list(entry.get("hooks"))]:
+                    if isinstance(handler, dict) and isinstance(handler.get("command"), str):
+                        out.append(
+                            (
+                                str(event_name),
+                                handler["command"],
+                                matcher,
+                                handler.get("type"),
+                                handler.get("if"),
+                            )
+                        )
     return out
 
 
-def _hook_state(matcher: Any, hook_type: Any, disabled: bool) -> dict[str, Any]:
+def _setting_digest(value: Any) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+    return _sha256_hex(text.encode())
+
+
+def _hook_state(matcher: Any, hook_type: Any, condition: Any, disabled: bool) -> dict[str, Any]:
     """What decides whether a hook still runs, as digests so no configuration text is copied.
 
-    An absent, empty or `*` matcher matches every tool. Only a matcher made of plain
-    `|`-separated names records its names, so a later matcher can be shown to match
-    everything it matched; any other matcher is compared by digest alone.
+    An absent, empty or `*` matcher matches every tool. A matcher of letters, digits,
+    `_`, `-`, spaces, `,` and `|` is a list of exact names, recorded so a later matcher
+    can be shown to match everything it matched; any other matcher is an unanchored
+    regular expression and is compared by digest alone, as the `if` filter always is.
     """
     digest: str | None = None
     names: list[str] | None = None
     if matcher not in (None, "", "*"):
-        text = matcher if isinstance(matcher, str) else json.dumps(matcher, sort_keys=True)
-        digest = _sha256_hex(text.encode())
+        digest = _setting_digest(matcher)
         if isinstance(matcher, str) and _PLAIN_MATCHER_RE.fullmatch(matcher):
-            names = sorted({_sha256_hex(name.encode()) for name in matcher.split("|")})
+            items = {item.strip() for item in _MATCHER_SPLIT_RE.split(matcher)} - {""}
+            names = sorted(_sha256_hex(item.encode()) for item in items) or None
     return _rec(
         matcher_digest=digest,
         matcher_names=names,
+        if_digest=None if condition is None else _setting_digest(condition),
         hook_type=None if hook_type is None else _clean(hook_type)[:64],
         runs_command=hook_type is None or hook_type == "command",
         hooks_disabled=disabled,
@@ -1218,9 +1232,9 @@ def _inspect_hooks_and_preambles(
             if cfg_path.startswith(".claude/")
             else doc.get("disableAllHooks") is True
         )
-        for raw_event, cmd_str, matcher, hook_type in _iter_hook_commands(doc):
+        for raw_event, cmd_str, matcher, hook_type, condition in _iter_hook_commands(doc):
             event_name = _clean(raw_event)
-            state = _hook_state(matcher, hook_type, disabled)
+            state = _hook_state(matcher, hook_type, condition, disabled)
             summary.hook_commands.append(
                 _rec(
                     source_file=cfg_path,
@@ -2583,16 +2597,29 @@ def _hook_runs(rec: dict[str, Any]) -> bool:
 def _hooks_stop_running(base_recs: list[dict[str, Any]], curr_recs: list[dict[str, Any]]) -> bool:
     """Whether some tool a running baseline hook matched is matched by no running current one.
 
-    The records share one command and event, so the union of the current matchers decides.
-    A summary written before these fields existed reads as running for every tool.
+    The records share one command and event, so among current hooks with the same `if`
+    filter the union of their matchers decides; an added or changed `if` may match
+    nothing. A summary written before these fields existed reads as running everywhere.
     """
-    live = [rec for rec in curr_recs if _hook_runs(rec)]
-    if any(rec.get("matcher_digest") is None for rec in live):
-        return False
-    digests = {rec["matcher_digest"] for rec in live}
-    names = {name for rec in live for name in rec.get("matcher_names") or ()}
+    live: dict[str | None, tuple[list[bool], set[str], set[str]]] = {}
+    for rec in curr_recs:
+        if _hook_runs(rec):
+            matches_all, digests, names = live.setdefault(
+                rec.get("if_digest"), ([False], set(), set())
+            )
+            if rec.get("matcher_digest") is None:
+                matches_all[0] = True
+            else:
+                digests.add(rec["matcher_digest"])
+                names.update(rec.get("matcher_names") or ())
     for base in base_recs:
-        if not _hook_runs(base) or base.get("matcher_digest") in digests:
+        if not _hook_runs(base):
+            continue
+        group = live.get(base.get("if_digest"))
+        if group is None:
+            return True
+        matches_all, digests, names = group
+        if matches_all[0] or base.get("matcher_digest") in digests:
             continue
         base_names = base.get("matcher_digest") is not None and base.get("matcher_names")
         if not base_names or not names.issuperset(base_names):
