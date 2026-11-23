@@ -94,7 +94,12 @@ from nexus_symbiote.scanners.mcp_launch import (
     known_executable,
     origin,
 )
-from nexus_symbiote.utils.confined import ConfinedCollection, fold_name
+from nexus_symbiote.utils.confined import (
+    AGENT_DEFAULT_EXCLUDE_REASON,
+    DEFAULT_EXCLUDE_REASON,
+    ConfinedCollection,
+    fold_name,
+)
 from nexus_symbiote.utils.jsonc import strip_jsonc
 from nexus_symbiote.utils.secrets import (
     MIN_SECRET_LENGTH,
@@ -3204,6 +3209,28 @@ def _configured_values(document: Any) -> list[str] | None:
     return values
 
 
+def _policy_exclusions(files: ConfinedCollection, result: ScanResult) -> int:
+    """Exclusions the walk recorded that leave the source search incomplete.
+
+    A default-excluded entry such as ``.git``, ``venv`` or ``__pycache__`` is reported
+    as a gap and handed to the search as unvisited, where it keeps the modules beside
+    it uncertain, so it does not make the walk incomplete; an explicit collection-policy
+    exclusion does, and so does any exclusion past the listing bound, which cannot be
+    told apart. A collection that counts policy exclusions itself is asked instead.
+    """
+    recorded: int | None = getattr(files, "policy_exclusions_recorded", None)
+    if recorded is not None:
+        return recorded
+    listed = result.surfaces_excluded
+    policy = sum(
+        1
+        for entry in listed
+        if not entry.endswith(DEFAULT_EXCLUDE_REASON)
+        and not entry.endswith(AGENT_DEFAULT_EXCLUDE_REASON)
+    )
+    return policy + max(0, files.exclusions_recorded - len(listed))
+
+
 class MCPScanner(Scanner):
     name = "mcp"
     _resolvers: _Resolvers | None = None
@@ -3222,8 +3249,7 @@ class MCPScanner(Scanner):
             links: list[Path] = []
             skipped: list[Path] = []
             sources = list(files.iter_files(directory_links=links, observed_excludes=skipped))
-            cache_dirs = [p for p in skipped if p.name.casefold() == "__pycache__"]
-            walk_complete = files.failures_recorded == 0 and files.exclusions_recorded == 0
+            walk_complete = files.failures_recorded == 0 and _policy_exclusions(files, result) == 0
             linked, linked_gaps = _linked_client_files(files, links)
             nested, directory_gaps = self._nested_client_files(files, [*sources, *linked])
             directory_gaps.update(path.as_posix() for path in linked_gaps)
@@ -3246,7 +3272,7 @@ class MCPScanner(Scanner):
             if known is not None:
                 self._read_host_settings(files, sources, links, known)
                 self._scan_code_mcp_clients(
-                    result, sources, known, [*links, *cache_dirs], walk_complete
+                    result, sources, known, [*links, *skipped], walk_complete
                 )
 
         if not found_any and not result.scan_failures and not result.surfaces_excluded:
