@@ -37,6 +37,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from itertools import groupby
+from typing import Protocol
 
 _LINE_END = re.compile(r"\r\n|\r|\n")
 # Containers nested this deep, or more container lines matched than the text has
@@ -44,14 +45,6 @@ _LINE_END = re.compile(r"\r\n|\r|\n")
 # every open list item again.
 _MAX_NESTING = 64
 _SPARE_MATCHES = 4096
-# Longer lines that could open an HTML block of kind 7 are read as ambiguous.
-_MAX_OPEN_TAG_LINE = 4096
-# A white space character beyond ASCII both separates attributes and continues an
-# unquoted value in the Unicode dialect, so the open-tag pattern backtracks
-# quadratically on a line that holds one. Such a line is tested only this long, and only
-# this many characters of them per reading; past either bound the file is ambiguous.
-_MAX_SPACED_OPEN_TAG_LINE = 256
-_MAX_SPACED_OPEN_TAG_CHARS = 64 * 1024
 _NON_ASCII_SPACE = re.compile("[\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]")
 _CODE_INDENT = 4
 _SPACE_OR_TAB = (" ", "\t")
@@ -71,6 +64,15 @@ _LIST_STARTS = frozenset("*+-0123456789")
 _NON_SPACE = re.compile(r"[^ \t\f\v\r\n]")
 # Whitespace as the JavaScript readers that hosts use match it in HTML.
 _WHITESPACE = "[\t\n\x0b\x0c\r \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
+_WHITESPACE_CHARS = frozenset(
+    "\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
+_OPEN_TAG_PREFIX = re.compile(r"<[A-Za-z][A-Za-z0-9-]*")
+_UNICODE_CLOSE_TAG = re.compile(rf"</[A-Za-z][A-Za-z0-9-]*{_WHITESPACE}*>{_WHITESPACE}*$")
+_ATTR_START_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_:")
+_ATTR_CONT_CHARS = _ATTR_START_CHARS | frozenset("0123456789.-")
+_UNQUOTED_FORBIDDEN = frozenset("\"'=<>`")
 _BLOCK_TAG_NAMES = (
     "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd"
     "|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset"
@@ -80,15 +82,110 @@ _BLOCK_TAG_NAMES = (
 )
 
 
+class _StartMatcher(Protocol):
+    def match(self, string: str, pos: int = 0) -> object: ...
+
+
+def _match_unicode_kind7(line: str, at: int = 0) -> bool:
+    """Exact O(N) bitmask NFA for CommonMark kind-7 HTML blocks in the Unicode dialect.
+
+    In the Unicode dialect, non-ASCII whitespace characters belong to both whitespace and
+    unquoted attribute values (`[^"'=<>`\\x00-\\x20]+`), making a backtracking regex
+    quadratic (`<a b=c\\xa0...`) and exponential (`<a b=\\xa0\\xa0\\xa0...`). Tracking
+    the 10 NFA states in an integer bitmask matches the exact same grammar in O(N) time.
+    """
+    if not line.startswith("<", at):
+        return False
+    if line.startswith("</", at):
+        return _UNICODE_CLOSE_TAG.match(line, at) is not None
+    prefix = _OPEN_TAG_PREFIX.match(line, at)
+    if prefix is None:
+        return False
+    # Bit positions for the 10 states of the open-tag grammar after the tag name.
+    s_need_ws, s_after_ws, s_attr, s_attr_ws, s_eq = 1, 2, 4, 8, 16
+    s_sq, s_dq, s_unq, s_slash, s_closed = 32, 64, 128, 256, 512
+    can_ws_next = s_need_ws | s_after_ws | s_unq
+    can_attr_ws = s_attr | s_attr_ws
+    can_slash = s_need_ws | s_after_ws | s_attr | s_attr_ws | s_unq
+    can_close = can_slash | s_slash
+    can_start_attr = s_after_ws | s_attr_ws
+    state = s_need_ws
+    ws_chars = _WHITESPACE_CHARS
+    attr_start = _ATTR_START_CHARS
+    attr_cont = _ATTR_CONT_CHARS
+    forbidden = _UNQUOTED_FORBIDDEN
+    for index in range(prefix.end(), len(line)):
+        ch = line[index]
+        nxt = 0
+        if state & s_sq:
+            nxt |= s_need_ws if ch == "'" else s_sq
+        if state & s_dq:
+            nxt |= s_need_ws if ch == '"' else s_dq
+        if ch in ws_chars:
+            if state & can_ws_next:
+                nxt |= s_after_ws
+            if state & can_attr_ws:
+                nxt |= s_attr_ws
+            if state & s_eq:
+                nxt |= s_eq
+            if state & s_closed:
+                nxt |= s_closed
+        if ch == "=":
+            if state & can_attr_ws:
+                nxt |= s_eq
+        elif ch == "'":
+            if state & s_eq:
+                nxt |= s_sq
+        elif ch == '"':
+            if state & s_eq:
+                nxt |= s_dq
+        elif ch == ">":
+            if state & can_close:
+                nxt |= s_closed
+        else:
+            if ch == "/" and (state & can_slash):
+                nxt |= s_slash
+            if ch in attr_start and (state & can_start_attr):
+                nxt |= s_attr
+            if ch in attr_cont and (state & s_attr):
+                nxt |= s_attr
+        if ord(ch) > 0x20 and ch not in forbidden and (state & (s_eq | s_unq)):
+            nxt |= s_unq
+        if not nxt:
+            return False
+        state = nxt
+    return bool(state & s_closed)
+
+
+class _UnicodeKind7Matcher:
+    """Kind-7 HTML block start matcher: fast disjoint ASCII regex, O(N) NFA for Unicode spaces."""
+
+    __slots__ = ("_ascii_fast",)
+
+    def __init__(self, ascii_fast: re.Pattern[str]) -> None:
+        self._ascii_fast = ascii_fast
+
+    def match(self, string: str, pos: int = 0) -> object:
+        if _NON_ASCII_SPACE.search(string, pos) is None:
+            return self._ascii_fast.match(string, pos)
+        return _match_unicode_kind7(string, pos)
+
+
 def _html_block_starts(
-    whitespace: str, tag_names: str, declaration: str
-) -> tuple[re.Pattern[str], ...]:
-    open_tag = (
-        rf"<[A-Za-z][A-Za-z0-9-]*(?:{whitespace}+[a-zA-Z_:][a-zA-Z0-9:._-]*"
-        rf"(?:{whitespace}*={whitespace}*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?)*"
-        rf"{whitespace}*/?>"
-    )
-    close_tag = rf"</[A-Za-z][A-Za-z0-9-]*{whitespace}*>"
+    whitespace: str,
+    tag_names: str,
+    declaration: str,
+    *,
+    kind7: _StartMatcher | None = None,
+) -> tuple[_StartMatcher, ...]:
+    if kind7 is None:
+        open_tag = (
+            rf"<[A-Za-z][A-Za-z0-9-]*(?:{whitespace}+[a-zA-Z_:][a-zA-Z0-9:._-]*"
+            rf"(?:{whitespace}*={whitespace}*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?)*"
+            rf"{whitespace}*/?>"
+        )
+        close_tag = rf"</[A-Za-z][A-Za-z0-9-]*{whitespace}*>"
+        kind7 = re.compile(rf"(?:{open_tag}|{close_tag}){whitespace}*$")
     return (
         re.compile(rf"<(?:pre|script|style|textarea)(?:{whitespace}|>|$)", re.I),
         re.compile(r"<!--"),
@@ -96,19 +193,22 @@ def _html_block_starts(
         re.compile(declaration),
         re.compile(r"<!\[CDATA\["),
         re.compile(rf"</?(?:{tag_names})(?:{whitespace}|/?>|$)", re.I),
-        re.compile(rf"(?:{open_tag}|{close_tag}){whitespace}*$"),
+        kind7,
     )
 
 
-# The seven start conditions of an HTML block, and the end conditions of the first five;
-# the last two end at a blank line.
-_HTML_BLOCK_STARTS = _html_block_starts(_WHITESPACE, _BLOCK_TAG_NAMES, r"<![A-Za-z]")
-# The same conditions as cmark-gfm 0.29, which GitHub renders with, reads them: only ASCII
-# whitespace ends a tag name, `search` is no block tag, and a declaration starts with an
-# upper-case letter, as markdown-it also reads it. Where the two readings start different
-# blocks, a definition, footnote or import one of them hides can be text to the other.
+# The seven start conditions as cmark-gfm 0.29 reads them: only ASCII whitespace ends a
+# tag name (strictly disjoint from unquoted attribute values), `search` is no block tag,
+# and a declaration starts with an upper-case letter, as markdown-it also reads it.
 _ASCII_HTML_BLOCK_STARTS = _html_block_starts(
     "[ \t\n\x0b\x0c\r]", _BLOCK_TAG_NAMES.replace("|search", ""), r"<![A-Z]"
+)
+_ASCII_KIND7 = _ASCII_HTML_BLOCK_STARTS[6]
+assert isinstance(_ASCII_KIND7, re.Pattern)
+# The seven start conditions of an HTML block in the Unicode whitespace dialect, using
+# the linear-time kind-7 matcher so non-ASCII whitespace never backtracks.
+_HTML_BLOCK_STARTS = _html_block_starts(
+    _WHITESPACE, _BLOCK_TAG_NAMES, r"<![A-Za-z]", kind7=_UnicodeKind7Matcher(_ASCII_KIND7)
 )
 _HTML_BLOCK_ENDS: tuple[re.Pattern[str] | str, ...] = (
     re.compile(r"</(?:pre|script|style|textarea)>", re.I),
@@ -492,7 +592,6 @@ class _Reader:
         self.include_fence = include_fence
         self.ascii_html = ascii_html
         self.recovered_blocks = False
-        self.spaced_tag_chars = 0
         self.parts: list[str] = []
         # Each paragraph, heading and HTML block as written, with its kind, in order.
         self.blocks: list[tuple[str, str]] = []
@@ -759,22 +858,8 @@ class _Reader:
                 lazy = not self.all_closed and not self.blank and self.stack[-1].kind == "paragraph"
                 starts = _ASCII_HTML_BLOCK_STARTS if self.ascii_html else _HTML_BLOCK_STARTS
                 for kind, start in enumerate(starts, 1):
-                    if kind == 7:
-                        if parent.kind == "paragraph" or lazy:
-                            break
-                        if not self.ascii_html:
-                            span = len(line) - at
-                            if span > _MAX_OPEN_TAG_LINE:
-                                # Unicode spaces are also unquoted-value characters, so the
-                                # tag pattern backtracks quadratically over a long line.
-                                raise _AmbiguousError
-                            if _NON_ASCII_SPACE.search(line, at):
-                                self.spaced_tag_chars += span
-                                if (
-                                    span > _MAX_SPACED_OPEN_TAG_LINE
-                                    or self.spaced_tag_chars > _MAX_SPACED_OPEN_TAG_CHARS
-                                ):
-                                    raise _AmbiguousError
+                    if kind == 7 and (parent.kind == "paragraph" or lazy):
+                        break
                     if start.match(line, at):
                         if self.ascii_html is None and not _ascii_html_block_agrees(
                             kind, line, at, parent.kind, lazy

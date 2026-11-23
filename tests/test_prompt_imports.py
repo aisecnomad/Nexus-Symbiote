@@ -1146,3 +1146,58 @@ def test_the_non_ascii_space_class_is_the_dialects_white_space_beyond_ascii():
         if markdown._NON_ASCII_SPACE.fullmatch(chr(code))
     }
     assert found == beyond
+    all_ws = {chr(code) for code in range(0x110000) if dialect.fullmatch(chr(code))}
+    assert all_ws == markdown._WHITESPACE_CHARS
+
+
+def test_exponential_spaced_attribute_backtracking_stays_linear():
+    # A 104-char `<a b=\xa0\xa0\xa0...` line was O(3^k) exponential in the old regex.
+    for scale in (1, 4):
+        line = "<a " + "b=\xa0\xa0\xa0" * (200 * scale) + "!"
+        started = time.process_time()
+        prompt._import_readings(line + "\n\nFollow @notes.md\n")
+        assert time.process_time() - started < 5
+    texts = {scale: "<a " + "b=\xa0\xa0\xa0" * (200 * scale) + "!\n" for scale in (1, 4)}
+    assert scaling_ratio(lambda scale: prompt._import_readings(texts[scale])) < 10
+
+
+def test_unicode_kind7_nfa_matches_the_commonmark_grammar_exactly():
+    import random
+
+    from nexus_symbiote.utils import markdown
+
+    ws = markdown._WHITESPACE
+    open_tag = (
+        rf"<[A-Za-z][A-Za-z0-9-]*(?:{ws}+[a-zA-Z_:][a-zA-Z0-9:._-]*"
+        rf"(?:{ws}*={ws}*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?)*"
+        rf"{ws}*/?>"
+    )
+    close_tag = rf"</[A-Za-z][A-Za-z0-9-]*{ws}*>"
+    spec = re.compile(rf"(?:{open_tag}|{close_tag}){ws}*$")
+    matcher = markdown._HTML_BLOCK_STARTS[6]
+
+    fixed = [
+        "<a>",
+        "<a/>",
+        "<a\xa0/>",
+        "<a\xa0b=c\xa0d=e>",
+        "<a b=c\xa0d=e/>",
+        "<a\xa0b='x\xa0y'\xa0c=\"z\">",
+        "<a b=c/d>",
+        "<a b=c/>",
+        "</a\xa0>\xa0",
+        "<a b=c\xa0!>",
+        "<a\xa0b=\xa0\xa0>",
+        "<a\xa0b=\xa0\xa0!>",
+        "<1a>",
+        "<>",
+        "plain text",
+    ]
+    for sample in fixed:
+        assert bool(matcher.match(sample, 0)) == (spec.match(sample, 0) is not None), sample
+
+    rng = random.Random(410)  # noqa: S311
+    alphabet = ["a", "1", "_", ":", "-", " ", "\t", "\xa0", "\u2000", "=", "'", '"', "/", ">", "!"]
+    for _ in range(2_000):
+        sample = "<a" + "".join(rng.choices(alphabet, k=rng.randint(0, 12)))
+        assert bool(matcher.match(sample, 0)) == (spec.match(sample, 0) is not None), sample

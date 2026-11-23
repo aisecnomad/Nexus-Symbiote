@@ -1218,10 +1218,7 @@ A way around a limit that its entry does not describe is worth a
   Where these readings may give a different block structure (a marked fence close,
   a tab before a fence, a fence or those HTML tags among lines marked keeps in a list
   item), the raw text is retained as for other ambiguities, so a fenced example there
-  can count as an import. So is a file with a line that could open an HTML block of
-  kind 7 and is longer than 4,096 characters, or holds a white space character
-  beyond ASCII and is longer than 256, or with more than 64 KiB of such lines: the
-  open-tag pattern would backtrack quadratically over them (#410). A name that only Claude Code's reading gives and that names
+  can count as an import. A name that only Claude Code's reading gives and that names
   no file is skipped silently: it is looked up only by its exact spelling, so it
   raises no credential or case-variant gap, and a case variant of it on a
   case-insensitive file system is not found. Each reference yields at most 16 names
