@@ -84,7 +84,10 @@ changed, since the export normalizes it.
   no model of its own; it confirms the declared artifact was collected.
 - **Hosted models.** A `provider` and `requested_ref` add a model component with the
   requested alias, declared assurance and unknown trust. Its identity and integrity
-  cannot be checked offline, so integrity validation reports them as unknown.
+  cannot be checked offline, so integrity validation reports them as unknown. The
+  `provider` and `requested_ref` pass through the shared credential redactor first, so
+  `gpt-4o?token=ghp_...` is recorded as `gpt-4o?token=***`; ordinary values such as
+  `openai/gpt-4o-mini` are kept as written.
 - **The risk gate.** A repository whose only local subject is the inferred agent
   fails with "no agent manifest or supported local inventory evidence was found".
   A manifest-declared agent, instruction or model is such evidence.
@@ -107,6 +110,7 @@ inventory, so the default gate fails and the evidence stays available for review
 | `agent.yaml#/models/KEY: the declared local model has no collected model artifact` | No collected model at that path |
 | `agent.yaml#/models/KEY: the declared local model is unavailable` | The artifact can no longer be opened safely |
 | `agent.yaml#/models/KEY: the key is too long for a component reference` | A hosted model key that, percent-encoded, makes the model's reference longer than 16,384 characters |
+| `agent.yaml#/models: a model key is shaped like a credential` | A model key that the credential redactor would change, such as a pasted `ghp_...` token. The key becomes the component reference, which cannot be redacted, so the model is not recorded |
 | `agent.yaml: declares a component reference that is already in use` | A declared instruction or hosted model would take the reference of a different component already in the inventory |
 
 These failures name an entry by its position or its percent-encoded key, never by

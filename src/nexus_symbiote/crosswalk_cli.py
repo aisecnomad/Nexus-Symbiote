@@ -27,6 +27,7 @@ import click
 from nexus_symbiote.core.aibom import AIBOM, NativeFormatError
 from nexus_symbiote.crosswalk import FRAMEWORK_KEYS
 from nexus_symbiote.runtime_cli import _refuse_source_overwrite
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDE_ACCEPTANCE
 from nexus_symbiote.utils.terminal import json_text, neutralize, write_cli_output
 
 if TYPE_CHECKING:
@@ -304,6 +305,21 @@ def register_crosswalk_commands(main: click.Group) -> None:
         default=None,
         help="Explicit operator signer policy JSON for --include-evidence-pack; requires --project.",
     )
+    @click.option(
+        "--accept-default-exclude",
+        "accept_default_exclude",
+        type=click.Choice(sorted(DEFAULT_EXCLUDE_ACCEPTANCE)),
+        multiple=True,
+        help="Accept one default exclusion while reconciling against --project. Repeat as needed.",
+    )
+    @click.option(
+        "--accept-default-excludes",
+        is_flag=True,
+        help=(
+            "Accept built-in default exclusions (.git, node_modules, __pycache__, .venv, venv) "
+            "while reconciling against --project."
+        ),
+    )
     def crosswalk(
         aibom_path: Path,
         frameworks: tuple[str, ...],
@@ -312,6 +328,8 @@ def register_crosswalk_commands(main: click.Group) -> None:
         include_evidence_pack: bool = False,
         project: Path | None = None,
         signature_policy: Path | None = None,
+        accept_default_exclude: tuple[str, ...] = (),
+        accept_default_excludes: bool = False,
     ) -> None:
         """Map findings to OWASP, MITRE ATLAS, NIST AI RMF, EU AI Act, ISO/IEC 42001 and CWE.
 
@@ -326,6 +344,10 @@ def register_crosswalk_commands(main: click.Group) -> None:
 
         if signature_policy is not None and project is None:
             raise click.UsageError("--signature-policy requires --project")
+        if (accept_default_excludes or accept_default_exclude) and project is None:
+            raise click.UsageError(
+                "--accept-default-exclude and --accept-default-excludes require --project"
+            )
         if project is not None and not include_evidence_pack:
             raise click.UsageError(
                 "--project and --signature-policy require --include-evidence-pack"
@@ -341,7 +363,11 @@ def register_crosswalk_commands(main: click.Group) -> None:
             from nexus_symbiote.policy_export import build_evidence_pack
 
             document["evidence_pack"] = build_evidence_pack(
-                raw_bytes, bom, project=project, signature_policy=signature_policy
+                raw_bytes,
+                bom,
+                project=project,
+                signature_policy=signature_policy,
+                accept_default_excludes=accept_default_excludes or accept_default_exclude,
             )
         if output_format == "markdown":
             text = render_markdown(document)

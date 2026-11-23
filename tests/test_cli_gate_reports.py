@@ -436,6 +436,20 @@ def test_unknown_integrity_is_named_and_explained(tmp_path):
     assert ("  UNKNOWN: no hash or signature could be verified", None) in unexplained
 
 
+def test_a_status_cannot_form_a_log_command_by_case_mapping():
+    from nexus_symbiote.reporting import validation_report_lines
+
+    # U+017F (long s) upper-cases to "S", so "##vſo[" would become "##VSO[" after the
+    # neutralizer had already passed it.
+    status = "##vſo[task.setvariable variable=x]1"
+    lines = validation_report_lines(
+        {"passed": False, "completeness": {"status": status}, "integrity": {"status": status}}
+    )
+    statuses = [text for text, _ in lines if text.startswith("  Status: ")]
+    assert len(statuses) == 2
+    assert not any(re.search(r"##[A-Za-z]*\[", text) for text in statuses)
+
+
 def test_skip_integrity_checks_completeness_only_and_says_so(tmp_path):
     project = _agent(tmp_path / "project", pickle=True)
     bom = tmp_path / "bom.json"

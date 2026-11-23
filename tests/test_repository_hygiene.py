@@ -391,20 +391,45 @@ def test_invisible_characters_in_source_and_documentation_are_reported(tmp_path)
     ]
 
 
-def test_escaped_invisible_characters_and_detection_fixtures_are_accepted(tmp_path):
-    for directory in ("src", "tests", "benchmarks/fixtures/case"):
+def test_escaped_invisible_characters_and_detection_data_are_accepted(tmp_path):
+    for directory in ("src", "tests/fixtures/py", "benchmarks/fixtures/case", "benchmarks/r"):
         (tmp_path / directory).mkdir(parents=True)
     (tmp_path / "src/module.py").write_text(
         'RLO = "\\u202e"\nTEXT = "caf\u00e9 \u00a0 \u2014"\n', "utf-8"
     )
-    (tmp_path / "tests/test_hidden.py").write_text('SAMPLE = "\u202e"\n', "utf-8")
+    (tmp_path / "tests/fixtures/py/server.py").write_text('SAMPLE = "\u202e"\n', "utf-8")
     (tmp_path / "benchmarks/fixtures/case/CLAUDE.md").write_text("hidden\u200b\n", "utf-8")
+    (tmp_path / "benchmarks/r/bom.json").write_text('{"n": "\u200b"}\n', "utf-8")
     files = [
         Path("src/module.py"),
-        Path("tests/test_hidden.py"),
+        Path("tests/fixtures/py/server.py"),
         Path("benchmarks/fixtures/case/CLAUDE.md"),
+        Path("benchmarks/r/bom.json"),
     ]
     assert hygiene.hidden_character_issues(tmp_path, files) == []
+
+
+def test_code_ci_runs_and_files_that_do_not_decode_are_checked(tmp_path):
+    # Test and benchmark Python runs in CI; build and ownership files steer it.
+    for directory in ("tests", "benchmarks/inventory", ".github", "examples"):
+        (tmp_path / directory).mkdir(parents=True)
+    hidden = {
+        "tests/conftest.py": 'X = "a\u200db"\n',
+        "benchmarks/inventory/evidence.py": "# \u202e\n",
+        "benchmarks/run_tools.sh": "echo \u200b\n",
+        "examples/Dockerfile.agent": "FROM x\u202e\n",
+        "Dockerfile": "FROM x\u2060\n",
+        "Makefile": "all:\u200b\n",
+        ".github/CODEOWNERS": "* @owner\u200c\n",
+        "requirements-ci.lock": "a==1\u00ad\n",
+        "config.json": '{"k": "\ufe0f"}\n',
+    }
+    for name, text in hidden.items():
+        (tmp_path / name).write_text(text, "utf-8")
+    (tmp_path / "setup.cfg").write_bytes("[x]\nk = \u202e".encode() + b"\xff\n")
+    issues = hygiene.hidden_character_issues(tmp_path, [*map(Path, hidden), Path("setup.cfg")])
+    assert sorted(issue.split(":", 1)[0] for issue in issues) == sorted([*hidden, "setup.cfg"])
+    assert "setup.cfg: not valid UTF-8; invisible characters were not checked" in issues
 
 
 def test_wall_clock_cost_bound_hygiene_rejects_unmarked_cost_bounds_and_allows_deadlines(tmp_path):
