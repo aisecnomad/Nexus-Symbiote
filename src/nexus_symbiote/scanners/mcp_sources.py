@@ -635,6 +635,8 @@ def _launch_words(config: Mapping[str, Any]) -> Iterator[tuple[str | None, str]]
 
 def _referenced_paths(word: str, previous: str | None) -> tuple[tuple[str, ...], bool]:
     """Relative files a launch word may run, and whether it names a source exactly."""
+    if "\x00" in word:
+        return (), False
     if previous == "-m" or (word.startswith("-m") and len(word) > 2):
         module = word if previous == "-m" else word[2:]
         if not _MODULE_NAME.fullmatch(module):
@@ -669,6 +671,14 @@ def _launch_base(text: str) -> str | None:
     return text
 
 
+def _excluded_quietly(files: ConfinedCollection, relative: str) -> bool:
+    """Whether policy excludes ``relative``; a path the collection refuses is not excluded."""
+    try:
+        return files.excluded(relative, record=False)
+    except CollectionError:
+        return False
+
+
 def _launched_sources(
     files: ConfinedCollection,
     servers: Sequence[LaunchedServer],
@@ -694,8 +704,11 @@ def _launched_sources(
         bases = [directory]
         cwd = config.get("cwd")
         extra = [cwd] if isinstance(cwd, str) else []
-        # `uv run --directory D` and `uv --directory=D run` start the script in D.
-        extra.extend(word for previous, word in words if previous == "--directory")
+        # `uv run --directory D` and `uv --directory=D run` start the script in D. Only
+        # the first and the last value can be the one a runtime honours, and every
+        # extra base multiplies the work per word, so no other value is a base.
+        directories = [word for previous, word in words if previous == "--directory"]
+        extra.extend(dict.fromkeys(directories[:1] + directories[-1:]))
         for text in extra:
             base = _launch_base(text)
             if base is not None:
@@ -734,7 +747,7 @@ def _launched_sources(
                     for relative in missing
                     if _SKIPPED_TREES.intersection(relative.split("/")[:-1])
                     # An excluded path already has its own gap, with its own reason.
-                    and not files.excluded(relative, record=False)
+                    and not _excluded_quietly(files, relative)
                     and files.entry_exists(relative)
                 ),
                 None,

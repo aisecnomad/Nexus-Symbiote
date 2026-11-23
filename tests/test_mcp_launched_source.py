@@ -15,6 +15,7 @@ from click.testing import CliRunner
 
 from nexus_symbiote.cli import main
 from nexus_symbiote.core.models import ToolComponent
+from nexus_symbiote.scanners import mcp_sources
 from nexus_symbiote.scanners.base import ScanResult
 from nexus_symbiote.scanners.mcp import MCPScanner
 from nexus_symbiote.scanners.mcp_sources import SOURCE_SEARCH_SKIPPED
@@ -322,8 +323,10 @@ def test_the_action_default_gate_fails_on_a_poisoned_launched_example(tmp_path):
         lambda n: " ".join(f"a{i}/b{i}" for i in range(n)),
         lambda n: " ".join(f"--opt{i % 97}=val{i % 89}/x{i % 13}" for i in range(n)),
         lambda n: " ".join(f"examples/s{i}.py" for i in range(n)),
+        lambda n: " ".join(f"--directory=d{i}" for i in range(n)) + " srv.py",
+        lambda n: " ".join(f"--directory d{i} s{i}.py" for i in range(n)),
     ],
-    ids=["distinct-paths", "repeated-options", "exact-sources"],
+    ids=["distinct-paths", "repeated-options", "exact-sources", "directories", "dir-words"],
 )
 def test_launch_word_resolution_stays_linear(tmp_path, make):
     roots = {}
@@ -357,3 +360,97 @@ def test_an_operator_excluded_launch_logs_no_configured_value(tmp_path):
     assert out.exists(), run.output
     assert configured not in out.read_text()
     assert configured not in run.output
+
+
+def test_many_directory_arguments_stay_linear(tmp_path):
+    roots = {}
+    for scale in (1, 4):
+        root = tmp_path / str(scale)
+        root.mkdir()
+        args = [word for i in range(240 * scale) for word in ("--directory", f"d{i}")]
+        server = {"command": "uv", "args": [*args, "run", "srv.py"]}
+        (root / ".mcp.json").write_text(json.dumps({"mcpServers": {"s": server}}))
+        roots[scale] = root
+    assert scaling_ratio(lambda scale: MCPScanner().scan(roots[scale])) < 10
+
+
+@pytest.mark.parametrize("position", ["first", "last"])
+def test_the_first_or_last_uv_directory_is_followed(tmp_path, position):
+    directories = ["examples", "other"] if position == "first" else ["other", "examples"]
+    args = [word for name in directories for word in ("--directory", name)]
+    result = _scan(
+        tmp_path,
+        {"examples/srv.py": SERVER_PY},
+        {"command": "uv", "args": [*args, "run", "srv.py"]},
+    )
+    assert "lookup" in _tools(result)
+
+
+def test_a_nul_in_a_launch_word_does_not_stop_collection(tmp_path):
+    result = _scan(
+        tmp_path,
+        {"srv.py": SERVER_PY},
+        {"command": "python3", "args": ["srv.py", "examples/a\u0000.py"]},
+    )
+    assert "lookup" in _tools(result)
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        {"command": "python", "args": ["-m", "build"]},
+        {"command": "node", "args": ["build/index.js"]},
+        {"command": "node", "args": ["dist/index.js"]},
+    ],
+)
+def test_a_root_file_where_a_launched_directory_would_be_is_not_a_gap(tmp_path, server):
+    result = _scan(tmp_path, {"build": "not a directory\n", "dist": "x\n"}, server)
+    assert not any(SKIP_GAP in gap for gap in result.surfaces_excluded), result.surfaces_excluded
+
+
+def test_a_directory_link_out_of_the_root_is_still_a_gap(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "srv.py").write_text(SERVER_PY)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "examples").symlink_to(outside)
+    result = _scan(project, {}, {"command": "python3", "args": ["examples/srv.py"]})
+    assert any(SKIP_GAP in gap for gap in result.surfaces_excluded), result.surfaces_excluded
+
+
+def test_a_launch_under_a_default_exclude_adds_no_skipped_directory_gap(tmp_path):
+    result = _scan(
+        tmp_path,
+        {".venv/lib/x/tests/s.py": SERVER_PY},
+        {"command": "python3", "args": [".venv/lib/x/tests/s.py"]},
+    )
+    assert not any(SKIP_GAP in gap for gap in result.surfaces_excluded), result.surfaces_excluded
+
+
+def test_a_repeated_launch_word_is_resolved_once(tmp_path, monkeypatch):
+    calls: list[str] = []
+    original = mcp_sources._referenced_paths
+
+    def counted(word, previous):
+        calls.append(word)
+        return original(word, previous)
+
+    monkeypatch.setattr(mcp_sources, "_referenced_paths", counted)
+    _scan(tmp_path, {}, {"command": "sh", "args": ["-c", " ".join(["examples/x"] * 500)]})
+    assert calls.count("examples/x") == 1
+
+
+def test_a_word_is_expanded_only_where_walked_files_are(tmp_path, monkeypatch):
+    normalized: list[str] = []
+    original = mcp_sources.posixpath.normpath
+
+    def counted(path):
+        normalized.append(path)
+        return original(path)
+
+    monkeypatch.setattr(mcp_sources.posixpath, "normpath", counted)
+    words = [f"a{i}/b{i}" for i in range(300)]
+    _scan(tmp_path, {"src/x.py": "x = 1\n"}, {"command": "sh", "args": ["-c", " ".join(words)]})
+    # One check per word, not one per candidate suffix, index script and __main__.py.
+    assert len([path for path in normalized if "/b" in path]) <= 2 * len(words)
