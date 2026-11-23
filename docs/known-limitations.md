@@ -1238,7 +1238,10 @@ A way around a limit that its entry does not describe is worth a
   a tab before a fence, a fence or those HTML tags among lines marked keeps in a list
   item, or an HTML block that marked starts or ends elsewhere, as above), the raw
   text is retained as for other ambiguities, and a code span on each line may end
-  right before an import, so a fenced example there can count as an import. A name that only Claude Code's reading gives and that names
+  right before an import, so a fenced example there can count as an import. A code
+  span may also pair across the lines marked reads as one paragraph there, up to a
+  blank line or a bullet or `1.` item, so `<div` and a tab, then `` `a ``, then
+  ``b`@notes.md`` imports `notes.md`. A name that only Claude Code's reading gives and that names
   no file is skipped silently: it is looked up only by its exact spelling, so it
   raises no credential or case-variant gap, and a case variant of it on a
   case-insensitive file system is not found. Such a name that leaves the project root
@@ -1247,7 +1250,8 @@ A way around a limit that its entry does not describe is worth a
   `a*@../x.md`, the gap is a false one and fails closed. An `@` inside a URL path, as
   in `(https://unpkg.com/@../../x.md)`, starts no reference. A name is cut at each markup character
   except a run of `_` between two letters or digits, where marked opens no emphasis,
-  so `**@a_b_c.md**` imports `a_b_c.md`. A file with more than 2,000 places where such
+  so `**@a_b_c.md**` imports `a_b_c.md`; marked compares one UTF-16 unit there, so
+  after a letter outside the Basic Multilingual Plane, as in `@a𝐀_b`, the run is a cut. A file with more than 2,000 places where such
   a reference can start, or whose references yield more than 32,000 names or more
   than 4 Mi characters of them, as a run of thousands of `*` after an `@` does, is a
   "too many @path imports" failure, and none of its imports is followed. In a seeded differential, the scanner missed 2
@@ -1257,7 +1261,10 @@ A way around a limit that its entry does not describe is worth a
   pairs into code spans differently from CommonMark, such as `` `y`@x.md `` after
   raw HTML that may hold a backtick, or a list item or tab-indented line whose
   blocks marked reads differently; one, `f4.md,`, is a name Claude Code reads but
-  does not load. Other hosts' import readers have not been tested.
+  does not load. Code spans that pair across block-quote lines and lazy lines after
+  a quoted HTML block, such as `> <div x=1>` with a span closing on a later `>`
+  line, are also missed in some arrangements. Other hosts' import readers have not
+  been tested.
 - **Files named as holding credentials are not read.** The `prompt` collector does not
   read a file without a Markdown suffix whose name says it holds credentials (`.env*`
   other than a template ending in `.example`, `.sample` or `.template`; `*.env` and

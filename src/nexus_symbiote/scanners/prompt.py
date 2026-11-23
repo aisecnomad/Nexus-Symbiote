@@ -1242,11 +1242,19 @@ def _cuts(part: str, start: int, limit: int) -> Iterator[int]:
     """Each place in ``part[start:limit]`` where markup may end a marked text token.
 
     marked opens and closes no emphasis at a run of ``_`` inside a word, between two
-    letters or digits, so that run ends no token.
+    letters or digits, so that run ends no token. It compares one UTF-16 code unit
+    there, so after a character outside the Basic Multilingual Plane the run still ends
+    one.
     """
     for markup in _MARKUP_START.finditer(part, start, limit):
         at, end = markup.span()
-        if part[at] == "_" and part[at - 1].isalnum() and end < len(part) and part[end].isalnum():
+        if (
+            part[at] == "_"
+            and ord(part[at - 1]) < 0x10000
+            and part[at - 1].isalnum()
+            and end < len(part)
+            and part[end].isalnum()
+        ):
             continue
         yield from range(at, end)
 

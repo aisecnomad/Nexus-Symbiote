@@ -862,6 +862,14 @@ def test_names_past_the_per_file_budget_are_a_failure_not_dropped(tmp_path):
     assert "CLAUDE.md: too many @path imports to inventory" in result.scan_failures
 
 
+def test_many_short_names_trip_the_name_budget_before_the_character_budget():
+    # 1,001 starts of 41 short names each: about 41,000 names but under 2 Mi characters.
+    text = "".join(f"@x{i}" + "*y" * 40 + "\n" for i in range(1_001))
+    own, host, too_many = prompt._import_readings(text)
+    assert too_many
+    assert sum(map(len, host)) < prompt._MAX_HOST_NAME_CHARACTERS
+
+
 @pytest.mark.parametrize(
     "text",
     [

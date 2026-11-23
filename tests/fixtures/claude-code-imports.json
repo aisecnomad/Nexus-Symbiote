@@ -1731,6 +1731,271 @@
    "name": "reference in a URL path",
    "source": "See https://unpkg.com/@notes.md here.\n",
    "imports": []
+  },
+  {
+   "name": "I399 no-break space inside a block tag",
+   "source": "<div\u00a0class=\"team\">\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 no-break space inside an inline tag",
+   "source": "<a\u00a0href=x>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 no-break space in an unquoted attribute value",
+   "source": "<a href=x\u00a0y>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 no-break space before the end of a tag",
+   "source": "<b x=\"1\"\u00a0>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 vertical tab inside a block tag",
+   "source": "<div\u000bclass=x>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 tab before the end of a tag",
+   "source": "<b x=\"1\"\t>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 tab inside a tag interrupting a paragraph",
+   "source": "Intro\n<div\tclass=\"team\">\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 tab inside a quoted tag",
+   "source": "> <div\tclass=x>\n> `x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 code span across lines after a tab inside a tag",
+   "source": "<div\tclass=\"team\">\n`a\nb`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 indented comment interrupting a paragraph",
+   "source": "Intro\n  <!--\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 indented block tag interrupting a paragraph",
+   "source": "Intro\n  <div>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 code span across lines after a declaration",
+   "source": "<!X\n>`a\nb`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 text after a declaration",
+   "source": "<!X >`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 text after a processing instruction",
+   "source": "<? x ?>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 text after a CDATA section",
+   "source": "<![CDATA[ x ]]>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 declaration interrupting a paragraph",
+   "source": "Intro\n<!X\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 processing instruction interrupting a paragraph",
+   "source": "Intro\n<?php\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 processing instruction marked ends later",
+   "source": "<?>\n`a\n?>\nb @notes.md c`\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 tag name marked ends a paragraph at",
+   "source": "`a @notes.md\n<script!\nb`\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I400 snake_case name with 17 underscores in emphasis",
+   "source": "*@a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r.md*\n",
+   "imports": [
+    "a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r.md"
+   ]
+  },
+  {
+   "name": "I400 snake_case name with 30 underscores in strong",
+   "source": "**@a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r_s_t_u_v_w_x_y_z_A_B_C_D_E.md**\n",
+   "imports": [
+    "a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r_s_t_u_v_w_x_y_z_A_B_C_D_E.md"
+   ]
+  },
+  {
+   "name": "I400 doubled underscores in strong",
+   "source": "**@a__b__c__d__e__f__g__h__i__j__k__l__m__n__o__p__q__r.md**\n",
+   "imports": [
+    "a__b__c__d__e__f__g__h__i__j__k__l__m__n__o__p__q__r.md"
+   ]
+  },
+  {
+   "name": "I400 underscores between digits in strong",
+   "source": "**@1_2_3_4_5_6_7_8_9_0_1_2_3_4_5_6_7_8.md**\n",
+   "imports": [
+    "1_2_3_4_5_6_7_8_9_0_1_2_3_4_5_6_7_8.md"
+   ]
+  },
+  {
+   "name": "I400 snake_case name before a link",
+   "source": "@a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r.md[x](y)\n",
+   "imports": [
+    "a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r.md"
+   ]
+  },
+  {
+   "name": "I400 underscores after a CJK letter in strong",
+   "source": "**@a\u4e2d_\u6587_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r.md**\n",
+   "imports": [
+    "a\u4e2d_\u6587_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r.md"
+   ]
+  },
+  {
+   "name": "I400 underscores after an astral letter in strong",
+   "source": "**@a\ud835\udc00_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r_s.md**\n",
+   "imports": [
+    "a\ud835\udc00_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r_s.md"
+   ]
+  },
+  {
+   "name": "I400 emphasis an astral letter opens",
+   "source": "@a\ud835\udc00_b_ c.md\n",
+   "imports": [
+    "a\ud835\udc00"
+   ]
+  },
+  {
+   "name": "I400 17 brackets in strong",
+   "source": "**@a[b[c[d[e[f[g[h[i[j[k[l[m[n[o[p[q[r.md**\n",
+   "imports": [
+    "a[b[c[d[e[f[g[h[i[j[k[l[m[n[o[p[q[r.md"
+   ]
+  },
+  {
+   "name": "I400 18 mixed markup characters in strong",
+   "source": "**@a!b[c!d<1e!f[g!h<2i!j[k!l<3m!n[o!p<4q!r.md**\n",
+   "imports": [
+    "a!b[c!d<1e!f[g!h<2i!j[k!l<3m!n[o!p<4q!r.md"
+   ]
+  },
+  {
+   "name": "I399 code span across lines after a block tag",
+   "source": "<div class=x>\n`a\nb`@notes.md\n",
+   "imports": []
+  },
+  {
+   "name": "I399 unindented comment interrupting a paragraph",
+   "source": "Intro\n<!--\n`x`@notes.md\n",
+   "imports": []
+  },
+  {
+   "name": "I399 tab inside a tag in a fence",
+   "source": "```\n<div\tclass=x>\n`x`@notes.md\n```\n",
+   "imports": []
+  },
+  {
+   "name": "Q lazy line after a quoted div, code span on the quote line",
+   "source": "> <div>\n`` `a` `@a.md y ``\n> x`@notes.md\n",
+   "imports": []
+  },
+  {
+   "name": "Q quoted div, code span ending before an import on a lazy line",
+   "source": "> <div x=1>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "Q quoted processing instruction then lazy code span",
+   "source": "> <?x\n`y`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "Q quoted pre then lazy code span",
+   "source": "> <pre>\n`y`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "Q lazy line after a quoted comment, then a quoted import",
+   "source": "> <!--\nx`@notes.md\n> x`@d.md\n",
+   "imports": [
+    "d.md"
+   ]
+  },
+  {
+   "name": "Q lazy line after a quoted div, then a quoted import",
+   "source": "> <div>\nx`@notes.md\n> x`@d.md\n",
+   "imports": [
+    "d.md"
+   ]
+  },
+  {
+   "name": "Q lazy line after a quoted pre, then a quoted import",
+   "source": "> <pre>\nx`@notes.md\n> x`@d.md\n",
+   "imports": [
+    "d.md"
+   ]
   }
  ]
 }

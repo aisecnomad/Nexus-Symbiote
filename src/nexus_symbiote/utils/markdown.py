@@ -360,6 +360,32 @@ def _adjacent_container_imports(lines: list[str], eligible: set[str] | None = No
     return parts
 
 
+# A bullet or a `1.` item, which end a paragraph in marked.
+_MARKED_ITEM_START = re.compile(r"(?<![0-9])(?:[*+-]|1[.)])(?=[ \t])")
+
+
+def _marked_paragraph_imports(lines: list[str]) -> list[str]:
+    """The code span boundaries of each run of lines that marked may read as one
+    paragraph where CommonMark reads HTML: up to a blank line, or a bullet or a ``1.``
+    item, which end a paragraph in marked. A code span can pair across the lines of a
+    run and end right before an import."""
+    parts: list[str] = []
+    group: list[str] = []
+    for line in (*lines, ""):
+        mark = _CONTAINER_MARKS.match(line)
+        text = line if mark is None else line[mark.end() :]
+        if not text.strip(" \t") or (mark is not None and _MARKED_ITEM_START.search(mark[0])):
+            content = "\n".join(group)
+            if len(group) > 1 and "`@" in content:
+                inline = _outside_spans(content, import_boundaries_only=True)
+                if inline != content:
+                    parts.append(inline)
+            group.clear()
+        if text.strip(" \t"):
+            group.append(text)
+    return parts
+
+
 def _import_boundaries(
     blocks: list[tuple[str, str]], lines: list[str], *, containers: bool = False
 ) -> list[str]:
@@ -443,9 +469,10 @@ def _text_outside_code(text: str) -> list[str]:
         # Raw HTML has no inline code spans, unless marked reads it as text. A
         # repeated line that another reading places in prose must keep its possible
         # inline boundaries.
+        marked_html = any(alt.marked_html for alt in readers)
         html_lines = (
             set()
-            if any(alt.marked_html for alt in readers)
+            if marked_html
             else set.intersection(
                 *(
                     {
@@ -481,6 +508,8 @@ def _text_outside_code(text: str) -> list[str]:
                         rendered = _outside_spans(bare)
                         if rendered != inline:
                             alternatives.append(rendered)
+        if marked_html:
+            alternatives.extend(_marked_paragraph_imports(lines))
         for alternative in readers:
             alternatives = _union(
                 alternatives,
