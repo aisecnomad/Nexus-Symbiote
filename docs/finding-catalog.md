@@ -1,10 +1,10 @@
 # Finding catalog
 
-A finding, or risk, is a security-relevant observation about one component: its
-category, severity, detail and recommendation. Findings describe declarations in
-the repository; they are not confirmed vulnerabilities. This page lists every
-category this version emits, which collector raises it, what it means and what to
-do about it. Use these names in `ignore_categories` and in
+A finding is a security-relevant observation about one component: its category,
+severity, detail and recommendation. Findings describe declarations in the
+repository; they are not confirmed vulnerabilities. This page lists every category
+this version emits, which collector raises it, what it means and what to do about it.
+Use these names in `ignore_categories` and in
 [suppressions](policy-reference.md#suppressions).
 
 - [How findings affect the gates](#how-findings-affect-the-gates)

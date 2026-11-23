@@ -1,16 +1,27 @@
 # Contributing to Nexus SymBiote
 
-Nexus SymBiote's compatibility baseline is the `nexus_symbiote` Python package and `nexus-symbiote` CLI on `main`. The product name is Nexus SymBiote. Experimental implementations on other branches are not interchangeable packages; port useful capabilities through reviewed, tested changes.
+## Quick start
+
+```bash
+git clone https://github.com/aisecnomad/Nexus-Symbiote.git && cd Nexus-Symbiote
+make install-locked   # hash-locked CI environment + editable install
+make check            # quality, tests, security regressions, distribution build
+# Open a pull request against main
+```
+
+Nexus SymBiote's compatibility baseline is the `nexus_symbiote` package and `nexus-symbiote` CLI on `main`. Experimental branches are not interchangeable packages; port useful capabilities through reviewed, tested changes.
 
 ## First contribution
 
-Read [SUPPORT.md](SUPPORT.md) for how the tool behaves and what to include when you ask for help; it is the place for usage questions. Well-bounded starter tasks are in the [known limitations](docs/known-limitations.md): each names a file type, collector or check that is not covered yet. Open an issue with the feature form saying which one you will take before you start, so that two people do not do the same work.
+Read [SUPPORT.md](SUPPORT.md) for how the tool behaves and what to include when asking for help. Well-bounded starter tasks are in the [known limitations](docs/known-limitations.md): each names a file type, collector or check that is not covered yet. Open an issue with the feature form saying which one you will take, so two people do not do the same work.
 
-Contributions are accepted under the project's [MIT license](LICENSE): by opening a pull request you agree that your contribution is licensed under the same terms (inbound equals outbound), and that you have the right to submit it.
+Contributions are accepted under the project's [MIT license](LICENSE): by opening a pull request you agree that your contribution is licensed under the same terms (inbound equals outbound) and that you have the right to submit it.
 
 ## Development
 
-Use Python 3.11 through 3.14 on Linux and an isolated virtual environment. `make install-locked` installs the locked environment, and `make check` runs the offline subset of the required CI checks: quality, the coverage-gated test suite, the security regression contracts and the distribution build. The individual commands, from a checkout:
+Use Python 3.11 through 3.14 on Linux with an isolated virtual environment. `make install-locked` installs the locked environment; `make check` runs the offline subset of the required CI checks: quality, the coverage-gated test suite, the security regression contracts and the distribution build.
+
+The individual commands, from a checkout:
 
 ```bash
 python3 -m venv .venv
@@ -32,21 +43,39 @@ python -m build --no-isolation
 python -m twine check --strict dist/*
 ```
 
-`make test-floor` runs the suite on Python 3.11 with every runtime dependency at its declared lower bound (it needs `python3.11`; set `PYTHON_FLOOR` to use another interpreter), as the CI `floor` job does. Both leave out the tests marked `locked_only`, which compare what a pinned library generates, such as the JSON schema pydantic derives from the models, with a committed file; every behavior test still runs. A test that fails only at the floors means the declared floor is wrong: raise it and run `make lock`.
+`make test-floor` runs the suite on Python 3.11 with every runtime dependency at its declared lower bound (needs `python3.11`; set `PYTHON_FLOOR` for another interpreter), as the CI `floor` job does. Both leave out `locked_only` tests, which compare pinned-library output (such as the JSON schema pydantic derives) with a committed file; every behavior test still runs. A test that fails only at the floors means the declared floor is wrong: raise it and run `make lock`.
 
 ## Tests
 
-`tests/conftest.py` gives every test a clean environment: the variables the tool, the Action runner and the gate scripts read (`NEXUS_SYMBIOTE_*`, `SYMBIOTE_*`, `SHADOWSCAN_*`, `GITHUB_*`, `RUNNER_*`, `GH_TOKEN`, the Actions token variables, `SOURCE_DATE_EPOCH`, the CI markers that the unsigned-discovery gate reads, such as `CI`, and color, width and terminal settings) are removed, and `HOME` and the XDG directories point at a private temporary directory. A test that leaves an operating mode enforced fails. Use the `runner` fixture for a `CliRunner` and `tests/support.py`'s `load_script` (or the `load_script` fixture) to import a script from `scripts/`; do not import one test module from another.
+### Environment isolation
 
-Each test has a time limit and fails with its traceback when it hangs, instead of using up the CI job's budget: `test_timeout` in `pyproject.toml` (300 seconds, for loaded development machines), tightened to 120 seconds in CI (240 under coverage). Mark a known slow test with `@pytest.mark.timeout(seconds)`, and give every `subprocess.run` in a test its own `timeout` as well. To show that parsing a hostile input stays linear, compare two input sizes with `tests.support.scaling_ratio` instead of asserting a duration: a busy runner or coverage tracing slows both sizes alike.
+`tests/conftest.py` gives every test a clean environment: the variables the tool, the Action runner and the gate scripts read (`NEXUS_SYMBIOTE_*`, `SYMBIOTE_*`, `SHADOWSCAN_*`, `GITHUB_*`, `RUNNER_*`, `GH_TOKEN`, the Actions token variables, `SOURCE_DATE_EPOCH`, CI markers, color/width/terminal settings) are removed, and `HOME` and XDG directories point at a private temporary directory. A test that leaves an operating mode enforced fails. Use the `runner` fixture for a `CliRunner` and `tests/support.py`'s `load_script` (or the `load_script` fixture) to import a script from `scripts/`; do not import one test module from another.
 
-CI's test, dependency-floor and coverage jobs and the `make` test targets run the suite on one pytest-xdist worker per core (`-n auto --dist worksteal`): each worker starts with a contiguous share of the tests in collection order, and an idle worker takes tests from the longest queue. The same tests run, and the clean environment, the time limit, the skip accounting and `no_cover` apply in every worker (`tests/test_suite_infrastructure.py` runs them in workers). A test therefore shares the machine with others and does not always run after its file neighbours: it must not depend on what another test left behind, on a fixed port or on a fixed path, and a wall-clock bound must hold on a busy machine, which is one more reason to measure CPU time or use `scaling_ratio`. A test that fails only in parallel has an isolation defect: fix the test instead of selecting it out. With `-vv` a parallel run prints each test's ID when it starts and `[gwN] ... PASSED <id>` when it ends, so the tests a killed run was inside are the IDs with no result line, and a skip's reason appears only in the skip accounting. To run in one process, for a debugger or `--durations=0`, leave the two options out (`make test PYTEST_PARALLEL=`).
+### Time limits
 
-The suite has a time budget as well, counted per change: the tests one pull request adds take at most 60 seconds in total without coverage. Measure them with `python -m pytest --durations=0` and state the figure in the pull request. A suite that documents its own budget is held to that budget instead; a hostile-corpus suite, for example, states how long its corpus may take, and the pull request gives that budget and the measured time. Coverage tracing makes a test about twice as slow (1.6 to 2.7 times in CI), so mark a black-box test that runs the CLI in a subprocess, a test that builds a large hostile input such as a decompression or nesting bomb, and a `scaling_ratio` test with `@pytest.mark.no_cover` when it takes more than 2 seconds: it still runs in every job, only without tracing. Never leave tests out of a CI job with `-m` or `-k`; only the dependency-floor job and Dependency health's newest-releases job leave out the `locked_only` tests, because the versions they install are not the locked ones those tests compare against.
+Each test has a time limit and fails with its traceback when it hangs, instead of consuming the CI job's budget: `test_timeout` in `pyproject.toml` (300 s, for loaded development machines), tightened to 120 s in CI (240 under coverage). Mark a known slow test with `@pytest.mark.timeout(seconds)`, and give every `subprocess.run` in a test its own `timeout`. To show that parsing hostile input stays linear, compare two input sizes with `tests.support.scaling_ratio` instead of asserting a duration: a busy runner or coverage tracing slows both sizes alike.
 
-The run lists every skip with its reason. With `--strict-skips`, which CI and `make test` pass, any skip other than a host file-system difference (a case-insensitive alias that a case-sensitive file system cannot have, or, off Linux, a name or a pair of case spellings the file system refuses), a test of a Linux interface (`/proc`, `prctl` or `clone(CLONE_PARENT)`) on another host, or, outside CI, a missing pip fails the run. So does any expected failure (`pytest.xfail()`, `xfail(run=False)` or a conditional `xfail` marker), since it also stops the test before its assertions decide. Do not guard a required dependency with `pytest.importorskip`; import it.
+### Parallel execution
 
-Parsers of hostile input need generated inputs as well as examples. `tests/test_parser_properties.py` checks the requirements collector against `packaging`, Dockerfile `FROM` handling, redaction of planted secrets, that no collected file can crash `scan`, and that hostile inputs parse in bounded time. The suite's Hypothesis profile is deterministic; a weekly job runs the same properties with the randomized `fuzz` profile (`python -m pytest --hypothesis-profile=fuzz tests/test_parser_properties.py`). Write new properties without a fixed `max_examples` so that profile can widen them.
+CI's test, dependency-floor and coverage jobs run the suite on one pytest-xdist worker per core (`-n auto --dist worksteal`): each worker starts with a contiguous share of the tests in collection order, and idle workers take tests from the longest queue. The same tests run, and the clean environment, time limit, skip accounting and `no_cover` apply in every worker (`tests/test_suite_infrastructure.py` verifies this).
+
+A test shares the machine with others and does not always run after its file neighbours. It must not depend on what another test left behind, on a fixed port or on a fixed path, and a wall-clock bound must hold on a busy machine. A test that fails only in parallel has an isolation defect: fix the test instead of selecting it out.
+
+With `-vv` a parallel run prints each test's ID when it starts and `[gwN] ... PASSED <id>` when it ends, so the tests a killed run was inside are the IDs with no result line. To run in one process (for a debugger or `--durations=0`), leave the two options out (`make test PYTEST_PARALLEL=`).
+
+### Test budget
+
+The suite has a per-change time budget: the tests one pull request adds take at most 60 seconds total without coverage. Measure with `python -m pytest --durations=0` and state the figure in the pull request. A suite that documents its own budget is held to that budget instead.
+
+Coverage tracing makes a test about twice as slow (1.6 to 2.7x in CI), so mark a black-box CLI subprocess test, a test that builds a large hostile input, or a `scaling_ratio` test with `@pytest.mark.no_cover` when it takes more than 2 seconds: it still runs in every job, only without tracing. Never leave tests out of a CI job with `-m` or `-k`; only the dependency-floor and Dependency health jobs leave out `locked_only` tests, because they install different versions.
+
+### Skips and expected failures
+
+The run lists every skip with its reason. With `--strict-skips` (which CI and `make test` pass), any skip other than a host file-system difference (case-insensitive aliases on a case-sensitive file system, or names the file system refuses), a Linux-only interface (`/proc`, `prctl`, `clone(CLONE_PARENT)`) on another host, or (outside CI) a missing pip fails the run. So does any expected failure (`pytest.xfail()`, `xfail(run=False)` or a conditional `xfail` marker). Do not guard a required dependency with `pytest.importorskip`; import it.
+
+### Property-based tests
+
+Parsers of hostile input need generated inputs as well as examples. `tests/test_parser_properties.py` checks the requirements collector against `packaging`, Dockerfile `FROM` handling, redaction of planted secrets, that no collected file can crash `scan`, and that hostile inputs parse in bounded time. The suite's Hypothesis profile is deterministic; a weekly job runs the same properties with the randomized `fuzz` profile (`python -m pytest --hypothesis-profile=fuzz tests/test_parser_properties.py`). Write new properties without a fixed `max_examples` so the fuzz profile can widen them.
 
 ## Dependency locks
 
@@ -54,27 +83,50 @@ Three hash locks are generated from `pyproject.toml`; never edit them by hand.
 
 | Lock | Contents | Used by |
 | --- | --- | --- |
-| `requirements-ci.lock` | Every extra and the `dev` dependency group, for CPython 3.11 and later on every platform | CI, the release build, `make install-locked` |
-| `requirements-action.lock` | The core dependencies, the `sigstore` extra and the build backend, resolved inside the CI lock: the same versions and the same hashes | The GitHub Action and the README's verified installs |
-| `requirements-floor.lock` | Each runtime dependency and the build backend at its declared lower bound on Python 3.11, with the test tools at their CI versions | The `floor` CI job, `make test-floor` |
+| `requirements-ci.lock` | Every extra and the `dev` dependency group, CPython 3.11+ on every platform | CI, the release build, `make install-locked` |
+| `requirements-action.lock` | Core dependencies, `sigstore` extra and build backend, resolved inside the CI lock (same versions and hashes) | The GitHub Action and the README's verified installs |
+| `requirements-floor.lock` | Each runtime dependency and build backend at its declared lower bound on Python 3.11, with test tools at their CI versions | The `floor` CI job, `make test-floor` |
 
-`make lock` regenerates all three with the uv version pinned in `scripts/check_locks.py` (it refuses any other). It keeps the existing CI pins unless a declaration needs a change, considers only packages uploaded before the cut-off recorded in the locks, and records that cut-off, the uv version and a digest of the dependency declarations in each lock's header. `make lock-upgrade` moves the cut-off to seven days ago and upgrades every CI pin to the newest release older than that, so a release has a week of public scrutiny before it can be locked. Both need access to PyPI; never run them with release credentials, or on a pull request you have not reviewed.
+### Regenerating locks
 
-`make lock-check` (`python scripts/check_locks.py`, also part of the CI quality job) checks offline that each lock header records the digest of the current declarations, the pinned uv and one cut-off, that the cut-off is a date at midnight UTC (`YYYY-MM-DDT00:00:00Z`) at least seven days in the past, so no lock can take a release that has had less than a week of public scrutiny (`make lock` refuses such a cut-off too), that every pin is an exact, hashed version inside its declared range, that every pin is either declared in pyproject.toml or required by another pin of the same lock according to uv's `# via` lines (a `-c` constraint is no reason), that the Action lock repeats the CI lock's versions and hashes and holds no test tool, and that the floor lock tests exactly each declared lower bound. A declared floor that cannot be installed together with the others, such as `pydantic>=2.10` beside the `sigstore` extra, which needs 2.12, fails until the floor is raised to what is tested.
+`make lock` regenerates all three with the uv version pinned in `scripts/check_locks.py` (it refuses any other). It keeps existing CI pins unless a declaration needs a change, considers only packages uploaded before the cut-off recorded in the locks, and records that cut-off, the uv version and a digest of the dependency declarations in each lock's header.
 
-The check trusts the `# via` lines it reads: a pin inserted with a forged `# via` naming a real parent passes offline. The locked test suite walks the installed metadata from pyproject.toml and fails on a CI-lock or Action-lock pin outside that closure, but only for pins the test platform installs. It runs inside the environment the lock installed, so a hostile package already installed there can rewrite that metadata at interpreter startup (a `.pth` file runs before the tests) and pass; closing that needs a job that resolves the declarations before installing anything, such as `make lock` followed by `git diff --exit-code`, which CI does not run yet. For the floor lock, for pins limited to Windows or macOS, and against a hostile published package, only regenerating the locks with `make lock` and comparing the result catches it, so review every added pin in a lock diff, and its `# via` lines, against the package's published metadata.
+`make lock-upgrade` moves the cut-off to seven days ago and upgrades every CI pin to the newest release older than that, so a release has a week of public scrutiny before it can be locked. Both need PyPI access; never run them with release credentials or on an unreviewed pull request.
 
-Dependabot proposes range changes in `pyproject.toml` only. Such a pull request fails `make lock-check` until a maintainer runs `make lock` on its branch. Before merging any change to the declared ranges or the locks, review new packages, hashes, markers and licenses, and wait for the "Dependency health" workflow, which runs the full suite on the newest releases the ranges admit. That run is not part of `Verified CI` because a new release, rather than the change, decides its result; `Verified CI` keeps only a smoke install of the wheel on freshly resolved releases and the OSV audit of the CI and Action locks, which a new release or advisory can still turn red. "Dependency health" also audits every locked pin against OSV daily, audits the floor lock, and runs the randomized property tests weekly.
+### Lock verification
 
-Every CI and release install of a lock uses `--require-hashes --only-binary=:all:` followed by `pip check`: a missing wheel stops the job instead of building a source distribution with unpinned build tools.
+`make lock-check` (`python scripts/check_locks.py`, also part of CI quality) verifies offline that:
 
-`Dependency advisories` blocks on any OSV advisory for a pin of the CI or Action lock. If an advisory cannot be fixed in time and does not affect this project, add a waiver to `config/dependency-advisory-waivers.json` in a reviewed pull request, with exactly the keys `advisory_id`, `package`, `version` (the exact version), `reason` (at least 20 characters) and `expires` (a date at most 90 days ahead). The gate prints and records every waiver, fails on an expired or malformed one, and fails on a waiver that no longer matches an advisory of the version it names. If OSV is unreachable, the gate fails closed: re-run the job later; there is no bypass.
+- Each lock header records the digest of the current declarations, the pinned uv and one cut-off
+- The cut-off is at midnight UTC, at least seven days in the past
+- Every pin is an exact, hashed version inside its declared range
+- Every pin is either declared in `pyproject.toml` or required by another pin of the same lock (a `-c` constraint is not a reason)
+- The Action lock repeats the CI lock's versions and hashes and holds no test tool
+- The floor lock tests exactly each declared lower bound
+
+A declared floor that cannot co-install with others (such as `pydantic>=2.10` beside the `sigstore` extra, which needs 2.12) fails until the floor is raised.
+
+### Trust boundaries of the lock check
+
+The check trusts the `# via` lines it reads: a pin inserted with a forged `# via` naming a real parent passes offline. The locked test suite walks installed metadata from `pyproject.toml` and fails on a CI-lock or Action-lock pin outside that closure, but only for pins the test platform installs. It runs inside the installed environment, so a hostile package could rewrite metadata at startup (a `.pth` file runs before the tests); closing that needs a job that resolves declarations before installing anything, which CI does not run yet.
+
+For the floor lock, for platform-limited pins, and against a hostile published package, only regenerating with `make lock` and comparing the result catches it. Review every added pin in a lock diff, and its `# via` lines, against the package's published metadata.
+
+### Dependabot and dependency health
+
+Dependabot proposes range changes in `pyproject.toml` only. Such a pull request fails `make lock-check` until a maintainer runs `make lock` on its branch. Before merging any range or lock change, review new packages, hashes, markers and licenses, and wait for the "Dependency health" workflow, which runs the full suite on the newest releases the ranges admit. That run is not part of `Verified CI` because a new release, not the change, decides its result. "Dependency health" also audits every locked pin against OSV daily, audits the floor lock, and runs the randomized property tests weekly.
+
+Every CI and release install uses `--require-hashes --only-binary=:all:` followed by `pip check`: a missing wheel stops the job instead of building a source distribution with unpinned build tools.
+
+### Dependency advisories
+
+`Dependency advisories` blocks on any OSV advisory for a CI or Action lock pin. If an advisory cannot be fixed in time and does not affect this project, add a waiver to `config/dependency-advisory-waivers.json` in a reviewed pull request, with exactly the keys `advisory_id`, `package`, `version` (exact), `reason` (at least 20 characters) and `expires` (at most 90 days ahead). The gate prints and records every waiver, fails on an expired or malformed one, and fails on a waiver that no longer matches an advisory. If OSV is unreachable, the gate fails closed: re-run the job later; there is no bypass.
 
 ## Verified CI and coverage
 
-`Verified CI` aggregates the test matrix, the full suite on macOS, the dependency-floor tests, coverage, quality, distribution, security-regression, dependency-advisory and CodeQL jobs, and the composite Action's end-to-end run on passing, failing and hostile fixtures with the check that the hostile one created no annotation. Missing, failed, cancelled and skipped prerequisites fail that stable check. Branch protection must require it; see [repository controls](docs/repository-controls.md). `scripts/check_workflows.py` fails if any of those jobs stops running the command that makes it a gate, so a job cannot be emptied while keeping its name.
+`Verified CI` aggregates the test matrix, macOS suite, dependency-floor tests, coverage, quality, distribution, security-regression, dependency-advisory and CodeQL jobs, and the Action's end-to-end run on passing, failing and hostile fixtures with the check that the hostile one created no annotation. Missing, failed, cancelled or skipped prerequisites fail that stable check. Branch protection must require it; see [repository controls](docs/repository-controls.md). `scripts/check_workflows.py` fails if any gate job stops running its gate command, so a job cannot be emptied while keeping its name.
 
-The coverage gate (`scripts/check_coverage.py`) uses exact counts rather than rounded display percentages. It holds the package to its statement and branch floors and each security-critical module (confined reads, hashing, signature verification and policy, the validators, the differ, the offline guard, runtime authorization, redaction and terminal neutralization) to its own, so that a well-tested average cannot hide an untested module. The gate scripts are measured as well, without counting toward the package figure, and the Action's runner `scripts/run_action.py` has a floor of its own; a report that leaves `scripts/` out fails. The job prints the measured figures beside the floors and writes them to the run summary; the floors themselves live only in that script. They prevent regression and are not a completeness claim. Raise them as missing paths gain tests.
+The coverage gate (`scripts/check_coverage.py`) uses exact counts, not rounded percentages. It holds the package to its statement and branch floors and each security-critical module (confined reads, hashing, signature verification and policy, validators, differ, offline guard, runtime authorization, redaction, terminal neutralization) to its own floor, so a well-tested average cannot hide an untested module. Gate scripts are measured as well (without counting toward the package figure), and `scripts/run_action.py` has its own floor. The floors live only in that script; they prevent regression and are not a completeness claim. Raise them as missing paths gain tests.
 
 ## Architecture boundaries
 
@@ -82,7 +134,7 @@ Nexus-ShadowScan is the primary discovery engine. Preserve the `import-shadowsca
 
 Run `PYTHONPATH=src python scripts/benchmark_security.py --out benchmark-results.json` after security changes. Review individual cases, corpus/source digests, unknowns, and denominators. Do not replace labels or remove negative fixtures to improve the result. The corpus is a finite regression suite, not representative field efficacy evidence.
 
-CI and release candidates also run `scripts/check_security_regressions.py`. Every committed detection label and control contract must pass; missing cases, abstentions on detection cases, duplicate cases and evaluator errors fail. A passing malformed-input coverage control can deliberately have an unknown detection prediction. The full per-case report is retained even when this gate fails. New labels and changed expectations require review of the fixture and its rationale; passing these fixtures establishes no production accuracy or percentile ranking.
+CI and release candidates also run `scripts/check_security_regressions.py`. Every committed detection label and control contract must pass; missing cases, abstentions, duplicates and evaluator errors fail. New labels and changed expectations require review of the fixture and its rationale; passing these fixtures establishes no production accuracy.
 
 ## Security changes
 
@@ -92,22 +144,32 @@ Exporter changes must validate against the pinned official schema and preserve r
 
 ## Pull requests
 
-Explain the concrete problem, resulting behavior, validation, and material limitations. Keep changes focused and include applicable documentation. Do not claim production enforcement for execution paths that bypass the adapter. Add no network access, executable discovery, or credential collection without an explicit design and tests.
+Explain the concrete problem, resulting behavior, validation, and material limitations. Keep changes focused and include applicable documentation. Do not claim production enforcement for paths that bypass the adapter. Add no network access, executable discovery, or credential collection without an explicit design and tests.
 
-Keep a pull request under 1,500 changed lines outside `tests/` and `benchmarks/` (insertions plus deletions). `scripts/check_pull_request_size.py` enforces that on pull requests. Split a larger change. Sign commits (`git commit -S`); requiring signatures on `main` is a repository setting an administrator turns on, and it is not on today. Changes under `.github/`, `action.yml`, `scripts/`, `config/`, `pyproject.toml`, the lockfiles and `tests/conftest.py` need a second reviewer once one exists. `.github/CODEOWNERS` names that owner; GitHub enforces the review only under the full protection profile, which an administrator applies.
+### Size and signing
 
-During the interim single-maintainer period (see [repository controls](docs/repository-controls.md)), keep every change on a pull request, up to date with `main` before it merges, and leave behavior- or security-changing pull requests open for a soak window of at least 24 hours before merging; re-read the full rendered diff after `Verified CI` completes and treat it as the reviewed artifact. Small documentation-only fixes may merge once CI is green. High-volume days of self-merged reviews are where defects slip through; the soak window is the control that compensates for the absent second reviewer. Fill in the pull request's review record: who reviewed the diff, when, and how. Publication repeats the soak mechanically: the release workflow refuses to publish to PyPI until the release commit has been on `main` for 24 hours (see [releasing](docs/releasing.md)).
+Keep a pull request under 1,500 changed lines outside `tests/` and `benchmarks/` (insertions plus deletions). `scripts/check_pull_request_size.py` enforces this. Split larger changes. Sign commits (`git commit -S`); requiring signatures on `main` is an administrator setting not yet active. Changes under `.github/`, `action.yml`, `scripts/`, `config/`, `pyproject.toml`, the lockfiles and `tests/conftest.py` need a second reviewer once one exists. `.github/CODEOWNERS` names that owner; GitHub enforces the review only under the full protection profile.
 
-Name the roadmap item the change implements and any recorded decision it relies on, as the pull-request template asks, and check that no open pull request already implements the same item. Label the pull request as the [label guide](docs/labels.md) describes: at least one type label, at least one area label and, while it is open, exactly one review-state label. When work moves from one pull request to another, update both descriptions so that each lists only what its diff contains.
+### Single-maintainer review process
 
-A pull request that rewrites a whole file from an old branch can silently revert changes merged since. Resolve conflicts against current `main`, never by taking your side wholesale, and check that the diff removes nothing you did not mean to remove; `scripts/check_workflows.py` also refuses an action pin older than its recorded floor and a gate job that lost its command.
+During the interim single-maintainer period (see [repository controls](docs/repository-controls.md)), keep every change on a pull request, up to date with `main` before it merges. Leave behavior- or security-changing pull requests open for a soak window of at least 24 hours; re-read the full rendered diff after `Verified CI` completes and treat it as the reviewed artifact. Small documentation-only fixes may merge once CI is green.
+
+Fill in the pull request's review record: who reviewed the diff, when, and how. Publication repeats the soak mechanically: the release workflow refuses to publish to PyPI until the release commit has been on `main` for 24 hours (see [releasing](docs/releasing.md)).
+
+### Labeling and tracking
+
+Name the roadmap item the change implements and any recorded decision it relies on, as the pull-request template asks. Check that no open pull request already implements the same item. Label the pull request as the [label guide](docs/labels.md) describes: at least one type label, at least one area label and, while open, exactly one review-state label. When work moves between pull requests, update both descriptions so each lists only what its diff contains.
+
+### Conflict resolution
+
+A pull request that rewrites a whole file from an old branch can silently revert merged changes. Resolve conflicts against current `main`, never by taking your side wholesale, and verify the diff removes nothing you did not intend. `scripts/check_workflows.py` also refuses an action pin older than its recorded floor and a gate job that lost its command.
 
 ### How a pull request merges
 
-- **One at a time.** Bring `main` into the branch with a merge commit; never rebase or force-push a branch someone else may hold. Wait for `Verified CI` on that head, then merge. Every other open branch is then behind `main` again.
-- **The merge commit.** Since #236 (2026-11-16), `main` has taken each pull request as a merge commit named after it, `<title> (#N)`. Before that, most pull requests were squash-merged (the integrations #202, #203, #226 and #227 were merge commits), and the [2026-11-03 review](docs/audits/closed-pr-review-2026-11-03.md#findings) records how a squash merge silently reverted #99. `git log --first-parent main` lists one commit per pull request merged directly; the constituents of an integration pull request appear only under its merge commit.
-- **Labels gate the merge.** From 2026-11-19, a pull request merges only with `review: verified` at its current head and without `do-not-merge`. The [label guide](docs/labels.md) gives what each label requires.
-- **Integration pull requests.** An integration pull request carries several reviewed pull requests at their reviewed heads, and the 1,500-line cap applies to it as a whole. Target each constituent at `main`, so that GitHub records it as merged when the integration lands. Otherwise, close each one by hand with a comment naming the integration's merge commit, and label it `superseded`.
+- **One at a time.** Bring `main` into the branch with a merge commit; never rebase or force-push a branch someone else may hold. Wait for `Verified CI` on that head, then merge.
+- **The merge commit.** Since #236 (2026-11-16), `main` takes each pull request as a merge commit, `<title> (#N)`. Before that, most were squash-merged; the [2026-11-03 review](docs/audits/closed-pr-review-2026-11-03.md#findings) records how a squash merge silently reverted #99. `git log --first-parent main` lists one commit per directly merged pull request.
+- **Labels gate the merge.** A pull request merges only with `review: verified` at its current head and without `do-not-merge`. The [label guide](docs/labels.md) lists requirements.
+- **Integration pull requests.** An integration pull request carries several reviewed pull requests at their reviewed heads; the 1,500-line cap applies to the whole. Target each constituent at `main` so GitHub records it as merged when the integration lands. Otherwise, close each by hand with a comment naming the integration's merge commit, and label it `superseded`.
 - **Recording.** The [pull-request reviews](docs/README.md#project-records) under `docs/audits/` record how each pull request reached `main`.
 
 ## AI-assisted contributions
@@ -116,13 +178,26 @@ Contributions written with an AI assistant are welcome on the same terms as any 
 
 - Disclose the assistance: a `Co-Authored-By:` trailer naming the assistant, or a sentence in the pull request.
 - Review the full rendered diff yourself after `Verified CI` completes. Generated code tends to restate what it was asked rather than what the code does; check tests for assertions that cannot fail.
-- A review by an assistant is a useful second opinion but not an independent review unless it runs outside the session that wrote the change, with its findings attached to the pull request. Record which it was in the review record.
+- A review by an assistant is not an independent review unless it runs outside the session that wrote the change, with its findings attached to the pull request. Record which it was.
 - Never paste secrets, private BOMs or unpublished vulnerability details into an assistant.
 
 ## Repository hygiene
 
-Gitleaks uses the upstream default rules in both source and tests. The configuration does not exempt a directory or a token prefix: a real credential can occur beside a synthetic fixture. Investigate each finding before recording an exception. If a fixture must retain detected bytes, record only that reviewed finding's exact Gitleaks fingerprint in `.gitleaksignore`, with its synthetic origin and rationale in the pull request; review the fingerprint again if the fixture or its location changes. Never baseline unreviewed findings or suppress a whole file/tree. Gitleaks is not currently a required CI job; this configuration governs local or external invocations that select it.
+### Secret scanning
 
-The quality job also checks tracked source for conflict markers and for invisible characters such as bidirectional controls and zero-width spaces, which code writes as escapes (`"\u202e"`). It reads Python and shell scripts everywhere outside a `fixtures` directory, tests and benchmarks included, and the other text files, `Dockerfile*`, `Makefile` and `CODEOWNERS` outside `tests/` and `benchmarks/`, whose data and recorded tool output hold such characters on purpose. A file it reads that is not valid UTF-8 fails the check. The job also checks documentation links, including heading anchors and absolute links into this repository; package, distribution and citation version agreement; and the vendored schemas' recorded SHA-256 digests. The README is also the package-index description, and `twine check` does not render Markdown, so the check rejects relative links and images in it and confirms that each absolute one still resolves to a tracked file and heading. These checks are offline and do not authenticate an upstream publisher. Review changes to schema bytes and their provenance manifest together. Keep experimental-branch merges and manually ported changes distinct from ancestry on `main`; the [closed-PR audit](docs/audits/closed-pr-review-2026-11-02.md) records that distinction.
+Gitleaks uses upstream default rules in both source and tests. The configuration exempts no directory or token prefix: a real credential can occur beside a synthetic fixture. Investigate each finding before recording an exception. If a fixture must retain detected bytes, record only that reviewed finding's exact Gitleaks fingerprint in `.gitleaksignore`, with its synthetic origin and rationale in the pull request; review the fingerprint again if the fixture or its location changes. Never baseline unreviewed findings or suppress a whole file/tree. Gitleaks is not a required CI job; this configuration governs local or external invocations.
+
+### Quality checks
+
+The quality job checks tracked source for conflict markers and invisible characters (bidirectional controls, zero-width spaces), which code writes as escapes (`"\u202e"`). It reads Python and shell scripts everywhere outside `fixtures` directories, and other text files (`Dockerfile*`, `Makefile`, `CODEOWNERS`) outside `tests/` and `benchmarks/`. A file it reads that is not valid UTF-8 fails.
+
+The job also checks:
+
+- Documentation links, including heading anchors and absolute links into this repository
+- Package, distribution and citation version agreement
+- Vendored schemas' recorded SHA-256 digests
+- README links (must be absolute for PyPI; each must resolve to a tracked file and heading)
+
+These checks are offline and do not authenticate an upstream publisher. Review schema byte changes and their provenance manifest together.
 
 Read [SECURITY.md](SECURITY.md) before reporting security-sensitive defects. This project is licensed under MIT as specified in [LICENSE](LICENSE).

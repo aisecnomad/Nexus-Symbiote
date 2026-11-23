@@ -10,51 +10,54 @@ rendered and no repository code is imported.
 The collector inventories every file whose name has one of these suffixes:
 `.safetensors`, `.onnx`, `.gguf`, `.ggml`, `.h5`, `.hdf5`, `.keras`, `.tflite`,
 `.mlmodel`, `.pte`, and the pickle family `.pkl`, `.pickle`, `.pck`, `.dill`,
-`.cloudpickle`, `.pt`, `.pth`, `.bin`, `.joblib`, `.ckpt` and `.pdparams`. A
-pickle-family name inside one or two archive or compression suffixes (`.tar`, `.gz`,
+`.cloudpickle`, `.pt`, `.pth`, `.bin`, `.joblib`, `.ckpt` and `.pdparams`.
+
+A pickle-family name inside one or two archive or compression suffixes (`.tar`, `.gz`,
 `.bz2`, `.xz`, `.lzma`, `.zst`, `.z`, `.lz4`, `.zip`), such as `checkpoint.pth.tar`,
 `model.pkl.gz`, joblib's `clf.joblib.z` and `clf.joblib.lz4`, or pandas'
-`frame.pkl.zip` and `frame.pkl.tar.gz`, counts as pickle family too, and such a file
+`frame.pkl.zip` and `frame.pkl.tar.gz`, counts as pickle family too. Such a file
 is `unsafe-code-execution` whatever it holds unless it is empty, since its content is
 not decompressed. A third wrapper suffix, which no loader unwraps by name, does not.
-TensorFlow graphs named
-`saved_model.pb` or `saved_model.pbtxt` are collected; other `.pb` files are not.
+TensorFlow graphs named `saved_model.pb` or `saved_model.pbtxt` are collected;
+other `.pb` files are not.
 
 A file that no name above rates is inventoried by its content when it is named
 `.npy`, `.npz` or `.dat`, or has any name below a directory named `model`, `models`,
-`weights`, `checkpoint` or `checkpoints`. A file named as the configuration,
-tokenizer and chat template files that a model directory's readers open are, such
-as `config.json` or `tokenizer.json`, and Python and Jinja sources are not checked
-this way. Such a file is a component when its content is rated
+`weights`, `checkpoint` or `checkpoints`. Configuration, tokenizer and chat template
+files such as `config.json` or `tokenizer.json`, and Python and Jinja sources, are
+not checked this way. Such a file is a component when its content is rated
 `unsafe-code-execution` by the checks in the table below, or when the content is a
-NumPy array, a ZIP archive or a pickle that those checks' bounds left unread, which
-is rated `unknown`.
+NumPy array, a ZIP archive or a pickle that those checks' bounds left unread (rated
+`unknown`).
 
 A pickle is rated by what `pickle.load` does with it. The check reads the first
 64 KiB as `pickle.load` reads them from `io.BytesIO`, in a loop, as `torch.load` reads
 the three header pickles of `torch.save`'s legacy format before the main one: once as
 the C unpickler and once as the pure-Python one, opcode by opcode, with the same
 frame handling, stack, MARK and memo rules and the same errors, for at most 4,096
-opcodes and 64 MARKs over all the pickles read. Where the unpicklers of CPython 3.11
-to 3.14 differ, it takes every reading one of them takes: `INT` and `LONG` text in
-base 0, as up to 3.13 (`I0x1f`), and in base 10, as from 3.14 (`I08`), and, for the C
-unpickler of 3.11 and 3.12, a read past the end of a frame, which goes on from where
-the pickle stands or from the frame's end. It also takes every reading that a loader's
-`encoding` gives a `STRING`, `BINSTRING` or `SHORT_BINSTRING` with a byte over 0x7f,
-which the default `"ASCII"` fails: `torch.load` passes `"utf-8"`, `np.load` and
-`pandas.read_pickle` `"latin1"`, and `"bytes"` keeps the bytes, which `READONLY_BUFFER`
-takes. A call that one supported version or encoding reaches is rated whatever version
-runs the scan. It never imports, calls or builds an
-object: what `find_class` returns is a placeholder that stands for any attribute of a
-module, a class or a function as well as `os.environ`, `sys.path` or
-`builtins.__dict__`. `find_class` imports the module before it looks the name up, and
-`importlib` imports a file of any name, such as `ev-il.py` or `evil x.py`, so only a
-module that no finder can name fails as the import does: an empty one, one with a NUL,
-or one with a `/` in a dotted part. A pickle
-ends where `pickle.load` would stop: at STOP, where the next one starts, or at the
-first error, such as a byte that is no opcode, PROTO above 5, a stack underflow, a
-MARK that is missing, a read of a memo slot never stored, an unhashable key or the end
-of the file, after which nothing is read. The ratings are:
+opcodes and 64 MARKs over all the pickles read.
+
+Where the unpicklers of CPython 3.11 to 3.14 differ, the check takes every reading
+one of them takes: `INT` and `LONG` text in base 0, as up to 3.13 (`I0x1f`), and in
+base 10, as from 3.14 (`I08`), and, for the C unpickler of 3.11 and 3.12, a read
+past the end of a frame, which goes on from where the pickle stands or from the
+frame's end. It also takes every reading that a loader's `encoding` gives a `STRING`,
+`BINSTRING` or `SHORT_BINSTRING` with a byte over 0x7f, which the default `"ASCII"`
+fails: `torch.load` passes `"utf-8"`, `np.load` and `pandas.read_pickle` `"latin1"`,
+and `"bytes"` keeps the bytes, which `READONLY_BUFFER` takes. A call that one
+supported version or encoding reaches is rated whatever version runs the scan.
+
+The check never imports, calls or builds an object: what `find_class` returns is a
+placeholder that stands for any attribute of a module, a class or a function as well
+as `os.environ`, `sys.path` or `builtins.__dict__`. `find_class` imports the module
+before it looks the name up, and `importlib` imports a file of any name, such as
+`ev-il.py` or `evil x.py`, so only a module that no finder can name fails as the
+import does: an empty one, one with a NUL, or one with a `/` in a dotted part.
+
+A pickle ends where `pickle.load` would stop: at STOP, where the next one starts, or
+at the first error, such as a byte that is no opcode, PROTO above 5, a stack
+underflow, a MARK that is missing, a read of a memo slot never stored, an unhashable
+key or the end of the file, after which nothing is read. The ratings are:
 
 - A pickle that hands what `find_class` returned to anything but the stack and the
   memo before it ends is `unsafe-code-execution`, wherever it starts and whatever

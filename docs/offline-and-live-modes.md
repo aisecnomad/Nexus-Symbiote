@@ -160,19 +160,11 @@ For tools verified through transport evidence, `--record` preserves the tool's
 observation method, collector and timestamp and records the verified attestation's
 SHA-256 digest in the tool claim's `evidence_refs`.
 Each server's report names its `endpoint_binding` and the evidence's `observed_at`.
-`--require-full-url-binding` refuses origin-only evidence (it checks the path the inventory endpoint names or the digest it records against the evidence, not the configured URL, so an inventory that names or records another URL satisfies it), `--max-evidence-age HOURS` refuses older evidence, and future-dated evidence is always refused. `--require-transport-evidence` makes a remote server
-without such evidence fail with reason `remote-transport`. Such a server that records a launch command, which
-a client may start, fails with reason `ambiguous-transport` unless the launch policy
-names it; one that the launch policy names is verified through its pinned launcher. A
-server with any other transport label fails with reason `unsupported-transport`. A
-run with no stdio server verifies nothing and exits 1. Each failed server carries a
-reason: `missing-launch-policy`, `invalid-launch-policy`, `launcher-unavailable`,
-`launcher-digest-mismatch`, `launcher-start-failed`, `isolation-unavailable`,
-`isolation-teardown-failed`, `deadline`, `unsupported-protocol-version`, `protocol`,
-`invalid-descriptor`, `ambiguous-approved-tools`, `ambiguous-transport`,
-`invalid-transport-evidence`, `unsupported-transport` or `internal-error`. The 20-second deadline covers each server's MCP exchange and the
-checks of the descriptors it served. The JSON report also records the SHA-256 of
-the inventory and of the launch policy, and each launcher's pin.
+`--require-full-url-binding` refuses origin-only evidence (it checks the path the inventory endpoint names or the digest it records against the evidence, not the configured URL, so an inventory that names or records another URL satisfies it). `--max-evidence-age HOURS` refuses older evidence, and future-dated evidence is always refused.
+
+`--require-transport-evidence` makes a remote server without such evidence fail with reason `remote-transport`. Such a server that records a launch command, which a client may start, fails with reason `ambiguous-transport` unless the launch policy names it; one that the launch policy names is verified through its pinned launcher. A server with any other transport label fails with reason `unsupported-transport`. A run with no stdio server verifies nothing and exits 1.
+
+Each failed server carries a reason: `missing-launch-policy`, `invalid-launch-policy`, `launcher-unavailable`, `launcher-digest-mismatch`, `launcher-start-failed`, `isolation-unavailable`, `isolation-teardown-failed`, `deadline`, `unsupported-protocol-version`, `protocol`, `invalid-descriptor`, `ambiguous-approved-tools`, `ambiguous-transport`, `invalid-transport-evidence`, `unsupported-transport` or `internal-error`. The 20-second deadline covers each server's MCP exchange and the checks of the descriptors it served. The JSON report also records the SHA-256 of the inventory and of the launch policy, and each launcher's pin.
 
 The server's instructions, prompts, resource templates and descriptor members
 outside the fingerprint profile are compared with the digest that a previous

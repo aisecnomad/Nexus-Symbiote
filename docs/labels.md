@@ -1,8 +1,8 @@
 # Pull-request labels
 
-What each label on a pull request means, who sets it, and which labels every pull request carries. A
-label's one-line description in GitHub's label settings should agree with this page; when you add a
-label, add its row here in the same change.
+What each label on a pull request means, who sets it, and which labels every pull
+request carries. A label's one-line description in GitHub's label settings must agree
+with this page; when you add a label, add its row here in the same change.
 
 ## Rules
 

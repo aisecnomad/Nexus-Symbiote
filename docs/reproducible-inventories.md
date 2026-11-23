@@ -1,11 +1,10 @@
 # Reproducible inventories
 
-Scan one checkout twice and you get the same inventory: SymBiote records no collection
-time unless you ask for one, writes components and dependencies sorted, and derives the
-serial number from the content. This page lists the fields that record the collection
-event, describes the content digest that leaves them out and the serial number derived
-from it, and shows how `SOURCE_DATE_EPOCH` records a collection time while keeping the
-files byte-identical.
+Scan one checkout twice and get the same inventory: SymBiote records no collection time
+unless asked, writes components and dependencies sorted, and derives the serial number
+from the content. This page covers the fields that record the collection event, the
+content digest that leaves them out, and how `SOURCE_DATE_EPOCH` records a collection
+time while keeping files byte-identical.
 
 - [What differs between two collections](#what-differs-between-two-collections)
 - [The content digest](#the-content-digest)
@@ -16,9 +15,9 @@ files byte-identical.
 
 ## What differs between two collections
 
-An inventory records paths relative to the scanned directory, so where a checkout lies
-does not enter it. Two scans of the same checkout, with the same tool and settings,
-can differ only in fields that record the collection event:
+An inventory records paths relative to the scanned directory. Two scans of the same
+checkout, with the same tool and settings, differ only in fields that record the
+collection event:
 
 | Field | What a scan writes |
 |---|---|
@@ -31,16 +30,14 @@ can differ only in fields that record the collection event:
 `import-shadowscan` writes the serial number, `metadata.timestamp` and the report's
 file name; its records carry no collection times.
 
-By default, then, two scans of the same checkout write byte-identical native JSON and
-CycloneDX files, and so the same SHA-256 of the file's bytes and the same canonical
-digest that a signed runtime snapshot binds (`runtime digest --kind bom`). SPDX requires
-a creation time, so without a recorded one an SPDX export writes the time of the export
-as `CreationInfo.created`, and two SPDX files differ in that field only. SARIF writes
-`endTimeUtc` only when the inventory records a time; its file locations depend on the
-working directory (see [below](#byte-identical-files-with-source_date_epoch)). Two
-imports of copies of one report under different file names differ in
-`source_report_path`, and so in their bytes, but not in their content digest or serial
-number.
+Two scans of the same checkout therefore write byte-identical native JSON and CycloneDX
+files, with the same SHA-256 and canonical digest. SPDX requires a creation time, so
+without a recorded one the export writes the current time as `CreationInfo.created`, and
+two SPDX files differ in that field only. SARIF writes `endTimeUtc` only when the
+inventory records a time; its file locations depend on the working directory
+(see [below](#byte-identical-files-with-source_date_epoch)). Two imports of one report
+under different file names differ in `source_report_path` but not in their content digest
+or serial number.
 
 ## The content digest
 
@@ -81,21 +78,19 @@ known-answer vectors in `tests/vectors/inventory-content-v1.json` pin this one.
 Equal content digests establish that two documents record the same content, field for
 field, apart from when and in which run each was collected. They do not establish who
 produced either file, that either is genuine or complete, or that what they record is
-safe: a forged inventory that copies a genuine one's content has the same content
-digest. Compare content digests of inventories that came from sources you trust, and
-use the SHA-256 of the file to name an exact file.
+safe. Compare content digests of inventories from sources you trust, and use the
+SHA-256 of the file to name an exact file.
 
 ## The serial number
 
-When an inventory is written without a serial number, which is how `scan`, `baseline`
-and `import-shadowscan` build one, SymBiote sets `metadata.serial_number` to `urn:uuid:`
-followed by the version 5 UUID of the content digest, as `digest` prints it, in the
-namespace `ccaa2a43-8ba9-58e6-8f22-f8793a2039d5`. The serial number is not content, so
-anyone who holds the native JSON file can recompute it from that file, and it names the
-content: two inventories of the same content have the same serial number, whatever
-instant each records and wherever an imported report was read from. CycloneDX and SPDX
-exports carry the same serial number and embed the native document as the native file
-records it. It is a name, not a digest: compare content digests to compare content.
+When an inventory is written without a serial number (`scan`, `baseline` and
+`import-shadowscan`), SymBiote sets `metadata.serial_number` to `urn:uuid:` followed by
+the version 5 UUID of the content digest in namespace
+`ccaa2a43-8ba9-58e6-8f22-f8793a2039d5`. The serial number is not content, so anyone
+holding the native JSON file can recompute it. Two inventories of the same content have
+the same serial number, whatever instant each records. CycloneDX and SPDX exports carry
+the same serial number. It is a name, not a digest: compare content digests to compare
+content.
 
 An inventory whose content digest cannot be computed, because it holds a value outside
 the I-JSON domain, such as a lone surrogate, or nests too deeply, has no serial number
@@ -103,27 +98,22 @@ and is not written: `scan` and `import-shadowscan` exit 1.
 
 ## Byte-identical files with `SOURCE_DATE_EPOCH`
 
-Set `SOURCE_DATE_EPOCH`, the variable that reproducible builds use, to a whole number
-of seconds since 1970-01-01T00:00:00Z: 1 to 12 ASCII digits, at most 253402300799
-(9999-12-31T23:59:59Z). Then `scan`, `baseline`, which runs `scan`, and
-`import-shadowscan` record that instant as `metadata.timestamp` and, for a scan, in
-every other time field of the table above. The serial number does not change: the
-recorded time is not content.
+Set `SOURCE_DATE_EPOCH` to a whole number of seconds since 1970-01-01T00:00:00Z (1 to
+12 ASCII digits, at most 253402300799). `scan`, `baseline` and `import-shadowscan` then
+record that instant as `metadata.timestamp` and, for a scan, in every other time field
+above. The serial number does not change: recorded time is not content.
 
 CycloneDX writes that instant as `metadata.timestamp` and SPDX as
 `CreationInfo.created`, so the same inputs give byte-identical native JSON, CycloneDX
-and SPDX files, and `vex` gives identical documents for them. SARIF records file
-locations relative to the working directory when the scanned directory lies below it,
-and relative to the scanned directory otherwise. Two SARIF files are therefore
-identical when the scanned directory lies at the same path below the working directory
-in both scans, or below it in neither: a scan run from inside the scanned directory, as
-CI and the pre-commit hooks do, and a scan of a directory elsewhere record the same
-locations.
+and SPDX files. SARIF records file locations relative to the working directory when the
+scanned directory lies below it, and relative to the scanned directory otherwise. Two
+SARIF files are identical when the scanned directory is at the same relative path in
+both scans: a scan from inside the scanned directory (as CI and pre-commit hooks do) and
+a scan of a directory elsewhere record the same locations.
 
-Any other value, such as an empty, signed, fractional or hexadecimal number, one with
-spaces, one of more than 12 digits or one after the year 9999, is a usage error (exit
-status 2) before anything is collected, and the message does not repeat it. Without
-the variable an inventory records no collection time.
+Any other value (empty, signed, fractional, hexadecimal, with spaces, over 12 digits,
+or past year 9999) is a usage error (exit 2) before anything is collected. Without the
+variable, an inventory records no collection time.
 
 No gate and no other command reads the variable:
 
@@ -186,53 +176,34 @@ against the current tree.
 
 ## Limits
 
-- **Content can change for reasons other than the checkout.** The tool version is
-  content, and another release can record more or differently. So are the governing
-  policy (`policy_source`, `policy_weakened`, the exclusions), the collectors selected
-  with `--scanner`, the [collection limits](collection-limits.md), which decide what is
-  a gap, and `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`, which keys the settings bindings (see
-  [source binding](verification-source-binding.md)). Take the inventories you compare
-  the same way; see
+- **Content can change for reasons other than the checkout.** The tool version,
+  governing policy, selected collectors (`--scanner`),
+  [collection limits](collection-limits.md), and `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` are
+  all content. Take compared inventories the same way; see
   [take both snapshots the same way](drift-gate.md#take-both-snapshots-the-same-way).
 - **List order is content.** This build writes components and dependencies sorted, and
-  the CycloneDX and SPDX exports embed the native document as written, so a native
-  document recovered from an export is the native file. A document written by another
-  build, or edited by hand, with its lists in another order has another content digest
-  than its sorted rewrite, although it records the same inventory; its serial number,
-  if it has one, may not be the one this build would derive.
+  exports embed the native document as written. A document from another build, or edited
+  by hand, with lists in a different order has a different content digest than its sorted
+  rewrite; its serial number may also differ.
 - **SARIF locations depend on the working directory**, as described above.
 - **A document nested deeper than 128 levels is not read by the shared reader.**
-  `diff`, `validate`, `risk`, `summary`, `graph`, `digest`, `export-inventory` and the
-  other commands that read a native inventory through `AIBOM.load` refuse one whose
-  arrays and objects nest more than 128 levels, the root counted, with "inventory
-  nests deeper than 128 levels"; the bound is fixed, so what one of them reads, every
-  one of them reads. Past the interpreter's recursion limit, just under 1,000 levels
-  by default, the refusal says the file is not strict UTF-8 JSON instead. Four
-  commands do not apply the bound. `verify-discovery` and `verify-live` read the
-  inventory with the strict JSON parser and the schema alone, so they read a document
-  at 129 or 257 levels and refuse one at 1,000. `attest` records a subject nested up
-  to 256 levels as a native inventory with a content digest, and a deeper one as
-  `other` without one, which `verify-attestation` then verifies only by its bytes
-  (`--match content` exits with `content-digest-unavailable`). A collected inventory
+  Commands that read through `AIBOM.load` (`diff`, `validate`, `risk`, `summary`,
+  `graph`, `digest`, `export-inventory`, etc.) refuse documents nested beyond 128 levels.
+  Four commands differ: `verify-discovery` and `verify-live` use the strict JSON parser
+  alone and read up to ~1,000 levels; `attest` records a subject up to 256 levels as
+  native with a content digest, and deeper as `other` without one. A collected inventory
   nests far less.
 - **A readable inventory can lack a digest.** A document without a `components` list
-  has no content digest. A runtime snapshot binds a document only
-  when its compact JSON, with every character outside ASCII escaped and each number
-  counted as 24 bytes, is at most 16 MiB, it holds at most 1,000,000 values and no value
-  is nested more than 64 levels deep; any other document has no canonical digest. A
-  native inventory may be up to 16 MiB as written, so one with much text outside ASCII,
-  or many numbers, can lack a canonical digest at a fraction of that size. `digest`
-  prints `unavailable` for a missing digest and every other value as usual, and exits 1.
-- **File names are input.** An inventory records names as the operating system lists
-  them, so a checkout whose names differ between machines, for example after Unicode
-  normalization, records different paths. The byte-identical results on this page were
-  checked with copies of a checkout on one file system.
-- **One collection bound counts time.** Every other bound counts something a scan
-  reads, such as bytes, entries or nodes, so two scans reach it alike. The mcp
-  collector also holds the parse of a TypeScript or JavaScript file to 250 ms of
-  processor time, which only a file the grammar cannot parse comes near. A busy
-  machine does not reach that limit sooner, but a slower one does, so scans on two
-  machines of different speed can record such a file with different failure reasons;
-  neither inventories it. See
+  has no content digest. A runtime snapshot binds a document only when its compact JSON
+  (non-ASCII escaped, numbers counted as 24 bytes) is at most 16 MiB, with at most
+  1,000,000 values and no nesting beyond 64 levels; otherwise it has no canonical digest.
+  `digest` prints `unavailable` for a missing digest and exits 1.
+- **File names are input.** An inventory records names as the OS lists them, so a
+  checkout whose names differ between machines (e.g. after Unicode normalization) records
+  different paths.
+- **One collection bound counts time.** The mcp collector holds TypeScript/JavaScript
+  parses to 250 ms of processor time. A busy machine does not reach it sooner, but a
+  slower one does, so scans on machines of different speed can record different failure
+  reasons for unparseable files; neither inventories the file. See
   [the TypeScript parse time limit](collection-limits.md#the-typescript-parse-time-limit).
 - **A digest is not a signature.** No digest on this page says who wrote a file.

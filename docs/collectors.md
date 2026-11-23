@@ -1,6 +1,6 @@
 # Collector reference
 
-Every path each built-in collector reads, and what the `ide_agents` collector records from coding-agent settings. The [registry collector](registry-collector.md) and [model integrity](model-integrity.md) pages describe those two collectors in full, and the [known limitations](known-limitations.md) list what each collector leaves out. A test checks that the `prompt`, `rag`, `a2a` and `ide_agents` rows below name every path those collectors read.
+Every path each built-in collector reads, and what `ide_agents` records from coding-agent settings. The [registry collector](registry-collector.md) and [model integrity](model-integrity.md) pages cover those collectors in full; [known limitations](known-limitations.md) lists what each leaves out. A test checks that the `prompt`, `rag`, `a2a` and `ide_agents` rows below name every path those collectors read.
 
 ## What each collector reads
 
@@ -27,33 +27,15 @@ that `logging` is used only for attribute reads. Passing the module as a value,
 including a default such as `def configure(mod=logging)`, produces a coverage gap
 for that call. Other server and tool declarations in the file are still inventoried.
 
-The `mcp` collector names a server it finds in Python, TypeScript or JavaScript
-source by the name its constructor declares as a string literal, the name clients
-see: the first argument or `name=` of `FastMCP("analytics-mcp")` or `MCPServer`,
-and `name` in the object literal given to
-`new McpServer({ name: "analytics-mcp", version: "1.0.0" })`. A name computed at
-run time, such as an f-string, a template literal with a substitution, a variable
-or a concatenation, keeps the variable the server is bound to as its name, as does
-a literal of more than 128 characters, one with characters other than ASCII
-letters, digits, `_`, `.`, `-` and single spaces between words, one without a
-letter or digit, one that redaction would change, or one that holds a value the
-scan read and does not publish. Those are the values of the MCP configuration
-files and of Claude Code and Cursor settings, whose `env` reaches every server the
-host starts: a credential in any field, such as an `env` value with no token shape,
-a server's `apiKey` or Codex's `experimental_bearer_token`, URL user information,
-and every `env`, header or query parameter value of at least 8 characters. While
-one of those files cannot be read whole, every source server keeps its variable
-([known limitations](known-limitations.md#mcp-servers-and-tools)). Every source
-server records that variable in its `binding` property and the line of its
-declaration in `declaration_line`. A TypeScript
-server's reference (`mcp-source:<path>:<name>:<line>:<offset>`) carries the name
-it is given. A Python server's reference stays `mcp-python:<path>:<variable>`,
-because a file binds each variable once while two servers in it can declare the same
-name. The [TypeScript inventory](typescript-inventory.md) page covers the
-TypeScript forms in full.
+The `mcp` collector names a source server by the string literal its constructor declares — the name clients see: the first argument or `name=` of `FastMCP("analytics-mcp")` or `MCPServer`, and `name` in `new McpServer({ name: "analytics-mcp", version: "1.0.0" })`.
 
-For Python SDK imports, the collector considers both script-directory and module-launch search roots. A local framework import must resolve to a regular module in each applicable first search root before it can suppress a coverage gap. A checkout module that could supply an SDK import produces a gap. The SDK’s standard session and request types can appear directly in a Context annotation. SDK subscriptions receiving a server or agent class and unions combining SDK objects remain visible to registration analysis. Runtime changes to import paths are unverified.
-Qualified SDK module imports remain unresolved when an installed or isolated launcher can skip a checkout package. An SDK-named helper inside a regular package can be ruled out when its bounded source contains only passive definitions and cannot supply the imported name or submodule. A same-stem alternate module, an adjacent excluded bytecode cache, or a directory link beneath the package leaves the import unresolved. Common standard-library imports before the helper definition are allowed only when the applicable search roots contain no candidate that could shadow the standard library.
+A computed name (f-string, template literal with substitution, variable, concatenation) keeps the variable the server is bound to as its name. So does a literal of more than 128 characters, one with characters other than ASCII letters, digits, `_`, `.`, `-` and single spaces between words, one without a letter or digit, one that redaction would change, or one that holds a value the scan read and does not publish. Those unpublished values come from MCP configuration files and Claude Code/Cursor settings, whose `env` reaches every server the host starts: a credential in any field, such as an `env` value with no token shape, a server's `apiKey` or Codex's `experimental_bearer_token`, URL user information, and every `env`, header or query parameter value of at least 8 characters. While one of those files cannot be read whole, every source server keeps its variable ([known limitations](known-limitations.md#mcp-servers-and-tools)).
+
+Every source server records that variable in `binding` and its declaration line in `declaration_line`. A TypeScript server's reference (`mcp-source:<path>:<name>:<line>:<offset>`) carries the name it is given. A Python server's reference stays `mcp-python:<path>:<variable>`, because a file binds each variable once while two servers in it can declare the same name. The [TypeScript inventory](typescript-inventory.md) covers the TypeScript forms in full.
+
+For Python SDK imports, the collector considers both script-directory and module-launch search roots. A local framework import must resolve to a regular module in each applicable first search root before it can suppress a coverage gap. A checkout module that could supply an SDK import produces a gap. The SDK’s standard session and request types can appear directly in a Context annotation. SDK subscriptions receiving a server or agent class, and unions combining SDK objects, remain visible to registration analysis. Runtime changes to import paths are unverified.
+
+Qualified SDK module imports remain unresolved when an installed or isolated launcher can skip a checkout package. An SDK-named helper inside a regular package can be ruled out when its bounded source contains only passive definitions and cannot supply the imported name or submodule. A same-stem alternate module, an adjacent excluded bytecode cache, or a directory link beneath the package leaves the import unresolved.
 
 ## Coding-agent settings
 

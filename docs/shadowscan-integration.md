@@ -1,13 +1,8 @@
 # ShadowScan discovery and Nexus SymBiote verification
 
-Nexus-ShadowScan is a separate project,
-[Hunzee-VC/Nexus-ShadowScan](https://github.com/Hunzee-VC/Nexus-ShadowScan). Install
-it from that repository at a commit you have reviewed. The PyPI project named
-`shadowscan` is an unrelated tool from another publisher.
+Nexus-ShadowScan is a separate project: [Hunzee-VC/Nexus-ShadowScan](https://github.com/Hunzee-VC/Nexus-ShadowScan). Install it from that repository at a reviewed commit. The PyPI project named `shadowscan` is an unrelated tool from another publisher.
 
-Run Nexus-ShadowScan separately with the least privileges needed for the chosen
-connectors and save its JSON report. Keep the report under appropriate access and
-retention controls. For example, following the ShadowScan version's own CLI help:
+Run Nexus-ShadowScan separately with the least privileges needed for the chosen connectors and save its JSON report. Keep the report under appropriate access and retention controls:
 
 ```sh
 shadowscan code /path/to/repository --format json -o shadowscan.json
@@ -17,10 +12,7 @@ nexus-symbiote verify-discovery agentbom.json shadowscan.json --projection
 nexus-symbiote verify-artifact model.safetensors --project /path/to/repository --sha256 "$TRUSTED_SHA256"
 ```
 
-A standalone import always records partial coverage, so `validate` of
-`agentbom.json` always fails. To gate on discovery together with the repository's
-own evidence, put the report at one of the supported paths in the repository (see
-below) and validate a merged scan:
+A standalone import always records partial coverage, so `validate` of `agentbom.json` always fails. To gate on discovery together with the repository's own evidence, place the report at a supported path in the repository and validate a merged scan:
 
 ```sh
 shadowscan code /path/to/repository --format json -o /path/to/repository/shadowscan.json
@@ -28,23 +20,11 @@ nexus-symbiote scan /path/to/repository --no-project-policy -o merged.json
 nexus-symbiote validate merged.json --project /path/to/repository --no-project-policy
 ```
 
-The output path must not exist. An incomplete source produces a partial BOM and
-nonzero exit; a malformed or unsupported report is rejected. With `--report-only`
-the exit status is 0 either way, except that unverified discovery evidence fails in CI
-unless `--bundle` verifies the producer or `--allow-unsigned-discovery` accepts it; read `metadata.completeness.source_report_status`
-(`complete`, `incomplete` or `unknown`) in the written BOM to tell them apart. A locally generated
-report digest binds the imported bytes, not the identity of their producer or the
-truth of their contents. Verification of signatures, sources and artifacts is a
-separate operation; this importer does not perform it. Do not infer production
-activity, effective access or authorization from a finding or inventory mismatch.
-`verify-discovery` compares exact report bytes with the native BOM's recorded
-digest; without `--projection` it does not compare the BOM's components. It does
-not authenticate either the BOM or the report.
-`verify-artifact` hashes a selected local artifact within the project root against
-an operator-supplied expected digest. To verify a Sigstore bundle as well, pass
-`--bundle`, `--signer-identity`, and `--issuer`. The expected digest and signer
-policy must come from a trusted source. This verifies the selected artifact, not
-its association with a discovery finding, deployment, or safety.
+The output path must not exist. An incomplete source produces a partial BOM and nonzero exit; a malformed or unsupported report is rejected. With `--report-only` the exit status is 0 either way, except that unverified discovery evidence fails in CI unless `--bundle` verifies the producer or `--allow-unsigned-discovery` accepts it; read `metadata.completeness.source_report_status` (`complete`, `incomplete` or `unknown`) in the written BOM to tell them apart.
+
+A locally generated report digest binds the imported bytes, not the identity of their producer or the truth of their contents. Verification of signatures, sources and artifacts is a separate operation; this importer does not perform it. Do not infer production activity, effective access or authorization from a finding or inventory mismatch.
+
+`verify-discovery` compares exact report bytes with the native BOM's recorded digest; without `--projection` it does not compare the BOM's components. It does not authenticate either the BOM or the report. `verify-artifact` hashes a selected local artifact within the project root against an operator-supplied expected digest. To verify a Sigstore bundle as well, pass `--bundle`, `--signer-identity`, and `--issuer`. The expected digest and signer policy must come from a trusted source. This verifies the selected artifact, not its association with a discovery finding, deployment, or safety.
 
 The importer maps native `agent`, `mcp-server` and `local-model` findings,
 including MCP tool observations distinguished by resource type, and two more kinds
@@ -60,9 +40,7 @@ the authoritative discovery record. Only supported, mapped-endpoint CycloneDX
 dependencies are projected as declared claims; the rest of those fields remain
 in the report. This reduces leakage but does not create a complete evidence graph.
 
-All imported components have declared assurance and unknown trust. The importer
-does not run ShadowScan, execute tools, fetch endpoints, infer agent autonomy, or
-promote a signature filename into verified evidence.
+All imported components have declared assurance and unknown trust. The importer does not run ShadowScan, execute tools, fetch endpoints, infer agent autonomy, or promote a signature filename into verified evidence.
 
 `validate --project` judges imported components as imported claims, not local
 subjects. Once reconciliation has bound them to the report beneath the project
@@ -120,26 +98,13 @@ regenerate inventories with the current profile and review them before compariso
 approval. Producer schema and version changes require compatibility testing; the
 report remains untrusted.
 
-At present the bridge does not resolve agents across tenants or reports, verify
-live MCP identities, or map every ShadowScan finding type, model association or
-dependency; the kinds it leaves out are listed
-[below](#what-each-shadowscan-kind-becomes). A complete ShadowScan run is only
-complete for its configured scope;
-Nexus SymBiote records the imported BOM coverage as partial. SARIF is not available
-for imported discovery because its finding projection does not retain complete
-coverage and provenance: `scan -f sarif` and `import-shadowscan -f sarif` refuse
-such an inventory, the GitHub Action skips its SARIF upload with a warning, and the
-`vex` command omits imported findings and records how many it omitted in the
-property `nexus-symbiote:omittedImportedFindings`.
+The bridge does not resolve agents across tenants or reports, verify live MCP identities, or map every ShadowScan finding type, model association or dependency; unmapped kinds are listed [below](#what-each-shadowscan-kind-becomes). A complete ShadowScan run is complete only for its configured scope; Nexus SymBiote records the imported BOM coverage as partial.
+
+SARIF is not available for imported discovery because its finding projection does not retain complete coverage and provenance: `scan -f sarif` and `import-shadowscan -f sarif` refuse such an inventory, the GitHub Action skips its SARIF upload with a warning, and the `vex` command omits imported findings and records the count in `nexus-symbiote:omittedImportedFindings`.
 
 ## What each ShadowScan kind becomes
 
-ShadowScan 0.1.4 reports 18 kinds of finding. This table was reviewed against that
-version at commit `2b80f199659a8de17ea9c7792c07940d5b747d72`. A kind that another
-version adds or renames stays unmapped until the mapping is reviewed, and so does a new
-resource type of `framework-usage` or `agent-config`. The kinds `agent`, `mcp-server`
-and `local-model` are projected for any resource type, so a new one of theirs is
-projected too.
+ShadowScan 0.1.4 reports 18 finding kinds. This table was reviewed against commit `2b80f199659a8de17ea9c7792c07940d5b747d72`. A kind that another version adds or renames stays unmapped until reviewed, as does a new resource type of `framework-usage` or `agent-config`. The kinds `agent`, `mcp-server` and `local-model` are projected for any resource type, so a new one of theirs is projected too.
 
 | ShadowScan kind | Becomes | Condition, or why it is a gap |
 | --- | --- | --- |
@@ -452,30 +417,11 @@ on the local filesystem.
 
 ### Scope of a repository baseline
 
-`scan` and `baseline` assess the supported static files in one repository.
-All eight collectors must finish for the default gate to pass. A successful
-search can find zero matching files. Git metadata, dependency directories and
-virtual environments are outside the built-in scope. The inventory lists those
-patterns under `exclusions`. Unreadable files, unsupported declarations and
-additional policy exclusions encountered inside the scope keep coverage partial.
-A baseline also requires a local subject. The inferred repository agent
-and imported findings alone provide no evidence of a local agent or artifact.
+`scan` and `baseline` assess the supported static files in one repository. All eight collectors must finish for the default gate to pass. A successful search can find zero matching files. Git metadata, dependency directories and virtual environments are outside the built-in scope; the inventory lists those patterns under `exclusions`. Unreadable files, unsupported declarations and additional policy exclusions keep coverage partial. A baseline also requires a local subject: the inferred repository agent and imported findings alone provide no evidence of a local agent or artifact.
 
-The collector reads a report at one of three paths beneath the project root:
-`.shadowscan/report.json`, `shadowscan-report.json` or `shadowscan.json`. Exactly
-one may exist. When more than one does, the scan records the failure
-"ShadowScan reports found at more than one supported path (...); keep exactly one"
-and imports none, so a file committed under another name cannot silently replace
-the report a pipeline generated. A report reached through a symbolic link in a parent
-directory, such as `.shadowscan/report.json` when `.shadowscan` is a link to another directory, is
-refused with the failure "ShadowScan report is reached through a symbolic link; not
-imported", and nothing is imported while one exists. A leaf link such as
-`.shadowscan/report.json -> ../vendor/report.json` can still be read when it satisfies
-the ordinary [confinement rules](known-limitations.md#every-collector),
-including a relative target inside the project reached without another symlink.
-The inventory lists the path it read under
-`surfaces_scanned`. If none exists, the inventory records that observation. A fully mapped native report
-whose source collection completed can accompany a successful repository baseline.
+The collector reads a report at one of three paths beneath the project root: `.shadowscan/report.json`, `shadowscan-report.json` or `shadowscan.json`. Exactly one may exist. Multiple reports produce a failure, so a file committed under another name cannot silently replace one a pipeline generated.
+
+A report reached through a symbolic link in a parent directory is refused. A leaf link such as `.shadowscan/report.json -> ../vendor/report.json` can still be read when it satisfies the ordinary [confinement rules](known-limitations.md#every-collector), including a relative target inside the project reached without another symlink. The inventory lists the path it read under `surfaces_scanned`. If none exists, the inventory records that observation. A fully mapped native report whose source collection completed can accompany a successful repository baseline.
 The digest and `source_projection_limitations` record the external evidence
 separately. Imported assets retain declared assurance and unknown trust, and
 the CycloneDX composition remains incomplete. Incomplete sources, unmapped

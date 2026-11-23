@@ -43,6 +43,7 @@ scan is a repository association: that an agent's repository configures a server
 not show that the agent calls it, or with what identity. Findings are the inventory's
 own, except that a model also carries the findings `risk` derives from its recorded
 fields when they are missing (see the [finding catalog](finding-catalog.md)).
+
 Relationship conditions and component descriptions are not shown. A finding's
 category and detail, a fact, and a coverage gap are cut at 2,000 characters.
 
@@ -82,33 +83,32 @@ A few rules need their reasons:
   gives no class. Its host is read only from a plain authority: an `http`, `https`, `ws`
   or `wss` URL whose authority is a host name of ASCII letters, digits, `.`, `-` and
   `_`, an IPv4 address or a bracketed IPv6 address, and an optional port, with nothing
-  else: no userinfo, backslash, percent-escape or whitespace. URL parsers can read any
-  other authority as different hosts: `http://evil.example\@localhost/` is a request
-  to `evil.example` for a WHATWG parser, such as the one Node-based MCP clients use, and
-  to `localhost` for Python's. Such an endpoint, like one whose host cannot be read,
-  could be remote, so it counts as one. The `mcp` collector records an ambiguous
-  authority as `[redacted]` in the first place.
+  else: no userinfo, backslash, percent-escape or whitespace.
+
+  URL parsers can read any other authority as different hosts:
+  `http://evil.example\@localhost/` is a request to `evil.example` for a WHATWG parser
+  (used by Node-based MCP clients) and to `localhost` for Python's. Such an endpoint,
+  like one whose host cannot be read, could be remote, so it counts as one. The `mcp`
+  collector records an ambiguous authority as `[redacted]`.
 - The `mcp` collector exports an environment variable's name, with its value masked,
   unless the name is token-shaped, not a plain field name, or holds a credential
-  value read in the scan or its configuration file; such a name is withheld as
-  `[redacted-N]`. That marker is the only credential signal the record keeps, so a
-  plainly named variable such as `GITHUB_TOKEN` gives no class: names are not guessed
-  at. A withheld name that is merely unusual, not a credential, still gives
-  `secret-access`.
+  value; such a name is withheld as `[redacted-N]`. That marker is the only credential
+  signal the record keeps, so a plainly named variable such as `GITHUB_TOKEN` gives no
+  class: names are not guessed at. A withheld name that is merely unusual, not a
+  credential, still gives `secret-access`.
 - Both unsafe serialization values mean that loading the model, or rendering its chat
   template, can run code; the [finding catalog](finding-catalog.md) rates both as a
   critical `serialization_format` finding.
-- For an IDE agent only starting modes whose meaning is unambiguous are read: Claude
-  Code's `bypassPermissions` skips every permission prompt and `acceptEdits` accepts
-  file edits without one, and Codex's `approval_policy = "never"` runs commands
-  without asking. Any other mode, Codex's `sandbox_mode`, the `agent.permissionMode`
-  that Cursor, Windsurf, Cline and Codex settings may carry (a convention their vendors
-  do not document), and the unscoped allow rules that a `permission_scope` finding
-  reports leave the agent unclassified. The collector records those allow rules only in
-  the text of that medium finding, and classification does not parse text: a Claude
-  Code agent whose `permissions.allow` is `["Bash", "Edit"]`, approving every shell
-  command and file edit, is unclassified, while one whose starting mode is
-  `acceptEdits` is `write-capable`. Effective approval also depends on deny and ask rules, user and
+- For an IDE agent, only starting modes with unambiguous meaning are read. Claude Code's
+  `bypassPermissions` skips every permission prompt, `acceptEdits` accepts file edits
+  without one, and Codex's `approval_policy = "never"` runs commands without asking.
+
+  Any other mode, Codex's `sandbox_mode`, the `agent.permissionMode` that Cursor,
+  Windsurf, Cline and Codex settings may carry, and the unscoped allow rules that a
+  `permission_scope` finding reports leave the agent unclassified. Classification does
+  not parse finding text: a Claude Code agent whose `permissions.allow` is
+  `["Bash", "Edit"]` is unclassified, while one with starting mode `acceptEdits` is
+  `write-capable`. Effective approval also depends on deny and ask rules, user and
   managed settings and session flags, which no record holds.
 
 A component is **unclassified** when its record holds no value these rules read. That
