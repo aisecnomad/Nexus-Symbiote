@@ -1,6 +1,6 @@
 # Operational guidance
 
-This page collects the practices that keep a Nexus SymBiote deployment inside the guarantees the security model and known limitations actually provide. It is written for operators and CI owners. Read the [security model](security-model.md), [threat model](threat-model.md) and [known limitations](known-limitations.md) first.
+Practices that keep a Nexus SymBiote deployment inside its documented guarantees. For operators and CI owners. Read the [security model](security-model.md), [threat model](threat-model.md) and [known limitations](known-limitations.md) first.
 
 ## Required practices
 

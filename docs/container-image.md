@@ -1,10 +1,10 @@
 # Container image
 
 Each PyPI release from the next one on also publishes the CLI as a container image,
-`ghcr.io/aisecnomad/nexus-symbiote`, tagged with the version. It is the same wheel
-that went to PyPI, installed on the hash-locked runtime the GitHub Action uses, and it
-carries a build-provenance attestation of its own. Use it where the CLI cannot run
-directly, such as on Windows ([platforms](../SECURITY.md#platforms)).
+`ghcr.io/aisecnomad/nexus-symbiote`, tagged with the version. It contains the same
+wheel that went to PyPI, installed on the hash-locked runtime the GitHub Action uses,
+with its own build-provenance attestation. Use it where the CLI cannot run directly,
+such as on Windows ([platforms](../SECURITY.md#platforms)).
 
 ## What is in it
 
@@ -40,11 +40,10 @@ docker run --rm --network none --read-only --user "$(id -u):$(id -g)" \
   scan /work --no-project-policy -f cyclonedx > agent.cdx.json
 ```
 
-The attestation binds the image digest to `release.yml` on `main` at the release commit,
-as the wheel's binds the wheel; it does not show that the base image or the runner was
-uncompromised. Mount the project read-only and run as yourself, so the scan reads what
-you can read and nothing more. Give `-o` a path on a writable mount to write a file
-instead of standard output.
+The attestation binds the image digest to `release.yml` on `main` at the release commit;
+it does not show that the base image or runner was uncompromised. Mount the project
+read-only and run as yourself, so the scan reads only what you can read. Use `-o` with
+a path on a writable mount to write a file instead of standard output.
 
 ## Build it yourself
 

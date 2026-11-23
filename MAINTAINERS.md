@@ -13,8 +13,8 @@ The lead maintainer is responsible for:
 - Reviewing and merging pull requests
 - Triaging issues and security reports
 - Managing releases and PyPI publication
-- Maintaining CI, branch protection, and repository controls
-- Regenerating the dependency locks and reviewing dependency updates
+- Maintaining CI, branch protection and repository controls
+- Regenerating dependency locks and reviewing dependency updates
 - Setting project direction and roadmap priorities
 
 These are ownership responsibilities, not a claim that external CI, branch protection or publication settings are already active. See [repository controls](docs/repository-controls.md#operator-prerequisites) for verification status and the administrator runbook, and [issue #74](https://github.com/aisecnomad/Nexus-Symbiote/issues/74) for the remediation history.
@@ -36,14 +36,14 @@ Add the second holder of each privilege here, with the date, when one exists.
 
 ## Becoming a maintainer
 
-Nexus SymBiote is in alpha with a single maintainer. As the project grows, contributors who demonstrate sustained, high-quality participation may be invited to take on maintainer responsibilities.
+Nexus SymBiote is in alpha with a single maintainer. Contributors who demonstrate sustained, high-quality participation may be invited to take on maintainer responsibilities.
 
-Qualities we value in potential maintainers:
+Qualities valued in potential maintainers:
 
 - Consistent, reviewed contributions over time
-- Understanding of the project's security model and trust boundaries
-- Careful attention to supply-chain security practices
+- Understanding of the security model and trust boundaries
+- Attention to supply-chain security practices
 - Responsiveness to issues and community questions
 - Willingness to review others' pull requests thoroughly
 
-Interested contributors should start by reading [CONTRIBUTING.md](CONTRIBUTING.md) and engaging with open issues.
+Start by reading [CONTRIBUTING.md](CONTRIBUTING.md) and engaging with open issues.

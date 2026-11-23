@@ -2,21 +2,18 @@
 
 ## Offline demo
 
-[`demo-agent/`](demo-agent) is a small, synthetic agent project: a support
-assistant with three MCP servers, an instruction file, a model file, a retrieval
-source, an A2A agent card, a container image and a coding-agent configuration.
-It exists to be inventoried. Nothing in it is installed, built or run. Once the
-tool is installed, every step below except the optional live step 6 works
-without network access or credentials.
+[`demo-agent/`](demo-agent) is a synthetic agent project: a support assistant with
+three MCP servers, an instruction file, a model file, a retrieval source, an A2A
+agent card, a container image and a coding-agent configuration. Nothing in it is
+installed, built or run. Every step below except optional live step 6 works without
+network access or credentials.
 
-For a target you did not author, see the tutorial on
-[scanning a public agent project](../docs/tutorials/scanning-a-public-agent.md):
-it walks through the same inventory against a real open-source repository
-pinned to a reviewed revision.
+For a real repository, see
+[scanning a public agent project](../docs/tutorials/scanning-a-public-agent.md).
 
 First complete [install from reviewed source](../README.md#install-from-reviewed-source),
-including the reviewed commit and HEAD check. The wheel does not include the
-examples. After that block succeeds, enter that checkout and activate its environment:
+including the reviewed commit and HEAD check. The wheel does not include examples.
+After that block succeeds, enter the checkout and activate its environment:
 
 ```bash
 cd Nexus-Symbiote && . .venv/bin/activate
@@ -51,12 +48,11 @@ nexus-symbiote risk demo.aibom.json --no-project-policy
 nexus-symbiote validate demo.aibom.json --project examples/demo-agent --no-project-policy
 ```
 
-`risk` passes the default gate. `validate` exits 1. Completeness passes, but
-integrity is unknown: no operator signer policy was supplied, so the model's
-signature cannot be verified, and unknown evidence never passes. It also warns
-that the `memory` package is unpinned and that the remote `tickets` endpoint's
-identity is unverified. That is the intended teaching point: an inventory can be
-complete and still not be approvable.
+`risk` passes the default gate. `validate` exits 1: completeness passes, but
+integrity is unknown — no signer policy was supplied, so the model's signature
+cannot be verified, and unknown evidence never passes. It also warns that `memory`
+is unpinned and the remote `tickets` endpoint is unverified. This is the teaching
+point: an inventory can be complete and still not approvable.
 
 ### 3. Export standard formats
 
@@ -68,9 +64,9 @@ nexus-symbiote scan examples/demo-agent -f sarif -o demo.sarif
 
 ### 4. Catch drift
 
-Take a reviewed snapshot of a copy, then make two changes an attacker or a
-careless update might make: float the pinned `notes` server, and point `tickets`
-at a different host.
+Take a reviewed snapshot of a copy, then simulate two changes an attacker or
+careless update might make: float the pinned `notes` server and point `tickets` at
+a different host.
 
 ```bash
 cp -r examples/demo-agent /tmp/demo-agent
@@ -103,7 +99,7 @@ snapshots, and what each alert means.
 ### 5. Import a discovery report
 
 [Nexus ShadowScan](https://github.com/Hunzee-VC/Nexus-ShadowScan) finds agents
-across many surfaces; Nexus SymBiote turns its report into an AgentBOM. A recorded
+across many surfaces; SymBiote turns its reports into AgentBOMs. A recorded
 ShadowScan 0.1.4 report ships with the tests:
 
 ```bash
@@ -122,17 +118,16 @@ on purpose: imported claims never establish complete, verified coverage.
 nexus-symbiote --live advisories demo.aibom.json -o advisories.json
 ```
 
-The demo's `notes` server is launched from an exact npm package, so `advisories`
-sends one identity to OSV, `@modelcontextprotocol/server-filesystem@2025.8.21`;
-add `--dry-run` to list it without contacting OSV. The demo's other components
-declare no exact PyPI or npm package URL. Point it at your own inventory to query
-OSV. See [offline and live modes](../docs/offline-and-live-modes.md).
+The demo's `notes` server has an exact npm package, so `advisories` sends one
+identity to OSV (`@modelcontextprotocol/server-filesystem@2025.8.21`); add
+`--dry-run` to preview without contacting OSV. See
+[offline and live modes](../docs/offline-and-live-modes.md).
 
 ### 7. Compare with runtime traces
 
 [`traces/demo-agent.otlp.json`](traces/demo-agent.otlp.json) is a synthetic
-OpenTelemetry trace of one run of the demo agent. `trace-diff` compares the runtime use
-that it reports with the inventory, offline:
+OpenTelemetry trace of one demo agent run. `trace-diff` compares reported runtime
+use with the inventory, offline:
 
 ```bash
 nexus-symbiote trace-diff demo.aibom.json examples/traces/demo-agent.otlp.json
@@ -151,4 +146,4 @@ nexus-symbiote scan examples --no-project-policy --report-only -o demo-agentbom.
 nexus-symbiote summary demo-agentbom.json
 ```
 
-This exercises the eight built-in collectors (`shadowscan`, `mcp`, `model`, `prompt`, `rag`, `registry`, `a2a`, `ide_agents`) against the files in this directory. A completed search may report zero matches for some collectors; that is expected and is recorded as coverage information rather than a failure.
+Exercises all eight collectors against the files in this directory. Zero matches for a collector is coverage information, not a failure.

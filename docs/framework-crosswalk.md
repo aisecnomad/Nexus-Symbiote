@@ -1,13 +1,12 @@
 # Framework crosswalk
 
 Security and compliance reviews ask how each finding relates to the frameworks they
-work with. This catalog answers that in one place: for every finding category, the
-entries of the OWASP Top 10 for LLM Applications (2025 and 2026 editions), the OWASP
-Top 10 for Agentic Applications, MITRE ATLAS, the NIST AI RMF, the EU AI Act, ISO/IEC
-42001 and CWE that its findings bear on, each with a one-line rationale. SARIF rules
-take their taxonomy tags from it, and the `crosswalk` command applies it to the
-findings of an inventory. The [finding catalog](finding-catalog.md) says what each
-category records.
+work with. This catalog maps every finding category to the entries of the OWASP Top 10
+for LLM Applications (2025 and 2026 editions), the OWASP Top 10 for Agentic
+Applications, MITRE ATLAS, the NIST AI RMF, the EU AI Act, ISO/IEC 42001 and CWE
+that its findings bear on, each with a one-line rationale. SARIF rules take their
+taxonomy tags from it, and the `crosswalk` command applies it to the findings of an
+inventory. The [finding catalog](finding-catalog.md) says what each category records.
 
 - [What a reference means](#what-a-reference-means)
 - [The crosswalk command](#the-crosswalk-command)

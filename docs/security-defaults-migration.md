@@ -19,21 +19,24 @@ The `model` collector applies the same rule to what a model file is. It records
 when the file's header is that format's; otherwise both are absent, which means
 that the format was not established, and `properties.named_format` holds the
 format the name claims ([model integrity](model-integrity.md#format-and-model-type)).
+
 Releases up to 0.2.0 recorded both from the suffix, so in an inventory they wrote,
 `serialization_format` and `model_type` on a `.gguf` or `.safetensors` record do
-not show that the file is of that format. Collect such an inventory again. For each
-file whose header is not its format's, `diff` reports the changed fields and
-properties as one alert, on which it exits 1 unless `--no-fail-on-alert` is given,
-and `validate --project` reports the older record as `Missing or mismatched local
-component`. The alert is medium for a `.gguf` file, and for a pickle, a ZIP that
-holds a pickle or a NumPy object array under either suffix. It is high for any other
-file named as SafeTensors that does not validate,
-such as an empty or a text file, and begins `Risk findings added: 1 high
-(invalid_safetensors).`, because the finding the collector now stores is new on
-the record. The `invalid_safetensors` gate is unchanged: `risk` raises it for
-either record, and the collector stores the finding on a record without
-`serialization_format`, so that a release up to 0.2.0, which derives it from that
-field alone, still fails the gate on an inventory this release wrote.
+not show that the file is of that format. Collect such an inventory again.
+
+For each file whose header is not its format's, `diff` reports the changed fields
+and properties as one alert, on which it exits 1 unless `--no-fail-on-alert` is
+given, and `validate --project` reports the older record as `Missing or mismatched
+local component`. The alert is medium for a `.gguf` file, and for a pickle, a ZIP
+that holds a pickle or a NumPy object array under either suffix. It is high for any
+other file named as SafeTensors that does not validate, such as an empty or a text
+file, and begins `Risk findings added: 1 high (invalid_safetensors).`, because the
+finding the collector now stores is new on the record.
+
+The `invalid_safetensors` gate is unchanged: `risk` raises it for either record, and
+the collector stores the finding on a record without `serialization_format`, so that
+a release up to 0.2.0, which derives it from that field alone, still fails the gate
+on an inventory this release wrote.
 
 Consumers must handle unknown values explicitly. In particular, avoid boolean
 coercion (`if not value`) when false and unknown have different consequences.
