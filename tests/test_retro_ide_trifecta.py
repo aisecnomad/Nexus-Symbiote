@@ -60,7 +60,9 @@ def test_external_272_scoped_mcp_rules_grant_no_server(rule: str) -> None:
     assert _broad_grants([rule]) == []
 
 
-@pytest.mark.parametrize("rule", ["mcp__docs", "mcp__docs__*", "mcp__server", "mcp__server__*"])
+@pytest.mark.parametrize(
+    "rule", ["mcp__docs", "mcp__docs__*", "mcp__docs__**", "mcp__server", "mcp__server__*"]
+)
 def test_per_server_mcp_allow_is_that_servers_grant_only(tmp_path: Path, rule: str) -> None:
     """A whole server is auto-approved. Its trifecta legs come from its declared tools."""
     assert _broad_grants([rule]) == ["MCP server tools"]

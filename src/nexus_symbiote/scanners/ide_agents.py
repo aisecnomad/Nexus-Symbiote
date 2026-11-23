@@ -369,10 +369,10 @@ def _broad_grants(allowed: list[str]) -> list[str]:
         if key.startswith("mcp__"):
             # Claude Code skips an unanchored allow glob (`mcp__*`, `mcp__*__*`) and
             # an `mcp__` rule with parentheses. A bare `mcp__server` and
-            # `mcp__server__*` auto-approve that server's own tools.
+            # `mcp__server__*` (or `mcp__server__**`) auto-approve that server's own tools.
             if not _claude_skips_mcp_allow(rule) and "(" not in rule and ")" not in rule:
-                server = key.removeprefix("mcp__")
-                whole_server = "__" not in server or server.endswith("__*")
+                server, sep, tool_glob = key.removeprefix("mcp__").partition("__")
+                whole_server = not sep or (bool(tool_glob) and set(tool_glob) == {"*"})
                 if whole_server and specifier in (None, "", "*"):
                     classes.add("MCP server tools")
             continue
