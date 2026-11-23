@@ -271,7 +271,8 @@ characters. Verification does not compare it with the file name you pass.
 Unlike the runtime contracts (whose subject is a contract digest), the subject here is
 a file, as generic in-toto tooling expects. The predicate type names Hunzee-VC (the
 repository's organization when the type was minted); the runtime contracts name
-aisecnomad. Both are stable identifiers, not links.
+aisecnomad. Both are stable identifiers, not links, and do not change when the
+repository moves.
 
 The predicate:
 
