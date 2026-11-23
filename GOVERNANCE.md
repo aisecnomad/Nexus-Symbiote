@@ -72,7 +72,7 @@ The maintainer's open actions (no repository change can do these): give a second
 
 ## Future governance
 
-Additional maintainers, architectural RFCs and broader decision processes may be introduced as participation grows. Governance changes follow the same review process, including who owns the decision and which external controls are actually active.
+Additional maintainers, architectural RFCs and broader decision processes may be introduced as participation grows. Changes to governance should be documented through the same review process, including who owns the decision and which external controls are actually active.
 
 ## Supported surface (1.0 contract)
 
