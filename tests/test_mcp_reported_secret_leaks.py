@@ -272,3 +272,47 @@ def test_setx_command_and_machine_flag_withhold_credential(
 ) -> None:
     bad = {"command": command, "args": args}
     assert SECRET not in _mcp(tmp_path, bad, SECRET)
+
+
+def test_scheme_flag_operands_rejects_hyphenated_words_in_linear_time() -> None:
+    from nexus_symbiote.scanners.mcp import _scheme_flag_operands
+    from tests.support import scaling_ratio
+
+    assert _scheme_flag_operands(f"Bearer-foo {SECRET}") == []
+    assert _scheme_flag_operands(f"X-Bearer --tls {SECRET}") == []
+    assert _scheme_flag_operands("Bearer-" * 4_000 + f" {SECRET}") == []
+    ratio = scaling_ratio(
+        lambda scale: _scheme_flag_operands("Bearer-" * (500 * scale) + f" {SECRET}")
+    )
+    assert ratio < 10.0
+
+
+@pytest.mark.parametrize("scheme", ["DPoP", "HOBA"])
+def test_dpop_and_hoba_scheme_flags_withhold_credential(tmp_path: Path, scheme: str) -> None:
+    bad = {
+        "command": "npx",
+        "args": ["-y", "x@1", "--header", f"Authorization: {scheme} --tls {SECRET}"],
+    }
+    assert SECRET not in _mcp(tmp_path, bad, SECRET)
+
+
+@pytest.mark.parametrize(
+    ("command", "head_args"),
+    [
+        ("cmd", ["/c", "set", "API_TOKEN", SECRET]),
+        ("cmd", ["/c", "setx", "API_TOKEN", SECRET]),
+        ("curl", ["-u", f"user:{SECRET}"]),
+    ],
+)
+def test_overflow_args_withhold_set_setx_and_fetcher_credentials(
+    tmp_path: Path, command: str, head_args: list[str]
+) -> None:
+    args = [*head_args, *(["pad"] * 1_000)]
+    bad = {"command": command, "args": args}
+    assert SECRET not in _mcp(tmp_path, bad, SECRET)
+
+
+def test_setx_withholds_base64_padded_secret(tmp_path: Path) -> None:
+    padded_value = "dG9rZW4xMjM0NTY3ODkw=="
+    bad = {"command": "cmd", "args": ["/c", "setx", "API_TOKEN", padded_value]}
+    assert padded_value not in _mcp(tmp_path, bad, padded_value)

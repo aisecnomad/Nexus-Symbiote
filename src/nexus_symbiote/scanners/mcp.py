@@ -844,7 +844,7 @@ _TOOL_FILTER_FIELDS = (
 _TOOL_LIST_FIELDS = (*_TOOL_APPROVAL_FIELDS, *_TOOL_FILTER_FIELDS)
 
 
-_SCHEME_HEAD = re.compile(r"(?i)\b(?:Bearer|Basic|Token|Bot|ApiKey|Api-Key)\b")
+_SCHEME_HEAD = re.compile(r"(?i)\b(?:Bearer|Basic|Token|Bot|ApiKey|Api-Key|DPoP|HOBA)\b")
 # Flags between a scheme word and its credential. One forward pass, so the scan is
 # linear in the text and stops after this many flags.
 _MAX_FLAGS_BEFORE_CREDENTIAL = 64
@@ -855,26 +855,33 @@ def _scheme_flag_operands(value: str) -> list[str]:
 
     ``Bearer --tls --insecure <token>`` hides the token behind flags. Each scheme is
     scanned in place with an integer index so work stays linear, and at most
-    ``_MAX_FLAGS_BEFORE_CREDENTIAL`` flags are skipped.
+    ``_MAX_FLAGS_BEFORE_CREDENTIAL`` flags are skipped. Whitespace must separate
+    the scheme word from the first flag and the last flag from the credential so
+    hyphenated words such as ``Bearer-foo`` neither match nor rescan quadratically.
     """
     found: list[str] = []
     length = len(value)
     for match in _SCHEME_HEAD.finditer(value):
+        if match.start() > 0 and value[match.start() - 1] == "-":
+            continue
         pos = match.end()
         flags = 0
         while flags < _MAX_FLAGS_BEFORE_CREDENTIAL:
+            ws_start = pos
             while pos < length and value[pos].isspace():
                 pos += 1
-            if pos >= length or value[pos] != "-":
+            if pos == ws_start or pos >= length or value[pos] != "-":
+                pos = ws_start
                 break
             while pos < length and not value[pos].isspace():
                 pos += 1
             flags += 1
         if flags == 0:
             continue
+        ws_start = pos
         while pos < length and value[pos].isspace():
             pos += 1
-        if pos >= length or value[pos] == "-":
+        if pos == ws_start or pos >= length or value[pos] == "-":
             continue
         end = pos
         while end < length and not value[end].isspace():
@@ -1765,29 +1772,49 @@ def _values_after_credential_flags(args: Sequence[Any]) -> list[str]:
     return found
 
 
-def _overflow_argument_secrets(args: Sequence[Any]) -> list[str]:
+def _overflow_argument_secrets(args: Sequence[Any], command: str = "") -> list[str]:
     """Credentials of an argument list past the server's argument limit.
 
-    The launch rules are read in full. Once they name more than
-    ``MAX_CREDENTIAL_POSITIONS`` values, keeping only that prefix would publish
-    the rest: every value after a credential flag is withheld instead, and when
-    that set is still past the cap, every long argument is.
+    Both launch rules and credential-hit rules (including ``set``/``setx`` and
+    fetcher ``-u`` credentials) are read up to ``MAX_SECRETS_PER_FILE + 1``
+    unique values. Once they name more than ``MAX_CREDENTIAL_POSITIONS`` values,
+    every value after a credential flag is withheld too, and when that set is
+    still past the cap, long non-flag arguments are withheld up to the
+    fail-closed file budget so decoys cannot push out real secrets or cause
+    unbounded memory growth.
     """
-    recognized = list(dict.fromkeys(_launch_secrets(Launch(), args, "")))
+    cap = MAX_SECRETS_PER_FILE + 1
+    recognized: dict[str, None] = {}
+    for value in _launch_secrets(Launch(), args, command):
+        recognized[value] = None
+        if len(recognized) >= cap:
+            return list(recognized)
+    for _, _, arg_hits in _credential_hits({}, list(args), [], [], command):
+        for _, literal in arg_hits:
+            if literal:
+                recognized[literal] = None
+                if len(recognized) >= cap:
+                    return list(recognized)
     if len(recognized) <= MAX_CREDENTIAL_POSITIONS:
-        return recognized
+        return list(recognized)
     flagged = list(dict.fromkeys(_values_after_credential_flags(args)))
+    for value in flagged:
+        recognized[value] = None
+        if len(recognized) >= cap:
+            return list(recognized)
     if len(flagged) <= MAX_CREDENTIAL_POSITIONS:
-        return list(dict.fromkeys([*recognized, *flagged]))
-    withheld = [
-        item
-        for item in args
-        if isinstance(item, str)
-        and not item.startswith("-")
-        and len(item) >= MIN_SECRET_LENGTH
-        and not is_reference(item)
-    ]
-    return list(dict.fromkeys([*recognized, *flagged, *withheld]))
+        return list(recognized)
+    for item in args:
+        if (
+            isinstance(item, str)
+            and not item.startswith("-")
+            and len(item) >= MIN_SECRET_LENGTH
+            and not is_reference(item)
+        ):
+            recognized[item] = None
+            if len(recognized) >= cap:
+                return list(recognized)
+    return list(recognized)
 
 
 def _ignorable_command_char(char: str) -> bool:
@@ -1801,7 +1828,7 @@ def _command_text_for_hash(
     exported_command: str | None = None,
     scrubber: SecretScrubber | None = None,
 ) -> str | None:
-    """The raw command when whitespace or a format character changes a safe command.
+    """The raw command when leading/trailing whitespace or format characters alter a safe command.
 
     Redacted commands, secret-bearing values, filesystem paths, and non-safe
     command cores stay out of the unkeyed ``static_config_hash`` so credentials
@@ -1825,8 +1852,6 @@ def _command_text_for_hash(
         return None
     if (start, end) != (0, len(command)):
         return command
-    if any(unicodedata.category(char) in {"Zs", "Cf"} for char in command):
-        return command
     return None
 
 
@@ -1848,7 +1873,8 @@ def _set_value_hits(
     """``set NAME value`` and ``setx [/M] NAME value`` with no ``=``.
 
     cmd and ``setx`` both accept the value as the next word. A credential-named
-    variable's value is committed even when the command spells no equals sign.
+    variable's value is committed even when the command spells no equals sign,
+    including base64-padded values ending in ``=``.
     """
     is_setter = _set_command(setter) or (
         isinstance(setter, str)
@@ -1860,7 +1886,6 @@ def _set_value_hits(
         or not isinstance(name, str)
         or not name
         or "=" in name
-        or "=" in value
         or value.startswith("-")
         or not credential_name(name)
         or is_reference(value)
@@ -3844,21 +3869,28 @@ class MCPScanner(Scanner):
                 continue
             values.extend(_shape_credentials(config, shape))
             if cls._server_problem(config, shape) is not None:
-                hits = _declared_hits(config)
-                declared, read = config, hits
                 args = config.get("args")
-                if isinstance(args, list) and len(args) > min(MAX_ARGUMENTS, MAX_LIST_ENTRIES):
+                overflow_args = isinstance(args, list) and len(args) > min(
+                    MAX_ARGUMENTS, MAX_LIST_ENTRIES
+                )
+                declared = (
+                    {field: item for field, item in config.items() if field != "args"}
+                    if overflow_args
+                    else config
+                )
+                hits = _declared_hits(declared)
+                if overflow_args and isinstance(args, list):
                     # A refused argument list must not publish a credential past the
-                    # position cap. Within the cap, the credentials the launch rules
-                    # read are withheld. Past it, every value after a credential flag
-                    # is withheld, and if that set is still past the cap the whole
-                    # argument list is, so a decoy cannot push the real secret out.
-                    declared = {field: item for field, item in config.items() if field != "args"}
-                    read = [hit for hit in hits if hit[0] != "argument"]
-                    values.extend(_overflow_argument_secrets(args))
+                    # position cap. Within the cap, the credentials the launch and
+                    # credential-hit rules read are withheld. Past it, every value after
+                    # a credential flag is withheld, and if that set is still past the
+                    # cap, long arguments are withheld up to the fail-closed file limit.
+                    raw_command = config.get("command")
+                    command_text = raw_command if isinstance(raw_command, str) else ""
+                    values.extend(_overflow_argument_secrets(args, command_text))
                 for field, value in cls._invalid_field_values(declared, shape):
                     values.extend(_malformed_values(value, field))
-                values.extend(_server_secrets(declared, Launch(), read))
+                values.extend(_server_secrets(declared, Launch(), hits))
                 if server_hits is not None:
                     server_hits[id(config)] = hits
                 continue
