@@ -215,6 +215,89 @@ def test_already_closed_refusal_paths_still_withhold_the_secret(tmp_path: Path, 
     assert SECRET not in _mcp(tmp_path, bad, SECRET)
 
 
+def test_flags_past_the_cap_withhold_the_whole_argument(tmp_path: Path) -> None:
+    flags = ["--f"] * 65
+    arguments = _mcp(
+        tmp_path / "args",
+        {"command": "npx", "args": ["-y", "x@1", "--auth", "bearer", *flags, SECRET]},
+        SECRET,
+    )
+    assert SECRET not in arguments and "repeat" in arguments
+    header = "Authorization: Bearer " + " ".join(flags) + " " + SECRET
+    recorded = _mcp(
+        tmp_path / "header",
+        {"command": "npx", "args": ["-y", "x@1", "--header", header]},
+        SECRET,
+    )
+    assert SECRET not in recorded and "repeat" in recorded
+
+
+def test_a_secret_command_is_not_stored_casefolded(tmp_path: Path) -> None:
+    folded = SECRET.casefold()
+    text = _mcp(tmp_path, {"command": SECRET, "args": ["-y", "x@1"]}, folded)
+    assert SECRET not in text
+    assert folded not in text
+    server = next(
+        item for item in json.loads(text) if "static_config_hash" in item.get("properties", {})
+    )
+    assert server["command"] == "[redacted-command]"
+
+
+def test_a_path_command_does_not_share_the_basename_digest(tmp_path: Path) -> None:
+    def digest(command: str) -> str:
+        text = _scan(
+            tmp_path / command.encode().hex(),
+            ".mcp.json",
+            {"mcpServers": {"s": {"command": command, "args": ["-y", "x@1"]}}},
+        )
+        server = next(
+            item for item in json.loads(text) if "static_config_hash" in item.get("properties", {})
+        )
+        return server["properties"]["static_config_hash"]
+
+    assert digest("/tmp/npx") != digest("npx")  # noqa: S108
+
+
+@pytest.mark.parametrize("mark", ["\u200b", "\u202e", "\u00a0", "\ufe0f", "\U000e0100"])
+def test_clean_and_marked_passwords_scrub_each_other(tmp_path: Path, mark: str) -> None:
+    marked = SECRET[:8] + mark + SECRET[8:]
+    assert marked not in _mcp(
+        tmp_path / "clean",
+        {"command": "npx", "args": ["-y", "x@1", "--password", SECRET]},
+        marked,
+    )
+    assert SECRET not in _mcp(
+        tmp_path / "marked",
+        {"command": "npx", "args": ["-y", "x@1", "--password", marked]},
+        SECRET,
+    )
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"API_TOKEN": [SECRET, "note"]},
+        {"API_TOKEN": {"value": SECRET}},
+    ],
+)
+def test_a_non_string_credential_value_is_withheld(tmp_path: Path, env: dict) -> None:
+    recorded = _mcp(
+        tmp_path,
+        {"command": "npx", "args": ["-y", "x@1"], "env": env},
+        SECRET,
+    )
+    assert SECRET not in recorded and "repeat" in recorded
+
+
+def test_a_slash_password_flag_withholds_the_value(tmp_path: Path) -> None:
+    recorded = _mcp(
+        tmp_path,
+        {"command": "npx", "args": ["-y", "x@1", "/password", SECRET]},
+        SECRET,
+    )
+    assert SECRET not in recorded and "repeat" in recorded
+
+
 def test_server_component_is_still_recorded_for_a_padded_command(tmp_path: Path) -> None:
     text = _scan(
         tmp_path,

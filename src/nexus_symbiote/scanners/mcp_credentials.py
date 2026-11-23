@@ -21,6 +21,7 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 from nexus_symbiote.utils.secrets import (
     MIN_SECRET_LENGTH,
     TOKEN_SHAPE,
+    SecretScrubber,
     authorization_header,
     credential_shaped,
     private_key_block,
@@ -331,18 +332,135 @@ def name_words(name: str) -> list[str]:
     return [word.lower() for word in _NAME_PARTS.split(name) if word and not word.isdigit()]
 
 
-def credential_spellings(value: str) -> tuple[str, ...]:
-    """``value`` and the same credential with format, bidi and zero-width characters removed.
+def _ignored_credential_char(char: str) -> bool:
+    """Format characters, variation selectors, and Unicode or ASCII whitespace."""
+    if char.isspace() or unicodedata.category(char) in {"Cf", "Zs"}:
+        return True
+    code = ord(char)
+    return 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF
 
-    A sibling can repeat ``--password`` text without the U+200B or U+202E that the
-    launch value used to disguise it. Those characters are category Cf, as are the
-    other bidi controls and zero-width marks, so the plain spelling is what matching
-    compares.
+
+def _normalize_credential_map(value: str) -> tuple[str, list[int]]:
+    """Normalized text and the original index of each kept character."""
+    chars: list[str] = []
+    mapping: list[int] = []
+    for index, char in enumerate(value):
+        for piece in unicodedata.normalize("NFKC", char):
+            if _ignored_credential_char(piece):
+                continue
+            chars.append(piece)
+            mapping.append(index)
+    return "".join(chars), mapping
+
+
+def _merged_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not spans:
+        return []
+    spans.sort()
+    merged = [spans[0]]
+    for start, end in spans[1:]:
+        if start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def normalize_credential(value: str) -> str:
+    """NFKC, then drop Cf, variation selectors and whitespace.
+
+    Applied to a stored credential and to the text it is matched against, so a clean
+    password scrubs a marked sibling and a marked password scrubs the clean spelling.
     """
-    plain = "".join(char for char in value if unicodedata.category(char) != "Cf")
+    text = unicodedata.normalize("NFKC", value)
+    return "".join(char for char in text if not _ignored_credential_char(char))
+
+
+def credential_spellings(value: str) -> tuple[str, ...]:
+    """``value`` and its normalized spelling, when that spelling still reads as a secret."""
+    plain = normalize_credential(value)
     if plain and plain != value and len(plain) >= MIN_SECRET_LENGTH:
         return (value, plain)
     return (value,)
+
+
+def _text_needs_credential_normalize(text: str) -> bool:
+    """Whether matching ``text`` has to ignore marks or compatibility characters."""
+    for char in text:
+        code = ord(char)
+        if code < 128:
+            if char.isspace() and char != " ":
+                return True
+            continue
+        if _ignored_credential_char(char) or unicodedata.normalize("NFKC", char) != char:
+            return True
+    return False
+
+
+class CredentialScrubber(SecretScrubber):
+    """A scrubber that matches credentials after :func:`normalize_credential` on both sides."""
+
+    __slots__ = ("_all", "_plain")
+
+    def __init__(self, values: Iterable[str] = ()) -> None:
+        super().__init__(values)
+        self._bind_plain()
+
+    def _bind_plain(self) -> None:
+        # Only spellings that differ: ASCII text keeps the parent's linear search.
+        self._plain = SecretScrubber(
+            plain
+            for value in self._values
+            if (plain := normalize_credential(value)) != value and len(plain) >= MIN_SECRET_LENGTH
+        )
+        self._all: SecretScrubber | None = None
+
+    def _all_plain(self) -> SecretScrubber:
+        cached = self._all
+        if cached is None:
+            cached = SecretScrubber(
+                plain
+                for value in self._values
+                if len(plain := normalize_credential(value)) >= MIN_SECRET_LENGTH
+            )
+            self._all = cached
+        return cached
+
+    def extended(self, values: Iterable[str]) -> CredentialScrubber:
+        base = super().extended(values)
+        if base is self:
+            return self
+        created = CredentialScrubber()
+        created._values = base._values
+        created._periods = base._periods
+        created._shortest = base._shortest
+        created._bind_plain()
+        return created
+
+    def contains(self, text: str) -> bool:
+        if super().contains(text):
+            return True
+        if self._plain.contains(text):
+            return True
+        if not _text_needs_credential_normalize(text):
+            return False
+        normalized = normalize_credential(text)
+        return bool(normalized) and self._all_plain().contains(normalized)
+
+    def spans(self, text: str) -> list[tuple[int, int]]:
+        found = list(super().spans(text))
+        if self._plain:
+            found.extend(self._plain.spans(text))
+        if not _text_needs_credential_normalize(text):
+            return _merged_spans(found) if found else found
+        normalized, mapping = _normalize_credential_map(text)
+        if not normalized or not mapping:
+            return found
+        for start, end in self._all_plain().spans(normalized):
+            if start < len(mapping) and end <= len(mapping):
+                found.append((mapping[start], mapping[end - 1] + 1))
+        return _merged_spans(found)
 
 
 def credential_name(name: str) -> bool:

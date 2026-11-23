@@ -71,6 +71,7 @@ from nexus_symbiote.scanners.mcp_credentials import (
     NAMED_CLASS,
     SCHEME_CLASS,
     SHAPE_CLASS,
+    CredentialScrubber,
     Hit,
     WrappedKeySearchLimitError,
     assignment_hits,
@@ -845,9 +846,45 @@ _TOOL_LIST_FIELDS = (*_TOOL_APPROVAL_FIELDS, *_TOOL_FILTER_FIELDS)
 
 
 _SCHEME_HEAD = re.compile(r"(?i)\b(?:Bearer|Basic|Token|Bot|ApiKey|Api-Key)\b")
+_SLASH_FLAG = re.compile(r"/[A-Za-z][A-Za-z0-9_-]{0,63}")
+# Returned when a flag run passes the cap: the caller withholds the whole tail.
+_WITHHOLD_TAIL = "\x00"
 # Flags between a scheme word and its credential. One forward pass, so the scan is
 # linear in the text and stops after this many flags.
 _MAX_FLAGS_BEFORE_CREDENTIAL = 64
+
+
+def _tail_secrets(words: Sequence[str]) -> list[str]:
+    """The whole tail and each long word in it, withheld when a scan cap is hit."""
+    text = " ".join(words)
+    found = [text] if len(text) >= MIN_SECRET_LENGTH else []
+    found.extend(
+        word
+        for word in words
+        if len(word) >= MIN_SECRET_LENGTH and not word.startswith("-") and not is_reference(word)
+    )
+    return found
+
+
+def _bounded_words(value: str) -> list[str]:
+    """Long words of ``value``. Used when a cap forces the whole value to be withheld."""
+    return [
+        word
+        for word in value.split()
+        if len(word) >= MIN_SECRET_LENGTH and not word.startswith("-") and not is_reference(word)
+    ]
+
+
+def _is_bare_flag(word: str) -> bool:
+    """A flag token with no ``=value``, such as ``--tls`` or ``--insecure``."""
+    return word.startswith("-") and "=" not in word
+
+
+def _is_credential_flag(flag: str) -> bool:
+    """``--password`` and Windows ``/password``, not an ordinary path."""
+    if _CLI_FLAG.fullmatch(flag):
+        return True
+    return _SLASH_FLAG.fullmatch(flag) is not None and credential_name(flag)
 
 
 def _scheme_flag_operands(value: str) -> list[str]:
@@ -870,6 +907,16 @@ def _scheme_flag_operands(value: str) -> list[str]:
             while pos < length and not value[pos].isspace():
                 pos += 1
             flags += 1
+        else:
+            # The cap was hit while flags remain. The operand is not identifiable, so
+            # the whole value is withheld instead of recording nothing.
+            look = pos
+            while look < length and value[look].isspace():
+                look += 1
+            if look < length and value[look] == "-":
+                found.append(value)
+                found.extend(_bounded_words(value))
+                continue
         if flags == 0:
             continue
         while pos < length and value[pos].isspace():
@@ -889,6 +936,10 @@ def _scheme_secrets(value: str) -> list[str]:
     """``value`` and its bare credential when it is an auth scheme word and a credential."""
     credentials = list(scheme_credentials(value))
     for operand in _scheme_flag_operands(value):
+        if any(char.isspace() for char in operand):
+            # The flag cap was hit: this is the whole header or argument, not one operand.
+            credentials.append(operand)
+            continue
         if _public_scheme_following("--auth", "Bearer", operand, variable=False, in_set=False):
             continue
         credentials.extend(scheme_credentials(f"Bearer {operand}"))
@@ -1113,6 +1164,12 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
         values.extend(_shape_secrets(word))
         following = words[index + 1] if index + 1 < len(words) else None
         skipped = _credential_after_flag(words, index)
+        if skipped == _WITHHOLD_TAIL:
+            # Only a scheme word's unresolved tail is a credential. A run of
+            # ``--token=value`` arguments is not one.
+            if word.lower() in _ASSIGNMENT_SCHEMES:
+                values.extend(_tail_secrets(words[index:]))
+            skipped = None
         in_set = False
         if cmd and following is not None:
             prev = words[index - 1] if index > 0 else None
@@ -1169,9 +1226,10 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
         if index > 0:
             flag = words[index - 1]
             if (
-                _CLI_FLAG.fullmatch(flag)
+                _is_credential_flag(flag)
                 and flag.lower() not in _HEADER_FLAGS
                 and not word.startswith("-")
+                and not word.startswith("/")
                 and not is_reference(word)
                 and secret_like(flag, word)
             ):
@@ -1597,6 +1655,9 @@ def _withheld_scheme_operands(words: Sequence[str], *, cmd: bool) -> Iterator[st
         if not _public_scheme_following(name, value, following, variable=variable, in_set=in_set):
             yield from (literal for _, literal in value_hits(name, f"{value} {following}"))
         skipped = _credential_after_flag(words, index)
+        if skipped == _WITHHOLD_TAIL:
+            yield from _tail_secrets(words[index:])
+            continue
         if skipped is not None and not _public_scheme_following(
             name, value, skipped, variable=variable, in_set=in_set
         ):
@@ -1730,13 +1791,13 @@ def _credential_after_flag(words: Sequence[str], index: int) -> str | None:
     the word list stays linear.
     """
     cursor = index + 1
-    if cursor >= len(words) or not words[cursor].startswith("-"):
+    if cursor >= len(words) or not _is_bare_flag(words[cursor]):
         return None
     seen = 0
-    while cursor < len(words) and words[cursor].startswith("-"):
+    while cursor < len(words) and _is_bare_flag(words[cursor]):
         seen += 1
         if seen > _MAX_FLAGS_BEFORE_CREDENTIAL:
-            return None
+            return _WITHHOLD_TAIL
         cursor += 1
     if cursor >= len(words):
         return None
@@ -1753,9 +1814,10 @@ def _values_after_credential_flags(args: Sequence[Any]) -> list[str]:
             continue
         if (
             previous is not None
-            and _CLI_FLAG.fullmatch(previous)
+            and _is_credential_flag(previous)
             and credential_name(previous)
             and not item.startswith("-")
+            and not item.startswith("/")
             and len(item) >= MIN_SECRET_LENGTH
             and not is_reference(item)
         ):
@@ -1794,39 +1856,82 @@ def _ignorable_command_char(char: str) -> bool:
     return char.isspace() or unicodedata.category(char) in {"Zs", "Cf"}
 
 
+_STRUCTURE_NODES = 4096
+
+
+def _string_leaves(node: Any) -> list[str]:
+    """String leaves of a non-string credential value.
+
+    A list or dict under a credential key is withheld whole: every string leaf is
+    scrubbed. Past the node cap the unread remainder is not dropped; the value's
+    JSON text is withheld too, which still carries those leaves.
+    """
+    found: list[str] = []
+    pending: list[Any] = [node]
+    seen = 0
+    while pending:
+        seen += 1
+        if seen > _STRUCTURE_NODES:
+            try:
+                found.append(json.dumps(node, default=str))
+            except (TypeError, ValueError):
+                found.append(str(node))
+            break
+        item = pending.pop()
+        if isinstance(item, str):
+            if len(item) >= MIN_SECRET_LENGTH:
+                found.append(item)
+        elif isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+        else:
+            text = str(item)
+            if len(text) >= MIN_SECRET_LENGTH:
+                found.append(text)
+    return found
+
+
+def _command_basename(command: str) -> str:
+    return re.split(r"[\\/]", command.strip().strip("\"'"))[-1]
+
+
+def _segment_is_secret(text: str, scrubber: SecretScrubber | None) -> bool:
+    """Whether ``text`` is a credential before any case-folding."""
+    if not text:
+        return False
+    if scrubber is not None and scrubber.contains(text):
+        return True
+    if TOKEN_SHAPE.search(text):
+        return True
+    return len(text) >= MIN_SECRET_LENGTH and literal_value(text)
+
+
+def _command_has_secret(command: str, scrubber: SecretScrubber | None) -> bool:
+    """Whether the command or one of its path segments is a credential."""
+    parts = [command.strip().strip("\"'")]
+    parts.extend(re.split(r"[\\/]", command))
+    return any(_segment_is_secret(part.strip().strip("\"'"), scrubber) for part in parts)
+
+
 def _command_text_for_hash(
     command: object,
     *,
     exported_command: str | None = None,
     scrubber: SecretScrubber | None = None,
 ) -> str | None:
-    """The raw command when whitespace or a format character changes a safe command.
+    """The exact raw command when it is not the exported name.
 
-    Redacted commands, secret-bearing values, filesystem paths, and non-safe
-    command cores stay out of the unkeyed ``static_config_hash`` so credentials
-    and local paths cannot be probed offline through the public digest.
+    ``/tmp/npx`` and ``npx`` must not share a digest. A command or path segment that
+    is itself a credential stays out of the unkeyed hash.
     """
     if not isinstance(command, str) or not command:
         return None
-    if exported_command is None or exported_command == "[redacted-command]":
+    if _command_has_secret(command, scrubber):
         return None
-    if re.search(r"[\\/]", command):
+    if exported_command is not None and command == exported_command:
         return None
-    if scrubber is not None and scrubber.contains(command):
-        return None
-    start, end = 0, len(command)
-    while start < end and _ignorable_command_char(command[start]):
-        start += 1
-    while end > start and _ignorable_command_char(command[end - 1]):
-        end -= 1
-    core = command[start:end]
-    if not core or not _SAFE_NAME.fullmatch(core) or TOKEN_SHAPE.search(core):
-        return None
-    if (start, end) != (0, len(command)):
-        return command
-    if any(unicodedata.category(char) in {"Zs", "Cf"} for char in command):
-        return command
-    return None
+    return command
 
 
 def _cmd_set_word(previous: str | None, before_previous: str | None) -> bool:
@@ -2092,6 +2197,8 @@ def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
                 use_shape = (value_record and key in {"value", "values"}) or (
                     unlabelled and (inferred or credential_name(name))
                 )
+                if not isinstance(value, str) and isinstance(key, str) and credential_name(key):
+                    yield from _string_leaves(value)
                 pending.append((str(key), value, use_shape))
         elif isinstance(item, list):
             # ``["API_TOKEN", "<secret>", ...]``: an env entry of any length. The
@@ -2099,13 +2206,16 @@ def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
             if (
                 len(item) >= 2
                 and isinstance(item[0], str)
-                and isinstance(item[1], str)
                 and (
                     credential_name(item[0])
                     or name.lower() in {"env", "environment", "command.env"}
                 )
             ):
-                pending.append((item[0], item[1], True))
+                if isinstance(item[1], str):
+                    pending.append((item[0], item[1], True))
+                else:
+                    # A list or dict under the credential name is not a string value.
+                    yield from _string_leaves(item[1])
             if name in {"", "args", "command", "command.args"}:
                 for index, word in enumerate(item):
                     if isinstance(word, str):
@@ -2163,6 +2273,11 @@ def _server_secrets(
     text or a name that repeats one is scrubbed or withheld as a scrubbed value is.
     """
     values: list[str] = []
+    raw_command = config.get("command")
+    if isinstance(raw_command, str):
+        basename = _command_basename(raw_command)
+        if _segment_is_secret(basename, None):
+            values.extend((raw_command, basename, basename.casefold()))
     for key, item in config.items():
         # A top-level ``apiKey`` (and any other credential-named string) is not an
         # environment map, but a sibling tool can still repeat it.
@@ -2174,9 +2289,11 @@ def _server_secrets(
         mapping = config.get(field)
         if isinstance(mapping, dict):
             values.extend(secret_values(mapping))
-            for item in mapping.values():
+            for key, item in mapping.items():
                 if isinstance(item, str):
                     values.extend(_shape_secrets(item))
+                elif isinstance(key, str) and credential_name(key):
+                    values.extend(_string_leaves(item))
     for field in ("oauth", "auth"):
         settings = config.get(field)
         if isinstance(settings, dict):
@@ -3663,7 +3780,9 @@ class MCPScanner(Scanner):
         # every file would cost the square of the number of nested client files.
         pending_refs: dict[str, set[str]] = {}
         parsed: dict[str, tuple[Any, list[str]]] = {}
-        collected: list[tuple[McpDialect, dict[str, Any], _Entries, SecretScrubber, dict[int, Any]]]
+        collected: list[
+            tuple[McpDialect, dict[str, Any], _Entries, CredentialScrubber, dict[int, Any]]
+        ]
         collected, literals = [], []
         for path in paths:
             dialect = _dialect(path)
@@ -3724,7 +3843,7 @@ class MCPScanner(Scanner):
                 continue
             if known is not None and wrapped_found:
                 known.add(wrapped_found)
-            file_secrets = SecretScrubber(unique)
+            file_secrets = CredentialScrubber(unique)
             collected.append((dialect, data, read, file_secrets, server_hits))
         # A name may repeat a literal of any client file, so every file is read first.
         names = _Names(literals)
@@ -3866,7 +3985,7 @@ class MCPScanner(Scanner):
         scrubber = (
             file_secrets
             if file_secrets is not None
-            else SecretScrubber(_server_secrets(config, launch))
+            else CredentialScrubber(_server_secrets(config, launch))
         )
         # A name may repeat what only this server's text holds and no rule reads as a
         # credential: URL user information, or `NAME=value` passed to a launcher such
@@ -4170,7 +4289,7 @@ class MCPScanner(Scanner):
             credential_hits = _server_hits(config)
         scrubber = file_secrets
         if scrubber is None:
-            scrubber = SecretScrubber(_server_secrets(config, launch, credential_hits))
+            scrubber = CredentialScrubber(_server_secrets(config, launch, credential_hits))
         own = _server_literals(config, credential_hits)
         names = (names or _Names(own).scoped(scrubber.values)).scoped(own=own)
         cwd = config.get("cwd")
@@ -4453,10 +4572,18 @@ class MCPScanner(Scanner):
         shown_name = redact_text(name, scrubber, identifier=True)
         if scrubber.contains(name):
             withheld.append("name")
-        command = self._safe_name(launch.command)
-        if launch.command and scrubber.contains(launch.command):
+        raw_command = config.get("command")
+        basename = _command_basename(raw_command) if isinstance(raw_command, str) else ""
+        command: str | None
+        if basename and _segment_is_secret(basename, scrubber):
+            # Detect before normalize_command case-folds the secret into a safe name.
             command = "[redacted-command]"
             withheld.append("command")
+        else:
+            command = self._safe_name(launch.command)
+            if launch.command and scrubber.contains(launch.command):
+                command = "[redacted-command]"
+                withheld.append("command")
         # The effective command can come from the arguments, whose values never
         # leave; only a recognised runner, wrapper or interpreter name is exported.
         executable = launch.executable if known_executable(launch.executable) else None
@@ -4503,9 +4630,15 @@ class MCPScanner(Scanner):
     def _safe_name(value: str | None) -> str | None:
         if value is None:
             return None
-        if _SAFE_NAME.fullmatch(value) and not TOKEN_SHAPE.search(value):
-            return value
-        return "[redacted-command]"
+        # The folded name is what would be stored. A credential is refused here too,
+        # after the raw command was already checked before case-folding.
+        if (
+            not _SAFE_NAME.fullmatch(value)
+            or TOKEN_SHAPE.search(value)
+            or (len(value) >= MIN_SECRET_LENGTH and literal_value(value))
+        ):
+            return "[redacted-command]"
+        return value
 
     def _package_sources(
         self,
@@ -5098,7 +5231,7 @@ class MCPScanner(Scanner):
         tools_config = config.get("tools", [])
         tool_comps = []
         seen_refs: set[str] = set()
-        scrubber = secrets if secrets is not None else SecretScrubber()
+        scrubber = secrets if secrets is not None else CredentialScrubber()
 
         if isinstance(tools_config, list):
             for tool_def in tools_config:
