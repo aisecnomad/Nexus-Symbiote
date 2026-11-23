@@ -106,7 +106,8 @@ above. The serial number does not change: recorded time is not content.
 
 CycloneDX writes that instant as `metadata.timestamp` and SPDX as
 `CreationInfo.created`, so the same inputs give byte-identical native JSON, CycloneDX
-and SPDX files. SARIF records file locations relative to the working directory when the
+and SPDX files, and `vex` gives identical documents for them. SARIF records file
+locations relative to the working directory when the
 scanned directory lies below it, and relative to the scanned directory otherwise. Two
 SARIF files are identical when the scanned directory is at one path below the working
 directory in both scans, or below it in neither: a scan from inside the scanned
