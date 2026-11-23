@@ -51,6 +51,7 @@ from nexus_symbiote.scanners.source_binding import BindingError, value_binding
 from nexus_symbiote.settings_precedence import (
     _VERSIONED_INTERPRETER,
     MAX_FRONTMATTER_YAML_NODES,
+    _claude_skips_mcp_allow,
     evaluate_tool_oversight,
     extract_bounded_deny_rules,
     extract_bounded_sandbox_domains,
@@ -349,6 +350,17 @@ def _runs_any_command(program: str, arguments: str, wildcard: bool = False) -> b
     return name in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(name) is not None
 
 
+def _misspelled_mcp_allow(rule: str) -> bool:
+    """Whether ``rule`` uses ``mcp__`` with the wrong case, which Claude Code ignores."""
+    head = rule.strip().partition("(")[0].strip()
+    return head.lower().startswith("mcp__") and not head.startswith("mcp__")
+
+
+def _deny_covers_every_mcp_server(rules: list[str]) -> bool:
+    """Whether a deny list blocks every MCP server, as ``*`` or ``mcp__*`` does."""
+    return any(rule.strip() in {"*", "mcp__*"} for rule in rules)
+
+
 def _broad_grants(allowed: list[str]) -> list[str]:
     """Capability classes that the allow list grants without a narrowing specifier."""
     classes: set[str] = set()
@@ -365,16 +377,16 @@ def _broad_grants(allowed: list[str]) -> list[str]:
                 continue
             specifier = rest[:-1].strip()
         key = tool.lower()
-        if key.startswith("mcp__"):
-            # A whole-server rule is reported as a blanket grant. Its class carries no
-            # trifecta leg: Claude Code honours an allow glob only after a literal
-            # `mcp__<server>__` prefix and skips an unanchored one such as `mcp__*` or
-            # `mcp__*__*`, which auto-approves nothing (code.claude.com/docs/en/permissions,
-            # "Tool name wildcards"), and a single server's tools are its own declared ones.
-            server = key.removeprefix("mcp__")
-            whole_server = "__" not in server or server.endswith("__*")
-            if server in {"", "*"} or (whole_server and specifier in (None, "", "*")):
-                classes.add("MCP server tools")
+        if tool.startswith("mcp__"):
+            # Claude Code skips an unanchored allow glob (`mcp__*`, `mcp__*__*`) and
+            # an `mcp__` rule with parentheses. A bare `mcp__server` and
+            # `mcp__server__*` auto-approve that server's own tools. The prefix is
+            # case-sensitive, and only the single token `*` is the server wildcard.
+            if not _claude_skips_mcp_allow(rule) and "(" not in rule and ")" not in rule:
+                server, sep, tool_glob = tool[5:].partition("__")
+                whole_server = not sep or tool_glob == "*"
+                if whole_server and server and specifier in (None, "", "*"):
+                    classes.add("MCP server tools")
             continue
         if "*" in key or "?" in key:
             # An unanchored allow glob such as `B*` or `Ba*(node:*)` is skipped too.
@@ -3506,6 +3518,24 @@ class IDEAgentScanner(Scanner):
             mode = properties.get("approval_policy")
             toml_mode = True
         broad = self._broad_permissions(settings or {}, ide_type, result)
+        permissions = (settings or {}).get("permissions")
+        allowed = permissions.get("allow") if isinstance(permissions, dict) else None
+        if (
+            ide_type == "claude-code"
+            and isinstance(allowed, list)
+            and any(isinstance(rule, str) and _misspelled_mcp_allow(rule) for rule in allowed)
+        ):
+            risks.append(
+                RiskAssessment(
+                    severity=RiskSeverity.INFO,
+                    category="permission_scope",
+                    detail=(
+                        f"IDE agent '{ide_type}' declares an allow rule whose mcp__ prefix "
+                        "is not lowercase, so Claude Code does not honour it."
+                    ),
+                    recommendation="Spell the MCP prefix as mcp__.",
+                )
+            )
         if broad:
             risks.insert(
                 0,
@@ -4246,7 +4276,17 @@ class IDEAgentScanner(Scanner):
         if not isinstance(allowed, list) or not all(isinstance(value, str) for value in allowed):
             result.scan_failures.append(f"{ide_type}: invalid declared permission allow-list")
             return []
-        return _broad_grants(allowed)
+        grants = _broad_grants(allowed)
+        denied = permissions.get("deny", [])
+        if (
+            isinstance(denied, list)
+            and all(isinstance(value, str) for value in denied)
+            and _deny_covers_every_mcp_server(denied)
+        ):
+            # `deny: ["mcp__*"]` blocks the whole-server allow, so the medium
+            # "MCP server tools" allowance is not what the file leaves in force.
+            grants = [item for item in grants if item != "MCP server tools"]
+        return grants
 
     def _scan_extensions(self, files: ConfinedCollection, result: ScanResult) -> None:
         relative = ".vscode/extensions.json"
