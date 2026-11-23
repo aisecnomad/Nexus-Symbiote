@@ -209,12 +209,13 @@ reviewed and the new collection with the same release and the same options.
 A trusted key is a trust anchor: whoever can write it decides which attestations
 verify. `verify-attestation` refuses (exit 2) a `--trusted-key` inside a git working
 tree that also holds SUBJECT, ENVELOPE or the current directory. The key's path and
-device/inode of each parent directory are compared with each working tree, so symlinks,
-case variants and bind mounts of the tree do not hide the key. A key file with other
-hard links is refused too.
+device/inode of each parent directory are compared with each working tree, so another
+name for the working-tree directory itself, such as symlinks, case variants and bind
+mounts of the tree, does not hide the key. A key file with other hard links is refused
+too.
 
-A mount of a file inside a working tree is not detected, because the key then has a
-location outside the tree: `docker run -v "$PWD/keys:/keys" -v "$PWD:/work" ...`
+A mount of a directory or file inside a working tree is not detected, because the key
+then has a location outside the tree: `docker run -v "$PWD/keys:/keys" -v "$PWD:/work" ...`
 accepts a committed key as `/keys/trusted.pub`. The rule catches misplacement, not
 provenance — it does not authenticate the key. Provision keys from a CI variable,
 secret store or runner directory outside the checkout.
@@ -298,8 +299,9 @@ each omitted only when it has the form the native format writes. Two collections
 the same content therefore have the same content digest.
 
 `attest` decides `subject_format` from the bytes it signs: a strict JSON object of at
-most 16 MiB, nested at most 256 levels, with a `components` list that validates as a
-native inventory is `nexus-symbiote-aibom`; anything else is `other`. The depth bound
+most 16 MiB, with arrays and objects nested at most 256 levels deep, that has a
+`components` list and validates as a native inventory (a missing `metadata` is read as
+an empty object) is `nexus-symbiote-aibom`; anything else is `other`. The depth bound
 ensures the same bytes get the same answer on every interpreter. For a native subject,
 verification recomputes the format version and content digest and requires both to
 match.

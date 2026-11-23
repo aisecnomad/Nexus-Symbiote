@@ -332,11 +332,10 @@ hash-checked binaries from `requirements-action.lock`, then collects the SBOM an
 benchmark evidence.
 
 `project.cdx.json` is a static inventory of the checked-out project, not a guarantee
-of complete runtime or build dependency coverage. The build job sets
-`SOURCE_DATE_EPOCH` to the commit time, so `project.cdx.json` records that time as
-its collection time; without the variable the inventory would record none. Its serial
-number is derived from its content either way (see
-[reproducible inventories](reproducible-inventories.md)).
+of complete runtime or build dependency coverage. The build job sets `SOURCE_DATE_EPOCH`
+to the commit time, so `project.cdx.json` records that time, not the time of the scan;
+without the variable the inventory would record none. Its serial number is derived from
+its content either way (see [reproducible inventories](reproducible-inventories.md)).
 
 `installed-distributions.json` records that locked environment and
 `environment.cdx.json` is the same record as a CycloneDX 1.7 SBOM of the installed

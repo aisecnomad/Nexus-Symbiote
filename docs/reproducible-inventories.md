@@ -86,11 +86,11 @@ SHA-256 of the file to name an exact file.
 When an inventory is written without a serial number (`scan`, `baseline` and
 `import-shadowscan`), SymBiote sets `metadata.serial_number` to `urn:uuid:` followed by
 the version 5 UUID of the content digest in namespace
-`ccaa2a43-8ba9-58e6-8f22-f8793a2039d5`. The serial number is not content, so anyone
-holding the native JSON file can recompute it. Two inventories of the same content have
-the same serial number, whatever instant each records. CycloneDX and SPDX exports carry
-the same serial number. It is a name, not a digest: compare content digests to compare
-content.
+`ccaa2a43-8ba9-58e6-8f22-f8793a2039d5`. The serial number is not content, so anyone who
+holds the native JSON file can recompute it from that file. Two inventories of the same
+content have the same serial number, whatever instant each records. CycloneDX and SPDX
+exports carry the same serial number. It is a name, not a digest: compare content
+digests to compare content.
 
 An inventory whose content digest cannot be computed, because it holds a value outside
 the I-JSON domain, such as a lone surrogate, or nests too deeply, has no serial number
@@ -107,9 +107,10 @@ CycloneDX writes that instant as `metadata.timestamp` and SPDX as
 `CreationInfo.created`, so the same inputs give byte-identical native JSON, CycloneDX
 and SPDX files. SARIF records file locations relative to the working directory when the
 scanned directory lies below it, and relative to the scanned directory otherwise. Two
-SARIF files are identical when the scanned directory is at the same relative path in
-both scans: a scan from inside the scanned directory (as CI and pre-commit hooks do) and
-a scan of a directory elsewhere record the same locations.
+SARIF files are identical when the scanned directory is at one path below the working
+directory in both scans, or below it in neither: a scan from inside the scanned
+directory (as CI and pre-commit hooks do) and a scan of a directory elsewhere record
+the same locations.
 
 Any other value (empty, signed, fractional, hexadecimal, with spaces, over 12 digits,
 or past year 9999) is a usage error (exit 2) before anything is collected. Without the
@@ -182,9 +183,9 @@ against the current tree.
   all content. Take compared inventories the same way; see
   [take both snapshots the same way](drift-gate.md#take-both-snapshots-the-same-way).
 - **List order is content.** This build writes components and dependencies sorted, and
-  exports embed the native document as written. A document from another build, or edited
-  by hand, with lists in a different order has a different content digest than its sorted
-  rewrite; its serial number may also differ.
+  exports embed the native document as written. A document written by another build, or
+  edited by hand, with lists in a different order has a different content digest than its
+  sorted rewrite; its serial number may also differ.
 - **SARIF locations depend on the working directory**, as described above.
 - **A document nested deeper than 128 levels is not read by the shared reader.**
   Commands that read through `AIBOM.load` (`diff`, `validate`, `risk`, `summary`,
@@ -194,10 +195,11 @@ against the current tree.
   native with a content digest, and deeper as `other` without one. A collected inventory
   nests far less.
 - **A readable inventory can lack a digest.** A document without a `components` list
-  has no content digest. A runtime snapshot binds a document only when its compact JSON
-  (non-ASCII escaped, numbers counted as 24 bytes) is at most 16 MiB, with at most
-  1,000,000 values and no nesting beyond 64 levels; otherwise it has no canonical digest.
-  `digest` prints `unavailable` for a missing digest and exits 1.
+  has no content digest. A runtime snapshot binds a document only when its compact JSON,
+  with every character outside ASCII escaped and each number counted as 24 bytes, is at
+  most 16 MiB, it holds at most 1,000,000 values and no value is nested more than 64
+  levels deep; otherwise it has no canonical digest. `digest` prints `unavailable` for a
+  missing digest and exits 1.
 - **File names are input.** An inventory records names as the OS lists them, so a
   checkout whose names differ between machines (e.g. after Unicode normalization) records
   different paths.
