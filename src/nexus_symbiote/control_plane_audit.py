@@ -119,6 +119,9 @@ _MAX_BRIDGE_EXPANSIONS = 64  # per top-level server declaration
 _MAX_SYMLINK_HOPS = 8
 _MAX_STEERING_COMPONENTS = 256
 _STEERING_STEPS: weakref.WeakKeyDictionary[ConfinedCollection, int] = weakref.WeakKeyDictionary()
+_CONFIG_ALIASES: weakref.WeakKeyDictionary[ConfinedCollection, dict[str, str]] = (
+    weakref.WeakKeyDictionary()
+)
 _SPLIT_SEPARATORS = _words("&& || ; | & ( )") | frozenset({"\n"})
 _SPLIT_CHAR_SET = frozenset(";|&()\n")
 _REDIR_OP_RE = re.compile(r"^(?:[0-9]+)?(?:>>?|<<?<?|>&|<&|&>>?|>\||<>)$")
@@ -245,7 +248,8 @@ def _load_json_docs(
     for rel_path in candidates:
         if rel_path not in path_set:
             continue
-        text = _read_confined_text(files, rel_path, gaps)
+        source = _CONFIG_ALIASES.get(files, {}).get(rel_path, rel_path)
+        text = _read_confined_text(files, source, gaps)
         if text is None:
             continue
         try:
@@ -1716,6 +1720,35 @@ def _surface_target(surface: str, files: ConfinedCollection) -> str:
     return "/".join(resolved)
 
 
+def _alias_linked_claude(files: ConfinedCollection, all_paths: list[str], gaps: list[str]) -> None:
+    """Name the configuration under a linked `.claude` by the paths Claude Code reads.
+
+    A walk does not descend a directory link, so `.claude -> config/claude` left its
+    settings, permission modes and hooks unread. Each file is read at its in-root target.
+    """
+    try:
+        target = _surface_target(".claude", files)
+    except CollectionError as exc:
+        _add_gap(gaps, f".claude: symlink cannot be resolved, so its settings were not read: {exc}")
+        return
+    if target == ".claude":
+        return
+    if target and files.excluded(target):
+        _add_gap(gaps, ".claude: symlink target is excluded, so its settings were not read")
+        return
+    present = set(all_paths)
+    aliases: dict[str, str] = {}
+    for logical in dict.fromkeys((*HOOK_CONFIG_FILES, *MCP_CONFIG_FILES, *PERMISSION_CONFIG_FILES)):
+        if logical.startswith(".claude/") and logical not in present:
+            physical = posixpath.join(target, logical.removeprefix(".claude/"))
+            if physical in present:
+                aliases[logical] = physical
+    if aliases:
+        _CONFIG_ALIASES[files] = aliases
+        all_paths.extend(aliases)
+        all_paths.sort()
+
+
 def _linked_steering_targets(files: ConfinedCollection) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Folded targets of steering surfaces that are links, and why any could not be resolved,
     computed once per audit so each root costs one pass over a fixed set of surfaces."""
@@ -2876,6 +2909,7 @@ def audit_project_control_plane(
                         decl_sources.append((decl_path, _parse_yaml(text), AssuranceLevel.DECLARED))
                     except (PolicyError, ValueError, RecursionError):
                         summary.gaps.append(f"{decl_path}: invalid YAML")
+        _alias_linked_claude(files, all_paths, summary.gaps)
         checkout = _CheckoutScripts(files, project_paths)
         _inspect_hooks_and_preambles(files, all_paths, checkout, summary)
         bridged_steering = _inspect_mcp_launchers_and_bridges(

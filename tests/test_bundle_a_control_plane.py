@@ -1541,3 +1541,67 @@ def test_hook_if_comparison_finds_unfiltered_hooks_in_linear_time() -> None:
         assert [alert["root_cause"] for alert in changed] == ["hook_command_removed"]
 
     assert scaling_ratio(run) < 10
+
+
+_LINKED_CLAUDE_SETTINGS = {
+    "permissions": {"defaultMode": "bypassPermissions"},
+    "hooks": {
+        "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "./guard.sh"}]}]
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("settings_dir", "links", "root_arg"),
+    [
+        ("config/claude", [(".claude", "config/claude")], "./config"),
+        ("b/claude", [("a", "b/claude"), (".claude", "a")], "./b"),
+        (".claude", [], "./.claude"),
+    ],
+)
+def test_settings_under_a_linked_claude_directory_are_read(
+    tmp_path: Path, settings_dir: str, links: list[tuple[str, str]], root_arg: str
+) -> None:
+    (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    _write_json(tmp_path / settings_dir / "settings.json", _LINKED_CLAUDE_SETTINGS)
+    for link, target in links:
+        (tmp_path / link).symlink_to(target, target_is_directory=True)
+    _write_filesystem_server(tmp_path, root_arg)
+    summary = audit_project_control_plane(tmp_path)
+    assert [s["permission_modes"] for s in summary.steering_surfaces] == [
+        [".claude/settings.json:bypassPermissions"]
+    ]
+    assert any(
+        f["category"] == "steering_surface_writable" and f["severity"] == "critical"
+        for f in summary.findings
+    )
+    assert [(h["source_file"], h["event"]) for h in summary.hook_commands] == [
+        (".claude/settings.json", "PreToolUse")
+    ]
+    assert [t["target_path"] for t in summary.hook_targets] == ["guard.sh"]
+    assert not any("settings were not read" in gap for gap in summary.gaps)
+
+
+def test_local_settings_under_a_linked_claude_directory_keep_their_precedence(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    _write_json(tmp_path / "config" / "claude" / "settings.json", _LINKED_CLAUDE_SETTINGS)
+    _write_json(tmp_path / "config" / "claude" / "settings.local.json", {"disableAllHooks": True})
+    (tmp_path / ".claude").symlink_to("config/claude", target_is_directory=True)
+    summary = audit_project_control_plane(tmp_path)
+    assert [h["hooks_disabled"] for h in summary.hook_commands] == [True]
+
+
+@pytest.mark.parametrize("target", ["../outside", "/absolute/claude", ".claude"])
+def test_unresolvable_claude_link_is_a_coverage_gap(tmp_path: Path, target: str) -> None:
+    (tmp_path / "project").mkdir()
+    root = tmp_path / "project"
+    _write_json(tmp_path / "outside" / "settings.json", _LINKED_CLAUDE_SETTINGS)
+    (root / ".claude").symlink_to(target, target_is_directory=True)
+    summary = audit_project_control_plane(root)
+    assert summary.hook_commands == []
+    assert any(
+        gap.startswith(".claude: symlink cannot be resolved, so its settings were not read")
+        for gap in summary.gaps
+    )
