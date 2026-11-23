@@ -83,23 +83,17 @@ def test_public_words_stay_public_after_a_spaced_mode(tmp_path, selector, word, 
     assert all(present[:3])
 
 
-_PAIRS = [
-    ("--auth", "bearer"),
-    ("--auth-type", "basic"),
-    ("--auth-header", "bearer"),
-    ("--api-key", "bearer"),
-    ("--type", "bearer"),
-]
-# A public selector chooses a value, not a mode. Within one shell word list the `=` form
-# of one is read more strictly than across launch arguments, so it is compared only there.
-_PUBLIC_SELECTOR_PAIRS = [("--format", "token"), ("--source", "token")]
-
-
+@pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize(
-    ("flag", "scheme", "layout"),
+    ("flag", "scheme"),
     [
-        *((flag, scheme, layout) for flag, scheme in _PAIRS for layout in ("array", "sh")),
-        *((flag, scheme, "array") for flag, scheme in _PUBLIC_SELECTOR_PAIRS),
+        ("--auth", "bearer"),
+        ("--auth-type", "basic"),
+        ("--auth-header", "bearer"),
+        ("--api-key", "bearer"),
+        ("--type", "bearer"),
+        ("--format", "token"),
+        ("--source", "token"),
     ],
 )
 @pytest.mark.parametrize(

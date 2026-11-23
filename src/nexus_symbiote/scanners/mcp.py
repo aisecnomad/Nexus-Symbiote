@@ -1510,6 +1510,8 @@ def _assigned(word: str) -> tuple[str, str, bool] | None:
 def _withheld_scheme_operands(words: Sequence[str], *, cmd: bool) -> Iterator[str]:
     """What the pairing rule reads after each ``NAME=<scheme>`` word of one command line.
 
+    A flag and its scheme in separate words (``--auth bearer``) pair as their ``=`` form.
+
     ``_assignment_word_hits`` narrows the pairing to operands that read as credentials,
     which decides the finding. Withholding fails closed: an operand it leaves unflagged
     stays out of exports unless it is positively a public launch word. ``words`` are the
@@ -1517,6 +1519,8 @@ def _withheld_scheme_operands(words: Sequence[str], *, cmd: bool) -> Iterator[st
     """
     for index in range(len(words) - 1):
         assigned = _assigned(words[index])
+        if assigned is None and index:
+            assigned = _spaced_scheme_pair(words[index - 1], words[index])
         if assigned is None:
             continue
         name, value, variable = assigned
