@@ -29,9 +29,10 @@ from array import array
 from bisect import bisect_left
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from itertools import pairwise
+from datetime import date
+from itertools import chain, pairwise
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 from packaging.utils import canonicalize_name
@@ -67,12 +68,19 @@ from nexus_symbiote.scanners.base import (
 )
 from nexus_symbiote.scanners.mcp_credentials import (
     NAMED_CLASS,
+    SCHEME_CLASS,
     SHAPE_CLASS,
     Hit,
+    WrappedKeySearchLimitError,
     assignment_hits,
     credential_name,
     endpoint_hits,
     literal_value,
+    name_words,
+    placeholder,
+    private_key_forms,
+    public_value,
+    rewrapped_key_literals,
     strongest,
     value_hits,
 )
@@ -560,7 +568,7 @@ class _Entries:
     servers: list[tuple[str, Any]]
     problems: dict[str, str]
     unknown: dict[str, str]
-    dropped: tuple[dict[str, Any], ...] = ()
+    dropped: tuple[Any, ...] = ()
 
 
 _INVALID_SERVER = "invalid server configuration"
@@ -615,7 +623,9 @@ def _zed_server(config: dict[str, Any]) -> _Normalized:
             if key in ("args", "env"):
                 if key in config:
                     problem = f"MCP server declares {key} both in and beside its command object"
-                config[key] = value
+                    config[f"command.{key}"] = value
+                else:
+                    config[key] = value
             else:
                 config[f"command.{key}"] = value
     launched = bool(config.get("command")) or any(config.get(field) for field in _ENDPOINT_FIELDS)
@@ -707,12 +717,14 @@ def _opencode_server(config: dict[str, Any]) -> _Normalized:
     command = config.get("command")
     if isinstance(command, list):
         if not command or not all(isinstance(word, str) for word in command):
+            # Keep the refused words for sibling redaction. Validation rejects the list.
             problem = _INVALID_SERVER
-            config["command"] = ""
         else:
             config["command"] = command[0]
             if "args" in config:
                 problem = "MCP server declares args beside a command list"
+                if command[1:]:
+                    config["command.args"] = command[1:]
             else:
                 config["args"] = command[1:]
     if "environment" in config:
@@ -838,6 +850,7 @@ def _shape_secrets(value: str) -> list[str]:
     return [
         *_scheme_secrets(value),
         *(match.group() for match in TOKEN_SHAPE.finditer(value)),
+        *private_key_forms(value),
         *_header_line_secrets(value),
         *_url_secrets(value),
     ]
@@ -870,7 +883,7 @@ def _url_secrets(value: str) -> list[str]:
         if username is not None:
             for candidate in dict.fromkeys((username, unquote(username))):
                 found.extend(match.group() for match in TOKEN_SHAPE.finditer(candidate))
-        for query_name, query_value in parse_qsl(parsed.query):
+        for query_name, query_value in parse_qsl(parsed.query.replace(";", "&")):
             if not is_reference(query_value):
                 if secret_like(query_name, query_value):
                     found.append(query_value)
@@ -966,17 +979,26 @@ def _settings_secrets(settings: dict[str, Any]) -> list[str]:
 # options and hub block inputs. Their values are scrubbed from every server of the file
 # all the same.
 _SHAPE_CREDENTIALS = {
-    "opencode": ("environment",),
+    "zed": ("command.env", "command.args"),
+    "opencode": ("environment", "command.args"),
     "continue": ("apiKey", "requestOptions", "with"),
 }
 
 
 def _shape_credentials(config: dict[str, Any], shape: str) -> list[str]:
     """Credential values ``config`` holds in its shape's uninterpreted credential fields."""
-    fields = {
-        field: config[field] for field in _SHAPE_CREDENTIALS.get(shape, ()) if field in config
-    }
-    return _settings_secrets(fields) if fields else []
+    found: list[str] = []
+    fields: dict[str, Any] = {}
+    for field in _SHAPE_CREDENTIALS.get(shape, ()):
+        if field not in config:
+            continue
+        if field in {"command.args", "command.env"}:
+            found.extend(_malformed_values(config[field], field))
+        else:
+            fields[field] = config[field]
+    if fields:
+        found.extend(_settings_secrets(fields))
+    return found
 
 
 def _launch_words(texts: Iterable[str]) -> list[str]:
@@ -1017,11 +1039,28 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
         values.extend(_shape_secrets(value))
     for _, source_value in launch.sources:
         values.extend(_url_secrets(source_value))
-    words = _launch_words(
-        [*([command] if command else []), *(a for a in args if isinstance(a, str))]
-    )
+    cmd = bool(command) and posixpath.basename(command.replace("\\", "/")).casefold() in {
+        "cmd",
+        "cmd.exe",
+    }
+    # Each text is split once here: its own words are also the ones a pairing is read from.
+    arguments = [_launch_words([a]) for a in args if isinstance(a, str)]
+    words = [*(_launch_words([command]) if command else []), *chain.from_iterable(arguments)]
+    for _, *inner in arguments:
+        values.extend(_withheld_scheme_operands(inner, cmd=cmd))
     for index, word in enumerate(words):
         values.extend(_shape_secrets(word))
+        following = words[index + 1] if index + 1 < len(words) else None
+        in_set = False
+        if cmd and following is not None:
+            prev = words[index - 1] if index > 0 else None
+            raw_before = words[index - 2] if index > 1 else None
+            before = (
+                None
+                if raw_before is not None and any(c.isspace() for c in raw_before)
+                else raw_before
+            )
+            in_set = _cmd_set_word(prev, before)
         name, equals, value = word.partition("=")
         if equals and not _requirement(name, value):
             name = name.lstrip("-").strip(" \"'")
@@ -1031,8 +1070,22 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
                     values.append(value)
                 values.extend(_shape_secrets(value))
                 # cmd's `set API_TOKEN=Bearer <token>` leaves the credential in the next word.
-                if index + 1 < len(words) and secret_like(name, f"{value} {words[index + 1]}"):
-                    values.extend(scheme_credentials(f"{value} {words[index + 1]}"))
+                if following is not None and secret_like(name, f"{value} {following}"):
+                    variable = not word.startswith("-")
+                    if value.lower() in _ASSIGNMENT_SCHEMES:
+                        values.extend(
+                            literal
+                            for _, literal in _assignment_word_hits(word, following, in_set=in_set)
+                        )
+                    elif _scheme_assignment_name(name, variable=variable):
+                        values.extend(scheme_credentials(f"{value} {following}"))
+                    # Withholding fails closed. The rules above choose what raises a
+                    # finding; an operand they leave unflagged still stays out of exports
+                    # unless it is positively a public launch word.
+                    if not _public_scheme_following(
+                        name, value, following, variable=variable, in_set=in_set
+                    ):
+                        values.extend(scheme_credentials(f"{value} {following}"))
         if index > 0:
             flag = words[index - 1]
             if (
@@ -1055,6 +1108,43 @@ _ENDPOINT_QUERY_POSITION = "endpoint URL query"
 _ASSIGNMENT_FLAGS = frozenset({"env", "e", "build-arg"})
 # The scheme words _AUTH reads, after which cmd's `set NAME=<scheme> <credential>` splits.
 _ASSIGNMENT_SCHEMES = frozenset({"bearer", "basic", "token", "bot", "apikey", "api-key"})
+_SCHEME_DESCRIPTORS = frozenset({"type", "mode", "scheme", "method", "transport", "strategy"})
+_PUBLIC_TOKEN_SELECTORS = frozenset({"format", "source", "profile", "output", "kind"})
+# These common switches can follow a credential binding in a launch declaration.
+# Normalize spelling only for the comparison; exports keep the original text.
+_PUBLIC_SCHEME_SWITCHES = _names(
+    "transport stateless privileged verbose readonly dryrun version debug help quiet "
+    "interactive stdio json enablelogging color nocolor noprompt watch force loglevel "
+    "allowhttp insecure noprofile outputformat noninteractive headless detached sandboxed "
+    "production telemetry recursive localhost maxconcurrentrequests enableautomaticupdates"
+)
+_LOWER_LONG_OPTION = re.compile(r"--[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
+_LOWER_CLI_DIGIT_SEGMENT = re.compile(r"(?:[a-z]{1,10}[0-9]{1,3}|[a-z][0-9]{1,2}[a-z])")
+_CAMEL_SWITCH = re.compile(r"[A-Za-z][a-z]+(?:[A-Z][a-z]+)+")
+_CLI_ACRONYMS = (
+    r"(?:HTTPS|HTTP[23]|HTTP|TLS1[23]|TLS|MTLS|SSL|SSH|URL|URI|JSONL|JSON|YAML|TOML|XML|CSV|"
+    r"SQL|SSE|MCP|GRPC|RPC|REST|API|SDK|CLI|TTY|ANSI|UTF16|UTF8|UTF|DNS|TCP|UDP|IPC|PID|"
+    r"CORS|CSRF|OIDC|SAML|JWKS|JWK|JWT|PEM|DER|AWS|GCP|IAM|KMS|HSM|IP[Vv][46]|IP|IO|FS|DB|UI|"
+    r"OS|CA|SNI|ALPN|UUID|ID|EOF|HTML|DOM|WASM|GPU|CPU|RAM|LLM|RAG|A2A|SBOM|VEX|OAuth2|OAuth)"
+)
+_ACRONYM_CLI_SWITCH = re.compile(
+    rf"(?:[a-z]{{2,}}(?:[A-Z][a-z]+)*{_CLI_ACRONYMS}(?:[A-Z][a-z]+)*"
+    rf"|{_CLI_ACRONYMS}(?:[A-Z][a-z]+)+)"
+)
+# A short public version or date label after a mode selector (e.g. Workspace2,
+# Workspace10, WorkspaceV2, OpenAPI3, OpenAPI3.1, 20250618). Mixed-case tokens
+# or random alphanumeric runs stay private.
+_MODE_LABEL = re.compile(
+    r"(?:(?:[A-Z][a-z]{2,10}|OpenAPI|OAuth|HTTP|TLS|SAML|OIDC|GraphQL|JSON|YAML|GRPC)"
+    r"[Vv]?[0-9]{1,2}(?:\.[0-9]{1,2})?|[0-9]{8})"
+)
+_BENIGN_ENV_KEY = re.compile(r"[A-Z]{2,15}(?:_[A-Z0-9]{1,15}){0,4}")
+_PUBLIC_UUID = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_RELEASE_VERSION_SEGMENT = re.compile(r"[0-9]{1,2}(?:\.[0-9]{1,2})?[a-z]?|(?:19|20)[0-9]{2}")
+_SCHEME_NUMBER = re.compile(r"[+]?[0-9]+(?:[.][0-9]+)?")
+_SCHEME_ASSIGNMENT_OPERAND = re.compile(r"[A-Za-z0-9_-]+=[A-Za-z0-9_+=-]+")
 # curl's `-u user:password`, also in a cluster of short flags (`-su`), and httpie's `-a`
 # (`--auth`) only under a fetcher. Under another command (docker -u www-data:www-data) the
 # part after the colon counts only when it reads as a literal under a non-password name.
@@ -1094,26 +1184,360 @@ def _explicit_header(previous: str | None, word: str) -> bool:
     )
 
 
-def _assignment_word_hits(word: str, following: str | None) -> list[Hit]:
+_SCHEME_AUTH_WORDS = frozenset(
+    {
+        "auth",
+        "authorization",
+        "authentication",
+        "authz",
+        "oauth",
+        "bearer",
+        "bot",
+        "conn",
+        "session",
+    }
+)
+
+_SchemeAssignmentKind = Literal["credential_binding", "mode_selector", "public_selector"]
+
+
+def _scheme_assignment_name(name: str, *, variable: bool = True) -> bool:
+    words = name_words(name)
+    if not words or words[-1] in _SCHEME_DESCRIPTORS:
+        return False
+    # CLI flags such as --auth=token, --authentication=bearer, and --auth-header=bearer
+    # select an authentication mode or header rather than binding a credential in the next arg.
+    if not variable and (
+        words[-1] == "header"
+        or words[-1] in _PUBLIC_TOKEN_SELECTORS
+        or tuple(words) in {("auth",), ("authentication",)}
+    ):
+        return False
+    return (
+        credential_name(name)
+        or words[-1] in _SCHEME_AUTH_WORDS
+        or (words[-1] == "header" and not _SCHEME_AUTH_WORDS.isdisjoint(words[:-1]))
+    )
+
+
+def _classify_scheme_assignment(
+    name: str, scheme: str, *, variable: bool, in_set: bool
+) -> _SchemeAssignmentKind:
+    """Distinguish a credential binding from an authentication-mode or public selector."""
+    if in_set or _scheme_assignment_name(name, variable=variable):
+        return "credential_binding"
+    words = name_words(name)
+    if (
+        not variable
+        and scheme.lower() == "token"
+        and words
+        and words[-1] in _PUBLIC_TOKEN_SELECTORS
+        and not credential_name(name)
+        and not any(credential_name(word) for word in words[:-1])
+        and _SCHEME_AUTH_WORDS.isdisjoint(words[:-1])
+    ):
+        return "public_selector"
+    return "mode_selector"
+
+
+def _is_valid_iso_date(digits: str) -> bool:
+    if len(digits) != 8 or not digits.isdecimal():
+        return False
+    try:
+        date.fromisoformat(digits)
+    except ValueError:
+        return False
+    return True
+
+
+def _public_mode_label(word: str) -> bool:
+    """Whether ``word`` is a short public version or ISO date label after a mode selector."""
+    if len(word) > 12 or _MODE_LABEL.fullmatch(word) is None:
+        return False
+    return _is_valid_iso_date(word) if word.isdecimal() else True
+
+
+def _public_release_identifier(value: str) -> bool:
+    """Whether ``value`` is a structured model or release identifier (e.g. claude-sonnet-4-20250514)."""
+    if len(value) >= 48 or "-" not in value or not value.isascii():
+        return False
+    segments = value.split("-")
+    if not (2 <= len(segments) <= 6):
+        return False
+    has_word = False
+    for segment in segments:
+        if not segment or len(segment) > 15:
+            return False
+        if segment.isalpha() and segment.islower():
+            if len(segment) >= 3:
+                has_word = True
+            continue
+        if _RELEASE_VERSION_SEGMENT.fullmatch(segment) or _is_valid_iso_date(segment):
+            continue
+        return False
+    return has_word
+
+
+def _benign_delimited_option(segments: list[str]) -> bool:
+    """Whether lowercase segments of a ``--foo-bar`` or ``--foo_bar`` option are normal CLI words."""
+    digit_segments = 0
+    has_word = False
+    for segment in segments:
+        if not segment:
+            return False
+        if segment.isalpha() and segment.islower():
+            if len(segment) >= 2:
+                has_word = True
+            continue
+        if _LOWER_CLI_DIGIT_SEGMENT.fullmatch(segment):
+            digit_segments += 1
+            if digit_segments > 1:
+                return False
+            continue
+        return False
+    return has_word
+
+
+def _benign_cli_option_name(key: str, body: str, *, bare: bool) -> bool:
+    """Whether ``--<body>`` reads as an ordinary CLI option name rather than an opaque secret."""
+    if not (2 <= len(body) < 32) or not body.isascii():
+        return False
+    if "-" in body:
+        if "_" in body or _LOWER_LONG_OPTION.fullmatch(key) is None:
+            return False
+        return _benign_delimited_option(body.split("-"))
+    if "_" in body:
+        max_len = 16 if bare else 24
+        if len(body) >= max_len or not body.islower():
+            return False
+        return _benign_delimited_option(body.split("_"))
+    if _ACRONYM_CLI_SWITCH.fullmatch(body):
+        return True
+    if body.isalpha():
+        if _CAMEL_SWITCH.fullmatch(body):
+            return True
+        if len(body) < 16 and (body.islower() or (body[0].isupper() and body[1:].islower())):
+            return True
+    return False
+
+
+def _benign_env_assignment_after_selector(key: str, argument: str) -> bool:
+    """Whether ``KEY=value`` after a mode selector is a separate non-credential env assignment."""
+    if (
+        not (3 <= len(key) < 32)
+        or _BENIGN_ENV_KEY.fullmatch(key) is None
+        or credential_name(key)
+        or _scheme_assignment_name(key, variable=True)
+    ):
+        return False
+    return (
+        not literal_value(argument)
+        or _PUBLIC_UUID.fullmatch(argument) is not None
+        or _public_release_identifier(argument)
+    )
+
+
+_OperandKind = Literal["credential", "public", "unclassified"]
+
+
+def _scheme_operand_kind(word: str, *, credential_binding: bool) -> _OperandKind:
+    """How the argument following an authentication scheme reads.
+
+    ``credential`` may be the scheme's literal value and raises a finding. ``public`` is
+    positively a launch word of its own: a known switch, an ordinary option or setting,
+    a label. ``unclassified`` is neither. It raises no finding, but an unfamiliar, weak
+    or placeholder shape is not evidence that a value is public, so it stays out of
+    exports wherever the scheme rule withholds it.
+    """
+    if len(word) < MIN_SECRET_LENGTH or is_reference(word):
+        return "public"
+    key, equals, argument = word.partition("=")
+    if word.startswith("--") and _CLI_FLAG.fullmatch(key):
+        body = key[2:]
+        if equals and argument not in {"", "="}:
+            if not credential_binding and _benign_cli_option_name(key, body, bare=False):
+                # Separate CLI option (e.g. --model=..., --tenant-id=...); its own word
+                # inspection still checks credential flag names and embedded token shapes.
+                return "public"
+            return (
+                "credential" if literal_value(body) or literal_value(argument) else "unclassified"
+            )
+        if (
+            not equals
+            and body.casefold().replace("-", "").replace("_", "") in _PUBLIC_SCHEME_SWITCHES
+        ):
+            return "public"
+        if equals:
+            if len(body) < MIN_SECRET_LENGTH:
+                return "public" if argument == "" else "unclassified"
+            if argument == "=":
+                return "credential"
+            if not credential_binding and _benign_cli_option_name(key, body, bare=True):
+                return "public"
+            return "credential" if "-" not in body or literal_value(body) else "unclassified"
+        if len(body) < MIN_SECRET_LENGTH:
+            return "public"
+        if not credential_binding and _benign_cli_option_name(key, body, bare=True):
+            return "public"
+        return "unclassified" if placeholder(body) else "credential"
+    # Padding belongs to the operand. Only a genuine option assignment has a
+    # non-credential key and a nonempty value with no further equals sign.
+    if (
+        argument
+        and "=" not in argument
+        and _SCHEME_ASSIGNMENT_OPERAND.fullmatch(word)
+        and not literal_value(key)
+    ):
+        if not credential_binding and _benign_env_assignment_after_selector(key, argument):
+            return "public"
+        return "credential" if literal_value(argument) else "unclassified"
+    if _SCHEME_NUMBER.fullmatch(word):
+        return "credential"
+    if placeholder(word):
+        # A launcher's own package (@example/server@1.0.0) holds a placeholder word too.
+        return "public" if not credential_binding and public_value(word) else "unclassified"
+    if word.isascii() and word.isalpha():
+        if credential_binding or len(word) >= 16:
+            return "credential"
+        unusual_case = (
+            any(char.isupper() for char in word[1:])
+            and _CAMEL_SWITCH.fullmatch(word) is None
+            and not word.isupper()
+        )
+        return "credential" if unusual_case else "public"
+    if credential_binding:
+        return "credential"
+    if (
+        word.isascii()
+        and any(char.isupper() for char in word)
+        and any(char.islower() for char in word)
+        and any(char.isdigit() for char in word)
+        and word.isalnum()
+    ):
+        return "credential"
+    if literal_value(word):
+        return "credential"
+    return "public" if public_value(word) else "unclassified"
+
+
+def _scheme_operand(word: str, *, credential_binding: bool) -> bool:
+    """Whether the argument following an authentication scheme may be its literal value."""
+    return _scheme_operand_kind(word, credential_binding=credential_binding) == "credential"
+
+
+def _public_scheme_following(
+    name: str, scheme: str, following: str, *, variable: bool, in_set: bool
+) -> bool:
+    """Whether the word after ``NAME=<scheme>`` is positively a public launch word.
+
+    A variable whose name ends in ``header`` (``HEADER``, ``CUSTOM_HEADER``) holds a whole
+    header value, so its operand is read as a binding's for withholding, whatever the
+    finding rules call it. A flag of that name (``--auth-header=bearer``) selects a header
+    mode, and a switch, an option, a setting, a label or a locator after it stays public;
+    a bare word after it is withheld, since a mode name does not make one public.
+    """
+    words = name_words(name)
+    header = bool(words) and words[-1] == "header"
+    binding = (header and variable) or (
+        _classify_scheme_assignment(name, scheme, variable=variable, in_set=in_set)
+        == "credential_binding"
+    )
+    if not binding and _public_mode_label(following):
+        return True
+    if _scheme_operand_kind(following, credential_binding=binding) != "public":
+        return False
+    if not header or variable or binding:
+        return True
+    return (
+        following.startswith("-")
+        or "=" in following
+        or _PUBLIC_UUID.fullmatch(following) is not None
+        or public_value(following)
+    )
+
+
+def _assigned(word: str) -> tuple[str, str, bool] | None:
+    """The name and value of a ``NAME=value`` word, and whether the name is a variable.
+
+    ``--env=NAME=value`` and its kin name the variable inside the flag's value.
+    """
+    name, equals, value = word.partition("=")
+    if not equals or _requirement(name, value):
+        return None
+    variable = not name.startswith("-")
+    name = name.lstrip("-").strip(" \"'")
+    if name.lower() in _ASSIGNMENT_FLAGS and "=" in value:
+        variable = True
+        name, _, value = value.strip(" \"'").partition("=")
+        name = name.strip(" \"'")
+        if _requirement(name, value):
+            return None
+    value = value.strip(" \"'")
+    if not name or not value or name.lower() in {"h", "header"}:
+        return None
+    return name, value, variable
+
+
+def _withheld_scheme_operands(words: Sequence[str], *, cmd: bool) -> Iterator[str]:
+    """What the pairing rule reads after each ``NAME=<scheme>`` word of one command line.
+
+    ``_assignment_word_hits`` narrows the pairing to operands that read as credentials,
+    which decides the finding. Withholding fails closed: an operand it leaves unflagged
+    stays out of exports unless it is positively a public launch word. ``words`` are the
+    shell words of one argument, as ``_argument_hits`` pairs them.
+    """
+    for index in range(len(words) - 1):
+        assigned = _assigned(words[index])
+        if assigned is None:
+            continue
+        name, value, variable = assigned
+        if value.lower() not in _ASSIGNMENT_SCHEMES:
+            continue
+        in_set = cmd and _cmd_set_word(
+            words[index - 1] if index else None, words[index - 2] if index > 1 else None
+        )
+        following = words[index + 1]
+        if not _public_scheme_following(name, value, following, variable=variable, in_set=in_set):
+            yield from (literal for _, literal in value_hits(name, f"{value} {following}"))
+
+
+def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = False) -> list[Hit]:
     """The hits of a ``NAME=value`` word, ``--name=value`` and ``--env=NAME=value`` included.
 
     cmd's ``set API_TOKEN=Bearer <token>`` leaves the credential in the next word.
     """
-    name, equals, value = word.partition("=")
-    if not equals or _requirement(name, value):
+    assigned = _assigned(word)
+    if assigned is None:
         return []
-    name = name.lstrip("-").strip(" \"'")
-    if name.lower() in _ASSIGNMENT_FLAGS and "=" in value:
-        name, _, value = value.strip(" \"'").partition("=")
-        name = name.strip(" \"'")
-        if _requirement(name, value):
-            return []
-    value = value.strip(" \"'")
-    if not name or not value or name.lower() in {"h", "header"}:
-        return []
+    name, value, variable = assigned
     hits = value_hits(name, value)
-    if following is not None and value.lower() in _ASSIGNMENT_SCHEMES:
-        hits.extend(value_hits(name, f"{value} {following}"))
+    if following is None or value.lower() not in _ASSIGNMENT_SCHEMES:
+        return hits
+    kind = _classify_scheme_assignment(name, value, variable=variable, in_set=in_set)
+    if kind == "public_selector":
+        return hits
+    if in_set:
+        # cmd's SET takes the rest of the assignment, including a literal
+        # spelled like an option. The lexer supplies operators as separate words.
+        if (
+            len(following) >= MIN_SECRET_LENGTH
+            and re.fullmatch(r"[-A-Za-z0-9._~+/]+=*", following)
+            and not placeholder(following)
+            and not is_reference(following)
+        ):
+            hits.extend(value_hits(name, f"{value} {following}") or [(SCHEME_CLASS, following)])
+            return hits
+    credential_binding = kind == "credential_binding"
+    # Only a mode selector can explain a short date or version label. An unfamiliar
+    # switch or an ordinary alphabetic word can itself be a bearer credential.
+    if not credential_binding and _public_mode_label(following):
+        return hits
+    if is_reference(following):
+        hits.extend(value_hits(name if credential_binding else "token", following))
+        return hits
+    if _scheme_operand(following, credential_binding=credential_binding):
+        paired = value_hits(name, f"{value} {following}")
+        hits.extend(paired or [(SCHEME_CLASS, following)])
     return hits
 
 
@@ -1137,8 +1561,25 @@ def _user_hits(previous: str | None, word: str, fetcher: bool) -> list[Hit]:
     return [(NAMED_CLASS, password)]
 
 
+def _cmd_set_word(previous: str | None, before_previous: str | None) -> bool:
+    """Whether the preceding word starts a SET command in a cmd command line."""
+    return (
+        previous is not None
+        and previous.casefold() in {"set", "@set"}
+        and (
+            before_previous is None
+            or before_previous.casefold() in {"/c", "/k", "&", "&&", "|", "||", "("}
+        )
+    )
+
+
 def _word_hits(
-    previous: str | None, word: str, following: str | None, fetcher: bool = False
+    previous: str | None,
+    word: str,
+    following: str | None,
+    fetcher: bool = False,
+    *,
+    in_set: bool = False,
 ) -> list[Hit]:
     """The hits of one argument or shell word, given the words around it."""
     flagged = previous is not None and _flag_value(previous, word)
@@ -1146,24 +1587,39 @@ def _word_hits(
     if ":" in word:
         hits.extend(_header_line_hits(word, explicit=_explicit_header(previous, word)))
     if "=" in word:
-        hits.extend(_assignment_word_hits(word, following))
+        hits.extend(_assignment_word_hits(word, following, in_set=in_set))
     if (":" in word or "=" in word) and _PLAIN_ASSIGNMENT.fullmatch(word) is None:
         hits.extend(assignment_hits(word))
     hits.extend(_user_hits(previous, word, fetcher))
     return hits
 
 
-def _argument_hits(previous: str | None, argument: str, fetcher: bool = False) -> list[Hit]:
+def _argument_hits(
+    previous: str | None,
+    argument: str,
+    fetcher: bool = False,
+    following: str | None = None,
+    *,
+    cmd: bool = False,
+    before_previous: str | None = None,
+) -> list[Hit]:
     """The hits of a launch argument.
 
     An argument without white space is one word, read with the argument before it as
-    its flag. One with white space (a command line, an inline script) is read whole
-    for what holds whatever names it, as a header line, for credential-named
-    assignments and as its flag's value; its shell words are then read one by one,
-    so ``-c "API_TOKEN=${API_TOKEN} exec ..."`` is never a ``NAME=value`` or a literal.
+    its flag and the one after it as the rest of ``NAME=<scheme>``. One with white space
+    (a command line, an inline script) is read whole for what holds whatever names it,
+    as a header line, for credential-named assignments and as its flag's value; its
+    shell words are then read one by one, so ``-c "API_TOKEN=${API_TOKEN} exec ..."``
+    is never a ``NAME=value`` or a literal.
     """
     if not any(char.isspace() for char in argument):
-        return _word_hits(previous, argument, None, fetcher)
+        return _word_hits(
+            previous,
+            argument,
+            following,
+            fetcher,
+            in_set=cmd and _cmd_set_word(previous, before_previous),
+        )
     flagged = previous is not None and _flag_value(previous, argument)
     hits = value_hits(previous if flagged and previous else "", argument)
     hits.extend(_header_line_hits(argument, explicit=_explicit_header(previous, argument)))
@@ -1173,7 +1629,8 @@ def _argument_hits(previous: str | None, argument: str, fetcher: bool = False) -
     fetcher = fetcher or not _FETCHERS.isdisjoint(map(posixpath.basename, words))
     around: list[str | None] = [None, *words, None]
     for index, word in enumerate(words, start=1):
-        hits.extend(_word_hits(around[index - 1], word, around[index + 1], fetcher))
+        start = cmd and _cmd_set_word(around[index - 1], around[index - 2] if index > 1 else None)
+        hits.extend(_word_hits(around[index - 1], word, around[index + 1], fetcher, in_set=start))
     return hits
 
 
@@ -1202,13 +1659,23 @@ def _credential_hits(
             hits.extend(value_hits(name, value))
             hits.extend(_header_line_hits(value, explicit=False))
         yield ("env", name, hits)
+    cmd = isinstance(command, str) and posixpath.basename(
+        command.replace("\\", "/")
+    ).casefold() in {"cmd", "cmd.exe"}
+    before_previous: str | None = None
     previous: str | None = None
     for index, argument in enumerate(args, start=1):
         if isinstance(argument, str):
-            yield ("argument", str(index), _argument_hits(previous, argument, fetcher))
-            previous = argument
-        else:
-            previous = None
+            after = args[index] if index < len(args) else None
+            following = after if isinstance(after, str) else None
+            yield (
+                "argument",
+                str(index),
+                _argument_hits(
+                    previous, argument, fetcher, following, cmd=cmd, before_previous=before_previous
+                ),
+            )
+        before_previous, previous = previous, argument if isinstance(argument, str) else None
     headers = [item for mapping in header_maps for item in mapping.items()]
     for name, value in sorted(headers, key=lambda item: item[0]):
         hits = _name_hits(name)
@@ -1275,11 +1742,74 @@ def _server_hits(config: dict[str, Any]) -> PositionHits:
 
 
 def _declared_hits(config: dict[str, Any]) -> PositionHits:
-    """The hits of a refused server's env, arguments and headers, read as a parsed one's are."""
+    """The hits of a refused server's env, arguments, headers and endpoints."""
     env, args = config.get("env"), config.get("args")
     maps = [m for m in (config.get("headers"), config.get("http_headers")) if isinstance(m, dict)]
+    endpoints = [
+        value for field in _ENDPOINT_FIELDS if isinstance(value := config.get(field), str) and value
+    ]
     args = args if isinstance(args, list) else []
-    return list(_credential_hits(env if isinstance(env, dict) else {}, args, maps, ()))
+    return list(
+        _credential_hits(
+            env if isinstance(env, dict) else {}, args, maps, endpoints, config.get("command", "")
+        )
+    )
+
+
+def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
+    """Select credentials by their field or value even when a server is refused."""
+    pending = [(field, node, False)]
+    while pending:
+        name, item, inferred = pending.pop()
+        if isinstance(item, dict):
+            credential_label = any(
+                isinstance(item.get(key), str) and _scheme_assignment_name(item[key])
+                for key in ("name", "key")
+            )
+            unlabelled = not {"name", "key"}.intersection(item)
+            value_record = credential_label or (
+                unlabelled
+                and (
+                    name.lower() in {"auth", "oauth", "headers", "http_headers"}
+                    or _scheme_assignment_name(name)
+                )
+            )
+            for key, value in item.items():
+                # A refused record supplies context, but a public package name
+                # can also occupy its value slot. Preserve explicit metadata labels.
+                use_shape = (value_record and key in {"value", "values"}) or (
+                    unlabelled and (inferred or credential_name(name))
+                )
+                pending.append((str(key), value, use_shape))
+        elif isinstance(item, list):
+            if name in {"", "args", "command", "command.args"}:
+                for index, word in enumerate(item):
+                    if isinstance(word, str):
+                        previous = item[index - 1] if index else None
+                        following = item[index + 1] if index + 1 < len(item) else None
+                        yield from (
+                            literal
+                            for _, literal in _argument_hits(
+                                previous if isinstance(previous, str) else None,
+                                word,
+                                following=following if isinstance(following, str) else None,
+                            )
+                        )
+            if len(item) == 2 and isinstance(item[0], str) and _scheme_assignment_name(item[0]):
+                pending.extend(((name, item[0], False), (item[0], item[1], True)))
+            else:
+                pending.extend((name, value, inferred) for value in item)
+        elif isinstance(item, str):
+            if is_reference(item):
+                yield from (literal for _, literal in value_hits(name or "secret", item))
+                continue
+            if secret_like(name, item) or (
+                (inferred or _scheme_assignment_name(name)) and literal_value(item)
+            ):
+                yield item
+            yield from _text_credentials(item)
+            yield from _shape_secrets(item)
+            yield from (literal for _, literal in _argument_hits(None, item))
 
 
 def _server_literals(config: dict[str, Any], hits: PositionHits) -> list[str]:
@@ -2794,23 +3324,42 @@ class MCPScanner(Scanner):
             values = self._file_secrets(
                 [*entries, *(("", config) for config in read.dropped)], dialect.shape, server_hits
             )
-            # Before either refusal below: a file that is not collected still holds them.
+            # Retain values from refused files when withholding names declared in source.
             if known is not None:
                 known.add(values)
             if key_error is not None and entries:
                 result.scan_failures.append(f"{dialect.path}: {key_error}")
                 continue
-            # Prepared once per file and reused for every server and diagnostic.
-            file_secrets = SecretScrubber(values)
             configs = {id(config): config for config in [*(c for _, c in entries), *read.dropped]}
             for server, hits in server_hits.items():
                 literals.extend(_server_literals(configs[server], hits))
-            if len(file_secrets) > MAX_SECRETS_PER_FILE:
+            unique = set(filter(None, values))
+            wrapped_found: list[str] = []
+            if len(unique) <= MAX_SECRETS_PER_FILE:
+                try:
+                    for wrapped in rewrapped_key_literals(data, tuple(unique)):
+                        unique.add(wrapped)
+                        wrapped_found.append(wrapped)
+                        if len(unique) > MAX_SECRETS_PER_FILE:
+                            break
+                except WrappedKeySearchLimitError:
+                    if known is not None:
+                        known.refuse()
+                    result.scan_failures.append(
+                        f"{dialect.path}: wrapped credential comparison limit reached; not collected"
+                    )
+                    continue
+            if len(unique) > MAX_SECRETS_PER_FILE:
+                if known is not None:
+                    known.refuse()
                 result.scan_failures.append(
                     f"{dialect.path}: more than {MAX_SECRETS_PER_FILE} credential values in one "
                     "file; not collected"
                 )
                 continue
+            if known is not None and wrapped_found:
+                known.add(wrapped_found)
+            file_secrets = SecretScrubber(unique)
             collected.append((dialect, data, read, file_secrets, server_hits))
         # A name may repeat a literal of any client file, so every file is read first.
         names = _Names(literals)
@@ -2884,24 +3433,30 @@ class MCPScanner(Scanner):
 
         One server's tool text or name may repeat a value that another server's
         environment, headers or launcher holds, so the file's values are scrubbed
-        from each. A server that _server_problem refuses is never parsed, but its
-        `env`, `headers` and `http_headers` still count, as they did before launcher
-        values were added: refusing it must not publish what its siblings repeat. Only
-        its launcher is not analysed: its arguments are read for the names they withhold. Each
-        server's launch positions are read once, into ``server_hits`` by the server's identity.
+        from each. A server that _server_problem refuses is never parsed, but every value
+        _server_secrets reads for a parsed one still counts: refusing it must not publish
+        what its siblings repeat. Only its launcher is not analysed, and the arguments of
+        one past an argument limit are read only for the names they withhold. Each server's
+        launch positions are read once, into ``server_hits`` by the server's identity.
         """
         values: list[str] = []
         for _, config in entries:
             if not isinstance(config, dict):
+                values.extend(_malformed_values(config))
                 continue
             values.extend(_shape_credentials(config, shape))
             if cls._server_problem(config, shape) is not None:
-                for field in ("env", "headers", "http_headers"):
-                    mapping = config.get(field)
-                    if isinstance(mapping, dict):
-                        values.extend(secret_values(mapping))
                 hits = _declared_hits(config)
-                values.extend(_literals([hit for hit in hits if hit[0] != "argument"]))
+                declared, read = config, hits
+                args = config.get("args")
+                if isinstance(args, list) and len(args) > min(MAX_ARGUMENTS, MAX_LIST_ENTRIES):
+                    # A server refused for its argument count must not fill the file's
+                    # credential limit and so withhold every sibling from the inventory.
+                    declared = {field: item for field, item in config.items() if field != "args"}
+                    read = [hit for hit in hits if hit[0] != "argument"]
+                for field, value in cls._invalid_field_values(declared, shape):
+                    values.extend(_malformed_values(value, field))
+                values.extend(_server_secrets(declared, Launch(), read))
                 if server_hits is not None:
                     server_hits[id(config)] = hits
                 continue
@@ -3001,7 +3556,7 @@ class MCPScanner(Scanner):
         entries: dict[str, Any] = {}
         problems: dict[str, str] = {}
         unknown: dict[str, str] = {}
-        dropped: list[dict[str, Any]] = []
+        dropped: list[Any] = []
         experimental = data.get("experimental")
         if (
             dialect.shape == "continuerc"
@@ -3026,9 +3581,7 @@ class MCPScanner(Scanner):
                 repeated: set[str] = set()
                 for index, config in enumerate(servers, 1):
                     name = config.get("name") if isinstance(config, dict) else None
-                    if isinstance(config, dict) and (
-                        not isinstance(name, str) or not name or name in entries or name in repeated
-                    ):
+                    if not isinstance(name, str) or not name or name in entries or name in repeated:
                         dropped.append(config)
                     if isinstance(config, dict) and "uses" in config and name is None:
                         # The slug is not shown: it is the checkout's text, not an identity.
@@ -3063,6 +3616,9 @@ class MCPScanner(Scanner):
                     result.scan_failures.append(
                         f"{dialect.path}: MCP server declared under more than one server map"
                     )
+                    if isinstance(config, dict):
+                        config = _normalized_server(dialect.shape, config).config
+                    dropped.append(config)
                     continue
                 if dialect.shape != "map" and isinstance(config, dict):
                     normalized = _normalized_server(dialect.shape, config)
@@ -3089,12 +3645,16 @@ class MCPScanner(Scanner):
             if value is not None and value != "":
                 commands.append(value)
         if len(commands) > 1:
+            for cmd_item in commands:
+                dropped.append({"command": cmd_item})
             result.scan_failures.append(
                 f"{dialect.path}: MCP server command declared under more than one setting"
             )
         elif commands and not isinstance(commands[0], str):
+            dropped.append({"command": commands[0]})
             result.scan_failures.append(f"{dialect.path}: invalid MCP server command")
         elif commands and _PLAIN_COMMAND.fullmatch(commands[0].strip(" \t")) is None:
+            dropped.append({"command": commands[0]})
             result.scan_failures.append(
                 f"{dialect.path}: MCP server command 'mcp' is not plain words and is not "
                 "inventoried"
@@ -3102,6 +3662,8 @@ class MCPScanner(Scanner):
         elif commands:
             command, *arguments = commands[0].split()
             # The client replaces a server map entry of the same name.
+            if (replaced := entries.get("mcp")) is not None:
+                dropped.append(replaced)
             entries["mcp"] = {"command": command, "args": arguments}
         tools = [
             tool
@@ -3126,8 +3688,8 @@ class MCPScanner(Scanner):
         return _Entries(sorted(entries.items()), problems, unknown, tuple(dropped))
 
     @staticmethod
-    def _server_problem(config: dict[str, Any], shape: str) -> str | None:
-        """A type or size problem in a server entry; unknown fields are gaps, not failures."""
+    def _invalid_field_values(config: dict[str, Any], shape: str) -> Iterator[tuple[str, Any]]:
+        """Values whose type prevents an interpreted server field from being read."""
         for field, value in config.items():
             if not _interpreted(field, shape):
                 continue
@@ -3152,7 +3714,13 @@ class MCPScanner(Scanner):
             else:
                 continue
             if not valid:
-                return "invalid server configuration"
+                yield field, value
+
+    @classmethod
+    def _server_problem(cls, config: dict[str, Any], shape: str) -> str | None:
+        """A type or size problem in a server entry; unknown fields are gaps, not failures."""
+        if any(True for _ in cls._invalid_field_values(config, shape)):
+            return "invalid server configuration"
         limits = (
             ("args", MAX_ARGUMENTS, "argument"),
             ("env", MAX_ENVIRONMENT, "environment variable"),
@@ -3358,7 +3926,17 @@ class MCPScanner(Scanner):
         recorded = (
             {"-y", "--yes", *(package.spec for package in packages)} if launcher_package else set()
         )
-        unbound = self._unbound_values(args, env, headers, endpoint_url, command, launch, recorded)
+        unbound = self._unbound_values(
+            args,
+            env,
+            headers,
+            endpoint_url,
+            command,
+            launch,
+            recorded,
+            identity,
+            multiple_endpoints=len(endpoints) > 1,
+        )
         unbound.extend(
             self._unbound_client_values(
                 config, dialect.shape, nested=nested, redacted=tool_lists_redacted
@@ -3759,6 +4337,8 @@ class MCPScanner(Scanner):
         """Export an origin only for an authority every URL parser reads the same way."""
         if expands(url):
             return "[redacted]", "endpoint depends on environment expansion"
+        if any(char.isspace() or ord(char) < 32 for char in url):
+            return "[redacted]", "endpoint URL cannot be parsed"
         try:
             parsed = urlsplit(url)
             hostname = parsed.hostname
@@ -3847,11 +4427,20 @@ class MCPScanner(Scanner):
         command: str,
         launch: Launch,
         recorded: set[str],
+        identity: _Identity,
+        *,
+        multiple_endpoints: bool = False,
     ) -> list[str]:
         """Values only the keyed binding covers, named by kind."""
         unbound = []
         if command and (re.search(r"[\\/]", command) or launch.wrappers):
             unbound.append("command path")
+        elif command and identity.command != command.strip(" \t\r\n\f\v"):
+            # A redacted command, or one exported case-folded or without its Windows
+            # suffix: MCPServer and mcpserver are different files on POSIX.
+            unbound.append("command")
+        if identity.endpoint == "[redacted]" or multiple_endpoints:
+            unbound.append("endpoint")
         if any(arg not in recorded for arg in args):
             unbound.append("launch arguments")
         if any(env.values()):
