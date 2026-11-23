@@ -40,6 +40,7 @@ from nexus_symbiote.utils.secrets import redact_text
 from nexus_symbiote.utils.terminal import neutralize
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -159,6 +160,7 @@ _VERSIONED_PYTHON_RE = re.compile(r"^python[0-9]+(?:\.[0-9]+)?$")
 _NODE_PACKAGE_IMPORT = re.compile(
     r"((?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*)(?:/[A-Za-z0-9_][\w.-]*)*", re.ASCII
 )
+_PLAIN_MATCHER_RE = re.compile(r"[A-Za-z0-9_-]+(?:\|[A-Za-z0-9_-]+)*")
 _SPIFFE_RE = re.compile(r"^spiffe://[a-z0-9.-]+/[A-Za-z0-9._/-]+$")
 
 
@@ -1158,19 +1160,44 @@ def _bind_script_target(
     )
 
 
-def _iter_hook_commands(doc: dict[str, Any]) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
+def _iter_hook_commands(doc: dict[str, Any]) -> list[tuple[str, str, Any, Any]]:
+    """Each hook command with the matcher and type that decide whether it runs."""
+    out: list[tuple[str, str, Any, Any]] = []
     for event_name, entries in _as_dict(doc.get("hooks")).items():
         for entry in _as_list(entries):
             if isinstance(entry, str):
-                out.append((str(event_name), entry))
+                out.append((str(event_name), entry, None, None))
             elif isinstance(entry, dict):
+                matcher = entry.get("matcher")
                 if isinstance(entry.get("command"), str):
-                    out.append((str(event_name), entry["command"]))
+                    out.append((str(event_name), entry["command"], matcher, entry.get("type")))
                 for sub in _as_list(entry.get("hooks")):
                     if isinstance(sub, dict) and isinstance(sub.get("command"), str):
-                        out.append((str(event_name), sub["command"]))
+                        out.append((str(event_name), sub["command"], matcher, sub.get("type")))
     return out
+
+
+def _hook_state(matcher: Any, hook_type: Any, disabled: bool) -> dict[str, Any]:
+    """What decides whether a hook still runs, as digests so no configuration text is copied.
+
+    An absent, empty or `*` matcher matches every tool. Only a matcher made of plain
+    `|`-separated names records its names, so a later matcher can be shown to match
+    everything it matched; any other matcher is compared by digest alone.
+    """
+    digest: str | None = None
+    names: list[str] | None = None
+    if matcher not in (None, "", "*"):
+        text = matcher if isinstance(matcher, str) else json.dumps(matcher, sort_keys=True)
+        digest = _sha256_hex(text.encode())
+        if isinstance(matcher, str) and _PLAIN_MATCHER_RE.fullmatch(matcher):
+            names = sorted({_sha256_hex(name.encode()) for name in matcher.split("|")})
+    return _rec(
+        matcher_digest=digest,
+        matcher_names=names,
+        hook_type=None if hook_type is None else _clean(hook_type)[:64],
+        runs_command=hook_type is None or hook_type == "command",
+        hooks_disabled=disabled,
+    )
 
 
 def _inspect_hooks_and_preambles(
@@ -1179,14 +1206,27 @@ def _inspect_hooks_and_preambles(
     checkout: _CheckoutScripts,
     summary: ControlPlaneAuditSummary,
 ) -> None:
-    for cfg_path, doc in _load_json_docs(files, all_paths, HOOK_CONFIG_FILES, summary.gaps):
-        for raw_event, cmd_str in _iter_hook_commands(doc):
+    hook_docs = _load_json_docs(files, all_paths, HOOK_CONFIG_FILES, summary.gaps)
+    # The local layer overrides the shared one, so its explicit value decides.
+    claude_disabled = False
+    for cfg_path, doc in hook_docs:
+        if cfg_path.startswith(".claude/settings") and "disableAllHooks" in doc:
+            claude_disabled = doc["disableAllHooks"] is True
+    for cfg_path, doc in hook_docs:
+        disabled = (
+            claude_disabled
+            if cfg_path.startswith(".claude/")
+            else doc.get("disableAllHooks") is True
+        )
+        for raw_event, cmd_str, matcher, hook_type in _iter_hook_commands(doc):
             event_name = _clean(raw_event)
+            state = _hook_state(matcher, hook_type, disabled)
             summary.hook_commands.append(
                 _rec(
                     source_file=cfg_path,
                     event=event_name,
                     command_digest=_sha256_hex(cmd_str.encode()),
+                    **state,
                 )
             )
             _, targets = _audit_command_segments(
@@ -1203,7 +1243,7 @@ def _inspect_hooks_and_preambles(
                     event_or_server=event_name,
                 )
                 if rec is not None:
-                    summary.hook_targets.append(rec)
+                    summary.hook_targets.append({**rec, **state})
 
     for skill_path in [
         p for p in all_paths if p == "SKILL.md" or p.endswith(("/SKILL.md", ".skill.md"))
@@ -2536,6 +2576,39 @@ def _backward_affected_refs(summary: ControlPlaneAuditSummary, target_ref: str) 
     return sorted(visited)
 
 
+def _hook_runs(rec: dict[str, Any]) -> bool:
+    return bool(rec.get("runs_command", True)) and not rec.get("hooks_disabled")
+
+
+def _hooks_stop_running(base_recs: list[dict[str, Any]], curr_recs: list[dict[str, Any]]) -> bool:
+    """Whether some tool a running baseline hook matched is matched by no running current one.
+
+    The records share one command and event, so the union of the current matchers decides.
+    A summary written before these fields existed reads as running for every tool.
+    """
+    live = [rec for rec in curr_recs if _hook_runs(rec)]
+    if any(rec.get("matcher_digest") is None for rec in live):
+        return False
+    digests = {rec["matcher_digest"] for rec in live}
+    names = {name for rec in live for name in rec.get("matcher_names") or ()}
+    for base in base_recs:
+        if not _hook_runs(base) or base.get("matcher_digest") in digests:
+            continue
+        base_names = base.get("matcher_digest") is not None and base.get("matcher_names")
+        if not base_names or not names.issuperset(base_names):
+            return True
+    return False
+
+
+def _group_hooks(
+    recs: list[dict[str, Any]], key: Callable[[dict[str, Any]], tuple[str, ...]]
+) -> dict[tuple[str, ...], list[dict[str, Any]]]:
+    groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for rec in recs:
+        groups.setdefault(key(rec), []).append(rec)
+    return groups
+
+
 def diff_control_plane_audits(
     baseline: ControlPlaneAuditSummary,
     current: ControlPlaneAuditSummary,
@@ -2610,6 +2683,29 @@ def diff_control_plane_audits(
                 f"Launch target '{key}' (baseline digest {base_sha[:12]}) was removed.",
             )
 
+    def _target_event(rec: dict[str, Any]) -> tuple[str, ...]:
+        return (f"hook-target:{rec['target_path']}", str(rec.get("context", "")))
+
+    # A disabled layer, a non-command type or a narrower matcher keeps the target
+    # bound while it no longer runs, which is a removal for the guard it implemented.
+    curr_target_hooks = _group_hooks(current.hook_targets, _target_event)
+    stopped_targets = sorted(
+        {
+            group[0]
+            for group, recs in _group_hooks(baseline.hook_targets, _target_event).items()
+            if group[0] in curr_targets
+            and _hooks_stop_running(recs, curr_target_hooks.get(group, []))
+        }
+    )
+    for key in stopped_targets:
+        _emit(
+            "launch_target_removed",
+            RiskSeverity.CRITICAL,
+            f"agent-control:{key}",
+            f"Launch target '{key}' (baseline digest {base_targets[key][:12]}) "
+            "is still bound but its hook no longer runs where it did.",
+        )
+
     def _hook_keys(s: ControlPlaneAuditSummary) -> set[tuple[str, str, str]]:
         return {(h["source_file"], h["event"], h["command_digest"]) for h in s.hook_commands}
 
@@ -2629,6 +2725,23 @@ def diff_control_plane_audits(
             f"hook-command:{src}:{event}:{digest[:12]}",
             f"Hook command for '{event}' in {src} (baseline digest {digest[:12]}) was removed.",
         )
+
+    def _hook_key(rec: dict[str, Any]) -> tuple[str, ...]:
+        return (rec["source_file"], rec["event"], rec["command_digest"])
+
+    curr_hook_recs = _group_hooks(current.hook_commands, _hook_key)
+    for (src, event, digest), recs in sorted(
+        _group_hooks(baseline.hook_commands, _hook_key).items()
+    ):
+        curr_recs = curr_hook_recs.get((src, event, digest))
+        if curr_recs is not None and _hooks_stop_running(recs, curr_recs):
+            _emit(
+                "hook_command_removed",
+                RiskSeverity.CRITICAL,
+                f"hook-command:{src}:{event}:{digest[:12]}",
+                f"Hook command for '{event}' in {src} (baseline digest {digest[:12]}) "
+                "is still declared but no longer runs where it did.",
+            )
 
     def _preamble_keys(s: ControlPlaneAuditSummary) -> set[tuple[str, str]]:
         return {(p["skill_path"], p["command_digest"]) for p in s.skill_preambles}

@@ -1357,3 +1357,104 @@ def test_linked_steering_targets_are_resolved_once_per_audit(
         return len(calls)
 
     assert lookups(1) == lookups(50) > 0
+
+
+def _guard_settings(
+    matcher: str | None = "Bash", hook_type: str = "command", **layer: object
+) -> dict[str, object]:
+    entry: dict[str, object] = {"hooks": [{"type": hook_type, "command": "./guard.sh"}]}
+    if matcher is not None:
+        entry["matcher"] = matcher
+    return {"hooks": {"PreToolUse": [entry]}, **layer}
+
+
+def _guard_alerts(
+    tmp_path: Path, current: dict[str, object], local: dict[str, object] | None = None
+) -> set[str]:
+    summaries = []
+    for side, settings, local_settings in (
+        ("base", _guard_settings(), None),
+        ("curr", current, local),
+    ):
+        root = tmp_path / side
+        root.mkdir()
+        (root / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+        _write_json(root / ".claude" / "settings.json", settings)
+        if local_settings is not None:
+            _write_json(root / ".claude" / "settings.local.json", local_settings)
+        summaries.append(audit_project_control_plane(root))
+    return {a["root_cause"] for a in diff_control_plane_audits(*summaries)}
+
+
+@pytest.mark.parametrize(
+    ("current", "local"),
+    [
+        (_guard_settings(matcher="NeverMatchesAnyTool"), None),
+        (_guard_settings(matcher="Bas.*"), None),
+        (_guard_settings(matcher="Edit|Write"), None),
+        (_guard_settings(disableAllHooks=True), None),
+        (_guard_settings(), {"disableAllHooks": True}),
+        (_guard_settings(hook_type="prompt"), None),
+    ],
+)
+def test_baseline_diff_alerts_when_a_kept_hook_no_longer_runs(
+    tmp_path: Path, current: dict[str, object], local: dict[str, object] | None
+) -> None:
+    causes = _guard_alerts(tmp_path, current, local)
+    assert {"hook_command_removed", "launch_target_removed"} <= causes
+
+
+@pytest.mark.parametrize(
+    ("current", "local"),
+    [
+        (_guard_settings(), None),
+        (_guard_settings(matcher="*"), None),
+        (_guard_settings(matcher=""), None),
+        (_guard_settings(matcher=None), None),
+        (_guard_settings(matcher="Bash|Edit"), None),
+        (_guard_settings(disableAllHooks=True), {"disableAllHooks": False}),
+        (_guard_settings(disableAllHooks=False), None),
+    ],
+)
+def test_baseline_diff_is_quiet_when_a_kept_hook_still_runs(
+    tmp_path: Path, current: dict[str, object], local: dict[str, object] | None
+) -> None:
+    causes = _guard_alerts(tmp_path, current, local)
+    assert not causes & {"hook_command_removed", "launch_target_removed"}
+
+
+def test_hook_records_carry_the_state_that_decides_whether_they_run(tmp_path: Path) -> None:
+    (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    _write_json(tmp_path / ".claude" / "settings.json", _guard_settings(disableAllHooks=True))
+    summary = audit_project_control_plane(tmp_path)
+    (hook,) = summary.hook_commands
+    assert hook["hooks_disabled"] is True
+    assert hook["runs_command"] is True
+    assert hook["matcher_digest"] and len(hook["matcher_names"]) == 1
+    assert "Bash" not in json.dumps(hook)
+    (target,) = summary.hook_targets
+    assert target["matcher_digest"] == hook["matcher_digest"]
+
+
+def test_hook_run_comparison_scales_linearly_with_matchers(tmp_path: Path) -> None:
+    def summary(count: int, prefix: str) -> ControlPlaneAuditSummary:
+        result = ControlPlaneAuditSummary()
+        result.hook_commands = [
+            {
+                "source_file": ".claude/settings.json",
+                "event": "PreToolUse",
+                "command_digest": "0" * 64,
+                "matcher_digest": f"{prefix}{index}",
+                "matcher_names": [f"{prefix}{index}"],
+                "runs_command": True,
+                "hooks_disabled": False,
+            }
+            for index in range(count)
+        ]
+        return result
+
+    def run(scale: int) -> None:
+        alerts = diff_control_plane_audits(summary(2_000 * scale, "b"), summary(2_000 * scale, "c"))
+        assert [a["root_cause"] for a in alerts] == ["hook_command_removed"]
+
+    assert scaling_ratio(run) < 10
