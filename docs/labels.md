@@ -6,7 +6,7 @@ with this page; when you add a label, add its row here in the same change.
 
 ## Rules
 
-- Every pull request must carry at least one [type](#type) label and at least one [area](#area) label.
+- Every pull request should carry at least one [type](#type) label and at least one [area](#area) label.
 - An open pull request carries exactly one [review state](#review-state) label:
   `needs-independent-review`, `review: changes-needed` or `review: verified`. It starts at
   `needs-independent-review`, and its reviewers move it. A [hold](#hold) may be added on top.

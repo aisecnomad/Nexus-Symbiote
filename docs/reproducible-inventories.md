@@ -192,8 +192,9 @@ against the current tree.
 - **SARIF locations depend on the working directory**, as described above.
 - **A document nested deeper than 128 levels is not read by the shared reader.**
   Commands that read through `AIBOM.load` (`diff`, `validate`, `risk`, `summary`,
-  `graph`, `digest`, `export-inventory`, etc.) refuse documents nested beyond 128 levels
-  (the root counted); the bound is fixed, so what one reads, every one reads. Four
+  `graph`, `digest`, `export-inventory`, etc.) refuse one whose arrays and objects nest
+  more than 128 levels, the root counted, with "inventory nests deeper than 128 levels";
+  the bound is fixed, so what one reads, every one reads. Four
   commands do not apply the bound: `verify-discovery` and `verify-live` read the
   inventory with the strict JSON parser and the schema, so they read a document at 129
   or 257 levels and refuse one at ~1,000; `attest` records a subject up to 256 levels as

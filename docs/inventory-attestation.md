@@ -45,7 +45,8 @@ It does not establish:
   ([known limitations](known-limitations.md)). An attested inventory of an unsafe agent
   is an inventory of an unsafe agent.
 - **That the file is the newest one.** An older file signed for the same purpose still
-  verifies. Bound it with `--max-age-days`, record `--source-revision`, and keep
+  verifies; replaying an old attested baseline is possible by design. Bound it with
+  `--max-age-days`, record `--source-revision`, and keep
   attested baselines where the change under review cannot choose among them.
 - **Who holds a key.** The tool checks signatures against the keys you name; issuing,
   protecting and retiring keys is your process.
@@ -63,10 +64,12 @@ nexus-symbiote runtime keygen --private-key reviewer.pem --public-key reviewer.p
 
 Add `--passphrase-file FILE` to encrypt the private key with the first line of a file
 you own and that gives group and others no permission; `attest` then needs the same flag. `attest` refuses a private key or passphrase file that the user running it does
-not own or that its group or others can access, even when running as root.
+not own or that its group or others can access, even when running as root: a container
+job cannot sign with a key mounted from the host and owned by another user.
 `runtime key-id reviewer.pub` prints the key ID (lowercase hex SHA-256 of the DER
 SubjectPublicKeyInfo). Use a key pair only for attestations — the runtime rings use one
-key per purpose — and keep private keys away from jobs that run pull-request code.
+key per purpose — and keep private keys away from jobs that run code from a pull
+request: such code can sign whatever it likes with a key it can read.
 
 The purpose is a signed field, not a property of the key: any trusted key can sign
 either purpose. Trust different keys for each. A CI key for `generated` must not be
@@ -184,8 +187,9 @@ nexus-symbiote diff "$RUNNER_TEMP/reviewed.json" "$RUNNER_TEMP/agentbom.json" --
 ```
 
 `verify-attestation` exits 1 on mismatch, wrong purpose, insufficient keys or age
-over 90 days; with `bash -e`, `diff` never runs. The same steps work for a baseline
-in an artifact store. The rules for
+over 90 days; a shell that stops at the first failure, such as GitHub's default
+`bash -e`, then never runs `diff`. The same steps work for a baseline in an artifact
+store. The rules for
 [taking both snapshots the same way](drift-gate.md#take-both-snapshots-the-same-way)
 still apply, as does protecting the workflow file.
 
@@ -221,8 +225,9 @@ too.
 A mount of a directory or file inside a working tree is not detected, because the key
 then has a location outside the tree: `docker run -v "$PWD/keys:/keys" -v "$PWD:/work" ...`
 accepts a committed key as `/keys/trusted.pub`. The rule catches misplacement, not
-provenance — it does not authenticate the key. Provision keys from a CI variable,
-secret store or runner directory outside the checkout.
+provenance — it does not authenticate the key. Provision keys from a place the change
+under review cannot write, such as a CI variable, a secret store or a directory on the
+runner outside the checkout.
 
 On POSIX systems a trusted key must also be safe from replacement: owned by you or
 root, group and others cannot write, and every parent directory up to the filesystem

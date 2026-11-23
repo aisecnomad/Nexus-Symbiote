@@ -50,7 +50,7 @@ The publication preflight checks that the release-tag ruleset is active, that ta
 
 ### Outstanding administrator actions
 
-Turning the signature requirement on, adding a second code owner, applying the full protection profile, deleting merged branches and enabling automatic deletion of head branches are administrator settings. The commands are in [repository controls](docs/repository-controls.md#administrator-actions-still-outstanding). See [repository controls](docs/repository-controls.md#operator-prerequisites) for the observed state of each control.
+Turning the signature requirement on, adding a second code owner, applying the full protection profile, deleting merged branches and enabling automatic deletion of head branches are administrator settings. This repository cannot do them. The commands are in [repository controls](docs/repository-controls.md#administrator-actions-still-outstanding). See [repository controls](docs/repository-controls.md#operator-prerequisites) for the observed state of each control.
 
 Do not claim active merge enforcement from a workflow file, governance statement or local passing suite. Verify live settings and successful checks for the revision being considered.
 

@@ -9,12 +9,12 @@ Every page answers one of three questions: **why** Nexus SymBiote works the way 
 
 ## Why: principles and trust model
 
-Read these before you use any result in an approval decision.
+Read these, and the [known limitations](known-limitations.md), before you use any result in an approval decision.
 
 | Page | Read it to understand |
 | --- | --- |
-| [Security model](security-model.md) | [Design principles](security-model.md#design-principles); declared, observed, approved and mediated evidence; [what results establish](security-model.md#what-results-do-and-do-not-establish); false-positive and false-negative classes |
-| [Architecture](architecture.md) | Module layout, scan pipeline, trust boundaries and their controls |
+| [Security model](security-model.md) | [Design principles](security-model.md#design-principles); declared, observed, approved and mediated evidence; [what results do and do not establish](security-model.md#what-results-do-and-do-not-establish); known false-positive and false-negative classes |
+| [Architecture](architecture.md) | Module layout, scan pipeline, where untrusted data enters, and which control guards each trust boundary |
 | [Threat model](threat-model.md) | Assets, adversaries, controls and residual risk |
 | [Offline and live modes](offline-and-live-modes.md#why) | Why every command is offline by default and how that is enforced |
 | [Security policy](../SECURITY.md) | Security boundaries, supported versions, vulnerability reporting and key limitations |

@@ -252,7 +252,7 @@ jobs:
           fail-on-severity: 'high'
 ```
 
-The Action installs its own hash-locked runtime, ignores checkout policy, and reports each gate in its `result` and `gates` outputs. `fail-on-severity` defaults to `high` — a high finding fails even when the aggregate score stays under `risk-threshold`. Full guide: [GitHub Action](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/github-action.md). Inputs and outputs: [action.yml](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/action.yml).
+The Action installs its own hash-locked runtime off the job's `PATH`, ignores checkout policy, and reports each gate in its `result` and `gates` outputs. `fail-on-severity` defaults to `high` — a high finding fails even when the aggregate score stays under `risk-threshold`. Set `fail-on-severity: critical` to fail on severity only for critical findings. Full guide: [GitHub Action](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/github-action.md). Inputs and outputs: [action.yml](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/action.yml).
 
 ### Gate drift in CI
 
