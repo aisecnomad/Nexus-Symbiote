@@ -332,7 +332,7 @@ def test_each_ci_suite_dumps_tracebacks_only_just_before_its_test_timeout():
             faulthandler = int(dump.group(1) if dump else options["faulthandler_timeout"])
             assert 0.9 * test_timeout <= faulthandler <= test_timeout, (job, run)
             checked += 1
-    assert checked == 5
+    assert checked == 6
 
 
 def test_the_time_limit_and_the_isolation_hold_in_a_parallel_worker(suite, monkeypatch):
