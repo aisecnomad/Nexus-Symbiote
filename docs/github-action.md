@@ -1,6 +1,6 @@
 # GitHub Action
 
-The composite Action collects an AgentBOM in a workflow job and applies the collection, completeness, integrity, risk and drift gates. Every input and output is defined in [action.yml](../action.yml). On `pull_request` the workflow file comes from the change under review, so also [protect the gate](drift-gate.md#protect-the-gate).
+The composite Action collects an AgentBOM and applies collection, completeness, integrity, risk and drift gates. Inputs and outputs are defined in [action.yml](../action.yml). On `pull_request` the workflow file comes from the change under review — see [protect the gate](drift-gate.md#protect-the-gate).
 
 ## Add it to a workflow
 

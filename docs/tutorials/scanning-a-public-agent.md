@@ -1,18 +1,17 @@
 # Scanning a public agent project
 
-This tutorial walks through using Nexus SymBiote against a real, public agent
-project rather than the synthetic [`examples/demo-agent/`](../../examples/README.md).
-It covers inventory, validation, risk gating, drift detection and a CI wiring.
+Run Nexus SymBiote against a real, public agent project rather than the synthetic
+[`examples/demo-agent/`](../../examples/README.md). Covers inventory, validation,
+risk gating, drift detection and CI wiring.
 
-The goal is to show the shape of the output on a repository you did not control
-the layout of. It is not a security review of the target. Findings reflect
-what SymBiote can see in static files; absence of a finding is not approval.
+The goal is to show output shape on a repository you did not author. This is not a
+security review of the target — findings reflect what SymBiote sees in static files,
+and absence of a finding is not approval.
 
 ## 1. Pick a reviewed revision
 
-The repository and the exact revision are inputs to the review, not something
-to pin loosely. Clone a public target and detach to the commit you will
-actually read:
+Pin to the exact revision you will review. Clone a public target and detach to that
+commit:
 
 ```bash
 git clone https://github.com/modelcontextprotocol/servers.git public-mcp-servers
@@ -21,9 +20,8 @@ git checkout --detach <40-character-commit-sha-you-reviewed>
 cd -
 ```
 
-Any public agent-ish repository works; `modelcontextprotocol/servers` is a
-convenient target because it ships several MCP server packages, each with its
-own package manifest, and the inventory exercise is representative.
+Any public agent repository works. `modelcontextprotocol/servers` is a convenient
+target because it ships several MCP server packages with separate manifests.
 
 ## 2. Install SymBiote from a reviewed checkout
 
@@ -36,10 +34,9 @@ nexus-symbiote --version
 
 ## 3. Collect an inventory
 
-Static collection is offline by default and does not execute project modules,
-MCP launchers or model loaders. Scan the target you detached in step 1, with
-project-supplied policy disabled so an untrusted checkout cannot pick its own
-gates. Accept the checkout's Git metadata with `--accept-default-exclude .git`:
+Collection is offline by default — no project modules, MCP launchers or model
+loaders execute. Disable project-supplied policy so an untrusted checkout cannot
+pick its own gates:
 
 ```bash
 nexus-symbiote scan public-mcp-servers \
@@ -49,11 +46,9 @@ nexus-symbiote scan public-mcp-servers \
 nexus-symbiote summary public.aibom.json
 ```
 
-`scan` prints each of the eight built-in collectors (`mcp`, `model`, `prompt`,
-`rag`, `registry`, `shadowscan`, `a2a`, `ide_agents`) as it runs, with the number
-of components it found. `summary` then counts the inventory's components by
-type, its dependencies and its findings by severity. The inventory itself
-records per-collector status, failures and excluded paths:
+`scan` prints each collector as it runs with its component count. `summary` counts
+components by type, dependencies and findings by severity. Inspect per-collector
+status, failures and exclusions:
 
 ```bash
 jq '.metadata.completeness | {scanner_status, scan_failures, exclusions, surfaces_excluded}' public.aibom.json
@@ -62,8 +57,8 @@ jq '.metadata.completeness | {scanner_status, scan_failures, exclusions, surface
 A completed search can report zero matches for a collector; that is coverage
 information, not a failure.
 
-For a target with a lot of dependency manifests, scope the pass to the
-collectors you intend to review. Repeat `--scanner` once per collector:
+For targets with many dependency manifests, scope to the collectors you intend to
+review:
 
 ```bash
 nexus-symbiote scan public-mcp-servers \
@@ -87,12 +82,11 @@ nexus-symbiote validate public.aibom.json \
 nexus-symbiote risk public.aibom.json --no-project-policy
 ```
 
-Validation checks completeness and integrity against the project you scanned.
-`risk` scores findings and applies the default gate. Both commands may fail
-with exit 1 even on a healthy project: unpinned package references, missing
-immutable image digests and absent signer policies all surface as findings
-rather than passing silently. That is the intended behaviour — this is a
-review surface, not a yes/no verdict.
+`validate` checks completeness and integrity against the project. `risk` scores
+findings and applies the default gate. Both may exit 1 even on a healthy project:
+unpinned packages, missing image digests and absent signer policies surface as
+findings rather than passing silently. This is a review surface, not a yes/no
+verdict.
 
 The validator uses the exact MCP source bound at scan time. If you edited the
 project between scanning and validating, re-scan: the fingerprint reconciliation
@@ -107,19 +101,18 @@ nexus-symbiote scan public-mcp-servers --accept-default-exclude .git --no-projec
 nexus-symbiote scan public-mcp-servers --accept-default-exclude .git --no-project-policy -f sarif    -o public.sarif
 ```
 
-The CycloneDX 1.7 and SPDX 3.0.1 exports carry a digest-bound native extension
-you must preserve to recover full semantics; a dropped extension loses the
-agent-native fields. The SARIF export contains reviewable findings, not an
-admission decision.
+CycloneDX 1.7 and SPDX 3.0.1 exports carry a digest-bound native extension you
+must preserve to recover full semantics. The SARIF export contains reviewable
+findings, not an admission decision.
 
 ## 6. Catch drift on the next review
 
-Collect a reviewed baseline, and every later scan, with the same source binding
-key: one secret of at least 32 characters, kept outside the checkout (a CI
-secret or a password manager, never a file in the repository). The key binds
-the MCP launch arguments, environment values and endpoint paths that the
-inventory otherwise redacts, so `diff` can tell whether they changed. The
-inventory from step 3 was collected without a key, so take the baseline again:
+Use the same source binding key for the reviewed baseline and every later scan:
+one secret of at least 32 characters, kept outside the checkout (a CI secret or
+password manager, never a file in the repository). The key binds MCP launch
+arguments, environment values and endpoint paths that the inventory otherwise
+redacts, so `diff` can detect changes. The step-3 inventory has no key, so
+re-collect:
 
 ```bash
 # One secret of 32 or more characters, kept outside the checkout; the same for every scan.
@@ -199,12 +192,12 @@ After this walkthrough you have:
 
 What you **do not** have, however the gate reads:
 
-- Proof that any model is benign, that any tool's backend obeys its description,
-  or that any live agent action was mediated. Read
+- Proof that any model is benign, that any tool backend obeys its description or
+  that any live agent action was mediated. Read
   [security-model.md](../security-model.md) before any approval decision.
 - Complete enterprise discovery. SymBiote is a local-evidence tool;
   [Nexus-ShadowScan](https://github.com/Hunzee-VC/Nexus-ShadowScan) is the
-  multi-surface discovery counterpart whose reports SymBiote imports.
+  multi-surface discovery counterpart.
 - Any claim about future revisions. Re-scan on each review.
 
 ## Next steps
