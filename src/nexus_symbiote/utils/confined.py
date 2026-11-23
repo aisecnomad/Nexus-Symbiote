@@ -1562,6 +1562,38 @@ class ConfinedCollection:
         os.close(fd)
         return True
 
+    def entry_link(self, path: str | Path) -> Path | None:
+        """The root-relative target of the symlink at ``path``, even when ``path`` is excluded.
+
+        Only the entry is inspected, without following it, from a parent reached without
+        symlinks; the empty path names the root itself. Returns ``None`` when the entry is
+        absent or not a symlink, and raises ``CollectionError`` with the reason when a
+        link cannot be placed beneath the root.
+        """
+        relative = self._relative(path)
+        if self._root_fd is None or not relative.parts:
+            return None
+        try:
+            parent = self._open_parent(relative)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise CollectionError("entry's directory is or passes through a symlink") from exc
+        try:
+            info = self._stat_exact_no_follow(parent, relative.name)
+            if not stat.S_ISLNK(info.st_mode):
+                return None
+            text = os.readlink(relative.name, dir_fd=parent)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise CollectionError("symlink could not be read") from exc
+        finally:
+            os.close(parent)
+        target = _lexical_target(relative.parent, text)
+        self._check_target_depth(target)
+        return target
+
     def _open_no_follow(self, relative: Path) -> int:
         parent = self._open_parent(relative)
         try:

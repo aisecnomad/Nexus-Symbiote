@@ -536,3 +536,25 @@ def test_a_case_variant_is_reported_once_however_many_paths_lead_to_it(tmp_path)
             f"q/.claude/Settings.json: case variant of q/.claude/settings.json {variant}",
         ]
     )
+
+
+def test_entry_link_reads_an_excluded_link_without_following_it(tmp_path):
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / "node_modules").symlink_to(".claude", target_is_directory=True)
+    (tmp_path / "venv").symlink_to(tmp_path / ".claude", target_is_directory=True)
+    (tmp_path / ".git").symlink_to("..", target_is_directory=True)
+    (tmp_path / "self").symlink_to(".", target_is_directory=True)
+    failures: list[str] = []
+    with ConfinedCollection(tmp_path, failures) as files:
+        assert files.excluded("node_modules")
+        assert files.entry_link("node_modules") == Path(".claude")
+        assert files.entry_link("self") == Path()
+        assert files.entry_link(".venv") is None
+        assert files.entry_link("missing") is None
+        for refused in ("venv", ".git"):
+            with pytest.raises(CollectionError):
+                files.entry_link(refused)
+        with pytest.raises(CollectionError):
+            files.entry_link("node_modules/inner")
+    assert failures == []

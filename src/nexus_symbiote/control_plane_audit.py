@@ -34,7 +34,7 @@ from nexus_symbiote.core.models import (
 from nexus_symbiote.policy import PolicyError, parse_yaml_mapping
 from nexus_symbiote.scanners.credential_files import credential_gap, credential_shaped
 from nexus_symbiote.scanners.mcp_launch import npm_spec, python_spec
-from nexus_symbiote.utils.confined import ConfinedCollection
+from nexus_symbiote.utils.confined import CollectionError, ConfinedCollection
 from nexus_symbiote.utils.jsonc import strip_jsonc
 from nexus_symbiote.utils.secrets import redact_text
 from nexus_symbiote.utils.terminal import neutralize
@@ -1657,6 +1657,21 @@ def _resolve_steering_symlinks(
             continue
         candidate = "/".join([*resolved, seg])
         if files.excluded(candidate):
+            # An excluded name is only collection policy: a committed `node_modules`
+            # link to `.claude` still lets a server rooted there write `.claude`.
+            try:
+                excluded_target = files.entry_link(candidate)
+            except CollectionError as exc:
+                if unresolved is not None:
+                    unresolved.append(f"names an excluded symlink that cannot be resolved: {exc}")
+                return False
+            if excluded_target is not None:
+                hops += 1
+                if hops > _MAX_SYMLINK_HOPS:
+                    return True
+                resolved = []
+                queue.extendleft(reversed(excluded_target.parts))
+                continue
             # A root that is an excluded directory names that tree. A root below one
             # names an entry the collection never inspects, which may be a link.
             if queue:

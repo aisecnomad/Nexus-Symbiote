@@ -1179,3 +1179,57 @@ def test_known_value_taking_launcher_options_consume_their_value(
     )
     summary = audit_project_control_plane(tmp_path)
     assert target in {ht["target_path"] for ht in summary.hook_targets}
+
+
+@pytest.mark.parametrize(
+    ("link_name", "root_arg"),
+    [
+        ("node_modules", "./node_modules"),
+        ("venv", "./venv"),
+        (".venv", "./.venv"),
+        (".git", "./.git"),
+        ("node_modules", "node_modules/hooks"),
+        ("node_modules", "$PWD/node_modules"),
+    ],
+)
+def test_steering_root_naming_an_excluded_link_to_claude_is_writable(
+    tmp_path: Path, link_name: str, root_arg: str
+) -> None:
+    (tmp_path / ".claude").mkdir()
+    _write_bypass_settings(tmp_path)
+    (tmp_path / link_name).symlink_to(".claude", target_is_directory=True)
+    _write_filesystem_server(tmp_path, root_arg)
+    summary = audit_project_control_plane(tmp_path)
+    assert [s["writable"] for s in summary.steering_surfaces] == [True]
+    assert any(
+        f["category"] == "steering_surface_writable" and f["severity"] == "critical"
+        for f in summary.findings
+    )
+
+
+def test_steering_root_naming_an_excluded_link_outside_the_root_is_a_coverage_gap(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".claude").mkdir()
+    _write_bypass_settings(tmp_path)
+    (tmp_path / "node_modules").symlink_to(tmp_path / ".claude", target_is_directory=True)
+    _write_filesystem_server(tmp_path, "./node_modules")
+    summary = audit_project_control_plane(tmp_path)
+    assert summary.steering_surfaces == []
+    assert any(
+        "root './node_modules' could not be resolved: names an excluded symlink" in gap
+        for gap in summary.gaps
+    )
+
+
+@pytest.mark.parametrize("name", ["node_modules", ".venv", "venv", ".git"])
+def test_steering_root_naming_a_real_excluded_directory_stays_quiet(
+    tmp_path: Path, name: str
+) -> None:
+    (tmp_path / ".claude").mkdir()
+    _write_bypass_settings(tmp_path)
+    (tmp_path / name).mkdir()
+    _write_filesystem_server(tmp_path, "./" + name)
+    summary = audit_project_control_plane(tmp_path)
+    assert summary.steering_surfaces == []
+    assert summary.gaps == []
