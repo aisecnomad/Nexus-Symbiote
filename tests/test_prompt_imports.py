@@ -1187,3 +1187,146 @@ def test_a_fence_in_front_matter_does_not_hide_imports(tmp_path, note):
     result = PromptScanner().scan(tmp_path)
     assert result.surfaces_excluded == [f"CLAUDE.md: {OUTSIDE}"]
     assert "prompt:import:x.md" in {c.bom_ref for c in result.components}
+
+
+# #410: in the Unicode dialect a white space character beyond ASCII both separates
+# attributes and continues an unquoted value, so the open-tag pattern backtracks
+# quadratically over a line that holds one. A value alternating a letter and a no-break
+# space took about 0.2 s per 4,000-character line.
+_SPACED_TAG = "<a b=" + "c\xa0" * 2_040
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        # The line length grows at a fixed line count.
+        lambda scale: "\n\n".join(["<a b=" + "c\xa0" * (500 * scale)] * 8) + "\n",
+        # The line count grows at a fixed length under the per-line bound.
+        lambda scale: "\n\n".join(["<a b=" + "c\xa0" * 120] * (100 * scale)) + "\n",
+        # Spaced lines among ordinary ones.
+        lambda scale: ("text\n\n" + "<a b=" + "c\xa0" * 120 + "\n\n") * (100 * scale),
+    ],
+    ids=["line length", "line count", "interleaved"],
+)
+def test_a_tag_with_non_ascii_spaces_stays_linear(make):
+    texts = {scale: make(scale) for scale in (1, 4)}
+    assert scaling_ratio(lambda scale: prompt._import_readings(texts[scale])) < 10
+
+
+def test_a_mebibyte_of_spaced_tag_lines_reads_quickly():
+    text = "\n\n".join([_SPACED_TAG] * 256) + "\n"
+    started = time.process_time()
+    prompt._import_readings(text)
+    # About 60 s before #410; the bound leaves room for a slow, traced runner.
+    assert time.process_time() - started < 15
+
+
+def test_an_import_after_a_long_spaced_tag_is_still_read():
+    text = _SPACED_TAG + "\n\nFollow @notes.md\n"
+    assert "notes.md" in prompt._import_tokens(text)
+
+
+def test_the_non_ascii_space_class_is_the_dialects_white_space_beyond_ascii():
+    from nexus_symbiote.utils import markdown
+
+    dialect = re.compile(markdown._WHITESPACE)
+    beyond = {chr(code) for code in range(0x80, 0x110000) if dialect.fullmatch(chr(code))}
+    found = {
+        chr(code)
+        for code in range(0x80, 0x110000)
+        if markdown._NON_ASCII_SPACE.fullmatch(chr(code))
+    }
+    assert found == beyond
+    all_ws = {chr(code) for code in range(0x110000) if dialect.fullmatch(chr(code))}
+    assert all_ws == markdown._WHITESPACE_CHARS
+
+
+def test_exponential_spaced_attribute_backtracking_stays_linear():
+    # A 104-char `<a b=\xa0\xa0\xa0...` line was O(3^k) exponential in the old regex.
+    for scale in (1, 4):
+        line = "<a " + "b=\xa0\xa0\xa0" * (200 * scale) + "!"
+        started = time.process_time()
+        prompt._import_readings(line + "\n\nFollow @notes.md\n")
+        assert time.process_time() - started < 5
+    texts = {scale: "<a " + "b=\xa0\xa0\xa0" * (200 * scale) + "!\n" for scale in (1, 4)}
+    assert scaling_ratio(lambda scale: prompt._import_readings(texts[scale])) < 10
+
+
+def test_unicode_kind7_nfa_matches_the_commonmark_grammar_exactly():
+    import random
+
+    from nexus_symbiote.utils import markdown
+
+    ws = markdown._WHITESPACE
+    open_tag = (
+        rf"<[A-Za-z][A-Za-z0-9-]*(?:{ws}+[a-zA-Z_:][a-zA-Z0-9:._-]*"
+        rf"(?:{ws}*={ws}*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?)*"
+        rf"{ws}*/?>"
+    )
+    close_tag = rf"</[A-Za-z][A-Za-z0-9-]*{ws}*>"
+    spec = re.compile(rf"(?:{open_tag}|{close_tag}){ws}*$")
+    matcher = markdown._HTML_BLOCK_STARTS[6]
+
+    fixed = [
+        ("<a>", True),
+        ("<a/>", True),
+        ("<a\xa0/>", True),
+        ("<a\xa0b=c\xa0d=e>", True),
+        ("<a b=c\xa0d=e/>", True),
+        ("<a\xa0b='x\xa0y'\xa0c=\"z\">", True),
+        ("<a b=c/d>", True),
+        ("<a b=c/>", True),
+        ("</a\xa0>\xa0", True),
+        ("<a b=c\xa0!>", True),
+        ("<a\xa0b=\xa0\xa0>", True),
+        ("<a\xa0b=\xa0\xa0!>", True),
+        ("<a b='x'c>", False),
+        ('<a b="x"c>', False),
+        ("<a b  =c>", True),
+        ("<a b=  c>", True),
+        ("<a b =c>", True),
+        ("<a b c>", True),
+        ("<a b.c>", True),
+        ("<a b=c`d>", False),
+        ("<a 0b>", False),
+        ("<1a>", False),
+        ("<>", False),
+        ("plain text", False),
+    ]
+    for sample, expected in fixed:
+        assert (spec.match(sample, 0) is not None) is expected, sample
+        assert bool(matcher.match(sample, 0)) is expected, sample
+        assert markdown._match_unicode_kind7(sample, 0) is expected, sample
+
+    rng = random.Random(410)  # noqa: S311
+    prefixes = ("", "<", "</", "<a", "</a")
+    alphabet = [
+        "a",
+        "0",
+        "1",
+        "_",
+        ":",
+        ".",
+        "-",
+        " ",
+        "\t",
+        "\n",
+        "\xa0",
+        "\u2000",
+        "\u3000",
+        "\ufeff",
+        "=",
+        "'",
+        '"',
+        "`",
+        "/",
+        ">",
+        "!",
+    ]
+    for _ in range(50_000):
+        lead = "x" * rng.randint(0, 3)
+        pos = len(lead)
+        sample = lead + rng.choice(prefixes) + "".join(rng.choices(alphabet, k=rng.randint(0, 12)))
+        expected = spec.match(sample, pos) is not None
+        assert bool(matcher.match(sample, pos)) is expected, (sample, pos)
+        assert markdown._match_unicode_kind7(sample, pos) is expected, (sample, pos)
