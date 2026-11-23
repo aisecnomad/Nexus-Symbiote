@@ -1221,15 +1221,18 @@ runs a short exec wrapper (the running interpreter with `-I -S`), which waits un
 `verify-live` holds a pidfd for it and only then executes the staged launcher with
 the same argument, environment and working directory. The launcher therefore cannot
 leave the process group, kill `unshare` through it or exit before cleanup can reach
-it. When the session ends, cleanup sends the launcher SIGKILL through that pidfd and
+it.
+
+When the session ends, cleanup sends the launcher SIGKILL through that pidfd and
 waits until the kernel has ended every process in the namespace, including nested
 PID namespaces. It does not rely on `--kill-child`, the process group or `unshare`,
 which a launcher can defeat by clearing its parent-death signal, calling `setsid` or
 `setpgid`, or killing `unshare` with `kill(0, SIGKILL)` from a child left in that
 group. If no namespace init appears within 5 seconds, the server fails with
 `isolation-unavailable` before the pinned launcher executes. If the namespace has not
-ended 5 seconds after the SIGKILL, it fails with `isolation-teardown-failed`. Without
-a separately runnable interpreter, as in a frozen build, or where the kernel cannot
+ended 5 seconds after the SIGKILL, it fails with `isolation-teardown-failed`.
+
+Without a separately runnable interpreter, as in a frozen build, or where the kernel cannot
 open a pidfd, the launcher runs without a pidfd held, and cleanup stops `unshare` so
 that it cannot reap the launcher, kills the launcher it finds as `unshare`'s child
 and waits in the same way; there a server whose `unshare` was killed by a signal
@@ -1238,6 +1241,7 @@ before cleanup, or did not stop within 1 second, also fails with
 that the launcher has another service start, such as `systemd-run --user`, is
 outside the namespace and is not ended, and nothing ends the namespace if
 `verify-live` itself is killed before its cleanup runs.
+
 Inside the namespace the launcher sees itself as uid 0
 and gid 0, mapped to the invoking user and group; every other uid and gid, including
 the owners of the files it reads and its own supplementary groups, appears as
@@ -1245,7 +1249,9 @@ the owners of the files it reads and its own supplementary groups, appears as
 outside the namespace, but a launcher that refuses to run as root, inspects its
 supplementary groups or changes file ownership behaves differently than under direct
 execution. A host that refuses the namespace fails with `isolation-unavailable`
-before executing the pinned launcher. Only the explicit operator option
+before executing the pinned launcher.
+
+Only the explicit operator option
 `--no-isolation` permits a launch without this boundary. On that path, on Linux,
 a short wrapper (the running interpreter with `-I -S`) sets
 `PR_SET_CHILD_SUBREAPER`, forks, and executes the staged launcher in the child with
@@ -1273,6 +1279,7 @@ the wrapper had adopted may still be running, outside that cgroup where none exi
 The report counts only when the kernel credits it to the wrapper's pid. A launcher
 running as root, or with `CAP_SYS_PTRACE` or `CAP_SYS_ADMIN`, can forge it or trace
 the wrapper, so its escape can go unreported; never opt out as root.
+
 A launcher or descendant can still evade cleanup another way, for example by moving
 out of the cgroup. Off Linux the option is refused, and every server fails with
 `isolation-unavailable` before its launcher executes: only the launcher's process group
@@ -1352,7 +1359,13 @@ nexus-symbiote export-standard [OPTIONS] AIBOM_PATH
 | `--agent-yaml` `PATH` | Relative path under `--project` to an `agent.yaml` (`1.0` or `1.1`) producer declaration file; recorded at `declared` assurance (`declaration_conflict` on contradiction). |
 | `--project` `DIR` | Trusted project root used to confine `--agent-yaml` declarations (requires `--agent-yaml`). |
 
-`--agent-yaml` and `--project` must be passed together; `--project` alone never reads `agent.yaml` implicitly. Producer declarations (`schema_version`, `owner`, `version`, `automation_level`, `licenses`, `data_usage`, `compliance`, `allowed_regions`, `release_time`, `download_location`, `datasets[]`, and `models[]`) never overwrite observed collector fields (`version`, `supplier`, `autonomy_level`, and a dataset's `source_uri` and `license`); on observed components they are recorded under `declared_*` properties with per-field `declaration.<field>` claims, and a conflicting value raises `declaration_conflict` and is not stored. Declarations match components by type and name. If only a collected component of the other type matches, the declaration raises a `declaration_conflict` (`component_type`) and is not applied. A model and dataset may share a name when both are declared independently. The first declaration of each type and name is retained, and a conflicting duplicate raises `declaration_conflict`. A `models[].training.datasets` entry adds a `trained-on` edge with `assurance_level: declared`, exported as a typed edge (CycloneDX `dependsOn` and `modelCard` datasets, SPDX `trainedOn`) whose native relationship keeps that assurance. Licences that do not parse as SPDX license expressions (listed licence ids with an optional `+`, `LicenseRef-`, `AND`, `OR`, parentheses, and `WITH` a listed exception id) export as SPDX `NoAssertion` and CycloneDX `license.name`; a licence taken from a declaration carries the comment `declared by producer`. A refused declared `download_location`, and an observed `source_uri` left out of the standard download fields (an unsupported scheme, credentials, a secret, or a character outside printable ASCII that is not percent-encoded), are reported on standard error. A `declared_download_location` property already in `AIBOM_PATH` passes the same check before it reaches a standard download field; a refused one is left out of those fields without a note on standard error, and the embedded native document still carries it unchanged. Recovery accepts the earlier typed download-location projection when the complete document matches it. Export generation refuses an embedded native document outside the recovery depth or byte limits. Passing `--author` or `--agent-yaml` enriches the embedded native inventory inside the exported document, so the recovered inventory's content digest reflects those additions rather than an attestation signed over the unmodified input `AIBOM_PATH`.
+`--agent-yaml` and `--project` must be passed together; `--project` alone never reads `agent.yaml` implicitly. Producer declarations (`schema_version`, `owner`, `version`, `automation_level`, `licenses`, `data_usage`, `compliance`, `allowed_regions`, `release_time`, `download_location`, `datasets[]`, and `models[]`) never overwrite observed collector fields (`version`, `supplier`, `autonomy_level`, and a dataset's `source_uri` and `license`); on observed components they are recorded under `declared_*` properties with per-field `declaration.<field>` claims, and a conflicting value raises `declaration_conflict` and is not stored.
+
+Declarations match components by type and name. If only a collected component of the other type matches, the declaration raises a `declaration_conflict` (`component_type`) and is not applied. A model and dataset may share a name when both are declared independently. The first declaration of each type and name is retained, and a conflicting duplicate raises `declaration_conflict`. A `models[].training.datasets` entry adds a `trained-on` edge with `assurance_level: declared`, exported as a typed edge (CycloneDX `dependsOn` and `modelCard` datasets, SPDX `trainedOn`) whose native relationship keeps that assurance.
+
+Licences that do not parse as SPDX license expressions (listed licence ids with an optional `+`, `LicenseRef-`, `AND`, `OR`, parentheses, and `WITH` a listed exception id) export as SPDX `NoAssertion` and CycloneDX `license.name`; a licence taken from a declaration carries the comment `declared by producer`. A refused declared `download_location`, and an observed `source_uri` left out of the standard download fields (an unsupported scheme, credentials, a secret, or a character outside printable ASCII that is not percent-encoded), are reported on standard error. A `declared_download_location` property already in `AIBOM_PATH` passes the same check before it reaches a standard download field; a refused one is left out of those fields without a note on standard error, and the embedded native document still carries it unchanged.
+
+Recovery accepts the earlier typed download-location projection when the complete document matches it. Export generation refuses an embedded native document outside the recovery depth or byte limits. Passing `--author` or `--agent-yaml` enriches the embedded native inventory inside the exported document, so the recovered inventory's content digest reflects those additions rather than an attestation signed over the unmodified input `AIBOM_PATH`.
 
 ```bash
 nexus-symbiote scan examples/demo-agent -f json --report-only -o /tmp/demo-aibom.json
