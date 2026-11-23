@@ -46,6 +46,13 @@ _MAX_NESTING = 64
 _SPARE_MATCHES = 4096
 # Longer lines that could open an HTML block of kind 7 are read as ambiguous.
 _MAX_OPEN_TAG_LINE = 4096
+# A white space character beyond ASCII both separates attributes and continues an
+# unquoted value in the Unicode dialect, so the open-tag pattern backtracks
+# quadratically on a line that holds one. Such a line is tested only this long, and only
+# this many characters of them per reading; past either bound the file is ambiguous.
+_MAX_SPACED_OPEN_TAG_LINE = 256
+_MAX_SPACED_OPEN_TAG_CHARS = 64 * 1024
+_NON_ASCII_SPACE = re.compile("[\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]")
 _CODE_INDENT = 4
 _SPACE_OR_TAB = (" ", "\t")
 _MAYBE_SPECIAL = re.compile(r"[#`~*+_=<>0-9-]")
@@ -485,6 +492,7 @@ class _Reader:
         self.include_fence = include_fence
         self.ascii_html = ascii_html
         self.recovered_blocks = False
+        self.spaced_tag_chars = 0
         self.parts: list[str] = []
         # Each paragraph, heading and HTML block as written, with its kind, in order.
         self.blocks: list[tuple[str, str]] = []
@@ -754,10 +762,19 @@ class _Reader:
                     if kind == 7:
                         if parent.kind == "paragraph" or lazy:
                             break
-                        if not self.ascii_html and len(line) - at > _MAX_OPEN_TAG_LINE:
-                            # Unicode spaces are also unquoted-value characters, so the
-                            # tag pattern backtracks quadratically over a long line.
-                            raise _AmbiguousError
+                        if not self.ascii_html:
+                            span = len(line) - at
+                            if span > _MAX_OPEN_TAG_LINE:
+                                # Unicode spaces are also unquoted-value characters, so the
+                                # tag pattern backtracks quadratically over a long line.
+                                raise _AmbiguousError
+                            if _NON_ASCII_SPACE.search(line, at):
+                                self.spaced_tag_chars += span
+                                if (
+                                    span > _MAX_SPACED_OPEN_TAG_LINE
+                                    or self.spaced_tag_chars > _MAX_SPACED_OPEN_TAG_CHARS
+                                ):
+                                    raise _AmbiguousError
                     if start.match(line, at):
                         if self.ascii_html is None and not _ascii_html_block_agrees(
                             kind, line, at, parent.kind, lazy

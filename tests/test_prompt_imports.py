@@ -1096,3 +1096,53 @@ def test_a_fence_in_front_matter_does_not_hide_imports(tmp_path, note):
     result = PromptScanner().scan(tmp_path)
     assert result.surfaces_excluded == [f"CLAUDE.md: {OUTSIDE}"]
     assert "prompt:import:x.md" in {c.bom_ref for c in result.components}
+
+
+# #410: in the Unicode dialect a white space character beyond ASCII both separates
+# attributes and continues an unquoted value, so the open-tag pattern backtracks
+# quadratically over a line that holds one. A value alternating a letter and a no-break
+# space took about 0.2 s per 4,000-character line.
+_SPACED_TAG = "<a b=" + "c\xa0" * 2_040
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        # The line length grows at a fixed line count.
+        lambda scale: "\n\n".join(["<a b=" + "c\xa0" * (500 * scale)] * 8) + "\n",
+        # The line count grows at a fixed length under the per-line bound.
+        lambda scale: "\n\n".join(["<a b=" + "c\xa0" * 120] * (100 * scale)) + "\n",
+        # Spaced lines among ordinary ones.
+        lambda scale: ("text\n\n" + "<a b=" + "c\xa0" * 120 + "\n\n") * (100 * scale),
+    ],
+    ids=["line length", "line count", "interleaved"],
+)
+def test_a_tag_with_non_ascii_spaces_stays_linear(make):
+    texts = {scale: make(scale) for scale in (1, 4)}
+    assert scaling_ratio(lambda scale: prompt._import_readings(texts[scale])) < 10
+
+
+def test_a_mebibyte_of_spaced_tag_lines_reads_quickly():
+    text = "\n\n".join([_SPACED_TAG] * 256) + "\n"
+    started = time.process_time()
+    prompt._import_readings(text)
+    # About 60 s before #410; the bound leaves room for a slow, traced runner.
+    assert time.process_time() - started < 15
+
+
+def test_an_import_after_a_long_spaced_tag_is_still_read():
+    text = _SPACED_TAG + "\n\nFollow @notes.md\n"
+    assert "notes.md" in prompt._import_tokens(text)
+
+
+def test_the_non_ascii_space_class_is_the_dialects_white_space_beyond_ascii():
+    from nexus_symbiote.utils import markdown
+
+    dialect = re.compile(markdown._WHITESPACE)
+    beyond = {chr(code) for code in range(0x80, 0x110000) if dialect.fullmatch(chr(code))}
+    found = {
+        chr(code)
+        for code in range(0x80, 0x110000)
+        if markdown._NON_ASCII_SPACE.fullmatch(chr(code))
+    }
+    assert found == beyond
