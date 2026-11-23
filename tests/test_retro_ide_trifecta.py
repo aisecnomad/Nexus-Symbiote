@@ -117,6 +117,39 @@ def test_deny_mcp_star_drops_the_whole_server_permission_scope(tmp_path: Path) -
     assert scopes[0].severity == RiskSeverity.MEDIUM
 
 
+@pytest.mark.parametrize(
+    "deny_rule",
+    [
+        "mcp__",
+        "mcp__docs__",
+        "mcp__innocent(*)",
+        "mcp__innocent(read",
+        "mcp__a*",
+        "mcp__?",
+        "mcp__*__*",
+        "mcp__**",
+    ],
+)
+def test_narrow_or_skipped_mcp_deny_does_not_drop_permission_scope(
+    tmp_path: Path, deny_rule: str
+) -> None:
+    """Skipped, malformed, or partial deny globs must not hide an active MCP server allow."""
+    _write(
+        tmp_path,
+        ".claude/settings.json",
+        json.dumps({"permissions": {"allow": ["mcp__evil_server"], "deny": [deny_rule]}}),
+    )
+    result = IDEAgentScanner().scan(tmp_path)
+    scopes = [
+        risk
+        for component in result.components
+        for risk in component.risks
+        if risk.category == "permission_scope"
+    ]
+    assert len(scopes) == 1
+    assert "MCP server tools" in scopes[0].detail
+
+
 def test_star_allow_is_still_a_lethal_trifecta(tmp_path: Path) -> None:
     assert _broad_grants(["*"]) == ["every tool"]
     _write(tmp_path, ".claude/settings.json", json.dumps({"permissions": {"allow": ["*"]}}))
