@@ -166,35 +166,59 @@ def _is_blanket_specifier(base: str, spec: str) -> bool:
     return base.lower() == "webfetch" and compact.lower() in {"domain:*", "domain:"}
 
 
+def _norm_mcp_prefix(base: str) -> str:
+    """Normalize the leading ``mcp__`` prefix to lowercase while preserving server/tool casing."""
+    if base.lower().startswith("mcp__"):
+        return "mcp__" + base[5:]
+    return base
+
+
+def _mcp_server_name(rule: str) -> str | None:
+    """Return the named server when ``rule`` is a whole-server MCP rule.
+
+    Matches ``mcp__server``, ``mcp__server__*``, and ``mcp__server__**``.
+    Returns ``None`` for unanchored globs, per-tool rules, parenthesized rules,
+    or whitespace-bearing heads.
+    """
+    text = rule.strip()
+    if "(" in text or ")" in text or any(char.isspace() for char in text):
+        return None
+    if not text.lower().startswith("mcp__"):
+        return None
+    server, separator, tool = text[5:].partition("__")
+    if not server or any(char in "*?" for char in server):
+        return None
+    if separator and (not tool or not set(tool) <= {"*"}):
+        return None
+    return server
+
+
 def _whole_mcp_server_allow(rule: str) -> bool:
     """Whether ``rule`` auto-approves every tool of one named MCP server.
 
-    ``mcp__server`` and ``mcp__server__*`` are the same grant. An unanchored
-    ``mcp__*`` is not: Claude Code skips it.
+    ``mcp__server``, ``mcp__server__*``, and ``mcp__server__**`` are the same
+    grant. An unanchored ``mcp__*`` is not: Claude Code skips it.
     """
-    text = rule.strip()
-    if "(" in text or ")" in text or _claude_skips_mcp_allow(text):
-        return False
-    if not text.lower().startswith("mcp__"):
-        return False
-    _server, separator, tool = text[5:].partition("__")
-    return not separator or set(tool) <= {"*"}
+    return _mcp_server_name(rule) is not None
 
 
 def _claude_skips_mcp_allow(rule: str) -> bool:
     """Whether this allow rule is skipped by Claude Code and auto-approves nothing.
 
     Unanchored server globs (``mcp__*``, ``mcp__*__*``, ``mcp__**``, ``mcp__``,
-    ``mcp__*(*)``), empty tool tails (``mcp__docs__``), and blanket/empty parenthesized
-    ``mcp__`` rules (``mcp__gh__*(*)``, ``mcp__docs()``) are skipped. A named server
-    stays, including ``mcp__server``, ``mcp__server__*`` and a narrow specifier the
+    ``mcp__*(*)``), whitespace-bearing heads (``mcp__ *``), empty tool tails
+    (``mcp__docs__``), and blanket/empty parenthesized ``mcp__`` rules
+    (``mcp__gh__*(*)``, ``mcp__docs()``) are skipped. A named server stays,
+    including ``mcp__server``, ``mcp__server__*`` and a narrow specifier the
     precedence engine reads, such as ``mcp__gh__*(read)``.
     """
     text = rule.strip()
     head, opened, rest = text.partition("(")
     head = head.strip()
-    if not head.lower().startswith("mcp__") or any(char.isspace() for char in head):
+    if not head.lower().startswith("mcp__"):
         return False
+    if any(char.isspace() for char in head):
+        return True
     server, separator, tool = head[5:].partition("__")
     if not server or any(char in "*?" for char in server):
         return True
@@ -286,19 +310,24 @@ class _RuleBucket:
         if parsed is None:
             return None
         base, spec, is_blanket = parsed
+        norm_base = _norm_mcp_prefix(base)
         if is_blanket:
-            if base == "*":
+            whole_server = _mcp_server_name(norm_base)
+            if whole_server is not None:
+                self.blanket_exact.add(f"mcp__{whole_server}")
+                self.blanket_prefixes.insert(f"mcp__{whole_server}__")
+            elif norm_base == "*":
                 self.has_star = True
-            elif base.endswith("*"):
-                self.blanket_prefixes.insert(base[:-1])
+            elif norm_base.endswith("*"):
+                self.blanket_prefixes.insert(norm_base[:-1])
             else:
-                self.blanket_exact.add(base)
+                self.blanket_exact.add(norm_base)
         elif spec is not None:
             stem = _narrow_spec_prefix(spec)
             trailing_glob = (
                 spec[:-1] if stem is None and spec.endswith("*") and len(spec) > 1 else None
             )
-            if base == "*":
+            if norm_base == "*":
                 self.narrow_star_specs.add(spec)
                 if stem is not None:
                     self.narrow_star_specs.add(stem)
@@ -306,19 +335,23 @@ class _RuleBucket:
                     self.narrow_star_spec_prefixes.insert(stem + ":")
                 elif trailing_glob is not None:
                     self.narrow_star_spec_prefixes.insert(trailing_glob)
-            elif base.endswith("*"):
+            elif norm_base.endswith("*"):
                 trie = self.narrow_prefix_specs.setdefault(spec, _SortedPrefixes())
-                trie.insert(base[:-1])
+                trie.insert(norm_base[:-1])
             else:
-                specs = self.narrow_by_base.setdefault(base, set())
+                specs = self.narrow_by_base.setdefault(norm_base, set())
                 specs.add(spec)
                 if stem is not None:
                     specs.add(stem)
-                    strie = self.narrow_spec_prefixes_by_base.setdefault(base, _SortedPrefixes())
+                    strie = self.narrow_spec_prefixes_by_base.setdefault(
+                        norm_base, _SortedPrefixes()
+                    )
                     strie.insert(stem + " ")
                     strie.insert(stem + ":")
                 elif trailing_glob is not None:
-                    strie = self.narrow_spec_prefixes_by_base.setdefault(base, _SortedPrefixes())
+                    strie = self.narrow_spec_prefixes_by_base.setdefault(
+                        norm_base, _SortedPrefixes()
+                    )
                     strie.insert(trailing_glob)
         return parsed
 
@@ -327,9 +360,20 @@ class _RuleBucket:
             return True
         if base == "*":
             return False
-        if base.endswith("*"):
-            return self.blanket_prefixes.matches_any_prefix_of(base[:-1])
-        return base in self.blanket_exact or self.blanket_prefixes.matches_any_prefix_of(base)
+        norm_base = _norm_mcp_prefix(base)
+        whole_server = _mcp_server_name(norm_base)
+        if whole_server is not None:
+            server_rule = f"mcp__{whole_server}"
+            return (
+                server_rule in self.blanket_exact
+                or self.blanket_prefixes.matches_any_prefix_of(server_rule)
+                or self.blanket_prefixes.matches_any_prefix_of(f"{server_rule}__")
+            )
+        if norm_base.endswith("*"):
+            return self.blanket_prefixes.matches_any_prefix_of(norm_base[:-1])
+        return norm_base in self.blanket_exact or self.blanket_prefixes.matches_any_prefix_of(
+            norm_base
+        )
 
     def matches_narrow(self, base: str, spec: str) -> bool:
         if self.matches_blanket(base):
@@ -338,15 +382,16 @@ class _RuleBucket:
             spec
         ):
             return True
+        norm_base = _norm_mcp_prefix(base)
         trie = self.narrow_prefix_specs.get(spec)
-        if base.endswith("*"):
-            return trie is not None and trie.matches_any_prefix_of(base[:-1])
-        if spec in self.narrow_by_base.get(base, ()):
+        if norm_base.endswith("*"):
+            return trie is not None and trie.matches_any_prefix_of(norm_base[:-1])
+        if spec in self.narrow_by_base.get(norm_base, ()):
             return True
-        strie = self.narrow_spec_prefixes_by_base.get(base)
+        strie = self.narrow_spec_prefixes_by_base.get(norm_base)
         if strie is not None and strie.matches_any_prefix_of(spec):
             return True
-        return trie is not None and trie.matches_any_prefix_of(base)
+        return trie is not None and trie.matches_any_prefix_of(norm_base)
 
 
 def _spec_runs_arbitrary_command(spec: str) -> bool:
@@ -650,7 +695,7 @@ def evaluate_tool_oversight(
     )
     fmt = text_formatter or _safe_settings_text
     raw_states: dict[str, str] = {}
-    gap_tools: list[str] = []
+    gap_tools: list[tuple[str, bool]] = []
     seen_gap_tools: set[str] = set()
     safe_source = neutralize(source_name)
 
@@ -662,13 +707,18 @@ def evaluate_tool_oversight(
         if prev is None or _STATE_PRIORITY[state] < _STATE_PRIORITY[prev]:
             raw_states[safe_tool] = state
 
+        is_whole_mcp_allow = (
+            resolved == HumanInTheLoop.NONE
+            and index.allow.matches_blanket(tool_name)
+            and _whole_mcp_server_allow(tool_name)
+        )
         has_gap = (
             resolved == HumanInTheLoop.NONE
             and (is_destructive_tool(tool_name) or _whole_mcp_server_allow(tool_name))
         ) or index.uncovered_destructive_narrow_allow(tool_name)
         if has_gap and safe_tool not in seen_gap_tools:
             seen_gap_tools.add(safe_tool)
-            gap_tools.append(safe_tool)
+            gap_tools.append((safe_tool, is_whole_mcp_allow))
 
     total_tools = len(raw_states)
     truncated = total_tools > MAX_RECORDED_TOOL_STATES or index.rules_truncated
@@ -696,9 +746,12 @@ def evaluate_tool_oversight(
                 ),
             )
         )
-    for safe_tool in gap_tools[:MAX_OVERSIGHT_GAP_FINDINGS]:
-        if _whole_mcp_server_allow(safe_tool):
-            server = safe_tool.strip()[5:].split("__", 1)[0]
+    for safe_tool, is_whole_mcp_allow in gap_tools[:MAX_OVERSIGHT_GAP_FINDINGS]:
+        if is_whole_mcp_allow:
+            stripped = safe_tool.strip()
+            server = (
+                stripped[5:].split("__", 1)[0] if stripped.lower().startswith("mcp__") else stripped
+            )
             detail = (
                 f"Allow rule '{safe_tool}' auto-approves every tool on MCP server "
                 f"'{server}' without human-in-the-loop in '{safe_source}'."

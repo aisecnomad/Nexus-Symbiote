@@ -352,7 +352,7 @@ def _runs_any_command(program: str, arguments: str, wildcard: bool = False) -> b
 
 def _deny_covers_every_mcp_server(rules: list[str]) -> bool:
     """Whether a deny list blocks every MCP server, as ``*`` or ``mcp__*`` does."""
-    return any(rule.strip() in {"*", "mcp__*"} for rule in rules)
+    return any(rule.strip().lower() in {"*", "mcp__*"} for rule in rules)
 
 
 def _broad_grants(allowed: list[str]) -> list[str]:

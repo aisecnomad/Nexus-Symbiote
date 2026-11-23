@@ -150,6 +150,84 @@ def test_narrow_or_skipped_mcp_deny_does_not_drop_permission_scope(
     assert "MCP server tools" in scopes[0].detail
 
 
+@pytest.mark.parametrize(
+    ("allow_rule", "deny_rule"),
+    [
+        ("mcp__evil", "mcp__evil__*"),
+        ("mcp__evil__*", "mcp__evil"),
+        ("mcp__evil__*", "mcp__evil__**"),
+        ("mcp__evil__**", "mcp__evil"),
+        ("MCP__DOCS", "mcp__*"),
+        ("mcp__evil", "MCP__*"),
+    ],
+)
+def test_whole_server_mcp_rules_are_symmetric_in_precedence(
+    allow_rule: str, deny_rule: str
+) -> None:
+    """Whole-server forms ``mcp__s``, ``mcp__s__*``, and ``mcp__s__**`` match symmetrically."""
+    from nexus_symbiote.core.models import HumanInTheLoop
+    from nexus_symbiote.settings_precedence import evaluate_tool_oversight, resolve_tool_approval
+
+    perms = {"allow": [allow_rule], "deny": [deny_rule]}
+    assert resolve_tool_approval("mcp__evil__delete", permissions=perms) in {
+        HumanInTheLoop.REQUIRED,
+        None,
+    }
+    _states, gaps, _total, _trunc = evaluate_tool_oversight(perms)
+    assert gaps == []
+
+
+def test_bare_and_double_star_mcp_allow_match_concrete_server_tools() -> None:
+    from nexus_symbiote.core.models import HumanInTheLoop
+    from nexus_symbiote.settings_precedence import resolve_tool_approval
+
+    assert (
+        resolve_tool_approval("mcp__evil__delete", permissions={"allow": ["mcp__evil"]})
+        == HumanInTheLoop.NONE
+    )
+    assert (
+        resolve_tool_approval("mcp__evil__delete", permissions={"allow": ["mcp__evil__**"]})
+        == HumanInTheLoop.NONE
+    )
+    assert (
+        resolve_tool_approval(
+            "mcp__evil__delete", permissions={"allow": ["mcp__evil__*"], "deny": ["mcp__evil"]}
+        )
+        == HumanInTheLoop.REQUIRED
+    )
+    assert (
+        resolve_tool_approval("mcp__evil_two__delete", permissions={"allow": ["mcp__evil"]}) is None
+    )
+
+
+@pytest.mark.parametrize("rule", ["mcp__ *", "mcp__\t*", "mcp__docs  __*"])
+def test_whitespace_in_mcp_allow_head_is_skipped(tmp_path: Path, rule: str) -> None:
+    _write(tmp_path, ".claude/settings.json", json.dumps({"permissions": {"allow": [rule]}}))
+    result = IDEAgentScanner().scan(tmp_path)
+    risks = [risk for component in result.components for risk in component.risks]
+    assert [risk for risk in risks if risk.category in {"permission_scope", "oversight_gap"}] == []
+
+
+def test_oversight_gap_wording_distinguishes_narrow_policy_and_redacted_mcp_rules() -> None:
+    from nexus_symbiote.settings_precedence import evaluate_tool_oversight
+
+    _states, narrow_gaps, _, _ = evaluate_tool_oversight({"allow": ["mcp__docs(rm -rf *)"]})
+    assert len(narrow_gaps) == 1
+    assert "every tool on MCP server" not in narrow_gaps[0].detail
+
+    _states, policy_gaps, _, _ = evaluate_tool_oversight(
+        {"deny": ["mcp__docs(foo)"]}, approval_policy="bypassPermissions"
+    )
+    assert len(policy_gaps) == 1
+    assert "every tool on MCP server" not in policy_gaps[0].detail
+
+    secret_rule = "mcp__ghp_" + "a1B2" * 9
+    _states, redacted_gaps, _, _ = evaluate_tool_oversight({"allow": [secret_rule]})
+    assert len(redacted_gaps) == 1
+    assert "every tool on MCP server" in redacted_gaps[0].detail
+    assert secret_rule not in redacted_gaps[0].detail
+
+
 def test_star_allow_is_still_a_lethal_trifecta(tmp_path: Path) -> None:
     assert _broad_grants(["*"]) == ["every tool"]
     _write(tmp_path, ".claude/settings.json", json.dumps({"permissions": {"allow": ["*"]}}))
