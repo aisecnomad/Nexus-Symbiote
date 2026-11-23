@@ -420,7 +420,8 @@ An existing `--out` is refused (exit 1); nothing is written.
   `ContractSigner` interface.
 - **No transparency log, no keyless signing.** Sigstore and OIDC-based signing are not
   supported.
-- **No revocation list.** Retire a key by removing it from the trusted set.
+- **No revocation list.** Retire a key by removing it from the trusted set; every
+  attestation it made then stops verifying wherever that set is used.
 - **No freshness.** An older attested file still verifies. Use `--max-age-days`,
   `source_revision` and your review process.
 - **Separate reads.** Verification and later commands read the file separately.
