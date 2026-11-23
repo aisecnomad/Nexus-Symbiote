@@ -770,6 +770,13 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         lambda scale: ("\\" * 50 + "@a ") * 2_000 * scale,
         lambda scale: "- x\n" + "> `y` @z\n" * 20_000 * scale,
         lambda scale: "- x\n> y\n" + "   ```\n" * 20_000 * scale,
+        lambda scale: "x\n <div>\n`y`@z\n" * 10_000 * scale,
+        lambda scale: "<a" + " b=c" * 50_000 * scale + "\t>\n",
+        lambda scale: "> <p>\n x `y`@z\n" * 10_000 * scale,
+        lambda scale: " @a" + "_b" * 40_000 * scale,
+        lambda scale: (" @x" + "_" * 40 + "y") * 1_000 * scale,
+        lambda scale: " @" + "*" * 4_000 * scale,
+        lambda scale: '(@a) x=@b "@c" x*@d ' * 10_000 * scale,
     ],
     ids=[
         "blank lines under nested items",
@@ -781,12 +788,96 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         "escapes before a reference",
         "lines marked keeps in an item",
         "fences marked keeps in an item",
+        "HTML starts marked reads as text",
+        "attributes marked does not take",
+        "lazy lines after quoted HTML",
+        "underscores inside a word",
+        "runs of underscores",
+        "a run of markup past the name budget",
+        "references where marked starts no text token",
     ],
 )
 def test_reading_markdown_grows_with_the_text_not_with_its_nesting(shape):
     texts = {scale: shape(scale) for scale in (1, 4)}
     growth = len(texts[4]) / len(texts[1])
     assert scaling_ratio(lambda scale: prompt._import_tokens(texts[scale])) < 2.5 * growth
+
+
+def test_an_at_sign_inside_a_url_path_raises_no_gap(tmp_path):
+    # Claude Code 2.1.42 and 2.1.330 import nothing here: marked starts no text token at
+    # an `@` after `/`.
+    _write(tmp_path, "CLAUDE.md", "See the docs (https://unpkg.com/@../../x.md).\n")
+    result = PromptScanner().scan(tmp_path)
+    assert not result.scan_failures and not result.surfaces_excluded
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "**@../x.md**\n",
+        "**@~/x.md**\n",
+        "_@../x.md_\n",
+        # Claude Code 2.1.42 and 2.1.330 read `../o.md.` here, after a code span in what
+        # marked reads as a paragraph and CommonMark as an HTML block in a quote.
+        "><div\n    ` `@../o.md.\n",
+    ],
+)
+def test_a_name_after_markup_that_leaves_the_root_raises_its_gap(tmp_path, text):
+    # Claude Code imports `../x.md` and `~/x.md` from these, from outside the root.
+    _write(tmp_path, "CLAUDE.md", text)
+    result = PromptScanner().scan(tmp_path)
+    assert result.surfaces_excluded == [
+        "CLAUDE.md: imports a file outside the project root, which is not inventoried"
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Use a*@../../x.md for it.\n", "Use a*@" + "x" * 300 + ".md for it.\n"],
+    ids=["after an asterisk", "long name after an asterisk"],
+)
+def test_a_name_marked_may_start_after_markup_fails_closed(tmp_path, text):
+    # Claude Code imports nothing here, but an `@` after `*` can open a text token, so
+    # the name is a gap rather than a silent miss.
+    _write(tmp_path, "CLAUDE.md", text)
+    result = PromptScanner().scan(tmp_path)
+    assert result.surfaces_excluded
+
+
+def test_a_name_both_readings_give_still_raises_its_gap(tmp_path):
+    _write(tmp_path, "CLAUDE.md", "Follow @../x.md.\n")
+    result = PromptScanner().scan(tmp_path)
+    assert result.surfaces_excluded == [
+        "CLAUDE.md: imports a file outside the project root, which is not inventoried"
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["See (@x.md).", 'Say "@x.md".', "x=@x.md", "https://unpkg.com/@x.md", "{@x.md}", "x\\@x.md"],
+)
+def test_no_name_is_read_where_marked_starts_no_text_token(text):
+    assert prompt._import_tokens(text) == []
+
+
+def test_a_name_is_not_cut_at_underscores_inside_a_word():
+    name = "a_" * 1_000 + "b.md"
+    assert name in prompt._import_tokens(f"**@{name}**\n")
+
+
+def test_names_past_the_per_file_budget_are_a_failure_not_dropped(tmp_path):
+    # 2,048 places a token may end in one name: its prefixes hold about 4 Mi characters.
+    _write(tmp_path, "CLAUDE.md", " @a" + "*b" * 2_048 + "\n")
+    result = PromptScanner().scan(tmp_path)
+    assert "CLAUDE.md: too many @path imports to inventory" in result.scan_failures
+
+
+def test_many_short_names_trip_the_name_budget_before_the_character_budget():
+    # 1,001 starts of 41 short names each: about 41,000 names but under 2 Mi characters.
+    text = "".join(f"@x{i}" + "*y" * 40 + "\n" for i in range(1_001))
+    own, host, too_many = prompt._import_readings(text)
+    assert too_many
+    assert sum(map(len, host)) < prompt._MAX_HOST_NAME_CHARACTERS
 
 
 @pytest.mark.parametrize(
