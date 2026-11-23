@@ -44,6 +44,8 @@ _LINE_END = re.compile(r"\r\n|\r|\n")
 # every open list item again.
 _MAX_NESTING = 64
 _SPARE_MATCHES = 4096
+# Longer lines that could open an HTML block of kind 7 are read as ambiguous.
+_MAX_OPEN_TAG_LINE = 4096
 _CODE_INDENT = 4
 _SPACE_OR_TAB = (" ", "\t")
 _MAYBE_SPECIAL = re.compile(r"[#`~*+_=<>0-9-]")
@@ -66,7 +68,9 @@ _BLOCK_TAG_NAMES = (
 )
 
 
-def _html_block_starts(whitespace: str, tag_names: str) -> tuple[re.Pattern[str], ...]:
+def _html_block_starts(
+    whitespace: str, tag_names: str, declaration: str
+) -> tuple[re.Pattern[str], ...]:
     open_tag = (
         rf"<[A-Za-z][A-Za-z0-9-]*(?:{whitespace}+[a-zA-Z_:][a-zA-Z0-9:._-]*"
         rf"(?:{whitespace}*={whitespace}*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?)*"
@@ -77,7 +81,7 @@ def _html_block_starts(whitespace: str, tag_names: str) -> tuple[re.Pattern[str]
         re.compile(rf"<(?:pre|script|style|textarea)(?:{whitespace}|>|$)", re.I),
         re.compile(r"<!--"),
         re.compile(r"<\?"),
-        re.compile(r"<![A-Za-z]"),
+        re.compile(declaration),
         re.compile(r"<!\[CDATA\["),
         re.compile(rf"</?(?:{tag_names})(?:{whitespace}|/?>|$)", re.I),
         re.compile(rf"(?:{open_tag}|{close_tag}){whitespace}*$"),
@@ -86,12 +90,13 @@ def _html_block_starts(whitespace: str, tag_names: str) -> tuple[re.Pattern[str]
 
 # The seven start conditions of an HTML block, and the end conditions of the first five;
 # the last two end at a blank line.
-_HTML_BLOCK_STARTS = _html_block_starts(_WHITESPACE, _BLOCK_TAG_NAMES)
+_HTML_BLOCK_STARTS = _html_block_starts(_WHITESPACE, _BLOCK_TAG_NAMES, r"<![A-Za-z]")
 # The same conditions as cmark-gfm 0.29, which GitHub renders with, reads them: only ASCII
-# whitespace ends a tag name, and `search` is no block tag. Where the two readings start
-# different blocks, a definition or footnote one of them hides can be text to the other.
+# whitespace ends a tag name, `search` is no block tag, and a declaration starts with an
+# upper-case letter, as markdown-it also reads it. Where the two readings start different
+# blocks, a definition, footnote or import one of them hides can be text to the other.
 _ASCII_HTML_BLOCK_STARTS = _html_block_starts(
-    "[ \t\n\x0b\x0c\r]", _BLOCK_TAG_NAMES.replace("|search", "")
+    "[ \t\n\x0b\x0c\r]", _BLOCK_TAG_NAMES.replace("|search", ""), r"<![A-Z]"
 )
 _HTML_BLOCK_ENDS: tuple[re.Pattern[str] | str, ...] = (
     re.compile(r"</(?:pre|script|style|textarea)>", re.I),
@@ -668,9 +673,14 @@ class _Reader:
                 lazy = not self.all_closed and not self.blank and self.stack[-1].kind == "paragraph"
                 starts = _ASCII_HTML_BLOCK_STARTS if self.ascii_html else _HTML_BLOCK_STARTS
                 for kind, start in enumerate(starts, 1):
-                    if start.match(line, at) and (
-                        kind < 7 or (parent.kind != "paragraph" and not lazy)
-                    ):
+                    if kind == 7:
+                        if parent.kind == "paragraph" or lazy:
+                            break
+                        if not self.ascii_html and len(line) - at > _MAX_OPEN_TAG_LINE:
+                            # Unicode spaces are also unquoted-value characters, so the
+                            # tag pattern backtracks quadratically over a long line.
+                            raise _AmbiguousError
+                    if start.match(line, at):
                         if self.ascii_html is None and not _ascii_html_block_agrees(
                             kind, line, at, parent.kind, lazy
                         ):

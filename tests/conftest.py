@@ -77,10 +77,6 @@ PRIVATE_DIRECTORIES = ("XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XD
 # Only these exact reason texts pass a strict run: a reason that merely starts with or
 # contains the words could disable any test.
 EXPECTED_SKIP_REASONS = (
-    re.compile(
-        r"\Afile system rejects (?:the name|distinct case spellings|names that are not UTF-8)\Z"
-    ),
-    re.compile(r"\Aneeds a case-sensitive file system to hold (?:both|distinct) spellings\Z"),
     re.compile(r"\Athe file system is case-sensitive, so the alias does not exist\Z"),
 )
 # Expected only outside CI: an environment that uv created has no pip, while CI always
@@ -97,6 +93,13 @@ NON_LINUX_SKIP_REASONS = (
         r"|the PID namespace teardown) is Linux-only\Z"
     ),
     re.compile(r"\Ano (?:/proc/self/cwd|/dev/fd link into /proc)\Z"),
+    # The suite's tmp_path lies on a case-sensitive Linux file system that holds any byte
+    # string but "/" and NUL as a name (not vfat, ntfs3, a casefold ext4 directory or a
+    # utf8only ZFS dataset): a Linux run that skips for one of these is testing nothing.
+    re.compile(
+        r"\Afile system rejects (?:the name|distinct case spellings|names that are not UTF-8)\Z"
+    ),
+    re.compile(r"\Aneeds a case-sensitive file system to hold (?:both|distinct) spellings\Z"),
 )
 # Expected only as root, which ignores directory modes: a test that needs the kernel to
 # refuse a traverse-only directory cannot simulate that refusal and skips.
@@ -181,7 +184,12 @@ class SkipAccounting:
         self.skips: list[tuple[str, str]] = []
 
     def _record(self, report: pytest.TestReport | pytest.CollectReport) -> None:
-        if not report.skipped or hasattr(report, "wasxfail"):
+        if not report.skipped:
+            return
+        if hasattr(report, "wasxfail"):
+            # An expected failure did not run to its assertions, as a skip does not:
+            # pytest.xfail(), xfail(run=False) or a conditional marker. No reason is expected.
+            self.skips.append((report.nodeid, f"xfail: {report.wasxfail}"))
             return
         longrepr = report.longrepr
         if isinstance(longrepr, tuple) and len(longrepr) == 3:

@@ -124,6 +124,15 @@ def test_real_mcp_launchers_preserve_only_exact_version_claims(tmp_path, command
     assert all(arg == "***" for arg in server.args)
 
 
+DEEP_MARKER = "mcp-server-git==1.2.3;" + "(" * 2000
+
+
+def test_a_deeply_nested_marker_is_no_pin():
+    # packaging parses marker parentheses recursively and raises RecursionError.
+    assert extract_version_pin(DEEP_MARKER, ecosystem="python") is None
+    assert extract_version_pin(DEEP_MARKER) is None
+
+
 @pytest.mark.parametrize(
     "image", ["registry.test:5000/image:1.2.3", "image:v2.0.1", "image:1.2.3-alpine"]
 )

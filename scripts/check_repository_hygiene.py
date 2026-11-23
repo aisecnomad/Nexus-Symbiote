@@ -50,9 +50,16 @@ EMBEDDED_SLUG = (
     + _SLUG_END
 )
 OWNER_TEXT_SUFFIXES = frozenset({".md", ".yml", ".yaml", ".cff", ".toml"})
-# Tests and benchmark fixtures hold the characters the collectors must detect.
+# Test and benchmark data hold the characters the collectors must detect, and benchmark
+# results record other tools' output verbatim. Their Python is code CI runs, so it is
+# checked like any other source outside a fixtures directory.
 HIDDEN_EXEMPT_PREFIXES = (Path("tests"), Path("benchmarks"))
-HIDDEN_SUFFIXES = frozenset({".py", ".md", ".toml", ".yml", ".yaml", ".cff", ".cfg", ".txt"})
+HIDDEN_SUFFIXES = frozenset(
+    {".py", ".md", ".toml", ".yml", ".yaml", ".cff", ".cfg", ".txt", ".json", ".sh", ".lock"}
+)
+HIDDEN_NAMES = frozenset({"Dockerfile", "Makefile", "CODEOWNERS"})
+# Checked in tests/ and benchmarks/ too, outside a fixtures directory: CI runs them.
+HIDDEN_CODE_SUFFIXES = frozenset({".py", ".sh"})
 _BLANK = frozenset({0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0})
 # Dated audits record what was inspected under the owner live at the time.
 # Rewriting their links would falsify the record rather than fix a stale one.
@@ -199,13 +206,27 @@ def hidden_character_issues(root: Path, files: list[Path]) -> list[str]:
     """
     errors = []
     for relative in files:
-        if relative.suffix not in HIDDEN_SUFFIXES or VENDOR in relative.parents:
+        if (
+            relative.suffix not in HIDDEN_SUFFIXES
+            and relative.name not in HIDDEN_NAMES
+            and not relative.name.startswith("Dockerfile")
+        ):
             continue
-        if any(prefix in relative.parents for prefix in HIDDEN_EXEMPT_PREFIXES):
+        if VENDOR in relative.parents:
+            continue
+        if any(prefix in relative.parents for prefix in HIDDEN_EXEMPT_PREFIXES) and (
+            relative.suffix not in HIDDEN_CODE_SUFFIXES or "fixtures" in relative.parts
+        ):
             continue
         try:
-            text = read_file(root, relative).decode("utf-8")
-        except (OSError, ValueError, UnicodeError):
+            data = read_file(root, relative)
+        except (OSError, ValueError):
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeError:
+            # Skipping it would let one invalid byte hide every character below.
+            errors.append(f"{relative}: not valid UTF-8; invisible characters were not checked")
             continue
         # Not splitlines: it would consume the separators this check reports.
         for number, line in enumerate(text.split("\n"), 1):

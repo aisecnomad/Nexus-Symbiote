@@ -447,7 +447,8 @@ def _python_version_pin(reference: str) -> str | None:
         requirement = Requirement(
             "package" + reference if reference.startswith("==") else reference
         )
-    except InvalidRequirement:
+    except (InvalidRequirement, RecursionError):
+        # packaging parses marker parentheses recursively; a deep nest is no pin either.
         return None
     constraints = list(requirement.specifier)
     if requirement.url or requirement.marker or len(constraints) != 1:
