@@ -896,7 +896,16 @@ A way around a limit that its entry does not describe is worth a
   declaration files and scripts named like `server.test.mjs` or `server.spec.ts`,
   unless a configured server's `command` or `args` names the file. A file such a
   server reaches some other way, such as through a wrapper script, a package entry
-  point, an absolute path or a `$VARIABLE`, stays skipped without a gap.
+  point, an absolute path, a `$VARIABLE` (`$PWD/`, `${workspaceFolder:name}/`), a
+  bare directory (`python3 examples`), combined short flags (`python3 -um x`) or a
+  name that differs only in case on a case-insensitive file system, stays skipped
+  without a gap. A launched path through an in-root directory link is reported as a
+  gap even when its target was read.
+- **A launched build output is read as written.** When `build/` or `dist/` is
+  checked in, a server launched from it is collected from the built file as well as
+  from its source, so the same tools can appear twice, and a bundle over the
+  `syntax-bytes` limit (256 KiB by default) is a scan failure. Raise the limit with
+  `--limit syntax-bytes=...`, or leave build output out of the checkout.
 - **Framework tools are collected by decorator only.** Module-level functions
   decorated with `@tool` (LangChain, CrewAI, smolagents), `@function_tool` (OpenAI
   Agents SDK) or PydanticAI's `@agent.tool` are collected by name; the descriptor is

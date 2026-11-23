@@ -766,7 +766,12 @@ class ConfinedCollection:
             raise CollectionError("parent traversal is not allowed")
         return candidate
 
-    def excluded(self, path: str | Path) -> bool:
+    def excluded(self, path: str | Path, *, record: bool = True) -> bool:
+        """Whether collection policy leaves ``path`` out.
+
+        A path an operator excluded is logged as a gap unless ``record`` is false, for a
+        caller that only asks: the path it asks about may hold a configured value.
+        """
         relative = self._relative(path)
         parts = relative.parts
         # Dependency caches, virtual environments and Git internals are outside
@@ -786,7 +791,7 @@ class ConfinedCollection:
             denied = any(
                 folded[:index] in self._folded_excluded for index in range(len(folded) + 1)
             )
-        if denied:
+        if denied and record:
             self._policy_exclusions_recorded += 1
             self._exclusion_log.add(f"{relative}: excluded by collection policy")
         return denied
@@ -1544,6 +1549,35 @@ class ConfinedCollection:
             return (opened, info.st_size) if stat.S_ISREG(info.st_mode) else None
         finally:
             os.close(fd)
+
+    def entry_exists(self, path: str | Path) -> bool:
+        """Whether something may be at ``path``, without following a link at it or above it.
+
+        Only a definite "no such entry" reads as absent. A link on the way, a refusal or
+        any other error reads as present, so a caller that reports an unread file errs
+        toward the report.
+        """
+        try:
+            relative = self._relative(path)
+        except CollectionError:
+            return True
+        if self._root_fd is None or not relative.parts:
+            return False
+        try:
+            parent = self._open_parent(relative)
+        except FileNotFoundError:
+            return False
+        except (OSError, CollectionError):
+            return True
+        try:
+            self._stat_exact_no_follow(parent, relative.name)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        finally:
+            os.close(parent)
+        return True
 
     def is_directory(self, path: str | Path) -> bool:
         """Whether ``path`` is a directory, reached through at most one in-root symlink.

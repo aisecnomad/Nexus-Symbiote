@@ -117,9 +117,13 @@ declaration files (`.d.ts`, `.d.mts`, `.d.cts`) and scripts named with `.spec.` 
 `command` or `args` names is searched wherever it is and whatever its name: a
 path such as `examples/srv.py`, an extensionless path such as `examples/server`
 (with each source suffix, or as a directory's `index` script or `__main__.py`), or a
-`-m` module such as `examples.srv`, each also relative to the server's `cwd`. Shell
-strings and `--flag=value` arguments are split into words for this. A source file named that way under one of those directories that
-the walk did not reach is a gap. Each is read as a stream under
+`-m` module such as `examples.srv`, each also relative to the server's `cwd`
+(`${workspaceFolder}/` is the root) and to a `uv --directory`. Shell strings and
+`--flag=value` arguments are split into words for this. A source file named that
+way under one of those directories that is in the checkout but that the walk did
+not reach, such as a link out of the root, is a gap. One absent from the checkout,
+such as unbuilt `build/index.js`, is not: no file there can declare a tool. Each
+is read as a stream under
 `source-scan-bytes`, in the text the language's own tools read, and only
 candidates are parsed:
 

@@ -657,53 +657,101 @@ def _referenced_paths(word: str, previous: str | None) -> tuple[tuple[str, ...],
     ), False
 
 
+def _launch_base(text: str) -> str | None:
+    """The relative directory a ``cwd`` or ``--directory`` value names, or ``None``."""
+    text = text.strip("\"'").replace("\\", "/")
+    if text in {"${workspaceFolder}", "${workspaceRoot}"}:
+        return None
+    for prefix in _WORKSPACE_PREFIXES:
+        text = text.removeprefix(prefix)
+    if not text.strip("./") or text.startswith(("/", "$", "~")) or ":" in text:
+        return None
+    return text
+
+
 def _launched_sources(
+    files: ConfinedCollection,
     servers: Sequence[LaunchedServer],
     sources: Sequence[Path],
     result: ScanResult,
     known: KnownValues | None,
 ) -> frozenset[Path]:
-    """Walked files under a skipped directory that a configured server may launch.
+    """Walked files that a configured server may launch, whatever their directory or name.
 
     Arguments are read before redaction, only to select files: no argument value is
     recorded unless it is a path the scan read no credential value into. A source
-    named exactly under a skipped directory that the walk did not reach is a gap.
+    named exactly under a skipped directory that is in the checkout but that the walk
+    did not reach is a gap; one absent from the checkout, such as unbuilt output, is
+    not, since no file there can declare a tool.
     """
     walked = {path.as_posix(): path for path in sources}
+    # A word that does not name a file exactly can only match where walked files are.
+    folders = {posixpath.dirname(relative) for relative in walked}
     launched: set[Path] = set()
     gaps: dict[str, None] = {}
     for config_path, directory, config in servers:
+        words = list(_launch_words(config))
         bases = [directory]
         cwd = config.get("cwd")
-        if isinstance(cwd, str) and cwd.strip("./") and not cwd.startswith(("/", "$", "~")):
-            bases.append(posixpath.join(directory, cwd))
-        for previous, word in _launch_words(config):
+        extra = [cwd] if isinstance(cwd, str) else []
+        # `uv run --directory D` and `uv --directory=D run` start the script in D.
+        extra.extend(word for previous, word in words if previous == "--directory")
+        for text in extra:
+            base = _launch_base(text)
+            if base is not None:
+                bases.append(posixpath.join(directory, base))
+        bases = list(dict.fromkeys(bases))
+        # A word is resolved once per server: a long argument repeats few distinct words.
+        seen: set[tuple[str, bool]] = set()
+        for previous, word in words:
+            key = (word, previous == "-m")
+            if key in seen:
+                continue
+            seen.add(key)
             references, exact = _referenced_paths(word, previous)
             found = False
-            skipped: list[str] = []
-            for reference in references:
-                for base in bases:
+            missing: list[str] = []
+            for base in bases:
+                if not exact:
+                    target = posixpath.normpath(posixpath.join(base, word))
+                    if target not in folders and posixpath.dirname(target) not in folders:
+                        continue
+                for reference in references:
                     relative = posixpath.normpath(posixpath.join(base, reference))
                     if relative.startswith("../") or relative == "..":
                         continue
-                    if relative in walked:
-                        launched.add(walked[relative])
+                    hit = walked.get(relative)
+                    if hit is not None:
+                        launched.add(hit)
                         found = True
-                    elif _SKIPPED_TREES.intersection(PurePosixPath(relative).parts[:-1]):
-                        skipped.append(relative)
-            if exact and skipped and not found:
-                shown = skipped[0]
-                named = _SAFE_PATH.fullmatch(shown) is not None and not (
-                    known is not None and known.held_by(shown)
-                )
-                target = f"source {shown}" if named else "a source file"
-                gaps[
-                    f"{config_path}: a server launches {target} under a directory the source "
-                    "search skips, which the collection did not read; its declared tools are "
-                    "not collected"
-                ] = None
+                    elif exact:
+                        missing.append(relative)
+            if found:
+                continue
+            unread = next(
+                (
+                    relative
+                    for relative in missing
+                    if _SKIPPED_TREES.intersection(relative.split("/")[:-1])
+                    # An excluded path already has its own gap, with its own reason.
+                    and not files.excluded(relative, record=False)
+                    and files.entry_exists(relative)
+                ),
+                None,
+            )
+            if unread is None:
+                continue
+            named = _SAFE_PATH.fullmatch(unread) is not None and not (
+                known is not None and known.held_by(unread)
+            )
+            target = f"source {unread}" if named else "a source file"
+            gaps[
+                f"{config_path}: a server launches {target} under a directory the source "
+                "search skips, which the collection did not read; its declared tools are "
+                "not collected"
+            ] = None
     result.surfaces_excluded.extend(gaps)
-    return frozenset(path for path in launched if _SKIPPED_TREES.intersection(path.parts))
+    return frozenset(launched)
 
 
 def _server_import(tree: ast.Module) -> bool:
@@ -1413,7 +1461,7 @@ def collect_source_references(
     """
     settings = limits.current()
     python_nodes = limits.bound("python-nodes")
-    started = _launched_sources(launched, sources, result, known)
+    started = _launched_sources(files, launched, sources, result, known)
     servers = _Kind(
         lambda path: is_server_source(path, launched=path in started), _server_candidate
     )
