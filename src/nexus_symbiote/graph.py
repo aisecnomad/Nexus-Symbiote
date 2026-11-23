@@ -335,18 +335,25 @@ def _manifest_dependencies(
             )
         )
     for key, model in declared.models.items():
+        if redact_text(key, identifier=True) != key:
+            # The key becomes the component reference and claim locator; a credential
+            # there cannot be masked without changing the reference, so it is refused.
+            problems.append(f"{MANIFEST}#/models: a model key is shaped like a credential")
+            continue
         locator = f"{MANIFEST}#/models/{_clip(quote(key, safe=''))}"
         if model.path is None:
             ref = f"model:{agent_ref}/hosted/{quote(key, safe='')}"
             if len(ref) > MAX_REFERENCE_CHARS:
                 problems.append(f"{locator}: the key is too long for a component reference")
                 continue
+            assert model.provider is not None and model.requested_ref is not None
+            requested = redact_text(model.requested_ref, identifier=True)
             additions.append(
                 ModelComponent(
                     bom_ref=ref,
-                    name=model.requested_ref or key,
-                    provider=model.provider,
-                    requested_alias=model.requested_ref,
+                    name=requested,
+                    provider=redact_text(model.provider, identifier=True),
+                    requested_alias=requested,
                     model_type="hosted",
                     source_path=MANIFEST,
                     claims={
