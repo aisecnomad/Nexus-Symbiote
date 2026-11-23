@@ -163,9 +163,27 @@ _VERSIONED_PYTHON_RE = re.compile(r"^python[0-9]+(?:\.[0-9]+)?$")
 _NODE_PACKAGE_IMPORT = re.compile(
     r"((?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*)(?:/[A-Za-z0-9_][\w.-]*)*", re.ASCII
 )
-_PLAIN_MATCHER_RE = re.compile(r"[A-Za-z0-9_\- ,|]+")
-_MATCHER_SPLIT_RE = re.compile(r"[|,]")
+_PLAIN_MATCHER_RE = re.compile(r"[A-Za-z0-9_|]+")
+_MATCHER_SPLIT_RE = re.compile(r"\|")
 _SPIFFE_RE = re.compile(r"^spiffe://[a-z0-9.-]+/[A-Za-z0-9._/-]+$")
+_KNOWN_EVENTS = frozenset(
+    [
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "PermissionRequest",
+        "PermissionDenied",
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop",
+        "Notification",
+        "SubagentStop",
+        "SubagentTurn",
+    ]
+)
+_TOOL_EVENTS = frozenset(
+    ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "PermissionDenied"]
+)
 
 
 def _clean(val: Any) -> str:
@@ -1193,27 +1211,39 @@ def _setting_digest(value: Any) -> str:
     return _sha256_hex(text.encode())
 
 
-def _hook_state(matcher: Any, hook_type: Any, condition: Any, disabled: bool) -> dict[str, Any]:
+def _hook_state(
+    matcher: Any,
+    hook_type: Any,
+    condition: Any,
+    disabled: bool,
+    event: str = "",
+) -> dict[str, Any]:
     """What decides whether a hook still runs, as digests so no configuration text is copied.
 
     An absent, empty or `*` matcher matches every tool. A matcher of letters, digits,
-    `_`, `-`, spaces, `,` and `|` is a list of exact names, recorded so a later matcher
-    can be shown to match everything it matched; any other matcher is an unanchored
-    regular expression and is compared by digest alone, as the `if` filter always is.
+    `_` and `|` is a list of exact tool names separated by `|`; any other matcher
+    (including one with commas, spaces or hyphens) is an unanchored regular expression
+    to Claude Code, so it is compared by digest alone, as the `if` filter always is.
+
+    An ``if`` filter is evaluated only on tool events. On other events a hook with
+    ``if`` set never runs, so ``runs_command`` is False.
     """
     digest: str | None = None
     names: list[str] | None = None
     if matcher not in (None, "", "*"):
         digest = _setting_digest(matcher)
         if isinstance(matcher, str) and _PLAIN_MATCHER_RE.fullmatch(matcher):
-            items = {item.strip() for item in _MATCHER_SPLIT_RE.split(matcher)} - {""}
+            items = set(_MATCHER_SPLIT_RE.split(matcher)) - {""}
             names = sorted(_sha256_hex(item.encode()) for item in items) or None
+    is_command = hook_type is None or hook_type == "command"
+    if_blocks = condition is not None and event not in _TOOL_EVENTS
+    known = event in _KNOWN_EVENTS or not event
     return _rec(
         matcher_digest=digest,
         matcher_names=names,
         if_digest=None if condition is None else _setting_digest(condition),
         hook_type=None if hook_type is None else _clean(hook_type)[:64],
-        runs_command=hook_type is None or hook_type == "command",
+        runs_command=is_command and not if_blocks and known,
         hooks_disabled=disabled,
     )
 
@@ -1237,8 +1267,10 @@ def _inspect_hooks_and_preambles(
             else doc.get("disableAllHooks") is True
         )
         for raw_event, cmd_str, matcher, hook_type, condition in _iter_hook_commands(doc):
-            event_name = _clean(raw_event)
-            state = _hook_state(matcher, hook_type, condition, disabled)
+            event_name = str(raw_event)
+            if event_name not in _KNOWN_EVENTS:
+                _add_gap(summary.gaps, f"{cfg_path}: unrecognized hook event '{_clean(raw_event)}'")
+            state = _hook_state(matcher, hook_type, condition, disabled, event=event_name)
             summary.hook_commands.append(
                 _rec(
                     source_file=cfg_path,

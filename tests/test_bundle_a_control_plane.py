@@ -1402,6 +1402,8 @@ def _guard_alerts(
         (_guard_settings(matcher="Bas.*"), None),
         (_guard_settings(matcher="Edit|Write"), None),
         (_guard_settings(matcher="Edit, Write"), None),
+        (_guard_settings(matcher="Bash, Edit"), None),
+        (_guard_settings(matcher=" Edit ,Bash|"), None),
         (_guard_settings(condition="Bash(never-matches *)"), None),
         (_guard_settings(disableAllHooks=True), None),
         (_guard_settings(), {"disableAllHooks": True}),
@@ -1423,8 +1425,6 @@ def test_baseline_diff_alerts_when_a_kept_hook_no_longer_runs(
         (_guard_settings(matcher=""), None),
         (_guard_settings(matcher=None), None),
         (_guard_settings(matcher="Bash|Edit"), None),
-        (_guard_settings(matcher="Bash, Edit"), None),
-        (_guard_settings(matcher=" Edit ,Bash|"), None),
         (_guard_settings(disableAllHooks=True), {"disableAllHooks": False}),
         (_guard_settings(disableAllHooks=False), None),
     ],
@@ -1448,6 +1448,86 @@ def test_hook_records_carry_the_state_that_decides_whether_they_run(tmp_path: Pa
     assert "Bash" not in json.dumps(hook)
     (target,) = summary.hook_targets
     assert target["matcher_digest"] == hook["matcher_digest"]
+
+
+def test_comma_separated_matcher_is_treated_as_regex(tmp_path: Path) -> None:
+    """Fix 1: commas and spaces in a matcher make it a regex, not an exact-name list."""
+    (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    _write_json(tmp_path / ".claude" / "settings.json", _guard_settings(matcher="Bash, Edit"))
+    summary = audit_project_control_plane(tmp_path)
+    (hook,) = summary.hook_commands
+    assert hook["matcher_digest"] is not None
+    assert hook["matcher_names"] is None
+
+
+def test_pipe_separated_matcher_is_exact_name_list(tmp_path: Path) -> None:
+    """Pipe-only matchers are exact-name lists with hashed names."""
+    (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    _write_json(tmp_path / ".claude" / "settings.json", _guard_settings(matcher="Bash|Edit"))
+    summary = audit_project_control_plane(tmp_path)
+    (hook,) = summary.hook_commands
+    assert hook["matcher_digest"] is not None
+    assert hook["matcher_names"] is not None
+    assert len(hook["matcher_names"]) == 2
+
+
+def test_if_on_non_tool_event_blocks_runs_command(tmp_path: Path) -> None:
+    """Fix 2: an ``if`` filter on a non-tool event means the hook never runs."""
+    (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    settings: dict[str, object] = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "./guard.sh", "if": "true"}],
+                }
+            ]
+        }
+    }
+    _write_json(tmp_path / ".claude" / "settings.json", settings)
+    summary = audit_project_control_plane(tmp_path)
+    (hook,) = summary.hook_commands
+    assert hook["runs_command"] is False
+    assert hook["if_digest"] is not None
+
+
+def test_if_on_tool_event_does_not_block_runs_command(tmp_path: Path) -> None:
+    """An ``if`` filter on PreToolUse is evaluated, so ``runs_command`` stays True."""
+    (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    _write_json(
+        tmp_path / ".claude" / "settings.json",
+        _guard_settings(condition="Bash(git *)"),
+    )
+    summary = audit_project_control_plane(tmp_path)
+    (hook,) = summary.hook_commands
+    assert hook["runs_command"] is True
+    assert hook["if_digest"] is not None
+
+
+def test_unrecognized_event_reports_gap_and_blocks_runs_command(tmp_path: Path) -> None:
+    """Fix 3: an unrecognized event name reports a gap and sets ``runs_command`` False."""
+    (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    settings: dict[str, object] = {
+        "hooks": {"MadeUpEvent": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}]}
+    }
+    _write_json(tmp_path / ".claude" / "settings.json", settings)
+    summary = audit_project_control_plane(tmp_path)
+    (hook,) = summary.hook_commands
+    assert hook["runs_command"] is False
+    assert any("unrecognized hook event" in g for g in summary.gaps)
+
+
+def test_whitespace_event_name_is_unrecognized(tmp_path: Path) -> None:
+    """Fix 3: a trailing-space event name like 'PreToolUse ' is unrecognized."""
+    (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    settings: dict[str, object] = {
+        "hooks": {"PreToolUse ": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}]}
+    }
+    _write_json(tmp_path / ".claude" / "settings.json", settings)
+    summary = audit_project_control_plane(tmp_path)
+    (hook,) = summary.hook_commands
+    assert hook["runs_command"] is False
+    assert any("unrecognized hook event" in g for g in summary.gaps)
 
 
 def test_hook_run_comparison_scales_linearly_with_matchers(tmp_path: Path) -> None:
@@ -1490,7 +1570,7 @@ def test_hook_run_comparison_scales_linearly_with_matchers(tmp_path: Path) -> No
         (_guard_settings(condition="Bash(git *)"), _guard_settings(condition="Bash(gi *)"), True),
         (_guard_settings(condition="Bash(git *)"), _guard_settings(), False),
         (
-            _guard_settings(matcher="Bash, Edit", condition="Bash(git *)"),
+            _guard_settings(matcher="Bash|Edit", condition="Bash(git *)"),
             {
                 "hooks": {
                     "PreToolUse": [
@@ -1641,7 +1721,7 @@ def test_baseline_diff_alerts_when_a_kept_hook_starts_running(
     [
         (_guard_settings(), _guard_settings()),
         (_guard_settings(), _guard_settings(matcher="*")),
-        (_guard_settings(), _guard_settings(matcher="Bash, Edit")),
+        (_guard_settings(), _guard_settings(matcher="Bash|Edit")),
         (_guard_settings(condition="Bash(git *)"), _guard_settings()),
         (_guard_settings(disableAllHooks=True), _guard_settings(disableAllHooks=True)),
     ],
