@@ -129,8 +129,12 @@ def test_benchmark_evidence_rejects_non_object_statement_and_predicate(
 
 def test_sub_millisecond_scaling_ratio_and_non_loopback_socket_guard() -> None:
     # Sub-millisecond work is amortized accurately rather than clipped at 1ms/1ms == 1.0
-    ratio = scaling_ratio(lambda scale: sum(range(2_000 * scale)))
-    assert 1.5 < ratio < 10.0
+    def ratio() -> float:
+        return scaling_ratio(lambda scale: sum(range(2_000 * scale)))
+
+    # A sample this short catches a load burst on a shared runner (10.88 once on macOS),
+    # so a ratio out of range is measured once more. Clipping reads exactly 1.0 both times.
+    assert 1.5 < ratio() < 10.0 or 1.5 < ratio() < 10.0
 
     # Non-loopback connect is blocked by conftest's autouse socket guard
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

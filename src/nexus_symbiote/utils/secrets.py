@@ -66,7 +66,9 @@ _AUTH = re.compile(r"(?i)\b(Bearer|Basic|Token|Bot|ApiKey|Api-Key)(\s++)([A-Za-z
 # After an Authorization or Proxy-Authorization header name the scheme's value is a
 # credential whatever its shape; the shape checks only tell prose from credentials.
 # Searched in a bounded window before each scheme, so the cost per match is constant.
-_AUTHORIZATION_HEADER = re.compile(r"(?i)authorization[\"']?\s{0,8}[:=]\s{0,8}[\"']?$")
+_AUTHORIZATION_HEADER = re.compile(
+    r"(?i)authorization(?:\\*+[\"'])?\s{0,8}[:=]\s{0,8}(?:\\*+[\"'])?$"
+)
 _AUTHORIZATION_LOOKBACK = 40
 # A prose word after a scheme ("Bearer authentication") is shorter than this; a value
 # this long after Bearer, Token, Bot, ApiKey or Api-Key is redacted whatever its shape.
@@ -171,10 +173,13 @@ def holds_token_shape(text: str, *, require_sk_boundary: bool = False) -> bool:
 
 
 # A header value with no scheme is redacted when it looks like a credential; after
-# Negotiate or NTLM, which the scheme rule above does not know, whatever its shape.
+# Negotiate, NTLM, DPoP (RFC 9449), HOBA (RFC 7486) or Mutual (RFC 8120), which the scheme
+# rule above does not know, whatever its shape. "Mutual" is an English word, so it counts
+# only after an Authorization header name, never in prose.
 _RAW_AUTH_HEADER = re.compile(
-    r"(?i)(\b(?:proxy-)?authorization[\"']?\s{0,8}[:=]\s{0,8}[\"']?)"
-    r"(?:(negotiate|ntlm)([ \t]++)([A-Za-z0-9_+/=.~-]++)|([A-Za-z0-9_+/=.~:-]{8,}+))"
+    r"(?i)(\b(?:proxy-)?authorization(?:\\*+[\"'])?\s{0,8}[:=]\s{0,8}(?:\\*+[\"'])?)"
+    r"(?:(negotiate|ntlm|dpop|hoba|mutual)([ \t]++)([A-Za-z0-9_+/=.~-]++)"
+    r"|([A-Za-z0-9_+/=.~:-]{8,}+))"
 )
 _AUTH_SCHEMES = frozenset(
     {
@@ -187,6 +192,9 @@ _AUTH_SCHEMES = frozenset(
         "digest",
         "negotiate",
         "aws4-hmac-sha256",
+        "dpop",
+        "hoba",
+        "mutual",
     }
 )
 _AUTH_SCHEME_LENGTH = max(map(len, _AUTH_SCHEMES))
@@ -199,8 +207,22 @@ def _is_auth_scheme(value: str, span: Span) -> bool:
     return end - start <= _AUTH_SCHEME_LENGTH and value[start:end].lower() in _AUTH_SCHEMES
 
 
-_COOKIE_HEADER = re.compile(r"(?i)(\b(?:set-)?cookie[\"']?\s{0,8}[:=]\s{0,8}[\"']?)([^\r\n\"']++)")
-_COOKIE_PAIR = re.compile(r"([A-Za-z0-9_.-]{1,64}=)([^\s;,\"']++)")
+_COOKIE_HEADER = re.compile(
+    r"(?i)(\b(?:set-)?cookie(?:\\*+[\"'])?\s{0,8}[:=]\s{0,8})"
+    r"(?:\"((?:[^\"\\\r\n]++|\\.)*+)\""
+    r"|\\\"((?:[^\"\\\r\n]++|\\\\\\\\|\\\\\\\"|\\\\[^\"\\\r\n]|\\[^\"\\\r\n])*+)\\\""
+    r"|'((?:[^'\\\r\n]++|\\.)*+)'"
+    r"|([^\r\n]++))"
+)
+_COOKIE_PAIR = re.compile(
+    r"([A-Za-z0-9_.-]{1,64}=)"
+    r"(\"(?:[^\"\\\r\n]++|\\.)*+\""
+    r"|\\\\\\\"(?:[^\"\\\r\n]++|\\\\\\\\|\\\\[^\"\\\r\n]|\\[^\"\\\r\n])*+\\\\\\\""
+    r"|\\\"(?:[^\"\\\r\n]++|\\\\\\\\|\\\\\\\"|\\\\[^\"\\\r\n]|\\[^\"\\\r\n])*+\\\""
+    r"|\\'(?:[^'\\\r\n]++|\\\\|\\[^'\\\r\n])*+\\'"
+    r"|'(?:[^'\\\r\n]++|\\.)*+'"
+    r"|(?:[^\s;,\"'\\]++|\\(?![\"']))++)"
+)
 _COOKIE_ATTRS = frozenset(
     {"path", "domain", "samesite", "max-age", "expires", "priority", "version"}
 )
@@ -612,7 +634,25 @@ def _cookie_pair_secret(match: re.Match[str]) -> bool:
     name_eq, val = match.groups()
     if name_eq[:-1].lower() in _COOKIE_ATTRS:
         return False
-    return len(val) >= MIN_SECRET_LENGTH or _credential_like(val, "token")
+    if val.startswith('\\\\\\"') and val.endswith('\\\\\\"') and len(val) >= 8:
+        inner = val[4:-4]
+    elif len(val) >= 4 and (
+        (val.startswith('\\"') and val.endswith('\\"'))
+        or (val.startswith("\\'") and val.endswith("\\'"))
+    ):
+        inner = val[2:-2]
+    elif len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+        inner = val[1:-1]
+    else:
+        inner = val
+    return len(inner) >= MIN_SECRET_LENGTH or _credential_like(inner, "token")
+
+
+def _cookie_header_span(match: re.Match[str]) -> Span:
+    for group in (2, 3, 4, 5):
+        if match.start(group) >= 0:
+            return match.span(group)
+    return match.span(0)  # pragma: no cover - pattern matches one of groups 2..5
 
 
 def _cookie_pair_replacement(match: re.Match[str]) -> str:
@@ -737,7 +777,7 @@ def _apply(value: str, spans: list[Span], rewrites: list[_Rewrite]) -> str:
 
 # The name part of an assignment, and the two quoted value forms; an unquoted value runs
 # to the next whitespace, `,` or `;`. The value forms are those of _ASSIGNMENT.
-_ASSIGNMENT_NAME = re.compile(rf"(?i){_CREDENTIAL_KEYWORD}[\"']?\s*+{_MARK}\s*+")
+_ASSIGNMENT_NAME = re.compile(rf"(?i){_CREDENTIAL_KEYWORD}(?:\\*+[\"'])?\s*+{_MARK}\s*+")
 _QUOTED_VALUE = re.compile(r"\"(?:[^\"\\\n]|\\.){0,8192}\"|'(?:[^'\\\n]|\\.){0,8192}'")
 _VALUE_END = re.compile(r"[\s,;]")
 # What stands in for a URL while the rules read the rest of the text. It is no keyword,
@@ -748,9 +788,9 @@ _VALUE_END = re.compile(r"[\s,;]")
 _URL_MASK = "\x00"
 # A credential name that ends a URL, with its mark when the URL holds it, and the rest
 # of an assignment after the URL: a closing quote, spaces and the mark.
-# A backslash may end the URL too: in JSON or shell text written inside a string,
-# `?api_key=\"value\"` escapes the quote that opens the value.
-_URL_END_NAME = re.compile(rf"(?i)(?:{_CREDENTIAL_KEYWORD})[\"']?(?P<mark>{_MARK})?\\?\Z")
+# One or more backslashes may end the URL too: in nested JSON or shell text written
+# inside a string, `?api_key=\"value\"` or `?api_key=\\"value\\"` escapes the opening quote.
+_URL_END_NAME = re.compile(rf"(?i)(?:{_CREDENTIAL_KEYWORD})(?:\\*+[\"'])?(?P<mark>{_MARK})?\\*+\Z")
 _AFTER_URL_MARK = re.compile(rf"[\"']?\s*+(?P<mark>{_MARK})?\s*+")
 # How far before a URL's start a credential name that runs into it may begin, and how
 # far past it the name may end: longer than any keyword with its suffixes.
@@ -790,6 +830,38 @@ class _UnquotedRuns:
         return self.end
 
 
+def _escaped_quote_span(text: str, start: int, limit: int) -> Span | None:
+    """Match a backslash-escaped quoted value such as ``\\"secret val\\"`` in linear time."""
+    slashes = start
+    while slashes < limit and text[slashes] == "\\":
+        slashes += 1
+    slash_count = slashes - start
+    if slash_count == 0 or slashes >= limit or text[slashes] not in "\"'":
+        return None
+    quote = text[slashes]
+    pos = slashes + 1
+    max_end = min(limit, pos + 8192)
+    newline = text.find("\n", pos, max_end)
+    stop = max_end if newline < 0 else newline
+    search = pos
+    fallback_end: int | None = None
+    while search < stop:
+        close = text.find(quote, search, stop)
+        if close < 0:
+            break
+        back = close - 1
+        while back >= pos and text[back] == "\\":
+            back -= 1
+        run = close - 1 - back
+        if run >= slash_count and (run - slash_count) % 2 == 0:
+            if slash_count != 1 or (run - 1) % 4 == 0:
+                return start, close + 1
+            if fallback_end is None:
+                fallback_end = close + 1
+        search = close + 1
+    return (start, fallback_end) if fallback_end is not None else None
+
+
 def _value_span(
     text: str, start: int, limit: int, runs: _UnquotedRuns, original: str | None = None
 ) -> Span | None:
@@ -801,6 +873,10 @@ def _value_span(
         # read in the original text too, and runs to the later end.
         written = None if original is None else _QUOTED_VALUE.match(original, start, limit)
         return start, max(quoted.end(), written.end() if written else 0)
+    if text[start] == "\\":
+        escaped = _escaped_quote_span(text, start, limit)
+        if escaped is not None:
+            return escaped
     return start, runs.value_end(start)
 
 
@@ -852,6 +928,21 @@ def _assignment_spans(value: str, url_spans: list[Span]) -> Iterable[Span]:
             gap += 1
         elif not (value[gap].isspace() or value[gap] in "\"'"):
             continue
+        if gap < len(value) and tail.group("mark") is not None and value[gap] in "\"'":
+            slash_start = gap
+            while slash_start > url_start and value[slash_start - 1] == "\\":
+                slash_start -= 1
+            if slash_start < gap:
+                escaped = _escaped_quote_span(value, slash_start, len(value))
+                if escaped is not None:
+                    if not _is_auth_scheme(value, escaped):
+                        yield escaped
+                    continue
+            else:
+                direct = _value_span(value, gap, len(value), after_runs)
+                if direct is not None and not _is_auth_scheme(value, direct):
+                    yield direct
+                continue
         # Every part of the pattern is optional, so it always matches.
         after = cast(re.Match[str], _AFTER_URL_MARK.match(value, gap))
         if tail.group("mark") is None and after.group("mark") is None:
@@ -920,7 +1011,7 @@ def _rule_matches(
     spans.extend(_url_clipped_cookie_spans(value, url_spans))
     if url_spans:
         for match in _COOKIE_HEADER.finditer(masked):
-            spans.extend(_cookie_spans(value, *match.span(2)))
+            spans.extend(_cookie_spans(value, *_cookie_header_span(match)))
     spans.extend(match.span() for match in TOKEN_SHAPE.finditer(value))
     if cookie:
         spans.extend(_cookie_spans(value))
@@ -932,7 +1023,7 @@ def _url_clipped_cookie_spans(value: str, url_spans: list[Span]) -> Iterable[Spa
     the header starts in, where the URL's own query is not a header's value."""
     url_index = 0
     for match in _COOKIE_HEADER.finditer(value):
-        start, end = match.span(2)
+        start, end = _cookie_header_span(match)
         while url_index < len(url_spans) and url_spans[url_index][1] <= match.start():
             url_index += 1
         if url_index < len(url_spans) and url_spans[url_index][0] <= match.start():
@@ -1138,12 +1229,18 @@ def redact_descriptor(
     scrubber = _scrubber(secrets)
     safe = {}
     for key, value in descriptor.items():
-        if key in {"inputSchema", "outputSchema"}:
+        raw_key = str(key)
+        if raw_key in {"inputSchema", "outputSchema"}:
             value = _schema_projection(value)
-        elif key not in {"name", "title", "description", "annotations", "_meta"}:
-            key = redact_text(key, scrubber)
-        if key == "name" and isinstance(value, str):
-            safe[key] = redact_text(value, scrubber, identifier=True)
+            out_key = raw_key
+        elif raw_key not in {"name", "title", "description", "annotations", "_meta"}:
+            out_key = redact_text(raw_key, scrubber)
         else:
-            safe[key] = _redact_metadata(value, scrubber)
+            out_key = raw_key
+        if raw_key == "name" and isinstance(value, str):
+            safe[out_key] = redact_text(value, scrubber, identifier=True)
+        elif isinstance(value, str):
+            safe[out_key] = redact_keyed_text(raw_key, value, scrubber)
+        else:
+            safe[out_key] = _redact_metadata(value, scrubber)
     return safe

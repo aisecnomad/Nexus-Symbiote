@@ -331,6 +331,36 @@ def test_malformed_frames_and_replies_are_refused(tmp_path, on_list, failure):
     refused_observation(tmp_path, failure, on_list=on_list)
 
 
+LIST_CHANGED = "MCP server changed a list during observation"
+
+
+@pytest.mark.parametrize("kind", ["tools", "prompts", "resources"])
+def test_a_list_changed_notification_before_the_reply_is_refused(tmp_path, kind):
+    # The server says the list it is about to serve is already stale.
+    changed = json.dumps({"jsonrpc": "2.0", "method": f"notifications/{kind}/list_changed"})
+    on_list = f"emit({changed!r})\nreply({{'tools': []}})"
+    refused_observation(tmp_path, LIST_CHANGED, on_list=on_list)
+
+
+def test_a_list_changed_notification_between_pages_is_refused(tmp_path):
+    # A list_changed-aware client would refetch here and could see other tools.
+    changed = json.dumps({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+    on_list = (
+        "if page == 1:\n"
+        "    reply({'tools': [{'name': 'a'}], 'nextCursor': 'c'})\n"
+        f"    emit({changed!r})\n"
+        "else:\n"
+        "    reply({'tools': [{'name': 'b'}]})"
+    )
+    refused_observation(tmp_path, LIST_CHANGED, on_list=on_list)
+
+
+def test_other_notifications_are_still_skipped(tmp_path):
+    command, pin, log = pinned(tmp_path, on_list=f"emit({NOTIFICATION!r})\nreply({{'tools': []}})")
+    assert stdio.observe_pinned(command, pin).tools == []
+    assert_reaped(log)
+
+
 @pytest.mark.parametrize(
     "on_list",
     [

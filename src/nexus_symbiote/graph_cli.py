@@ -14,6 +14,7 @@ import click
 
 from nexus_symbiote.core.aibom import AIBOM, NativeFormatError
 from nexus_symbiote.runtime_cli import _refuse_source_overwrite
+from nexus_symbiote.utils.confined import DEFAULT_EXCLUDE_ACCEPTANCE
 from nexus_symbiote.utils.terminal import echo_line, json_text, neutralize, write_cli_output
 
 DEFAULT_MAX_NODES = 2_000
@@ -146,6 +147,21 @@ def register_graph_commands(main: click.Group) -> None:
         help="Trusted Ed25519 public key PEM for --require-attestation (repeatable).",
     )
     @click.option(
+        "--accept-default-exclude",
+        "accept_default_exclude",
+        type=click.Choice(sorted(DEFAULT_EXCLUDE_ACCEPTANCE)),
+        multiple=True,
+        help="Accept one default exclusion while reconciling against --project. Repeat as needed.",
+    )
+    @click.option(
+        "--accept-default-excludes",
+        is_flag=True,
+        help=(
+            "Accept built-in default exclusions (.git, node_modules, __pycache__, .venv, venv) "
+            "while reconciling against --project."
+        ),
+    )
+    @click.option(
         "-o",
         "--output",
         type=click.Path(path_type=Path),
@@ -159,6 +175,8 @@ def register_graph_commands(main: click.Group) -> None:
         signature_policy: Path | None,
         attestation_envelope: Path | None,
         trusted_keys: tuple[Path, ...],
+        accept_default_exclude: tuple[str, ...],
+        accept_default_excludes: bool,
         output: Path | None,
     ) -> None:
         """Export a default-deny Cedar, Rego, or JSON runtime allowlist from an inventory."""
@@ -172,6 +190,8 @@ def register_graph_commands(main: click.Group) -> None:
             signature_policy=signature_policy,
             attestation_envelope=attestation_envelope,
             trusted_keys=trusted_keys,
+            accept_default_excludes=accept_default_excludes,
+            accept_default_exclude=accept_default_exclude,
             output=output,
         )
 

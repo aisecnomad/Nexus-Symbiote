@@ -35,6 +35,7 @@ from nexus_symbiote.live.pinned_process import (
 )
 from nexus_symbiote.live.stdio import DEADLINE_SECONDS, MAX_TOOLS, PROTOCOL, _frames, _ready
 from nexus_symbiote.runtime import (
+    REASONS,
     AuthorizationError,
     Decision,
     Envelope,
@@ -148,7 +149,8 @@ class PinnedStdioSession:
             return self
         except PinnedProcessError as exc:
             self.__exit__(None, None, None)
-            raise AuthorizationError(str(exc)) from exc
+            reason = exc.reason if exc.reason in REASONS else "denied"
+            raise AuthorizationError(str(exc), reason=reason) from exc
         except BaseException:
             self.__exit__(None, None, None)
             raise
@@ -343,8 +345,13 @@ class PinnedStdioSession:
                             proc.stdout.close()
         finally:
             if self._directory is not None:
-                self._directory.cleanup()
-                self._directory = None
+                try:
+                    self._directory.cleanup()
+                except OSError:
+                    if not isinstance(teardown, PinnedProcessError):
+                        raise
+                finally:
+                    self._directory = None
         if teardown is None:
             return
         if self._called:
@@ -358,10 +365,15 @@ class PinnedStdioSession:
                 if isinstance(teardown, PinnedProcessError)
                 else "launcher cleanup did not complete; the tool may still be running"
             ) from teardown
+        if isinstance(teardown, PinnedProcessError):
+            if exc is not None and not isinstance(exc, Exception):
+                # An interrupt or an exit is not replaced by an error a caller's loop
+                # catches; the teardown failure rides along as a note.
+                exc.add_note(f"launcher teardown failed: {teardown}")
+                return
+            raise AuthorizationError(str(teardown), reason=teardown.reason) from teardown
         if exc is not None:
             return
-        if isinstance(teardown, PinnedProcessError):
-            raise AuthorizationError(str(teardown)) from teardown
         raise teardown
 
 

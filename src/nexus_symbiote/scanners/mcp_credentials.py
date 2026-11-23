@@ -13,6 +13,7 @@ import json
 import re
 import string
 import unicodedata
+from array import array
 from collections.abc import Iterable
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -130,7 +131,7 @@ _VARIABLE_NAME = re.compile(r"[A-Z]+(?:_[A-Z]+)+")
 # ``=``, ``:+``, ``+``): the text after the operator is in the file, so a literal
 # there is committed. ``:?`` carries a message, not a value.
 _SHELL_DEFAULT = re.compile(
-    r"\$\{[A-Za-z_][A-Za-z0-9_]{0,127}(?::?[-=+])((?:[^{}\\]|\\.){1,8192})\}"
+    r"\$\{([A-Za-z_][A-Za-z0-9_]{0,127})(?::?[-=+])((?:[^{}\\]|\\.){1,8192})\}"
 )
 # A shell variable in lower case (``$api_token``) names one too, but under a password
 # name ``$hunter_two_pw`` is as likely a password: there only ``$NAME`` is a reference.
@@ -212,6 +213,13 @@ _HOST = re.compile(
     r"(?:(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.){1,16}[a-z]{2,24}|localhost)"
     r"(?::\d{1,5})?(?:/\S{0,2048})?"
 )
+_BARE_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.){1,16}([a-z]{2,24})")
+# Generic top-level domains in common use for service hosts. Two-letter country codes are
+# read by rule in public_scheme_operand; anything else is not a public suffix.
+_PUBLIC_SUFFIXES = _words(
+    "com net org edu gov mil int info biz io ai dev app cloud tech xyz site online run page"
+)
+_SOURCE_EXTENSIONS = _words("js mjs cjs ts mts cts py rb jar")
 _HOST_PORT = re.compile(r"[A-Za-z0-9.-]{1,253}:(\d{1,5})(?:/\S{0,2048})?")
 _PORT_PATH = re.compile(r"\d{1,5}(?:/\S{0,2048})?")
 _PLAIN_PORT_PATH = re.compile(r"\d{1,5}(?:/[\w./-]{0,2048})?")
@@ -304,6 +312,10 @@ _ASSIGNMENT = re.compile(
 _NETRC_WORDS = frozenset({"password", "passwd"})
 _BASE64 = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
 _ENCODED_LIMIT = 65536
+_KEY_WRAP_CHARS = frozenset("\u200b\ufeff\u2060\u200c\u200d\u00ad")
+_KEY_WRAP = re.compile(r"[\s\u200b\ufeff\u2060\u200c\u200d\u00ad]+")
+_KEY_PREFIX_LENGTH = 16
+_WRAP_COMPARISON_FACTOR = 64
 JSON_LIMIT = 65536
 JSON_DEPTH = 8
 
@@ -602,6 +614,42 @@ def literal_value(value: str, *, password: bool = False) -> bool:
     return credential_shaped(value)
 
 
+def public_value(value: str) -> bool:
+    """Whether ``value`` positively names something public, whatever placeholder it holds.
+
+    The refusals of ``literal_value`` that say where a value points (a URL, a path, a
+    package, an image, a host, public key material), and not the ones that only say what
+    it looks like or lacks: a label, a setting, a placeholder or a weak shape is not
+    evidence that a value is public.
+    """
+    value = _strip(value)
+    # Not ``reference``: it also accepts a literal that merely contains `${NAME}`. A whole
+    # reference is already public by ``is_reference`` before this is asked.
+    return "://" in value or public_material(value) or _locator_or_value(value)
+
+
+def public_scheme_operand(value: str) -> bool:
+    """Whether the word after an authentication scheme positively names something public.
+
+    As ``public_value``, except that a bare dotted word (no scheme, port or path) is a
+    host only when its last label is a public suffix or a script name ends in a source
+    extension. Dots alone do not make ``db.internal.example`` or ``hunter.corp`` public
+    where a credential may stand; ``.example``, ``.test``, ``.invalid``, ``.local``,
+    ``.internal``, ``.corp`` and ``.lan`` are reserved or private names, never suffixes.
+    """
+    value = _strip(value)
+    if not public_value(value):
+        return False
+    host = _BARE_HOST.fullmatch(value)
+    if host is None or _path(value):
+        return True
+    suffix = host.group(1)
+    if len(suffix) == 2:
+        # ISO 3166 reserves these alpha-2 codes for user assignment; no ccTLD uses one.
+        return suffix not in {"aa", "zz"} and not ("qm" <= suffix <= "qz" or suffix[0] == "x")
+    return suffix in _PUBLIC_SUFFIXES or suffix in _SOURCE_EXTENSIONS
+
+
 def _token_hits(value: str) -> list[Hit]:
     return [
         (SHAPE_CLASS, match.group())
@@ -610,25 +658,108 @@ def _token_hits(value: str) -> list[Hit]:
     ]
 
 
-def _private_key(value: str) -> bool:
-    """A private key block whose body is not elided, a PuTTY key, or either in base64."""
+def _private_key(value: str) -> str | None:
+    """Return the unpadded text to redact, unwrapped when the key is base64-encoded."""
     if private_key_block(value):
-        return "..." not in value and "…" not in value
+        return None if "..." in value or "…" in value else value.strip()
     if _putty_key(value):
-        return True
-    encoded = _BASE64.fullmatch(value.strip())
-    if encoded is None or len(value) > _ENCODED_LIMIT:
-        return False
+        return value.strip()
+    # base64 and openssl wrap their output at 76 and 64 columns by default.
+    compact = _KEY_WRAP.sub("", value.strip())
+    if len(compact) > _ENCODED_LIMIT or _BASE64.fullmatch(compact) is None:
+        return None
     try:
-        decoded = base64.b64decode(value.strip() + "=" * (-len(value.strip()) % 4))
+        decoded = base64.b64decode(compact + "=" * (-len(compact) % 4))
     except (binascii.Error, ValueError):
-        return False
+        return None
     text = decoded.decode("utf-8", "replace")
-    return private_key_block(text) or '"private_key"' in text or _putty_key(text)
+    if private_key_block(text) or '"private_key"' in text or _putty_key(text):
+        return compact
+    return None
+
+
+def private_key_forms(value: str) -> tuple[str, ...]:
+    """Every form of a private key or base64-encoded private key to scrub from siblings."""
+    key = _private_key(value)
+    if key is None:
+        return ()
+    unpadded = key.rstrip("=")
+    if unpadded and len(unpadded) >= 40 and _BASE64.fullmatch(key):
+        return tuple(dict.fromkeys((value, value.strip(), key, unpadded)))
+    return tuple(dict.fromkeys((value, value.strip(), key)))
 
 
 def _putty_key(text: str) -> bool:
     return "PuTTY-User-Key-File-" in text and "Private-Lines:" in text
+
+
+class WrappedKeySearchLimitError(ValueError):
+    """A complete search for alternate wrapping would exceed the per-text work bound."""
+
+
+def rewrapped_key_literals(document: Any, values: Iterable[str]) -> Iterable[str]:
+    """Find differently wrapped copies without comparing every key with every field."""
+    keys: set[str] = set()
+    for value in values:
+        compact = _private_key(value)
+        if compact is not None and len(compact) <= _ENCODED_LIMIT and _BASE64.fullmatch(compact):
+            keys.add(compact.rstrip("="))
+    if not keys:
+        return
+    shortest = min(map(len, keys))
+    # Anchor on each key's midpoint rather than its header prefix: standard PEM,
+    # OpenSSH, PuTTY and GCP JSON keys share constant 16-char base64 prefixes.
+    grouped: dict[str, set[tuple[int, int]]] = {}
+    for key in keys:
+        offset = len(key) // 2
+        grouped.setdefault(key[offset : offset + _KEY_PREFIX_LENGTH], set()).add((offset, len(key)))
+    anchors = {anchor: sorted(specs) for anchor, specs in grouped.items()}
+
+    pending = [document]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            pending.extend(node.keys())
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
+        elif isinstance(node, str) and len(node) >= shortest and _KEY_WRAP.search(node):
+            compact = _KEY_WRAP.sub("", node)
+            if len(compact) < shortest:
+                continue
+            budget = _WRAP_COMPARISON_FACTOR * len(node)
+            offsets = None
+            for mid in range(len(compact) - _KEY_PREFIX_LENGTH + 1):
+                for offset, size in anchors.get(compact[mid : mid + _KEY_PREFIX_LENGTH], ()):
+                    start = mid - offset
+                    end = start + size
+                    if start < 0 or end > len(compact):
+                        continue
+                    # Account for slicing and hashing even if an anchor is shared by
+                    # many lengths. Never return a partial set as a complete search.
+                    budget -= size
+                    if budget < 0:
+                        raise WrappedKeySearchLimitError
+                    if compact[start:end] not in keys:
+                        continue
+                    if offsets is None:
+                        offsets = array(
+                            "I",
+                            (
+                                i
+                                for i, c in enumerate(node)
+                                if not (c.isspace() or c in _KEY_WRAP_CHARS)
+                            ),
+                        )
+                    pad = 0
+                    while pad < 2 and end + pad < len(compact) and compact[end + pad] == "=":
+                        pad += 1
+                    first, last = offsets[start], offsets[end + pad - 1] + 1
+                    if last - first > size + pad:
+                        budget -= last - first
+                        if budget < 0:
+                            raise WrappedKeySearchLimitError
+                        yield node[first:last]
 
 
 def _json_hits(value: str) -> list[Hit]:
@@ -802,8 +933,9 @@ def value_hits(name: str, value: str, *, header: bool = False) -> list[Hit]:
     if _PUBLIC_JWT.fullmatch(_strip(value)) and not _JWT_PUBLIC_WORDS.isdisjoint(name_words(name)):
         return []  # A JWT under an anon or public name is a key published by design.
     hits = _token_hits(value)
-    if _private_key(value):
-        hits.append((NAMED_CLASS, value))
+    if forms := private_key_forms(value):
+        # A sibling can repeat the same key without the original field's padding or wrapping.
+        hits.extend((NAMED_CLASS, form) for form in forms)
     stripped = _strip(value)
     if not stripped or public_material(stripped):
         return hits
@@ -826,10 +958,14 @@ def _default_hits(name: str, value: str) -> list[Hit]:
     """Literal defaults of shell expansions in ``value``, read by the rules for ``name``."""
     hits: list[Hit] = []
     for match in _SHELL_DEFAULT.finditer(value):
-        default = match.group(1).strip(" \"'")
+        var_name = match.group(1)
+        default = match.group(2).strip(" \"'")
         if "$" in default or "`" in default:
             continue
-        hits.extend(_named_hits(name, default))
+        found = _named_hits(name, default)
+        if not found and credential_name(var_name):
+            found = _named_hits(var_name, default)
+        hits.extend(found)
     return hits
 
 

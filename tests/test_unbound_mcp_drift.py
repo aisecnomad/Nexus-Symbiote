@@ -162,3 +162,45 @@ def test_binding_key_input_reaches_the_cli_and_is_not_printed(tmp_path, monkeypa
     assert seen == [KEY]
     log = capsys.readouterr().err + capsys.readouterr().out
     assert KEY not in log
+
+
+def _server(root: Path, config: dict) -> MCPServerComponent:
+    root.mkdir()
+    (root / ".mcp.json").write_text(json.dumps({"mcpServers": {"s": config}}))
+    (server,) = [
+        c for c in mcp.MCPScanner().scan(root).components if isinstance(c, MCPServerComponent)
+    ]
+    return server
+
+
+def _unbound_kinds(server: MCPServerComponent) -> list[str]:
+    detail = next(r.detail for r in server.risks if UNBOUND_VALUES_DETAIL in r.detail)
+    return detail.rsplit(": ", 1)[1].rstrip(".").split("; ")
+
+
+@pytest.mark.parametrize(
+    "first,second,unbound",
+    [
+        # Redacted for its shape: both export "[redacted-command]".
+        ({"command": "srv@good"}, {"command": "srv@evil"}, "command"),
+        ({"command": "g" * 70}, {"command": "e" * 70}, "command"),
+        # Exported case-folded: two files on POSIX share one record.
+        ({"command": "mcpserver"}, {"command": "MCPServer"}, "command"),
+        ({"url": "https://${HOST_A}/"}, {"url": "https://${HOST_B}/"}, "endpoint"),
+    ],
+)
+def test_a_command_or_endpoint_the_export_redacts_or_folds_is_unbound_without_a_key(
+    tmp_path, first, second, unbound
+):
+    one, two = _server(tmp_path / "one", first), _server(tmp_path / "two", second)
+    assert one.properties["static_config_hash"] == two.properties["static_config_hash"]
+    assert unbound in _unbound_kinds(two)
+    assert _values_unbound(two)
+
+
+def test_a_command_the_export_shows_verbatim_stays_bound(tmp_path, monkeypatch):
+    assert not _values_unbound(_server(tmp_path / "bare", {"command": "mcpserver"}))
+    monkeypatch.setenv(SOURCE_BINDING_KEY_ENV, KEY)
+    keyed = _server(tmp_path / "keyed", {"command": "MCPServer"})
+    assert keyed.properties["source_values_bound"] is True
+    assert not _values_unbound(keyed)

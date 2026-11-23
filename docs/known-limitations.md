@@ -1007,7 +1007,9 @@ A way around a limit that its entry does not describe is worth a
   `unsafe-code-execution`, and a NumPy header or ZIP archive left unread at the
   bounds below is rated `unknown`. A pickle renamed anywhere else, an unrecognized
   pickle, a numeric NumPy array, a ZIP archive with neither kind of member, and `.pb`
-  files other than `saved_model.pb` produce no component. A candidate ZIP archive is
+  files other than `saved_model.pb` produce no component. So do archive model formats
+  whose loaders unpickle a member, such as NeMo's `.nemo` and TorchServe's `.mar`, and
+  scikit-learn's conventional `.sav`, outside those directories. A candidate ZIP archive is
   read to its end and digested, as a model archive is, and a candidate larger than
   the `model-bytes` limit is a collection failure. A candidate that a model binds,
   such as ONNX external data or a SavedModel variables file, is rated the same way
@@ -1136,24 +1138,19 @@ A way around a limit that its entry does not describe is worth a
   resolved from that file's directory. The imports of other instruction files, such
   as `AGENTS.md` or a rule file, are followed only when a memory file imports them.
   Imports are read from the text outside fenced code and code spans as CommonMark
-  reads it, across lines and inside block quotes and list items. When the only
+  reads it, across lines and inside block quotes and list items, and also from what
+  Claude Code reads as text. When the only
   disagreement is the start of an HTML block, the scanner follows imports from
   either complete reading. For example, cmark-gfm 0.29 parses the line after
   `<search>notes</search>` as prose when there is no intervening blank line.
   A closing code span there can expose an import. Readers that treat `search`
   as a block tag keep the same line in raw HTML. A fenced example that both
-  readers recognize stays an example. Other ambiguities, including footnotes followed by a setext heading
+  readers and Claude Code recognize stays an example. Other ambiguities, including footnotes followed by a setext heading
   underline, also retain the raw text and container and inline-code boundaries.
   In that case a fenced example such as `@../notes.md` can count as an import and
   cause `scan --check` to fail.
   A host using GitHub's table or autolink extensions can still import a
   file from text read here as code.
-  A reference is read only where `@` starts the text or follows white space, and
-  without the sentence punctuation after it. A host that also starts a reference
-  after inline markup (`**@docs/x.md**`, the text of a link, `<b>@x.md</b>`), keeps that
-  punctuation, decodes an escaped space, or interprets a `#fragment` instead of
-  treating it as part of the literal filename can import a different file that is
-  not inventoried here; which hosts do has not been established by test.
   An import that leaves the project root, names an excluded path or lies deeper than
   the `depth` limit is a gap, so write a path alias such as `@/components` as code. An
   import of a file named as holding credentials, as the next entry lists them, is a
@@ -1192,6 +1189,47 @@ A way around a limit that its entry does not describe is worth a
   import targets fails until the limit is raised. Past 262,144 characters of listed
   paths, an `imports` list is replaced by `imports_count` and `imports_digest`, and an
   `imported_by` list by `imported_by_count`; every file is still inventoried.
+- **Claude Code's own import reading is followed too.** Claude Code 2.1.42 and
+  2.1.330 were tested by running their bundled marked lexer and import extractor;
+  both return the same imports for every document tested, and
+  `tests/fixtures/claude-code-imports.json` records them for 200 documents. They
+  differ from CommonMark in these ways, and the scanner inventories each name they
+  give:
+  - A reference starts wherever marked starts a text token: after white space, and
+    also right after inline markup (`**@x.md**`, `_@x.md_`, the text of a link,
+    a link, an escape such as `\#@x.md`, an escaped backtick, or raw
+    HTML such as `<b>@x.md</b>`), even inside what CommonMark reads as one word.
+  - The name ends where markup starts (`@x.md<br>` imports `x.md`) and at a
+    backslash that escapes no space. `\ ` is a space, so `@my\ notes.md` imports
+    `my notes.md`. A `#fragment` is dropped, so `@notes.md#rules` imports `notes.md`.
+    Trailing punctuation is kept, so `@notes.md.` imports `notes.md.` (the scanner
+    looks up both spellings).
+  - A list item's text is read raw, code spans included: ``- ` @notes.md ` ``
+    imports `notes.md`, which GitHub shows as code. marked also keeps the lines after
+    an item in it up to a blank line, and indented lines after that, where CommonMark
+    ends the item.
+  - A fence closes on its opening run followed by any `~` or backticks, as in the
+    line ```` ```~ ````. A leading tab counts as four spaces, so a tab between `>` and
+    a fence opens indented code, not a fence. A last line with no line end that would open a fence after a
+    paragraph is text. The closing tags `</pre>`, `</script>`, `</style>` and
+    `</textarea>`, and tags whose names only begin with those words, such as
+    `<pretty>`, are text; `<meta>` opens an HTML block.
+
+  Where these readings may give a different block structure (a marked fence close,
+  a tab before a fence, a fence or those HTML tags among lines marked keeps in a list
+  item), the raw text is retained as for other ambiguities, so a fenced example there
+  can count as an import. A name that only Claude Code's reading gives and that names
+  no file is skipped silently: it is looked up only by its exact spelling, so it
+  raises no credential or case-variant gap, and a case variant of it on a
+  case-insensitive file system is not found. Each reference yields at most 16 names
+  cut at markup, so a name whose text token ends past its sixteenth markup character
+  is missed; a file with more than 2,000 places where such a reference can start is a
+  "too many @path imports" failure. In a seeded differential, the scanner missed 3
+  of 70,976 imports in 40,000 documents built from whole lines and 6 of 25,993 in
+  24,000 documents built from inline fragments. Each miss follows backticks that
+  marked pairs into code spans differently from CommonMark, such as `` `y`@x.md ``
+  after an unmatched run, or an HTML block that marked reads as the text of a block
+  quote above it. Other hosts' import readers have not been tested.
 - **Files named as holding credentials are not read.** The `prompt` collector does not
   read a file without a Markdown suffix whose name says it holds credentials (`.env*`
   other than a template ending in `.example`, `.sample` or `.template`; `*.env` and
@@ -1559,6 +1597,9 @@ A way around a limit that its entry does not describe is worth a
   `across N head file(s)` in the text one, before trusting a clean result.
   In ambiguous Markdown the container reading can strip indentation, so an added
   indented code example can register as a change.
+  Imports are read as `scan` reads them, Claude Code's reading included, so one
+  added reference can register as several added imports, such as `notes.md` and
+  `notes.md**` for `**@notes.md**`.
   The diff compares prose separately from raw HTML, so a blank line that moves
   a previously illustrated reference into prose can register as a new import.
   A closing span can expose an import whose filename contains literal backticks.
