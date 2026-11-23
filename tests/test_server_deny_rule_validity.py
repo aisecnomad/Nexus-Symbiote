@@ -34,6 +34,13 @@ from tests.test_steering_mcp_names import _surfaces
         ("reports", "*ports__detail*", False),
         ("reports", "mcp__reports__*suffix", False),
         ("logs", "*ports__*", False),
+        ("a__b__c", "mcp__a__b", False),
+        ("reports", "MCP__reports", False),
+        ("Reports", "mcp__reports", False),
+        ("", "mcp__", False),
+        ("reports", "mcp__reports(foo)", False),
+        ("__reports", "mcp____reports(foo)", False),
+        ("reports", "mcp__*(*)", False),
     ],
 )
 def test_only_a_valid_whole_namespace_deny_covers_a_write_capable_server(

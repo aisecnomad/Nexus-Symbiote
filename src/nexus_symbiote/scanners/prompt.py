@@ -10,6 +10,7 @@ import sys
 import unicodedata
 from collections import deque
 from collections.abc import Collection
+from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -238,23 +239,30 @@ def detect_invisible_characters(
     ]
 
 
-def definition_text_risks(definition: object, source_name: str) -> list[RiskAssessment]:
+def definition_text_risks(
+    definition: object, source_name: str, *, include_name: bool = False
+) -> list[RiskAssessment]:
     """Rate the hidden characters in a tool definition as in an instruction file.
 
     A host puts a tool's description and schema text in front of the model as it does an
     instruction file, so the same characters hide the same text. Every string and key
     of the definition is read except the tool's own name, which is reported as an
-    identifier. A byte-order mark is never ordinary here: no string of a definition
-    starts a file.
+    identifier unless ``include_name`` is set, as for a served descriptor whose name a
+    host shows the model unredacted. A byte-order mark is never ordinary here: no
+    string of a definition starts a file.
     """
     counts: dict[str, int] = {}
     separators: dict[str, int] = {}
     tags = 0
-    pending = (
-        [value for key, value in definition.items() if key != "name"]
-        if isinstance(definition, dict)
-        else [definition]
-    )
+    if isinstance(definition, dict):
+        pending = [
+            item
+            for key, value in definition.items()
+            if include_name or key != "name"
+            for item in (key, value)
+        ]
+    else:
+        pending = [definition]
     while pending:
         value = pending.pop()
         if isinstance(value, dict):
@@ -1139,6 +1147,18 @@ def withholds_content_hash(component: PromptComponent) -> bool:
 # not bound the inventory.
 _MAX_LISTED_IMPORT_CHARACTERS = 256 * 1024
 _IMPORT = re.compile(r"(?<!\S)@(\S+)")
+# JavaScript's \s, which Claude Code's import pattern uses.
+_JS_SPACE = "\t\n\x0b\x0c\r \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+# An @ that can open a marked text token: after white space or any inline markup, an
+# escape or raw HTML, all of which end on ASCII punctuation. An @ after a backtick does
+# only when that backtick is escaped; the name after a code span is read where it closes.
+_HOST_START = re.compile(rf"(?<![^{_JS_SPACE}!-/:-?\[-`{{-~])@(?=[^{_JS_SPACE}\\]|\\ )")
+_HOST_NAME = re.compile(rf"(?:[^{_JS_SPACE}\\]|\\ )+")
+_MARKUP_START = re.compile(r"[`*_\[\]<!\\]")
+# Each start yields at most this many names plus its whole run, and a file at most
+# ``_MAX_HOST_STARTS`` starts, so the names read stay linear in the text.
+_MAX_HOST_CUTS = 16
+_MAX_HOST_STARTS = 2 * _MAX_IMPORTS
 _DRIVE = re.compile(r"[A-Za-z]:[\\/]")
 # Sentence punctuation after a reference; the file is inventoried without it.
 _TRAILING = ".,;:!?)]}\"'"
@@ -1194,10 +1214,70 @@ def _resolve_import(directory: tuple[str, ...], token: str) -> tuple[list[str], 
     return targets, outside, too_long
 
 
-def _import_tokens(text: str) -> list[str]:
+def _import_readings(text: str) -> tuple[list[str], list[str], bool]:
     """@path references in the text of a Markdown file, outside its code as CommonMark
-    reads it."""
-    return [token for part in text_outside_code(text) for token in _IMPORT.findall(part)]
+    reads it, each name Claude Code may read from the same text, and whether it holds
+    too many such references to read them all.
+
+    Claude Code matches ``(?:^|\\s)@((?:[^\\s\\\\]|\\\\ )+)`` against each text token of its
+    marked lexer, so a reference can open right after inline markup, even inside what
+    this collector reads as one name; a name stops at a backslash that escapes no space,
+    ``\\ `` is a space, and a ``#`` starts a fragment. A token ends where markup starts,
+    so each prefix before a character that can open markup is also a name. A name that
+    names no file is skipped, so extra names cost only a lookup.
+    """
+    own: list[str] = []
+    host: list[str] = []
+    starts = 0
+    for part in text_outside_code(text):
+        own.extend(_IMPORT.findall(part))
+        end = 0
+        for found in _HOST_START.finditer(part):
+            at = found.start()
+            tick = at > 0 and part[at - 1] == "`"
+            escape = at - tick
+            while escape and part[escape - 1] == "\\":
+                escape -= 1
+            if (at - tick - escape) % 2 != tick:
+                continue
+            starts += 1
+            if starts > _MAX_HOST_STARTS:
+                return own, host, True
+            start = found.end()
+            # Every start inside one run of name characters ends where that run ends.
+            if start >= end:
+                run = _HOST_NAME.match(part, start)
+                end = start if run is None else run.end()
+            limit = min(end, start + _MAX_PATH_BYTES + 1)
+            if (fragment := part.find("#", start, limit)) >= 0:
+                limit = fragment
+            cuts = islice(
+                (markup.start() for markup in _MARKUP_START.finditer(part, start, limit)),
+                _MAX_HOST_CUTS,
+            )
+            for cut in dict.fromkeys((*cuts, limit)):
+                if form := part[start:cut].replace("\\ ", " "):
+                    host.append(form)
+    return own, host, False
+
+
+def _import_tokens(text: str) -> list[str]:
+    """Every name ``_import_readings`` finds in ``text``."""
+    own, host, _ = _import_readings(text)
+    return own + host
+
+
+def _import_names(own: list[str], host: list[str], overflow: bool) -> tuple[dict[str, bool], bool]:
+    """The names to look up for these references, each mapped to whether only Claude
+    Code's reading names it, and whether there are too many to inventory.
+
+    Claude Code also keeps the trailing punctuation that the collector strips.
+    """
+    names = dict.fromkeys((token.rstrip(_TRAILING) for token in own), False)
+    for token in (*own, *host):
+        for form in (token.rstrip(_TRAILING), token):
+            names.setdefault(form, True)
+    return names, overflow or len(set(own)) > _MAX_IMPORTS
 
 
 class _ImportListing:
@@ -1491,7 +1571,9 @@ class PromptScanner(Scanner):
             text,
             decoded=(
                 _escaped_text(rel_path, text, result.surfaces_excluded)
-                if escapes or _markup(rel_path)
+                if escapes
+                or _markup(rel_path)
+                or PurePosixPath(rel_path).suffix.lower() in _ESCAPED_FORMATS
                 else None
             ),
         )
@@ -1545,25 +1627,27 @@ class PromptScanner(Scanner):
 
         while pending:
             importer, depth = pending.popleft()
-            tokens = _import_tokens(texts[importer])
-            if not tokens:
+            references, too_many = _import_names(*_import_readings(texts[importer]))
+            if not references:
                 continue
-            if len(set(tokens)) > _MAX_IMPORTS:
+            if too_many:
                 result.scan_failures.append(f"{importer}: too many @path imports to inventory")
                 continue
             # A file found by a lookup was counted when it was looked up.
             if importer not in looked_up and not spend(importer):
                 break
             imports: dict[str, None] = {}
-            targets: list[str] = []
+            # Each target, and whether only a name Claude Code may read leads to it.
+            targets: dict[str, bool] = {}
             outside = too_long = exhausted = False
             directory = PurePosixPath(importer).parent.parts
-            for token in dict.fromkeys(token.rstrip(_TRAILING) for token in tokens):
+            for token, speculative in references.items():
                 named, leaves, long = _resolve_import(directory, token)
-                targets.extend(named)
+                for target in named:
+                    targets[target] = targets.get(target, True) and speculative
                 outside |= leaves
                 too_long |= long
-            for target in dict.fromkeys(targets):
+            for target, speculative in targets.items():
                 known = paths.get(target)
                 if known is not None:
                     imports[known] = None
@@ -1577,6 +1661,15 @@ class PromptScanner(Scanner):
                     exhausted = True
                     break
                 looked_up.add(target)
+                # A name only Claude Code's reading gives is looked up exactly and is
+                # silent when it names nothing, so its credential or case-variant checks
+                # cannot report a file no host loads.
+                if (
+                    speculative
+                    and not files.excluded(target)
+                    and files.regular_file(target) is None
+                ):
+                    continue
                 if _credential_shaped(target):
                     imported.add(target)
                     result.surfaces_excluded.append(
@@ -1855,8 +1948,12 @@ class PromptScanner(Scanner):
                 *_line_separator_risks(stream.line_separators, relative),
             ]
         markup = declaration and path.suffix.lower() in _MARKUP_SUFFIXES
-        # A host reads a skill's front matter, such as its description, decoded.
-        decoded = _escaped_text(relative, text, result.surfaces_excluded) if markup else None
+        # A host reads a skill's front matter or structured JSON/YAML/TOML declarations decoded.
+        decoded = (
+            _escaped_text(relative, text, result.surfaces_excluded)
+            if markup or path.suffix.lower() in _ESCAPED_FORMATS
+            else None
+        )
         risks = detect_invisible_characters(text, relative, decoded=decoded)
         if markup:
             risks.extend(detect_hidden_markup(text, relative))
