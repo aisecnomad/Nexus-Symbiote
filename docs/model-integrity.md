@@ -102,58 +102,63 @@ A pickle whose STOP falls inside a protocol 4 or 5 FRAME with bytes left in the 
 is read on from both places a loader resumes: after the frame, as `io.BytesIO` and an
 unbuffered file give the bytes, and right after the STOP, as the C unpickler reading a
 buffered file, such as the one `torch.load` opens for a path, does. The worse reading
-counts, and such a file is rated `unknown` at least. Under a model suffix, the pickle
-family included, content is also recognized by its shape: a binary
-pickle with PROTO and 16 well-formed opcodes in its first 64 KiB, or a stream that
-passes `pickletools` checks to its first STOP, is `unsafe-code-execution`. A
-pickle-family name rates no content but a pickle, a compressed or archived stream
-and a file that starts with the GGUF magic: a pickle opcode stream that a
-bound cuts short before a recognized shape or a call is `unsafe-code-execution`
-under such a name, with the evidence `Potential code-executing loader format (...)`
-around the bounded verdict, as the loader unpickles whatever it holds; a readable
-file whose first 64 KiB start no pickle, NumPy array, ZIP archive, compressed or
-archived stream or GGUF magic is `unknown`,
-with the evidence `Named pickle-family format; no pickle evidence in the inspected
-prefix` (`empty file` for a zero-length one); and a file that cannot be read keeps
-the loader's `unsafe-code-execution` rating by name. Under a pickle-family name, a
-ZIP archive whose directory is malformed or over 1 MiB, or with a member that was
-not checked, and a NumPy array whose header is past the inspection limits are
-`unsafe-code-execution` with the evidence `Potential code-executing loader format
-(...)` around that verdict, as `torch.load` and `np.load` still read past the bound;
-so is a compressed or archived stream, named with a wrapper suffix (`.tar`, `.gz`,
-`.bz2`, `.xz`, `.lzma`, `.zst`, `.z`, `.lz4`, `.zip`) or starting with gzip, zlib, bzip2, xz, Zstandard,
-LZ4 frame or joblib `ZF` magic, an LZMA-alone header after joblib's `5d 00`, the
-ustar magic at offset 257, or a tar header that `tarfile` reads without that magic,
-which pandas, joblib and `torch.load` unwrap before they unpickle, with the evidence
-`Potential code-executing loader format (compressed or archived stream; decompressed
-content not inspected)`. An LZMA-alone header is read from the first 14 bytes:
-joblib's `5d 00`, which it detects whatever dictionary size follows, an uncompressed
-size that is unknown or below 2^63, and a zero byte after it, where the range coder
-starts. A tar header is a first 512-byte block whose checksum `tarfile` accepts and
-whose mode, owner, size, time and device numbers it parses, whatever its name and
-type. A raw array whose first bytes happen to form such a header is rated critical
-by it: a little-endian integer array whose first value is 93, such as a `labels.bin`
-of 32-bit integers 93 to 156, opens with an LZMA-alone header, and, rarely, a float32
-array, such as one upcast from bfloat16, opens with a tar header that `tarfile`
-reads. A file that starts with the GGUF magic, whatever follows,
-as with the wrapper magics, is `unsafe-code-execution` too under a pickle-family
-name, with the evidence `Potential code-executing loader format
-(GGUF content under a pickle-family name; its chat templates are not inspected under
-this name)`: llama.cpp opens a model by its magic, not its name, and the chat-template
-check below runs only under a `.gguf` name. Only a ZIP archive whose directory was
-read whole and lists no pickle-family member or object-dtype array keeps its
-`unknown` verdict.
-Any other content, such as a numeric NumPy array or a ZIP archive with
-neither a pickle-family member nor an object-dtype array as a member, is not a
-component. Each such file is opened once, after every file that the models with a
-name bind and their directories configure has been read, and only if it is not one
-of those files. Reading stops as soon as its content is known not to be a payload:
-after the first 8 bytes when they can start no pickle, NumPy array or ZIP archive,
-after at most 64 KiB when they can start a pickle, and after the header of a NumPy
-array; a ZIP archive is read to its end, as a model archive is. A component is
-digested from the same read, so each byte is charged once to the `model-total-bytes`
-limit. A file larger than the `model-bytes` limit is a collection failure, as a
-model file is.
+counts, and such a file is rated `unknown` at least.
+
+Under a model suffix (the pickle family included), content is also recognized by its
+shape: a binary pickle with PROTO and 16 well-formed opcodes in its first 64 KiB, or
+a stream that passes `pickletools` checks to its first STOP, is
+`unsafe-code-execution`.
+
+A pickle-family name rates no content but a pickle, a compressed or archived stream
+and a file that starts with the GGUF magic. A pickle opcode stream that a bound cuts
+short before a recognized shape or a call is `unsafe-code-execution` under such a
+name, with the evidence `Potential code-executing loader format (...)` around the
+bounded verdict, as the loader unpickles whatever it holds. A readable file whose
+first 64 KiB start no pickle, NumPy array, ZIP archive, compressed or archived stream
+or GGUF magic is `unknown`, with the evidence `Named pickle-family format; no pickle
+evidence in the inspected prefix` (`empty file` for a zero-length one). A file that
+cannot be read keeps the loader's `unsafe-code-execution` rating by name.
+
+Under a pickle-family name, a ZIP archive whose directory is malformed or over 1 MiB,
+or with a member that was not checked, and a NumPy array whose header is past the
+inspection limits are `unsafe-code-execution` with the evidence `Potential
+code-executing loader format (...)` around that verdict, as `torch.load` and `np.load`
+still read past the bound. So is a compressed or archived stream, named with a wrapper
+suffix (`.tar`, `.gz`, `.bz2`, `.xz`, `.lzma`, `.zst`, `.z`, `.lz4`, `.zip`) or
+starting with gzip, zlib, bzip2, xz, Zstandard, LZ4 frame or joblib `ZF` magic, an
+LZMA-alone header after joblib's `5d 00`, the ustar magic at offset 257, or a tar
+header that `tarfile` reads without that magic, which pandas, joblib and `torch.load`
+unwrap before they unpickle, with the evidence `Potential code-executing loader format
+(compressed or archived stream; decompressed content not inspected)`.
+
+An LZMA-alone header is read from the first 14 bytes: joblib's `5d 00`, which it
+detects whatever dictionary size follows, an uncompressed size that is unknown or
+below 2^63, and a zero byte after it, where the range coder starts. A tar header is a
+first 512-byte block whose checksum `tarfile` accepts and whose mode, owner, size,
+time and device numbers it parses, whatever its name and type. A raw array whose first
+bytes happen to form such a header is rated critical by it: a little-endian integer
+array whose first value is 93, such as a `labels.bin` of 32-bit integers 93 to 156,
+opens with an LZMA-alone header, and, rarely, a float32 array, such as one upcast from
+bfloat16, opens with a tar header that `tarfile` reads.
+
+A file that starts with the GGUF magic, whatever follows, is `unsafe-code-execution`
+too under a pickle-family name, with the evidence `Potential code-executing loader
+format (GGUF content under a pickle-family name; its chat templates are not inspected
+under this name)`: llama.cpp opens a model by its magic, not its name, and the
+chat-template check below runs only under a `.gguf` name. Only a ZIP archive whose
+directory was read whole and lists no pickle-family member or object-dtype array keeps
+its `unknown` verdict.
+Any other content, such as a numeric NumPy array or a ZIP archive with neither a
+pickle-family member nor an object-dtype array, is not a component. Each such file is
+opened once, after every model-bound and directory-configured file has been read, and
+only if it is not one of those files.
+
+Reading stops as soon as its content is known not to be a payload: after the first 8
+bytes when they can start no pickle, NumPy array or ZIP archive, after at most 64 KiB
+when they can start a pickle, and after the header of a NumPy array; a ZIP archive is
+read to its end. A component is digested from the same read, so each byte is charged
+once to the `model-total-bytes` limit. A file larger than the `model-bytes` limit is a
+collection failure, as a model file is.
 
 Each model file is one component. Its `bom_ref` is `model:` followed by the
 file's path relative to the scanned root, and its `name` and `source_path` are
