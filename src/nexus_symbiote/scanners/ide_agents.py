@@ -888,6 +888,9 @@ _SEVERITY_RANK = {severity: index for index, severity in enumerate(RiskSeverity)
 _GROUP_KEYWORDS = {"if": "fi", "while": "done", "until": "done", "for": "done"}
 _GROUP_KEYWORDS |= {"select": "done", "case": "esac"}
 _GROUP_ENDS = frozenset(_GROUP_KEYWORDS.values())
+# A pipe can feed a group only where one opens: without a `{`, `(` or opening keyword
+# the group view equals the plain one, so it is not built.
+_GROUP_OPENER = re.compile(r"[{(]|\b(?:if|while|until|for|select|case)\b")
 # Reserved words that open a compound command's next part; the command after one is
 # the next word, as after `{`, `(` and `!`.
 _RESERVED_PREFIXES = frozenset({"if", "while", "until", "then", "do", "else", "elif"})
@@ -997,7 +1000,7 @@ def _split_pipelines(
                 pop()
             elif char == "(" and nxt != "(" and at_command_start():
                 push(")", bool(segments) or piped())
-            elif at_command_start() and (index == 0 or command[index - 1] in " \t\r\n;&|({"):
+            elif (index == 0 or command[index - 1] in " \t\r\n;&|({") and at_command_start():
                 word = word_at(index)
                 if word == "{" or word in _GROUP_KEYWORDS:
                     closer = "}" if word == "{" else _GROUP_KEYWORDS[word]
@@ -1315,14 +1318,15 @@ def _decode_word(word: str, *, drop_ifs: bool) -> str:
                 out.append(char)
             index += 1
             continue
-        if not quote and word.startswith("$'", index):
+        # Testing the character first keeps the per-character cost of every word low.
+        if not quote and char == "$" and word.startswith("$'", index):
             end = index + 2
             while end < len(word) and word[end] != "'":
                 end += 2 if word[end] == "\\" else 1
             out.append(_ansi_c(word[index + 2 : end]))
             index = end + 1
             continue
-        if not quote and word.startswith('$"', index):
+        if not quote and char == "$" and word.startswith('$"', index):
             index += 1
             continue
         if char == "'" and not quote:
@@ -2854,7 +2858,9 @@ def _fetch_exec(command: str) -> bool:
         if extra:
             pipe_views = [*pipelines, *extra]
     # A group a pipe feeds passes it on to every command inside it.
-    for segments in [*pipe_views, *_command_pipelines(command, piped_groups=True)]:
+    if "|" in command and _GROUP_OPENER.search(command):
+        pipe_views = [*pipe_views, *_command_pipelines(command, piped_groups=True)]
+    for segments in pipe_views:
         # One forward pass: a fetch and an executor later in the same pipeline.
         fetched = False
         for segment in segments:
