@@ -1096,6 +1096,12 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
             # The same floor whatever the name: MODE=Bearer <operand> names no credential
             # but may still carry one.
             values.extend(_withheld_operand(*assigned, following, in_set=in_set))
+        spaced = _spaced_scheme_pair(words[index - 1], word) if index > 0 else None
+        if spaced is not None and following is not None:
+            values.extend(
+                literal for _, literal in _scheme_pair_hits(*spaced, following, in_set=False)
+            )
+            values.extend(_withheld_operand(*spaced, following, in_set=False))
         if index > 0:
             flag = words[index - 1]
             if (
@@ -1553,7 +1559,33 @@ def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = Fa
         return []
     name, value, variable = assigned
     hits = value_hits(name, value)
-    if following is None or value.lower() not in _ASSIGNMENT_SCHEMES:
+    if following is not None:
+        hits.extend(_scheme_pair_hits(name, value, variable, following, in_set=in_set))
+    return hits
+
+
+def _spaced_scheme_pair(flag: str | None, word: str) -> tuple[str, str, bool] | None:
+    """``--auth bearer <operand>`` as the ``--auth=bearer <operand>`` it spells.
+
+    A flag and its scheme in separate words are the same mode selector or binding as
+    the ``=`` form, so the operand after them gets the same reading.
+    """
+    if (
+        flag is None
+        or "=" in flag
+        or _CLI_FLAG.fullmatch(flag) is None
+        or word.lower() not in _ASSIGNMENT_SCHEMES
+    ):
+        return None
+    return _assigned(f"{flag}={word}")
+
+
+def _scheme_pair_hits(
+    name: str, value: str, variable: bool, following: str, *, in_set: bool
+) -> list[Hit]:
+    """The hits of the operand after ``NAME=<scheme>``, read by how the name uses it."""
+    hits: list[Hit] = []
+    if value.lower() not in _ASSIGNMENT_SCHEMES:
         return hits
     kind = _classify_scheme_assignment(name, value, variable=variable, in_set=in_set)
     if kind == "public_selector":
@@ -1630,6 +1662,9 @@ def _word_hits(
         hits.extend(_header_line_hits(word, explicit=_explicit_header(previous, word)))
     if "=" in word:
         hits.extend(_assignment_word_hits(word, following, in_set=in_set))
+    spaced = _spaced_scheme_pair(previous, word) if following is not None else None
+    if spaced is not None and following is not None:
+        hits.extend(_scheme_pair_hits(*spaced, following, in_set=False))
     if (":" in word or "=" in word) and _PLAIN_ASSIGNMENT.fullmatch(word) is None:
         hits.extend(assignment_hits(word))
     hits.extend(_user_hits(previous, word, fetcher))
