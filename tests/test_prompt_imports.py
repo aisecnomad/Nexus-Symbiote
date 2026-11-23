@@ -770,6 +770,13 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         lambda scale: ("\\" * 50 + "@a ") * 2_000 * scale,
         lambda scale: "- x\n" + "> `y` @z\n" * 20_000 * scale,
         lambda scale: "- x\n> y\n" + "   ```\n" * 20_000 * scale,
+        lambda scale: "x\n <div>\n`y`@z\n" * 10_000 * scale,
+        lambda scale: "<a" + " b=c" * 50_000 * scale + "\t>\n",
+        lambda scale: "> <p>\n x `y`@z\n" * 10_000 * scale,
+        lambda scale: " @a" + "_b" * 40_000 * scale,
+        lambda scale: (" @x" + "_" * 40 + "y") * 1_000 * scale,
+        lambda scale: " @" + "*" * 4_000 * scale,
+        lambda scale: '(@a) x=@b "@c" x*@d ' * 10_000 * scale,
     ],
     ids=[
         "blank lines under nested items",
@@ -781,12 +788,96 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         "escapes before a reference",
         "lines marked keeps in an item",
         "fences marked keeps in an item",
+        "HTML starts marked reads as text",
+        "attributes marked does not take",
+        "lazy lines after quoted HTML",
+        "underscores inside a word",
+        "runs of underscores",
+        "a run of markup past the name budget",
+        "references where marked starts no text token",
     ],
 )
 def test_reading_markdown_grows_with_the_text_not_with_its_nesting(shape):
     texts = {scale: shape(scale) for scale in (1, 4)}
     growth = len(texts[4]) / len(texts[1])
     assert scaling_ratio(lambda scale: prompt._import_tokens(texts[scale])) < 2.5 * growth
+
+
+def test_an_at_sign_inside_a_url_path_raises_no_gap(tmp_path):
+    # Claude Code 2.1.42 and 2.1.330 import nothing here: marked starts no text token at
+    # an `@` after `/`.
+    _write(tmp_path, "CLAUDE.md", "See the docs (https://unpkg.com/@../../x.md).\n")
+    result = PromptScanner().scan(tmp_path)
+    assert not result.scan_failures and not result.surfaces_excluded
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "**@../x.md**\n",
+        "**@~/x.md**\n",
+        "_@../x.md_\n",
+        # Claude Code 2.1.42 and 2.1.330 read `../o.md.` here, after a code span in what
+        # marked reads as a paragraph and CommonMark as an HTML block in a quote.
+        "><div\n    ` `@../o.md.\n",
+    ],
+)
+def test_a_name_after_markup_that_leaves_the_root_raises_its_gap(tmp_path, text):
+    # Claude Code imports `../x.md` and `~/x.md` from these, from outside the root.
+    _write(tmp_path, "CLAUDE.md", text)
+    result = PromptScanner().scan(tmp_path)
+    assert result.surfaces_excluded == [
+        "CLAUDE.md: imports a file outside the project root, which is not inventoried"
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Use a*@../../x.md for it.\n", "Use a*@" + "x" * 300 + ".md for it.\n"],
+    ids=["after an asterisk", "long name after an asterisk"],
+)
+def test_a_name_marked_may_start_after_markup_fails_closed(tmp_path, text):
+    # Claude Code imports nothing here, but an `@` after `*` can open a text token, so
+    # the name is a gap rather than a silent miss.
+    _write(tmp_path, "CLAUDE.md", text)
+    result = PromptScanner().scan(tmp_path)
+    assert result.surfaces_excluded
+
+
+def test_a_name_both_readings_give_still_raises_its_gap(tmp_path):
+    _write(tmp_path, "CLAUDE.md", "Follow @../x.md.\n")
+    result = PromptScanner().scan(tmp_path)
+    assert result.surfaces_excluded == [
+        "CLAUDE.md: imports a file outside the project root, which is not inventoried"
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["See (@x.md).", 'Say "@x.md".', "x=@x.md", "https://unpkg.com/@x.md", "{@x.md}", "x\\@x.md"],
+)
+def test_no_name_is_read_where_marked_starts_no_text_token(text):
+    assert prompt._import_tokens(text) == []
+
+
+def test_a_name_is_not_cut_at_underscores_inside_a_word():
+    name = "a_" * 1_000 + "b.md"
+    assert name in prompt._import_tokens(f"**@{name}**\n")
+
+
+def test_names_past_the_per_file_budget_are_a_failure_not_dropped(tmp_path):
+    # 2,048 places a token may end in one name: its prefixes hold about 4 Mi characters.
+    _write(tmp_path, "CLAUDE.md", " @a" + "*b" * 2_048 + "\n")
+    result = PromptScanner().scan(tmp_path)
+    assert "CLAUDE.md: too many @path imports to inventory" in result.scan_failures
+
+
+def test_many_short_names_trip_the_name_budget_before_the_character_budget():
+    # 1,001 starts of 41 short names each: about 41,000 names but under 2 Mi characters.
+    text = "".join(f"@x{i}" + "*y" * 40 + "\n" for i in range(1_001))
+    own, host, too_many = prompt._import_readings(text)
+    assert too_many
+    assert sum(map(len, host)) < prompt._MAX_HOST_NAME_CHARACTERS
 
 
 @pytest.mark.parametrize(
@@ -1096,3 +1187,182 @@ def test_a_fence_in_front_matter_does_not_hide_imports(tmp_path, note):
     result = PromptScanner().scan(tmp_path)
     assert result.surfaces_excluded == [f"CLAUDE.md: {OUTSIDE}"]
     assert "prompt:import:x.md" in {c.bom_ref for c in result.components}
+
+
+# #410: in the Unicode dialect a white space character beyond ASCII both separates
+# attributes and continues an unquoted value, so the open-tag pattern backtracks
+# quadratically over a line that holds one. A value alternating a letter and a no-break
+# space took about 0.2 s per 4,000-character line.
+_SPACED_TAG = "<a b=" + "c\xa0" * 2_040
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        # The line length grows at a fixed line count.
+        lambda scale: "\n\n".join(["<a b=" + "c\xa0" * (500 * scale)] * 8) + "\n",
+        # The line count grows at a fixed length under the per-line bound.
+        lambda scale: "\n\n".join(["<a b=" + "c\xa0" * 120] * (100 * scale)) + "\n",
+        # Spaced lines among ordinary ones.
+        lambda scale: ("text\n\n" + "<a b=" + "c\xa0" * 120 + "\n\n") * (100 * scale),
+    ],
+    ids=["line length", "line count", "interleaved"],
+)
+def test_a_tag_with_non_ascii_spaces_stays_linear(make):
+    texts = {scale: make(scale) for scale in (1, 4)}
+    assert scaling_ratio(lambda scale: prompt._import_readings(texts[scale])) < 10
+
+
+def test_a_mebibyte_of_spaced_tag_lines_reads_quickly():
+    text = "\n\n".join([_SPACED_TAG] * 256) + "\n"
+    started = time.process_time()
+    prompt._import_readings(text)
+    # About 60 s before #410; the bound leaves room for a slow, traced runner.
+    assert time.process_time() - started < 15
+
+
+def test_an_import_after_a_long_spaced_tag_is_still_read():
+    text = _SPACED_TAG + "\n\nFollow @notes.md\n"
+    assert "notes.md" in prompt._import_tokens(text)
+
+
+def test_the_non_ascii_space_class_is_the_dialects_white_space_beyond_ascii():
+    from nexus_symbiote.utils import markdown
+
+    dialect = re.compile(markdown._WHITESPACE)
+    beyond = {chr(code) for code in range(0x80, 0x110000) if dialect.fullmatch(chr(code))}
+    found = {
+        chr(code)
+        for code in range(0x80, 0x110000)
+        if markdown._NON_ASCII_SPACE.fullmatch(chr(code))
+    }
+    assert found == beyond
+    all_ws = {chr(code) for code in range(0x110000) if dialect.fullmatch(chr(code))}
+    assert all_ws == markdown._WHITESPACE_CHARS
+
+
+def test_exponential_spaced_attribute_backtracking_stays_linear():
+    # A 104-char `<a b=\xa0\xa0\xa0...` line was O(3^k) exponential in the old regex.
+    for scale in (1, 4):
+        line = "<a " + "b=\xa0\xa0\xa0" * (200 * scale) + "!"
+        started = time.process_time()
+        prompt._import_readings(line + "\n\nFollow @notes.md\n")
+        assert time.process_time() - started < 5
+    texts = {scale: "<a " + "b=\xa0\xa0\xa0" * (200 * scale) + "!\n" for scale in (1, 4)}
+    assert scaling_ratio(lambda scale: prompt._import_readings(texts[scale])) < 10
+
+
+# Attribute lists whose spaces the old pattern could assign to more than one part of the
+# grammar. Each is read in a child process, so a regression fails at the timeout instead
+# of hanging the suite.
+_SPACED_ATTRIBUTE_LINES = [
+    "<a " + "b=\xa0\xa0\xa0" * 600 + "!",
+    "<a" + "\xa0b\xa0=\xa0c\xa0" * 600 + "!",
+    "<a" + "\xa0b=\xa0c\xa0c" * 600 + "!",
+    "<a" + "\xa0b=c\xa0c\xa0c\xa0c" * 600 + "!",
+]
+_READ_SPACED_LINES = """
+import time
+from nexus_symbiote.scanners import prompt
+from tests.test_prompt_imports import _SPACED_ATTRIBUTE_LINES
+for line in _SPACED_ATTRIBUTE_LINES:
+    started = time.process_time()
+    assert "notes.md" in prompt._import_tokens(line + "\\n\\nFollow @notes.md\\n")
+    print(round(time.process_time() - started, 3))
+"""
+
+
+def test_spaced_attribute_lists_read_in_bounded_time():
+    root = Path(__file__).resolve().parents[1]
+    measured = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", _READ_SPACED_LINES],
+        cwd=root,
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=60,
+    ).stdout.split()
+    # Each line takes milliseconds; the old pattern needed seconds at 70 characters
+    # and did not finish at about 100.
+    assert len(measured) == len(_SPACED_ATTRIBUTE_LINES)
+    assert all(float(seconds) < 5 for seconds in measured)
+
+
+def test_unicode_kind7_nfa_matches_the_commonmark_grammar_exactly():
+    import random
+
+    from nexus_symbiote.utils import markdown
+
+    ws = markdown._WHITESPACE
+    open_tag = (
+        rf"<[A-Za-z][A-Za-z0-9-]*(?:{ws}+[a-zA-Z_:][a-zA-Z0-9:._-]*"
+        rf"(?:{ws}*={ws}*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?)*"
+        rf"{ws}*/?>"
+    )
+    close_tag = rf"</[A-Za-z][A-Za-z0-9-]*{ws}*>"
+    spec = re.compile(rf"(?:{open_tag}|{close_tag}){ws}*$")
+    matcher = markdown._HTML_BLOCK_STARTS[6]
+
+    fixed = [
+        ("<a>", True),
+        ("<a/>", True),
+        ("<a\xa0/>", True),
+        ("<a\xa0b=c\xa0d=e>", True),
+        ("<a b=c\xa0d=e/>", True),
+        ("<a\xa0b='x\xa0y'\xa0c=\"z\">", True),
+        ("<a b=c/d>", True),
+        ("<a b=c/>", True),
+        ("</a\xa0>\xa0", True),
+        ("<a b=c\xa0!>", True),
+        ("<a\xa0b=\xa0\xa0>", True),
+        ("<a\xa0b=\xa0\xa0!>", True),
+        ("<a b='x'c>", False),
+        ('<a b="x"c>', False),
+        ("<a b  =c>", True),
+        ("<a b=  c>", True),
+        ("<a b =c>", True),
+        ("<a b c>", True),
+        ("<a b.c>", True),
+        ("<a b=c`d>", False),
+        ("<a 0b>", False),
+        ("<1a>", False),
+        ("<>", False),
+        ("plain text", False),
+    ]
+    for sample, expected in fixed:
+        assert (spec.match(sample, 0) is not None) is expected, sample
+        assert bool(matcher.match(sample, 0)) is expected, sample
+        assert markdown._match_unicode_kind7(sample, 0) is expected, sample
+
+    rng = random.Random(410)  # noqa: S311
+    prefixes = ("", "<", "</", "<a", "</a")
+    alphabet = [
+        "a",
+        "0",
+        "1",
+        "_",
+        ":",
+        ".",
+        "-",
+        " ",
+        "\t",
+        "\n",
+        "\xa0",
+        "\u2000",
+        "\u3000",
+        "\ufeff",
+        "=",
+        "'",
+        '"',
+        "`",
+        "/",
+        ">",
+        "!",
+    ]
+    for _ in range(50_000):
+        lead = "x" * rng.randint(0, 3)
+        pos = len(lead)
+        sample = lead + rng.choice(prefixes) + "".join(rng.choices(alphabet, k=rng.randint(0, 12)))
+        expected = spec.match(sample, pos) is not None
+        assert bool(matcher.match(sample, pos)) is expected, (sample, pos)
+        assert markdown._match_unicode_kind7(sample, pos) is expected, (sample, pos)

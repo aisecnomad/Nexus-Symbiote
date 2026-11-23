@@ -324,6 +324,7 @@ class _WalkScope:
         unlisted: _Unlisted,
         skipped: list[Path] | None = None,
         observed_excludes: list[Path] | None = None,
+        symlinks: list[Path] | None = None,
     ) -> None:
         self.top = top
         self.walked = {top}
@@ -331,6 +332,7 @@ class _WalkScope:
         self.unlisted = unlisted
         self.skipped = skipped
         self.observed_excludes = observed_excludes
+        self.symlinks = symlinks
 
     def covers(self, target: Path) -> bool:
         """Whether the walk reaches ``target`` already, under its own name."""
@@ -766,7 +768,12 @@ class ConfinedCollection:
             raise CollectionError("parent traversal is not allowed")
         return candidate
 
-    def excluded(self, path: str | Path) -> bool:
+    def excluded(self, path: str | Path, *, record: bool = True) -> bool:
+        """Whether collection policy leaves ``path`` out.
+
+        A path an operator excluded is logged as a gap unless ``record`` is false, for a
+        caller that only asks: the path it asks about may hold a configured value.
+        """
         relative = self._relative(path)
         parts = relative.parts
         # Dependency caches, virtual environments and Git internals are outside
@@ -786,7 +793,7 @@ class ConfinedCollection:
             denied = any(
                 folded[:index] in self._folded_excluded for index in range(len(folded) + 1)
             )
-        if denied:
+        if denied and record:
             self._policy_exclusions_recorded += 1
             self._exclusion_log.add(f"{relative}: excluded by collection policy")
         return denied
@@ -1281,10 +1288,13 @@ class ConfinedCollection:
         directory_links: list[Path] | None = None,
         skipped: list[Path] | None = None,
         observed_excludes: list[Path] | None = None,
+        symlinks: list[Path] | None = None,
     ) -> Iterator[Path]:
         """Yield root-relative file paths, never through more than one symlink.
 
         ``observed_excludes`` collects excluded paths without changing who reports them.
+        ``symlinks`` collects every symlink entry encountered during the walk (files and
+        directories), even when refused or met beneath a followed directory link.
 
         A ``directory`` reached through one in-root symlink is walked under its
         target's name. Inside a walk that did not start through a symlink, a symlink
@@ -1335,7 +1345,9 @@ class ConfinedCollection:
         # count before and after a walk sees every walk that met a failure. Once the
         # entry budget is spent, a later walk lists nothing and records nothing: the
         # one failure that spent it names where collection stopped.
-        scope = _WalkScope(walked, directory_links, _Unlisted(), skipped, observed_excludes)
+        scope = _WalkScope(
+            walked, directory_links, _Unlisted(), skipped, observed_excludes, symlinks
+        )
         try:
             if relative.parts:
                 self._report_case_variants(relative, ())
@@ -1431,6 +1443,8 @@ class ConfinedCollection:
                 self._record(child, "cross-filesystem mount excluded", scope.unlisted)
                 continue
             if stat.S_ISLNK(metadata.st_mode):
+                if scope.symlinks is not None:
+                    scope.symlinks.append(child)
                 if followed:
                     self._record(child, "symlink reached through another symlink", scope.unlisted)
                     continue
@@ -1545,6 +1559,54 @@ class ConfinedCollection:
         finally:
             os.close(fd)
 
+    def entry_exists(self, path: str | Path) -> bool:
+        """Whether something may be at ``path``, without following a link at it or above it.
+
+        Only a definite "no such entry" reads as absent: a missing component, or a
+        component that is a plain file where a directory was needed. A link on the way,
+        a refusal or any other error reads as present, so a caller that reports an
+        unread file errs toward the report.
+        """
+        try:
+            relative = self._relative(path)
+        except CollectionError:
+            return True
+        # Without a root descriptor nothing was walked either, so nothing is unread.
+        if self._root_fd is None or not relative.parts:
+            return False
+        fd = os.dup(self._root_fd)
+        try:
+            for part in relative.parts[:-1]:
+                try:
+                    child = self._open_dir_part(fd, part)
+                except FileNotFoundError:
+                    return False
+                except NotADirectoryError:
+                    # O_NOFOLLOW|O_DIRECTORY fails the same way on a link and a file.
+                    return self._names_link(fd, part)
+                except (OSError, CollectionError):
+                    return True
+                os.close(fd)
+                fd = child
+            try:
+                self._stat_exact_no_follow(fd, relative.name)
+            except FileNotFoundError:
+                return False
+            except OSError:
+                return True
+            return True
+        finally:
+            os.close(fd)
+
+    def _names_link(self, directory_fd: int, name: str) -> bool:
+        try:
+            info = self._stat_exact_no_follow(directory_fd, name)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return not stat.S_ISREG(info.st_mode)
+
     def is_directory(self, path: str | Path) -> bool:
         """Whether ``path`` is a directory, reached through at most one in-root symlink.
 
@@ -1561,6 +1623,40 @@ class ConfinedCollection:
             return False
         os.close(fd)
         return True
+
+    def entry_link(self, path: str | Path) -> Path | None:
+        """The root-relative target of the symlink at ``path``, even when ``path`` is excluded.
+
+        Only the entry is inspected, without following it, from a parent reached without
+        symlinks; the empty path names the root itself. Returns ``None`` when the entry is
+        absent or not a symlink, and raises ``CollectionError`` with the reason when a
+        link cannot be placed beneath the root.
+        """
+        relative = self._relative(path)
+        if self._root_fd is None or not relative.parts:
+            return None
+        try:
+            parent = self._open_parent(relative)
+        except FileNotFoundError:
+            return None
+        except NotADirectoryError as exc:
+            raise CollectionError("entry's parent is not a directory") from exc
+        except OSError as exc:
+            raise CollectionError("entry's directory is or passes through a symlink") from exc
+        try:
+            info = self._stat_exact_no_follow(parent, relative.name)
+            if not stat.S_ISLNK(info.st_mode):
+                return None
+            text = os.readlink(relative.name, dir_fd=parent)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise CollectionError("symlink could not be read") from exc
+        finally:
+            os.close(parent)
+        target = _lexical_target(relative.parent, text)
+        self._check_target_depth(target)
+        return target
 
     def _open_no_follow(self, relative: Path) -> int:
         parent = self._open_parent(relative)
