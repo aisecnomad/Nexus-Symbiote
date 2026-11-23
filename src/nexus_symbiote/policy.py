@@ -362,6 +362,97 @@ def _integer_or_text(loader: Any, node: Any) -> Any:
     return text if ":" in text else loader.construct_yaml_int(node)
 
 
+MAX_YAML_FLOW_DEPTH = 64
+YAML_FLOW_GUARD_TOKENS = 20_000
+_bounded_loaders: dict[Any, Any] = {}
+
+
+def flow_depth_error() -> Any:
+    """The ``yaml.YAMLError`` subclass a bounded loader raises outside its flow bounds.
+
+    That is a flow start past ``max_depth`` or a flow end at level zero; the message says
+    which.
+    """
+    import yaml
+
+    error = _bounded_loaders.get("error")
+    if error is None:
+
+        class FlowDepthError(yaml.scanner.ScannerError):
+            pass
+
+        error = _bounded_loaders["error"] = FlowDepthError
+    return error
+
+
+def bounded_flow_loader(base: Any = None, *, max_depth: int = MAX_YAML_FLOW_DEPTH) -> Any:
+    """A ``yaml.SafeLoader`` (or ``base``) subclass whose scanner keeps flow nesting bounded.
+
+    PyYAML's scanner keeps one possible simple key per open flow level and sweeps them on
+    every token, so its time grows with nesting depth, and its ``fetch_flow_collection_end``
+    lowers the level with no floor, so a run of ``]`` before a run of ``[`` walks the level
+    negative and past any ceiling. The ceiling raises ``flow_depth_error()`` inside the
+    scanner, in PyYAML's own grammar, and so does a flow end at level zero: the parser refuses
+    such a token in every context, so the document fails as it always did, only before the
+    level can go negative. A caller's single ``scan`` or ``load`` with this
+    loader is then the whole cost; nothing is scanned twice.
+    """
+    import yaml
+
+    base_cls = yaml.SafeLoader if base is None else base
+    key = (base_cls, max_depth)
+    loader = _bounded_loaders.get(key)
+    if loader is not None:
+        return loader
+    depth_error = flow_depth_error()
+
+    class BoundedFlowLoader(base_cls):  # type: ignore[misc,valid-type]
+        flow_level: int
+
+        def fetch_flow_collection_start(self, token_class: Any) -> None:
+            if self.flow_level >= max_depth:
+                raise depth_error(
+                    None, None, f"flow nesting exceeds depth limit ({max_depth})", self.get_mark()
+                )
+            super().fetch_flow_collection_start(token_class)
+
+        def fetch_flow_collection_end(self, token_class: Any) -> None:
+            if self.flow_level <= 0:
+                raise depth_error(
+                    None, None, "flow collection closed without being opened", self.get_mark()
+                )
+            super().fetch_flow_collection_end(token_class)
+
+    _bounded_loaders[key] = BoundedFlowLoader
+    return BoundedFlowLoader
+
+
+def check_yaml_flow_depth(
+    text: str, *, max_depth: int = MAX_YAML_FLOW_DEPTH, max_tokens: int = YAML_FLOW_GUARD_TOKENS
+) -> None:
+    """Raise ``PolicyError`` when ``text`` nests flow collections past ``max_depth``.
+
+    A bounded pre-scan for callers that cannot pass ``bounded_flow_loader`` to their own
+    parser. It reads at most ``max_tokens`` tokens and refuses a longer document, which it
+    has not checked. A document that is not YAML is left to the caller's parser. Callers in
+    this package scan or load with the bounded loader directly, which costs nothing extra.
+    """
+    if text.count("[") + text.count("{") + text.count("]") + text.count("}") <= max_depth:
+        return
+    import yaml
+
+    try:
+        for index, _ in enumerate(yaml.scan(text, Loader=bounded_flow_loader(max_depth=max_depth))):
+            if index >= max_tokens:
+                raise PolicyError(f"YAML exceeds the flow-depth check's {max_tokens} tokens")
+    except flow_depth_error() as exc:
+        if exc.problem == "flow collection closed without being opened":
+            raise PolicyError("YAML flow collection closed without being opened") from exc
+        raise PolicyError(f"YAML flow nesting exceeds depth limit ({max_depth})") from exc
+    except yaml.YAMLError:
+        return
+
+
 def _contains_lone_surrogate(value: str) -> bool:
     return any("\ud800" <= char <= "\udfff" for char in value)
 
@@ -380,7 +471,7 @@ def parse_yaml_mapping(text: str, *, max_nodes: int | None = None) -> dict[str, 
     except ImportError as exc:
         raise PolicyError("PyYAML is required; install the declared dependencies") from exc
 
-    class UniqueLoader(yaml.SafeLoader):
+    class UniqueLoader(bounded_flow_loader()):  # type: ignore[misc]
         def __init__(self, stream: Any) -> None:
             super().__init__(stream)
             self._nodes = 0

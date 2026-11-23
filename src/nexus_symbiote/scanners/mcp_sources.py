@@ -59,7 +59,12 @@ from nexus_symbiote.scanners.ts_tools import (
     is_server_source,
     source_text,
 )
-from nexus_symbiote.utils.confined import CollectionError, ConfinedCollection, recorded_count
+from nexus_symbiote.utils.confined import (
+    CollectionError,
+    ConfinedCollection,
+    fold_name,
+    recorded_count,
+)
 
 _SDK_IMPORT = re.compile(
     r"(?:\bfrom\s*[\"']@modelcontextprotocol/sdk(?:/[^\"']*)?[\"']|"
@@ -1143,8 +1148,10 @@ def _python_launches(tree: ast.Module, project_imports: _ProjectImports) -> list
                         if not star:
                             unused.add(alias.asname or name)
     loaders = _loader_aliases(nodes, loaders, bound_names)
+    # A local logging module in any first search root shadows the standard one:
+    # has_module() asks for one in every root, which is what a local exemption needs.
     stdlib_clear = project_imports is None or (
-        project_imports.stdlib_search_clear and not project_imports.has_module("logging")
+        project_imports.stdlib_search_clear and not project_imports.shadows("logging")
     )
     logging_module, loggers = _honest_loggers(nodes, loggers, stdlib_clear=stdlib_clear)
     annotations = _annotation_names(nodes, project_imports=project_imports)
@@ -1319,7 +1326,7 @@ def collect_source_references(
     # A package link, alternate loader, or excluded local bytecode cache makes
     # the selected source uncertain. Never open a binary or enter a skipped cache.
     uncertain: set[Path] = set()
-    cache_parents = {p.parent for p in unvisited if p.name.casefold() == "__pycache__"}
+    cache_parents = {p.parent for p in unvisited if fold_name(p.name) == "__pycache__"}
     for path in unvisited:
         uncertain.update(p for p in (path, *path.parents) if p.name in SDK_IMPORT_ROOTS)
     for path in sources:
@@ -1342,6 +1349,11 @@ def collect_source_references(
             stdlib_roots.add(path.parent)
         if not sys.stdlib_module_names.isdisjoint(path.parts[:-1]):
             stdlib_roots.update(p.parent for p in path.parents if p.name in sys.stdlib_module_names)
+    # The walk skips an excluded entry in any spelling a case-insensitive file system
+    # folds to its name, which is then the name a standard import resolves to.
+    for path in unvisited:
+        if fold_name(path.name).partition(".")[0] in sys.stdlib_module_names:
+            stdlib_roots.add(path.parent)
     eligible = [path for path in sources if any(kind.eligible(path) for kind in kinds)]
     # Root files first, as before, so what a lowered budget reads stays predictable.
     eligible.sort(key=lambda path: len(path.parts) > 1)

@@ -77,6 +77,11 @@ def _resolve_analysis(
     advisory_complete: bool = True,
 ) -> dict[str, Any]:
     analysis: dict[str, Any] = {"state": "in_triage", "detail": default_detail}
+    outcome = (
+        execution_evidence.outcome_for(component_ref) if execution_evidence is not None else None
+    )
+    if outcome is not None:
+        props["nexus-symbiote:executionOutcome"] = outcome
     decision = decisions.lookup(vuln_id, component_ref) if decisions is not None else None
     if decision is not None:
         owner = plain_text(decision.owner)
@@ -117,9 +122,6 @@ def _resolve_analysis(
             if decision.expires_at is not None:
                 props["nexus-symbiote:vexDecisionExpiresAt"] = decision.expires_at.isoformat()
     elif execution_evidence is not None:
-        outcome = execution_evidence.outcome_for(component_ref)
-        if outcome is not None:
-            props["nexus-symbiote:executionOutcome"] = outcome
         if outcome == "declared-never-loaded":
             analysis["detail"] = (
                 "Execution-bound (reported): component was declared but never loaded in "
@@ -317,7 +319,9 @@ class VEXGenerator(Generator):
             analysis = _resolve_analysis(
                 vuln_id=adv_id,
                 component_ref=comp_ref,
-                default_detail=f"Advisory match for {adv_comp.name}; deployment impact unverified.",
+                default_detail=(
+                    f"Advisory match for {plain_text(adv_comp.name)}; deployment impact unverified."
+                ),
                 timestamp=timestamp,
                 decisions=self._decisions,
                 execution_evidence=self._execution_evidence,
