@@ -66,14 +66,17 @@ def _check_launch_policy(policy: Path, project: Path, inventory: Path) -> os.sta
     """Refuse a launch policy that the change under review could have written.
 
     The policy must lie outside the project, outside every repository that encloses
-    the project or the inventory, be a single-link regular file owned by the caller or
+    the project, the inventory or the current directory, be a single-link regular file owned by the caller or
     root that only its owner can write, in directories owned by you or root that others
     cannot write unless they are sticky, up to the file system root. This catches
     misplacement; it does not authenticate the policy.
     """
     resolved = policy.resolve()
     untrusted = [project.resolve()]
-    for start in (project.resolve(), inventory.resolve().parent):
+    # The checkout the command runs from is a change under review too, as for the
+    # operator and signer policies: CI runs from a pull request's checkout even when the
+    # project and inventory it verifies lie elsewhere.
+    for start in (project.resolve(), inventory.resolve().parent, Path.cwd().resolve()):
         # A nested checkout (a submodule or vendored repository) has its own .git, but
         # the change under review can still edit the repository around it.
         untrusted.extend(_repository_roots(start))
@@ -81,7 +84,7 @@ def _check_launch_policy(policy: Path, project: Path, inventory: Path) -> os.sta
         raise click.UsageError(
             "launch policy must be provisioned outside the untrusted project and outside "
             "the repository that holds the project or the inventory, and any repository "
-            "enclosing either"
+            "enclosing either or the current directory"
         )
     if os.name != "posix":
         return None
@@ -354,6 +357,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
             project_path.resolve(),
             *_repository_roots(project_path.resolve()),
             *_repository_roots(inventory_path.resolve().parent),
+            *_repository_roots(Path.cwd().resolve()),
         ]
         for ev_path, att_path in zip(
             transport_evidence, transport_evidence_attestations, strict=True
@@ -366,7 +370,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
                 if any(resolved_ev.is_relative_to(root) for root in untrusted_roots):
                     raise click.UsageError(
                         f"{flag_name} must lie outside --project and any repository enclosing "
-                        "--project or AIBOM_PATH"
+                        "--project or AIBOM_PATH, or the current directory"
                     )
                 try:
                     if resolved_ev == inventory_path.resolve() or os.path.samefile(

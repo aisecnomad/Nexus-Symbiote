@@ -265,8 +265,8 @@ of its bytes as `sha256:<64 lowercase hexadecimal characters>`. A server without
 entry is not started.
 
 The file must lie outside the project and outside every repository (a directory with
-a `.git` entry) that encloses the project or the inventory, including the repository
-around a nested checkout such as a submodule. On POSIX
+a `.git` entry) that encloses the project, the inventory or the current directory,
+including the repository around a nested checkout such as a submodule. On POSIX
 systems it must also be a single-link regular file owned by you or root that only its
 owner can write, and every directory above it, up to the file system root, must be
 owned by you or root and not writable by others unless it is sticky: whoever can write
@@ -1202,7 +1202,7 @@ nexus-symbiote verify-live [OPTIONS] AIBOM_PATH
 | `--json-output` | Output the verification report as JSON. |
 | `--record` | Print an unsigned candidate BOM with the observed descriptors instead of a report; exits 1 when served tools, declarations or the server identity drifted, unless `--accept-drift`. |
 | `--accept-drift` | With `--record`, exit 0 although changed or new tools, declarations or server identity were recorded. |
-| `--transport-evidence` `FILE` | Recorded `discover-mcp --record` inventory providing live observation evidence for remote MCP servers; requires `--transport-evidence-attestation` and `--trusted-key` (repeatable). |
+| `--transport-evidence` `FILE` | Recorded `discover-mcp --record` inventory providing live observation evidence for remote MCP servers; requires `--transport-evidence-attestation` and `--trusted-key`; each file and its envelope must lie outside `--project` and every repository enclosing `--project`, `AIBOM_PATH` or the current directory (repeatable). |
 | `--transport-evidence-attestation` `FILE` | DSSE inventory attestation envelope matching each `--transport-evidence` file in order (repeatable). |
 | `--trusted-key` `FILE` | Trusted Ed25519 public key PEM for `--transport-evidence-attestation`; must lie outside `--project` and every repository enclosing `--project`, the inventory or the evidence (repeatable). |
 | `--transport-evidence-purpose` `generated\|reviewed` | Expected attestation purpose for `--transport-evidence-attestation` (default: `generated`). |

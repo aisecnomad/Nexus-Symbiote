@@ -1102,3 +1102,24 @@ def test_advisories_purl_identity_decodes_rfc3986_repository_url_and_rejects_smu
     ):
         with pytest.raises(ValueError, match="exact package_url is required"):
             _purl_identity(bad, "https://npm.acme.internal")
+
+
+def test_launch_policy_in_the_checkout_the_command_runs_from_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # CI runs verify-live from a pull request's checkout while the project and inventory
+    # it verifies lie elsewhere; a launch policy in that checkout picks what runs.
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    policy = checkout / "launch.json"
+    policy.write_text("{}", encoding="utf-8")
+    policy.chmod(0o600)
+    project = tmp_path / "artifact"
+    project.mkdir()
+    bom_path = project / "bom.json"
+    bom = AIBOM()
+    bom.add_component(MCPServerComponent(bom_ref="mcp:demo", name="demo", transport="stdio"))
+    bom.save(bom_path)
+    monkeypatch.chdir(checkout)
+    with pytest.raises(click.UsageError, match="or the current directory"):
+        _check_launch_policy(policy, project, bom_path)
