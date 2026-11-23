@@ -1,11 +1,9 @@
 # Architecture and trust boundaries
 
-This page shows how Nexus SymBiote is put together, where untrusted data enters,
-and which module is responsible for each control. Read it before you change a
-collector, a gate or an export. The [security model](security-model.md) states the
-design principles and what results establish; the [threat model](threat-model.md)
-lists the attacks each boundary is meant to stop; the
-[known limitations](known-limitations.md), summarized in the
+Module layout, trust boundaries and data flow. Read this before changing a
+collector, gate or export. The [security model](security-model.md) states the
+design principles; the [threat model](threat-model.md) lists the attacks each
+boundary stops; the [known limitations](known-limitations.md), summarized in the
 [security policy](../SECURITY.md#known-limitations), list what the controls do not
 cover.
 

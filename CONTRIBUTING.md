@@ -75,7 +75,7 @@ Three hash-locked files are generated from `pyproject.toml` using the pinned `uv
 - **Size cap:** Keep PRs under **1,500 changed lines** (insertions + deletions) outside `tests/` and `benchmarks/`, enforced by `scripts/check_pull_request_size.py`. Split larger work into focused PRs.
 - **Branch & merge hygiene:** Merge `main` into your branch rather than rebasing/force-pushing shared branches, resolve conflicts carefully (never overwriting `main` wholesale), and wait for `Verified CI`. Gate paths (`.github/`, `action.yml`, `scripts/`, `config/`, `pyproject.toml`, lockfiles, `tests/conftest.py`, `scanners/`, `validators/`, `generators/`) are listed in `.github/CODEOWNERS`.
 - **Single-maintainer soak window:** While one maintainer reviews changes, behavior- and security-changing PRs stay open for a ≥24-hour soak window, with a full post-CI diff review recorded in the PR description. Small docs-only PRs may merge once `Verified CI` is green.
-- **Commits & labels:** Sign commits (`git commit -S`), reference relevant [roadmap](ROADMAP.md) items or [decisions](docs/decisions.md), and apply type, area, and review-state labels per the [label guide](docs/labels.md).
+- **Commits & labels:** Sign commits (`git commit -S`), reference relevant [roadmap](ROADMAP.md) items or [decisions](docs/decisions.md), and apply type, area, and review-state labels per the [label guide](docs/labels.md). A pull request merges only with `review: verified` at its current head and without `do-not-merge`.
 
 ## AI-assisted contributions
 
