@@ -471,10 +471,18 @@ def test_long_memo_indexes_keep_distinct_keys() -> None:
     [
         (b"0" * 5_000 + b"7", b"7"),
         (b"0" * 100 + b"9" * 700, b"9" * 700),
+        # Past the floor either way, but one spelling int() would refuse and one it reads.
+        (b"0" * 4_000 + b"9" * 700, b"9" * 700),
         (b"1_0", b"10"),
         (b" 0" + b"0" * 4_400 + b"5 ", b"+5"),
     ],
-    ids=["zeros-then-short", "zeros-then-long", "underscore", "whitespace-and-sign"],
+    ids=[
+        "zeros-then-short",
+        "zeros-then-long",
+        "straddles-int-limit",
+        "underscore",
+        "whitespace-and-sign",
+    ],
 )
 def test_one_memo_index_written_two_ways_is_one_key(put: bytes, get: bytes) -> None:
     payload = _memo_call(put, b"99", get)
