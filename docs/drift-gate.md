@@ -70,100 +70,40 @@ nexus-symbiote diff "$RUNNER_TEMP/reviewed.json" "$RUNNER_TEMP/agentbom.json" --
 Taking both snapshots in the same job from the same checkout compares the pull
 request with itself, and that gate can never fail.
 
-- **Use the same policy for both.** `--no-project-policy` keeps a policy file in the
-  checkout from narrowing either snapshot. `baseline` accepts it, and
-  `--signature-policy`, like `scan`.
-- **Use the same binding key for both.** Set one `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`
-  of 32 or more characters for the baseline and every candidate scan. Without it, the
-  values described above cannot alert on a change: every record that carries the low
-  `completeness` finding for unbound values (MCP server, IDE agent, RAG source, A2A
-  agent or client, or repository agent when redaction changed an `agent.yaml` field),
-  and every prompt file whose content hash is withheld, raises a medium alert on every
-  comparison instead — so `diff --fail-on-alert` fails rather than reporting no change.
-  The alert does not name the value.
-
-  The same alert fires when only one of the two scans has the key and the digests of
-  the IDE settings files then differ. With a *different* key, every MCP, A2A, RAG, IDE
-  settings and prompt file binding changes and alerts. The Action refuses
-  `reviewed-baseline` unless that key is set on the step or passed as
-  `source-binding-key`. Fork `pull_request` jobs receive no secrets, so they cannot
-  satisfy that input; run the keyed drift gate on same-repository pull requests and
-  trusted branches, as the example under [Protect the gate](#protect-the-gate) does.
-  See [source binding](verification-source-binding.md).
-- **Recollect v1 RAG baselines once.** Under RAG structure profile v2, every RAG
-  source's `static_config_hash` changes once, not only sources with inline
-  documents: the profile name is part of the digested structure, and an absent
-  `documents` key is digested as `{"present": false}` where v1 digested `null`. On
-  an unchanged project, a baseline that 0.2.0 wrote raises a high
-  `properties.static_config_hash changed` alert for every RAG source, and
-  `validate --project` fails reconciliation on every v1 inventory that records a
-  RAG source, until both are recollected. Take a new baseline at the commit the old
-  one was reviewed at; see [RAG sources](verification-source-binding.md#rag-sources).
-- **Paths are root-relative.** Recorded paths are relative to the scan root, so a
-  snapshot taken in `/Users/alice/agent` compares with one taken in
-  `/home/runner/work/agent/agent`. Without a manifest `id`, the repository agent is
-  `agent:repository:cdb4ee2aea69cc6a83331bbe`, named `repository`, wherever the
-  checkout is. An
-  [agent manifest](agent-manifest.md) `id` gives it a stable, named reference.
-- **Upgrading from 0.1.0: re-create the baseline.** Snapshots written by 0.1.0
-  record absolute paths and a path-derived agent reference. `diff` does not treat
-  `/old/root/CLAUDE.md` and `CLAUDE.md` as the same location, because the old root
-  is not recorded and guessing it could hide a file that really moved. It adds a
-  note when one snapshot has absolute paths and the other relative ones. The new
-  native format version also alerts: `spec_version` 1.0.0 against 1.1.0 is high,
-  and the policy record 1.1.0 adds (`policy_source`, `policy_weakened`) is medium.
-  To migrate, check out the commit the old baseline was reviewed at, take a new
-  baseline there with this release, and review `diff old.json new.json`: on the
-  same commit it should show only how the evidence is recorded, not what it
-  contains. Then adopt the new baseline through your usual review.
-- **ShadowScan reports** are compared by normalized content; see
-  [comparing discovery across reruns](shadowscan-integration.md#compare-discovery-across-reruns).
+- **Use the same policy for both.** Pass `--no-project-policy` (and `--signature-policy`, if used) to both `baseline` and `scan` so checkout policies cannot narrow either snapshot.
+- **Use the same binding key for both.** Set one ≥32-char `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` across both scans. Without it, records with unbound values (MCP servers, IDE agents, RAG sources, A2A agents/clients, redacted `agent.yaml` fields, or withheld-hash prompt files) emit a medium unbound-values alert on every comparison (failing `diff --fail-on-alert`), and the GitHub Action refuses `reviewed-baseline`. Using different keys alerts on every keyed binding. Fork PRs receive no secrets—run keyed drift gates on same-repository PRs and trusted branches ([Protect the gate](#protect-the-gate); [source binding](verification-source-binding.md)).
+- **Recollect v1 RAG baselines once.** Under RAG structure profile v2, `static_config_hash` changes once per RAG source (alerting high in `diff` and failing `validate --project`); take a new baseline at the reviewed commit ([RAG sources](verification-source-binding.md#rag-sources)).
+- **Paths are root-relative.** Snapshots compare cleanly across checkout paths. Without a manifest `id`, the repository agent is `agent:repository:cdb4ee2aea69cc6a83331bbe` (`repository`); add an [agent manifest](agent-manifest.md) `id` for a stable named reference.
+- **Upgrading from 0.1.0:** Re-create baselines at their reviewed commit (0.1.0 recorded absolute paths and `spec_version` 1.0.0 vs. 1.1.0).
+- **ShadowScan reports** compare by normalized content ([ShadowScan integration](shadowscan-integration.md#compare-discovery-across-reruns)).
 
 ## What the alerts mean
 
-Every alert names what changed. Security alerts are listed first in text output,
-then notes, then the added, removed and modified components and relationships.
-`--json-output` carries the same records.
+Security alerts appear first in text output, followed by notes and component/relationship changes (`--json-output` carries the same records).
 
 | Change | Rating |
 | --- | --- |
-| Component added | at least medium, or the highest effective finding severity on the added component (for example critical for an executable model format) |
-| Component removed | high for MCP servers and clients, tools, models, instruction and skill files, guardrails, IDE agents and extensions, A2A clients and servers, and for any record that carried integrity evidence (file, content, definition or schema digest, exact package URL, version pin, lockfile integrity, static source binding); medium otherwise. Confirm it was deleted, not moved where no collector reads it |
-| MCP endpoint, transport, launch command, launcher package or static source binding changed; the served tool set, or the served instructions, prompts or resource templates, that a live observation recorded (`discover-mcp --record`, `verify-live --record`) changed | critical |
-| Tool definition, input schema, description or annotations changed; model serialization safety changed to an unsafe execution or template format; a model's `trust_remote_code` set to true | critical |
-| Security field changed (for example capabilities, authorizations, claims, endpoints, A2A card URL, package URL, provider, source URI, signing identity or key reference, permission mode, version pin), a `*_ref` or `*_refs` field changed, declared autonomy level changed, trust tier or signing status downgraded, a digest removed or changed, including the `config_hash` of a guardrail or evaluation configuration file (`config_hash changed.`) | high |
-| Tool definition, content or file hash became available: the baseline carried no digest for content the new snapshot pins (`Tool definition hash became available — first binding of content the baseline never pinned.`, `Content hash became available — first binding of content the baseline never pinned.`, `File hash (sha256) became available — first binding of content the baseline never pinned.`). A baseline whose records carry no digest, such as a ShadowScan import or another lossy source, meets this once, when the next scan pins the content: review that snapshot and adopt it as the baseline | medium |
-| Trust tier or signing status raised | medium: a snapshot is written unsigned, so a raised label is a claim to review |
-| Risk findings added | the highest added severity, at least medium |
-| Risk findings removed; any other field changed, including snapshot metadata such as the producer's `tool_name` or `tool_vendor` | medium |
-| Values unbound in either snapshot: the record has no keyed binding (`static_value_binding`) and either carries a `completeness` finding saying its values are not bound in this inventory, as MCP launch values, IDE agent settings values and RAG and A2A values do without `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`, or has its content hash withheld, as a prompt file has without the key, such as an `@path` import that is not Markdown or a prompt template, which shares one such finding with the other templates. Raised on every comparison, changed or not, and names no value: `MCP server launch values are unbound in one snapshot; argument, environment and endpoint-path drift is undetectable. Set NEXUS_SYMBIOTE_SOURCE_BINDING_KEY during both collections.` for an MCP server, `Values are unbound in one snapshot without the binding key; a change to them is undetectable and no value is recorded. Set NEXUS_SYMBIOTE_SOURCE_BINDING_KEY during both collections.` for any other record | medium |
-| Relationship added | medium; high for `invokes`, `delegates-to` and `acts-as-identity` |
-| Relationship removed | medium; high for `uses-guardrail` and `approved-under` |
-| Relationship kept but its assurance or conditions changed | high |
-| Coverage regressed: a new scan failure, coverage gap or exclusion; a collector's status got worse or is no longer recorded; fewer collectors requested or completed; a different scope; more unobserved surfaces; lower coverage assurance; no completeness claim in the new snapshot; or a baseline without a completeness claim (such as a hand-made or supplied BOM) while the new snapshot records a scan failure, a coverage gap, a collector that did not complete or no collector at all, since nothing shows that gap predates the change | high, naming the collector or entries |
-| A scanned surface removed from the completeness claim (`1 scanned surface removed (src/old.py): coverage narrowed; components found there are no longer compared.`); an added surface is recorded as info | high |
-| A collector first recorded as anything but `complete`, such as `failed` or `partial`, when the baseline's completeness claim never recorded it (`Collector 'model' is now recorded as failed; the baseline does not show this gap predates the change.`); first recorded as `complete`, it is an improvement | high |
-| ShadowScan: report content changed; report bytes changed without comparable content digests; source status worse; more unmapped entries; new projection limitations; a lossy format | high |
-| The new snapshot has graph problems the baseline did not (dangling or mistyped references), the snapshots differ in `spec_version`, or either snapshot uses a `spec_version` this release does not support | high |
-| IDE settings guardrail removed or widened on a retained `ide-agent` component: a `deny_rules` matcher removed (`deny_rule_removed`), a `sandbox.network.allowedDomains` host added (`sandbox_egress_widened`), a rule/subagent activation scope changed to `always_apply` or gained globs (`scope_widened`), or malformed settings metadata prevents verification (`malformed_settings_metadata`) | high |
+| Component added | at least medium, or highest effective finding severity on the added component |
+| Component removed | high for MCP servers/clients, tools, models, instructions/skills, guardrails, IDE agents/extensions, A2A clients/servers, or any record with integrity/pin/binding evidence; medium otherwise |
+| MCP endpoint, transport, launch command, launcher package, static source binding, or live-observed tools/instructions/prompts/resource templates changed | critical |
+| Tool definition/schema/description/annotations changed; model serialization safety changed to unsafe format/template; `trust_remote_code` set to `true` | critical |
+| Security field changed (capabilities, authorizations, claims, endpoints, A2A card URL, `purl`, provider, source URI, signing identity/key ref, permission mode, version pin, `*_ref`/`*_refs`, autonomy level), trust/signing downgraded, or digest removed/changed (including guardrail/eval `config_hash changed.`) | high |
+| First content digest binding on a previously unpinned baseline (`Tool definition hash became available — first binding of content the baseline never pinned.`, `Content hash became available — first binding of content the baseline never pinned.`, `File hash (sha256) became available — first binding of content the baseline never pinned.`) | medium |
+| Trust tier or signing status raised (unsigned claim to review) | medium |
+| Risk findings added | highest added severity, at least medium |
+| Risk findings removed; any other field or producer metadata (`tool_name`, `tool_vendor`) changed | medium |
+| Values unbound in either snapshot without `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` (raised on every comparison, naming no value: `MCP server launch values are unbound in one snapshot; argument, environment and endpoint-path drift is undetectable. Set NEXUS_SYMBIOTE_SOURCE_BINDING_KEY during both collections.` or `Values are unbound in one snapshot without the binding key; a change to them is undetectable and no value is recorded. Set NEXUS_SYMBIOTE_SOURCE_BINDING_KEY during both collections.`) | medium |
+| Relationship added | medium; high for `invokes`, `delegates-to`, `acts-as-identity` |
+| Relationship removed | medium; high for `uses-guardrail`, `approved-under` |
+| Relationship assurance or conditions changed | high |
+| Coverage regressed (new failure/gap/exclusion, worse or missing collector status, fewer collectors, changed scope, more unobserved surfaces, lower coverage assurance, or missing completeness claim) | high (naming collector/entries) |
+| Scanned surface removed from completeness claim (`1 scanned surface removed (src/old.py): coverage narrowed; components found there are no longer compared.`); added surfaces are info | high |
+| Collector newly recorded as non-complete (`Collector 'model' is now recorded as failed; the baseline does not show this gap predates the change.`); newly `complete` is an improvement | high |
+| ShadowScan report content/bytes changed without matching digests, worse status, more unmapped entries, new projection limits, or lossy format | high |
+| New graph consistency errors (dangling/mistyped refs), `spec_version` mismatch, or unsupported `spec_version` | high |
+| IDE settings guardrail removed or widened (`deny_rule_removed`, `sandbox_egress_widened`, `scope_widened`, `malformed_settings_metadata`) | high |
 
-A relationship to a component that was itself added or removed is listed but alerts
-through that component, unless its own rating is high.
-
-These are recorded but never alert: a scanned surface added to the completeness
-claim (the components found there are compared separately, so an added source
-file is not drift; a surface removed from the claim narrows coverage and alerts,
-as the table says), a coverage improvement, such as a collector first recorded as
-`complete`, a baseline without a completeness claim compared with a snapshot
-whose coverage is complete, a different Nexus SymBiote release (`tool_version`),
-a ShadowScan report regenerated with unchanged content, and unmapped ShadowScan
-entries that moved within the report.
-
-Notes describe the comparison, not a change, and are printed even when nothing
-changed: gaps both snapshots share (the baseline was already incomplete, and changes
-inside those gaps cannot be detected), graph problems in both, a baseline recorded
-after the candidate (check the argument order, since swapped snapshots show
-additions as removals), and snapshots that disagree on absolute paths.
+**Non-alerting changes & notes:** Added scanned surfaces, coverage improvements, different Nexus SymBiote `tool_version`, unchanged regenerated ShadowScan reports, and reordered unmapped ShadowScan entries never alert. **Notes** (printed even with zero changes) highlight shared gaps in both snapshots, shared graph problems, reversed snapshot timestamps, and absolute-vs-relative path mismatches.
 
 ## Exit status
 
