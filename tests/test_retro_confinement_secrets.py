@@ -750,7 +750,7 @@ def test_scanner_yaml_with_an_underflow_payload_is_refused_in_linear_time(tmp_pa
 def test_each_yaml_scan_and_load_uses_the_bounded_loader(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import nexus_symbiote.policy as policy_module
+    from nexus_symbiote import policy as policy_module
     from nexus_symbiote.scanners import rag as rag_module
 
     made: list[str] = []
@@ -783,7 +783,7 @@ def test_each_yaml_scan_and_load_uses_the_bounded_loader(
 
 
 def test_the_scan_step_refuses_deep_flow_before_any_load(monkeypatch: pytest.MonkeyPatch) -> None:
-    import nexus_symbiote.policy as policy_module
+    from nexus_symbiote import policy as policy_module
 
     def no_load(text: str) -> Any:
         raise AssertionError("the bounded scan should refuse the document first")
