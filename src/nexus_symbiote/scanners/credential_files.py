@@ -50,9 +50,37 @@ _PROGRAM_SUFFIXES = frozenset(
 _CREDENTIAL_DIRECTORIES = frozenset(
     marker + plural for marker in _CREDENTIAL_MARKERS for plural in ("", "s")
 )
-_RAIL_LINK_CREDENTIAL_STORES = frozenset(
-    {".aws", ".ssh", ".gnupg", ".kube", ".docker", ".azure", ".gcloud", ".vault", "vault"}
+_CREDENTIAL_STORE_NAMES = frozenset(
+    {
+        "aws",
+        "ssh",
+        "gnupg",
+        "kube",
+        "docker",
+        "azure",
+        "gcloud",
+        "vault",
+        "oci",
+        "sops",
+        "terraform.d",
+        "1password",
+        "helm",
+        "gh",
+        "heroku",
+    }
 )
+# Dotted home-directory credential stores; XDG `.config/<store>` is matched by
+# adjacent pair so non-credential `.config/` files (e.g. `.config/mcp.json`) are still scanned.
+_DOT_CREDENTIAL_STORES = frozenset(f".{name}" for name in _CREDENTIAL_STORE_NAMES)
+_RAIL_LINK_CREDENTIAL_STORES = _DOT_CREDENTIAL_STORES | _CREDENTIAL_STORE_NAMES
+_LINK_CREDENTIAL_STORES = _DOT_CREDENTIAL_STORES | {"vault"}
+
+
+def _has_xdg_credential_store(directories: tuple[str, ...]) -> bool:
+    return any(
+        left.casefold() == ".config" and right.casefold() in _CREDENTIAL_STORE_NAMES
+        for left, right in zip(directories, directories[1:], strict=False)
+    )
 
 
 def credential_shaped(path: str, *, colang_source: bool = False) -> bool:
@@ -65,7 +93,11 @@ def credential_shaped(path: str, *, colang_source: bool = False) -> bool:
     if PurePosixPath(path).suffix.lower() in MARKDOWN_SUFFIXES:
         return False
     directories = PurePosixPath(path).parts[:-1]
-    if any(part.lower().lstrip(".") in _CREDENTIAL_DIRECTORIES for part in directories):
+    if any(
+        part.casefold().lstrip(".") in _CREDENTIAL_DIRECTORIES
+        or part.casefold() in _DOT_CREDENTIAL_STORES
+        for part in directories
+    ) or _has_xdg_credential_store(directories):
         return True
     name = PurePosixPath(path).name.lower()
     suffix = PurePosixPath(name).suffix
@@ -89,41 +121,87 @@ def credential_shaped(path: str, *, colang_source: bool = False) -> bool:
 def credential_gap(path: str, target: str | None) -> str | None:
     """Why the file at ``path`` is not read, or None: its name, or the name of
     ``target``, the in-root file a symlink at ``path`` leads to, says it holds
-    credentials."""
+    credentials. A regular file names itself as its target: it is withheld only
+    inside a credential store, whatever its own name."""
     if credential_shaped(path):
         return "its name says it holds credentials"
+    if target is None:
+        return None
+    if PurePosixPath(target) == PurePosixPath(path):
+        if _in_credential_store(PurePosixPath(path), _LINK_CREDENTIAL_STORES):
+            return "lies in a credential directory"
+        return None
     return link_gap(target)
+
+
+def _in_credential_store(target_path: PurePosixPath, stores: frozenset[str]) -> bool:
+    directories = target_path.parts[:-1]
+    return (
+        any(part.casefold() in stores for part in directories)
+        or _has_xdg_credential_store(directories)
+        or (
+            bool(directories)
+            and directories[-1].casefold() == ".config"
+            and target_path.stem.casefold() in _CREDENTIAL_STORE_NAMES
+        )
+    )
 
 
 def link_gap(target: str | None, *, colang_rail: str | None = None) -> str | None:
     """Why a symlink that leads to ``target`` is not followed, or None."""
     if target is None:
         return None
-    if any(
-        part.casefold() in _RAIL_LINK_CREDENTIAL_STORES for part in PurePosixPath(target).parts[:-1]
-    ):
+    target_path = PurePosixPath(target)
+    # An undotted store name (`docker/`, `helm/`) is an ordinary project directory for
+    # every file but a Colang rail reached through a link, which keeps its program role.
+    # `vault/` is the exception: a link into it was refused before the store names grew.
+    stores = _RAIL_LINK_CREDENTIAL_STORES if colang_rail is not None else _LINK_CREDENTIAL_STORES
+    if _in_credential_store(target_path, stores):
         return "symlink leads into a credential directory"
     # A transparent rail link keeps its declared name and program role. A
     # renamed target can be a credential store presented under a rail alias.
-    same_rail = (
-        colang_rail is not None and PurePosixPath(colang_rail).name == PurePosixPath(target).name
-    )
+    same_rail = colang_rail is not None and PurePosixPath(colang_rail).name == target_path.name
     if credential_shaped(target, colang_source=same_rail):
         return f"a symlink leads to {target}, whose name says it holds credentials"
     return None
 
 
+def _in_dot_or_xdg_credential_store(directories: tuple[str, ...]) -> bool:
+    return any(
+        part.casefold() in _DOT_CREDENTIAL_STORES
+        or (part.startswith(".") and part.casefold().lstrip(".") in _CREDENTIAL_DIRECTORIES)
+        for part in directories
+    ) or _has_xdg_credential_store(directories)
+
+
 def withheld(
-    files: ConfinedCollection, path: str, excluded: list[str], *, colang_source: bool = False
+    files: ConfinedCollection,
+    path: str,
+    excluded: list[str],
+    *,
+    colang_source: bool = False,
+    allow_service_parent: bool = False,
 ) -> bool:
     """Record credential-name refusals for RAG, guardrail and A2A inputs.
 
-    Known collector files use their own names. The NeMo collector can designate a
-    Colang rail as a program. A same-name link preserves that role for the target.
+    Known collector files use their own names; regular files inside credential
+    directories and stores are also withheld unless ``allow_service_parent`` is set
+    for an explicit ``.well-known`` A2A discovery card beneath a plain service
+    directory (dotted and XDG credential stores remain withheld even then).
+    The NeMo collector can designate a Colang rail as a program. A same-name link
+    preserves that role for the target.
     """
     relative = PurePosixPath(path)
     reason: str | None
-    if credential_shaped(relative.name, colang_source=colang_source):
+    direct_credential = (
+        (
+            credential_shaped(relative.name, colang_source=colang_source)
+            or _in_dot_or_xdg_credential_store(relative.parts[:-1])
+        )
+        if allow_service_parent
+        else credential_shaped(path, colang_source=colang_source)
+    )
+    if direct_credential:
         reason = "its name says it holds credentials"
     else:
         linked = files.in_root_target(path)
