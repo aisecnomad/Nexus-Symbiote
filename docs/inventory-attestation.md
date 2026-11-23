@@ -48,7 +48,7 @@ It does not establish:
   verifies. Bound it with `--max-age-days`, record `--source-revision`, and keep
   attested baselines where the change under review cannot choose among them.
 - **Who holds a key.** The tool checks signatures against the keys you name; key
-  lifecycle is your process.
+  issuing, protecting and retiring keys is your process.
 - **That the file stays unchanged.** `verify-attestation` and a later command read the
   file separately. Run both in a workspace the change under review cannot write to.
 
@@ -61,8 +61,8 @@ never overwrites):
 nexus-symbiote runtime keygen --private-key reviewer.pem --public-key reviewer.pub
 ```
 
-Add `--passphrase-file FILE` to encrypt the private key; `attest` then needs the same
-flag. `attest` refuses a private key or passphrase file that the user running it does
+Add `--passphrase-file FILE` to encrypt the private key with the first line of a file
+you own and that gives group and others no permission; `attest` then needs the same flag. `attest` refuses a private key or passphrase file that the user running it does
 not own or that its group or others can access, even when running as root.
 `runtime key-id reviewer.pub` prints the key ID (lowercase hex SHA-256 of the DER
 SubjectPublicKeyInfo). Use a key pair only for attestations — the runtime rings use one
@@ -424,8 +424,9 @@ An existing `--out` is refused (exit 1); nothing is written.
   `source_revision` and your review process.
 - **Separate reads.** Verification and later commands read the file separately.
 - **Signer's clock.** `signed_at` comes from the signer; backdating is possible.
-- **Format compatibility.** Verification recomputes format version and content digest.
-  A build that cannot read the format refuses with `subject-not-inventory`.
+- **Format compatibility.** Verification recomputes format version and content digest,
+  even with `--match bytes`. A build that cannot read the format refuses with
+  `subject-not-inventory`.
 - **Deeply nested inventories are `other`.** Over 256 levels of nesting means no
   content digest and no `--match content`.
 - **Trusted-key rule checks placement only.** It does not authenticate keys or follow

@@ -10,9 +10,9 @@ Contributors propose changes through issues and pull requests. The maintainer ev
 
 ## Review expectations
 
-Use the review contract in [CONTRIBUTING.md](CONTRIBUTING.md): explain the concrete problem, resulting behavior, tests and material limitations. Changes must pass the configured `Verified CI` aggregate, quality checks, coverage floors, distribution checks and committed security contracts.
+Use the review contract in [CONTRIBUTING.md](CONTRIBUTING.md): explain the concrete problem, resulting behavior, tests and material limitations. Changes should pass the configured `Verified CI` aggregate, quality checks, coverage floors, distribution checks and committed security contracts.
 
-Security-sensitive changes require a stated trust boundary and abuse case, a regression that fails on the vulnerable behavior, and review of the affected security corpus. Record the checks that actually ran and any unavailable verification. Any maintainer-authorized alpha exception must state its scope and remaining checks; it must not be described as passing unavailable CI or satisfying inactive protection.
+Security-sensitive changes require a stated trust boundary and abuse case, a regression that fails on the vulnerable behavior, and review of the affected security corpus. Record the checks that actually ran and any unavailable verification. Local evidence does not establish a successful hosted matrix or CodeQL run. Any maintainer-authorized alpha exception must state its scope and remaining checks; it must not be described as passing unavailable CI or satisfying inactive protection.
 
 ### Review policy while there is one maintainer
 
@@ -20,7 +20,7 @@ No second person reviews changes today. What stands in for that review, and what
 
 - **Required checks.** `Verified CI` must pass on a branch up to date with `main`; branch protection enforces it for everyone, administrators included. It establishes that the gates ran, not that the change is right.
 - **Gate integrity.** `scripts/check_workflows.py` fails when a verification job stops running its gate command, when an action pin moves back past its floor, or when a workflow gains a privileged trigger, writable top-level permissions, or a job write scope outside the reviewed list (code-scanning upload, attestation signing, trusted publishing). A change to those files is still self-approved; read such diffs line by line.
-- **Soak window.** Behavior- and security-changing pull requests stay open at least 24 hours before merging. The release workflow refuses to publish to PyPI until the release commit has been on `main` for 24 hours, unless the maintainer states an urgent reason that the run log records.
+- **Soak window.** Behavior- and security-changing pull requests stay open at least 24 hours before merging. Merging is not mechanically held; publication is: the release workflow refuses to publish to PyPI until the release commit has been on `main` for 24 hours, unless the maintainer states an urgent reason that the run log records.
 - **Review record.** Each pull request records who reviewed the full rendered diff after CI and how, including whether an AI review ran outside the session that wrote the change.
 - **AI-assisted changes.** Most of the history was written with AI assistance, disclosed in commit trailers. They receive the same review as any other change: the maintainer reads the full diff and is accountable for what merges. An assistant's review is a second opinion, not an independent reviewer. See "AI-assisted contributions" in CONTRIBUTING.md.
 
@@ -35,6 +35,8 @@ The checked-in [protection proposal](config/github-main-protection.json) require
 ### What is active today
 
 Pull requests are capped at 1,500 changed lines outside `tests/` and `benchmarks/` (CI-enforced; no second person required). Signed commits are requested in [CONTRIBUTING.md](CONTRIBUTING.md#pull-requests). `.github/CODEOWNERS` names the owner of gate paths; it requests review but enforces none under the interim profile.
+
+This file does not apply GitHub settings. The hosted CI and CodeQL failures recorded by the 2026-11-02 audit were subsequently addressed; that historical remediation is not evidence that the latest revision passes. Check the latest trusted CI attempt for the exact source SHA before merging or releasing.
 
 On 2026-11-06 the interim configuration was applied to `main`, the repository ruleset was retargeted to the default branch, and the `testpypi` and `pypi` environments were limited to deployments from `main`, with the sole maintainer as their required reviewer. [Issue #74](https://github.com/aisecnomad/Nexus-Symbiote/issues/74) records the remediation history; remaining administrator actions are tracked in the [roadmap](ROADMAP.md).
 

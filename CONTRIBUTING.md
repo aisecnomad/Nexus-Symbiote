@@ -4,6 +4,7 @@
 
 ```bash
 git clone https://github.com/aisecnomad/Nexus-Symbiote.git && cd Nexus-Symbiote
+python3 -m venv .venv && . .venv/bin/activate
 make install-locked   # hash-locked CI environment + editable install
 make check            # quality, tests, security regressions, distribution build
 # Open a pull request against main
@@ -71,7 +72,7 @@ Coverage tracing makes a test about twice as slow (1.6 to 2.7x in CI), so mark a
 
 ### Skips and expected failures
 
-The run lists every skip with its reason. With `--strict-skips` (which CI and `make test` pass), any skip other than a host file-system difference (case-insensitive aliases on a case-sensitive file system, or names the file system refuses), a Linux-only interface (`/proc`, `prctl`, `clone(CLONE_PARENT)`) on another host, or (outside CI) a missing pip fails the run. So does any expected failure (`pytest.xfail()`, `xfail(run=False)` or a conditional `xfail` marker). Do not guard a required dependency with `pytest.importorskip`; import it.
+The run lists every skip with its reason. With `--strict-skips` (which CI and `make test` pass), any skip other than a host file-system difference (case-insensitive aliases on a case-sensitive file system, or, off Linux, names the file system refuses), a Linux-only interface (`/proc`, `prctl`, `clone(CLONE_PARENT)`) on another host, or (outside CI) a missing pip fails the run. So does any expected failure (`pytest.xfail()`, `xfail(run=False)` or a conditional `xfail` marker). Do not guard a required dependency with `pytest.importorskip`; import it.
 
 ### Property-based tests
 
@@ -98,7 +99,7 @@ Three hash locks are generated from `pyproject.toml`; never edit them by hand.
 `make lock-check` (`python scripts/check_locks.py`, also part of CI quality) verifies offline that:
 
 - Each lock header records the digest of the current declarations, the pinned uv and one cut-off
-- The cut-off is at midnight UTC, at least seven days in the past
+- The cut-off is at midnight UTC (`YYYY-MM-DDT00:00:00Z`), at least seven days in the past (`make lock` refuses such a cut-off too)
 - Every pin is an exact, hashed version inside its declared range
 - Every pin is either declared in `pyproject.toml` or required by another pin of the same lock (a `-c` constraint is not a reason)
 - The Action lock repeats the CI lock's versions and hashes and holds no test tool
@@ -114,7 +115,7 @@ For the floor lock, for platform-limited pins, and against a hostile published p
 
 ### Dependabot and dependency health
 
-Dependabot proposes range changes in `pyproject.toml` only. Such a pull request fails `make lock-check` until a maintainer runs `make lock` on its branch. Before merging any range or lock change, review new packages, hashes, markers and licenses, and wait for the "Dependency health" workflow, which runs the full suite on the newest releases the ranges admit. That run is not part of `Verified CI` because a new release, not the change, decides its result. "Dependency health" also audits every locked pin against OSV daily, audits the floor lock, and runs the randomized property tests weekly.
+Dependabot proposes range changes in `pyproject.toml` only. Such a pull request fails `make lock-check` until a maintainer runs `make lock` on its branch. Before merging any range or lock change, review new packages, hashes, markers and licenses, and wait for the "Dependency health" workflow, which runs the full suite on the newest releases the ranges admit. That run is not part of `Verified CI` because a new release, rather than the change, decides its result; `Verified CI` keeps only a smoke install of the wheel on freshly resolved releases and the OSV audit of the CI and Action locks, which a new release or advisory can still turn red. "Dependency health" also audits every locked pin against OSV daily, audits the floor lock, and runs the randomized property tests weekly.
 
 Every CI and release install uses `--require-hashes --only-binary=:all:` followed by `pip check`: a missing wheel stops the job instead of building a source distribution with unpinned build tools.
 
@@ -126,7 +127,7 @@ Every CI and release install uses `--require-hashes --only-binary=:all:` followe
 
 `Verified CI` aggregates the test matrix, macOS suite, dependency-floor tests, coverage, quality, distribution, security-regression, dependency-advisory and CodeQL jobs, and the Action's end-to-end run on passing, failing and hostile fixtures with the check that the hostile one created no annotation. Missing, failed, cancelled or skipped prerequisites fail that stable check. Branch protection must require it; see [repository controls](docs/repository-controls.md). `scripts/check_workflows.py` fails if any gate job stops running its gate command, so a job cannot be emptied while keeping its name.
 
-The coverage gate (`scripts/check_coverage.py`) uses exact counts, not rounded percentages. It holds the package to its statement and branch floors and each security-critical module (confined reads, hashing, signature verification and policy, validators, differ, offline guard, runtime authorization, redaction, terminal neutralization) to its own floor, so a well-tested average cannot hide an untested module. Gate scripts are measured as well (without counting toward the package figure), and `scripts/run_action.py` has its own floor. The floors live only in that script; they prevent regression and are not a completeness claim. Raise them as missing paths gain tests.
+The coverage gate (`scripts/check_coverage.py`) uses exact counts, not rounded percentages. It holds the package to its statement and branch floors and each security-critical module (confined reads, hashing, signature verification and policy, validators, differ, offline guard, runtime authorization, redaction, terminal neutralization) to its own floor, so a well-tested average cannot hide an untested module. Gate scripts are measured as well (without counting toward the package figure), and `scripts/run_action.py` has its own floor; a report that leaves `scripts/` out fails. The floors live only in that script; they prevent regression and are not a completeness claim. Raise them as missing paths gain tests.
 
 ## Architecture boundaries
 
@@ -134,7 +135,7 @@ Nexus-ShadowScan is the primary discovery engine. Preserve the `import-shadowsca
 
 Run `PYTHONPATH=src python scripts/benchmark_security.py --out benchmark-results.json` after security changes. Review individual cases, corpus/source digests, unknowns, and denominators. Do not replace labels or remove negative fixtures to improve the result. The corpus is a finite regression suite, not representative field efficacy evidence.
 
-CI and release candidates also run `scripts/check_security_regressions.py`. Every committed detection label and control contract must pass; missing cases, abstentions, duplicates and evaluator errors fail. New labels and changed expectations require review of the fixture and its rationale; passing these fixtures establishes no production accuracy.
+CI and release candidates also run `scripts/check_security_regressions.py`. Every committed detection label and control contract must pass; missing cases, abstentions on detection cases, duplicate cases and evaluator errors fail. A passing malformed-input coverage control can deliberately have an unknown detection prediction. The full per-case report is retained even when this gate fails. New labels and changed expectations require review of the fixture and its rationale; passing these fixtures establishes no production accuracy or percentile ranking.
 
 ## Security changes
 

@@ -126,7 +126,7 @@ nexus-symbiote validate agentbom.json --project /path/to/agent --no-project-poli
 nexus-symbiote risk agentbom.json --project /path/to/agent --no-project-policy --accept-default-exclude root:.git --threshold 50
 ```
 
-Checkout tightenings apply automatically. Pass `--accept-project-policy` for reviewed relaxations, or `--no-project-policy` to ignore checkout policy. With `--project`, `validate` and `risk` collect fresh evidence and fail when it disagrees with the BOM. Full walkthrough: [scanning a public agent](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/tutorials/scanning-a-public-agent.md).
+Checkout tightenings apply automatically. Pass `--accept-project-policy` to accept reviewed relaxations within the operator policy, or `--no-project-policy` to ignore checkout policy. With `--project`, `validate` and `risk` collect fresh evidence and fail when it disagrees with the BOM. Full walkthrough: [scanning a public agent](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/tutorials/scanning-a-public-agent.md).
 
 ## Why
 
@@ -274,7 +274,7 @@ nexus-symbiote scan . --no-project-policy --accept-default-exclude root:.git -o 
 nexus-symbiote diff "$RUNNER_TEMP/reviewed.json" "$RUNNER_TEMP/agentbom.json" --fail-on-alert
 ```
 
-`--fail-on-alert` fails on any recorded change rated medium or higher, including removed components and coverage regressions. Set `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` on both snapshots to compare launch arguments, environment values and endpoint paths ([source binding](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/verification-source-binding.md)). Run the comparison in a job the pull request cannot edit ([protect the gate](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md#protect-the-gate)), and sign the reviewed baseline ([inventory attestation](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/inventory-attestation.md#gate-a-pull-request-on-an-attested-baseline)). Full guide: [Gate drift in CI](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md).
+`--fail-on-alert` fails on any recorded change rated medium or higher, including a removed component and a coverage regression. Without the binding key, an MCP server whose launch arguments, environment values or endpoint path were not bound is itself a medium alert, so a widened filesystem root cannot pass silently; the alert does not name the new value. Set `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` on both snapshots to compare those values ([source binding](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/verification-source-binding.md)). Run the comparison in a job the pull request cannot edit ([protect the gate](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md#protect-the-gate)), and sign the reviewed baseline to know who approved it ([inventory attestation](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/inventory-attestation.md#gate-a-pull-request-on-an-attested-baseline)). Full guide: [Gate drift in CI](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md).
 
 ### Policy and live mode
 
