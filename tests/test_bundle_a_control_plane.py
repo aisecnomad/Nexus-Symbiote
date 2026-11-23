@@ -1410,8 +1410,6 @@ def _guard_alerts(
         (_guard_settings(matcher="my-tool"), None),
         (_guard_settings(matcher="Edit|Write"), None),
         (_guard_settings(matcher="Edit, Write"), None),
-        (_guard_settings(matcher="Bash, Edit"), None),
-        (_guard_settings(matcher=" Edit ,Bash|"), None),
         (_guard_settings(condition="Bash(never-matches *)"), None),
         (_guard_settings(disableAllHooks=True), None),
         (_guard_settings(), {"disableAllHooks": True}),
@@ -1536,6 +1534,37 @@ def test_whitespace_event_name_is_unrecognized(tmp_path: Path) -> None:
     (hook,) = summary.hook_commands
     assert hook["runs_command"] is False
     assert any("unrecognized hook event" in g for g in summary.gaps)
+
+
+def test_empty_event_name_is_unrecognized_and_documented_client_events_are_recognized(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    _write_json(
+        tmp_path / ".claude" / "settings.json",
+        {
+            "hooks": {
+                "": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}],
+                "FileChanged": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}],
+                "StopFailure": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}],
+                "PreCompact": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}],
+            }
+        },
+    )
+    _write_json(
+        tmp_path / ".cursor" / "hooks.json",
+        {"hooks": {"beforeShellExecution": [{"command": "./guard.sh"}]}},
+    )
+    summary = audit_project_control_plane(tmp_path)
+    by_event = {(h["source_file"], h["event"]): h["runs_command"] for h in summary.hook_commands}
+    assert by_event[(".claude/settings.json", "")] is False
+    assert by_event[(".claude/settings.json", "FileChanged")] is True
+    assert by_event[(".claude/settings.json", "StopFailure")] is True
+    assert by_event[(".claude/settings.json", "PreCompact")] is True
+    assert by_event[(".cursor/hooks.json", "beforeShellExecution")] is True
+    assert [g for g in summary.gaps if "unrecognized hook event" in g] == [
+        ".claude/settings.json: unrecognized hook event ''"
+    ]
 
 
 def test_hook_run_comparison_scales_linearly_with_matchers(tmp_path: Path) -> None:

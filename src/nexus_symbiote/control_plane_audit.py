@@ -172,20 +172,55 @@ _PLAIN_MATCHER_RE = re.compile(r"[A-Za-z0-9_|]+")
 _IF_TOOL_EVENTS = frozenset(
     {"PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "PermissionDenied"}
 )
-_KNOWN_EVENTS = frozenset(
-    [
+_CLAUDE_HOOK_EVENTS = frozenset(
+    {
         "PreToolUse",
         "PostToolUse",
         "PostToolUseFailure",
         "PermissionRequest",
         "PermissionDenied",
         "SessionStart",
+        "SessionEnd",
         "UserPromptSubmit",
         "Stop",
+        "StopFailure",
         "Notification",
+        "SubagentStart",
         "SubagentStop",
         "SubagentTurn",
-    ]
+        "PreCompact",
+        "PostCompact",
+        "Setup",
+        "TeammateIdle",
+        "TaskCompleted",
+        "ConfigChange",
+        "WorktreeCreate",
+        "WorktreeRemove",
+        "FileChanged",
+        "CwdChanged",
+        "Elicitation",
+        "ElicitationResult",
+        "InstructionsLoaded",
+    }
+)
+_CURSOR_HOOK_EVENTS = frozenset(
+    {
+        "beforeShellExecution",
+        "afterShellExecution",
+        "beforeMCPExecution",
+        "afterMCPExecution",
+        "beforeReadFile",
+        "afterFileEdit",
+        "beforeSubmitPrompt",
+        "beforeTabFileRead",
+        "afterTabFileEdit",
+        "stop",
+        "sessionStart",
+        "sessionEnd",
+        "preCompact",
+        "subagentStart",
+        "subagentStop",
+    }
 )
 _SPIFFE_RE = re.compile(r"^spiffe://[a-z0-9.-]+/[A-Za-z0-9._/-]+$")
 
@@ -1225,7 +1260,13 @@ def _hook_event_key(raw_event: str) -> tuple[str, bool]:
 
 
 def _hook_state(
-    matcher: Any, hook_type: Any, condition: Any, disabled: bool, event_name: str
+    matcher: Any,
+    hook_type: Any,
+    condition: Any,
+    disabled: bool,
+    event_name: str,
+    *,
+    known_events: frozenset[str] = _CLAUDE_HOOK_EVENTS,
 ) -> dict[str, Any]:
     """What decides whether a hook still runs, as digests so no configuration text is copied.
 
@@ -1233,7 +1274,7 @@ def _hook_state(
     `_` and `|` (with non-empty segments) is a list of exact names, recorded so a later
     matcher can be shown to match everything it matched; any other matcher (including
     spaces, commas or `-`) is compared by digest alone, as the `if` filter always is.
-    An `if` filter on a non-tool event never runs. An unrecognized event name
+    An `if` filter on a non-tool event never runs. An unrecognized or empty event name
     also sets ``runs_command`` to False, failing closed.
     """
     digest: str | None = None
@@ -1246,7 +1287,7 @@ def _hook_state(
                 names = sorted(_sha256_hex(item.encode()) for item in set(parts))
     is_command = hook_type is None or hook_type == "command"
     if_ok = condition is None or event_name in _IF_TOOL_EVENTS
-    known = event_name in _KNOWN_EVENTS or not event_name
+    known = event_name in known_events
     runs_command = is_command and if_ok and known
     return _rec(
         matcher_digest=digest,
@@ -1276,6 +1317,9 @@ def _inspect_hooks_and_preambles(
             if cfg_path.startswith(".claude/")
             else doc.get("disableAllHooks") is True
         )
+        known_events = (
+            _CURSOR_HOOK_EVENTS if cfg_path.startswith(".cursor/") else _CLAUDE_HOOK_EVENTS
+        )
         for raw_event, cmd_str, matcher, hook_type, condition in _iter_hook_commands(doc):
             event_name, altered = _hook_event_key(raw_event)
             if altered:
@@ -1283,12 +1327,14 @@ def _inspect_hooks_and_preambles(
                     summary.gaps,
                     f"{cfg_path}: hook event '{event_name}' contains whitespace or non-printable characters",
                 )
-            if event_name not in _KNOWN_EVENTS:
+            if event_name not in known_events:
                 _add_gap(
                     summary.gaps,
                     f"{cfg_path}: unrecognized hook event '{_clean(raw_event)}'",
                 )
-            state = _hook_state(matcher, hook_type, condition, disabled, event_name)
+            state = _hook_state(
+                matcher, hook_type, condition, disabled, event_name, known_events=known_events
+            )
             summary.hook_commands.append(
                 _rec(
                     source_file=cfg_path,
