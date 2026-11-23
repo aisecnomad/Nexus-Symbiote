@@ -1709,13 +1709,14 @@ def _user_hits(previous: str | None, word: str, fetcher: bool) -> list[Hit]:
 
 
 _SET_COMMANDS = frozenset({"set", "@set", "setx"})
+_SETX_SWITCHES = frozenset({"/m", "-m"})
 
 
 def _set_command(word: str | None) -> bool:
-    """``set``, ``@set`` or ``setx``, with or without a Windows ``.exe`` suffix."""
+    """``set``, ``@set`` or ``setx``, with or without a path or Windows ``.exe`` suffix."""
     if not isinstance(word, str) or not word:
         return False
-    name = word.casefold()
+    name = posixpath.basename(word.replace("\\", "/")).casefold()
     if name.endswith(".exe"):
         name = name[:-4]
     return name in _SET_COMMANDS
@@ -1837,14 +1838,25 @@ def _cmd_set_word(previous: str | None, before_previous: str | None) -> bool:
     )
 
 
-def _set_value_hits(setter: str | None, name: str | None, value: str) -> list[Hit]:
-    """``set NAME value`` and ``setx NAME value`` with no ``=``.
+def _set_value_hits(
+    setter: str | None,
+    name: str | None,
+    value: str,
+    *,
+    before_setter: str | None = None,
+) -> list[Hit]:
+    """``set NAME value`` and ``setx [/M] NAME value`` with no ``=``.
 
     cmd and ``setx`` both accept the value as the next word. A credential-named
     variable's value is committed even when the command spells no equals sign.
     """
+    is_setter = _set_command(setter) or (
+        isinstance(setter, str)
+        and setter.casefold() in _SETX_SWITCHES
+        and _set_command(before_setter)
+    )
     if (
-        not _set_command(setter)
+        not is_setter
         or not isinstance(name, str)
         or not name
         or "=" in name
@@ -1889,6 +1901,7 @@ def _argument_hits(
     *,
     cmd: bool = False,
     before_previous: str | None = None,
+    two_before_previous: str | None = None,
     skipped_operand: str | None = None,
 ) -> list[Hit]:
     """The hits of a launch argument.
@@ -1909,7 +1922,9 @@ def _argument_hits(
                 fetcher,
                 in_set=cmd and _cmd_set_word(previous, before_previous),
             ),
-            *_set_value_hits(before_previous, previous, argument),
+            *_set_value_hits(
+                before_previous, previous, argument, before_setter=two_before_previous
+            ),
         ]
         if (
             following is not None
@@ -1933,7 +1948,12 @@ def _argument_hits(
         start = cmd and _cmd_set_word(around[index - 1], around[index - 2] if index > 1 else None)
         hits.extend(_word_hits(around[index - 1], word, around[index + 1], fetcher, in_set=start))
         hits.extend(
-            _set_value_hits(around[index - 2] if index > 1 else None, around[index - 1], word)
+            _set_value_hits(
+                around[index - 2] if index > 1 else None,
+                around[index - 1],
+                word,
+                before_setter=around[index - 3] if index > 2 else None,
+            )
         )
     return hits
 
@@ -1966,8 +1986,9 @@ def _credential_hits(
     cmd = isinstance(command, str) and posixpath.basename(
         command.replace("\\", "/")
     ).casefold() in {"cmd", "cmd.exe"}
+    two_before: str | None = None
     before_previous: str | None = None
-    previous: str | None = None
+    previous: str | None = command if isinstance(command, str) and _set_command(command) else None
     for index, argument in enumerate(args, start=1):
         if isinstance(argument, str):
             after = args[index] if index < len(args) else None
@@ -1984,10 +2005,15 @@ def _credential_hits(
                     following,
                     cmd=cmd,
                     before_previous=before_previous,
+                    two_before_previous=two_before,
                     skipped_operand=skipped,
                 ),
             )
-        before_previous, previous = previous, argument if isinstance(argument, str) else None
+        two_before, before_previous, previous = (
+            before_previous,
+            previous,
+            argument if isinstance(argument, str) else None,
+        )
     headers = [item for mapping in header_maps for item in mapping.items()]
     for name, value in sorted(headers, key=lambda item: item[0]):
         hits = _name_hits(name)

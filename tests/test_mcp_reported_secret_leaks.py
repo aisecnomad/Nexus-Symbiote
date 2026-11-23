@@ -255,3 +255,20 @@ def test_padded_secret_or_path_command_does_not_leak_into_unkeyed_hash(
         return server["properties"]["static_config_hash"]
 
     assert digest("a", first) == digest("b", second)
+
+
+@pytest.mark.parametrize(
+    ("command", "args"),
+    [
+        ("setx", ["API_TOKEN", SECRET]),
+        ("setx", ["/M", "API_TOKEN", SECRET]),
+        ("C:\\Windows\\System32\\setx.exe", ["/M", "API_TOKEN", SECRET]),
+        ("cmd", ["/c", f"setx /M API_TOKEN {SECRET}"]),
+        ("cmd", ["/c", "setx", "/M", "API_TOKEN", SECRET]),
+    ],
+)
+def test_setx_command_and_machine_flag_withhold_credential(
+    tmp_path: Path, command: str, args: list[str]
+) -> None:
+    bad = {"command": command, "args": args}
+    assert SECRET not in _mcp(tmp_path, bad, SECRET)
