@@ -1076,3 +1076,31 @@ def test_required_approvals_are_visible_on_unverified_flow_legs():
     assert all(
         not leg["approval_enforcement_verified"] and not leg["gated"] for leg in flow.evidence
     )
+
+
+def _named_trifecta(*names: str) -> list[str]:
+    tools = [ToolComponent(bom_ref=f"tool:{name}", name=name) for name in names]
+    report = analyze_trifecta(AIBOM(components=tools))
+    return [f.kind for f in report.findings if f.kind == "lethal_trifecta"]
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        # Plurals and digit suffixes of names the legs already list.
+        ("read_emails", "read_files", "send_emails"),
+        ("fetch_url", "read_file", "send_email2"),
+        # The reference MCP servers' own tool names.
+        ("browser_navigate", "read_text_file", "slack_post_message"),
+        ("get_webpage", "read_document", "post_to_channel"),
+        ("get_issue", "read_multiple_files", "create_pull_request"),
+        ("fetch", "query", "add_issue_comment"),
+    ],
+)
+def test_reference_and_plural_tool_names_reach_every_leg(names: tuple[str, ...]) -> None:
+    assert _named_trifecta(*names) == ["lethal_trifecta"]
+
+
+def test_ordinary_names_without_the_three_legs_stay_clean() -> None:
+    assert _named_trifecta("get_time", "list_timezones", "convert_units") == []
+    assert _named_trifecta("browser_navigate", "get_time", "slack_post_message") == []

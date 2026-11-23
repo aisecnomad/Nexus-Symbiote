@@ -181,12 +181,19 @@ _URL_FETCH_NAMES = (
     r"scrape|scrape_url|crawl|browse|browser|web_browse|http_get|curl|download|"
     r"download_url|read_web"
 )
-_URL_FETCH_TOOL_RE = re.compile(rf"(?:^|_)(?:{_URL_FETCH_NAMES})(?:$|_)")
+# The end of a leg name: an optional plural and digit suffix (`read_emails`, `send_email2`),
+# then the end of the name or the next word.
+_LEG_END = r"(?:e?s)?[0-9]*(?:$|_)"
+_URL_FETCH_TOOL_RE = re.compile(rf"(?:^|_)(?:{_URL_FETCH_NAMES}){_LEG_END}")
 _UNTRUSTED_TOOL_RE = re.compile(
     r"(?:^|_)(?:" + _URL_FETCH_NAMES + r"|web_search|search_web|external_read|"
     r"read_email|fetch_email|get_email|list_emails|read_issue|read_pr|"
-    r"read_comment|read_message|read_slack|read_webhook|receive_webhook"
-    r")(?:$|_)"
+    r"read_comment|read_message|read_slack|read_webhook|receive_webhook|"
+    # Reference MCP servers' readers of content someone else wrote.
+    r"get_webpage|fetch_webpage|read_webpage|navigate|get_issue|list_issue|search_issue|"
+    r"get_pull_request|list_pull_request|get_message|list_message|read_channel|"
+    r"read_inbox|search_email"
+    r")" + _LEG_END
 )
 _UNTRUSTED_DESC_RE = re.compile(
     r"(?:^|_)(?:fetch_external|web_page|web_pages|scrape|crawl|browse_web|"
@@ -202,8 +209,11 @@ _PRIVATE_TOOL_RE = re.compile(
     r"db_query|query_db|sql_query|run_sql|execute_sql|read_db|"
     r"customer_data|private_data|internal_doc|internal_docs|"
     r"read_email|list_emails|get_email|read_drive|read_s3|get_object|"
-    r"read_config|read_ssh|read_key|private_key"
-    r")(?:$|_)"
+    r"read_config|read_ssh|read_key|private_key|"
+    # Reference MCP servers' readers of local or private data.
+    r"read_text_file|read_media_file|read_multiple_file|directory_tree|read_document|"
+    r"get_document|read_note|get_note|query|read_record|get_record|read_table|read_query"
+    r")" + _LEG_END
 )
 _EGRESS_TOOL_RE = re.compile(
     r"(?:^|_)(?:"
@@ -211,8 +221,11 @@ _EGRESS_TOOL_RE = re.compile(
     r"send_message|post_message|post_slack|slack_post|send_report|send_data|"
     r"http_post|http_put|http_patch|http_delete|http_request|post_data|upload|publish|"
     r"notify|write_file|delete_file|exec|execute|shell|bash|run_command|eval|run_code|"
-    r"git_push|create_pr|create_issue"
-    r")(?:$|_)"
+    r"git_push|create_pr|create_issue|"
+    # Reference MCP servers' writers that reach other people or systems.
+    r"post_to_channel|reply_to_thread|create_pull_request|push_file|add_issue_comment|"
+    r"create_comment|add_comment|edit_file|move_file|create_or_update_file|send_dm"
+    r")" + _LEG_END
 )
 
 # Token sets for static MCP server launcher packages and declared server names.
