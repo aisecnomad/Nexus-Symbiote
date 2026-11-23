@@ -47,6 +47,7 @@ from nexus_symbiote.scanners.mcp import (
 )
 from nexus_symbiote.scanners.source_binding import BindingError, value_binding
 from nexus_symbiote.settings_precedence import (
+    _VERSIONED_INTERPRETER,
     evaluate_tool_oversight,
     extract_bounded_deny_rules,
     extract_bounded_sandbox_domains,
@@ -279,7 +280,6 @@ _COMMAND_RUNNERS = frozenset(
         "docker", "podman", "nerdctl", "npx", "bunx", "uvx", "uv", "pipx",
     }
 )  # fmt: skip
-_VERSIONED_INTERPRETER = re.compile(r"(?:python|pypy|ruby|php|perl|node)[0-9.]*")
 
 
 _RULE_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=\S*")
@@ -336,6 +336,8 @@ def _runs_any_command(program: str, arguments: str, wildcard: bool = False) -> b
     if " " in name and _EVAL_ARGUMENT.match(arguments):
         # A locally named interpreter such as "my python.exe" with an evaluation switch.
         name = name.rsplit(" ", 1)[-1]
+    # `Bash(python3*)` approves every python3 invocation, as `Bash(python3:*)` does.
+    name = name.rstrip("*")
     return name in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(name) is not None
 
 
@@ -356,10 +358,18 @@ def _broad_grants(allowed: list[str]) -> list[str]:
             specifier = rest[:-1].strip()
         key = tool.lower()
         if key.startswith("mcp__"):
+            # A whole-server rule is reported as a blanket grant. Its class carries no
+            # trifecta leg: Claude Code honours an allow glob only after a literal
+            # `mcp__<server>__` prefix and skips an unanchored one such as `mcp__*` or
+            # `mcp__*__*`, which auto-approves nothing (code.claude.com/docs/en/permissions,
+            # "Tool name wildcards"), and a single server's tools are its own declared ones.
             server = key.removeprefix("mcp__")
             whole_server = "__" not in server or server.endswith("__*")
             if server in {"", "*"} or (whole_server and specifier in (None, "", "*")):
                 classes.add("MCP server tools")
+            continue
+        if "*" in key or "?" in key:
+            # An unanchored allow glob such as `B*` or `Ba*(node:*)` is skipped too.
             continue
         broad = specifier is None or bool(_WILDCARD_SPECIFIER.fullmatch(specifier))
         if key == "bash" and specifier is not None:
@@ -883,19 +893,13 @@ _GROUP_ENDS = frozenset(_GROUP_KEYWORDS.values())
 _RESERVED_PREFIXES = frozenset({"if", "while", "until", "then", "do", "else", "elif"})
 
 
-def _command_pipelines(command: str, *, piped_groups: bool = False) -> list[list[str]]:
-    """Pipelines in ``command``.
+def _split_pipelines(
+    command: str, *, respect_quotes: bool, piped_groups: bool = False
+) -> list[list[str]]:
+    """Pipelines in ``command``, as ``_command_pipelines`` describes.
 
-    ``|`` and ``|&`` separate segments of one pipeline. A newline after either stays
-    in that pipeline, as the shell reads it. ``||`` does not: it is a logical or, as
-    ``&&``, ``;``, a newline elsewhere and a background ``&`` are command separators.
-    ``>&``, ``<&`` and ``&>`` stay inside a segment.
-
-    With ``piped_groups``, a group or compound command that a pipe feeds (`{ ...; }`,
-    `( ... )`, `if`/`while`/`until`/`for`/`select`/`case`) passes the pipe to every
-    command inside it, so those commands stay later segments of the same pipeline
-    instead of starting new ones: `curl x | { true; sh; }` runs the download in `sh`.
-    The group is read lexically, so this view can only add segments after a pipe.
+    With ``respect_quotes``, a separator inside quotes or after a backslash stays in
+    its segment; quoted text is never read as a group's opener or closer.
     """
     pipelines: list[list[str]] = []
     segments: list[str] = []
@@ -944,6 +948,8 @@ def _command_pipelines(command: str, *, piped_groups: bool = False) -> list[list
     def pop() -> None:
         fed[0] -= groups.pop()[1]
 
+    quote = ""
+
     def flush_segment() -> None:
         segments.append("".join(buf))
         buf.clear()
@@ -960,6 +966,27 @@ def _command_pipelines(command: str, *, piped_groups: bool = False) -> list[list
             segment_start[0], segment_start[1] = index, False
         char = command[index]
         nxt = command[index + 1] if index + 1 < length else ""
+        if respect_quotes:
+            if quote:
+                buf.append(char)
+                if char == quote:
+                    quote = ""
+                elif quote == '"' and char == "\\" and index + 1 < length:
+                    buf.append(nxt)
+                    index += 2
+                    continue
+                index += 1
+                continue
+            if char in "'\"":
+                quote = char
+                buf.append(char)
+                index += 1
+                continue
+            if char == "\\" and nxt not in {"", "\n", "\r"}:
+                buf.append(char)
+                buf.append(nxt)
+                index += 2
+                continue
         if piped_groups:
             if char == "$" and nxt == "(" or char in "<>" and nxt == "(":
                 push(")", False)
@@ -1027,6 +1054,23 @@ def _command_pipelines(command: str, *, piped_groups: bool = False) -> list[list
         index += 1
     flush_command()
     return pipelines
+
+
+def _command_pipelines(command: str, *, piped_groups: bool = False) -> list[list[str]]:
+    """Pipelines in ``command``.
+
+    ``|`` and ``|&`` separate segments of one pipeline. A newline after either stays
+    in that pipeline, as the shell reads it. ``||`` does not: it is a logical or, as
+    ``&&``, ``;``, a newline elsewhere and a background ``&`` are command separators.
+    ``>&``, ``<&`` and ``&>`` stay inside a segment.
+
+    With ``piped_groups``, a group or compound command that a pipe feeds (`{ ...; }`,
+    `( ... )`, `if`/`while`/`until`/`for`/`select`/`case`) passes the pipe to every
+    command inside it, so those commands stay later segments of the same pipeline
+    instead of starting new ones: `curl x | { true; sh; }` runs the download in `sh`.
+    The group is read lexically, so this view can only add segments after a pipe.
+    """
+    return _split_pipelines(command, respect_quotes=False, piped_groups=piped_groups)
 
 
 def _skip_pipe_gap(command: str, index: int) -> int:
@@ -1382,7 +1426,7 @@ def _name_variants(word: str) -> set[str]:
     return names
 
 
-_SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+_SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]\s]+\])?\+?=")
 
 
 # How many words one assignment's substitution is followed across.
@@ -1436,31 +1480,89 @@ def _assignment_end(words: list[str], index: int) -> int:
     return index + 1
 
 
-_ENV_LONG_VALUES = frozenset({"--unset", "--chdir", "--split-string"})
+_ENV_LONG_VALUES = frozenset({"--unset", "--chdir"})
+_ENV_SPLIT = frozenset({"--split-string"})
 
 
-def _skip_env(words: list[str], index: int) -> int:
+def _unwrap_env_split_string(payload: str, depth: int) -> list[str]:
+    """Split and unwrap the command and arguments carried inside ``env -S`` / ``--split-string``."""
+    if depth >= 4:
+        return []
+    inner = _decode_word(payload, drop_ifs=True)
+    parts = _shell_words(inner)
+    if not parts:
+        return []
+    pos = _skip_env(parts, 0, depth=depth + 1)
+    return parts[pos:]
+
+
+def _skip_env(
+    words: list[str],
+    index: int,
+    *,
+    depth: int = 0,
+    orig: list[int] | None = None,
+) -> int:
+    def _splice(start: int, stop: int, replacement: list[str]) -> int:
+        words[start:stop] = replacement
+        if orig is not None:
+            slot = orig[stop - 1]
+            orig[start:stop] = [slot] * len(replacement)
+        return start
+
     while index < len(words):
         word = _decode_word(words[index], drop_ifs=True)
         if word == "--":
             index += 1
             break
-        if word in {"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}:
+        if word in {"-", "-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}:
             index += 1
             continue
-        if word in {"-u", "-C", "-S"}:
+        if word in {"-u", "-C"}:
             index += 2
             continue
-        if (
-            word.startswith("--")
-            and "=" in word
-            and _long_value_option(word.partition("=")[0], _ENV_LONG_VALUES)
-        ):
+        option, eq, value = word.partition("=")
+        # getopt_long takes any unambiguous prefix: `--split S` is `--split-string S`.
+        splits = word == "-S" or _long_value_option(option, _ENV_SPLIT)
+        if splits and eq:
+            unwrapped = _unwrap_env_split_string(value, depth)
+            if unwrapped:
+                return _splice(index, index + 1, unwrapped)
             index += 1
             continue
-        if _long_value_option(word, _ENV_LONG_VALUES):
+        if splits:
+            if index + 1 < len(words):
+                unwrapped = _unwrap_env_split_string(words[index + 1], depth)
+                if unwrapped:
+                    return _splice(index, index + 2, unwrapped)
             index += 2
             continue
+        if _long_value_option(option, _ENV_LONG_VALUES):
+            index += 1 if eq else 2
+            continue
+        if word.startswith("-") and not word.startswith("--") and len(word) > 1:
+            bundle = re.fullmatch(r"-([i0v]*)([uCS])(.*)", word)
+            if bundle is not None:
+                flag, attached = bundle.group(2), bundle.group(3)
+                if flag == "S":
+                    if attached:
+                        unwrapped = _unwrap_env_split_string(attached, depth)
+                        if unwrapped:
+                            return _splice(index, index + 1, unwrapped)
+                        index += 1
+                    else:
+                        if index + 1 < len(words):
+                            unwrapped = _unwrap_env_split_string(words[index + 1], depth)
+                            if unwrapped:
+                                return _splice(index, index + 2, unwrapped)
+                        index += 2
+                else:
+                    index += 1 if attached else 2
+                continue
+            if re.fullmatch(r"-[i0v]+", word):
+                index += 1
+                continue
+            return index
         if word.startswith("-"):
             return index
         break
@@ -1522,7 +1624,7 @@ def _skip_exec(words: list[str], index: int) -> int:
         word = _decode_word(words[index], drop_ifs=True)
         if word == "--":
             return index + 1
-        if word in {"-a", "--argv0"}:
+        if word in {"-a", "--argv0"} or re.fullmatch(r"-[cl]*a", word):
             index += 2
             continue
         if word.startswith("-"):
@@ -1535,6 +1637,7 @@ def _skip_exec(words: list[str], index: int) -> int:
 # Programs that run the command after their options and a fixed number of operands:
 # the options that take a value, and how many operands come before the command.
 _WRAPPERS: dict[str, tuple[frozenset[str], int]] = {
+    "builtin": (frozenset(), 0),
     "nohup": (frozenset(), 0),
     "setsid": (frozenset(), 0),
     "time": (frozenset({"-f", "--format", "-o", "--output"}), 0),
@@ -1722,7 +1825,7 @@ def _executable_index(
     while cur < len(argv):
         names = _name_variants(argv[cur])
         if "env" in names:
-            cur = _skip_env(argv, cur + 1)
+            cur = _skip_env(argv, cur + 1, orig=orig)
             continue
         wrapper = next(iter(names & _WRAPPERS.keys()), None)
         if wrapper is not None:
@@ -1974,14 +2077,44 @@ def _sudo_shell(words: list[str]) -> bool:
     return False
 
 
+_MAX_ENV_WRAPPERS = 32
+
+
+def _expand_env_words(words: list[str]) -> list[str] | None:
+    """``words`` with each ``env`` wrapper's payload spliced in, or ``None`` past the budget.
+
+    An ``env`` wrapper left unexpanded could hide a download, so the callers treat
+    ``None`` as one rather than rate the command by the words they could see.
+    """
+    if not any("env" in _name_variants(word) for word in words):
+        return words
+    expanded = list(words)
+    idx = 0
+    steps = 0
+    while idx < len(expanded):
+        if "env" in _name_variants(expanded[idx]):
+            if steps >= _MAX_ENV_WRAPPERS:
+                return None
+            nxt = _skip_env(expanded, idx + 1)
+            idx = nxt if nxt > idx else idx + 1
+            steps += 1
+        else:
+            idx += 1
+    return expanded
+
+
 def _segment_downloads(segment: str) -> bool:
-    return any(_name_variants(word) & _DOWNLOAD_NAMES for word in _shell_words(segment))
+    words = _expand_env_words(_shell_words(segment))
+    return words is None or any(_name_variants(word) & _DOWNLOAD_NAMES for word in words)
 
 
 def _segment_fetches(segment: str) -> bool:
     """Whether a word downloads, or `base64` is given a decode flag among its arguments."""
+    words = _expand_env_words(_shell_words(segment))
+    if words is None:
+        return True
     decoder = False
-    for word in _shell_words(segment):
+    for word in words:
         names = _name_variants(word)
         if names & _DOWNLOAD_NAMES:
             return True
@@ -2714,8 +2847,14 @@ def _fetch_exec(command: str) -> bool:
     pipelines = _command_pipelines(command)
     if _substitution_exec(pipelines) or _download_then_run(pipelines):
         return True
+    pipe_views = pipelines
+    if any(ch in command for ch in "'\"\\"):
+        seen = {tuple(p) for p in pipelines}
+        extra = [p for p in _split_pipelines(command, respect_quotes=True) if tuple(p) not in seen]
+        if extra:
+            pipe_views = [*pipelines, *extra]
     # A group a pipe feeds passes it on to every command inside it.
-    for segments in [*pipelines, *_command_pipelines(command, piped_groups=True)]:
+    for segments in [*pipe_views, *_command_pipelines(command, piped_groups=True)]:
         # One forward pass: a fetch and an executor later in the same pipeline.
         fetched = False
         for segment in segments:
@@ -2873,6 +3012,7 @@ def _computed_powershell(segment: str) -> int | None:
     if re.search(r"[a-z]{2}", literal) is None and not any(
         len(flag.group().lstrip("\"'‘’“”\\^`-/–—―")) > 2
         or (position + 1 < len(words) and _encoded_payload(words[position + 1]))
+        or (":" in words[position] and _encoded_payload(words[position].split(":", 1)[1]))
         for position in range(index + 1, len(words))
         if (flag := _ENCODED_COMMAND.match(segment, spans[position][0])) is not None
     ):
@@ -3507,6 +3647,48 @@ class IDEAgentScanner(Scanner):
             properties["tool_human_in_the_loop_total"] = tool_total
             properties["tool_human_in_the_loop_truncated"] = True
         risks.extend(oversight_risks)
+        if len(layers) > 1:
+            merged_gap_keys = {
+                risk.detail.split(" in '", 1)[0]
+                for risk in oversight_risks
+                if risk.category == "oversight_gap"
+            }
+            overridden_gaps: dict[str, tuple[RiskAssessment, list[str]]] = {}
+            for relative, data in layers.items():
+                raw_layer_rules = data.get("permissions")
+                layer_rules: dict[str, Any] = (
+                    raw_layer_rules if isinstance(raw_layer_rules, dict) else {}
+                )
+                raw_layer_mode = layer_rules.get("defaultMode")
+                layer_mode = raw_layer_mode if isinstance(raw_layer_mode, str) else None
+                layer_raw_always = data.get("alwaysAllow") or layer_rules.get("alwaysAllow")
+                layer_always: Iterable[str] = (
+                    layer_raw_always if isinstance(layer_raw_always, (str, list)) else ()
+                )
+                _, layer_oversight, _, _ = evaluate_tool_oversight(
+                    layer_rules,
+                    always_allow=layer_always,
+                    approval_policy=layer_mode,
+                    source_name=relative,
+                    text_formatter=_safe_projected_text,
+                )
+                for layer_risk in layer_oversight:
+                    if layer_risk.category != "oversight_gap":
+                        continue
+                    key = layer_risk.detail.split(" in '", 1)[0]
+                    if key in merged_gap_keys:
+                        continue
+                    existing = overridden_gaps.get(key)
+                    if existing is None:
+                        overridden_gaps[key] = (layer_risk, [relative])
+                    elif relative not in existing[1]:
+                        existing[1].append(relative)
+            for layer_risk, layer_files in overridden_gaps.values():
+                risks.append(
+                    layer_risk.model_copy(
+                        update={"detail": f"{layer_risk.detail}{_overridden(layer_files)}"}
+                    )
+                )
         hook_commands = 0
         hook_severity: RiskSeverity | None = None
         # Auto-run settings and credential helpers run without an agent event, as hooks do.
@@ -3585,6 +3767,26 @@ class IDEAgentScanner(Scanner):
             if any(data.get(key) is not None and merged.get(key) is None for key in helpers)
         ]
         helper_note = _overridden(overridden_helpers) if overridden_helpers else ""
+        plugin_layers = [
+            relative
+            for relative, data in layers.items()
+            if _count(data.get("enabledPlugins")) or _count(data.get("extraKnownMarketplaces"))
+        ]
+        plugin_note = (
+            _overridden(plugin_layers)
+            if plugin_layers
+            and not (declared["enabled_plugins"] or declared["extra_known_marketplaces"])
+            else ""
+        )
+        dir_layers = [
+            relative
+            for relative, data in layers.items()
+            if isinstance(data.get("permissions"), dict)
+            and _count(data["permissions"].get("additionalDirectories"))
+        ]
+        dir_note = (
+            _overridden(dir_layers) if dir_layers and not declared["additional_directories"] else ""
+        )
         for category, severity, present, detail in (
             (
                 "mcp_auto_approval",
@@ -3602,19 +3804,24 @@ class IDEAgentScanner(Scanner):
             (
                 "plugin_sources",
                 RiskSeverity.LOW,
-                bool(declared["enabled_plugins"] or declared["extra_known_marketplaces"]),
+                bool(plugin_layers),
                 "enables plugins or registers plugin marketplaces, which can add commands, "
                 "agents, hooks and MCP servers",
             ),
             (
                 "additional_directories",
                 RiskSeverity.LOW,
-                bool(declared["additional_directories"]),
+                bool(dir_layers),
                 "grants access to directories outside the project",
             ),
         ):
             if present:
-                note = {"mcp_auto_approval": approval_note, "credential_helper": helper_note}
+                note = {
+                    "mcp_auto_approval": approval_note,
+                    "credential_helper": helper_note,
+                    "plugin_sources": plugin_note,
+                    "additional_directories": dir_note,
+                }
                 risks.append(
                     RiskAssessment(
                         severity=severity,

@@ -214,6 +214,8 @@ def test_group_tracking_stays_linear(make):
         _FETCH + "chroot --users root / sh",
         _FETCH + "env --uns X sh",
         _FETCH + "env --ch / sh",
+        _FETCH + "env --split 'sh -e'",
+        _FETCH + "env --sp='sh'",
         _FETCH + "flock --time 1 ./l sh",
         _FETCH + "script -q --comm=sh /dev/null",
         # With no `-c`, script runs the user's shell on its standard input.
