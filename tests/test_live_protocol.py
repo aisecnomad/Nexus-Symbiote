@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import jsonschema.exceptions
 import pytest
 from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
@@ -267,7 +268,7 @@ def test_quadratic_unique_items_schemas_are_refused_before_checking():
     ],
     ids=["prefix-items", "all-of", "properties", "nested-dependencies"],
 )
-def test_invalid_dependency_subschemas_are_refused_at_their_first_error(make_inner):
+def test_invalid_dependency_subschemas_are_refused_at_their_first_error(make_inner, monkeypatch):
     replies = {
         scale: rpc_result(
             2,
@@ -282,6 +283,19 @@ def test_invalid_dependency_subschemas_are_refused_at_their_first_error(make_inn
 
     # The metaschema's anyOf listed every error of such a subschema: seconds each.
     assert scaling_ratio(run) < 10
+
+    # That cost is linear in the subschema, so no growth ratio sees it come back. Count
+    # the errors instead: one refusal builds a few, the whole-object anyOf one per item.
+    built = [0]
+    init = jsonschema.exceptions.ValidationError.__init__
+
+    def counting(self: jsonschema.exceptions.ValidationError, *args: Any, **kwargs: Any) -> None:
+        built[0] += 1
+        init(self, *args, **kwargs)
+
+    monkeypatch.setattr(jsonschema.exceptions.ValidationError, "__init__", counting)
+    run(4)
+    assert built[0] < 64
 
 
 SCHEMA_LEAVES = st.booleans() | st.fixed_dictionaries(
