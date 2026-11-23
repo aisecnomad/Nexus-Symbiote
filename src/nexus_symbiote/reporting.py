@@ -388,7 +388,8 @@ def validation_report_lines(
     if completeness.get("status") == "skipped":
         lines.append(("  SKIPPED by explicit policy", "yellow"))
     else:
-        status = neutralize(completeness.get("status", "unknown")).upper()
+        # Case mapping first: upper() can turn a neutralized "##vſo[" into "##VSO[".
+        status = neutralize(str(completeness.get("status", "unknown")).upper())
         lines.append((f"  Status: {status}", status_color.get(status)))
         if "assessment_basis" in completeness:
             lines.append((safe_line("  Basis: ", completeness["assessment_basis"]), None))
@@ -425,7 +426,7 @@ def validation_report_lines(
         else:
             lines.append(("  SKIPPED by explicit policy", "yellow"))
     else:
-        status = neutralize(integrity.get("status", "unknown")).upper()
+        status = neutralize(str(integrity.get("status", "unknown")).upper())
         lines.append((f"  Status: {status}", status_color.get(status)))
         verified = _shown(integrity.get("hashes_verified"))
         failed = _shown(integrity.get("hashes_failed"))

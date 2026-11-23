@@ -1038,7 +1038,7 @@ def check_served_tool(raw: Any, secrets: Iterable[str] = ()) -> CheckedDescripto
         display=display,
         # Field names are controlled by the server too. Keep the original names
         # only in the digest above; reporting them verbatim can disclose a bearer
-        # token or session ID echoed as an extension key.
+        # token echoed as an extension key.
         unprofiled_fields=tuple(redact_text(key, secrets) for key in unprofiled),
         unprofiled_hash=unprofiled_hash,
         display_differs=display != raw,

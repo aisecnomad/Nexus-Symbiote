@@ -87,6 +87,7 @@ MODEL_EXTENSIONS = {
     ".pkl": ("pickle", "pickle"),
     ".pck": ("pickle", "pickle"),
     ".dill": ("pickle", "dill"),
+    ".cloudpickle": ("pickle", "cloudpickle"),
     ".joblib": ("joblib", "scikit-learn"),
     ".gguf": ("gguf", "llama.cpp"),
     ".ggml": ("ggml", "llama.cpp-legacy"),
@@ -273,6 +274,7 @@ _UNSAFE_SUFFIXES = {
     ".pkl",
     ".pck",
     ".dill",
+    ".cloudpickle",
     ".pt",
     ".pth",
     ".bin",
@@ -280,8 +282,11 @@ _UNSAFE_SUFFIXES = {
     ".ckpt",
     ".pdparams",
 }
-# Archive and compression suffixes do not change what a pickle loader unpickles.
-_PICKLE_WRAPPERS = {".tar", ".gz", ".bz2", ".xz", ".lzma", ".zst"}
+# Archive and compression suffixes do not change what a pickle loader unpickles. joblib
+# picks zlib for ".z" and LZ4 for ".lz4" by name, and pandas infers ".zip" and ".tar.*".
+_PICKLE_WRAPPERS = {".tar", ".gz", ".bz2", ".xz", ".lzma", ".zst", ".z", ".lz4", ".zip"}
+# "frame.pkl.tar.gz" wraps a pickle twice; no loader unwraps a third layer by name.
+_MAX_PICKLE_WRAPPERS = 2
 _TEXT_PICKLE_START = frozenset(b"(cNILFSV}])KJMUTX")
 # Bytes that start an opcode: pickle.load reads a pickle that starts with any of them.
 _OPCODE_BYTES = frozenset(opcode.code.encode("latin-1")[0] for opcode in pickletools.opcodes)
@@ -347,11 +352,12 @@ _SOURCE_SUFFIXES = frozenset({".py", ".jinja", ".jinja2"})
 
 def _pickle_family(path: PurePath) -> bool:
     suffixes = [suffix.lower() for suffix in path.suffixes]
-    if suffixes and suffixes[-1] in _UNSAFE_SUFFIXES:
-        return True
-    return (
-        len(suffixes) > 1 and suffixes[-1] in _PICKLE_WRAPPERS and suffixes[-2] in _UNSAFE_SUFFIXES
-    )
+    for suffix in reversed(suffixes[-1 - _MAX_PICKLE_WRAPPERS :]):
+        if suffix in _UNSAFE_SUFFIXES:
+            return True
+        if suffix not in _PICKLE_WRAPPERS:
+            return False
+    return False
 
 
 def _content_candidate(path: Path) -> bool:
@@ -536,12 +542,13 @@ def _pickle_member(name: bytes) -> bool:
     ``zipfile`` cuts a name at its first NUL, so that name is matched as well.
     """
     for text in {name.decode("latin-1").lower(), name.split(b"\0")[0].decode("latin-1").lower()}:
-        if text.endswith(tuple(_UNSAFE_SUFFIXES)) or any(
-            text.endswith(unsafe + wrapper)
-            for unsafe in _UNSAFE_SUFFIXES
-            for wrapper in _PICKLE_WRAPPERS
-        ):
-            return True
+        for _ in range(_MAX_PICKLE_WRAPPERS + 1):
+            if text.endswith(tuple(_UNSAFE_SUFFIXES)):
+                return True
+            wrapper = next((w for w in _PICKLE_WRAPPERS if text.endswith(w)), None)
+            if wrapper is None:
+                break
+            text = text[: -len(wrapper)]
     return False
 
 

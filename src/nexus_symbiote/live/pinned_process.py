@@ -30,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import ctypes
+import errno
 import hashlib
 import os
 import re
@@ -251,14 +252,6 @@ def isolation_off() -> Iterator[None]:
         yield
     finally:
         _ISOLATION.reset(token)
-
-
-def teardown_verifiable() -> bool:
-    """Whether the configured mode can support verified cleanup if its prerequisites hold.
-
-    Only the receipt from terminate_process_group confirms an individual launch.
-    """
-    return isolation_enabled() or sys.platform.startswith("linux")
 
 
 def stage_pinned_executable(command: str, digest: str, work: Path) -> Path:
@@ -943,8 +936,14 @@ def _cgroup_kill(path: Path) -> None:
 
 
 def _remove_cgroup(path: Path) -> None:
-    with contextlib.suppress(OSError):
-        path.rmdir()
+    for attempt in range(5):
+        try:
+            path.rmdir()
+            return
+        except OSError as exc:
+            if exc.errno != errno.EBUSY or attempt == 4:
+                return
+            time.sleep(0.02)
 
 
 def _proc_fields(pid: int) -> list[str] | None:
@@ -1180,13 +1179,14 @@ def terminate_process_group(proc: subprocess.Popen[bytes]) -> bool:
                 if seen == os.CLD_STOPPED:
                     _stop_tree(proc.pid)
                 _kill_descendants(proc.pid)
-            # Defense in depth after the sweep: the cgroup also holds a process that
-            # has left the wrapper's tree, as one does when the launcher kills its
-            # wrapper. Killing the cgroup first would orphan the tree before the walk.
-            if cgroup is not None:
-                _cgroup_kill(cgroup)
             if done is not None:
                 contained = _wrapper_contained(proc.pid, done, seen, stop)
+            # Defense in depth after the wrapper check: the cgroup also holds any
+            # process that left the wrapper's tree (or survived if the wrapper died).
+            # Killing the cgroup before _wrapper_contained would kill the wrapper
+            # before it can reap and confirm containment.
+            if cgroup is not None:
+                _cgroup_kill(cgroup)
             swept = True
         finally:
             if not swept and not namespaced:
@@ -1231,6 +1231,9 @@ def terminate_process_group(proc: subprocess.Popen[bytes]) -> bool:
                 with contextlib.suppress(OSError):
                     os.close(init)
         if cgroup is not None:
+            if not swept:
+                with contextlib.suppress(Exception):
+                    _cgroup_kill(cgroup)
             _remove_cgroup(cgroup)
         if stop:
             # killpg has normally killed it already. If cleanup failed before that, a

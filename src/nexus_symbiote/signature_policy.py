@@ -179,8 +179,9 @@ def _read_policy(policy_path: Path, root: Path) -> tuple[bytes, str]:
         "every repository that holds it"
     )
     # A change under review can edit any file of the repository that holds the project,
-    # including a superproject's policy and gitlink, so none may gate itself.
-    untrusted = [root, *_repository_roots(root)]
+    # including a superproject's policy and gitlink, so none may gate itself. The checkout
+    # the command runs from is a change under review too, as for the operator policy.
+    untrusted = [root, *_repository_roots(root), *_repository_roots(Path.cwd().resolve())]
     resolved = policy_path.resolve()
     if any(resolved.is_relative_to(directory) for directory in untrusted):
         raise SignaturePolicyError(inside)

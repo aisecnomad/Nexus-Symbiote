@@ -2888,15 +2888,3 @@ def test_a_survivor_whose_main_thread_exited_is_not_taken_for_ended(
     finally:
         monkeypatch.undo()
         _kill_marked(marker)
-
-
-@pytest.mark.parametrize(
-    ("platform", "opted_out", "verifiable"),
-    [("darwin", True, False), ("darwin", False, True), ("linux", True, True)],
-)
-def test_teardown_is_verifiable_unless_opted_out_where_descendants_cannot_be_listed(
-    platform: str, opted_out: bool, verifiable: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(pinned_process.sys, "platform", platform)
-    with isolation_off() if opted_out else contextlib.nullcontext():
-        assert pinned_process.teardown_verifiable() is verifiable

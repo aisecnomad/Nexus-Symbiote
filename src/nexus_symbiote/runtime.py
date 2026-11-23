@@ -95,6 +95,8 @@ U = TypeVar("U")
 
 REASONS: dict[str, str] = {
     "denied": "authorization evidence is incomplete or invalid",
+    "isolation-unavailable": "the pinned launcher's process isolation is unavailable",
+    "isolation-teardown-failed": "the launcher's processes could not be confirmed ended",
     "configuration-invalid": "gateway, signer or quorum configuration is invalid",
     "json-invalid": "input is not strict JSON",
     "json-not-object": "input must be a JSON object",
