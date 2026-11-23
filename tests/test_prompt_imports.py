@@ -427,9 +427,13 @@ def test_scan_memory_grows_with_the_files_not_with_the_paths_they_reference(tmp_
     # tracemalloc charges to whatever scan runs then. The measuring interpreter first
     # interns and holds strings until the table is rebuilt: the new table has room for at
     # least as many strings again as it holds, far more than the scans add.
+    # Strip pytest-cov hooks so the child measures PromptScanner's own tracemalloc peak
+    # without branch-coverage instrumentation multiplying runtime or charging tracer memory.
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("COV_CORE_", "COVERAGE"))}
     measured = subprocess.run(  # noqa: S603
         [sys.executable, "-c", _PEAKS, *map(str, roots)],
         cwd=tmp_path,
+        env=env,
         capture_output=True,
         check=True,
         text=True,
@@ -1366,3 +1370,98 @@ def test_unicode_kind7_nfa_matches_the_commonmark_grammar_exactly():
         expected = spec.match(sample, pos) is not None
         assert bool(matcher.match(sample, pos)) is expected, (sample, pos)
         assert markdown._match_unicode_kind7(sample, pos) is expected, (sample, pos)
+
+
+def test_atomic_ascii_and_marked_kind7_match_canonical_grammars():
+    import random
+
+    from nexus_symbiote.utils import markdown
+
+    ascii_ws = "[ \t\n\x0b\x0c\r]"
+    ascii_open = (
+        rf"<[A-Za-z][A-Za-z0-9-]*(?:{ascii_ws}+[a-zA-Z_:][a-zA-Z0-9:._-]*"
+        rf"(?:{ascii_ws}*={ascii_ws}*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?)*"
+        rf"{ascii_ws}*/?>"
+    )
+    ascii_close = rf"</[A-Za-z][A-Za-z0-9-]*{ascii_ws}*>"
+    canonical_ascii = re.compile(rf"(?:{ascii_open}|{ascii_close}){ascii_ws}*$")
+
+    js_ws = markdown._JS_WHITESPACE
+    raw = "script|pre|style|textarea"
+    marked_attr = (
+        r"(?: +[a-zA-Z:_][\w.:-]*"
+        rf"(?: *= *\"[^\"]*\"| *= *'[^']*'| *= *[^{js_ws}\"'=<>`]+)?)"
+    )
+    canonical_marked = re.compile(
+        rf"(?:<(?!{raw})[a-z][\w-]*{marked_attr}*? */?>(?=[ \t]*$)"
+        rf"|</(?!{raw})[a-z][\w-]*[{js_ws}]*(?:>[ \t]*)?$)",
+        re.I | re.A,
+    )
+
+    ascii_matcher = markdown._ASCII_HTML_BLOCK_STARTS[6]
+    marked_matcher = markdown._MARKED_HTML_BLOCK_STARTS[6]
+
+    fixed = [
+        "<a b=c/>",
+        "<a b=/>",
+        "<a b=c/ >",
+        "<a b= />",
+        "<a b=c//>",
+        "<a b='x'/>",
+        "<a b='x' />",
+        "<a b='x'c>",
+        '<a b="x"c>',
+        "<a b= >",
+        "<a b   >",
+        "<a b   =   c   />",
+        "<a b='x' d=\"y\" e=z/>",
+        "<a b=c\t>",
+        "<a b=c >\t",
+        "</a\xa0>\t",
+        "</a\xa0",
+        "<script a=b>",
+        "<pre a=b>",
+        "<a_b c=d>",
+        "<a b=c=d>",
+        "<a b=c`d>",
+    ]
+    for sample in fixed:
+        assert bool(ascii_matcher.match(sample, 0)) == (
+            canonical_ascii.match(sample, 0) is not None
+        ), sample
+        assert bool(marked_matcher.match(sample, 0)) == (
+            canonical_marked.match(sample, 0) is not None
+        ), sample
+
+    rng = random.Random(413)  # noqa: S311
+    prefixes = ("<a", "</a", "<pre", "<script", "<div", "<A_b", "<", "</", "")
+    alphabet = [
+        "a",
+        "0",
+        "_",
+        ":",
+        "-",
+        ".",
+        " ",
+        "\t",
+        "\n",
+        "\xa0",
+        "=",
+        "'",
+        '"',
+        "`",
+        "/",
+        ">",
+        "<",
+        "!",
+    ]
+    for _ in range(20_000):
+        lead = "x" * rng.randint(0, 2)
+        pos = len(lead)
+        sample = lead + rng.choice(prefixes) + "".join(rng.choices(alphabet, k=rng.randint(0, 12)))
+        assert bool(ascii_matcher.match(sample, pos)) == (
+            canonical_ascii.match(sample, pos) is not None
+        ), (sample, pos)
+        assert bool(marked_matcher.match(sample, pos)) == (
+            canonical_marked.match(sample, pos) is not None
+        ), (sample, pos)
