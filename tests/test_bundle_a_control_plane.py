@@ -1406,7 +1406,8 @@ def _guard_alerts(
         (_guard_settings(matcher="Bash,Edit"), None),
         (_guard_settings(matcher="Bash, Edit"), None),
         (_guard_settings(matcher=" Edit ,Bash|"), None),
-        (_guard_settings(matcher="Bash|"), None),
+        (_guard_settings(matcher="|"), None),
+        (_guard_settings(matcher="||"), None),
         (_guard_settings(matcher="my-tool"), None),
         (_guard_settings(matcher="Edit|Write"), None),
         (_guard_settings(matcher="Edit, Write"), None),
@@ -1430,7 +1431,9 @@ def test_baseline_diff_alerts_when_a_kept_hook_no_longer_runs(
         (_guard_settings(matcher="*"), None),
         (_guard_settings(matcher=""), None),
         (_guard_settings(matcher=None), None),
+        (_guard_settings(matcher="Bash|"), None),
         (_guard_settings(matcher="Bash|Edit"), None),
+        (_guard_settings(matcher="Edit|Bash|"), None),
         (_guard_settings(disableAllHooks=True), {"disableAllHooks": False}),
         (_guard_settings(disableAllHooks=False), None),
     ],
@@ -1510,8 +1513,8 @@ def test_if_on_tool_event_does_not_block_runs_command(tmp_path: Path) -> None:
     assert hook["if_digest"] is not None
 
 
-def test_unrecognized_event_reports_gap_and_blocks_runs_command(tmp_path: Path) -> None:
-    """Fix 3: an unrecognized event name reports a gap and sets ``runs_command`` False."""
+def test_unrecognized_event_reports_gap_and_diffs_runs_command(tmp_path: Path) -> None:
+    """An unrecognized event records a gap while keeping ``runs_command`` from type and if."""
     (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
     settings: dict[str, object] = {
         "hooks": {"MadeUpEvent": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}]}
@@ -1519,12 +1522,21 @@ def test_unrecognized_event_reports_gap_and_blocks_runs_command(tmp_path: Path) 
     _write_json(tmp_path / ".claude" / "settings.json", settings)
     summary = audit_project_control_plane(tmp_path)
     (hook,) = summary.hook_commands
-    assert hook["runs_command"] is False
-    assert any("unrecognized hook event" in g for g in summary.gaps)
+    assert hook["runs_command"] is True
+    assert any("unrecognized hook event 'MadeUpEvent'" in g for g in summary.gaps)
+
+    # Changing an unrecognized event's hook from command to prompt still diffs as removed.
+    prompt_settings: dict[str, object] = {
+        "hooks": {"MadeUpEvent": [{"hooks": [{"type": "prompt", "command": "./guard.sh"}]}]}
+    }
+    diff_dir = tmp_path / "diff"
+    diff_dir.mkdir()
+    causes = _guard_alerts(diff_dir, prompt_settings, baseline=settings)
+    assert {"hook_command_removed", "launch_target_removed"} <= causes
 
 
-def test_whitespace_event_name_is_unrecognized(tmp_path: Path) -> None:
-    """Fix 3: a trailing-space event name like 'PreToolUse ' is unrecognized."""
+def test_whitespace_event_name_is_unrecognized_with_digest_key_in_gap(tmp_path: Path) -> None:
+    """A trailing-space event name is keyed with a digest and printed that way in gaps."""
     (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
     settings: dict[str, object] = {
         "hooks": {"PreToolUse ": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}]}
@@ -1532,38 +1544,51 @@ def test_whitespace_event_name_is_unrecognized(tmp_path: Path) -> None:
     _write_json(tmp_path / ".claude" / "settings.json", settings)
     summary = audit_project_control_plane(tmp_path)
     (hook,) = summary.hook_commands
-    assert hook["runs_command"] is False
-    assert any("unrecognized hook event" in g for g in summary.gaps)
+    assert hook["event"].startswith("PreToolUse:")
+    assert hook["runs_command"] is True
+    assert f".claude/settings.json: unrecognized hook event '{hook['event']}'" in summary.gaps
+    assert ".claude/settings.json: unrecognized hook event 'PreToolUse'" not in summary.gaps
 
 
 def test_empty_event_name_is_unrecognized_and_documented_client_events_are_recognized(
     tmp_path: Path,
 ) -> None:
     (tmp_path / "guard.sh").write_text("echo guard\n", encoding="utf-8")
-    _write_json(
-        tmp_path / ".claude" / "settings.json",
-        {
-            "hooks": {
-                "": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}],
-                "FileChanged": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}],
-                "StopFailure": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}],
-                "PreCompact": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}],
-            }
-        },
+    documented_claude_events = (
+        "FileChanged",
+        "StopFailure",
+        "PreCompact",
+        "UserPromptExpansion",
+        "PostToolBatch",
+        "MessageDisplay",
+        "TaskCreated",
+        "DirectoryAdded",
+        "PreModelSwitch",
+        "PostModelSwitch",
     )
+    claude_hooks: dict[str, object] = {
+        "": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}],
+        "SubagentTurn": [{"hooks": [{"type": "command", "command": "./guard.sh"}]}],
+        **{
+            event: [{"hooks": [{"type": "command", "command": "./guard.sh"}]}]
+            for event in documented_claude_events
+        },
+    }
+    _write_json(tmp_path / ".claude" / "settings.json", {"hooks": claude_hooks})
     _write_json(
         tmp_path / ".cursor" / "hooks.json",
         {"hooks": {"beforeShellExecution": [{"command": "./guard.sh"}]}},
     )
     summary = audit_project_control_plane(tmp_path)
     by_event = {(h["source_file"], h["event"]): h["runs_command"] for h in summary.hook_commands}
-    assert by_event[(".claude/settings.json", "")] is False
-    assert by_event[(".claude/settings.json", "FileChanged")] is True
-    assert by_event[(".claude/settings.json", "StopFailure")] is True
-    assert by_event[(".claude/settings.json", "PreCompact")] is True
+    assert by_event[(".claude/settings.json", "")] is True
+    assert by_event[(".claude/settings.json", "SubagentTurn")] is True
+    for event in documented_claude_events:
+        assert by_event[(".claude/settings.json", event)] is True
     assert by_event[(".cursor/hooks.json", "beforeShellExecution")] is True
-    assert [g for g in summary.gaps if "unrecognized hook event" in g] == [
-        ".claude/settings.json: unrecognized hook event ''"
+    assert sorted(g for g in summary.gaps if "unrecognized hook event" in g) == [
+        ".claude/settings.json: unrecognized hook event ''",
+        ".claude/settings.json: unrecognized hook event 'SubagentTurn'",
     ]
 
 
@@ -1990,3 +2015,76 @@ def test_disable_all_hooks_outside_claude_is_scoped_to_that_file(tmp_path: Path)
     summary = audit_project_control_plane(tmp_path)
     by_src = {h["source_file"]: h["hooks_disabled"] for h in summary.hook_commands}
     assert by_src == {".cursor/hooks.json": True, ".claude/settings.json": False}
+
+
+def test_trailing_pipe_matcher_keeps_exact_names_and_all_empty_pipe_is_digest_only(
+    tmp_path: Path,
+) -> None:
+    """Changing 'Edit|Bash' to 'Edit|Bash|' raises no alerts; '|' stays digest-only."""
+    causes = _guard_alerts(
+        tmp_path,
+        _guard_settings(matcher="Edit|Bash|"),
+        baseline=_guard_settings(matcher="Edit|Bash"),
+    )
+    assert causes == set()
+
+    inspect_root = tmp_path / "inspect"
+    inspect_root.mkdir()
+    (inspect_root / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    _write_json(
+        inspect_root / ".claude" / "settings.json",
+        {
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Edit|Bash|",
+                        "hooks": [{"type": "command", "command": "./guard.sh"}],
+                    },
+                    {"matcher": "|", "hooks": [{"type": "command", "command": "./guard.sh"}]},
+                ]
+            }
+        },
+    )
+    summary = audit_project_control_plane(inspect_root)
+    names_by_len = sorted(
+        (0 if h["matcher_names"] is None else len(h["matcher_names"]), h["matcher_names"])
+        for h in summary.hook_commands
+    )
+    assert names_by_len[0] == (0, None)
+    assert names_by_len[1][0] == 2
+
+
+def test_nested_steering_symlink_budget_records_gap_past_256_links(tmp_path: Path) -> None:
+    """Kills mutant N13: more than 256 nested steering symlinks records a coverage gap."""
+    skills = tmp_path / ".claude" / "skills"
+    skills.mkdir(parents=True)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (tmp_path / "other").mkdir()
+    for index in range(257):
+        target = shared / f"t{index:03d}"
+        target.mkdir()
+        (skills / f"s{index:03d}").symlink_to(
+            f"../../shared/t{index:03d}", target_is_directory=True
+        )
+    _write_always_allowed_filesystem_server(tmp_path, "./other")
+    summary = audit_project_control_plane(tmp_path)
+    assert summary.steering_surfaces == []
+    assert any("more than 256 steering symlinks" in gap for gap in summary.gaps)
+
+
+def test_nested_steering_symlink_chains_across_multiple_passes(tmp_path: Path) -> None:
+    """Kills mutant N17: steering links discovered past the first frontier pass still resolve."""
+    (tmp_path / "dir1").mkdir()
+    (tmp_path / "dir2").mkdir()
+    (tmp_path / "shared").mkdir()
+    (tmp_path / ".claude").symlink_to("dir1", target_is_directory=True)
+    (tmp_path / "dir1" / "skills").symlink_to("../dir2", target_is_directory=True)
+    (tmp_path / "dir2" / "foo").symlink_to("../shared", target_is_directory=True)
+    _write_always_allowed_filesystem_server(tmp_path, "./shared")
+    summary = audit_project_control_plane(tmp_path)
+    assert [s["writable"] for s in summary.steering_surfaces] == [True]
+    assert any(
+        f["category"] == "steering_surface_writable" and f["severity"] == "critical"
+        for f in summary.findings
+    )

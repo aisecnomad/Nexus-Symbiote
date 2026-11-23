@@ -177,27 +177,33 @@ _CLAUDE_HOOK_EVENTS = frozenset(
         "PreToolUse",
         "PostToolUse",
         "PostToolUseFailure",
+        "PostToolBatch",
         "PermissionRequest",
         "PermissionDenied",
         "SessionStart",
         "SessionEnd",
         "UserPromptSubmit",
+        "UserPromptExpansion",
+        "MessageDisplay",
         "Stop",
         "StopFailure",
         "Notification",
         "SubagentStart",
         "SubagentStop",
-        "SubagentTurn",
         "PreCompact",
         "PostCompact",
         "Setup",
         "TeammateIdle",
+        "TaskCreated",
         "TaskCompleted",
         "ConfigChange",
         "WorktreeCreate",
         "WorktreeRemove",
         "FileChanged",
         "CwdChanged",
+        "DirectoryAdded",
+        "PreModelSwitch",
+        "PostModelSwitch",
         "Elicitation",
         "ElicitationResult",
         "InstructionsLoaded",
@@ -1265,30 +1271,27 @@ def _hook_state(
     condition: Any,
     disabled: bool,
     event_name: str,
-    *,
-    known_events: frozenset[str] = _CLAUDE_HOOK_EVENTS,
 ) -> dict[str, Any]:
     """What decides whether a hook still runs, as digests so no configuration text is copied.
 
     An absent, empty or `*` matcher matches every tool. A matcher of letters, digits,
-    `_` and `|` (with non-empty segments) is a list of exact names, recorded so a later
-    matcher can be shown to match everything it matched; any other matcher (including
-    spaces, commas or `-`) is compared by digest alone, as the `if` filter always is.
-    An `if` filter on a non-tool event never runs. An unrecognized or empty event name
-    also sets ``runs_command`` to False, failing closed.
+    `_` and `|` with at least one non-empty segment is a list of exact names (empty
+    segments such as a trailing `|` are ignored; an all-empty matcher such as `|` is
+    digest-only), recorded so a later matcher can be shown to match everything it
+    matched; any other matcher (including spaces, commas or `-`) is compared by digest
+    alone, as the `if` filter always is. An `if` filter on a non-tool event never runs.
     """
     digest: str | None = None
     names: list[str] | None = None
     if matcher not in (None, "", "*"):
         digest = _setting_digest(matcher)
         if isinstance(matcher, str) and _PLAIN_MATCHER_RE.fullmatch(matcher):
-            parts = matcher.split("|")
-            if all(parts):
-                names = sorted(_sha256_hex(item.encode()) for item in set(parts))
+            items = {item for item in matcher.split("|") if item}
+            if items:
+                names = sorted(_sha256_hex(item.encode()) for item in items)
     is_command = hook_type is None or hook_type == "command"
     if_ok = condition is None or event_name in _IF_TOOL_EVENTS
-    known = event_name in known_events
-    runs_command = is_command and if_ok and known
+    runs_command = is_command and if_ok
     return _rec(
         matcher_digest=digest,
         matcher_names=names,
@@ -1330,11 +1333,9 @@ def _inspect_hooks_and_preambles(
             if event_name not in known_events:
                 _add_gap(
                     summary.gaps,
-                    f"{cfg_path}: unrecognized hook event '{_clean(raw_event)}'",
+                    f"{cfg_path}: unrecognized hook event '{event_name}'",
                 )
-            state = _hook_state(
-                matcher, hook_type, condition, disabled, event_name, known_events=known_events
-            )
+            state = _hook_state(matcher, hook_type, condition, disabled, event_name)
             summary.hook_commands.append(
                 _rec(
                     source_file=cfg_path,
