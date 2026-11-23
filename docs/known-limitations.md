@@ -1192,7 +1192,7 @@ A way around a limit that its entry does not describe is worth a
 - **Claude Code's own import reading is followed too.** Claude Code 2.1.42 and
   2.1.330 were tested by running their bundled marked lexer and import extractor;
   both return the same imports for every document tested, and
-  `tests/fixtures/claude-code-imports.json` records them for 226 documents. They
+  `tests/fixtures/claude-code-imports.json` records them for 238 documents. They
   differ from CommonMark in these ways, and the scanner inventories each name they
   give:
   - A reference starts wherever marked starts a text token: after white space, and
@@ -1232,10 +1232,11 @@ A way around a limit that its entry does not describe is worth a
   a paragraph. A name that only Claude Code's reading gives and that names
   no file is skipped silently: it is looked up only by its exact spelling, so it
   raises no credential or case-variant gap, and a case variant of it on a
-  case-insensitive file system is not found. Each reference yields at most 16 names
-  cut at markup, so a name whose text token ends past its sixteenth markup character
-  is missed; a file with more than 2,000 places where such a reference can start is a
-  "too many @path imports" failure. In a seeded differential, the scanner missed 3
+  case-insensitive file system is not found. Each reference yields a name cut at
+  every markup character within 4,097 characters of its start, except a run of `_`
+  between letters or digits (as in `snake_case`), where marked opens no emphasis. A
+  file with more than 2,000 places where such a reference can start, or more than
+  32,000 names cut at markup, is a "too many @path imports" failure. In a seeded differential, the scanner missed 3
   of 70,976 imports in 40,000 documents built from whole lines and 6 of 25,993 in
   24,000 documents built from inline fragments. Each miss follows backticks that
   marked pairs into code spans differently from CommonMark, such as `` `y`@x.md ``

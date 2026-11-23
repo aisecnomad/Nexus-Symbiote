@@ -809,6 +809,9 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         lambda scale: "- x\n" + "> `y` @z\n" * 20_000 * scale,
         lambda scale: "- x\n> y\n" + "   ```\n" * 20_000 * scale,
         lambda scale: "<div\tx>\n" + "`a\n" * 20_000 * scale + "b`@z",
+        lambda scale: " @a" + "_" * 40_000 * scale + "b",
+        lambda scale: " @" + "a_" * 20_000 * scale,
+        lambda scale: (" **@" + "a!" * 30 + "**") * 100 * scale,
     ],
     ids=[
         "blank lines under nested items",
@@ -821,6 +824,9 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         "lines marked keeps in an item",
         "fences marked keeps in an item",
         "a paragraph marked reads where CommonMark reads HTML",
+        "a run of markup characters in a name",
+        "a snake_case name",
+        "names cut at markup up to the file's budget",
     ],
 )
 def test_reading_markdown_grows_with_the_text_not_with_its_nesting(shape):
@@ -841,6 +847,13 @@ def test_a_lower_case_declaration_cannot_hide_an_import(text):
     # CommonMark 0.31 starts a declaration block at any letter, markdown-it and cmark-gfm
     # 0.29 at an upper-case one; the import is text to the second reading.
     assert "docs/style.md" in prompt._import_tokens(text)
+
+
+def test_names_cut_at_markup_past_the_file_budget_are_a_scan_failure(tmp_path):
+    # Each reference may end at any of its 2,000 markup characters (#400).
+    _write(tmp_path, "CLAUDE.md", ("**@" + "a!" * 2_000 + "x.md**\n") * 20)
+    result = PromptScanner().scan(tmp_path)
+    assert result.scan_failures == ["CLAUDE.md: too many @path imports to inventory"]
 
 
 def test_credential_shaped_imports_are_never_read_or_hashed(tmp_path):

@@ -10,7 +10,6 @@ import sys
 import unicodedata
 from collections import deque
 from collections.abc import Collection
-from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -1154,11 +1153,12 @@ _JS_SPACE = "\t\n\x0b\x0c\r \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u300
 # only when that backtick is escaped; the name after a code span is read where it closes.
 _HOST_START = re.compile(rf"(?<![^{_JS_SPACE}!-/:-?\[-`{{-~])@(?=[^{_JS_SPACE}\\]|\\ )")
 _HOST_NAME = re.compile(rf"(?:[^{_JS_SPACE}\\]|\\ )+")
-_MARKUP_START = re.compile(r"[`*_\[\]<!\\]")
-# Each start yields at most this many names plus its whole run, and a file at most
-# ``_MAX_HOST_STARTS`` starts, so the names read stay linear in the text.
-_MAX_HOST_CUTS = 16
+_MARKUP_START = re.compile(r"_+|[`*\[\]<!\\]")
+# A file yields at most this many starts and names cut at markup, each name within one
+# path's length of its start, so the names read stay linear in the text; past either, the
+# file is a "too many @path imports" failure rather than a silent miss.
 _MAX_HOST_STARTS = 2 * _MAX_IMPORTS
+_MAX_HOST_NAMES = 32 * _MAX_IMPORTS
 _DRIVE = re.compile(r"[A-Za-z]:[\\/]")
 # Sentence punctuation after a reference; the file is inventoried without it.
 _TRAILING = ".,;:!?)]}\"'"
@@ -1228,7 +1228,7 @@ def _import_readings(text: str) -> tuple[list[str], list[str], bool]:
     """
     own: list[str] = []
     host: list[str] = []
-    starts = 0
+    starts = names = 0
     for part in text_outside_code(text):
         own.extend(_IMPORT.findall(part))
         end = 0
@@ -1251,14 +1251,35 @@ def _import_readings(text: str) -> tuple[list[str], list[str], bool]:
             limit = min(end, start + _MAX_PATH_BYTES + 1)
             if (fragment := part.find("#", start, limit)) >= 0:
                 limit = fragment
-            cuts = islice(
-                (markup.start() for markup in _MARKUP_START.finditer(part, start, limit)),
-                _MAX_HOST_CUTS,
-            )
+            cuts = [
+                cut
+                for markup in _MARKUP_START.finditer(part, start, limit)
+                if not _intraword(part, markup)
+                for cut in range(markup.start(), markup.end())
+            ]
+            names += len(cuts) + 1
+            if names > _MAX_HOST_NAMES:
+                return own, host, True
             for cut in dict.fromkeys((*cuts, limit)):
                 if form := part[start:cut].replace("\\ ", " "):
                     host.append(form)
     return own, host, False
+
+
+def _intraword(text: str, markup: re.Match[str]) -> bool:
+    """Whether ``markup`` is a run of ``_`` between letters or digits, which marked reads
+    as text: it opens emphasis only after a character that is not alphanumeric, and
+    closes it only before one. marked compares one UTF-16 unit before the run, so a run
+    after a character outside the Basic Multilingual Plane can open emphasis."""
+    before, after = markup.start() - 1, markup.end()
+    return (
+        text[markup.start()] == "_"
+        and before >= 0
+        and after < len(text)
+        and ord(text[before]) < 0x10000
+        and text[before].isalnum()
+        and text[after].isalnum()
+    )
 
 
 def _import_tokens(text: str) -> list[str]:
