@@ -47,8 +47,8 @@ It does not establish:
 - **That the file is the newest one.** An older file signed for the same purpose still
   verifies. Bound it with `--max-age-days`, record `--source-revision`, and keep
   attested baselines where the change under review cannot choose among them.
-- **Who holds a key.** The tool checks signatures against the keys you name; key
-  issuing, protecting and retiring keys is your process.
+- **Who holds a key.** The tool checks signatures against the keys you name; issuing,
+  protecting and retiring keys is your process.
 - **That the file stays unchanged.** `verify-attestation` and a later command read the
   file separately. Run both in a workspace the change under review cannot write to.
 
@@ -211,7 +211,8 @@ reviewed and the new collection with the same release and the same options.
 
 A trusted key is a trust anchor: whoever can write it decides which attestations
 verify. `verify-attestation` refuses (exit 2) a `--trusted-key` inside a git working
-tree that also holds SUBJECT, ENVELOPE or the current directory. The key's path and
+tree (a directory with a `.git` entry, at any level) that also holds SUBJECT, ENVELOPE
+or the current directory. The key's path and
 device/inode of each parent directory are compared with each working tree, so another
 name for the working-tree directory itself, such as symlinks, case variants and bind
 mounts of the tree, does not hide the key. A key file with other hard links is refused
