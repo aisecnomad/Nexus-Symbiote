@@ -754,6 +754,42 @@ def test_a_private_key_block_fires_under_any_name(tmp_path, server, expected):
     assert PEM_SENTINEL not in _dump(result)
 
 
+def _wrapped(text: str, columns: int) -> str:
+    return "\n".join(text[start : start + columns] for start in range(0, len(text), columns))
+
+
+_ENCODED_PEM = base64.b64encode((PEM_BLOCK + "\n").encode()).decode()
+_ENCODED_ACCOUNT = base64.b64encode(
+    json.dumps({"type": "service_account", "private_key": PEM_BLOCK}).encode()
+).decode()
+
+
+@pytest.mark.parametrize("encoded", [_ENCODED_PEM, _ENCODED_ACCOUNT])
+@pytest.mark.parametrize("columns", [64, 76])
+def test_a_base64_private_key_wrapped_as_base64_prints_it_fires(tmp_path, encoded, columns):
+    # GNU base64 wraps at 76 columns and openssl at 64 by default.
+    value = _wrapped(encoded, columns) + "\n"
+    result = _scan(tmp_path, {"pem": {"command": "npx", "env": {"SERVICE_CONFIG": value}}})
+    (finding,) = _findings(_servers(result)["pem"])
+    assert finding.detail.endswith(
+        "in its launch: env SERVICE_CONFIG (a generic secret-like value)."
+    )
+    assert encoded[:40] not in _dump(result)
+
+
+def test_a_wrapped_base64_value_past_the_encoded_limit_is_not_decoded():
+    long = _wrapped(base64.b64encode(b"\0" * 50_000 + PEM_BLOCK.encode()).decode(), 76)
+    assert _positions({"command": "npx", "env": {"SERVICE_CONFIG": long}}) == []
+
+
+def test_a_scheme_credential_split_across_arguments_fires_at_its_name():
+    token = "Q7mX2kL9pR4tW8yZ1nB5vC3d"  # noqa: S105 - synthetic, no vendor prefix
+    args = ["/c", "set", "API_TOKEN=Bearer", token, "&&", "npx", "-y", "srv@1.0.0"]
+    assert _positions({"command": "cmd", "args": args}) == [
+        ("argument 3", "an authorization scheme credential")
+    ]
+
+
 def test_a_certificate_block_is_not_a_private_key():
     certificate = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----"
     assert _positions({"command": "npx", "env": {"CA_BUNDLE": certificate}}) == []

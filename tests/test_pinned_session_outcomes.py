@@ -214,11 +214,36 @@ def test_an_unexpected_teardown_error_before_any_call_is_raised(tmp_path, monkey
     assert not log.exists()
 
 
-def test_an_error_inside_the_session_is_not_replaced_by_a_teardown_report(tmp_path, monkeypatch):
+def test_an_error_inside_the_session_is_not_replaced_by_a_generic_teardown_fault(
+    tmp_path, monkeypatch
+):
     ended: list = []
-    _teardown_fails(monkeypatch, ended)
-    path, pin, log = launcher(tmp_path, "ok")
+    terminate = session_module.terminate_process_group
+
+    def fail_generic(proc):
+        terminate(proc)
+        ended.append(proc)
+        raise RuntimeError("secondary cleanup fault")
+
+    monkeypatch.setattr(session_module, "terminate_process_group", fail_generic)
+    path, pin, _log = launcher(tmp_path, "ok")
     session = PinnedStdioSession(command=str(path), sha256=pin, server_id="server:mail")
     with pytest.raises(LookupError, match="caller's own failure"), session:
         raise LookupError("caller's own failure")
+    assert [proc.returncode is not None for proc in ended] == [True]
+
+
+def test_isolation_teardown_failure_is_not_swallowed_by_a_pre_call_error(tmp_path, monkeypatch):
+    ended: list = []
+    _teardown_fails(monkeypatch, ended)
+    path, pin, _log = launcher(tmp_path, "ok")
+    session = PinnedStdioSession(command=str(path), sha256=pin, server_id="server:mail")
+
+    def fail_before_call() -> None:
+        raise LookupError("caller's own failure")
+
+    with pytest.raises(AuthorizationError, match="the namespace did not end") as caught, session:
+        fail_before_call()
+    assert isinstance(caught.value.__cause__, PinnedProcessError)
+    assert isinstance(caught.value.__context__, LookupError)
     assert [proc.returncode is not None for proc in ended] == [True]

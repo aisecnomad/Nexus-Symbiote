@@ -51,6 +51,7 @@ from nexus_symbiote.core.hashing import (
     hash_tool_definition,
     tool_definition_extensions,
 )
+from nexus_symbiote.core.models import RiskAssessment
 from nexus_symbiote.modes import OfflineViolation
 from nexus_symbiote.runtime_validation import (
     DIALECTS,
@@ -58,6 +59,7 @@ from nexus_symbiote.runtime_validation import (
     check_json_budget,
     ecma_pattern,
 )
+from nexus_symbiote.scanners.prompt import definition_text_risks
 from nexus_symbiote.utils.secrets import redact_descriptor, redact_metadata, redact_text
 
 # Revisions whose initialize, tools/list, prompts/list and resources/templates/list
@@ -232,6 +234,7 @@ class CheckedDescriptor:
     unprofiled_fields: tuple[str, ...]
     unprofiled_hash: str | None
     display_differs: bool
+    text_risks: tuple[RiskAssessment, ...] = ()
 
 
 @dataclass
@@ -245,6 +248,7 @@ class ObservedTool:
     fingerprint_profile: str = TOOL_DEFINITION_HASH_VERSION
     display_differs: bool = False
     unprofiled_fields: list[str] = field(default_factory=list)
+    text_risks: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -254,6 +258,7 @@ class ObservedItem:
     identity: str
     descriptor: dict[str, Any]
     digest: str
+    text_risks: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -282,6 +287,7 @@ class DiscoveryResult:
     tools: list[ObservedTool] = field(default_factory=list)
     prompts: list[ObservedItem] | None = None
     resource_templates: list[ObservedItem] | None = None
+    server_text_risks: list[dict[str, Any]] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
     complete: bool = False
     pages_observed: int = 0
@@ -792,6 +798,19 @@ def _bounded_unique_items(schema: dict[str, Any]) -> None:
                     and not all(isinstance(element, str) for element in array)
                 ):
                     raise DiscoveryError("MCP tool schema exceeds the validation budget")
+            enum_values = item.get("enum")
+            # jsonschema sorts a uniqueItems list and falls back to a pairwise scan when
+            # the sort raises TypeError, so only values that sort together are admitted:
+            # bool, None and a str/number mix each force the quadratic path.
+            if (
+                isinstance(enum_values, list)
+                and len(enum_values) > _UNIQUE_ITEMS_PAIRWISE_LIMIT
+                and not (
+                    all(type(element) is str for element in enum_values)
+                    or all(type(element) in (int, float) for element in enum_values)
+                )
+            ):
+                raise DiscoveryError("MCP tool schema exceeds the validation budget")
             pending.extend(item.values())
         elif isinstance(item, list):
             pending.extend(item)
@@ -901,13 +920,13 @@ def _check_tool_schema_dialect(schema: dict[str, Any]) -> str:
                 target = node[ref_key]
                 if not isinstance(target, str) or (target != "#" and not target.startswith("#/")):
                     raise DiscoveryError("non-pointer or external JSON Schema reference refused")
-                if ref_key == "$ref" and not _local_pointer_exists(schema, target):
+                if not _local_pointer_exists(schema, target):
                     raise DiscoveryError("dangling JSON Schema local reference")
         pattern = node.get("pattern")
         if isinstance(pattern, str):
             try:
                 re.compile(ecma_pattern(pattern))
-            except (re.error, OverflowError, RecursionError) as exc:
+            except (re.error, ValueError, OverflowError, RecursionError) as exc:
                 raise DiscoveryError("invalid MCP tool JSON Schema") from exc
         pat_props = node.get("patternProperties")
         if isinstance(pat_props, dict):
@@ -915,7 +934,7 @@ def _check_tool_schema_dialect(schema: dict[str, Any]) -> str:
                 if isinstance(pat_key, str):
                     try:
                         re.compile(ecma_pattern(pat_key))
-                    except (re.error, OverflowError, RecursionError) as exc:
+                    except (re.error, ValueError, OverflowError, RecursionError) as exc:
                         raise DiscoveryError("invalid MCP tool JSON Schema") from exc
         if depth > 0:
             for meta_key in ("$schema", subschema_id, "$vocabulary"):
@@ -1031,6 +1050,10 @@ def check_served_tool(raw: Any, secrets: Iterable[str] = ()) -> CheckedDescripto
         display = redact_descriptor(raw, secrets)
     except (ValueError, TypeError, RecursionError) as exc:
         raise DiscoveryError("MCP tool descriptor cannot be canonicalized") from exc
+    shown_name = (
+        display.get("name") if isinstance(display.get("name"), str) else redact_text(name, secrets)
+    )
+    text_risks = tuple(definition_text_risks(raw, f"served tool {shown_name}", include_name=True))
     return CheckedDescriptor(
         name=name,
         fingerprint=fingerprint,
@@ -1038,10 +1061,11 @@ def check_served_tool(raw: Any, secrets: Iterable[str] = ()) -> CheckedDescripto
         display=display,
         # Field names are controlled by the server too. Keep the original names
         # only in the digest above; reporting them verbatim can disclose a bearer
-        # token or session ID echoed as an extension key.
+        # token echoed as an extension key.
         unprofiled_fields=tuple(redact_text(key, secrets) for key in unprofiled),
         unprofiled_hash=unprofiled_hash,
         display_differs=display != raw,
+        text_risks=text_risks,
     )
 
 
@@ -1056,7 +1080,12 @@ def check_listed_item(raw: Any, identity: str, secrets: Iterable[str] = ()) -> O
         display = redact_metadata(raw, secrets)
     except (ValueError, TypeError, RecursionError) as exc:
         raise DiscoveryError("MCP list entry exceeds the validation budget") from exc
-    return ObservedItem(identity=value, descriptor=display, digest=digest)
+    shown_id = redact_text(value, secrets)
+    item_risks = [
+        risk.model_dump(mode="json")
+        for risk in definition_text_risks(raw, f"served {identity} {shown_id}", include_name=True)
+    ]
+    return ObservedItem(identity=value, descriptor=display, digest=digest, text_risks=item_risks)
 
 
 def declaration_hash(
@@ -1163,6 +1192,7 @@ def _observed_tool(checked: CheckedDescriptor) -> ObservedTool:
         fingerprint=checked.fingerprint,
         display_differs=checked.display_differs,
         unprofiled_fields=list(checked.unprofiled_fields),
+        text_risks=[risk.model_dump(mode="json") for risk in checked.text_risks],
     )
 
 
@@ -1415,7 +1445,19 @@ def discover_tools(
         result.server_info, result.server_capabilities = server_info, capabilities
         raw["serverInfo"] = _mask_exact(hello["serverInfo"], secrets)
         raw["capabilities"] = _mask_exact(hello["capabilities"], secrets)
+        result.server_text_risks.extend(
+            risk.model_dump(mode="json")
+            for risk in definition_text_risks(
+                {"serverInfo": hello["serverInfo"]}, "served server identity"
+            )
+        )
         if instructions is not None:
+            result.server_text_risks.extend(
+                risk.model_dump(mode="json")
+                for risk in definition_text_risks(
+                    {"instructions": instructions}, "served server instructions"
+                )
+            )
             result.instructions = redact_text(instructions, secrets)
             result.instructions_hash = hash_canonical({"instructions": instructions})
             raw["instructions"] = _mask_exact(instructions, secrets)

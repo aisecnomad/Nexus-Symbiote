@@ -116,7 +116,11 @@ _WRAPPED_SCHEME_TYPES = {
     "mtls_security_scheme": "mutualTLS",
 }
 # Legacy scheme and client method names that declare no authentication.
-_ANONYMOUS = frozenset({"none", "noauth", "no-auth", "anonymous", "public", "unauthenticated"})
+ANONYMOUS_AUTH_METHODS = frozenset(
+    {"", "none", "noauth", "no-auth", "no_auth", "anonymous", "public", "unauthenticated"}
+)
+"""Authentication method names that grant no authentication; shared with the CycloneDX export."""
+_ANONYMOUS = ANONYMOUS_AUTH_METHODS
 _MAX_ENTRIES = 1000
 _MAX_DEPTH = 8
 _MAX_NAME = 256
@@ -872,7 +876,10 @@ class A2AScanner(Scanner):
         if files is None:
             raise RuntimeError("_read_mapping called outside a _collection context")
         relative = path.as_posix()
-        if withheld(files, relative, result.surfaces_excluded):
+        known_well_known = len(path.parts) >= 2 and path.parts[-2].casefold() == ".well-known"
+        if withheld(
+            files, relative, result.surfaces_excluded, allow_service_parent=known_well_known
+        ):
             return None
         data = super()._read_mapping(path, result, missing_ok=missing_ok)
         return None if self._relinked(relative, files, result) else data
@@ -895,7 +902,13 @@ class A2AScanner(Scanner):
         """Queue a card path; one named as holding credentials, by its own name or that of
         the in-root file a symlink there leads to, such as ``agent.json ->
         credentials.json``, is a gap and is not read."""
-        if withheld(files, path.as_posix(), result.surfaces_excluded):
+        known_well_known = len(path.parts) >= 2 and path.parts[-2].casefold() == ".well-known"
+        if withheld(
+            files,
+            path.as_posix(),
+            result.surfaces_excluded,
+            allow_service_parent=known_well_known,
+        ):
             return
         canonical, exact = location
         if exact:
@@ -1121,6 +1134,11 @@ class A2AScanner(Scanner):
                     recommendation=f"Set {SOURCE_BINDING_KEY_ENV} during collection to detect changes to these values.",
                 )
             )
+        from nexus_symbiote.scanners.prompt import definition_text_risks
+
+        risks.extend(
+            definition_text_risks(data, f"{rel_path}: A2A agent '{shown}'", include_name=True)
+        )
         return A2AServerComponent(
             bom_ref=bom_ref,
             name=name,

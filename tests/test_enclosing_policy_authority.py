@@ -88,3 +88,26 @@ def test_signature_policy_rejects_an_enclosing_repository(nested_policy):
     with pytest.raises(SignaturePolicyError, match="outside.*repository"):
         load_signature_policies(policy, project)
     assert len(load_signature_policies(outside, project).digest_pins) == 1
+
+
+def test_signature_policy_rejects_the_checkout_it_runs_from(tmp_path, monkeypatch):
+    # CI scans an artifact outside the pull request's checkout; a policy in that checkout
+    # is part of the change under review, as for the operator policy.
+    checkout = tmp_path / "checkout"
+    project = tmp_path / "artifact"
+    checkout.mkdir()
+    project.mkdir()
+    git(checkout, "init", "--quiet")
+    (project / "model.bin").write_bytes(b"synthetic local model")
+    record = {
+        "kind": "digest-pin",
+        "artifact_path": "model.bin",
+        "expected_sha256": hashlib.sha256(b"synthetic local model").hexdigest(),
+    }
+    document = json.dumps({"version": 2, "artifacts": [record]})
+    (checkout / "policy.json").write_text(document)
+    (tmp_path / "trusted-policy.json").write_text(document)
+    monkeypatch.chdir(checkout)
+    with pytest.raises(SignaturePolicyError, match="outside.*repository"):
+        load_signature_policies(checkout / "policy.json", project)
+    assert len(load_signature_policies(tmp_path / "trusted-policy.json", project).digest_pins) == 1

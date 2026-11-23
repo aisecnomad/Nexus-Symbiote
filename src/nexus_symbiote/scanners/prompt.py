@@ -238,23 +238,30 @@ def detect_invisible_characters(
     ]
 
 
-def definition_text_risks(definition: object, source_name: str) -> list[RiskAssessment]:
+def definition_text_risks(
+    definition: object, source_name: str, *, include_name: bool = False
+) -> list[RiskAssessment]:
     """Rate the hidden characters in a tool definition as in an instruction file.
 
     A host puts a tool's description and schema text in front of the model as it does an
     instruction file, so the same characters hide the same text. Every string and key
     of the definition is read except the tool's own name, which is reported as an
-    identifier. A byte-order mark is never ordinary here: no string of a definition
-    starts a file.
+    identifier unless ``include_name`` is set, as for a served descriptor whose name a
+    host shows the model unredacted. A byte-order mark is never ordinary here: no
+    string of a definition starts a file.
     """
     counts: dict[str, int] = {}
     separators: dict[str, int] = {}
     tags = 0
-    pending = (
-        [value for key, value in definition.items() if key != "name"]
-        if isinstance(definition, dict)
-        else [definition]
-    )
+    if isinstance(definition, dict):
+        pending = [
+            item
+            for key, value in definition.items()
+            if include_name or key != "name"
+            for item in (key, value)
+        ]
+    else:
+        pending = [definition]
     while pending:
         value = pending.pop()
         if isinstance(value, dict):
@@ -1017,6 +1024,7 @@ def _read_unless_credential(
     context: str = "",
     missing_ok: bool = False,
     variants_read: Collection[str] = (),
+    report_coexisting_variants: bool = True,
 ) -> bytes | None:
     """The bytes of the file at ``path``, or None when it is absent, unreadable or a gap.
 
@@ -1032,7 +1040,12 @@ def _read_unless_credential(
         if result is not None:
             result.surfaces_excluded.append(f"{path}: {context}{reason}; not read or inventoried")
         return None
-    content = files.read_bytes(path, missing_ok=missing_ok, variants_read=variants_read)
+    content = files.read_bytes(
+        path,
+        missing_ok=missing_ok,
+        variants_read=variants_read,
+        report_coexisting_variants=report_coexisting_variants,
+    )
     followed = files.link_target(path)
     if content is None or followed is None or not _credential_shaped(followed):
         return content
@@ -1388,7 +1401,12 @@ class PromptScanner(Scanner):
                     continue
                 spellings = _CODEX_SPELLINGS if rel_path in _CODEX_SPELLINGS else ()
                 content = _read_unless_credential(
-                    rel_path, files, result, missing_ok=True, variants_read=spellings
+                    rel_path,
+                    files,
+                    result,
+                    missing_ok=True,
+                    variants_read=spellings,
+                    report_coexisting_variants=False,
                 )
                 if content is None:
                     continue
@@ -1585,7 +1603,9 @@ class PromptScanner(Scanner):
             text,
             decoded=(
                 _escaped_text(rel_path, text, result.surfaces_excluded)
-                if escapes or _markup(rel_path)
+                if escapes
+                or _markup(rel_path)
+                or PurePosixPath(rel_path).suffix.lower() in _ESCAPED_FORMATS
                 else None
             ),
         )
@@ -1962,8 +1982,12 @@ class PromptScanner(Scanner):
                 *_line_separator_risks(stream.line_separators, relative),
             ]
         markup = declaration and path.suffix.lower() in _MARKUP_SUFFIXES
-        # A host reads a skill's front matter, such as its description, decoded.
-        decoded = _escaped_text(relative, text, result.surfaces_excluded) if markup else None
+        # A host reads a skill's front matter or structured JSON/YAML/TOML declarations decoded.
+        decoded = (
+            _escaped_text(relative, text, result.surfaces_excluded)
+            if markup or path.suffix.lower() in _ESCAPED_FORMATS
+            else None
+        )
         risks = detect_invisible_characters(text, relative, decoded=decoded)
         if markup:
             risks.extend(detect_hidden_markup(text, relative))

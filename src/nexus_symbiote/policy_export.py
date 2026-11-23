@@ -178,6 +178,8 @@ def corroborate_against_project(
     bom: AIBOM,
     project: Path,
     signature_policy: Path | None = None,
+    *,
+    accept_default_excludes: bool | tuple[str, ...] = False,
 ) -> tuple[str, frozenset[str], frozenset[str]]:
     """Reconcile and integrity-check ``bom`` in the named project's scan scope."""
     from nexus_symbiote.validators.completeness import (
@@ -206,7 +208,11 @@ def corroborate_against_project(
         )
     excluded = policy.scan.exclude_paths
     c_report = CompletenessValidator().validate_against_project(
-        bom, root, exclude_paths=excluded, signature_policies=sig_policies
+        bom,
+        root,
+        exclude_paths=excluded,
+        signature_policies=sig_policies,
+        accept_default_excludes=accept_default_excludes,
     )
     if not c_report.is_complete:
         raise click.ClickException("inventory failed completeness reconciliation against --project")
@@ -409,10 +415,16 @@ def run_export_policy(
     attestation_envelope: Path | None,
     trusted_keys: tuple[Path, ...],
     output: Path | None,
+    accept_default_excludes: bool = False,
+    accept_default_exclude: tuple[str, ...] = (),
 ) -> None:
     """Execute the ``export-policy`` CLI workflow."""
     if signature_policy is not None and project is None:
         raise click.UsageError("--signature-policy requires --project")
+    if (accept_default_excludes or accept_default_exclude) and project is None:
+        raise click.UsageError(
+            "--accept-default-exclude and --accept-default-excludes require --project"
+        )
     if trusted_keys and attestation_envelope is None:
         raise click.UsageError("--trusted-key requires --require-attestation")
     if attestation_envelope is not None and not trusted_keys:
@@ -449,7 +461,10 @@ def run_export_policy(
     unverified_refs: frozenset[str] = frozenset()
     if project is not None:
         _basis, corroborated_models, unverified_refs = corroborate_against_project(
-            bom, project, signature_policy
+            bom,
+            project,
+            signature_policy,
+            accept_default_excludes=accept_default_excludes or accept_default_exclude,
         )
     text = render_authorization_policy(
         bom,
@@ -473,6 +488,7 @@ def build_evidence_pack(
     *,
     project: Path | None = None,
     signature_policy: Path | None = None,
+    accept_default_excludes: bool | tuple[str, ...] = False,
 ) -> dict[str, Any]:
     """Build the compliance evidence pack for ``crosswalk --include-evidence-pack``."""
     digests = inventory_digests(raw_bytes)
@@ -494,7 +510,10 @@ def build_evidence_pack(
     verified_models: list[dict[str, Any]] = []
     if project is not None:
         verification_basis, corroborated_refs, _unverified = corroborate_against_project(
-            bom, project, signature_policy
+            bom,
+            project,
+            signature_policy,
+            accept_default_excludes=accept_default_excludes,
         )
         verified_models = [
             entry for entry in declared_signed_models if entry["bom_ref"] in corroborated_refs

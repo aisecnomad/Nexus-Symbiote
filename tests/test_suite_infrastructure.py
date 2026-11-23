@@ -81,8 +81,6 @@ def test_a_hung_test_fails_with_its_traceback_instead_of_stalling_the_run(suite)
             True,
             pytest.ExitCode.OK,
         ),
-        ("file system rejects the name", True, pytest.ExitCode.OK),
-        ("needs a case-sensitive file system to hold both spellings", True, pytest.ExitCode.OK),
         # Only the exact reasons pass: containing or starting with the words is not enough.
         ("quarantined for now; file system rejects nothing", True, pytest.ExitCode.TESTS_FAILED),
         ("flaky on case-sensitive hosts", True, pytest.ExitCode.TESTS_FAILED),
@@ -108,6 +106,24 @@ def test_only_host_file_system_skips_pass_a_strict_run(suite, reason, strict, st
 
 
 @pytest.mark.parametrize(
+    "body",
+    [
+        "def test_off():\n    pytest.xfail('quarantined')\n",
+        "@pytest.mark.xfail(run=False, reason='quarantined')\ndef test_off():\n    assert False\n",
+        "@pytest.mark.xfail(True, reason='quarantined')\ndef test_off():\n    assert False\n",
+    ],
+    ids=["imperative", "run=False", "conditional marker"],
+)
+def test_an_expected_failure_fails_a_strict_run(suite, body):
+    # Each form stops the test before its assertions decide anything, as a skip does.
+    suite.makepyfile("import pytest\n\n\ndef test_runs():\n    pass\n\n\n" + body)
+    strict = suite.runpytest("-p", "no:cacheprovider", "--strict-skips")
+    assert strict.ret == pytest.ExitCode.TESTS_FAILED
+    strict.stdout.fnmatch_lines(["*UNEXPECTED: *test_off: xfail: *quarantined*"])
+    assert suite.runpytest("-p", "no:cacheprovider").ret == pytest.ExitCode.OK
+
+
+@pytest.mark.parametrize(
     "reason",
     [
         "the subreaper wrapper is Linux-only",
@@ -116,6 +132,10 @@ def test_only_host_file_system_skips_pass_a_strict_run(suite, reason, strict, st
         "the PID namespace teardown is Linux-only",
         "no /proc/self/cwd",
         "no /dev/fd link into /proc",
+        "file system rejects the name",
+        "file system rejects distinct case spellings",
+        "file system rejects names that are not UTF-8",
+        "needs a case-sensitive file system to hold both spellings",
     ],
 )
 @pytest.mark.parametrize(
@@ -424,7 +444,12 @@ def test_the_scaling_check_tells_linear_from_quadratic_work():
     # milliseconds catches their load unevenly: two samples of a 1,000-square loop once
     # measured 9.9 for a 16. Longer and more samples average it out.
     assert scaling_ratio(linear) < 10
-    assert scaling_ratio(quadratic, repeats=3) > 10
+    # scaling_ratio returns the smaller of two ratios when the first is high, which suits
+    # the upper bounds its callers assert. This bound is a lower one, and load during the
+    # smaller size alone still depresses a ratio (9.1 for a 16, three samples of a
+    # 2,000-square loop, on a hosted runner), so quadratic work has to measure quadratic
+    # in one of three ratios, not in the first.
+    assert any(scaling_ratio(quadratic, repeats=3) > 10 for _ in range(3))
 
 
 def test_a_ratio_skewed_by_a_burst_of_load_is_measured_once_more(monkeypatch):

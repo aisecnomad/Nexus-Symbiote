@@ -77,17 +77,34 @@ _SEVERITY_RANK = {"critical": 0, "error": 0, "unknown": 1, "warning": 2, "info":
 NO_LOCAL_SUBJECT = "No local project subject was available to reconcile."
 COLLECTOR_OWNED_PROPERTIES = frozenset(
     {
+        "artifact_verified",
         "collection_mode",
-        "content_hash_withheld",
+        "config_file_hash",
         "config_hash",
         "config_hash_profile",
+        "content_hash_withheld",
         "identity_source",
+        "imports_digest",
+        "lockfile_integrity",
+        "lockfile_record",
+        "lockfile_sha256",
+        "named_format",
+        "pinning_state",
+        "rail_files",
+        "requirement_hashes",
+        "settings_hashes",
+        "settings_hashes_profile",
+        "source_values_bound",
         "weight_files",
     }
 )
 """Property keys only a collector writes, which validation, integrity, diff and risk read
 as content binding or collection provenance. Suppression fingerprints, integrity and the
-static binding checks trust them, so a supplier may not add one the collector did not."""
+static binding checks trust them, so a supplier may not add one the collector did not.
+The ``observed_*`` and ``displayed_descriptor_differs`` keys that ``verify-live --record``
+and ``discover-mcp --record`` write are not here: no validator trusts them, only the next
+live verification reads them as its drift baseline, and a static collection never records
+them, so owning them would block every recorded inventory."""
 COLLECTOR_OWNED_PREFIXES = ("static_value_binding", "static_config_hash", "static_card_hash")
 
 Basis = Literal[

@@ -42,6 +42,7 @@ from nexus_symbiote.scanners.base import YAML_TOKEN_LIMIT
 from nexus_symbiote.scanners.prompt import HIDDEN_CHARACTERS
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.jsonc import strip_jsonc
+from nexus_symbiote.utils.markdown import front_matter_candidates
 from nexus_symbiote.utils.terminal import neutralize
 from nexus_symbiote.utils.toml import loads as toml_loads
 
@@ -124,19 +125,21 @@ _APOSTROPHES = {"‘": "'", "’": "'"}
 # as well as the raw text.
 _DECODED_FORMATS = {".jsonc": "JSON", ".yaml": "YAML", ".yml": "YAML", ".toml": "TOML"}
 _MARKDOWN_SUFFIXES = frozenset({".md", ".mdc", ".markdown"})
-_FRONT_MATTER_RE = re.compile(
-    r"\ufeff?(?>(?:[ \t]*\r?\n)*)[ \t]*-{3,}[ \t]*\r?\n(.*?)^(?:-{3,}|\.\.\.)[ \t]*\r?$",
-    re.S | re.M,
+_CODE_SOURCE_SUFFIXES = frozenset(
+    {".py", ".pyi", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}
 )
 # The bounds the prompt collector parses YAML and TOML within: the parsers are pure Python,
 # and PyYAML's cost grows with flow nesting. Past them, escapes are decoded by pattern.
 _MAX_PARSED_CHARS = 65_536
 _MAX_YAML_FLOW_DEPTH = 64
 _FLOW_BRACKETS_RE = re.compile(r"[\[\]{}]")
-# Every escape a JSON, YAML or TOML string can hold, a line continuation and YAML's ''.
-# Decoding them anywhere, inside a literal string or a comment too, only adds findings.
+# Every escape a JSON, YAML, TOML, Python or JS/TS string can hold, a line continuation
+# and YAML's ''. Decoding them anywhere, inside a literal string or a comment too, only
+# adds findings.
 _ESCAPE_RE = re.compile(
-    r"\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|[ \t]*\r?\n\s*|(.))|''", re.S
+    r"\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|u\{([0-9A-Fa-f]++)\}"
+    r"|[ \t]*\r?\n\s*|(.))|''",
+    re.S,
 )
 _NAMED_ESCAPES = {
     "n": "\n",
@@ -826,55 +829,138 @@ def _flow_depth(text: str) -> int:
     return deepest
 
 
-def _decoded_source(
+_FM_LINE_END_RE = re.compile(r"\r\n|\r|\n")
+_FM_DASH_OPENER_RE = re.compile(r"-{3,}[ \t]*([A-Za-z]*)")
+_FM_FORMATS = {"toml": "TOML", "json": "JSON"}
+
+
+def _extra_front_matter_candidates(text: str) -> list[tuple[str, tuple[int, int]]]:
+    """Linear-time fallback for Hugo ``+++`` TOML and for fences a strict reader skips:
+    leading blank lines or spaces before the opener, a wider ``----`` opener or closer,
+    and a ``...`` YAML closer. Decoding one a host does not read only adds findings."""
+    stripped = text.removeprefix("\ufeff")
+    offset = len(text) - len(stripped)
+    pos = offset
+    end = len(text)
+    while pos < end and text[pos] in " \t\r\n":
+        pos += 1
+    nl = _FM_LINE_END_RE.search(text, pos)
+    if nl is None:
+        return []
+    first = text[pos : nl.start()].rstrip(" \t")
+    literal_closers: tuple[str, ...]
+    if first == "+++":
+        kind, literal_closers, dash_closer = "TOML", ("+++",), False
+    elif (opener := _FM_DASH_OPENER_RE.fullmatch(first)) is not None:
+        kind = _FM_FORMATS.get(opener.group(1).lower(), "YAML")
+        literal_closers, dash_closer = (("...",) if kind == "YAML" else ()), True
+    else:
+        return []
+    body_start = nl.end()
+    cur = body_start
+    while cur < end:
+        nxt = _FM_LINE_END_RE.search(text, cur)
+        line_end = end if nxt is None else nxt.start()
+        next_pos = end if nxt is None else nxt.end()
+        line = text[cur:line_end].strip(" \t")
+        if line in literal_closers or (dash_closer and len(line) >= 3 and not line.strip("-")):
+            return [(kind, (body_start, cur))]
+        cur = next_pos
+    return []
+
+
+def _decoded_sources(
     rel_path: str, text: str, *, raw_matches: _RawMatches | None = None
-) -> tuple[object, tuple[int, int] | None]:
-    """What a host decodes a JSONC, YAML or TOML source, or a Markdown file's YAML front
-    matter, to: ``(tree, None)`` when it parses within the bounds, ``(None, span)`` for
-    the part of ``text`` to decode by pattern when it does not, and ``(None, None)``
-    when it holds no escape.
+) -> tuple[list[object], list[tuple[int, int]]]:
+    """What a host decodes a JSONC, YAML, TOML, code source, or Markdown front matter to.
+
+    Returns ``(trees, spans)`` where each parsed tree is scanned structurally and each
+    span is escape-decoded by pattern when parsing is bypassed, unsupported, or failed.
     """
     suffix = PurePosixPath(rel_path).suffix.lower()
+    if suffix in _CODE_SOURCE_SUFFIXES:
+        return [], [(0, len(text))] if "\\" in text else []
     kind = _DECODED_FORMATS.get(suffix)
-    span = (0, len(text))
-    if kind is None:
-        front = _FRONT_MATTER_RE.match(text) if suffix in _MARKDOWN_SUFFIXES else None
-        if front is None:
-            return None, None
-        kind, span = "YAML", front.span(1)
-    body = text[span[0] : span[1]]
-    has_escapes = "\\" in body or (kind == "YAML" and "''" in body)
-    if not (has_escapes or raw_matches is not None):
-        return None, None
+    candidates: list[tuple[str, tuple[int, int]]] = []
+    if kind is not None:
+        candidates.append((kind, (0, len(text))))
+    elif suffix in _MARKDOWN_SUFFIXES:
+        # Each candidate's raw text starts right after the opener line, which is the
+        # first line of the text.
+        first_nl = _FM_LINE_END_RE.search(text)
+        fm_start = first_nl.end() if first_nl is not None else 0
+        for fm_lang, fm_raw, _body in front_matter_candidates(text):
+            if fm_raw:
+                fm_kind = _FM_FORMATS.get(fm_lang, "YAML")
+                candidates.append((fm_kind, (fm_start, fm_start + len(fm_raw))))
+        if not candidates:
+            candidates.extend(_extra_front_matter_candidates(text))
+    if not candidates:
+        return [], []
     import yaml
 
-    try:
-        if kind == "JSON":
-            parsed = _parse_json_leniently(body)
-            if raw_matches is not None:
-                try:
-                    strip_jsonc(body, on_string=lambda a, b: raw_matches.bind(a, b, body, "JSON"))
-                except ValueError:
-                    # _parse_json_leniently succeeded while strip_jsonc refused U+2028/U+2029,
-                    # so body is valid strict JSON with no comments and every quoted token is a string.
-                    for match in _JSON_STRING_RE.finditer(body):
-                        raw_matches.bind(match.start(), match.end(), body, "JSON")
-            return parsed, None
-        if len(body) <= _MAX_PARSED_CHARS:
-            if kind == "TOML":
+    trees: list[object] = []
+    spans: list[tuple[int, int]] = []
+    for cand_kind, span in candidates:
+        body = text[span[0] : span[1]]
+        has_escapes = "\\" in body or (cand_kind == "YAML" and "''" in body)
+        if not (has_escapes or raw_matches is not None):
+            continue
+        try:
+            if cand_kind == "JSON":
+                parsed = _parse_json_leniently(body)
                 if raw_matches is not None:
-                    return toml_loads(
-                        body, on_string=lambda a, b: raw_matches.bind(a, b, body, "TOML")
-                    ), None
-                return toml_loads(body), None
-            if _flow_depth(body) <= _MAX_YAML_FLOW_DEPTH:
-                if raw_matches is not None:
-                    return _yaml_tree(body, raw_matches, span[0]), None
-                return _yaml_tree(body), None
-    except (ValueError, OverflowError, RecursionError, yaml.YAMLError):
-        # Malformed input still needs the same escape inspection as input over a parse limit.
-        return None, span if has_escapes else None
-    return None, span if has_escapes else None
+                    json_at = span[0]
+
+                    # Raw hits sit at file offsets, so a token's body offsets shift by the span.
+                    def _bind_json(a: int, b: int, _at: int = json_at) -> None:
+                        raw_matches.bind(_at + a, _at + b, text, "JSON")
+
+                    try:
+                        strip_jsonc(body, on_string=_bind_json)
+                    except ValueError:
+                        # _parse_json_leniently succeeded while strip_jsonc refused U+2028/U+2029,
+                        # so body is valid strict JSON with no comments and every quoted token is a string.
+                        for match in _JSON_STRING_RE.finditer(body):
+                            raw_matches.bind(
+                                span[0] + match.start(), span[0] + match.end(), text, "JSON"
+                            )
+                trees.append(parsed)
+                continue
+            if len(body) <= _MAX_PARSED_CHARS:
+                if cand_kind == "TOML":
+                    if raw_matches is not None:
+                        toml_at = span[0]
+
+                        def _bind_toml(a: int, b: int, _at: int = toml_at) -> None:
+                            raw_matches.bind(_at + a, _at + b, text, "TOML")
+
+                        trees.append(toml_loads(body, on_string=_bind_toml))
+                    else:
+                        trees.append(toml_loads(body))
+                    continue
+                if _flow_depth(body) <= _MAX_YAML_FLOW_DEPTH:
+                    if raw_matches is not None:
+                        trees.append(_yaml_tree(body, raw_matches, span[0]))
+                    else:
+                        trees.append(_yaml_tree(body))
+                    continue
+        except (ValueError, OverflowError, RecursionError, yaml.YAMLError):
+            # Malformed input still needs the same escape inspection as input over a parse limit.
+            if has_escapes:
+                spans.append(span)
+            continue
+        if has_escapes:
+            spans.append(span)
+    return trees, spans
+
+
+def _decoded_source(
+    rel_path: str, text: str, *, raw_matches: _RawMatches | None = None
+) -> tuple[object | None, tuple[int, int] | None]:
+    """Single-reading view of :func:`_decoded_sources` for direct callers and tests."""
+    trees, spans = _decoded_sources(rel_path, text, raw_matches=raw_matches)
+    return (trees[0] if trees else None), (spans[0] if spans else None)
 
 
 def _escape_decoded(text: str, start: int, end: int) -> tuple[str, list[int]]:
@@ -887,16 +973,17 @@ def _escape_decoded(text: str, start: int, end: int) -> tuple[str, list[int]]:
         chars.extend(text[pos : match.start()])
         origins.extend(range(pos, match.start()))
         pos = match.end()
-        digits = match.group(1) or match.group(2) or match.group(3)
+        digits = match.group(1) or match.group(2) or match.group(3) or match.group(4)
         if digits is not None:
-            code = int(digits, 16)
+            stripped = digits.lstrip("0") or "0"
+            code = int(stripped, 16) if len(stripped) <= 6 else sys.maxunicode + 1
             decoded = chr(code) if code <= sys.maxunicode else match.group()
         elif match.group() == "''":
             decoded = "'"
-        elif match.group(4) is None:
+        elif match.group(5) is None:
             decoded = ""
         else:
-            decoded = _NAMED_ESCAPES.get(match.group(4), match.group(4))
+            decoded = _NAMED_ESCAPES.get(match.group(5), match.group(5))
         for ch in decoded:
             if "\udc00" <= ch <= "\udfff" and chars and "\ud800" <= chars[-1] <= "\udbff":
                 chars[-1] = _joined_surrogates(chars[-1] + ch)
@@ -1558,30 +1645,31 @@ def _scan_text_source(
     structured_attribution = bool(shared_names) or (is_tool_ctx and suffix in _DECODED_FORMATS)
     raw_bytes = raw_text.encode("utf-8") if hits else b""
     raw_matches = _RawMatches(raw_bytes, hits) if structured_attribution and hits else None
-    tree, span = _decoded_source(rel_path, raw_text, raw_matches=raw_matches)
-    if span is not None:
+    trees, spans = _decoded_sources(rel_path, raw_text, raw_matches=raw_matches)
+    if spans:
         located = {(h.rule_id, h.byte_offset) for h in hits}
-        hits += [
-            h
-            for h in _escape_decoded_hits(raw_text, span, rel_path, is_tool_ctx)
-            if (h.rule_id, h.byte_offset) not in located
-        ]
+        for span in spans:
+            for h in _escape_decoded_hits(raw_text, span, rel_path, is_tool_ctx):
+                key = (h.rule_id, h.byte_offset)
+                if key not in located:
+                    located.add(key)
+                    hits.append(h)
     file_owner = _file_level_owner(comps, root_agent) if shared_names else None
     if hits and not raw_bytes:
         raw_bytes = raw_text.encode("utf-8")
-    decoded_groups = (
-        _scan_structured_source(
-            rel_path,
-            tree,
-            comps,
-            root_agent,
-            include_keys=True,
-            tool_context=is_tool_ctx,
-            raw_matches=raw_matches,
+    decoded_groups: list[tuple[ComponentWithRisks | None, list[TextPoisoningHit]]] = []
+    for tree in trees:
+        decoded_groups.extend(
+            _scan_structured_source(
+                rel_path,
+                tree,
+                comps,
+                root_agent,
+                include_keys=True,
+                tool_context=is_tool_ctx,
+                raw_matches=raw_matches,
+            )
         )
-        if tree is not None
-        else []
-    )
     by_target: dict[str | None, tuple[ComponentWithRisks | None, list[TextPoisoningHit]]] = {}
     for h in hits:
         chosen = _attribute_source_component(

@@ -216,7 +216,11 @@ def _declared_url(value: Any, owner: str, notices: list[str]) -> str | None:
 def _clean_rfc3339(value: Any) -> str | None:
     if isinstance(value, datetime):
         aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
-        return aware.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        try:
+            utc_dt = aware.astimezone(UTC)
+        except OverflowError:
+            return None
+        return utc_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
     if isinstance(value, date):
         return f"{value.isoformat()}T00:00:00Z"
     if not isinstance(value, str):
@@ -224,7 +228,14 @@ def _clean_rfc3339(value: Any) -> str | None:
     candidate = value.strip()
     if len(candidate) == 10 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", candidate, re.ASCII):
         candidate = f"{candidate}T00:00:00Z"
-    return candidate if _RFC3339_RE.fullmatch(candidate) else None
+    if not _RFC3339_RE.fullmatch(candidate):
+        return None
+    try:
+        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00").replace("z", "+00:00"))
+        utc_dt = parsed.astimezone(UTC)
+    except (ValueError, OverflowError):
+        return None
+    return utc_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def clean_license_identifier(value: Any) -> str | None:

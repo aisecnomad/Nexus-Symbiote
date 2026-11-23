@@ -31,6 +31,7 @@ _MAX_OUTPUT_APPLICATOR_DEPTH = 160
 _MAX_OUTPUT_APPLICATOR_STEPS = 1024
 _MAX_OUTPUT_UNION_STEPS = 4096
 _MAX_OUTPUT_REPEATED_STEPS = 32768
+_MIN_SHARED_MULTIPLICITY = 32
 MAX_SAFE_INTEGER = 2**53 - 1
 # Interpreter start-up and imports get their own budget, so a slow or throttled
 # host does not spend the evaluation budget before the untrusted input arrives.
@@ -1269,24 +1270,52 @@ def _collection_work_exceeds_budget(
 
     # Keep each level separate. A recursive reference through a child advances
     # one level, while all in-place callers are processed before their targets.
+    # Track per-value duplication separately for object vs array parent slots
+    # (a single JSON value cannot simultaneously be an object property and an
+    # array element) and preserve exact slot keys whenever a key repeats across
+    # containers or enters an in-place branching subgraph (allOf/anyOf/oneOf).
     counts = {root: 1}
+    # The largest count any single parent hands a node. Sums count every path, which
+    # separate sibling values (a tree's left and right) would compound per level; one
+    # value reaches a node at most ``max_dup`` times, so the sum is capped there.
+    peaks = {root: 1}
     nested: set[int] = set()
     fallible: set[int] = set()
+    step_cap = _MAX_OUTPUT_REPEATED_STEPS + 1
+
+    max_dup = _max_single_value_multiplicity(root, order, graph, nodes, step_cap)
+    if max_dup is None:
+        return True
+
     for _ in range(MAX_JSON_DEPTH + 1):
         following: dict[int, int] = {}
+        following_peaks: dict[int, int] = {}
         nested_following: set[int] = set()
         fallible_following: set[int] = set()
         for current in order:
             count = counts.get(current, 0)
             if not count:
                 continue
+            multiplicity = max(1, max_dup.get(current, 1))
+            count = min(count, peaks.get(current, count) * multiplicity)
+            # A value reaches a shared definition once per in-place path, so its
+            # multiplicity stays within the schema's own size unless paths compound:
+            # a chain of allOf arms that doubles per level reaches 2**depth from a
+            # few dozen nodes. The raw count is not capped; a shared definition
+            # multiplies the visits of every element, and a bound on the product
+            # refused ordinary unions whose variants share a list.
+            if multiplicity > max(_MIN_SHARED_MULTIPLICITY, len(order)):
+                return True
+            dup = min(step_cap, multiplicity)
             node = nodes[current]
             # Only schemas that abort collection validation on a non-conforming
             # value can bound repetitions by a conforming value's node footprint.
             # Branches under contains/anyOf/oneOf/not/if can fail repeatedly on
             # single-node values without stopping collection evaluation.
-            limit = MAX_JSON_NODES if current in fallible else MAX_JSON_NODES // footprint[current]
-            count = min(count, limit)
+            distinct_limit = (
+                MAX_JSON_NODES if current in fallible else MAX_JSON_NODES // footprint[current]
+            )
+            count = min(count, distinct_limit * dup)
             costly = work[current] > 32 or (current in nested and branching[current])
             if costly and count * work[current] > _MAX_OUTPUT_REPEATED_STEPS:
                 return True
@@ -1299,7 +1328,8 @@ def _collection_work_exceeds_budget(
                     if isinstance(arm, dict):
                         fallible_children.add(id(arm))
             for child in graph[current]:
-                counts[child] = max(counts.get(child, 0), count)
+                counts[child] = min(step_cap, counts.get(child, 0) + count)
+                peaks[child] = max(peaks.get(child, 0), count)
                 if current in nested:
                     nested.add(child)
                 if current in fallible or child in fallible_children:
@@ -1326,11 +1356,13 @@ def _collection_work_exceeds_budget(
                     or keyword in ("prefixItems", "items")
                     and isinstance(value, list)
                 ):
-                    choices = value.values() if isinstance(value, dict) else value[:items]
+                    entries_list = (
+                        list(value.values()) if isinstance(value, dict) else value[:items]
+                    )
                     cardinality = 1
                     costs = [
                         work[id(x)]
-                        for x in choices
+                        for x in entries_list
                         if isinstance(x, dict) and (branching[id(x)] or work[id(x)] > 32)
                     ]
                     if isinstance(value, dict) and len(costs) > properties:
@@ -1338,9 +1370,10 @@ def _collection_work_exceeds_budget(
                         del costs[properties:]
                     fixed_costs.extend(costs)
                 elif keyword == "patternProperties":
-                    choices, cardinality = value.values(), properties
+                    entries_list = list(value.values())
+                    cardinality = properties
                     matching_work = sum(
-                        work[id(part)] for part in choices if isinstance(part, dict)
+                        work[id(part)] for part in entries_list if isinstance(part, dict)
                     )
                     if (
                         len(value) > 1
@@ -1349,15 +1382,20 @@ def _collection_work_exceeds_budget(
                     ):
                         return True
                 elif keyword in ("items", "contains", "additionalItems", "unevaluatedItems"):
-                    choices, cardinality = [value], items
+                    entries_list, cardinality = [value], items
                 elif keyword in ("additionalProperties", "unevaluatedProperties", "propertyNames"):
-                    choices, cardinality = [value], properties
+                    entries_list, cardinality = [value], properties
                 else:
                     continue
-                for part in choices:
+                for part in entries_list:
                     if isinstance(part, dict):
                         child = id(part)
-                        following[child] = max(following.get(child, 0), count * cardinality)
+                        following[child] = min(
+                            step_cap, following.get(child, 0) + count * cardinality
+                        )
+                        following_peaks[child] = max(
+                            following_peaks.get(child, 0), min(step_cap, count * cardinality)
+                        )
                         if (
                             current in nested
                             or keyword == "contains"
@@ -1372,8 +1410,182 @@ def _collection_work_exceeds_budget(
             following == counts and nested_following == nested and fallible_following == fallible
         ):
             break
-        counts, nested, fallible = following, nested_following, fallible_following
+        counts, peaks, nested, fallible = (
+            following,
+            following_peaks,
+            nested_following,
+            fallible_following,
+        )
     return False
+
+
+_MAX_PATH_STATES = 4096
+_MAX_PATH_TRANSITIONS = 16384
+
+
+def _max_single_value_multiplicity(
+    root: int,
+    order: list[int],
+    graph: dict[int, list[int]],
+    nodes: dict[int, dict[str, Any]],
+    step_cap: int,
+) -> dict[int, int] | None:
+    """Upper bound on how many times a single JSON value can reach each schema node."""
+    closure: dict[int, dict[int, int]] = {}
+    for current in reversed(order):
+        acc: dict[int, int] = {current: 1}
+        for child in graph[current]:
+            for target, mult in closure[child].items():
+                nxt = acc.get(target, 0) + mult
+                if nxt >= step_cap:
+                    return None
+                acc[target] = nxt
+        closure[current] = acc
+
+    def _close(seed: dict[int, int]) -> dict[int, int] | None:
+        closed: dict[int, int] = {}
+        total = 0
+        for u, weight in seed.items():
+            for target, mult in closure[u].items():
+                add = weight * mult
+                nxt = closed.get(target, 0) + add
+                total += add
+                if nxt >= step_cap or total >= step_cap:
+                    return None
+                closed[target] = nxt
+        return closed
+
+    init = _close({root: 1})
+    if init is None:
+        return None
+    max_dup: dict[int, int] = dict(init)
+    init_key = tuple(sorted(init))
+    frontier: dict[tuple[int, ...], dict[int, int]] = {init_key: init}
+    seen: dict[tuple[int, ...], dict[int, int]] = {init_key: dict(init)}
+    expansions = 0
+    transitions = 0
+
+    def _record(
+        seed: dict[int, int],
+        target_frontier: dict[tuple[int, ...], dict[int, int]],
+    ) -> bool:
+        nonlocal transitions
+        transitions += 1
+        if transitions > _MAX_PATH_TRANSITIONS:
+            return False
+        if not seed:
+            return True
+        closed = _close(seed)
+        if closed is None:
+            return False
+        for nid, m in closed.items():
+            if m > max_dup.get(nid, 0):
+                max_dup[nid] = m
+        key = tuple(sorted(closed))
+        prev = seen.get(key)
+        if prev is not None and all(closed[nid] <= prev[nid] for nid in key):
+            return True
+        seen[key] = (
+            {nid: max(prev[nid], closed[nid]) for nid in key} if prev is not None else dict(closed)
+        )
+        existing = target_frontier.get(key)
+        target_frontier[key] = (
+            closed if existing is None else {nid: max(existing[nid], closed[nid]) for nid in key}
+        )
+        return True
+
+    for _ in range(MAX_JSON_DEPTH):
+        if not frontier:
+            break
+        next_frontier: dict[tuple[int, ...], dict[int, int]] = {}
+
+        for active in frontier.values():
+            expansions += 1
+            if expansions > _MAX_PATH_STATES:
+                return None
+
+            propname_seed: dict[int, int] = {}
+            obj_wild_base: dict[int, int] = {}
+            obj_key_nodes: dict[str, list[tuple[int, int]]] = {}
+            arr_wild_base: dict[int, int] = {}
+            arr_idx_nodes: dict[int, list[tuple[int, str, int]]] = {}
+
+            for u, mult in active.items():
+                node = nodes[u]
+                if isinstance(node.get("propertyNames"), dict):
+                    cid = id(node["propertyNames"])
+                    propname_seed[cid] = min(step_cap, propname_seed.get(cid, 0) + mult)
+                props = node.get("properties")
+                if isinstance(props, dict):
+                    for k in props:
+                        obj_key_nodes.setdefault(k, []).append((u, mult))
+                patterns = node.get("patternProperties")
+                if isinstance(patterns, dict):
+                    for psub in patterns.values():
+                        if isinstance(psub, dict):
+                            cid = id(psub)
+                            obj_wild_base[cid] = min(step_cap, obj_wild_base.get(cid, 0) + mult)
+                for kw in ("additionalProperties", "unevaluatedProperties"):
+                    sub = node.get(kw)
+                    if isinstance(sub, dict):
+                        cid = id(sub)
+                        obj_wild_base[cid] = min(step_cap, obj_wild_base.get(cid, 0) + mult)
+                for kw in ("prefixItems", "items"):
+                    tuple_kw = node.get(kw)
+                    if isinstance(tuple_kw, list):
+                        for idx in range(len(tuple_kw)):
+                            arr_idx_nodes.setdefault(idx, []).append((u, kw, mult))
+                for kw in ("items", "additionalItems", "contains", "unevaluatedItems"):
+                    sub = node.get(kw)
+                    if isinstance(sub, dict):
+                        cid = id(sub)
+                        arr_wild_base[cid] = min(step_cap, arr_wild_base.get(cid, 0) + mult)
+
+            if propname_seed and not _record(propname_seed, next_frontier):
+                return None
+            if obj_wild_base and not _record(obj_wild_base, next_frontier):
+                return None
+            for k, holders in obj_key_nodes.items():
+                seed = dict(obj_wild_base)
+                for u, mult in holders:
+                    node = nodes[u]
+                    addl = node.get("additionalProperties")
+                    if isinstance(addl, dict):
+                        aid = id(addl)
+                        rem = seed.get(aid, 0) - mult
+                        if rem <= 0:
+                            seed.pop(aid, None)
+                        else:
+                            seed[aid] = rem
+                    sub = node["properties"][k]
+                    if isinstance(sub, dict):
+                        cid = id(sub)
+                        seed[cid] = min(step_cap, seed.get(cid, 0) + mult)
+                if not _record(seed, next_frontier):
+                    return None
+            if arr_wild_base and not _record(arr_wild_base, next_frontier):
+                return None
+            for idx, arr_holders in arr_idx_nodes.items():
+                seed = dict(arr_wild_base)
+                for u, kw, mult in arr_holders:
+                    node = nodes[u]
+                    tail_kw = "items" if kw == "prefixItems" else "additionalItems"
+                    tail_sub = node.get(tail_kw)
+                    if isinstance(tail_sub, dict):
+                        aid = id(tail_sub)
+                        rem = seed.get(aid, 0) - mult
+                        if rem <= 0:
+                            seed.pop(aid, None)
+                        else:
+                            seed[aid] = rem
+                    sub = node[kw][idx]
+                    if isinstance(sub, dict):
+                        cid = id(sub)
+                        seed[cid] = min(step_cap, seed.get(cid, 0) + mult)
+                if not _record(seed, next_frontier):
+                    return None
+        frontier = next_frontier
+    return max_dup
 
 
 def _contains_meets_unevaluated_items(nodes: list[dict[str, Any]], resolver: Any) -> bool:
