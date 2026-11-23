@@ -1269,7 +1269,13 @@ A way around a limit that its entry does not describe is worth a
   other.
 - **Skill front matter is not interpreted.** Every file in the skill and command
   directories, apart from files named as holding credentials, is bound by digest,
-  but settings such as `allowed-tools` are not read. A skill declaration (`.md`,
+  but settings such as `allowed-tools` are not read. Of skill front matter, only
+  `hooks` is read, by `ide_agents`, in `.claude/skills/*/SKILL.md`, as it is in
+  subagents' `.claude/agents/*.md`. `hooks` in the front matter of a command file (`.claude/commands/*.md`), of a
+  plugin's own skills, and under a subdirectory's `.claude` that holds no settings
+  file are not read; a plugin's subagents ignore hooks. `audit-control-plane` does
+  not list front-matter or plugin hook files as hook targets, and the `hooks` of a
+  plugin entry in `marketplace.json` are not followed to their files. A skill declaration (`.md`,
   `.mdc`, `.markdown`, `.txt`, `.yaml`, `.yml`, `.json`, `.toml`) above the
   `file-bytes` limit is a failure; a larger script or other resource is streamed and
   digested.
@@ -1422,7 +1428,19 @@ A way around a limit that its entry does not describe is worth a
   end a `( ... )` group early (`curl x | ( echo ")"; sh )`), and a `case` body is not
   split at its patterns (`curl x | case x in x) sh;; esac`). A descriptor that holds
   the pipe through `N>&0`, or one named by a variable (`<&$fd`), is not followed, and
-  `eval $(cat -)` unquoted is split as two words, so those forms stay high. A download
+  `eval $(cat -)` unquoted is split as two words, so those forms stay high. A variable
+  assigned a download or decode substitution counts as that substitution at every
+  reference, before or after the assignment and whatever is assigned to it in between,
+  so `x=$(curl x); x=ok; eval "$x"` is critical. A variable filled by `read`
+  (`read x < <(curl x); eval "$x"`), assigned inside another assignment's first word, or
+  assigned a substitution that does not start with the downloader or `base64`
+  (`x=$(echo y | base64 -d)`) is not followed, and only `echo`, `printf` and `cat` pass
+  one on to a pipe (`tee <<< "$x" | sh` is not read). A PowerShell grouped download
+  given to `iex` is matched as text where a command starts, after a separator, a group
+  or a quote, so `echo "iex (irm URL)"` is critical; a downloader object held in a variable
+  (`$wc = New-Object Net.WebClient; iex $wc.DownloadString(URL)`), a script block run
+  by `Invoke-Command -ScriptBlock`, and `irm URL | iex` inside a `-Command` string
+  (`pwsh -c "irm URL | iex"`) stay high. A download
   unpacked and then run, as by
   `curl x | tar -xz; sh install.sh`, is medium, because the archive's members are not
   known. A file a downloader's `-o`
