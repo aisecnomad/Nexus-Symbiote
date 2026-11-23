@@ -213,6 +213,13 @@ _HOST = re.compile(
     r"(?:(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.){1,16}[a-z]{2,24}|localhost)"
     r"(?::\d{1,5})?(?:/\S{0,2048})?"
 )
+_BARE_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.){1,16}([a-z]{2,24})")
+# Generic top-level domains in common use for service hosts. Two-letter country codes are
+# read by rule in public_scheme_operand; anything else is not a public suffix.
+_PUBLIC_SUFFIXES = _words(
+    "com net org edu gov mil int info biz io ai dev app cloud tech xyz site online run page"
+)
+_SOURCE_EXTENSIONS = _words("js mjs cjs ts mts cts py rb jar")
 _HOST_PORT = re.compile(r"[A-Za-z0-9.-]{1,253}:(\d{1,5})(?:/\S{0,2048})?")
 _PORT_PATH = re.compile(r"\d{1,5}(?:/\S{0,2048})?")
 _PLAIN_PORT_PATH = re.compile(r"\d{1,5}(?:/[\w./-]{0,2048})?")
@@ -619,6 +626,28 @@ def public_value(value: str) -> bool:
     # Not ``reference``: it also accepts a literal that merely contains `${NAME}`. A whole
     # reference is already public by ``is_reference`` before this is asked.
     return "://" in value or public_material(value) or _locator_or_value(value)
+
+
+def public_scheme_operand(value: str) -> bool:
+    """Whether the word after an authentication scheme positively names something public.
+
+    As ``public_value``, except that a bare dotted word (no scheme, port or path) is a
+    host only when its last label is a public suffix or a script name ends in a source
+    extension. Dots alone do not make ``db.internal.example`` or ``hunter.corp`` public
+    where a credential may stand; ``.example``, ``.test``, ``.invalid``, ``.local``,
+    ``.internal``, ``.corp`` and ``.lan`` are reserved or private names, never suffixes.
+    """
+    value = _strip(value)
+    if not public_value(value):
+        return False
+    host = _BARE_HOST.fullmatch(value)
+    if host is None or _path(value):
+        return True
+    suffix = host.group(1)
+    if len(suffix) == 2:
+        # ISO 3166 reserves these alpha-2 codes for user assignment; no ccTLD uses one.
+        return suffix not in {"aa", "zz"} and not ("qm" <= suffix <= "qz" or suffix[0] == "x")
+    return suffix in _PUBLIC_SUFFIXES or suffix in _SOURCE_EXTENSIONS
 
 
 def _token_hits(value: str) -> list[Hit]:

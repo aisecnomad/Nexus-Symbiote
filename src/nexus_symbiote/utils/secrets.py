@@ -173,10 +173,13 @@ def holds_token_shape(text: str, *, require_sk_boundary: bool = False) -> bool:
 
 
 # A header value with no scheme is redacted when it looks like a credential; after
-# Negotiate or NTLM, which the scheme rule above does not know, whatever its shape.
+# Negotiate, NTLM, DPoP (RFC 9449), HOBA (RFC 7486) or Mutual (RFC 8120), which the scheme
+# rule above does not know, whatever its shape. "Mutual" is an English word, so it counts
+# only after an Authorization header name, never in prose.
 _RAW_AUTH_HEADER = re.compile(
     r"(?i)(\b(?:proxy-)?authorization(?:\\*+[\"'])?\s{0,8}[:=]\s{0,8}(?:\\*+[\"'])?)"
-    r"(?:(negotiate|ntlm)([ \t]++)([A-Za-z0-9_+/=.~-]++)|([A-Za-z0-9_+/=.~:-]{8,}+))"
+    r"(?:(negotiate|ntlm|dpop|hoba|mutual)([ \t]++)([A-Za-z0-9_+/=.~-]++)"
+    r"|([A-Za-z0-9_+/=.~:-]{8,}+))"
 )
 _AUTH_SCHEMES = frozenset(
     {
@@ -189,6 +192,9 @@ _AUTH_SCHEMES = frozenset(
         "digest",
         "negotiate",
         "aws4-hmac-sha256",
+        "dpop",
+        "hoba",
+        "mutual",
     }
 )
 _AUTH_SCHEME_LENGTH = max(map(len, _AUTH_SCHEMES))
