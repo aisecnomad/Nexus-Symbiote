@@ -8,7 +8,7 @@ import pytest
 
 from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import AIBOM
-from nexus_symbiote.core.models import AgentComponent, RAGSourceComponent
+from nexus_symbiote.core.models import AgentComponent, ModelComponent, RAGSourceComponent
 from nexus_symbiote.diff.differ import AIBOMDiffer
 from nexus_symbiote.generators.recovery import recover_export
 from nexus_symbiote.generators.validation import (
@@ -244,3 +244,63 @@ def test_static_credentials_reach_no_cli_export(
     assert rag.source_uris == ["[redacted]", "[redacted]"]
     assert rag.properties["source_values_bound"] is keyed
     assert any(risk.category == "completeness" for risk in rag.risks) is not keyed
+
+
+GITHUB_TOKEN = "ghp_" + "C3" * 18
+OPENAI_TOKEN = "sk-proj-" + "D4e5" * 10
+
+
+def test_agent_manifest_hosted_model_fields_are_redacted(tmp_path, runner):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "agent.yaml").write_text(
+        json.dumps(
+            {
+                "name": "helper",
+                "models": {
+                    "primary": {
+                        "provider": f"openai api_key={OPENAI_TOKEN}",
+                        "requested_ref": f"gpt-4o?token={GITHUB_TOKEN}",
+                    },
+                    GITHUB_TOKEN: {"provider": "openai", "requested_ref": OPENAI_TOKEN},
+                    "planner": {"provider": "anthropic", "requested_ref": "claude-sonnet-4-5"},
+                    "sk-research-assistant": {
+                        "provider": "openai",
+                        "requested_ref": "openai/gpt-4o-mini",
+                    },
+                },
+            }
+        )
+    )
+    inventory = tmp_path / "inventory.json"
+    scanned = runner.invoke(
+        main, ["scan", str(project), "--no-project-policy", "--report-only", "-o", str(inventory)]
+    )
+    assert scanned.exit_code == 0, scanned.output
+    outputs = [inventory.read_text(), scanned.output]
+    for output_format, validator in (("cyclonedx", validate_cyclonedx), ("spdx", validate_spdx)):
+        exported = tmp_path / f"inventory.{output_format}.json"
+        result = runner.invoke(
+            main, ["export-standard", str(inventory), "-f", output_format, "-o", str(exported)]
+        )
+        assert result.exit_code == 0, result.output
+        assert validator(json.loads(exported.read_text())) == []
+        outputs += [exported.read_text(), result.output]
+    for output in outputs:
+        assert GITHUB_TOKEN not in output
+        assert OPENAI_TOKEN not in output
+
+    bom = AIBOM.model_validate_json(outputs[0])
+    hosted = {
+        c.bom_ref.rsplit("/", 1)[1]: (c.name, c.provider, c.requested_alias)
+        for c in bom.components
+        if isinstance(c, ModelComponent) and c.model_type == "hosted"
+    }
+    assert hosted == {
+        "primary": ("gpt-4o?token=***", "openai api_key=***", "gpt-4o?token=***"),
+        "planner": ("claude-sonnet-4-5", "anthropic", "claude-sonnet-4-5"),
+        "sk-research-assistant": ("openai/gpt-4o-mini", "openai", "openai/gpt-4o-mini"),
+    }
+    assert "agent.yaml#/models: a model key is shaped like a credential" in (
+        bom.metadata.completeness.scan_failures
+    )
