@@ -217,8 +217,22 @@ def test_safetensors_valid_and_malformed_non_pickle_preserve_verdicts(tmp_path: 
         b'{%- raw -%}{# unclosed comment {%- endraw -%}{{ "_" + "_globals_" + "_" }}',
         b'{%+ raw %}{% if "{%+ endraw -%}{{ "_" ~ "_subclasses_" ~ "_" }}',
         b'{% raw %}{% raw %}{% endraw %}{{ "_" ~ "_builtins_" ~ "_" }}',
-        b'{% raw %}{% endraw +%}{# {% endraw %}{{ "_" ~ "_class_" ~ "_" }}',
+        # Jinja2 3.1 ends a raw block at "+%}" too (TOKEN_RAW_BEGIN's end rule).
+        b'{% raw %}hello{% endraw +%}{{ a["_" ~ "_class_" ~ "_"] }}',
         b'{% set x = ({1: {2: 3}}, a["_" ~ "_class_" ~ "_"]) %}',
+        # A "}}" that closes nested dict braces does not end the tag: Jinja's lexer
+        # matches a tag's end only while brackets balance.
+        b'{{ ({1: {2: 3}}, a["_" ~ "_class_" ~ "_"]) }}',
+        b'{{ {1: {2: 3}} and "{% raw %}" }}{{ a["_" ~ "_class_" ~ "_"] }}',
+        b'{{ {1: 2}}}{{ a["_" ~ "_class_" ~ "_"] }}',
+        # A ")" skipped between two joined pieces still closes its "(": the tag ends at
+        # its "}}" and the apostrophe after it is text, not the start of a string.
+        b'{{ ("x") ~ "y" }} Don\'t {{ a["_" ~ "_class_" ~ "_"] }}',
+        b"{{ ('<|' + message['role'] + '|>') + '\\n' }} Don't "
+        + b'{{ cycler["_" ~ "_init_" ~ "_"]["_" ~ "_globals_" ~ "_"] }}',
+        # Jinja2 3.x ends this raw block at "+%}", 2.x only at the later "{% endraw %}",
+        # which makes the payload a live tag: both readings are checked.
+        b'{% raw %}X{% endraw +%}{# {% endraw %}{{ a["_" ~ "_class_" ~ "_"] }} #}',
     ],
 )
 def test_jinja_raw_block_cannot_blind_joined_literal_marker(template: bytes) -> None:
@@ -231,6 +245,8 @@ def test_jinja_raw_block_cannot_blind_joined_literal_marker(template: bytes) -> 
         b'{% raw %}{{ "_" ~ "_class_" ~ "_" }}{% endraw %}{{ "hello" }}',
         b'{%- raw -%}{{ "_" ~ "_class_" ~ "_" }}{%- endraw -%}',
         b'{% raw %}{{ "_" ~ "_class_" ~ "_" }}',
+        b'{% raw %}{{ "_" ~ "_class_" ~ "_" }}{% endraw +%}{{ "hello" }}',
+        b'{{ {1: {2: 3}} }}"_" ~ "_class_" ~ "_"',
     ],
 )
 def test_jinja_raw_block_literal_text_does_not_false_positive(template: bytes) -> None:
@@ -309,3 +325,175 @@ def test_jinja_raw_block_scanning_stays_linear() -> None:
         return template_escape_markers(chunk + b'{{ "plain" }}')
 
     assert scaling_ratio(run) < 10
+
+
+def test_c_unpickler_int_with_leading_zeros_past_the_int_digit_limit_is_followed(
+    tmp_path: Path,
+) -> None:
+    # strtol reads any number of leading zeros; int() refuses more than 4,300 digits.
+    zeros = b"0" * (sys.get_int_max_str_digits() + 1)
+    payload = b"I" + zeros + b"\n0cos\ngetpid\n)R."
+    assert pickle.loads(payload) > 0  # noqa: S301 - inert os.getpid()
+    segment = load_segment(payload, len(payload), 0, "c", Budget(65536, 64))
+    assert segment.outcome == "called"
+
+    # Past what a C long holds, strtol overflows and PyLong_FromString reads the digits:
+    # under the default limit it refuses them, under no limit it reads them and the call
+    # runs, so the walk goes on as the loader with no limit does ("int-digits").
+    overflowing = b"I" + b"1" * (sys.get_int_max_str_digits() + 1) + b"\n0cos\ngetpid\n)R."
+    with pytest.raises(ValueError):
+        pickle.loads(overflowing)  # noqa: S301 - refused before any call
+    overflowed = load_segment(overflowing, len(overflowing), 0, "c", Budget(65536, 64))
+    assert overflowed.outcome == "called"
+    assert "int-digits" in overflowed.differs
+
+    for rel_path in ("models/weights.dat", "models/direct.pkl"):
+        target = tmp_path / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+    result = ModelScanner().scan(tmp_path)
+    for rel_path in ("models/weights.dat", "models/direct.pkl"):
+        matched = [c for c in result.components if c.source_path == rel_path]
+        assert len(matched) == 1, rel_path
+        assert matched[0].serialization_safety is SerializationSafety.UNSAFE_CODE_EXECUTION
+
+
+def test_hashing_reader_never_asks_for_more_than_the_limit() -> None:
+    from dataclasses import replace
+
+    from nexus_symbiote import limits
+    from nexus_symbiote.scanners.model import _HashingModelReader
+
+    requested: list[int] = []
+
+    class _Recording(io.BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            requested.append(-1 if size is None else size)
+            return super().read(size)
+
+    with limits.applied(replace(limits.DEFAULTS, model_bytes=16)):
+        reader = _HashingModelReader(_Recording(b"A" * 64))
+    with pytest.raises(OSError, match="hash byte limit"):
+        reader.read(-1)
+    assert requested == [17]
+
+
+_DIGIT_CALLS = {
+    "int": b"I" + b"1" * 5000 + b"\n0cos\ngetpid\n)R.",
+    "long": b"L" + b"1" * 5000 + b"L\n0cos\ngetpid\n)R.",
+    "get": b"K0p0\n0g" + b"0" * 5000 + b"\n0cos\ngetpid\n)R.",
+    "put": b"K0p" + b"0" * 5000 + b"\n0cos\ngetpid\n)R.",
+}
+
+
+@pytest.mark.parametrize("payload", _DIGIT_CALLS.values(), ids=_DIGIT_CALLS)
+def test_text_integers_are_read_whatever_the_int_digit_limit(payload: bytes) -> None:
+    # A loader run with int_max_str_digits=0 reads every one of these and calls getpid.
+    import subprocess
+
+    loaded = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-X",
+            "int_max_str_digits=0",
+            "-c",
+            "import pickle, sys; pickle.loads(sys.stdin.buffer.read()); print('loaded')",
+        ],
+        input=payload,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert loaded.stdout.strip() == b"loaded"
+    for flavor in ("c", "py"):
+        segment = load_segment(payload, len(payload), 0, flavor, Budget(65536, 64))
+        assert segment.outcome == "called", flavor
+        assert "int-digits" in segment.differs
+
+
+def test_a_literal_past_the_digit_floor_is_not_converted_on_any_walk() -> None:
+    # C-flavour walks re-read the same INT at every frame end they cross (185 walks for
+    # eight crossing stages); converting a 60,000-digit literal on each cost 3 s a file.
+    from nexus_symbiote.utils import pickle_load
+
+    beyond = pickle_load._BEYOND
+    assert pickle_load._py_int(b"1" * 60_000 + b"\n", 10) is beyond
+    assert pickle_load._py_int(b"0" * 5_000 + b"1" * 641, 10) is beyond  # past the floor
+    assert pickle_load._py_int(b"0" * 5_000 + b"1" * 641, 0) is None  # base 0: no leading 0
+    assert pickle_load._py_int(b"-" + b"1" * 5_000, 10) == -beyond
+    assert pickle_load._py_int(b"9" * 640, 10) == int("9" * 640)
+    stage = b"\x95" + (2).to_bytes(8, "little") + b"M\x01\x01N"
+    payload = stage * 8 + b"I" + b"1" * 60_000 + b"\n."
+    segments = list(pickle_load.load_segments(payload, len(payload), 0, "c", Budget(4096, 64)))
+    assert len(segments) > 100
+    assert {segment.outcome for segment in segments} <= {"stop", "unread"}
+
+
+def _memo_call(put: bytes, other: bytes, get: bytes) -> bytes:
+    # len under memo index `put`, None under `other`, then GET `get` and call it.
+    return b"cbuiltins\nlen\np" + put + b"\n0Np" + other + b"\n0g" + get + b"\n(S'ab'\ntR."
+
+
+def test_long_memo_indexes_keep_distinct_keys() -> None:
+    import subprocess
+
+    first, second = b"1" * 5_000, b"2" * 5_000
+    payload = _memo_call(first, second, first)
+    # The pure-Python unpickler with no digit limit keys its memo by the exact integer.
+    loaded = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-X",
+            "int_max_str_digits=0",
+            "-c",
+            "import pickle, sys; print(pickle._loads(sys.stdin.buffer.read()))",
+        ],
+        input=payload,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert loaded.stdout.strip() == b"2"
+    segment = load_segment(payload, len(payload), 0, "py", Budget(65536, 64))
+    assert segment.outcome == "called"
+    assert "int-digits" in segment.differs
+    # Past LONG_MAX, the C unpickler refuses the index, as PyLong_AsSsize_t does.
+    assert load_segment(payload, len(payload), 0, "c", Budget(65536, 64)).outcome == "error"
+    # A different index under GET still misses the memo.
+    missed = _memo_call(first, second, b"3" * 5_000)
+    assert load_segment(missed, len(missed), 0, "py", Budget(65536, 64)).outcome == "error"
+
+
+@pytest.mark.parametrize(
+    ("put", "get"),
+    [
+        (b"0" * 5_000 + b"7", b"7"),
+        (b"0" * 100 + b"9" * 700, b"9" * 700),
+        (b"1_0", b"10"),
+        (b" 0" + b"0" * 4_400 + b"5 ", b"+5"),
+    ],
+    ids=["zeros-then-short", "zeros-then-long", "underscore", "whitespace-and-sign"],
+)
+def test_one_memo_index_written_two_ways_is_one_key(put: bytes, get: bytes) -> None:
+    payload = _memo_call(put, b"99", get)
+    assert load_segment(payload, len(payload), 0, "py", Budget(65536, 64)).outcome == "called"
+
+
+def test_a_negative_long_memo_index_is_refused() -> None:
+    payload = b"Np-" + b"1" * 5_000 + b"\n."
+    for flavor in ("c", "py"):
+        assert load_segment(payload, len(payload), 0, flavor, Budget(65536, 64)).outcome == (
+            "error"
+        )
+
+
+def test_a_memo_index_past_a_c_long_still_fails_the_c_unpickler() -> None:
+    index = b"1" + b"0" * 5000
+    payload = b"K0p" + index + b"\n0cos\ngetpid\n)R."
+    assert load_segment(payload, len(payload), 0, "c", Budget(65536, 64)).outcome == "error"
+    boundary = b"K0p9223372036854775807\n0g9223372036854775807\n."
+    assert load_segment(boundary, len(boundary), 0, "c", Budget(4096, 64)).outcome == "stop"
+    over = b"K0p9223372036854775808\n."
+    assert load_segment(over, len(over), 0, "c", Budget(4096, 64)).outcome == "error"
