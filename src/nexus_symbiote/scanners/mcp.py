@@ -1932,7 +1932,13 @@ def _segment_is_secret(text: str, scrubber: SecretScrubber | None) -> bool:
         return True
     if TOKEN_SHAPE.search(text):
         return True
-    return len(text) >= MIN_SECRET_LENGTH and literal_value(text)
+    return (
+        len(text) >= 16
+        and any(char.isdigit() for char in text)
+        and any(char.isupper() for char in text)
+        and any(char.islower() for char in text)
+        and literal_value(text)
+    )
 
 
 def _command_has_secret(command: str, scrubber: SecretScrubber | None) -> bool:
@@ -1948,18 +1954,32 @@ def _command_text_for_hash(
     exported_command: str | None = None,
     scrubber: SecretScrubber | None = None,
 ) -> str | None:
-    """The exact raw command when it is not the exported name.
+    """The raw command when a path or whitespace/format padding changes a safe command.
 
-    ``/tmp/npx`` and ``npx`` must not share a digest. A command or path segment that
-    is itself a credential stays out of the unkeyed hash.
+    Redacted commands (``[redacted-command]``), secret-bearing paths, and bare
+    case-folded or Windows-suffix-folded commands stay out of the unkeyed
+    ``static_config_hash`` so they remain unbound without a key and credentials
+    never enter the public digest. Safe path commands such as ``/tmp/npx`` and
+    padded bare commands such as ``npx `` stay distinct from ``npx``.
     """
     if not isinstance(command, str) or not command:
         return None
+    if exported_command is None or exported_command == "[redacted-command]":
+        return None
     if _command_has_secret(command, scrubber):
         return None
-    if exported_command is not None and command == exported_command:
+    if re.search(r"[\\/]", command):
+        return command
+    if command.casefold() == exported_command.casefold():
         return None
-    return command
+    start, end = 0, len(command)
+    while start < end and _ignorable_command_char(command[start]):
+        start += 1
+    while end > start and _ignorable_command_char(command[end - 1]):
+        end -= 1
+    if (start, end) != (0, len(command)):
+        return command
+    return None
 
 
 def _cmd_set_word(previous: str | None, before_previous: str | None) -> bool:
@@ -4690,15 +4710,9 @@ class MCPScanner(Scanner):
     def _safe_name(value: str | None) -> str | None:
         if value is None:
             return None
-        # The folded name is what would be stored. A credential is refused here too,
-        # after the raw command was already checked before case-folding.
-        if (
-            not _SAFE_NAME.fullmatch(value)
-            or TOKEN_SHAPE.search(value)
-            or (len(value) >= MIN_SECRET_LENGTH and literal_value(value))
-        ):
-            return "[redacted-command]"
-        return value
+        if _SAFE_NAME.fullmatch(value) and not TOKEN_SHAPE.search(value):
+            return value
+        return "[redacted-command]"
 
     def _package_sources(
         self,
