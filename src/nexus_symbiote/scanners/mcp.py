@@ -71,7 +71,6 @@ from nexus_symbiote.scanners.mcp_credentials import (
     NAMED_CLASS,
     SCHEME_CLASS,
     SHAPE_CLASS,
-    CredentialScrubber,
     Hit,
     WrappedKeySearchLimitError,
     assignment_hits,
@@ -86,6 +85,9 @@ from nexus_symbiote.scanners.mcp_credentials import (
     rewrapped_key_literals,
     strongest,
     value_hits,
+)
+from nexus_symbiote.scanners.mcp_credentials import (
+    CredentialScrubber as SecretScrubber,
 )
 from nexus_symbiote.scanners.mcp_launch import (
     NPM_CONFIG_FLAGS,
@@ -108,7 +110,6 @@ from nexus_symbiote.utils.secrets import (
     MIN_SECRET_LENGTH,
     REDACTED,
     TOKEN_SHAPE,
-    SecretScrubber,
     credential_shaped,
     is_reference,
     redact_descriptor,
@@ -1849,7 +1850,7 @@ def _overflow_argument_secrets(args: Sequence[Any], command: str = "") -> list[s
     fail-closed file budget so decoys cannot push out real secrets or cause
     unbounded memory growth.
     """
-    cap = MAX_SECRETS_PER_FILE + 1
+    cap = MAX_SECRETS_PER_FILE * 4 + 1
     recognized: dict[str, None] = {}
     for value in _launch_secrets(Launch(), args, command):
         recognized[value] = None
@@ -2280,25 +2281,17 @@ def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
                 use_shape = (value_record and key in {"value", "values"}) or (
                     unlabelled and (inferred or credential_name(name))
                 )
-                if not isinstance(value, str) and isinstance(key, str) and credential_name(key):
+                if (
+                    not isinstance(value, str)
+                    and isinstance(key, str)
+                    and key.lower()
+                    not in {"auth", "oauth", "headers", "http_headers", "env", "environment"}
+                    and credential_name(key)
+                ):
                     yield from _string_leaves(value)
+                    continue
                 pending.append((str(key), value, use_shape))
         elif isinstance(item, list):
-            # ``["API_TOKEN", "<secret>", ...]``: an env entry of any length. The
-            # value is the second element; further elements are comments or flags.
-            if (
-                len(item) >= 2
-                and isinstance(item[0], str)
-                and (
-                    credential_name(item[0])
-                    or name.lower() in {"env", "environment", "command.env"}
-                )
-            ):
-                if isinstance(item[1], str):
-                    pending.append((item[0], item[1], True))
-                else:
-                    # A list or dict under the credential name is not a string value.
-                    yield from _string_leaves(item[1])
             if name in {"", "args", "command", "command.args"}:
                 for index, word in enumerate(item):
                     if isinstance(word, str):
@@ -2312,8 +2305,20 @@ def _malformed_values(node: Any, field: str = "") -> Iterator[str]:
                                 following=following if isinstance(following, str) else None,
                             )
                         )
-            if len(item) == 2 and isinstance(item[0], str) and _scheme_assignment_name(item[0]):
-                pending.extend(((name, item[0], False), (item[0], item[1], True)))
+            # ``["API_TOKEN", "<secret>", ...]``: an env entry of any length. The
+            # value is the second element; further elements are comments or flags.
+            if (
+                len(item) >= 2
+                and isinstance(item[0], str)
+                and (
+                    _scheme_assignment_name(item[0])
+                    or credential_name(item[0])
+                    or name.lower() in {"env", "environment", "command.env"}
+                )
+            ):
+                pending.append((name, item[0], False))
+                pending.append((item[0], item[1], True))
+                pending.extend((name, extra, inferred) for extra in item[2:])
             else:
                 pending.extend((name, value, inferred) for value in item)
         elif isinstance(item, str):
@@ -2363,8 +2368,13 @@ def _server_secrets(
             values.extend((raw_command, basename, basename.casefold()))
     for key, item in config.items():
         # A top-level ``apiKey`` (and any other credential-named field) is not an
-        # environment map, but a sibling tool can still repeat it.
-        if isinstance(key, str) and credential_name(key):
+        # environment map, but a sibling tool can still repeat it. Structured MCP
+        # sections are read by their own field-aware extractors below.
+        if (
+            isinstance(key, str)
+            and key not in {"auth", "oauth", "env", "headers", "http_headers"}
+            and credential_name(key)
+        ):
             if isinstance(item, str):
                 if not is_reference(item) and secret_like(key, item):
                     values.append(item)
@@ -3866,9 +3876,7 @@ class MCPScanner(Scanner):
         # every file would cost the square of the number of nested client files.
         pending_refs: dict[str, set[str]] = {}
         parsed: dict[str, tuple[Any, list[str]]] = {}
-        collected: list[
-            tuple[McpDialect, dict[str, Any], _Entries, CredentialScrubber, dict[int, Any]]
-        ]
+        collected: list[tuple[McpDialect, dict[str, Any], _Entries, SecretScrubber, dict[int, Any]]]
         collected, literals = [], []
         for path in paths:
             dialect = _dialect(path)
@@ -3891,12 +3899,18 @@ class MCPScanner(Scanner):
                 continue
             entries = read.servers
             server_hits: dict[int, PositionHits] = {}
+            overflow_values: list[str] = []
             values = self._file_secrets(
-                [*entries, *(("", config) for config in read.dropped)], dialect.shape, server_hits
+                [*entries, *(("", config) for config in read.dropped)],
+                dialect.shape,
+                server_hits,
+                overflow_values=overflow_values,
             )
             # Retain values from refused files when withholding names declared in source.
             if known is not None:
                 known.add(values)
+                if overflow_values:
+                    known.add(overflow_values)
             if key_error is not None and entries:
                 result.scan_failures.append(f"{dialect.path}: {key_error}")
                 continue
@@ -3904,6 +3918,7 @@ class MCPScanner(Scanner):
             for server, hits in server_hits.items():
                 literals.extend(_server_literals(configs[server], hits))
             unique = set(filter(None, values))
+            overflow_unique = set(filter(None, overflow_values))
             wrapped_found: list[str] = []
             if len(unique) <= MAX_SECRETS_PER_FILE:
                 try:
@@ -3919,7 +3934,10 @@ class MCPScanner(Scanner):
                         f"{dialect.path}: wrapped credential comparison limit reached; not collected"
                     )
                     continue
-            if len(unique) > MAX_SECRETS_PER_FILE:
+            if (
+                len(unique) > MAX_SECRETS_PER_FILE
+                or len(overflow_unique) > MAX_SECRETS_PER_FILE * 4
+            ):
                 if known is not None:
                     known.refuse()
                 result.scan_failures.append(
@@ -3929,7 +3947,7 @@ class MCPScanner(Scanner):
                 continue
             if known is not None and wrapped_found:
                 known.add(wrapped_found)
-            file_secrets = CredentialScrubber(unique)
+            file_secrets = SecretScrubber(unique | overflow_unique)
             collected.append((dialect, data, read, file_secrets, server_hits))
         # A name may repeat a literal of any client file, so every file is read first.
         names = _Names(literals)
@@ -4005,6 +4023,8 @@ class MCPScanner(Scanner):
         entries: list[tuple[str, Any]],
         shape: str,
         server_hits: dict[int, PositionHits] | None = None,
+        *,
+        overflow_values: list[str] | None = None,
     ) -> list[str]:
         """Credential values of every server in a file, inline launcher values included.
 
@@ -4013,10 +4033,13 @@ class MCPScanner(Scanner):
         from each. A server that _server_problem refuses is never parsed, but every value
         _server_secrets reads for a parsed one still counts: refusing it must not publish
         what its siblings repeat. Only its launcher is not analysed, and the arguments of
-        one past an argument limit are read only for the names they withhold. Each server's
-        launch positions are read once, into ``server_hits`` by the server's identity.
+        one past an argument limit are collected into ``overflow_values`` so they are
+        scrubbed from sibling servers without consuming the admitted-server secret cap.
+        Each server's launch positions are read once, into ``server_hits`` by the
+        server's identity.
         """
         values: list[str] = []
+        overflow_raw: list[str] = []
         for _, config in entries:
             if not isinstance(config, dict):
                 values.extend(_malformed_values(config))
@@ -4033,15 +4056,12 @@ class MCPScanner(Scanner):
                     else config
                 )
                 hits = _declared_hits(declared)
-                if overflow_args and isinstance(args, list):
+                if overflow_args and isinstance(args, list) and overflow_values is not None:
                     # A refused argument list must not publish a credential past the
-                    # position cap. Within the cap, the credentials the launch and
-                    # credential-hit rules read are withheld. Past it, every value after
-                    # a credential flag is withheld, and if that set is still past the
-                    # cap, long arguments are withheld up to the fail-closed file limit.
+                    # position cap or consume the admitted-server secret budget.
                     raw_command = config.get("command")
                     command_text = raw_command if isinstance(raw_command, str) else ""
-                    values.extend(_overflow_argument_secrets(args, command_text))
+                    overflow_raw.extend(_overflow_argument_secrets(args, command_text))
                 for field, value in cls._invalid_field_values(declared, shape):
                     values.extend(_malformed_values(value, field))
                 values.extend(_server_secrets(declared, Launch(), hits))
@@ -4057,6 +4077,12 @@ class MCPScanner(Scanner):
             if server_hits is not None:
                 server_hits[id(config)] = hits
             values.extend(_server_secrets(config, launch, hits))
+        if overflow_values is not None and overflow_raw:
+            overflow_values.extend(
+                dict.fromkeys(
+                    spelling for value in overflow_raw for spelling in credential_spellings(value)
+                )
+            )
         return list(
             dict.fromkeys(spelling for value in values for spelling in credential_spellings(value))
         )
@@ -4078,7 +4104,7 @@ class MCPScanner(Scanner):
         scrubber = (
             file_secrets
             if file_secrets is not None
-            else CredentialScrubber(_server_secrets(config, launch))
+            else SecretScrubber(_server_secrets(config, launch))
         )
         # A name may repeat what only this server's text holds and no rule reads as a
         # credential: URL user information, or `NAME=value` passed to a launcher such
@@ -4382,7 +4408,7 @@ class MCPScanner(Scanner):
             credential_hits = _server_hits(config)
         scrubber = file_secrets
         if scrubber is None:
-            scrubber = CredentialScrubber(_server_secrets(config, launch, credential_hits))
+            scrubber = SecretScrubber(_server_secrets(config, launch, credential_hits))
         own = _server_literals(config, credential_hits)
         names = (names or _Names(own).scoped(scrubber.values)).scoped(own=own)
         cwd = config.get("cwd")
@@ -5318,7 +5344,7 @@ class MCPScanner(Scanner):
         tools_config = config.get("tools", [])
         tool_comps = []
         seen_refs: set[str] = set()
-        scrubber = secrets if secrets is not None else CredentialScrubber()
+        scrubber = secrets if secrets is not None else SecretScrubber()
 
         if isinstance(tools_config, list):
             for tool_def in tools_config:
