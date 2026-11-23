@@ -3,8 +3,9 @@
 Module layout, trust boundaries and data flow. Read this before changing a
 collector, gate or export. The [security model](security-model.md) states the
 design principles; the [threat model](threat-model.md) lists the attacks each
-boundary stops; the [known limitations](known-limitations.md) list what the
-controls do not cover.
+boundary stops; the [known limitations](known-limitations.md), summarized in the
+[security policy](../SECURITY.md#known-limitations), list what the controls do not
+cover.
 
 - [Data flow](#data-flow)
 - [What a scan does](#what-a-scan-does)

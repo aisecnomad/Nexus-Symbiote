@@ -40,8 +40,10 @@ older than that limit.
 It does not establish:
 
 - **That the inventory is accurate, complete or safe.** An attestation authenticates
-  a file, not its claims. An attested inventory of an unsafe agent is an inventory
-  of an unsafe agent.
+  a file, not its claims (whether claims are declared, observed or verified is in the
+  [security model](security-model.md)), and what the collectors cannot see stays unseen
+  ([known limitations](known-limitations.md)). An attested inventory of an unsafe agent
+  is an inventory of an unsafe agent.
 - **That the file is the newest one.** An older file signed for the same purpose still
   verifies. Bound it with `--max-age-days`, record `--source-revision`, and keep
   attested baselines where the change under review cannot choose among them.

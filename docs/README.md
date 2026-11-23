@@ -13,7 +13,7 @@ Read these before you use any result in an approval decision.
 
 | Page | Read it to understand |
 | --- | --- |
-| [Security model](security-model.md) | Design principles; declared, observed, approved and mediated evidence; [what results establish](security-model.md#what-results-do-and-do-not-establish); false-positive and false-negative classes |
+| [Security model](security-model.md) | [Design principles](security-model.md#design-principles); declared, observed, approved and mediated evidence; [what results establish](security-model.md#what-results-do-and-do-not-establish); false-positive and false-negative classes |
 | [Architecture](architecture.md) | Module layout, scan pipeline, trust boundaries and their controls |
 | [Threat model](threat-model.md) | Assets, adversaries, controls and residual risk |
 | [Offline and live modes](offline-and-live-modes.md#why) | Why every command is offline by default and how that is enforced |

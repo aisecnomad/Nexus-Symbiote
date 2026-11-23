@@ -179,7 +179,8 @@ against the current tree.
 
 - **Content can change for reasons other than the checkout.** The tool version,
   governing policy, selected collectors (`--scanner`),
-  [collection limits](collection-limits.md), and `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` are
+  [collection limits](collection-limits.md), and `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`
+  ([source binding](verification-source-binding.md)) are
   all content. Take compared inventories the same way; see
   [take both snapshots the same way](drift-gate.md#take-both-snapshots-the-same-way).
 - **List order is content.** This build writes components and dependencies sorted, and

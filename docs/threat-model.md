@@ -3,7 +3,8 @@
 Nexus SymBiote reads hostile input and makes decisions other people rely on. This
 page states what it protects, from whom and which control answers each threat.
 The [architecture](architecture.md) shows where each boundary sits. What the
-controls do not cover is in the [known limitations](known-limitations.md).
+controls do not cover is in the [security policy](../SECURITY.md#known-limitations)
+and, in full, the [known limitations](known-limitations.md).
 
 ## Assets
 

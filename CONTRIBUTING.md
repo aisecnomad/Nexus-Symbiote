@@ -198,6 +198,6 @@ The job also checks:
 - Vendored schemas' recorded SHA-256 digests
 - README links (must be absolute for PyPI; each must resolve to a tracked file and heading)
 
-These checks are offline and do not authenticate an upstream publisher. Review schema byte changes and their provenance manifest together.
+These checks are offline and do not authenticate an upstream publisher. Review schema byte changes and their provenance manifest together. Keep experimental-branch merges and manually ported changes distinct from ancestry on `main`; the [closed-PR audit](docs/audits/closed-pr-review-2026-11-02.md) records that distinction.
 
 Read [SECURITY.md](SECURITY.md) before reporting security-sensitive defects. This project is licensed under MIT as specified in [LICENSE](LICENSE).

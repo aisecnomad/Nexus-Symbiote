@@ -31,13 +31,11 @@ python -m pip install --no-deps --no-build-isolation -e .
 
 Run these from the reviewed checkout inside your virtual environment. Fresh extra resolution can select different dependency versions within the declared ranges. If binary wheel installation fails, check Python/platform compatibility before installing additional compilers or changing the dependency policy.
 
-## Troubleshooting
+## No supported assets collected
 
-### No assets collected
+Check the project path and the supported file/configuration scope. A completed static search may find no matching files; this does not prove there are no agents or deployments. A repository-path-inferred agent alone is not a supported local baseline subject.
 
-Check the project path and the supported file/configuration scope. A completed static search may find no matching files; this does not prove there are no agents or deployments.
-
-Inspect `metadata.completeness.scanner_status`, exclusions, unobserved surfaces and scan failures. `--scanner` deliberately narrows the requested collector set and leaves others as `unknown`.
+Inspect `metadata.completeness.scanner_status`, exclusions, unobserved surfaces and scan failures. Unsupported or dynamic declarations and failed reads remain visible as partial or failed collection. `--scanner` deliberately narrows the requested collector set and leaves others as `unknown`.
 
 For untrusted checkouts, use caller-owned policy:
 
@@ -47,21 +45,21 @@ nexus-symbiote validate candidate.json --project /path/to/project --no-project-p
 nexus-symbiote risk candidate.json --no-project-policy --threshold 50
 ```
 
-A command can write an inventory while returning a failing status. `--report-only` permits inspection without a successful gate; do not use it to make a deployment approval appear green.
+A command can write an inventory while returning a failing status. `--report-only` permits inspection without a successful gate; do not use it to make a deployment approval appear green. The trusted GitHub Action ignores checkout-supplied policy, and disabled Action gates are reported as skipped rather than successful verification.
 
-### Collection limit exceeded
+## A collection limit was exceeded
 
 A failure such as `vendor: entries limit of 100000 exceeded; raise it with --limit entries=N` means a collector stopped at a [collection limit](docs/collection-limits.md), so coverage is incomplete and gates fail. Check first that the path belongs in the scan; otherwise raise the named limit with `--limit NAME=VALUE` or `NEXUS_SYMBIOTE_LIMITS`. Settings in the scanned project never change a limit.
 
-### ShadowScan import fails
+## ShadowScan import returns a failing status
 
 Standalone import remains partial even for a completed source scan. It writes evidence and normally exits nonzero. Use `--report-only` for inspection with a fresh output path.
 
-In CI, unverified discovery evidence fails even with `--report-only`. Verify the producer with `--bundle`, `--signer-identity` and `--issuer`, or accept the report explicitly with `--allow-unsigned-discovery`. The command ignores project policy beside the report and in parent directories.
+In CI, unverified discovery evidence fails even with `--report-only`. Verify the producer with `--bundle`, `--signer-identity` and `--issuer`, or accept the report explicitly with `--allow-unsigned-discovery`. The command ignores project policy beside the report and in parent directories. Malformed input is rejected; unsupported entries and lossy projections remain limitations.
 
 A matching source digest binds bytes, not the producer or the truth of the report. Producer verification requires an independently configured signer and issuer. See [ShadowScan integration](docs/shadowscan-integration.md).
 
-### Validation fails
+## Integrity or standards validation fails
 
 Supply independent expected digests and signer policies; an adjacent signature file or supplier-provided trust label cannot establish verification. Check that the project still contains the exact recorded subject and that the inventory's supported schema and fingerprint versions match the verifier.
 

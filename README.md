@@ -36,7 +36,7 @@ nexus-symbiote risk agentbom.json --no-project-policy --threshold 50   # gate on
 nexus-symbiote diff reviewed.json agentbom.json --fail-on-alert        # gate on drift
 ```
 
-> **Alpha.** Interfaces, formats and policy semantics may change. Verify the build attestation before installing a release, or install a [reviewed commit from source](#install-from-reviewed-source). This release has [known detection gaps](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/known-limitations.md): what the collectors do not record, no gate can alert on.
+> **Alpha.** Interfaces, formats and policy semantics may change. Verify the [build attestation before installing a release](#install-a-verified-release), or install a [reviewed commit from source](#install-from-reviewed-source). This release has [known detection gaps](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/known-limitations.md): what the collectors do not record, no gate can alert on.
 
 ## Quick start
 
@@ -256,23 +256,29 @@ The Action installs its own hash-locked runtime, ignores checkout policy, and re
 
 ### Gate drift in CI
 
-Approve a baseline on the protected branch, then compare every pull request against it. Read the baseline from a place the pull request cannot change — `diff --fail-on-alert` fails on any recorded change rated medium or higher, including removed components and coverage regressions.
+Approve a baseline once on the protected branch, then compare every pull request with it. The commands below accept the checkout's `.git` metadata. `baseline` writes an unsigned file and `diff` checks no signature, so read the baseline from a place the pull request cannot change:
 
 ```bash
-# On the protected branch: approve a baseline
+# One secret of 32 or more characters, the same for the baseline and every later scan.
+export NEXUS_SYMBIOTE_SOURCE_BINDING_KEY="$AGENTBOM_BINDING_KEY"
+
+# On the protected branch, through a reviewed pull request: approve the baseline.
+mkdir -p .nexus-symbiote
 nexus-symbiote baseline . --no-project-policy --accept-default-exclude root:.git -o .nexus-symbiote/reviewed.json
 
-# In the pull-request job: compare against the base commit's baseline
-git show origin/main:.nexus-symbiote/reviewed.json > "$RUNNER_TEMP/reviewed.json"
+# In the pull-request job (with fetch-depth: 0 or the base commit fetched): read the
+# baseline from the base commit, never from the pull request.
+BASE_SHA="${BASE_SHA:-origin/main}"
+git show "$BASE_SHA:.nexus-symbiote/reviewed.json" > "$RUNNER_TEMP/reviewed.json"
 nexus-symbiote scan . --no-project-policy --accept-default-exclude root:.git -o "$RUNNER_TEMP/agentbom.json"
 nexus-symbiote diff "$RUNNER_TEMP/reviewed.json" "$RUNNER_TEMP/agentbom.json" --fail-on-alert
 ```
 
-Set `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` on both snapshots to compare launch arguments, environment values and endpoint paths. Full guide: [Gate drift in CI](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md). Sign the reviewed baseline: [inventory attestation](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/inventory-attestation.md#gate-a-pull-request-on-an-attested-baseline).
+`--fail-on-alert` fails on any recorded change rated medium or higher, including removed components and coverage regressions. Set `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` on both snapshots to compare launch arguments, environment values and endpoint paths ([source binding](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/verification-source-binding.md)). Run the comparison in a job the pull request cannot edit ([protect the gate](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md#protect-the-gate)), and sign the reviewed baseline ([inventory attestation](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/inventory-attestation.md#gate-a-pull-request-on-an-attested-baseline)). Full guide: [Gate drift in CI](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md).
 
 ### Policy and live mode
 
-Every command is offline by default. Only `discover-mcp`, `advisories` and `verify-live` reach the network, and only in live mode (`--live`). Generate a project policy with `nexus-symbiote init`. Stricter project gates apply automatically; review relaxations before passing `--accept-project-policy`. See [policy reference](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/policy-reference.md) and [offline and live modes](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/offline-and-live-modes.md).
+Every command is offline by default. Only `discover-mcp`, `advisories` and `verify-live` reach the network, and only in live mode (`--live` or `NEXUS_SYMBIOTE_MODE=live`). Generate a project policy (`.nexus-symbiote.yaml`) with `nexus-symbiote init`. Stricter project gates apply automatically; review relaxations before passing `--accept-project-policy`. See [policy reference](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/policy-reference.md) and [offline and live modes](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/offline-and-live-modes.md). The [pre-commit hooks](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/cli-reference.md#pre-commit-hooks) are a convenience for your own tree, not a control.
 
 ## Documentation
 
@@ -282,8 +288,8 @@ The [documentation hub](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/d
 | --- | --- |
 | **Understand** | [Security model](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/security-model.md) · [Architecture](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/architecture.md) · [Threat model](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/threat-model.md) · [Known limitations](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/known-limitations.md) |
 | **Learn** | [Examples walkthrough](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/examples/README.md) · [Scanning a public agent](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/tutorials/scanning-a-public-agent.md) |
-| **Reference** | [CLI reference](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/cli-reference.md) · [Collectors](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/collectors.md) · [Finding catalog](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/finding-catalog.md) · [Policy](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/policy-reference.md) |
-| **Integrate** | [GitHub Action](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/github-action.md) · [Drift gate](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md) · [Attestation](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/inventory-attestation.md) · [ShadowScan](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/shadowscan-integration.md) |
+| **Reference** | [CLI reference](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/cli-reference.md) · [Collectors](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/collectors.md) · [Finding catalog](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/finding-catalog.md) · [Policy](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/policy-reference.md) · [Collection limits](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/collection-limits.md) · [Framework crosswalk](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/framework-crosswalk.md) |
+| **Integrate** | [GitHub Action](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/github-action.md) · [Drift gate](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md) · [Attestation](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/inventory-attestation.md) · [Trace evidence](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/trace-evidence.md) · [ShadowScan](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/shadowscan-integration.md) |
 | **Operate** | [Runtime assurance](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/runtime-assurance.md) · [Releasing](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/releasing.md) · [Repository controls](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/repository-controls.md) |
 
 ## Project status
