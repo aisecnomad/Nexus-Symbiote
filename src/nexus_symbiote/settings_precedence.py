@@ -167,21 +167,30 @@ def _is_blanket_specifier(base: str, spec: str) -> bool:
 
 
 def _claude_skips_mcp_allow(rule: str) -> bool:
-    """Whether this allow rule names no MCP server, so Claude Code auto-approves nothing.
+    """Whether this allow rule is skipped by Claude Code and auto-approves nothing.
 
-    ``mcp__*``, ``mcp__*__*``, ``mcp__**``, ``mcp__`` and ``mcp__*(*)`` are skipped.
-    A named server stays, including ``mcp__server``, ``mcp__server__*`` and a narrow
-    specifier the precedence engine reads, such as ``mcp__gh__*(read)``.
+    Unanchored server globs (``mcp__*``, ``mcp__*__*``, ``mcp__**``, ``mcp__``,
+    ``mcp__*(*)``), empty tool tails (``mcp__docs__``), and blanket/empty parenthesized
+    ``mcp__`` rules (``mcp__gh__*(*)``, ``mcp__docs()``) are skipped. A named server
+    stays, including ``mcp__server``, ``mcp__server__*`` and a narrow specifier the
+    precedence engine reads, such as ``mcp__gh__*(read)``.
     """
     text = rule.strip()
-    head, _separator, _rest = text.partition("(")
+    head, opened, rest = text.partition("(")
     head = head.strip()
     if not head.lower().startswith("mcp__") or any(char.isspace() for char in head):
         return False
     server, separator, tool = head[5:].partition("__")
     if not server or any(char in "*?" for char in server):
         return True
-    return bool(separator) and not tool
+    if separator and not tool:
+        return True
+    if opened:
+        if not rest.endswith(")"):
+            return True
+        if _is_blanket_specifier(head, rest[:-1].strip()):
+            return True
+    return False
 
 
 def _parse_rule(pattern: str) -> tuple[str, str | None, bool] | None:

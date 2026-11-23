@@ -272,6 +272,8 @@ def test_unanchored_mcp_allow_approves_nothing_and_a_server_wildcard_still_does(
     assert resolve_tool_approval(tool, permissions={"allow": ["mcp__*"]}) is None
     assert resolve_tool_approval(tool, permissions={"allow": ["mcp__*__*"]}) is None
     assert resolve_tool_approval(tool, permissions={"allow": ["mcp__*(*)"]}) is None
+    assert resolve_tool_approval(tool, permissions={"allow": ["mcp__github__*(*)"]}) is None
+    assert resolve_tool_approval(tool, permissions={"allow": ["mcp__github(*)"]}) is None
     assert (
         resolve_tool_approval(tool, permissions={"allow": ["mcp__github__*"]})
         == HumanInTheLoop.NONE
@@ -281,6 +283,8 @@ def test_unanchored_mcp_allow_approves_nothing_and_a_server_wildcard_still_does(
     assert resolve_tool_approval(tool, permissions=denied) == HumanInTheLoop.REQUIRED
     _, risks = oversight_gap_assessments({"allow": ["mcp__*"]})
     assert risks == []
+    _, paren_risks = oversight_gap_assessments({"allow": ["mcp__github__*(*)"]})
+    assert paren_risks == []
     _, server_risks = oversight_gap_assessments({"allow": ["mcp__github__*"]})
     assert any("mcp__github__*" in risk.detail for risk in server_risks)
 
