@@ -37,7 +37,7 @@ Schema validity says nothing about whether collection was complete, whether dige
 
 ## Compatibility
 
-Unknown fields are rejected on every object, including dependency edges, so a producer cannot smuggle unreviewed semantics into a document. Types are strict: the model refuses `"no"` for a boolean, `"3"` for an integer or a string of digits for a timestamp. Missing security values mean **unknown**, not `false`; see [security defaults migration](../docs/security-defaults-migration.md). Standard exports (CycloneDX 1.7, SPDX 3.0.1) validate against official schemas vendored under `src/nexus_symbiote/generators/schemas/vendor/`. [Standard exports](../docs/standard-exports.md#extension-properties) lists the extension properties.
+Unknown fields are rejected on every object, including dependency edges, so a producer cannot smuggle unreviewed semantics into a document. Types are strict: the model refuses `"no"` or `0` for a boolean, `"3"` for an integer and a number, or a string of digits such as `"1700000000"` for a timestamp. Missing security values mean **unknown**, not `false`; see [security defaults migration](../docs/security-defaults-migration.md). Standard exports (CycloneDX 1.7, SPDX 3.0.1) validate against official schemas vendored under `src/nexus_symbiote/generators/schemas/vendor/`, whose provenance digests the hygiene check and the package verify. [Standard exports](../docs/standard-exports.md#extension-properties) lists the extension properties.
 
 ### Format versions
 

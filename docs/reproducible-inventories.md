@@ -78,14 +78,15 @@ known-answer vectors in `tests/vectors/inventory-content-v1.json` pin this one.
 Equal content digests establish that two documents record the same content, field for
 field, apart from when and in which run each was collected. They do not establish who
 produced either file, that either is genuine or complete, or that what they record is
-safe. Compare content digests of inventories from sources you trust, and use the
+safe: a forged inventory that copies a genuine one's content has the same content
+digest. Compare content digests of inventories from sources you trust, and use the
 SHA-256 of the file to name an exact file.
 
 ## The serial number
 
 When an inventory is written without a serial number (`scan`, `baseline` and
 `import-shadowscan`), SymBiote sets `metadata.serial_number` to `urn:uuid:` followed by
-the version 5 UUID of the content digest in namespace
+the version 5 UUID of the content digest, as `digest` prints it, in namespace
 `ccaa2a43-8ba9-58e6-8f22-f8793a2039d5`. The serial number is not content, so anyone who
 holds the native JSON file can recompute it from that file. Two inventories of the same
 content have the same serial number, whatever instant each records. CycloneDX and SPDX
@@ -190,11 +191,14 @@ against the current tree.
 - **SARIF locations depend on the working directory**, as described above.
 - **A document nested deeper than 128 levels is not read by the shared reader.**
   Commands that read through `AIBOM.load` (`diff`, `validate`, `risk`, `summary`,
-  `graph`, `digest`, `export-inventory`, etc.) refuse documents nested beyond 128 levels.
-  Four commands differ: `verify-discovery` and `verify-live` use the strict JSON parser
-  alone and read up to ~1,000 levels; `attest` records a subject up to 256 levels as
-  native with a content digest, and deeper as `other` without one. A collected inventory
-  nests far less.
+  `graph`, `digest`, `export-inventory`, etc.) refuse documents nested beyond 128 levels
+  (the root counted); the bound is fixed, so what one reads, every one reads. Four
+  commands do not apply the bound: `verify-discovery` and `verify-live` read the
+  inventory with the strict JSON parser and the schema, so they read a document at 129
+  or 257 levels and refuse one at ~1,000; `attest` records a subject up to 256 levels as
+  a native inventory with a content digest, and a deeper one as `other` without one,
+  which `verify-attestation` then verifies only by its bytes (`--match content` exits
+  with `content-digest-unavailable`). A collected inventory nests far less.
 - **A readable inventory can lack a digest.** A document without a `components` list
   has no content digest. A runtime snapshot binds a document only when its compact JSON,
   with every character outside ASCII escaped and each number counted as 24 bytes, is at

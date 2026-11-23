@@ -293,7 +293,8 @@ checkout. Later jobs receive those bytes by their immutable artifact ID, so a st
 that misbehaves later in the build job cannot change the distributions that are
 attested or published. Before deriving benchmark and checksum evidence from `dist/`,
 the build re-checks the files against the digests recorded at staging and fails on
-any difference.
+any difference. That evidence is produced after the upload, so its attestation binds
+it to this run, not to the pre-test state of the job.
 
 **Locked build tools.** The CI distribution build and the release build use
 `--no-isolation` after installing `requirements-ci.lock` with hash verification and
