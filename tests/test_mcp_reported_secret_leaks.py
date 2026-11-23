@@ -399,3 +399,73 @@ def test_setx_withholds_base64_padded_secret(tmp_path: Path) -> None:
     padded_value = "dG9rZW4xMjM0NTY3ODkw=="
     bad = {"command": "cmd", "args": ["/c", "setx", "API_TOKEN", padded_value]}
     assert padded_value not in _mcp(tmp_path, bad, padded_value)
+
+
+@pytest.mark.parametrize(
+    "sibling_text",
+    [
+        "HunteR2-e\u0301-99xx",
+        "HunteR2-e\u0301\u200b-99xx",
+    ],
+)
+def test_nfd_combining_sequence_is_scrubbed_by_nfc_password(
+    tmp_path: Path, sibling_text: str
+) -> None:
+    nfc_value = "HunteR2-\u00e9-99xx"
+    bad = {"command": "npx", "args": ["-y", "x@1", "--password", nfc_value]}
+    recorded = _mcp(tmp_path, bad, sibling_text)
+    assert sibling_text not in recorded
+    assert nfc_value not in recorded
+
+
+def test_flag_cap_withholding_stays_linear_on_repeated_schemes() -> None:
+    from nexus_symbiote.scanners.mcp import _launch_secrets, _scheme_flag_operands
+    from nexus_symbiote.scanners.mcp_launch import Launch
+    from tests.support import scaling_ratio
+
+    header_ratio = scaling_ratio(
+        lambda scale: _scheme_flag_operands(("Bearer " + "-f " * 65 + "aaaaaaaa ") * (25 * scale))
+    )
+    assert header_ratio < 10.0
+
+    args_ratio = scaling_ratio(
+        lambda scale: _launch_secrets(Launch(), ["bearer", *(["--f"] * 65)] * (15 * scale), "npx")
+    )
+    assert args_ratio < 10.0
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("npx --arg=secretOne111 ", "npx --arg=secretTwo222 "),
+        ("/usr/bin/npx --arg=secretOne111", "/usr/bin/npx --arg=secretTwo222"),
+    ],
+)
+def test_inline_command_arguments_do_not_enter_unkeyed_hash(
+    tmp_path: Path, first: str, second: str
+) -> None:
+    def digest(sub: str, command: str) -> str:
+        text = _scan(
+            tmp_path / sub,
+            ".mcp.json",
+            {"mcpServers": {"s": {"command": command, "args": ["-y", "x@1"]}}},
+        )
+        server = next(
+            item for item in json.loads(text) if "static_config_hash" in item.get("properties", {})
+        )
+        return server["properties"]["static_config_hash"]
+
+    assert digest("a", first) == digest("b", second)
+
+
+@pytest.mark.parametrize("head", ["--auth=bearer", "AUTH_HEADER=Bearer"])
+def test_assigned_scheme_with_flags_past_cap_withholds_secret(tmp_path: Path, head: str) -> None:
+    flags = ["--f"] * 65
+    bad = {"command": "npx", "args": ["-y", "x@1", head, *flags, SECRET]}
+    assert SECRET not in _mcp(tmp_path, bad, SECRET)
+
+
+@pytest.mark.parametrize("api_key", [[SECRET], {"value": SECRET}])
+def test_top_level_non_string_credential_key_is_withheld(tmp_path: Path, api_key: object) -> None:
+    bad = {"command": "npx", "args": ["-y", "x@1"], "apiKey": api_key}
+    assert SECRET not in _mcp(tmp_path, bad, SECRET)

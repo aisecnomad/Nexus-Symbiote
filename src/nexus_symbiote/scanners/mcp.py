@@ -915,14 +915,12 @@ def _scheme_flag_operands(value: str) -> list[str]:
             flags += 1
         else:
             # The cap was hit while flags remain. The operand is not identifiable, so
-            # the whole value is withheld instead of recording nothing.
+            # the whole value and its bounded words are withheld once (O(N)).
             look = pos
             while look < length and value[look].isspace():
                 look += 1
             if look < length and value[look] == "-":
-                found.append(value)
-                found.extend(_bounded_words(value))
-                continue
+                return list(dict.fromkeys([*found, value, *_bounded_words(value)]))
         if flags == 0:
             continue
         ws_start = pos
@@ -1167,15 +1165,21 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
     words = [*(_launch_words([command]) if command else []), *chain.from_iterable(arguments)]
     for _, *inner in arguments:
         values.extend(_withheld_scheme_operands(inner, cmd=cmd))
+    tail_withheld = False
     for index, word in enumerate(words):
         values.extend(_shape_secrets(word))
         following = words[index + 1] if index + 1 < len(words) else None
         skipped = _credential_after_flag(words, index)
         if skipped == _WITHHOLD_TAIL:
-            # Only a scheme word's unresolved tail is a credential. A run of
-            # ``--token=value`` arguments is not one.
-            if word.lower() in _ASSIGNMENT_SCHEMES:
-                values.extend(_tail_secrets(words[index:]))
+            # Only a scheme word's (or NAME=<scheme>'s) unresolved tail is a credential.
+            # Emit at most once so repeated scheme+flag runs stay strictly O(N).
+            if not tail_withheld:
+                assigned_tail = _assigned(word)
+                if word.lower() in _ASSIGNMENT_SCHEMES or (
+                    assigned_tail is not None and assigned_tail[1].lower() in _ASSIGNMENT_SCHEMES
+                ):
+                    values.extend(_tail_secrets(words[index:]))
+                    tail_withheld = True
             skipped = None
         in_set = False
         if cmd and following is not None:
@@ -1664,7 +1668,7 @@ def _withheld_scheme_operands(words: Sequence[str], *, cmd: bool) -> Iterator[st
         skipped = _credential_after_flag(words, index)
         if skipped == _WITHHOLD_TAIL:
             yield from _tail_secrets(words[index:])
-            continue
+            return
         if skipped is not None and not _public_scheme_following(
             name, value, skipped, variable=variable, in_set=in_set
         ):
@@ -1956,11 +1960,12 @@ def _command_text_for_hash(
 ) -> str | None:
     """The raw command when a path or whitespace/format padding changes a safe command.
 
-    Redacted commands (``[redacted-command]``), secret-bearing paths, and bare
-    case-folded or Windows-suffix-folded commands stay out of the unkeyed
-    ``static_config_hash`` so they remain unbound without a key and credentials
-    never enter the public digest. Safe path commands such as ``/tmp/npx`` and
-    padded bare commands such as ``npx `` stay distinct from ``npx``.
+    Redacted commands (``[redacted-command]``), secret-bearing paths, inline
+    arguments, and bare case-folded or Windows-suffix-folded commands stay out
+    of the unkeyed ``static_config_hash`` so they remain unbound without a key
+    and credentials never enter the public digest. Safe path commands such as
+    ``/tmp/npx`` and padded bare commands such as ``npx `` stay distinct from
+    ``npx``.
     """
     if not isinstance(command, str) or not command:
         return None
@@ -1968,15 +1973,20 @@ def _command_text_for_hash(
         return None
     if _command_has_secret(command, scrubber):
         return None
-    if re.search(r"[\\/]", command):
-        return command
-    if command.casefold() == exported_command.casefold():
-        return None
     start, end = 0, len(command)
     while start < end and _ignorable_command_char(command[start]):
         start += 1
     while end > start and _ignorable_command_char(command[end - 1]):
         end -= 1
+    core = command[start:end]
+    if not core or any(char.isspace() for char in core):
+        return None
+    if re.search(r"[\\/]", core):
+        return command
+    if not _SAFE_NAME.fullmatch(core) or TOKEN_SHAPE.search(core):
+        return None
+    if core.casefold() == exported_command.casefold() and (start, end) == (0, len(command)):
+        return None
     if (start, end) != (0, len(command)):
         return command
     return None
@@ -2352,12 +2362,15 @@ def _server_secrets(
         if _segment_is_secret(basename, None):
             values.extend((raw_command, basename, basename.casefold()))
     for key, item in config.items():
-        # A top-level ``apiKey`` (and any other credential-named string) is not an
+        # A top-level ``apiKey`` (and any other credential-named field) is not an
         # environment map, but a sibling tool can still repeat it.
-        if isinstance(item, str) and isinstance(key, str) and credential_name(key):
-            if not is_reference(item) and secret_like(key, item):
-                values.append(item)
-            values.extend(_shape_secrets(item))
+        if isinstance(key, str) and credential_name(key):
+            if isinstance(item, str):
+                if not is_reference(item) and secret_like(key, item):
+                    values.append(item)
+                values.extend(_shape_secrets(item))
+            else:
+                values.extend(_string_leaves(item))
     for field in ("env", "headers", "http_headers"):
         mapping = config.get(field)
         if isinstance(mapping, dict):

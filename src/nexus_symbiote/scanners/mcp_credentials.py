@@ -340,16 +340,30 @@ def _ignored_credential_char(char: str) -> bool:
     return 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF
 
 
-def _normalize_credential_map(value: str) -> tuple[str, list[int]]:
-    """Normalized text and the original index of each kept character."""
+def _normalize_credential_map(value: str) -> tuple[str, list[tuple[int, int]]]:
+    """Normalized text and the original ``(start, end)`` slice of each kept character."""
     chars: list[str] = []
-    mapping: list[int] = []
-    for index, char in enumerate(value):
-        for piece in unicodedata.normalize("NFKC", char):
+    mapping: list[tuple[int, int]] = []
+    length = len(value)
+    index = 0
+    while index < length:
+        if _ignored_credential_char(value[index]):
+            index += 1
+            continue
+        cluster_start = index
+        index += 1
+        while index < length and (
+            unicodedata.combining(value[index]) != 0
+            or unicodedata.category(value[index]) in {"Mn", "Mc", "Me"}
+            or 0x1100 <= ord(value[index]) <= 0x11FF
+        ):
+            index += 1
+        cluster_end = index
+        for piece in unicodedata.normalize("NFKC", value[cluster_start:cluster_end]):
             if _ignored_credential_char(piece):
                 continue
             chars.append(piece)
-            mapping.append(index)
+            mapping.append((cluster_start, cluster_end))
     return "".join(chars), mapping
 
 
@@ -387,13 +401,15 @@ def credential_spellings(value: str) -> tuple[str, ...]:
 
 def _text_needs_credential_normalize(text: str) -> bool:
     """Whether matching ``text`` has to ignore marks or compatibility characters."""
+    if not unicodedata.is_normalized("NFKC", text):
+        return True
     for char in text:
         code = ord(char)
         if code < 128:
             if char.isspace() and char != " ":
                 return True
             continue
-        if _ignored_credential_char(char) or unicodedata.normalize("NFKC", char) != char:
+        if _ignored_credential_char(char):
             return True
     return False
 
@@ -459,7 +475,7 @@ class CredentialScrubber(SecretScrubber):
             return found
         for start, end in self._all_plain().spans(normalized):
             if start < len(mapping) and end <= len(mapping):
-                found.append((mapping[start], mapping[end - 1] + 1))
+                found.append((mapping[start][0], mapping[end - 1][1]))
         return _merged_spans(found)
 
 
