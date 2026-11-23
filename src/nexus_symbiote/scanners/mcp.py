@@ -1117,7 +1117,9 @@ MAX_CREDENTIAL_POSITIONS = 64
 _ENDPOINT_QUERY_POSITION = "endpoint URL query"
 _ASSIGNMENT_FLAGS = frozenset({"env", "e", "build-arg"})
 # The scheme words _AUTH reads, after which cmd's `set NAME=<scheme> <credential>` splits.
-_ASSIGNMENT_SCHEMES = frozenset({"bearer", "basic", "token", "bot", "apikey", "api-key"})
+_ASSIGNMENT_SCHEMES = frozenset(
+    {"bearer", "basic", "token", "bot", "apikey", "api-key", "dpop", "hoba", "mutual"}
+)
 _SCHEME_DESCRIPTORS = frozenset({"type", "mode", "scheme", "method", "transport", "strategy"})
 _PUBLIC_TOKEN_SELECTORS = frozenset({"format", "source", "profile", "output", "kind"})
 # These common switches can follow a credential binding in a launch declaration.

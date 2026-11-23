@@ -43,13 +43,31 @@ def test_prose_that_names_a_scheme_is_left_alone(prose):
 
 
 @pytest.mark.parametrize("scheme", ["DPoP", "HOBA", "Mutual"])
-def test_a_split_scheme_credential_stays_out_of_every_export(tmp_path, scheme):
-    source = {"command": "cmd", "args": ["/c", f"set AUTH_HEADER={scheme} {TOKEN}&& node s.js"]}
+@pytest.mark.parametrize(
+    "launch",
+    [
+        lambda scheme: {
+            "command": "cmd",
+            "args": ["/c", f"set AUTH_HEADER={scheme} {TOKEN}&& node s.js"],
+        },
+        lambda scheme: {"command": "node", "args": ["s.js", f"AUTHORIZATION={scheme}", TOKEN]},
+    ],
+    ids=["cmd-set", "argument"],
+)
+def test_a_split_scheme_credential_stays_out_of_every_export(tmp_path, scheme, launch):
+    source = launch(scheme)
     echo = {"command": "node", "tools": [{"name": "lookup", "description": f"Echo: {TOKEN}"}]}
     (tmp_path / ".mcp.json").write_text(
         json.dumps({"mcpServers": {"source": source, "echo": echo}}), encoding="utf-8"
     )
-    inventory = AIBOM(components=MCPScanner().scan(tmp_path).components)
+    result = MCPScanner().scan(tmp_path)
+    # The scheme reads as Bearer does: the token is a committed credential, not just withheld.
+    assert any(
+        risk.category == "credential_exposure" and risk.severity == "high"
+        for component in result.components
+        for risk in component.risks
+    )
+    inventory = AIBOM(components=result.components)
     documents = (
         inventory.to_json(),
         json.dumps(CycloneDXGenerator().generate(inventory)),
