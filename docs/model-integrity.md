@@ -318,41 +318,44 @@ these lists, `tokenizer_hash` or `chat_template_hash`.
 
 `trust_remote_code` is `true` when any configuration file says so, so an empty
 `config.json` cannot hide it in a later file. A configuration that declares
-`auto_map` or `custom_pipelines` declares custom code, which the loader imports
-only with `trust_remote_code`: the model gets a high `custom_code` finding, and
+`auto_map` or `custom_pipelines` declares custom code, which the loader imports only
+with `trust_remote_code`: the model gets a high `custom_code` finding, and
 `properties.custom_code` records which files declare it, the well-formed module
-references, whether any reference names another repository, and the digests of
-the directory's `.py` files and the referenced modules below it. A module named as
-holding credentials, such as `secrets.py` or `token_utils.py`, is not read and is a
-coverage gap instead, as a change to it would raise no drift alert. Without such a declaration, Python files are not
-recorded, so adding an unrelated script does not change the inventory. The
-`base_model_name_or_path` of an `adapter_config.json` is recorded as
-`properties.base_model` when it is a Hugging Face model identifier.
+references, whether any reference names another repository, and the digests of the
+directory's `.py` files and the referenced modules below it.
+
+A module named as holding credentials, such as `secrets.py` or `token_utils.py`, is
+not read and is a coverage gap instead, as a change to it would raise no drift alert.
+Without such a declaration, Python files are not recorded, so adding an unrelated
+script does not change the inventory. The `base_model_name_or_path` of an
+`adapter_config.json` is recorded as `properties.base_model` when it is a Hugging
+Face model identifier.
 
 In `diff`, a change to `tokenizer_hash` or `chat_template_hash` is a high alert,
 and a change to a bound weight file, a configuration file or custom code is a
 high alert naming the property that records its digest.
 
 Every chat template that `properties.chat_templates` lists is checked for potential
-Python-internals access patterns: a dunder attribute, named or subscripted, a
-dunder name as a string such as an `attribute=` argument, the `attr` filter, a
-Python-mangled private name such as `self._TemplateReference__context`, read as an
-attribute or written as a string, or an underscore string repeated with `*`.
-The heuristic decodes string escapes such as `\x5f`, removes a backslash before a
-line break, and folds adjacent constant strings joined with `~` or `+`, or written
-next to each other, inside Jinja expressions. It does not evaluate templates.
-Matches may be harmless in the actual context; a correctly configured sandbox can
-deny the access. Other ways to construct names may not match. A Hugging Face template
-that matches gives every
-model in its directory a critical `serialization_format` finding that names up to
-three matching templates and counts the rest, and a model that would otherwise be
-rated `safe` is rated `unsafe-template-injection`. A model rated `unknown` or
-`unsafe-code-execution` keeps its rating and the findings that come with it, such as
-`invalid_safetensors` for a SafeTensors file that does not validate, so a suppression
-of the template finding does not accept them. `validate` checks each model file's own
-structure again, not its directory's templates: its completeness check, on by
-default, and `risk --project` compare the rating and the finding with a new
-collection. A template file larger than the `file-bytes` limit is digested but not
+Python-internals access patterns: a dunder attribute (named or subscripted), a dunder
+name as a string such as an `attribute=` argument, the `attr` filter, a
+Python-mangled private name such as `self._TemplateReference__context` (read as an
+attribute or written as a string), or an underscore string repeated with `*`. The
+heuristic decodes string escapes such as `\x5f`, removes a backslash before a line
+break, and folds adjacent constant strings joined with `~` or `+`, or written next to
+each other, inside Jinja expressions. It does not evaluate templates.
+
+Matches may be harmless in the actual context; a correctly configured sandbox can deny
+the access. Other ways to construct names may not match. A Hugging Face template that
+matches gives every model in its directory a critical `serialization_format` finding
+that names up to three matching templates and counts the rest, and a model that would
+otherwise be rated `safe` is rated `unsafe-template-injection`.
+
+A model rated `unknown` or `unsafe-code-execution` keeps its rating and the findings
+that come with it, such as `invalid_safetensors` for a SafeTensors file that does not
+validate, so suppressing the template finding does not accept them. `validate` checks
+each model file's own structure again, not its directory's templates: its completeness
+check (on by default) and `risk --project` compare the rating and the finding with a
+new collection. A template file larger than the `file-bytes` limit is digested but not
 checked, and is a coverage gap in `surfaces_excluded`.
 
 A GGUF file whose metadata exceeds the reader's bounds (65,536 keys, 16 MiB
@@ -369,21 +372,23 @@ and the files bound to it) verifies under a signature policy you own. Pass the
 same policy to `scan`, `validate --project`, `risk --project` and `baseline`
 with `--signature-policy`, or to the GitHub Action with `signature-policy`.
 
-Keep the policy outside the checkout: the commands refuse a policy file inside
-the scanned project or anywhere in any enclosing Git working tree, including a
-superproject above a nested checkout or submodule (so a
-monorepo's `ci/signers.json` is refused when you scan `services/agent`), or in
-any Git working tree that holds the directory the command runs from (so a
-pull request's checkout cannot supply the policy for an artifact scanned elsewhere), also
-under another name for any of these directories such as a case variant or a bind mount
-(compared by device and inode), or one with other hard links, and they resolve the project path first, so a symlinked `--project`
-path works for every command. Every directory at or above the project with a `.git`
-entry counts as an enclosing repository, so two layouts cannot hold the policy: a
-trusted base checkout that encloses the pull request's checkout (the base at the
-workspace root, the pull request in `pr/`), and a home directory that is itself a
-repository (`~/.git`) when the project is below it. Every entry must name a file beneath the project,
-spelled as its directory spells it: another case is refused on every file system,
-also where file names fold case.
+Keep the policy outside the checkout: the commands refuse a policy file inside the
+scanned project or anywhere in any enclosing Git working tree, including a superproject
+above a nested checkout or submodule (so a monorepo's `ci/signers.json` is refused
+when you scan `services/agent`), or in any Git working tree that holds the directory
+the command runs from (so a pull request's checkout cannot supply the policy for an
+artifact scanned elsewhere), also under another name for any of these directories such
+as a case variant or a bind mount (compared by device and inode), or one with other
+hard links. The commands resolve the project path first, so a symlinked `--project`
+path works for every command.
+
+Every directory at or above the project with a `.git` entry counts as an enclosing
+repository, so two layouts cannot hold the policy: a trusted base checkout that
+encloses the pull request's checkout (the base at the workspace root, the pull request
+in `pr/`), and a home directory that is itself a repository (`~/.git`) when the
+project is below it. Every entry must name a file beneath the project, spelled as its
+directory spells it: another case is refused on every file system, also where file
+names fold case.
 An entry that names neither a collected model weight file nor the ShadowScan
 report makes the `model` collector fail, and `validate --project` reports it as
 the integrity error `unused_policy_entry` even when the completeness check does
