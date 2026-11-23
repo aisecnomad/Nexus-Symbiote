@@ -51,6 +51,7 @@ from nexus_symbiote.scanners.source_binding import BindingError, value_binding
 from nexus_symbiote.settings_precedence import (
     _VERSIONED_INTERPRETER,
     MAX_FRONTMATTER_YAML_NODES,
+    _claude_skips_mcp_allow,
     evaluate_tool_oversight,
     extract_bounded_deny_rules,
     extract_bounded_sandbox_domains,
@@ -366,15 +367,14 @@ def _broad_grants(allowed: list[str]) -> list[str]:
             specifier = rest[:-1].strip()
         key = tool.lower()
         if key.startswith("mcp__"):
-            # A whole-server rule is reported as a blanket grant. Its class carries no
-            # trifecta leg: Claude Code honours an allow glob only after a literal
-            # `mcp__<server>__` prefix and skips an unanchored one such as `mcp__*` or
-            # `mcp__*__*`, which auto-approves nothing (code.claude.com/docs/en/permissions,
-            # "Tool name wildcards"), and a single server's tools are its own declared ones.
-            server = key.removeprefix("mcp__")
-            whole_server = "__" not in server or server.endswith("__*")
-            if server in {"", "*"} or (whole_server and specifier in (None, "", "*")):
-                classes.add("MCP server tools")
+            # Claude Code skips an unanchored allow glob (`mcp__*`, `mcp__*__*`) and
+            # an `mcp__` rule with parentheses. A bare `mcp__server` and
+            # `mcp__server__*` auto-approve that server's own tools.
+            if not _claude_skips_mcp_allow(rule) and "(" not in rule and ")" not in rule:
+                server = key.removeprefix("mcp__")
+                whole_server = "__" not in server or server.endswith("__*")
+                if whole_server and specifier in (None, "", "*"):
+                    classes.add("MCP server tools")
             continue
         if "*" in key or "?" in key:
             # An unanchored allow glob such as `B*` or `Ba*(node:*)` is skipped too.

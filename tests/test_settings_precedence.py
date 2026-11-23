@@ -267,6 +267,24 @@ def test_wildcards_acceptedits_and_narrow_destructive_allows() -> None:
     assert not _tool_pattern_matches("Bash(git status)", "Bash")
 
 
+def test_unanchored_mcp_allow_approves_nothing_and_a_server_wildcard_still_does() -> None:
+    tool = "mcp__github__create_issue"
+    assert resolve_tool_approval(tool, permissions={"allow": ["mcp__*"]}) is None
+    assert resolve_tool_approval(tool, permissions={"allow": ["mcp__*__*"]}) is None
+    assert resolve_tool_approval(tool, permissions={"allow": ["mcp__*(*)"]}) is None
+    assert (
+        resolve_tool_approval(tool, permissions={"allow": ["mcp__github__*"]})
+        == HumanInTheLoop.NONE
+    )
+    # A deny glob still covers every MCP tool. An allow of one server does not outrank it.
+    denied = {"allow": ["mcp__github__*"], "deny": ["mcp__*"]}
+    assert resolve_tool_approval(tool, permissions=denied) == HumanInTheLoop.REQUIRED
+    _, risks = oversight_gap_assessments({"allow": ["mcp__*"]})
+    assert risks == []
+    _, server_risks = oversight_gap_assessments({"allow": ["mcp__github__*"]})
+    assert any("mcp__github__*" in risk.detail for risk in server_risks)
+
+
 def test_deny_rules_and_codex_model_confidentiality_and_neutralization(tmp_path: Path) -> None:
     proj = tmp_path / "secrets"
     (proj / ".claude").mkdir(parents=True)

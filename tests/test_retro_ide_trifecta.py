@@ -34,27 +34,60 @@ def _write(root: Path, rel: str, content: str) -> Path:
 # ---------------------------------------------------------------------------
 # External #272: cross-server `mcp__*` allow globs. Claude Code honours an allow glob
 # only after a literal `mcp__<server>__` prefix and skips an unanchored one, so these
-# rules auto-approve nothing and must not raise a trifecta (docs: "Tool name wildcards").
+# rules auto-approve nothing. They are not a grant and must not raise a trifecta
+# (docs: "Tool name wildcards").
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("rule", ["mcp__*", "mcp__**", "mcp__*__*", "mcp__", "mcp__*(*)"])
 def test_external_272_unanchored_mcp_allow_globs_grant_nothing(tmp_path: Path, rule: str) -> None:
-    # Reported as a blanket grant, as on main, but never as a cross-server capability.
-    assert "every MCP server tool" not in _broad_grants([rule])
+    assert _broad_grants([rule]) == []
     _write(
         tmp_path,
         ".claude/settings.json",
         json.dumps({"permissions": {"allow": [rule]}}),
     )
-    bom = AIBOM(components=IDEAgentScanner().scan(tmp_path).components)
-    report = analyze_trifecta(bom)
+    result = IDEAgentScanner().scan(tmp_path)
+    risks = [risk for component in result.components for risk in component.risks]
+    assert not [risk for risk in risks if risk.category == "permission_scope"]
+    assert not [risk for risk in risks if risk.category == "oversight_gap"]
+    report = analyze_trifecta(AIBOM(components=result.components))
     assert not [f for f in report.findings if f.kind == "lethal_trifecta"]
 
 
 @pytest.mark.parametrize("rule", ["mcp__docs(read_doc)", "mcp__docs__get_*"])
 def test_external_272_scoped_mcp_rules_grant_no_server(rule: str) -> None:
     assert _broad_grants([rule]) == []
+
+
+@pytest.mark.parametrize("rule", ["mcp__docs", "mcp__docs__*", "mcp__server", "mcp__server__*"])
+def test_per_server_mcp_allow_is_that_servers_grant_only(tmp_path: Path, rule: str) -> None:
+    """A whole server is auto-approved. Its trifecta legs come from its declared tools."""
+    assert _broad_grants([rule]) == ["MCP server tools"]
+    _write(
+        tmp_path,
+        ".claude/settings.json",
+        json.dumps({"permissions": {"allow": [rule]}}),
+    )
+    result = IDEAgentScanner().scan(tmp_path)
+    bom = AIBOM(components=result.components)
+    report = analyze_trifecta(bom)
+    assert not [f for f in report.findings if f.kind == "lethal_trifecta"]
+    scopes = [
+        risk
+        for component in result.components
+        for risk in component.risks
+        if risk.category == "permission_scope"
+    ]
+    assert len(scopes) == 1
+    assert "MCP server tools" in scopes[0].detail
+
+
+def test_star_allow_is_still_a_lethal_trifecta(tmp_path: Path) -> None:
+    assert _broad_grants(["*"]) == ["every tool"]
+    _write(tmp_path, ".claude/settings.json", json.dumps({"permissions": {"allow": ["*"]}}))
+    bom = AIBOM(components=IDEAgentScanner().scan(tmp_path).components)
+    assert [f.kind for f in analyze_trifecta(bom).findings] == ["lethal_trifecta"]
 
 
 @pytest.mark.parametrize("rule", ["mcp__docs", "mcp__docs__*", "mcp__docs__read_doc"])

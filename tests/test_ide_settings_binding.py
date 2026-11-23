@@ -151,7 +151,6 @@ def test_risky_settings_raise_findings(tmp_path, settings, category, severity):
         "WebFetch",
         "WebFetch(domain:*)",
         "mcp__shell",
-        "mcp__*",
         "mcp__github__*",
         "MultiEdit",
         "*",

@@ -166,6 +166,24 @@ def _is_blanket_specifier(base: str, spec: str) -> bool:
     return base.lower() == "webfetch" and compact.lower() in {"domain:*", "domain:"}
 
 
+def _claude_skips_mcp_allow(rule: str) -> bool:
+    """Whether this allow rule names no MCP server, so Claude Code auto-approves nothing.
+
+    ``mcp__*``, ``mcp__*__*``, ``mcp__**``, ``mcp__`` and ``mcp__*(*)`` are skipped.
+    A named server stays, including ``mcp__server``, ``mcp__server__*`` and a narrow
+    specifier the precedence engine reads, such as ``mcp__gh__*(read)``.
+    """
+    text = rule.strip()
+    head, _separator, _rest = text.partition("(")
+    head = head.strip()
+    if not head.lower().startswith("mcp__") or any(char.isspace() for char in head):
+        return False
+    server, separator, tool = head[5:].partition("__")
+    if not server or any(char in "*?" for char in server):
+        return True
+    return bool(separator) and not tool
+
+
 def _parse_rule(pattern: str) -> tuple[str, str | None, bool] | None:
     """Parse ``pattern`` into ``(base_tool, normalized_specifier, is_blanket)``."""
     pat = pattern.strip()
@@ -404,6 +422,11 @@ class _RuleIndex:
                     if indexed >= max_indexed_rules:
                         self.rules_truncated = True
                         break
+                    # A skipped allow still occupies a slot, so a run of them cannot
+                    # reveal a later rule the cap used to hide, but it approves nothing.
+                    if bucket is self.allow and _claude_skips_mcp_allow(pat):
+                        indexed += 1
+                        continue
                     parsed = bucket.add(pat)
                     if parsed is None:
                         continue
