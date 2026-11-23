@@ -774,6 +774,7 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         lambda scale: " @a" + "_b" * 40_000 * scale,
         lambda scale: (" @x" + "_" * 40 + "y") * 1_000 * scale,
         lambda scale: " @" + "*" * 4_000 * scale,
+        lambda scale: '(@a) x=@b "@c" x*@d ' * 10_000 * scale,
     ],
     ids=[
         "blank lines under nested items",
@@ -790,6 +791,7 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         "underscores inside a word",
         "runs of underscores",
         "a run of markup past the name budget",
+        "references where marked starts no text token",
     ],
 )
 def test_reading_markdown_grows_with_the_text_not_with_its_nesting(shape):

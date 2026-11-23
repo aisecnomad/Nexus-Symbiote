@@ -1248,12 +1248,14 @@ A way around a limit that its entry does not describe is worth a
   so `**@a_b_c.md**` imports `a_b_c.md`. A file with more than 2,000 places where such
   a reference can start, or whose references yield more than 32,000 names or more
   than 4 Mi characters of them, as a run of thousands of `*` after an `@` does, is a
-  "too many @path imports" failure, and none of its imports is followed. In a seeded differential, the scanner missed 3
-  of 70,976 imports in 40,000 documents built from whole lines and 6 of 25,993 in
-  24,000 documents built from inline fragments. Each miss follows backticks that
-  marked pairs into code spans differently from CommonMark, such as `` `y`@x.md ``
-  after an unmatched run, or an HTML block that marked reads as the text of a block
-  quote above it. Other hosts' import readers have not been tested.
+  "too many @path imports" failure, and none of its imports is followed. In a seeded differential, the scanner missed 2
+  of 70,956 imports in 40,000 documents built from whole lines, 2 of 25,668 in
+  24,000 documents built from inline fragments, and 18 of 81,995 in 100,000
+  documents built around HTML block starts. Each miss follows backticks that marked
+  pairs into code spans differently from CommonMark, such as `` `y`@x.md `` after
+  raw HTML that may hold a backtick, or a list item or tab-indented line whose
+  blocks marked reads differently; one, `f4.md,`, is a name Claude Code reads but
+  does not load. Other hosts' import readers have not been tested.
 - **Files named as holding credentials are not read.** The `prompt` collector does not
   read a file without a Markdown suffix whose name says it holds credentials (`.env*`
   other than a template ending in `.example`, `.sample` or `.template`; `*.env` and
