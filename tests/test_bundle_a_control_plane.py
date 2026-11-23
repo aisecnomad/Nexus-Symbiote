@@ -1484,6 +1484,27 @@ def test_hook_run_comparison_scales_linearly_with_matchers(tmp_path: Path) -> No
             False,
         ),
         (_guard_settings(condition="Bash(git *)"), _guard_settings(condition="Bash(gi *)"), True),
+        (_guard_settings(condition="Bash(git *)"), _guard_settings(), False),
+        (
+            _guard_settings(matcher="Bash, Edit", condition="Bash(git *)"),
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{"type": "command", "command": "./guard.sh"}],
+                        },
+                        {
+                            "matcher": "Edit",
+                            "hooks": [
+                                {"type": "command", "command": "./guard.sh", "if": "Bash(git *)"}
+                            ],
+                        },
+                    ]
+                }
+            },
+            False,
+        ),
         (_guard_settings(), _guard_settings(condition="Bash(never-matches *)"), True),
     ],
 )
@@ -1493,3 +1514,30 @@ def test_baseline_diff_compares_the_hook_if_filter(
     causes = _guard_alerts(tmp_path, current, baseline=baseline)
     removal = {"hook_command_removed", "launch_target_removed"}
     assert (removal <= causes) if stops else not (causes & removal)
+
+
+def test_hook_if_comparison_finds_unfiltered_hooks_in_linear_time() -> None:
+    def summary(count: int, prefix: str | None) -> ControlPlaneAuditSummary:
+        result = ControlPlaneAuditSummary()
+        result.hook_commands = [
+            {
+                "source_file": ".claude/settings.json",
+                "event": "PreToolUse",
+                "command_digest": "0" * 64,
+                "matcher_digest": f"m{index}",
+                "matcher_names": [f"n{index}"],
+                "if_digest": None if prefix is None else f"{prefix}{index}",
+                "runs_command": True,
+                "hooks_disabled": False,
+            }
+            for index in range(count)
+        ]
+        return result
+
+    def run(scale: int) -> None:
+        count = 2_000 * scale
+        assert diff_control_plane_audits(summary(count, "b"), summary(count, None)) == []
+        changed = diff_control_plane_audits(summary(count, "b"), summary(count, "c"))
+        assert [alert["root_cause"] for alert in changed] == ["hook_command_removed"]
+
+    assert scaling_ratio(run) < 10

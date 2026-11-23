@@ -2597,9 +2597,10 @@ def _hook_runs(rec: dict[str, Any]) -> bool:
 def _hooks_stop_running(base_recs: list[dict[str, Any]], curr_recs: list[dict[str, Any]]) -> bool:
     """Whether some tool a running baseline hook matched is matched by no running current one.
 
-    The records share one command and event, so among current hooks with the same `if`
-    filter the union of their matchers decides; an added or changed `if` may match
-    nothing. A summary written before these fields existed reads as running everywhere.
+    The records share one command and event, so the union of the matchers of current
+    hooks with the baseline's `if` filter or none decides: dropping the filter only
+    widens, while an added or changed `if` may match nothing. Each baseline hook looks
+    up those two groups. A summary written before these fields existed runs everywhere.
     """
     live: dict[str | None, tuple[list[bool], set[str], set[str]]] = {}
     for rec in curr_recs:
@@ -2615,14 +2616,15 @@ def _hooks_stop_running(base_recs: list[dict[str, Any]], curr_recs: list[dict[st
     for base in base_recs:
         if not _hook_runs(base):
             continue
-        group = live.get(base.get("if_digest"))
-        if group is None:
-            return True
-        matches_all, digests, names = group
-        if matches_all[0] or base.get("matcher_digest") in digests:
+        groups = [live[key] for key in {base.get("if_digest"), None} if key in live]
+        if any(matches_all[0] for matches_all, _, _ in groups) or any(
+            base.get("matcher_digest") in digests for _, digests, _ in groups
+        ):
             continue
         base_names = base.get("matcher_digest") is not None and base.get("matcher_names")
-        if not base_names or not names.issuperset(base_names):
+        if not base_names or not all(
+            any(name in names for _, _, names in groups) for name in base_names
+        ):
             return True
     return False
 
