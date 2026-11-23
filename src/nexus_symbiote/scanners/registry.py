@@ -4272,8 +4272,8 @@ class RegistryScanner(Scanner):
             return None
         try:
             return load_toml(content)
-        except TOMLBoundsError:
-            result.scan_failures.append(f"{name}: dotted key exceeds the length limit: not read")
+        except TOMLBoundsError as exc:
+            result.scan_failures.append(f"{name}: {exc}: not read")
             return None
         except (ValueError, RecursionError, MemoryError):
             # TOMLDecodeError is a ValueError; tomllib raises a plain one for a decimal

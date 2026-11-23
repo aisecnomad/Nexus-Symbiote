@@ -253,6 +253,9 @@ class CycloneDXGenerator(Generator):
 
     @staticmethod
     def _services(aibom: AIBOM) -> list[dict[str, Any]]:
+        from nexus_symbiote.scanners.a2a import ANONYMOUS_AUTH_METHODS
+
+        used_refs = {comp.bom_ref for comp in aibom.components}
         services: list[dict[str, Any]] = []
         for comp in sorted(aibom.components, key=lambda c: c.bom_ref):
             endpoints: list[str] = []
@@ -267,15 +270,27 @@ class CycloneDXGenerator(Generator):
             elif isinstance(comp, A2AClientComponent) and comp.agent_card_url:
                 if _is_iri_reference(comp.agent_card_url):
                     endpoints.append(comp.agent_card_url)
-                authenticated = bool(comp.authentication_methods)
+                # A client that declares no method is unauthenticated, as the collector's
+                # finding says; only a non-anonymous method makes the service authenticated.
+                authenticated = any(
+                    isinstance(m, str) and m.strip().lower() not in ANONYMOUS_AUTH_METHODS
+                    for m in comp.authentication_methods or ()
+                )
             elif isinstance(comp.properties.get("hosted_tool_origin"), str):
                 origin = comp.properties["hosted_tool_origin"]
                 if _is_iri_reference(origin):
                     endpoints.append(origin)
             if not endpoints:
                 continue
+            service_ref = f"service:{comp.bom_ref}"
+            if service_ref in used_refs:
+                suffix = 1
+                while f"service:{comp.bom_ref}:{suffix}" in used_refs:
+                    suffix += 1
+                service_ref = f"service:{comp.bom_ref}:{suffix}"
+            used_refs.add(service_ref)
             entry: dict[str, Any] = {
-                "bom-ref": f"service:{comp.bom_ref}",
+                "bom-ref": service_ref,
                 "name": comp.name,
                 "endpoints": endpoints,
             }

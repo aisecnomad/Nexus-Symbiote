@@ -20,7 +20,7 @@ from nexus_symbiote.core.enums import RiskSeverity, TrustTier
 from nexus_symbiote.core.hashing import hash_bytes, hash_canonical
 from nexus_symbiote.core.identifiers import reference_text
 from nexus_symbiote.core.models import GuardrailComponent, RAGSourceComponent, RiskAssessment
-from nexus_symbiote.policy import read_sexagesimal_integers_as_text
+from nexus_symbiote.policy import bounded_flow_loader, read_sexagesimal_integers_as_text
 from nexus_symbiote.scanners.base import (
     Scanner,
     ScanResult,
@@ -242,7 +242,7 @@ def _transport(raw: str) -> str | None:
     text with ``:``, ``@`` or ``=``, such as a connection string, shows no scheme; text
     without them is a path.
     """
-    value = raw.strip()
+    value = whatwg_form(raw.strip())
     match = _SCHEME.match(value)
     if match:
         return "" if value[match.end() : match.end() + 1].isdigit() else match.group(1).lower()
@@ -397,7 +397,7 @@ class RAGScanner(Scanner):
                     self._config_variant(path, files, result)
                 elif fold_name(path.name) in _FOLDED_GUARDRAIL_NAMES:
                     guardrails.append(path)
-                elif path.suffix == NEMO_RAIL_SUFFIX:
+                elif Path(fold_name(path.name)).suffix == NEMO_RAIL_SUFFIX:
                     rails.setdefault(path.parent, []).append(path)
                 elif path.name in ENV_FILES and len(path.parts) == 1:
                     raw = files.read_bytes(path)
@@ -434,6 +434,7 @@ class RAGScanner(Scanner):
         is not read or digested; the record binds the directory's other files.
         """
         components = []
+        reported_rail_variants: set[Path] = set()
         for path in sorted(candidates):
             canonical = _FOLDED_GUARDRAIL_NAMES[fold_name(path.name)]
             siblings = sorted(rails.get(path.parent, ())) if canonical in NEMO_CONFIG_NAMES else []
@@ -451,6 +452,28 @@ class RAGScanner(Scanner):
                     f"{relative}: more than {_MAX_ENTRIES} Colang files beside the configuration"
                 )
                 continue
+            if withheld(files, relative, result.surfaces_excluded):
+                continue
+            valid_siblings: list[Path] = []
+            for rail in siblings:
+                if rail.suffix == NEMO_RAIL_SUFFIX and fold_name(rail.name) == rail.name.casefold():
+                    valid_siblings.append(rail)
+                    continue
+                if rail not in reported_rail_variants:
+                    reported_rail_variants.add(rail)
+                    canonical_rail = (
+                        rail.with_suffix(NEMO_RAIL_SUFFIX)
+                        if rail.suffix.lower() == NEMO_RAIL_SUFFIX
+                        else rail.with_name(fold_name(rail.name))
+                    )
+                    result.scan_failures.append(
+                        f"{rail.as_posix()}: case variant of "
+                        f"{canonical_rail.as_posix()} is the active file on "
+                        "case-insensitive file systems and is not inventoried"
+                    )
+            siblings = valid_siblings
+            if canonical in NEMO_CONFIG_NAMES and not siblings:
+                continue
             siblings = [
                 rail
                 for rail in siblings
@@ -458,8 +481,6 @@ class RAGScanner(Scanner):
                     files, rail.as_posix(), result.surfaces_excluded, colang_source=True
                 )
             ]
-            if withheld(files, relative, result.surfaces_excluded):
-                continue
             raw = files.read_bytes(path)
             if raw is None or self._relinked(path, files, result):
                 continue
@@ -606,7 +627,7 @@ class RAGScanner(Scanner):
         try:
             # Anchors/aliases and tags are unnecessary for this static profile;
             # rejecting them avoids recursive or amplified configuration graphs.
-            for index, token in enumerate(yaml.scan(content)):
+            for index, token in enumerate(yaml.scan(content, Loader=bounded_flow_loader())):
                 if index >= 20_000 or isinstance(
                     token, (yaml.AliasToken, yaml.AnchorToken, yaml.TagToken)
                 ):
@@ -615,7 +636,7 @@ class RAGScanner(Scanner):
                     )
                     return None
 
-            class UniqueSafeLoader(yaml.SafeLoader):
+            class UniqueSafeLoader(bounded_flow_loader()):  # type: ignore[misc]
                 pass
 
             def unique_mapping(loader: Any, node: Any) -> dict[Any, Any]:

@@ -1372,7 +1372,9 @@ class _HashingModelReader:
     def read(self, size: int) -> bytes:
         if self.bytes_read > self.limit:
             raise OSError("model artifact exceeds the hash byte limit")
-        content = self.stream.read(min(size, self.limit + 1 - self.bytes_read))
+        remaining = self.limit + 1 - self.bytes_read
+        # read(-1) means "to the end"; it must not buffer more than the limit first.
+        content = self.stream.read(remaining if size < 0 else min(size, remaining))
         self.bytes_read += len(content)
         if self.bytes_read > self.limit:
             raise OSError("model artifact exceeds the hash byte limit")

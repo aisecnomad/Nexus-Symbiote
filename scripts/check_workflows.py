@@ -257,6 +257,11 @@ UNSAFE_GATE_ENV = frozenset(
         "PYTHONINSPECT",
         "PYTEST_ADDOPTS",
         "PYTEST_PLUGINS",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+        "VIRTUAL_ENV",
+        "MYPYPATH",
+        "NODE_OPTIONS",
+        "NODE_PATH",
         # bash imports these at startup: SHELLOPTS=noexec parses a gate without running
         # it and exits 0, and ENV, PS4 and BASHOPTS run or change code before it. PATH
         # can put a stub first in place of python, mypy or git.
@@ -270,11 +275,27 @@ UNSAFE_GATE_ENV = frozenset(
         "HOME",
     }
 )
+# Explicit output-path env vars permitted despite matching a blocked prefix.
+SAFE_GATE_ENV = frozenset({"COVERAGE_JSON"})
 # Families of variables that do the same: bash imports BASH_FUNC_<name>%% as a function
 # that shadows the gate's program, PYTHON* (PYTHONUSERBASE with a committed
-# usercustomize) can run code before the gate, and GIT_* (GIT_DIR) can point git at
-# another history. A name outside [A-Za-z0-9_] is no ordinary variable either.
-UNSAFE_GATE_ENV_PREFIXES = ("BASH_FUNC_", "PYTHON", "GIT_", "XDG_")
+# usercustomize) can run code before the gate, GIT_* (GIT_DIR) can point git at
+# another history, COVERAGE_/COV_CORE_ alter coverage/pytest-cov hooks, DYLD_ overrides
+# macOS dynamic loading, and PIP_/UV_/MYPY_/RUFF_ can alter package or gate behavior.
+# A name outside [A-Za-z0-9_] is no ordinary variable either.
+UNSAFE_GATE_ENV_PREFIXES = (
+    "BASH_FUNC_",
+    "PYTHON",
+    "GIT_",
+    "XDG_",
+    "PIP_",
+    "UV_",
+    "MYPY_",
+    "RUFF_",
+    "COVERAGE_",
+    "COV_CORE_",
+    "DYLD_",
+)
 ENV_NAME = re.compile(r"[A-Za-z0-9_]+")
 # An earlier step that appends to $GITHUB_ENV or $GITHUB_PATH sets the environment of
 # every later step of the job, gates included, out of reach of the env checks; only this
@@ -1367,6 +1388,8 @@ def _run_setting(
 
 
 def _unsafe_gate_env(name: str) -> bool:
+    if name in SAFE_GATE_ENV:
+        return False
     return (
         name in UNSAFE_GATE_ENV
         or name.startswith(UNSAFE_GATE_ENV_PREFIXES)

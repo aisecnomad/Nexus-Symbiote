@@ -592,6 +592,7 @@ def _read_confined_file(
     missing_ok: bool = False,
     variants_read: Collection[str] = (),
     fail_on_credential: bool = False,
+    report_coexisting_variants: bool = True,
 ) -> str | None:
     linked = None if credential_shaped(path) else files.in_root_target(path)
     reason = credential_gap(path, None if linked is None else linked.as_posix())
@@ -601,7 +602,12 @@ def _read_confined_file(
         else:
             excluded.append(f"{path}: {context}{reason}; not read or inventoried")
         return None
-    raw = files.read_bytes(path, missing_ok=missing_ok, variants_read=variants_read)
+    raw = files.read_bytes(
+        path,
+        missing_ok=missing_ok,
+        variants_read=variants_read,
+        report_coexisting_variants=report_coexisting_variants,
+    )
     followed = files.link_target(path)
     if raw is None:
         return None
@@ -657,6 +663,7 @@ def _read_confined_tree(root: Path) -> tuple[dict[str, _ParsedInstruction], list
                 missing_ok=True,
                 variants_read=spellings,
                 fail_on_credential=True,
+                report_coexisting_variants=False,
             )
             if text is None:
                 continue

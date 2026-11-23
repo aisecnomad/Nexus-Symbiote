@@ -568,7 +568,14 @@ def test_long_kept_paths_add_only_their_index_lists_to_the_page():
     views = {scale: view_of(long_paths(1_000, scale)) for scale in (1, MAX_PATHS)}
     assert [len(views[scale].paths[-1].nodes) for scale in (1, MAX_PATHS)] == [1_002, 1_002]
     assert len(views[MAX_PATHS].paths) == MAX_PATHS
-    assert scaling_ratio(lambda scale: render_html(views[scale]), factor=MAX_PATHS) < 5
+
+    def ratio() -> float:
+        return scaling_ratio(lambda scale: render_html(views[scale]), factor=MAX_PATHS)
+
+    # scaling_ratio measures again only above 1.5 times its factor, which is 300 here and
+    # far over this bound, so load during the larger render alone is not forgiven there:
+    # 5.98 was measured once on a hosted runner for a ratio that is otherwise about 2.2.
+    assert ratio() < 5 or ratio() < 5
 
 
 def test_findings_are_ordered_bounded_and_clipped():

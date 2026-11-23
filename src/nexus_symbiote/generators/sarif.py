@@ -150,8 +150,13 @@ class SARIFGenerator(Generator):
         """A %SRCROOT%-relative URI for a file path; None for URLs and escaping paths."""
         if source is None or str(source) in {"", "."}:
             return None
-        text = str(source)
-        if not text.startswith("/") and _SCHEME.match(text):
+        text = source.as_posix() if isinstance(source, Path) else source
+        if (
+            "\\" in text
+            or "\x00" in text
+            or any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+            or (not text.startswith("/") and _SCHEME.match(text))
+        ):
             return None
         path = Path(text)
         if path.is_absolute():
