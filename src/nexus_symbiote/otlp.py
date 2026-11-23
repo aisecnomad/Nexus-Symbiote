@@ -321,7 +321,8 @@ _UNREAD_CONTAINERS = frozenset(
 def _refuse_unread_containers(value: dict[str, Any], where: str) -> None:
     unread = sorted(_UNREAD_CONTAINERS.intersection(value))
     if unread:
-        raise _MalformedError(f"{where} holds {unread[0]}, which is not read; use scopeSpans")
+        read_as = "resourceSpans" if unread[0] == "resource_spans" else "scopeSpans"
+        raise _MalformedError(f"{where} holds {unread[0]}, which is not read; use {read_as}")
 
 
 def _optional_list(value: object, where: str) -> list[Any]:

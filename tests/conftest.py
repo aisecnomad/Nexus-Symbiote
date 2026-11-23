@@ -93,8 +93,9 @@ NON_LINUX_SKIP_REASONS = (
         r"|the PID namespace teardown) is Linux-only\Z"
     ),
     re.compile(r"\Ano (?:/proc/self/cwd|/dev/fd link into /proc)\Z"),
-    # A Linux file system holds any byte string but "/" and NUL as a name, in any case:
-    # a Linux run that skips for one of these has stopped testing for another reason.
+    # The suite's tmp_path lies on a case-sensitive Linux file system that holds any byte
+    # string but "/" and NUL as a name (not vfat, ntfs3, a casefold ext4 directory or a
+    # utf8only ZFS dataset): a Linux run that skips for one of these is testing nothing.
     re.compile(
         r"\Afile system rejects (?:the name|distinct case spellings|names that are not UTF-8)\Z"
     ),

@@ -58,6 +58,8 @@ HIDDEN_SUFFIXES = frozenset(
     {".py", ".md", ".toml", ".yml", ".yaml", ".cff", ".cfg", ".txt", ".json", ".sh", ".lock"}
 )
 HIDDEN_NAMES = frozenset({"Dockerfile", "Makefile", "CODEOWNERS"})
+# Checked in tests/ and benchmarks/ too, outside a fixtures directory: CI runs them.
+HIDDEN_CODE_SUFFIXES = frozenset({".py", ".sh"})
 _BLANK = frozenset({0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0})
 # Dated audits record what was inspected under the owner live at the time.
 # Rewriting their links would falsify the record rather than fix a stale one.
@@ -204,12 +206,16 @@ def hidden_character_issues(root: Path, files: list[Path]) -> list[str]:
     """
     errors = []
     for relative in files:
-        if relative.suffix not in HIDDEN_SUFFIXES and relative.name not in HIDDEN_NAMES:
+        if (
+            relative.suffix not in HIDDEN_SUFFIXES
+            and relative.name not in HIDDEN_NAMES
+            and not relative.name.startswith("Dockerfile")
+        ):
             continue
         if VENDOR in relative.parents:
             continue
         if any(prefix in relative.parents for prefix in HIDDEN_EXEMPT_PREFIXES) and (
-            relative.suffix != ".py" or "fixtures" in relative.parts
+            relative.suffix not in HIDDEN_CODE_SUFFIXES or "fixtures" in relative.parts
         ):
             continue
         try:

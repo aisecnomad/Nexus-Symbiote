@@ -411,11 +411,13 @@ def test_escaped_invisible_characters_and_detection_data_are_accepted(tmp_path):
 
 def test_code_ci_runs_and_files_that_do_not_decode_are_checked(tmp_path):
     # Test and benchmark Python runs in CI; build and ownership files steer it.
-    for directory in ("tests", "benchmarks/inventory", ".github"):
+    for directory in ("tests", "benchmarks/inventory", ".github", "examples"):
         (tmp_path / directory).mkdir(parents=True)
     hidden = {
         "tests/conftest.py": 'X = "a\u200db"\n',
         "benchmarks/inventory/evidence.py": "# \u202e\n",
+        "benchmarks/run_tools.sh": "echo \u200b\n",
+        "examples/Dockerfile.agent": "FROM x\u202e\n",
         "Dockerfile": "FROM x\u2060\n",
         "Makefile": "all:\u200b\n",
         ".github/CODEOWNERS": "* @owner\u200c\n",

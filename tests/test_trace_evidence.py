@@ -265,7 +265,9 @@ def test_spans_under_a_container_the_reader_does_not_read_are_refused(tmp_path, 
 def test_a_second_resource_spans_array_under_the_proto_name_is_refused(tmp_path):
     document = _valid()
     document["resource_spans"] = copy.deepcopy(document["resourceSpans"])
-    with pytest.raises(TraceInputError, match="the document holds resource_spans"):
+    with pytest.raises(
+        TraceInputError, match="holds resource_spans, which is not read; use resourceSpans"
+    ):
         _read(_trace(tmp_path, document))
 
 
