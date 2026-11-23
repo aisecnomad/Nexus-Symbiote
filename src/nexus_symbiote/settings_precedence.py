@@ -205,14 +205,16 @@ def _claude_skips_mcp_allow(rule: str) -> bool:
     text = rule.strip()
     head, opened, rest = text.partition("(")
     head = head.strip()
-    if not head.startswith("mcp__"):
+    if not head.lower().startswith("mcp__"):
         return False
+    if not head.startswith("mcp__"):
+        return True
     if any(char.isspace() for char in head):
         return True
     server, separator, tool = head[5:].partition("__")
     if not server or any(char in "*?" for char in server):
         return True
-    if separator and not tool:
+    if separator and (not tool or (set(tool) <= {"*"} and tool != "*")):
         return True
     if opened:
         if not rest.endswith(")"):

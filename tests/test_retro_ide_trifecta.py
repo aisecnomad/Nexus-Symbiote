@@ -223,12 +223,13 @@ def test_double_star_tool_segment_is_not_a_whole_server_deny() -> None:
     )
 
 
-def test_uppercase_mcp_allow_is_not_a_grant(tmp_path: Path) -> None:
-    assert _broad_grants(["MCP__evil"]) == []
+@pytest.mark.parametrize("rule", ["MCP__evil", "MCP__*", "MCP__evil__*", "MCP__shell"])
+def test_uppercase_mcp_allow_is_not_a_grant(tmp_path: Path, rule: str) -> None:
+    assert _broad_grants([rule]) == []
     _write(
         tmp_path,
         ".claude/settings.json",
-        json.dumps({"permissions": {"allow": ["MCP__evil"]}}),
+        json.dumps({"permissions": {"allow": [rule]}}),
     )
     result = IDEAgentScanner().scan(tmp_path)
     risks = [risk for component in result.components for risk in component.risks]
@@ -237,6 +238,7 @@ def test_uppercase_mcp_allow_is_not_a_grant(tmp_path: Path) -> None:
         for risk in risks
         if risk.category == "permission_scope" and risk.severity == RiskSeverity.MEDIUM
     ]
+    assert not [risk for risk in risks if risk.category == "oversight_gap"]
     notes = [
         risk
         for risk in risks
@@ -244,6 +246,14 @@ def test_uppercase_mcp_allow_is_not_a_grant(tmp_path: Path) -> None:
     ]
     assert len(notes) == 1
     assert "not lowercase" in notes[0].detail
+
+
+@pytest.mark.parametrize("rule", ["mcp__evil__**", "mcp__evil__***"])
+def test_multi_star_mcp_tool_wildcard_is_skipped_in_allow(tmp_path: Path, rule: str) -> None:
+    _write(tmp_path, ".claude/settings.json", json.dumps({"permissions": {"allow": [rule]}}))
+    result = IDEAgentScanner().scan(tmp_path)
+    risks = [risk for component in result.components for risk in component.risks]
+    assert [risk for risk in risks if risk.category in {"permission_scope", "oversight_gap"}] == []
 
 
 @pytest.mark.parametrize("rule", ["mcp__ *", "mcp__\t*", "mcp__docs  __*"])
