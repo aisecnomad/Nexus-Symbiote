@@ -1,6 +1,6 @@
 # Container image
 
-Each PyPI release also publishes the CLI as a container image,
+Each PyPI release from the next one on also publishes the CLI as a container image,
 `ghcr.io/aisecnomad/nexus-symbiote`, tagged with the version. It contains the same
 wheel that went to PyPI, installed on the hash-locked runtime the GitHub Action uses,
 with its own build-provenance attestation. Use it where the CLI cannot run directly,
@@ -22,9 +22,10 @@ take the network away by itself, so run it with `--network none`.
 
 ## Verify and run a published image
 
-These commands require a published image. Take the digest from the release notes or
-resolve the version tag, then use only the digest: a tag can be pushed again, a digest
-cannot change.
+These commands need a published image, so they cannot be run before the first release
+that has one. Take the digest from the release notes, or resolve the version's tag to its
+digest, and use only the digest from then on: a tag can be pushed again, a digest cannot
+change.
 
 ```bash
 gh auth login

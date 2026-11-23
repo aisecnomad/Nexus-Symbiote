@@ -49,7 +49,7 @@ A command can write an inventory while returning a failing status. `--report-onl
 
 ## A collection limit was exceeded
 
-A failure such as `vendor: entries limit of 100000 exceeded; raise it with --limit entries=N` means a collector stopped at a [collection limit](docs/collection-limits.md), so coverage is incomplete and gates fail. Check first that the path belongs in the scan; otherwise raise the named limit with `--limit NAME=VALUE` or `NEXUS_SYMBIOTE_LIMITS`. Settings in the scanned project never change a limit.
+A failure such as `vendor: entries limit of 100000 exceeded; raise it with --limit entries=N` means a collector stopped at a [collection limit](docs/collection-limits.md), so coverage is incomplete and gates fail. Check first that the path belongs in the scan; otherwise raise the named limit with `--limit NAME=VALUE` before the command or with `NEXUS_SYMBIOTE_LIMITS`. Settings in the scanned project never change a limit.
 
 ## ShadowScan import returns a failing status
 

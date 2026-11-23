@@ -67,7 +67,7 @@ With `-vv` a parallel run prints each test's ID when it starts and `[gwN] ... PA
 
 The suite has a per-change time budget: the tests one pull request adds take at most 60 seconds total without coverage. Measure with `python -m pytest --durations=0` and state the figure in the pull request. A suite that documents its own budget is held to that budget instead.
 
-Coverage tracing makes a test about twice as slow (1.6 to 2.7x in CI), so mark a black-box CLI subprocess test, a test that builds a large hostile input, or a `scaling_ratio` test with `@pytest.mark.no_cover` when it takes more than 2 seconds: it still runs in every job, only without tracing. Never leave tests out of a CI job with `-m` or `-k`; only the dependency-floor and Dependency health jobs leave out `locked_only` tests, because they install different versions.
+Coverage tracing makes a test about twice as slow (1.6 to 2.7x in CI), so mark a black-box CLI subprocess test, a test that builds a large hostile input, or a `scaling_ratio` test with `@pytest.mark.no_cover` when it takes more than 2 seconds: it still runs in every job, only without tracing. Never leave tests out of a CI job with `-m` or `-k`; only the dependency-floor job and Dependency health's newest-releases job leave out the `locked_only` tests, because the versions they install are not the locked ones those tests compare against.
 
 ### Skips and expected failures
 

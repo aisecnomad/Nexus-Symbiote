@@ -75,9 +75,10 @@ build could sign its own reviewed baseline.
 
 ## Walkthrough
 
-Sign a collection as reviewed, verify it, show a tampered copy failing, and verify a
-later collection of the same content. Run in a temporary directory outside every git
-working tree ([trusted keys](#trusted-keys)).
+From the repository root, this signs a collection of `examples/demo-agent` as
+reviewed, verifies it, shows a tampered copy failing, and verifies a later collection
+of the same content. It works in a new temporary directory, outside every git working
+tree; see [trusted keys](#trusted-keys) for why that matters.
 
 ```bash
 demo="$PWD/examples/demo-agent"
