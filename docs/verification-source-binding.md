@@ -121,7 +121,10 @@ that names the variable, and no server of that file is recorded. Every record st
 
 Without the key, a server whose values go beyond what the inventory exports carries a
 low `completeness` risk that names the key and lists what is unbound: a command path
-(a command with a directory, or one behind a wrapper), launch arguments other than the
+(a command with a directory, or one behind a wrapper), a command the record does not
+show as written (`[redacted-command]`, or a name exported in lower case or without its
+Windows suffix, so `MCPServer` and `mcpserver`, two files on Linux, share one record),
+an endpoint exported as `[redacted]`, launch arguments other than the
 recorded launcher package and `-y`, environment values, header values, an endpoint path,
 query, fragment or user information, project resolver settings, redacted tool list
 entries (when an `alwaysAllow`, `autoApprove`, `includeTools`, `excludeTools`,

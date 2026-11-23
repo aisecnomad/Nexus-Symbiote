@@ -16,11 +16,16 @@ from nexus_symbiote.core.coverage import CoverageStatus, assess_coverage
 from nexus_symbiote.core.enums import RiskSeverity, SerializationSafety
 from nexus_symbiote.core.models import (
     NAMED_FORMAT_PROPERTY,
+    A2AClientComponent,
+    A2AServerComponent,
     AgentComponent,
     AnyComponent,
     ComponentBase,
+    IDEAgentComponent,
+    MCPServerComponent,
     ModelComponent,
     PromptComponent,
+    RAGSourceComponent,
     RiskAssessment,
 )
 from nexus_symbiote.scanner_catalog import BUILTIN_SCANNER_NAMES
@@ -86,7 +91,20 @@ def _intrinsic_model_risks(component: ModelComponent) -> list[RiskAssessment]:
     return risks
 
 
-_CONTENT_DIGEST_FIELDS = ("content_hash", "definition_hash", "schema_hash")
+_CONTENT_DIGEST_FIELDS = ("content_hash", "definition_hash", "schema_hash", "config_hash")
+_PROPERTY_BOUND_COMPONENT_TYPES = (
+    MCPServerComponent,
+    IDEAgentComponent,
+    A2AServerComponent,
+    A2AClientComponent,
+    RAGSourceComponent,
+)
+_COMPONENT_BINDING_PROPERTIES = (
+    "static_value_binding",
+    "static_config_hash",
+    "static_card_hash",
+    "config_hash",
+)
 
 
 def component_content_digest(component: ComponentBase) -> str | None:
@@ -105,7 +123,35 @@ def component_content_digest(component: ComponentBase) -> str | None:
         # supplied text, and a binding it carried would outlive a change of the bytes.
         binding = component.properties.get("static_value_binding")
         return binding if isinstance(binding, str) and binding else None
-    return component.hashes.get("sha256") or None
+    sha = component.hashes.get("sha256")
+    if sha:
+        return sha
+    if isinstance(component, _PROPERTY_BOUND_COMPONENT_TYPES):
+        present: dict[str, Any] = {}
+        for prop_key in _COMPONENT_BINDING_PROPERTIES:
+            bound = component.properties.get(prop_key)
+            if isinstance(bound, str) and bound:
+                present[prop_key] = bound
+        settings_hashes = component.properties.get("settings_hashes")
+        if (
+            isinstance(settings_hashes, dict)
+            and settings_hashes
+            and all(
+                isinstance(k, str) and k and isinstance(v, str) and v
+                for k, v in settings_hashes.items()
+            )
+        ):
+            present["settings_hashes"] = settings_hashes
+        if len(present) == 1:
+            only = next(iter(present.values()))
+            if isinstance(only, str):
+                return only
+            payload = json.dumps(only, sort_keys=True, separators=(",", ":"))
+            return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        if present:
+            payload = json.dumps(present, sort_keys=True, separators=(",", ":"))
+            return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return None
 
 
 def content_unbound(component: ComponentBase) -> bool:

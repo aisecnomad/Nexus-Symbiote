@@ -271,7 +271,7 @@ def _semantic_value(value: Any, path: tuple[str, ...]) -> Any:
         and path[2:] in {("locator",), ("evidence_refs", "[]")}
     ):
         # A cited line moves with every edit above it; the cited file is what is compared.
-        return value.rpartition(":")[0]
+        return re.sub(r":[0-9]+\Z", "", value)
     if isinstance(value, dict):
         return {
             key: _semantic_value(item, (*path, key))

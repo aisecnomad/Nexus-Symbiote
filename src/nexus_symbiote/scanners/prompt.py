@@ -1017,6 +1017,7 @@ def _read_unless_credential(
     context: str = "",
     missing_ok: bool = False,
     variants_read: Collection[str] = (),
+    report_coexisting_variants: bool = True,
 ) -> bytes | None:
     """The bytes of the file at ``path``, or None when it is absent, unreadable or a gap.
 
@@ -1032,7 +1033,12 @@ def _read_unless_credential(
         if result is not None:
             result.surfaces_excluded.append(f"{path}: {context}{reason}; not read or inventoried")
         return None
-    content = files.read_bytes(path, missing_ok=missing_ok, variants_read=variants_read)
+    content = files.read_bytes(
+        path,
+        missing_ok=missing_ok,
+        variants_read=variants_read,
+        report_coexisting_variants=report_coexisting_variants,
+    )
     followed = files.link_target(path)
     if content is None or followed is None or not _credential_shaped(followed):
         return content
@@ -1283,7 +1289,12 @@ class PromptScanner(Scanner):
                     continue
                 spellings = _CODEX_SPELLINGS if rel_path in _CODEX_SPELLINGS else ()
                 content = _read_unless_credential(
-                    rel_path, files, result, missing_ok=True, variants_read=spellings
+                    rel_path,
+                    files,
+                    result,
+                    missing_ok=True,
+                    variants_read=spellings,
+                    report_coexisting_variants=False,
                 )
                 if content is None:
                     continue
