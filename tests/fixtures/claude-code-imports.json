@@ -243,6 +243,160 @@
    ]
   },
   {
+   "name": "I399 tab inside a block tag",
+   "source": "<div\tclass=\"team\">\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 tab inside an inline tag",
+   "source": "<a\thref=x>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 no-break space inside a block tag",
+   "source": "<div\u00a0class=\"team\">\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 no-break space inside an inline tag",
+   "source": "<a\u00a0href=x>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 no-break space in an unquoted attribute value",
+   "source": "<a href=x\u00a0y>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 no-break space before the end of a tag",
+   "source": "<b x=\"1\"\u00a0>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 vertical tab inside a block tag",
+   "source": "<div\u000bclass=x>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 tab before the end of a tag",
+   "source": "<b x=\"1\"\t>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 tab inside a tag interrupting a paragraph",
+   "source": "Intro\n<div\tclass=\"team\">\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 tab inside a quoted tag",
+   "source": "> <div\tclass=x>\n> `x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 code span across lines after a tab inside a tag",
+   "source": "<div\tclass=\"team\">\n`a\nb`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 indented comment interrupting a paragraph",
+   "source": "Intro\n  <!--\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 indented block tag interrupting a paragraph",
+   "source": "Intro\n  <div>\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 declaration over two lines",
+   "source": "<!X\n>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 code span across lines after a declaration",
+   "source": "<!X\n>`a\nb`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 text after a declaration",
+   "source": "<!X >`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 text after a processing instruction",
+   "source": "<? x ?>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 text after a CDATA section",
+   "source": "<![CDATA[ x ]]>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 declaration interrupting a paragraph",
+   "source": "Intro\n<!X\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 processing instruction interrupting a paragraph",
+   "source": "Intro\n<?php\n`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 processing instruction marked ends later",
+   "source": "<?>\n`a\n?>\nb @notes.md c`\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "I399 tag name marked ends a paragraph at",
+   "source": "`a @notes.md\n<script!\nb`\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
    "name": "code span",
    "source": "- [ ] run `@notes.md`\n",
    "imports": []
@@ -300,6 +454,26 @@
   {
    "name": "fence opener with a line end",
    "source": "Rules\n~~~ @notes.md\n",
+   "imports": []
+  },
+  {
+   "name": "I399 space inside a block tag",
+   "source": "<div class=\"team\">\n`x`@notes.md\n",
+   "imports": []
+  },
+  {
+   "name": "I399 code span across lines after a block tag",
+   "source": "<div class=x>\n`a\nb`@notes.md\n",
+   "imports": []
+  },
+  {
+   "name": "I399 unindented comment interrupting a paragraph",
+   "source": "Intro\n<!--\n`x`@notes.md\n",
+   "imports": []
+  },
+  {
+   "name": "I399 tab inside a tag in a fence",
+   "source": "```\n<div\tclass=x>\n`x`@notes.md\n```\n",
    "imports": []
   },
   {

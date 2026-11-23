@@ -93,6 +93,30 @@ def _html_block_starts(
     )
 
 
+# The HTML block starts of Claude Code's marked, which allows only spaces in a tag and
+# no indentation before a start that ends a paragraph, and the end of a processing
+# instruction, declaration or CDATA section, after which it reads the rest of the line.
+_MARKED_TAG_NAMES = _BLOCK_TAG_NAMES.replace("|menuitem", "|menuitem|meta")
+_MARKED_HTML_BLOCK = re.compile(
+    rf"<(?:script|pre|style|textarea)(?:{_WHITESPACE}|>|$)|<!--|<\?|<![A-Z]|<!\[CDATA\["
+    rf"|</?(?:{_MARKED_TAG_NAMES})(?: +|$|/?>)"
+    r"|<(?!script|pre|style|textarea)[a-z][\w-]*"
+    rf"(?: +[a-z:_][\w.:-]*(?: *= *\"[^\"]*\"| *= *'[^']*'| *= *[^{_WHITESPACE[1:-1]}\"'=<>`]+)?)*?"
+    r" */?>[ \t]*$"
+    rf"|</(?!script|pre|style|textarea)[a-z][\w-]*{_WHITESPACE}*>[ \t]*$",
+    re.I | re.A,
+)
+_MARKED_HTML_INTERRUPTS = re.compile(
+    rf"</?(?:{_MARKED_TAG_NAMES})(?: +|$|/?>)|<(?:script|pre|style|textarea|!--)", re.I | re.A
+)
+_MARKED_ITEM_START = re.compile(r"(?<![0-9])(?:[*+-]|1[.)])(?=[ \t])")
+# The length of the start of each such block, and its end.
+_MARKED_HTML_ENDS = {3: (2, "?>"), 4: (3, ">"), 5: (9, "]]>")}
+_MARKED_RAW_ENDS = {
+    name: re.compile(rf"</{name}>", re.I) for name in ("pre", "script", "style", "textarea")
+}
+_RAW_TAG_NAME = re.compile(r"<(pre|script|style|textarea)", re.I)
+
 # The seven start conditions of an HTML block, and the end conditions of the first five;
 # the last two end at a blank line.
 _HTML_BLOCK_STARTS = _html_block_starts(_WHITESPACE, _BLOCK_TAG_NAMES, r"<![A-Za-z]")
@@ -175,6 +199,7 @@ class _Block:
     fence: str = ""
     fence_offset: int = 0
     html: int = 0
+    tag: str = ""
     suspects: list[int] = field(default_factory=list)
     after_code: bool = False
 
@@ -306,6 +331,28 @@ def _adjacent_container_imports(lines: list[str], eligible: set[str] | None = No
     return parts
 
 
+def _marked_paragraph_imports(lines: list[str]) -> list[str]:
+    """The code span boundaries of each run of lines that marked may read as one
+    paragraph where CommonMark reads HTML: up to a blank line, or a bullet or a ``1.``
+    item, which end a paragraph in marked. A code span can pair across the lines of a
+    run and end right before an import."""
+    parts: list[str] = []
+    group: list[str] = []
+    for line in (*lines, ""):
+        mark = _CONTAINER_MARKS.match(line)
+        text = line if mark is None else line[mark.end() :]
+        if not text.strip(" \t") or (mark is not None and _MARKED_ITEM_START.search(mark[0])):
+            content = "\n".join(group)
+            if len(group) > 1 and "`@" in content:
+                inline = _outside_spans(content, import_boundaries_only=True)
+                if inline != content:
+                    parts.append(inline)
+            group.clear()
+        if text.strip(" \t"):
+            group.append(text)
+    return parts
+
+
 def _import_boundaries(
     blocks: list[tuple[str, str]], lines: list[str], *, containers: bool = False
 ) -> list[str]:
@@ -389,9 +436,10 @@ def _text_outside_code(text: str) -> list[str]:
         # Raw HTML has no inline code spans, unless marked reads it as text. A
         # repeated line that another reading places in prose must keep its possible
         # inline boundaries.
+        marked_html = any(alt.marked_html for alt in readers)
         html_lines = (
             set()
-            if any(alt.marked_html for alt in readers)
+            if marked_html
             else set.intersection(
                 *(
                     {
@@ -427,6 +475,8 @@ def _text_outside_code(text: str) -> list[str]:
                         rendered = _outside_spans(bare)
                         if rendered != inline:
                             alternatives.append(rendered)
+        if marked_html:
+            alternatives.extend(_marked_paragraph_imports(lines))
         for alternative in readers:
             alternatives = _union(
                 alternatives,
@@ -582,11 +632,41 @@ class _Reader:
         if block.kind in ("paragraph", "fence", "indented", "html"):
             self._add_line()
             if 1 <= block.html <= 5 and _html_block_ends(block.html, line, self.offset):
+                if self.marked and self.ascii_html is not True and self._marked_end_differs(block):
+                    self.marked_html = True
+                    self._block_disagreement()
                 self._finalize()
         elif self.offset < len(line) and not self.blank:
             self._add_child("paragraph").after_code = self.after_code_text and not self.opened
             self._advance_next_nonspace()
             self._add_line()
+
+    def _marked_html_differs(self, line: str, at: int, interrupting: bool) -> bool:
+        """Whether marked starts an HTML block at ``at`` where CommonMark does not, or
+        the other way round."""
+        common = any(start.match(line, at) for start in _HTML_BLOCK_STARTS[:6])
+        if not interrupting and not common:
+            if len(line) - at > _MAX_OPEN_TAG_LINE:
+                # As in _start: past this the kind-7 pattern backtracks quadratically,
+                # so the line is a disagreement and keeps the raw reading.
+                return True
+            common = _HTML_BLOCK_STARTS[6].match(line, at) is not None
+        if interrupting:
+            return common != bool(self.indent == 0 and _MARKED_HTML_INTERRUPTS.match(line, at))
+        return common != bool(_MARKED_HTML_BLOCK.match(line, at))
+
+    def _marked_end_differs(self, block: _Block) -> bool:
+        """Whether marked ends the HTML block that CommonMark ends on this line elsewhere:
+        later, or before text that it then reads."""
+        line, offset = self.line, self.offset
+        if block.html == 1:
+            raw_end = _MARKED_RAW_ENDS.get(block.tag)
+            return raw_end is None or raw_end.search(line, offset) is None
+        if block.html == 2:
+            return False
+        opener, closer = _MARKED_HTML_ENDS[block.html]
+        end = line.find(closer, offset + opener if len(block.lines) == 1 else offset)
+        return end < 0 or bool(line[end + len(closer) :].strip(" \t"))
 
     def finish(self) -> None:
         while len(self.stack) > 1:
@@ -739,16 +819,21 @@ class _Reader:
                 self._advance(len(block.fence), columns=False)
                 return 2
             if char == "<":
+                lazy = not self.all_closed and not self.blank and self.stack[-1].kind == "paragraph"
                 if (
                     self.marked
                     and self.ascii_html is not True
-                    and _MARKED_HTML_DISAGREES.match(line, at)
+                    and (
+                        _MARKED_HTML_DISAGREES.match(line, at)
+                        or self._marked_html_differs(line, at, parent.kind == "paragraph" or lazy)
+                    )
                 ):
                     # marked, which matches JavaScript's white space, reads these tags as
-                    # text, or meta as a block, where CommonMark does the opposite.
+                    # text, or meta as a block, where CommonMark does the opposite; or it
+                    # starts or ends an HTML block where CommonMark does not, as at a tab in
+                    # a tag, and pairs code spans across what CommonMark reads as HTML.
                     self.marked_html = True
                     self._block_disagreement()
-                lazy = not self.all_closed and not self.blank and self.stack[-1].kind == "paragraph"
                 starts = _ASCII_HTML_BLOCK_STARTS if self.ascii_html else _HTML_BLOCK_STARTS
                 for kind, start in enumerate(starts, 1):
                     if kind == 7:
@@ -767,6 +852,8 @@ class _Reader:
                         block = self._add_child("html")
                         block.html = kind
                         block.after_code = kind == 7 and self.after_code_text and not self.opened
+                        if kind == 1 and (raw := _RAW_TAG_NAME.match(line, at)) is not None:
+                            block.tag = raw[1].lower()
                         return 2
             if (
                 char in ("=", "-")

@@ -1192,7 +1192,7 @@ A way around a limit that its entry does not describe is worth a
 - **Claude Code's own import reading is followed too.** Claude Code 2.1.42 and
   2.1.330 were tested by running their bundled marked lexer and import extractor;
   both return the same imports for every document tested, and
-  `tests/fixtures/claude-code-imports.json` records them for 200 documents. They
+  `tests/fixtures/claude-code-imports.json` records them for 226 documents. They
   differ from CommonMark in these ways, and the scanner inventories each name they
   give:
   - A reference starts wherever marked starts a text token: after white space, and
@@ -1214,11 +1214,22 @@ A way around a limit that its entry does not describe is worth a
     paragraph is text. The closing tags `</pre>`, `</script>`, `</style>` and
     `</textarea>`, and tags whose names only begin with those words, such as
     `<pretty>`, are text; `<meta>` opens an HTML block.
+  - An HTML block opens only at a tag whose parts are separated by spaces, so a tab,
+    no-break space or other white space in it, as in `<div\tclass="team">`, opens a
+    paragraph whose code span can end right before an import (`` `x`@notes.md ``).
+    Only a block tag, a `<script>`, `<pre>`, `<style>` or `<textarea>` tag, or a
+    `<!--` comment at the start of the line ends a paragraph: an indented one, a
+    declaration such as `<!X`, a processing instruction or a CDATA section does not.
+    A declaration, processing instruction or CDATA section ends at its `>`, `?>` or
+    `]]>`, and the rest of that line is text.
 
   Where these readings may give a different block structure (a marked fence close,
-  a tab before a fence, a fence or those HTML tags among lines marked keeps in a list
-  item), the raw text is retained as for other ambiguities, so a fenced example there
-  can count as an import. A name that only Claude Code's reading gives and that names
+  a tab before a fence, a fence among lines marked keeps in a list item, the closing
+  and `<meta>` tags above, or an HTML block that marked opens or ends where CommonMark
+  does not), the raw text is retained as for other ambiguities, so a fenced example
+  there can count as an import. Where they differ on an HTML block, the code spans of each
+  run of lines up to a blank line or an item are also paired as marked pairs them in
+  a paragraph. A name that only Claude Code's reading gives and that names
   no file is skipped silently: it is looked up only by its exact spelling, so it
   raises no credential or case-variant gap, and a case variant of it on a
   case-insensitive file system is not found. Each reference yields at most 16 names
