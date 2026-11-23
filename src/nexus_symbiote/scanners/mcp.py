@@ -1096,6 +1096,12 @@ def _launch_secrets(launch: Launch, args: Sequence[str] = (), command: str = "")
             # The same floor whatever the name: MODE=Bearer <operand> names no credential
             # but may still carry one.
             values.extend(_withheld_operand(*assigned, following, in_set=in_set))
+        spaced = _spaced_scheme_pair(words[index - 1], word) if index > 0 else None
+        if spaced is not None and following is not None:
+            values.extend(
+                literal for _, literal in _scheme_pair_hits(*spaced, following, in_set=False)
+            )
+            values.extend(_withheld_operand(*spaced, following, in_set=False))
         if index > 0:
             flag = words[index - 1]
             if (
@@ -1504,6 +1510,8 @@ def _assigned(word: str) -> tuple[str, str, bool] | None:
 def _withheld_scheme_operands(words: Sequence[str], *, cmd: bool) -> Iterator[str]:
     """What the pairing rule reads after each ``NAME=<scheme>`` word of one command line.
 
+    A flag and its scheme in separate words (``--auth bearer``) pair as their ``=`` form.
+
     ``_assignment_word_hits`` narrows the pairing to operands that read as credentials,
     which decides the finding. Withholding fails closed: an operand it leaves unflagged
     stays out of exports unless it is positively a public launch word. ``words`` are the
@@ -1511,6 +1519,8 @@ def _withheld_scheme_operands(words: Sequence[str], *, cmd: bool) -> Iterator[st
     """
     for index in range(len(words) - 1):
         assigned = _assigned(words[index])
+        if assigned is None and index:
+            assigned = _spaced_scheme_pair(words[index - 1], words[index])
         if assigned is None:
             continue
         name, value, variable = assigned
@@ -1553,7 +1563,33 @@ def _assignment_word_hits(word: str, following: str | None, *, in_set: bool = Fa
         return []
     name, value, variable = assigned
     hits = value_hits(name, value)
-    if following is None or value.lower() not in _ASSIGNMENT_SCHEMES:
+    if following is not None:
+        hits.extend(_scheme_pair_hits(name, value, variable, following, in_set=in_set))
+    return hits
+
+
+def _spaced_scheme_pair(flag: str | None, word: str) -> tuple[str, str, bool] | None:
+    """``--auth bearer <operand>`` as the ``--auth=bearer <operand>`` it spells.
+
+    A flag and its scheme in separate words are the same mode selector or binding as
+    the ``=`` form, so the operand after them gets the same reading.
+    """
+    if (
+        flag is None
+        or "=" in flag
+        or _CLI_FLAG.fullmatch(flag) is None
+        or word.lower() not in _ASSIGNMENT_SCHEMES
+    ):
+        return None
+    return _assigned(f"{flag}={word}")
+
+
+def _scheme_pair_hits(
+    name: str, value: str, variable: bool, following: str, *, in_set: bool
+) -> list[Hit]:
+    """The hits of the operand after ``NAME=<scheme>``, read by how the name uses it."""
+    hits: list[Hit] = []
+    if value.lower() not in _ASSIGNMENT_SCHEMES:
         return hits
     kind = _classify_scheme_assignment(name, value, variable=variable, in_set=in_set)
     if kind == "public_selector":
@@ -1630,6 +1666,9 @@ def _word_hits(
         hits.extend(_header_line_hits(word, explicit=_explicit_header(previous, word)))
     if "=" in word:
         hits.extend(_assignment_word_hits(word, following, in_set=in_set))
+    spaced = _spaced_scheme_pair(previous, word) if following is not None else None
+    if spaced is not None and following is not None:
+        hits.extend(_scheme_pair_hits(*spaced, following, in_set=False))
     if (":" in word or "=" in word) and _PLAIN_ASSIGNMENT.fullmatch(word) is None:
         hits.extend(assignment_hits(word))
     hits.extend(_user_hits(previous, word, fetcher))
@@ -3296,9 +3335,17 @@ class MCPScanner(Scanner):
                 key, key_error = None, str(exc)
             self._resolvers = _Resolvers(files, result, self._read_mapping)
             known = None if config_only else KnownValues()
+            launched: list[tuple[str, str, dict[str, Any]]] = []
             try:
                 found_any = self._scan_dialects(
-                    files, result, (*MCP_CONFIG_FILES, *nested), key, key_error, clients, known
+                    files,
+                    result,
+                    (*MCP_CONFIG_FILES, *nested),
+                    key,
+                    key_error,
+                    clients,
+                    known,
+                    launched,
                 )
             finally:
                 self._resolvers = None
@@ -3309,7 +3356,7 @@ class MCPScanner(Scanner):
             if known is not None:
                 self._read_host_settings(files, sources, links, known)
                 self._scan_code_mcp_clients(
-                    result, sources, known, [*links, *skipped], walk_complete
+                    result, sources, known, [*links, *skipped], walk_complete, launched
                 )
 
         if not found_any and not result.scan_failures and not result.surfaces_excluded:
@@ -3350,11 +3397,14 @@ class MCPScanner(Scanner):
         key_error: str | None,
         clients: dict[str, MCPClientComponent],
         known: KnownValues | None,
+        launched: list[tuple[str, str, dict[str, Any]]] | None = None,
     ) -> bool:
         """Read each client file in ``paths``; whether any of them was present.
 
         ``known`` gains the values of every file read that a name declared in source
         must not publish, also of a file or server map that is not collected.
+        ``launched`` gains each collected file's raw server entries, so the source
+        search can read what they start before their arguments are redacted.
         """
         found_any = False
         # Server references per host, sorted once at the end: sorting the union after
@@ -3429,6 +3479,13 @@ class MCPScanner(Scanner):
         for dialect, data, read, file_secrets, server_hits in collected:
             file_names = names.scoped(file_secrets.values)
             server_refs: list[str] = []
+            if launched is not None:
+                directory = _launch_directory(dialect.path)
+                launched.extend(
+                    (dialect.path, directory, config)
+                    for config in [*(config for _, config in read.servers), *read.dropped]
+                    if isinstance(config, dict)
+                )
             for server_name, server_config in read.servers:
                 problem = read.problems.get(server_name) or (
                     self._server_problem(server_config, dialect.shape)
@@ -4943,6 +5000,7 @@ class MCPScanner(Scanner):
         known: KnownValues,
         unvisited: list[Path],
         walk_complete: bool,
+        launched: list[tuple[str, str, dict[str, Any]]],
     ) -> None:
         if self._files is None:
             raise RuntimeError("_scan_code_mcp_clients called outside a _collection context")
@@ -4957,6 +5015,7 @@ class MCPScanner(Scanner):
             known,
             unvisited=unvisited,
             walk_complete=walk_complete,
+            launched=launched,
         )
 
     @staticmethod

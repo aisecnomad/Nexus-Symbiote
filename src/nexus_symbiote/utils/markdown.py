@@ -63,7 +63,8 @@ _LIST_MARKER = re.compile(r"[*+-]|(\d{1,9})[.)]")
 _LIST_STARTS = frozenset("*+-0123456789")
 _NON_SPACE = re.compile(r"[^ \t\f\v\r\n]")
 # Whitespace as the JavaScript readers that hosts use match it in HTML.
-_WHITESPACE = "[\t\n\x0b\x0c\r \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
+_JS_WHITESPACE = "\t\n\x0b\x0c\r \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+_WHITESPACE = f"[{_JS_WHITESPACE}]"
 _WHITESPACE_CHARS = frozenset(
     "\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
     "\u2028\u2029\u202f\u205f\u3000\ufeff"
@@ -229,11 +230,64 @@ def _ascii_html_block_agrees(kind: int, line: str, at: int, parent: str, lazy: b
     return False
 
 
-def _html_block_ends(kind: int, line: str, offset: int) -> bool:
+def _html_block_end(kind: int, line: str, offset: int) -> tuple[int, int] | None:
+    """Where the end condition of an HTML block of ``kind`` is met on ``line``, if it is."""
     end = _HTML_BLOCK_ENDS[kind - 1]
     if isinstance(end, str):
-        return line.find(end, offset) >= 0
-    return end.search(line, offset) is not None
+        found = line.find(end, offset)
+        return None if found < 0 else (found, found + len(end))
+    closing = end.search(line, offset)
+    return None if closing is None else closing.span()
+
+
+def _marked_html_block_starts() -> tuple[re.Pattern[str], ...]:
+    """The HTML block starts of the marked lexer Claude Code bundles, read one line at a
+    time: only spaces separate a tag name from its attributes, and a line end is ``$``.
+
+    A closing tag whose ``>`` is on a later line also counts, since marked's white space
+    there spans lines.
+    """
+    flags = re.I | re.A
+    attribute = (
+        r"(?: +[a-zA-Z:_][\w.:-]*"
+        rf"(?: *= *\"[^\"]*\"| *= *'[^']*'| *= *[^{_JS_WHITESPACE}\"'=<>`]+)?)"
+    )
+    raw = "script|pre|style|textarea"
+    return (
+        re.compile(rf"<(?:{raw})(?:[{_JS_WHITESPACE}>]|$)", flags),
+        re.compile(r"<!--"),
+        re.compile(r"<\?"),
+        re.compile(r"<![A-Z]", flags),
+        re.compile(r"<!\[CDATA\["),
+        re.compile(rf"</?(?:{_BLOCK_TAG_NAMES}|meta)(?: +|/?>|$)", flags),
+        re.compile(
+            rf"(?:<(?!{raw})[a-z][\w-]*{attribute}*? */?>(?=[ \t]*$)"
+            rf"|</(?!{raw})[a-z][\w-]*[{_JS_WHITESPACE}]*(?:>[ \t]*)?$)",
+            flags,
+        ),
+    )
+
+
+_MARKED_HTML_BLOCK_STARTS = _marked_html_block_starts()
+# What ends a paragraph in marked: only these, and only at the start of a line.
+# marked's paragraph rule matches these without its block rules' `i` flag, so an
+# upper-case `<DIV>` stays in the paragraph, where a code span may end before an import.
+_MARKED_HTML_INTERRUPTS = re.compile(
+    rf"</?(?:{_BLOCK_TAG_NAMES}|meta)(?: +|/?>|$)|<(?:script|pre|style|textarea|!--)",
+    re.A,
+)
+_HTML_TAG_NAME = re.compile(r"</?([A-Za-z]+)")
+
+
+def _marked_html_kind(line: str, at: int, interrupts: bool, indented: bool) -> int:
+    """The kind of HTML block marked starts at ``at``, 0 for none, or -1 where it only
+    ends the paragraph there and starts another."""
+    if interrupts and (indented or not _MARKED_HTML_INTERRUPTS.match(line, at)):
+        return 0
+    for kind, start in enumerate(_MARKED_HTML_BLOCK_STARTS, 1):
+        if start.match(line, at):
+            return kind
+    return -1 if interrupts else 0
 
 
 # Inline: what pairs backticks, and what can take one out of a code span.
@@ -282,6 +336,8 @@ class _Block:
     fence: str = ""
     fence_offset: int = 0
     html: int = 0
+    html_tag: str = ""
+    interrupted: bool = False
     suspects: list[int] = field(default_factory=list)
     after_code: bool = False
 
@@ -413,6 +469,32 @@ def _adjacent_container_imports(lines: list[str], eligible: set[str] | None = No
     return parts
 
 
+# A bullet or a `1.` item, which end a paragraph in marked.
+_MARKED_ITEM_START = re.compile(r"(?<![0-9])(?:[*+-]|1[.)])(?=[ \t])")
+
+
+def _marked_paragraph_imports(lines: list[str]) -> list[str]:
+    """The code span boundaries of each run of lines that marked may read as one
+    paragraph where CommonMark reads HTML: up to a blank line, or a bullet or a ``1.``
+    item, which end a paragraph in marked. A code span can pair across the lines of a
+    run and end right before an import."""
+    parts: list[str] = []
+    group: list[str] = []
+    for line in (*lines, ""):
+        mark = _CONTAINER_MARKS.match(line)
+        text = line if mark is None else line[mark.end() :]
+        if not text.strip(" \t") or (mark is not None and _MARKED_ITEM_START.search(mark[0])):
+            content = "\n".join(group)
+            if len(group) > 1 and "`@" in content:
+                inline = _outside_spans(content, import_boundaries_only=True)
+                if inline != content:
+                    parts.append(inline)
+            group.clear()
+        if text.strip(" \t"):
+            group.append(text)
+    return parts
+
+
 def _import_boundaries(
     blocks: list[tuple[str, str]], lines: list[str], *, containers: bool = False
 ) -> list[str]:
@@ -496,9 +578,10 @@ def _text_outside_code(text: str) -> list[str]:
         # Raw HTML has no inline code spans, unless marked reads it as text. A
         # repeated line that another reading places in prose must keep its possible
         # inline boundaries.
+        marked_html = any(alt.marked_html for alt in readers)
         html_lines = (
             set()
-            if any(alt.marked_html for alt in readers)
+            if marked_html
             else set.intersection(
                 *(
                     {
@@ -534,6 +617,8 @@ def _text_outside_code(text: str) -> list[str]:
                         rendered = _outside_spans(bare)
                         if rendered != inline:
                             alternatives.append(rendered)
+        if marked_html:
+            alternatives.extend(_marked_paragraph_imports(lines))
         for alternative in readers:
             alternatives = _union(
                 alternatives,
@@ -601,7 +686,7 @@ class _Reader:
         # paragraph and these blocks as its lazy lines.
         self.after_code: set[int] = set()
         self.code_text = self.after_code_text = self.opened = False
-        self.prior_text = self.marked_item = self.marked_html = False
+        self.prior_text = self.after_text = self.marked_item = self.marked_html = False
         self.marked_margin = -1
         self.marked_width = 1
         self.stack = [_Block("document")]
@@ -623,6 +708,7 @@ class _Reader:
 
     def read(self, line: str) -> None:
         prior_text, self.prior_text = self.prior_text, bool(line.strip(" \t"))
+        self.after_text = prior_text
         self.line = line
         self.offset = self.column = 0
         self.blank = self.partial = self.opened = False
@@ -644,6 +730,18 @@ class _Reader:
             container = depth
         self.all_closed = container == old_tip
         self.matched = container
+        if (
+            self.marked
+            and self.ascii_html is not True
+            and prior_text
+            and self.prior_text
+            and stack[-1].kind == "html"
+            and any(b.kind == "quote" for b in stack[container + 1 :])
+        ):
+            # marked's block quote takes this line lazily where CommonMark ends the quote
+            # and the HTML block in it.
+            self.marked_html = True
+            self._block_disagreement()
         # marked keeps the lines after a list item in it where CommonMark ends the item,
         # up to a blank line and then while lines are indented to the item's content,
         # unless a line opens a fence at the margin of the last item opened, when that
@@ -687,8 +785,29 @@ class _Reader:
             # title, which is known when the paragraph ends.
             block.suspects.append(len(block.lines))
         if block.kind in ("paragraph", "fence", "indented", "html"):
+            if (
+                self.marked
+                and self.ascii_html is not True
+                and block.interrupted
+                and not self.indented
+                and _SETEXT_UNDERLINE.match(line, self.next_nonspace)
+            ):
+                # marked reads the paragraph this block interrupted, and the block, as the
+                # text of a setext heading.
+                self.marked_html = True
+                self._block_disagreement()
             self._add_line()
-            if 1 <= block.html <= 5 and _html_block_ends(block.html, line, self.offset):
+            if (
+                1 <= block.html <= 5
+                and (close := _html_block_end(block.html, line, self.offset)) is not None
+            ):
+                if (
+                    self.marked
+                    and self.ascii_html is not True
+                    and self._marked_ends_elsewhere(block, line, close)
+                ):
+                    self.marked_html = True
+                    self._block_disagreement()
                 self._finalize()
         elif self.offset < len(line) and not self.blank:
             self._add_child("paragraph").after_code = self.after_code_text and not self.opened
@@ -698,6 +817,19 @@ class _Reader:
     def finish(self) -> None:
         while len(self.stack) > 1:
             self._finalize()
+
+    @staticmethod
+    def _marked_ends_elsewhere(block: _Block, line: str, close: tuple[int, int]) -> bool:
+        """Whether marked ends this HTML block at another place than CommonMark.
+
+        marked ends a raw block only at the closing tag it opened with, and a processing
+        instruction, declaration or CDATA section right after it closes, reading the rest
+        of that line as a new block.
+        """
+        if block.html == 1:
+            name = _HTML_TAG_NAME.match(line, close[0])
+            return name is None or name.group(1).lower() != block.html_tag
+        return block.html >= 3 and bool(line[close[1] :].strip(" \t"))
 
     def _peek(self, index: int) -> str:
         return self.line[index : index + 1]
@@ -856,20 +988,44 @@ class _Reader:
                     self.marked_html = True
                     self._block_disagreement()
                 lazy = not self.all_closed and not self.blank and self.stack[-1].kind == "paragraph"
+                interrupts = parent.kind == "paragraph" or lazy
                 starts = _ASCII_HTML_BLOCK_STARTS if self.ascii_html else _HTML_BLOCK_STARTS
-                for kind, start in enumerate(starts, 1):
-                    if kind == 7 and (parent.kind == "paragraph" or lazy):
-                        break
-                    if start.match(line, at):
-                        if self.ascii_html is None and not _ascii_html_block_agrees(
-                            kind, line, at, parent.kind, lazy
-                        ):
-                            raise _HTMLDisagreementError
-                        self._close_unmatched()
-                        block = self._add_child("html")
-                        block.html = kind
-                        block.after_code = kind == 7 and self.after_code_text and not self.opened
-                        return 2
+                kind = next(
+                    (kind for kind, start in enumerate(starts[:6], 1) if start.match(line, at)),
+                    0,
+                )
+                if not kind and not interrupts and starts[6].match(line, at):
+                    kind = 7
+                if self.marked and self.ascii_html is not True:
+                    # marked's block quote continues on any line its paragraph rule takes,
+                    # whatever block the quote holds.
+                    quoted = (
+                        not interrupts
+                        and not self.all_closed
+                        and self.after_text
+                        and any(b.kind == "quote" for b in self.stack[self.matched + 1 :])
+                    )
+                    marked = _marked_html_kind(line, at, interrupts or quoted, at > self.offset)
+                    if min(kind, 6) != min(marked, 6) or (kind == 3 and line.startswith("<?>", at)):
+                        # marked starts another block here than CommonMark, or none: after
+                        # a tab in a tag, at an indented start after a paragraph, or at a
+                        # tag name with an underscore. The code spans of what it reads as
+                        # text may end right before an import.
+                        self.marked_html = True
+                        self._block_disagreement()
+                if kind:
+                    if self.ascii_html is None and not _ascii_html_block_agrees(
+                        kind, line, at, parent.kind, lazy
+                    ):
+                        raise _HTMLDisagreementError
+                    self._close_unmatched()
+                    block = self._add_child("html")
+                    block.html = kind
+                    block.after_code = kind == 7 and self.after_code_text and not self.opened
+                    block.interrupted = interrupts
+                    if kind == 1 and (name := _HTML_TAG_NAME.match(line, at)) is not None:
+                        block.html_tag = name.group(1).lower()
+                    return 2
             if (
                 char in ("=", "-")
                 and parent.kind == "paragraph"

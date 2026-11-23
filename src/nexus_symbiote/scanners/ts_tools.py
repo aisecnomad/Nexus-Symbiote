@@ -50,7 +50,9 @@ from nexus_symbiote.scanners.base import KnownValues, ScanResult, declared_serve
 
 _SDK = "@modelcontextprotocol/"
 _MODULES = {"@modelcontextprotocol/server", "@modelcontextprotocol/sdk/server/mcp.js"}
-_IGNORED = {"dist", "build", "__tests__", "tests", "test", "docs", "benchmarks", "examples"}
+SKIPPED_DIRECTORIES = frozenset(
+    {"dist", "build", "__tests__", "tests", "test", "docs", "benchmarks", "examples"}
+)
 # Whether tsc reads a suffix with JSX: TypeScript without, .tsx and JavaScript with.
 _JSX = {
     ".ts": False,
@@ -238,12 +240,17 @@ class _Launcher:
     reason: str
 
 
-def is_server_source(path: Path) -> bool:
-    """A TypeScript or JavaScript file this collector supports, before its content is known."""
-    return (
-        path.suffix in SCRIPT_SUFFIXES
-        and not _IGNORED.intersection(path.parts)
-        and not path.name.endswith(NOT_SOURCE_NAMES)
+def is_server_source(path: Path, *, launched: bool = False) -> bool:
+    """A TypeScript or JavaScript file this collector supports, before its content is known.
+
+    A file a configured server launches is searched wherever it is and whatever its name.
+    """
+    return path.suffix in SCRIPT_SUFFIXES and (
+        launched
+        or (
+            not SKIPPED_DIRECTORIES.intersection(path.parts)
+            and not path.name.endswith(NOT_SOURCE_NAMES)
+        )
     )
 
 
