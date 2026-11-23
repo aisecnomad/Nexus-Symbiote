@@ -32,7 +32,7 @@ Each is reproduced and fixed with a regression test. One CI flake failed `Verifi
 
 **What was not read line by line.** The other modules were covered by the automated checks and by the full test suite, not by a manual reading. That includes the exporters, validators, graph, attestation, crosswalk and minimum-element code, most scanners, and `runtime.py`.
 
-The [2026-11-14 audit](security-audit-2026-11-14.md) read every module at `4aaf727`. This audit does not repeat that reading; it targets what changed since (#202, #203, #226) and the open pull requests.
+The 2026-11-14 audit (archived in git history) read every module at `4aaf727`. This audit does not repeat that reading; it targets what changed since (#202, #203, #226) and the open pull requests.
 
 ## Findings
 

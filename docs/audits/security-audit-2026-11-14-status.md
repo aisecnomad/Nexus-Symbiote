@@ -1,7 +1,7 @@
 # Status of the 2026-11-14 security audit findings
 
 This note records, finding by finding, where the
-[2026-11-14 security audit](security-audit-2026-11-14.md) stands on `main` at
+2026-11-14 security audit (archived in git history) stands on `main` at
 `a604c33` (batch 1, #202, merged) plus the commits on the branch that carries this
 note. It was produced with Claude Code at the maintainer's request on 2026-11-15; no
 second person has reviewed it. Re-check each claim against the commit it names.
