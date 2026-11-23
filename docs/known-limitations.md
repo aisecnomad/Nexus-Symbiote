@@ -1225,9 +1225,9 @@ A way around a limit that its entry does not describe is worth a
     and spaces alone separate its attributes, so after a tag with a tab or a no-break
     space in it, such as `<div` and a tab before `class="team">`, the next line is
     text and ``` `x`@notes.md ``` there imports `notes.md`. A tag name may hold an underscore, so
-    `<a_b>` opens a block. Only an unindented block tag, `<script`, `<pre`, `<style`,
-    `<textarea` or `<!--` ends a paragraph, so an indented `<div>` or a `<!X`
-    declaration after a paragraph is text. A processing instruction, declaration or
+    `<a_b>` opens a block. Only an unindented, lower-case block tag, `<script`, `<pre`,
+    `<style`, `<textarea` or `<!--` ends a paragraph, so an indented `<div>`, an
+    upper-case `<DIV>` or a `<!X` declaration after a paragraph is text. A processing instruction, declaration or
     CDATA section ends right after it closes and the rest of its line is a new block
     (``<?x?>`x`@notes.md`` imports `notes.md`); a `<pre>`, `<script>`, `<style>` or
     `<textarea>` block ends only at its own closing tag; a block quote that holds an

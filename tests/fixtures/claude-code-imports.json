@@ -1996,6 +1996,67 @@
    "imports": [
     "d.md"
    ]
+  },
+  {
+   "name": "Upper-case DIV after a paragraph",
+   "source": "Intro\n<DIV>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "Upper-case PRE after a paragraph",
+   "source": "Intro\n<PRE>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "Upper-case TABLE after a paragraph",
+   "source": "Intro\n<TABLE>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "Upper-case DIV with an attribute after a paragraph",
+   "source": "Intro\n<DIV class=x>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "Mixed-case Div after a paragraph",
+   "source": "Intro\n<Div>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "Upper-case SCRIPT after a paragraph",
+   "source": "Intro\n<SCRIPT>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "Upper-case closing DIV after a paragraph",
+   "source": "Intro\n</DIV>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "Quoted upper-case DIV after a paragraph",
+   "source": "> Intro\n> <DIV>`x`@notes.md\n",
+   "imports": [
+    "notes.md"
+   ]
+  },
+  {
+   "name": "Lower-case div after a paragraph",
+   "source": "Intro\n<div>`x`@notes.md\n",
+   "imports": []
   }
  ]
 }

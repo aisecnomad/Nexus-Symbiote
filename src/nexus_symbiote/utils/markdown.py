@@ -163,9 +163,11 @@ def _marked_html_block_starts() -> tuple[re.Pattern[str], ...]:
 
 _MARKED_HTML_BLOCK_STARTS = _marked_html_block_starts()
 # What ends a paragraph in marked: only these, and only at the start of a line.
+# marked's paragraph rule matches these without its block rules' `i` flag, so an
+# upper-case `<DIV>` stays in the paragraph, where a code span may end before an import.
 _MARKED_HTML_INTERRUPTS = re.compile(
     rf"</?(?:{_BLOCK_TAG_NAMES}|meta)(?: +|/?>|$)|<(?:script|pre|style|textarea|!--)",
-    re.I | re.A,
+    re.A,
 )
 _HTML_TAG_NAME = re.compile(r"</?([A-Za-z]+)")
 

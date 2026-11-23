@@ -811,7 +811,17 @@ def test_an_at_sign_inside_a_url_path_raises_no_gap(tmp_path):
     assert not result.scan_failures and not result.surfaces_excluded
 
 
-@pytest.mark.parametrize("text", ["**@../x.md**\n", "**@~/x.md**\n", "_@../x.md_\n"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "**@../x.md**\n",
+        "**@~/x.md**\n",
+        "_@../x.md_\n",
+        # Claude Code 2.1.42 and 2.1.330 read `../o.md.` here, after a code span in what
+        # marked reads as a paragraph and CommonMark as an HTML block in a quote.
+        "><div\n    ` `@../o.md.\n",
+    ],
+)
 def test_a_name_after_markup_that_leaves_the_root_raises_its_gap(tmp_path, text):
     # Claude Code imports `../x.md` and `~/x.md` from these, from outside the root.
     _write(tmp_path, "CLAUDE.md", text)
