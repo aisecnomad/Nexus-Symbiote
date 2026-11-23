@@ -9,8 +9,7 @@ import re
 import sys
 import unicodedata
 from collections import deque
-from collections.abc import Collection
-from itertools import islice
+from collections.abc import Collection, Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -1149,16 +1148,20 @@ _MAX_LISTED_IMPORT_CHARACTERS = 256 * 1024
 _IMPORT = re.compile(r"(?<!\S)@(\S+)")
 # JavaScript's \s, which Claude Code's import pattern uses.
 _JS_SPACE = "\t\n\x0b\x0c\r \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
-# An @ that can open a marked text token: after white space or any inline markup, an
-# escape or raw HTML, all of which end on ASCII punctuation. An @ after a backtick does
-# only when that backtick is escaped; the name after a code span is read where it closes.
-_HOST_START = re.compile(rf"(?<![^{_JS_SPACE}!-/:-?\[-`{{-~])@(?=[^{_JS_SPACE}\\]|\\ )")
+# An @ after white space or ASCII punctuation, of which ``_opens_text`` keeps those that
+# can open a marked text token.
+_HOST_START = re.compile(rf"(?<![^{_JS_SPACE}!-/:-@\[-`{{-~])@(?=[^{_JS_SPACE}\\]|\\ )")
+# What inline markup can end on: raw HTML and autolinks, links, reference links, link
+# text and emphasis.
+_MARKUP_END = re.compile(rf"[{_JS_SPACE}>)\]\[*_]")
 _HOST_NAME = re.compile(rf"(?:[^{_JS_SPACE}\\]|\\ )+")
-_MARKUP_START = re.compile(r"[`*_\[\]<!\\]")
-# Each start yields at most this many names plus its whole run, and a file at most
-# ``_MAX_HOST_STARTS`` starts, so the names read stay linear in the text.
-_MAX_HOST_CUTS = 16
+_MARKUP_START = re.compile(r"[`*\[\]<!\\]|_+")
 _MAX_HOST_STARTS = 2 * _MAX_IMPORTS
+# The names a file's references yield, and their characters, counted as they are read;
+# past either the file is a "too many @path imports" failure, so the work stays bounded
+# by the text and no name is dropped silently.
+_MAX_HOST_NAMES = 16 * _MAX_HOST_STARTS
+_MAX_HOST_NAME_CHARACTERS = 4 * 1024 * 1024
 _DRIVE = re.compile(r"[A-Za-z]:[\\/]")
 # Sentence punctuation after a reference; the file is inventoried without it.
 _TRAILING = ".,;:!?)]}\"'"
@@ -1214,6 +1217,48 @@ def _resolve_import(directory: tuple[str, ...], token: str) -> tuple[list[str], 
     return targets, outside, too_long
 
 
+def _backslashes_before(part: str, index: int) -> int:
+    start = index
+    while start and part[start - 1] == "\\":
+        start -= 1
+    return index - start
+
+
+def _opens_text(part: str, at: int) -> bool:
+    """Whether marked may start a text token at the ``@`` at ``at``: after white space,
+    markup or an escape. The name after a code span is read where the span closes, and
+    an escaped ``@`` starts none.
+    """
+    if not at:
+        return True
+    if slashes := _backslashes_before(part, at):
+        return slashes % 2 == 0
+    if _MARKUP_END.match(part, at - 1):
+        return True
+    return _backslashes_before(part, at - 1) % 2 == 1
+
+
+def _cuts(part: str, start: int, limit: int) -> Iterator[int]:
+    """Each place in ``part[start:limit]`` where markup may end a marked text token.
+
+    marked opens and closes no emphasis at a run of ``_`` inside a word, between two
+    letters or digits, so that run ends no token. It compares one UTF-16 code unit
+    there, so after a character outside the Basic Multilingual Plane the run still ends
+    one.
+    """
+    for markup in _MARKUP_START.finditer(part, start, limit):
+        at, end = markup.span()
+        if (
+            part[at] == "_"
+            and ord(part[at - 1]) < 0x10000
+            and part[at - 1].isalnum()
+            and end < len(part)
+            and part[end].isalnum()
+        ):
+            continue
+        yield from range(at, end)
+
+
 def _import_readings(text: str) -> tuple[list[str], list[str], bool]:
     """@path references in the text of a Markdown file, outside its code as CommonMark
     reads it, each name Claude Code may read from the same text, and whether it holds
@@ -1227,22 +1272,17 @@ def _import_readings(text: str) -> tuple[list[str], list[str], bool]:
     names no file is skipped, so extra names cost only a lookup.
     """
     own: list[str] = []
-    host: list[str] = []
-    starts = 0
-    for part in text_outside_code(text):
+    host: dict[str, None] = {}
+    starts = names = characters = 0
+    for part in dict.fromkeys(text_outside_code(text)):
         own.extend(_IMPORT.findall(part))
         end = 0
         for found in _HOST_START.finditer(part):
-            at = found.start()
-            tick = at > 0 and part[at - 1] == "`"
-            escape = at - tick
-            while escape and part[escape - 1] == "\\":
-                escape -= 1
-            if (at - tick - escape) % 2 != tick:
+            if not _opens_text(part, found.start()):
                 continue
             starts += 1
             if starts > _MAX_HOST_STARTS:
-                return own, host, True
+                return own, list(host), True
             start = found.end()
             # Every start inside one run of name characters ends where that run ends.
             if start >= end:
@@ -1251,14 +1291,14 @@ def _import_readings(text: str) -> tuple[list[str], list[str], bool]:
             limit = min(end, start + _MAX_PATH_BYTES + 1)
             if (fragment := part.find("#", start, limit)) >= 0:
                 limit = fragment
-            cuts = islice(
-                (markup.start() for markup in _MARKUP_START.finditer(part, start, limit)),
-                _MAX_HOST_CUTS,
-            )
-            for cut in dict.fromkeys((*cuts, limit)):
+            for cut in (*_cuts(part, start, limit), limit):
+                names += 1
+                characters += cut - start
+                if names > _MAX_HOST_NAMES or characters > _MAX_HOST_NAME_CHARACTERS:
+                    return own, list(host), True
                 if form := part[start:cut].replace("\\ ", " "):
-                    host.append(form)
-    return own, host, False
+                    host[form] = None
+    return own, list(host), False
 
 
 def _import_tokens(text: str) -> list[str]:
@@ -1645,6 +1685,8 @@ class PromptScanner(Scanner):
                 named, leaves, long = _resolve_import(directory, token)
                 for target in named:
                     targets[target] = targets.get(target, True) and speculative
+                # Claude Code imports a name past the root after markup too (`**@../x.md**`),
+                # so a name only its reading gives still marks a gap no lookup can clear.
                 outside |= leaves
                 too_long |= long
             for target, speculative in targets.items():

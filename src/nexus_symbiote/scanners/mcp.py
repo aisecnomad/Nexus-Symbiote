@@ -3335,9 +3335,17 @@ class MCPScanner(Scanner):
                 key, key_error = None, str(exc)
             self._resolvers = _Resolvers(files, result, self._read_mapping)
             known = None if config_only else KnownValues()
+            launched: list[tuple[str, str, dict[str, Any]]] = []
             try:
                 found_any = self._scan_dialects(
-                    files, result, (*MCP_CONFIG_FILES, *nested), key, key_error, clients, known
+                    files,
+                    result,
+                    (*MCP_CONFIG_FILES, *nested),
+                    key,
+                    key_error,
+                    clients,
+                    known,
+                    launched,
                 )
             finally:
                 self._resolvers = None
@@ -3348,7 +3356,7 @@ class MCPScanner(Scanner):
             if known is not None:
                 self._read_host_settings(files, sources, links, known)
                 self._scan_code_mcp_clients(
-                    result, sources, known, [*links, *skipped], walk_complete
+                    result, sources, known, [*links, *skipped], walk_complete, launched
                 )
 
         if not found_any and not result.scan_failures and not result.surfaces_excluded:
@@ -3389,11 +3397,14 @@ class MCPScanner(Scanner):
         key_error: str | None,
         clients: dict[str, MCPClientComponent],
         known: KnownValues | None,
+        launched: list[tuple[str, str, dict[str, Any]]] | None = None,
     ) -> bool:
         """Read each client file in ``paths``; whether any of them was present.
 
         ``known`` gains the values of every file read that a name declared in source
         must not publish, also of a file or server map that is not collected.
+        ``launched`` gains each collected file's raw server entries, so the source
+        search can read what they start before their arguments are redacted.
         """
         found_any = False
         # Server references per host, sorted once at the end: sorting the union after
@@ -3468,6 +3479,13 @@ class MCPScanner(Scanner):
         for dialect, data, read, file_secrets, server_hits in collected:
             file_names = names.scoped(file_secrets.values)
             server_refs: list[str] = []
+            if launched is not None:
+                directory = _launch_directory(dialect.path)
+                launched.extend(
+                    (dialect.path, directory, config)
+                    for config in [*(config for _, config in read.servers), *read.dropped]
+                    if isinstance(config, dict)
+                )
             for server_name, server_config in read.servers:
                 problem = read.problems.get(server_name) or (
                     self._server_problem(server_config, dialect.shape)
@@ -4982,6 +5000,7 @@ class MCPScanner(Scanner):
         known: KnownValues,
         unvisited: list[Path],
         walk_complete: bool,
+        launched: list[tuple[str, str, dict[str, Any]]],
     ) -> None:
         if self._files is None:
             raise RuntimeError("_scan_code_mcp_clients called outside a _collection context")
@@ -4996,6 +5015,7 @@ class MCPScanner(Scanner):
             known,
             unvisited=unvisited,
             walk_complete=walk_complete,
+            launched=launched,
         )
 
     @staticmethod
