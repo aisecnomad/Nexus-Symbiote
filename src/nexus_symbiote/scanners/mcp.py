@@ -851,28 +851,35 @@ _MAX_FLAGS_BEFORE_CREDENTIAL = 64
 
 
 def _scheme_flag_operands(value: str) -> list[str]:
-    """The credential after any run of flags that follows an auth scheme word.
+    """The credential after one or more flags that follow an auth scheme word.
 
-    ``Bearer --tls --insecure <token>`` hides the token behind more than one flag.
-    Each scheme is read once, left to right, and at most ``_MAX_FLAGS_BEFORE_CREDENTIAL``
-    flags are skipped.
+    ``Bearer --tls --insecure <token>`` hides the token behind flags. Each scheme is
+    scanned in place with an integer index so work stays linear, and at most
+    ``_MAX_FLAGS_BEFORE_CREDENTIAL`` flags are skipped.
     """
     found: list[str] = []
+    length = len(value)
     for match in _SCHEME_HEAD.finditer(value):
-        rest = value[match.end() :]
+        pos = match.end()
         flags = 0
         while flags < _MAX_FLAGS_BEFORE_CREDENTIAL:
-            rest = rest.lstrip()
-            if not rest.startswith("-"):
+            while pos < length and value[pos].isspace():
+                pos += 1
+            if pos >= length or value[pos] != "-":
                 break
-            word, _, rest = rest.partition(" ")
-            if not word:
-                break
+            while pos < length and not value[pos].isspace():
+                pos += 1
             flags += 1
-        rest = rest.lstrip()
-        if not rest or rest.startswith("-"):
+        if flags == 0:
             continue
-        operand = rest.split(None, 1)[0].strip("\"'")
+        while pos < length and value[pos].isspace():
+            pos += 1
+        if pos >= length or value[pos] == "-":
+            continue
+        end = pos
+        while end < length and not value[end].isspace():
+            end += 1
+        operand = value[pos:end].strip("\"'")
         if operand and not is_reference(operand):
             found.append(operand)
     return found
@@ -882,7 +889,8 @@ def _scheme_secrets(value: str) -> list[str]:
     """``value`` and its bare credential when it is an auth scheme word and a credential."""
     credentials = list(scheme_credentials(value))
     for operand in _scheme_flag_operands(value):
-        credentials.append(operand)
+        if _public_scheme_following("--auth", "Bearer", operand, variable=False, in_set=False):
+            continue
         credentials.extend(scheme_credentials(f"Bearer {operand}"))
     if credentials and len(value) >= MIN_SECRET_LENGTH:
         return list(dict.fromkeys([value, *credentials]))
@@ -1786,15 +1794,34 @@ def _ignorable_command_char(char: str) -> bool:
     return char.isspace() or unicodedata.category(char) in {"Zs", "Cf"}
 
 
-def _command_text_for_hash(command: object) -> str | None:
-    """The raw command when whitespace or a format character changes what is spawned."""
+def _command_text_for_hash(
+    command: object,
+    *,
+    exported_command: str | None = None,
+    scrubber: SecretScrubber | None = None,
+) -> str | None:
+    """The raw command when whitespace or a format character changes a safe command.
+
+    Redacted commands, secret-bearing values, filesystem paths, and non-safe
+    command cores stay out of the unkeyed ``static_config_hash`` so credentials
+    and local paths cannot be probed offline through the public digest.
+    """
     if not isinstance(command, str) or not command:
+        return None
+    if exported_command is None or exported_command == "[redacted-command]":
+        return None
+    if re.search(r"[\\/]", command):
+        return None
+    if scrubber is not None and scrubber.contains(command):
         return None
     start, end = 0, len(command)
     while start < end and _ignorable_command_char(command[start]):
         start += 1
     while end > start and _ignorable_command_char(command[end - 1]):
         end -= 1
+    core = command[start:end]
+    if not core or not _SAFE_NAME.fullmatch(core) or TOKEN_SHAPE.search(core):
+        return None
     if (start, end) != (0, len(command)):
         return command
     if any(unicodedata.category(char) in {"Zs", "Cf"} for char in command):
@@ -4342,7 +4369,14 @@ class MCPScanner(Scanner):
                     # a client spawns and are not part of the folded command name.
                     **(
                         {"command_text": command_text}
-                        if (command_text := _command_text_for_hash(command)) is not None
+                        if (
+                            command_text := _command_text_for_hash(
+                                command,
+                                exported_command=identity.command,
+                                scrubber=scrubber,
+                            )
+                        )
+                        is not None
                         else {}
                     ),
                     "launcher": launch.launcher,

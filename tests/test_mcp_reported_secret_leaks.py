@@ -225,3 +225,33 @@ def test_server_component_is_still_recorded_for_a_padded_command(tmp_path: Path)
         item for item in json.loads(text) if "static_config_hash" in item.get("properties", {})
     )
     assert MCPServerComponent.model_validate(server).command == "npx"
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "expected_command"),
+    [
+        (" ghp_" + "a1B2" * 9 + " ", " ghp_" + "c3D4" * 9 + " ", "[redacted-command]"),
+        ("ghp_" + "a1B2" * 9 + "\u200b", "ghp_" + "c3D4" * 9 + "\u200b", "[redacted-command]"),
+        (
+            "/opt/ghp_" + "a1B2" * 9 + "/npx ",
+            "/opt/ghp_" + "c3D4" * 9 + "/npx ",
+            "npx",
+        ),
+    ],
+)
+def test_padded_secret_or_path_command_does_not_leak_into_unkeyed_hash(
+    tmp_path: Path, first: str, second: str, expected_command: str
+) -> None:
+    def digest(sub: str, command: str) -> str:
+        text = _scan(
+            tmp_path / sub,
+            ".mcp.json",
+            {"mcpServers": {"s": {"command": command, "args": ["-y", "x@1"]}}},
+        )
+        server = next(
+            item for item in json.loads(text) if "static_config_hash" in item.get("properties", {})
+        )
+        assert server["command"] == expected_command
+        return server["properties"]["static_config_hash"]
+
+    assert digest("a", first) == digest("b", second)
