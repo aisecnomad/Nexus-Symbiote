@@ -1,12 +1,10 @@
 # Inventory attestation
 
-`nexus-symbiote attest` signs the exact bytes of a file, usually an inventory or a
-reviewed baseline, for a purpose you state, and `nexus-symbiote verify-attestation`
-checks that signature against public keys you trust. Inventories and baselines are
-still written unsigned; signing is a separate, explicit step that a key holder takes.
-This page says what an attestation establishes and what it does not, how to make keys,
-how to use attestations in CI, and the exact format, so that other DSSE tooling can
-check one.
+`nexus-symbiote attest` signs the exact bytes of a file for a stated purpose.
+`nexus-symbiote verify-attestation` checks that signature against public keys you
+trust. Inventories and baselines are written unsigned; signing is a separate, explicit
+step. This page covers what an attestation establishes, key management, CI usage and
+the exact format for interoperability with other DSSE tooling.
 
 - [What an attestation establishes](#what-an-attestation-establishes)
 - [Keys](#keys)
@@ -42,44 +40,41 @@ older than that limit.
 It does not establish:
 
 - **That the inventory is accurate, complete or safe.** An attestation authenticates
-  a file. The claims inside keep the assurance they were recorded with (declared,
-  observed or verified; see the [security model](security-model.md)), and what the
-  collectors cannot see stays unseen ([known limitations](known-limitations.md)).
-  An attested inventory of an unsafe agent is an inventory of an unsafe agent.
-- **That the file is the newest one.** An older file that the same keys signed for
-  the same purpose still verifies; replaying an old attested baseline is possible
-  by design. Bound it with `--max-age-days`, record `--source-revision`, and keep
+  a file, not its claims (whether claims are declared, observed or verified is in the
+  [security model](security-model.md)), and what the collectors cannot see stays unseen
+  ([known limitations](known-limitations.md)). An attested inventory of an unsafe agent
+  is an inventory of an unsafe agent.
+- **That the file is the newest one.** An older file signed for the same purpose still
+  verifies; replaying an old attested baseline is possible by design. Bound it with
+  `--max-age-days`, record `--source-revision`, and keep
   attested baselines where the change under review cannot choose among them.
 - **Who holds a key.** The tool checks signatures against the keys you name; issuing,
   protecting and retiring keys is your process.
-- **That the file stays unchanged.** `verify-attestation` and a later command, such
-  as `diff`, read the file separately. Run both in a workspace that the change under
-  review cannot write between the two steps.
+- **That the file stays unchanged.** `verify-attestation` and a later command read the
+  file separately. Run both in a workspace the change under review cannot write to.
 
 ## Keys
 
-Attestations use Ed25519 keys. Create a pair with `runtime keygen`; both files are
-created with mode 0600, and existing files are never overwritten:
+Attestations use Ed25519 keys. Create a pair with `runtime keygen` (mode 0600,
+never overwrites):
 
 ```bash
 nexus-symbiote runtime keygen --private-key reviewer.pem --public-key reviewer.pub
 ```
 
 Add `--passphrase-file FILE` to encrypt the private key with the first line of a file
-you own and that gives group and others no permission; `attest` then needs the same `--passphrase-file`.
-`attest` refuses a private key or passphrase file that the user running it does not
-own, or that its group or others can access, also when it runs as root: a container
+you own and that gives group and others no permission; `attest` then needs the same flag. `attest` refuses a private key or passphrase file that the user running it does
+not own or that its group or others can access, even when running as root: a container
 job cannot sign with a key mounted from the host and owned by another user.
-`runtime key-id reviewer.pub` prints the key ID, the lowercase hexadecimal SHA-256 of
-the key's DER SubjectPublicKeyInfo, which `attest` and `verify-attestation` print. Use
-a key pair only for attestations, as the runtime rings use one key per purpose, and
-keep private keys away from jobs that run code from a pull request: such code can sign
-whatever it likes with a key it can read.
+`runtime key-id reviewer.pub` prints the key ID (lowercase hex SHA-256 of the DER
+SubjectPublicKeyInfo). Use a key pair only for attestations — the runtime rings use one
+key per purpose — and keep private keys away from jobs that run code from a pull
+request: such code can sign whatever it likes with a key it can read.
 
-The purpose is a signed field, not a property of the key: any key you trust can sign
-either purpose. Trust different keys for each. A key that CI holds to sign what it
-`generated` must not be among the `--trusted-key` files you pass with
-`--purpose reviewed`, or a compromised build could sign its own reviewed baseline.
+The purpose is a signed field, not a property of the key: any trusted key can sign
+either purpose. Trust different keys for each. A CI key for `generated` must not be
+among the `--trusted-key` files you pass with `--purpose reviewed`, or a compromised
+build could sign its own reviewed baseline.
 
 ## Walkthrough
 
@@ -162,14 +157,12 @@ file you passed), `attested_sha256` (the file that was signed), `subject_format`
 
 ## Gate a pull request on an attested baseline
 
-The [drift gate](drift-gate.md) compares a reviewed baseline with a new collection,
-and is only as strong as the place the baseline comes from. An attestation adds a
-check that a key holder you trust reviewed exactly that file, independently of who
-can write to the branch or store that holds it.
+The [drift gate](drift-gate.md) is only as strong as the baseline's provenance. An
+attestation adds a check that a trusted key holder reviewed exactly that file,
+independently of who can write to the branch or store that holds it.
 
-A reviewer approves a baseline on a checkout of the protected base branch and signs it
-with a key that never reaches CI, then commits both files through a reviewed pull
-request:
+A reviewer signs the baseline on a checkout of the protected base branch with a key
+that never reaches CI, then commits both files through a reviewed pull request:
 
 ```bash
 mkdir -p .nexus-symbiote
@@ -180,9 +173,8 @@ nexus-symbiote attest .nexus-symbiote/reviewed.json --key ~/keys/reviewer.pem --
 ```
 
 The pull-request job takes the reviewer's public key from an operator-controlled
-setting, such as a repository or organization variable, never from the checkout. It
-reads the baseline and its attestation from the base commit, verifies them, and only
-then compares:
+setting (repository or organization variable, never from the checkout), reads the
+baseline from the base commit, verifies it, and only then compares:
 
 ```bash
 printf '%s\n' "$AGENTBOM_REVIEWER_PUBLIC_KEY" > "$RUNNER_TEMP/reviewer.pub"
@@ -194,13 +186,12 @@ nexus-symbiote scan . --no-project-policy -o "$RUNNER_TEMP/agentbom.json"
 nexus-symbiote diff "$RUNNER_TEMP/reviewed.json" "$RUNNER_TEMP/agentbom.json" --fail-on-alert
 ```
 
-`verify-attestation` exits 1 when the baseline is not the attested file, was signed
-for another purpose, by too few trusted keys or more than 90 days ago; a shell that
-stops at the first failure, such as GitHub's default `bash -e`, then never runs
-`diff`. The same steps work for a baseline kept in an artifact store. The rules for
-taking both snapshots the same way still apply
-([take both snapshots the same way](drift-gate.md#take-both-snapshots-the-same-way)),
-and so does protecting the workflow file itself.
+`verify-attestation` exits 1 on mismatch, wrong purpose, insufficient keys or age
+over 90 days; a shell that stops at the first failure, such as GitHub's default
+`bash -e`, then never runs `diff`. The same steps work for a baseline in an artifact
+store. The rules for
+[taking both snapshots the same way](drift-gate.md#take-both-snapshots-the-same-way)
+still apply, as does protecting the workflow file.
 
 For a stricter gate that fails on any change the inventory records, verify the new
 collection against the reviewed attestation by content instead of running `diff`. It
@@ -223,55 +214,51 @@ reviewed and the new collection with the same release and the same options.
 ## Trusted keys
 
 A trusted key is a trust anchor: whoever can write it decides which attestations
-verify. `verify-attestation` therefore refuses, as a usage error with exit status 2, a
-`--trusted-key` file that lies inside a git working tree (a directory with a `.git`
-entry, at any level) that also holds SUBJECT, ENVELOPE or the current directory. The
-key's path, and the device and inode of each directory above it, are compared with each
-such working tree, so another name for the working-tree directory itself, such as a
-symbolic link, a case variant or a bind mount of the tree, does not hide the key, and a
-key file with other hard links is refused too. A mount of a directory or file inside a
-working tree is not detected, because the key then has a location outside the tree:
-with `docker run -v "$PWD/keys:/keys" -v "$PWD:/work" ...`, a key committed under
-`keys/` reaches the job as `/keys/trusted.pub` and is accepted. The rule catches
-misplacement, such as a key committed to the repository under review and passed by its
-path in the checkout; it does not authenticate the key, and it cannot follow a key
-copied or mounted out of the checkout. Provision keys from a place the change under
-review cannot write, such as a CI variable, a secret store or a directory on the runner
-outside the checkout.
+verify. `verify-attestation` refuses (exit 2) a `--trusted-key` inside a git working
+tree (a directory with a `.git` entry, at any level) that also holds SUBJECT, ENVELOPE
+or the current directory. The key's path and
+device/inode of each parent directory are compared with each working tree, so another
+name for the working-tree directory itself, such as symlinks, case variants and bind
+mounts of the tree, does not hide the key. A key file with other hard links is refused
+too.
 
-On POSIX systems a trusted key must also be one that no other user can replace: a file
-owned by you or root that its group and others cannot write, in directories, up to the
-file system root, that are owned by you or root and that their group and others cannot
-write unless the directory is sticky, as `/tmp` is. Whoever can write a directory above
-the key can rename the directory below it away and put another key in its place. The
-same rule applies to `runtime` public keys, `--operator-policy`, its
-`--operator-policy-attestation` keys and `--signature-policy` files. The inventory attestation commands report `key-invalid` for this refusal. Runtime
-commands and operator-policy verification report the error through their own CLI diagnostics.
+A mount of a directory or file inside a working tree is not detected, because the key
+then has a location outside the tree: `docker run -v "$PWD/keys:/keys" -v "$PWD:/work" ...`
+accepts a committed key as `/keys/trusted.pub`. The rule catches misplacement, not
+provenance — it does not authenticate the key. Provision keys from a place the change
+under review cannot write, such as a CI variable, a secret store or a directory on the
+runner outside the checkout.
 
-Like every input, a key file is read without following symbolic links and with a size
-limit; FIFOs and devices are refused. Each distinct key counts once: two copies of the
-same key are one trusted key, and `--threshold` may not exceed the number of distinct
-keys.
+On POSIX systems a trusted key must also be safe from replacement: owned by you or
+root, group and others cannot write, and every parent directory up to the filesystem
+root has the same constraints (sticky directories like `/tmp` are accepted). Whoever
+can write a parent directory can swap the key. The same rule applies to `runtime`
+public keys, `--operator-policy`, its `--operator-policy-attestation` keys and
+`--signature-policy` files. Attestation commands report `key-invalid`; runtime
+commands report through their own diagnostics.
+
+Key files are read without following symlinks and with a size limit; FIFOs and devices
+are refused. Each distinct key counts once, and `--threshold` may not exceed the
+number of distinct keys.
 
 ## Format
 
 An attestation is a [DSSE](https://github.com/secure-systems-lab/dsse) envelope with
-the same encoding as the runtime contracts' ([envelope](runtime-contract-reference.md#envelope)):
-`payloadType` `application/vnd.in-toto+json`, a base64 `payload` of at most 1 MiB once
-decoded, and up to 32 `signatures`, each a `keyid` (a hint: the key ID above) and a
-`sig`, the base64 Ed25519 signature over the DSSE pre-authentication encoding:
+the same encoding as the [runtime contracts](runtime-contract-reference.md#envelope):
+`payloadType` `application/vnd.in-toto+json`, a base64 `payload` (at most 1 MiB
+decoded), and up to 32 `signatures`, each a `keyid` hint and `sig` (Ed25519 over the
+DSSE pre-authentication encoding):
 
 ```text
 "DSSEv1" SP "28" SP "application/vnd.in-toto+json" SP <decimal byte length of payload> SP <payload bytes>
 ```
 
-`attest` writes the envelope as indented JSON with signatures ordered by key ID.
-`verify-attestation` reads at most 2 MiB of strict UTF-8 JSON that uses exactly the
-DSSE member names `payloadType`, `payload`, `signatures`, `keyid` and `sig` (`keyid`
-may be omitted). Base64 may use the standard or the URL-safe alphabet, in canonical
-padded form only. A signature whose `keyid` names a trusted key is tried with that key
-only; any other is tried against each trusted key, and a verifier stops after 64
-signature verifications per envelope, as for the runtime contracts.
+`attest` writes indented JSON with signatures ordered by key ID.
+`verify-attestation` reads at most 2 MiB of strict UTF-8 JSON using exactly the DSSE
+member names (`keyid` may be omitted). Base64 accepts the standard or URL-safe
+alphabet in canonical padded form only. A `keyid` naming a trusted key is tried with
+that key only; others are tried against each trusted key, up to 64 verifications per
+envelope.
 
 The payload is an [in-toto Statement v1](https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md)
 with exactly these members:
@@ -283,17 +270,16 @@ with exactly these members:
 | `predicateType` | `https://github.com/Hunzee-VC/Nexus-Symbiote/attestation/inventory/v1` |
 | `predicate` | The inventory predicate below |
 
-The subject digest is the SHA-256 of the file's exact bytes, and it is the binding. The
-name is the file's base name for information only: characters that could rewrite or
-disguise terminal or CI output (controls, line breaks, format characters and every other
-default-ignorable code point, such as variation selectors and blank fillers) and
-undecodable bytes are replaced with U+FFFD, a U+FFFD after the `##` breaks a
-`##name[` CI log command, and it is cut to 255 characters. Verification does not compare
-it with the file name you pass. Unlike the runtime contracts, whose subject is a
-contract digest, the subject here is a file, as generic in-toto tooling expects. The
-predicate type names the Hunzee-VC organization, which owned the repository when the
-type was minted; the runtime contracts' predicate types name aisecnomad. Both are
-stable type identifiers, not links, and do not change when the repository moves.
+The subject digest is the SHA-256 of the file's exact bytes. The name is informational:
+control characters, format characters, default-ignorable code points and undecodable
+bytes become U+FFFD, a U+FFFD after `##` breaks CI log commands, and it is cut to 255
+characters. Verification does not compare it with the file name you pass.
+
+Unlike the runtime contracts (whose subject is a contract digest), the subject here is
+a file, as generic in-toto tooling expects. The predicate type names Hunzee-VC (the
+repository's organization when the type was minted); the runtime contracts name
+aisecnomad. Both are stable identifiers, not links, and do not change when the
+repository moves.
 
 The predicate:
 
@@ -308,29 +294,27 @@ The predicate:
 | `content_profile` | `"nexus-symbiote/inventory-content/v1"`; only for `nexus-symbiote-aibom` |
 | `source_revision` | Optional: a git commit ID of 40 or 64 lowercase hexadecimal characters, the signer's claim |
 
-No other field is accepted, a field without a value is omitted rather than `null`, and
-the predicate must be in exactly this form: another spelling of the same time, such as
-`+00:00` for `Z`, is refused, so one attestation has one predicate encoding. The signer
-writes the payload as RFC 8785 canonical JSON; a verifier accepts any strict JSON
-serialization (no duplicate keys, `NaN` or `Infinity`) whose predicate is in this form.
+No other field is accepted. Fields without a value are omitted, not `null`. The
+predicate must be in exactly this form (`+00:00` for `Z` is refused), so one
+attestation has one predicate encoding. The signer writes RFC 8785 canonical JSON; a
+verifier accepts any strict JSON whose predicate matches this form.
 
 ### Content digest
 
 The content digest is the SHA-256 of the RFC 8785 canonical JSON of the parsed
-inventory without the fields that record the collection event:
-`metadata.serial_number`, `metadata.timestamp`, `metadata.completeness.timestamp`,
-`metadata.completeness.source_report_path` and the `observed_at` of each component
-claim, each left out only when it has the form the native format writes. Two collections of the same content therefore have the same
-content digest. `attest` decides `subject_format` from the bytes it signs: a strict
-JSON object of at most 16 MiB, with arrays and objects nested at most 256 levels deep,
-that has a `components` list and validates as a native inventory is
-`nexus-symbiote-aibom` (a missing `metadata` is read as an empty object, as every
-command reads it); anything else, including a native format version this build
-cannot read, is `other`. The depth bound is part of the rule so that the same bytes get
-the same answer on every interpreter and through every entry point; a more deeply
-nested inventory that other commands still read is `other` here. For a native subject,
-verification recomputes the format version and the content digest from the file and
-requires both to equal the recorded ones.
+inventory without collection-event fields: `metadata.serial_number`,
+`metadata.timestamp`, `metadata.completeness.timestamp`,
+`metadata.completeness.source_report_path` and each component claim's `observed_at`,
+each omitted only when it has the form the native format writes. Two collections of
+the same content therefore have the same content digest.
+
+`attest` decides `subject_format` from the bytes it signs: a strict JSON object of at
+most 16 MiB, with arrays and objects nested at most 256 levels deep, that has a
+`components` list and validates as a native inventory (a missing `metadata` is read as
+an empty object) is `nexus-symbiote-aibom`; anything else is `other`. The depth bound
+ensures the same bytes get the same answer on every interpreter. For a native subject,
+verification recomputes the format version and content digest and requires both to
+match.
 
 ### Checking an attestation without this tool
 
@@ -405,11 +389,10 @@ this order, and stop at the first failure:
 
 ## Reason codes
 
-A refused attestation or input ends with `attestation verification failed:` (or
-`attestation signing failed:`), a fixed message and one of these codes in parentheses,
-with exit status 1; usage errors and an `--out` that cannot be written are reported as
-for every command, as described below the table. `AttestationError.reason` carries the
-same codes. The message never quotes the file, the envelope or a key.
+A refused attestation ends with `attestation verification failed:` (or
+`attestation signing failed:`), a fixed message and a code in parentheses (exit 1).
+`AttestationError.reason` carries the same codes. Messages never quote files, envelopes
+or keys.
 
 | Code | Meaning |
 | --- | --- |
@@ -431,41 +414,30 @@ same codes. The message never quotes the file, the envelope or a key.
 | `attestation-expired` | `signed_at` is more than `--max-age-days` days before the current time |
 | `content-digest-unavailable` | `--match content` was requested, but the attestation records no content digest |
 
-Usage errors exit with status 2: a missing or unknown option, a SUBJECT, ENVELOPE or key
-file that does not exist, a `--threshold` above the number of distinct trusted keys, a
-malformed `--source-revision`, the same signing key given twice, an `attest --out`
-that names the subject, and a trusted key kept where the [trusted keys](#trusted-keys)
-rule forbids. An `--out` that already exists is refused with exit status 1, and
-nothing is written.
+Usage errors exit 2: missing or unknown options, nonexistent files, `--threshold`
+above distinct key count, malformed `--source-revision`, duplicate signing keys,
+`--out` naming the subject, and a trusted key in a [forbidden location](#trusted-keys).
+An existing `--out` is refused (exit 1); nothing is written.
 
 ## Limits
 
-- **Ed25519 keys only.** The commands load PEM key files. A KMS or HSM signer can be
-  used through the library's `sign_statement`, which accepts any object with the
-  runtime contracts' `ContractSigner` methods.
-- **No transparency log, no keyless signing.** Attestations are not recorded in a
-  public log, and Sigstore or other OIDC-based signing is not supported.
+- **Ed25519 keys only.** PEM key files. KMS/HSM signers use `sign_statement` with the
+  `ContractSigner` interface.
+- **No transparency log, no keyless signing.** Sigstore and OIDC-based signing are not
+  supported.
 - **No revocation list.** Retire a key by removing it from the trusted set; every
   attestation it made then stops verifying wherever that set is used.
-- **No freshness.** Nothing binds an attestation to the newest inventory or to a
-  serial, so an older attested file for the same purpose still verifies. Use
-  `--max-age-days`, `source_revision` and your review process.
-- **Separate reads.** Verification and a later command read the file separately; see
-  [what an attestation establishes](#what-an-attestation-establishes).
-- **The signing time is the signer's.** `signed_at` comes from the signer's clock; a
-  signer can date an attestation in the past.
-- **The verifying build must read the inventory's format.** An attestation of a native
-  inventory records its format version and content digest, and verification
-  recomputes both, even with `--match bytes`. A build that cannot read that format
-  version refuses the attestation with `subject-not-inventory`; verify it with a build
-  that reads the format.
-- **Deeply nested inventories are `other`.** An inventory whose arrays and objects nest
-  more than 256 levels deep is attested by its bytes only, without a content digest,
-  so `--match content` cannot be used for it; see [content digest](#content-digest).
-- **The trusted-key rule checks placement only.** It does not authenticate a key, and
-  it cannot follow a key copied or mounted out of the checkout; see
-  [trusted keys](#trusted-keys).
+- **No freshness.** An older attested file still verifies. Use `--max-age-days`,
+  `source_revision` and your review process.
+- **Separate reads.** Verification and later commands read the file separately.
+- **Signer's clock.** `signed_at` comes from the signer; backdating is possible.
+- **Format compatibility.** Verification recomputes format version and content digest,
+  even with `--match bytes`. A build that cannot read the format refuses with
+  `subject-not-inventory`.
+- **Deeply nested inventories are `other`.** Over 256 levels of nesting means no
+  content digest and no `--match content`.
+- **Trusted-key rule checks placement only.** It does not authenticate keys or follow
+  keys mounted out of the checkout.
 - **The GitHub Action does not sign or verify attestations yet.** Run the commands in
   a workflow step.
-- **POSIX only.** The owner and mode checks on private keys and the reads that follow
-  no symbolic link need POSIX file APIs.
+- **POSIX only.** Owner/mode checks and no-symlink reads need POSIX file APIs.

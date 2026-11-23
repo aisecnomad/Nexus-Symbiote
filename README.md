@@ -36,13 +36,13 @@ nexus-symbiote risk agentbom.json --no-project-policy --threshold 50   # gate on
 nexus-symbiote diff reviewed.json agentbom.json --fail-on-alert        # gate on drift
 ```
 
-> **Alpha.** Interfaces, formats and policy semantics may change. Install the published release only after verifying its build attestation, or install a reviewed commit from source; see [Install a verified release](#install-a-verified-release) and [Install from reviewed source](#install-from-reviewed-source). This release has [known detection gaps](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/known-limitations.md): what the collectors do not record, no gate or `diff` can alert on.
+> **Alpha.** Interfaces, formats and policy semantics may change. Verify the [build attestation before installing a release](#install-a-verified-release), or install a [reviewed commit from source](#install-from-reviewed-source). This release has [known detection gaps](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/known-limitations.md): what the collectors do not record, no gate can alert on.
 
 ## Quick start
 
 ### Install from reviewed source
 
-Requires git and Python 3.11 to 3.14 on Linux. Install exactly the commit you reviewed, with the hash-locked runtime:
+**Requires:** git, Python 3.11–3.14, Linux. Installs the exact commit you reviewed with a hash-locked runtime:
 
 ```bash
 (
@@ -60,11 +60,17 @@ Requires git and Python 3.11 to 3.14 on Linux. Install exactly the commit you re
 )
 ```
 
-Replace `REVIEWED_COMMIT_SHA` with the full lowercase commit SHA you reviewed, then paste the entire block. A failed checkout or mismatched HEAD stops before installation. After it succeeds, run `cd Nexus-Symbiote && . .venv/bin/activate` in your shell to use the commands below. Optional extras: `.[sigstore]` for Sigstore verification, `.[cyclonedx]` for CycloneDX cross-checks, `.[all]` for both. For development: `make install-locked` (see [CONTRIBUTING.md](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/CONTRIBUTING.md)).
+Replace `REVIEWED_COMMIT_SHA` with the full lowercase commit SHA you reviewed, then paste the block. A failed checkout or mismatched HEAD stops before installation. After it succeeds:
+
+```bash
+cd Nexus-Symbiote && . .venv/bin/activate
+```
+
+Optional extras: `.[sigstore]` for Sigstore verification, `.[cyclonedx]` for CycloneDX cross-checks, `.[all]` for both. For development: `make install-locked` ([CONTRIBUTING.md](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/CONTRIBUTING.md)).
 
 ### Install a verified release
 
-Requires Python 3.11 to 3.14, git, curl and the [GitHub CLI](https://cli.github.com/) signed in with `gh auth login`. The block downloads the `v0.1.0` wheel, verifies its attestation against the tagged commit, and installs the hash-locked runtime. (`0.2.0` is in preparation on `main`; use [Install from reviewed source](#install-from-reviewed-source) to run it before publication.)
+**Requires:** Python 3.11–3.14, git, curl, [GitHub CLI](https://cli.github.com/) (`gh auth login`). Downloads the `v0.1.0` wheel, verifies its attestation against the tagged commit, and installs the hash-locked runtime. (`0.2.0` is in preparation on `main`; use [Install from reviewed source](#install-from-reviewed-source) to run it before publication.)
 
 ```bash
 (
@@ -84,11 +90,11 @@ Requires Python 3.11 to 3.14, git, curl and the [GitHub CLI](https://cli.github.
 )
 ```
 
-Paste the block as one unit, unchanged. The wheel is downloaded, but the package is not installed unless the attestation passes. `--repo` and `--signer-workflow` name the Hunzee-VC organization because `v0.1.0` was published while it owned the repository, and the attestation certificate records that repository and workflow; the clone, tag lookup and lock download use the current owner. [Releasing](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/releasing.md) describes what the attestation does and does not establish.
+Paste the block unchanged. The package is not installed unless the attestation passes. `--repo` and `--signer-workflow` name the Hunzee-VC organization because `v0.1.0` was published while it owned the repository and the attestation certificate records that workflow; the clone, tag lookup and lock download use the current owner. [Releasing](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/releasing.md) describes what the attestation does and does not establish.
 
 ### Try it in 60 seconds
 
-This walkthrough needs the [source install](#install-from-reviewed-source): the `v0.1.0` wheel has no checkout and does not read the signer policy format used below. From the checkout, inventory the bundled [demo agent](https://github.com/aisecnomad/Nexus-Symbiote/tree/main/examples/demo-agent). Nothing is executed and no network is used:
+Needs the [source install](#install-from-reviewed-source) (the `v0.1.0` wheel has no checkout and does not read the signer policy format used below). From the checkout, inventory the bundled [demo agent](https://github.com/aisecnomad/Nexus-Symbiote/tree/main/examples/demo-agent) — nothing is executed, no network is used:
 
 ```bash
 nexus-symbiote scan examples/demo-agent -o demo.aibom.json
@@ -97,9 +103,9 @@ nexus-symbiote risk demo.aibom.json --no-project-policy
 nexus-symbiote validate demo.aibom.json --project examples/demo-agent --no-project-policy
 ```
 
-The scan records 11 components across 9 types and eleven findings (risk score 41, below the default fail threshold of 50). `validate` exits 1 on purpose: completeness passes, but the model's integrity stays unknown because no signer policy was supplied. An inventory can be complete and still not be approvable.
+The scan records 11 components across 9 types and eleven findings (risk score 41, below the default fail threshold of 50). `validate` exits 1 on purpose: completeness passes but the model's integrity stays unknown — no signer policy was supplied. An inventory can be complete and still not be approvable.
 
-To approve the model, pin its digest in a [signer policy](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/model-integrity.md#operator-signature-policy) you own, kept outside the scanned project. Here the digest comes from the checkout only to show the mechanism; in real use, take it from a source you trust:
+To approve the model, pin its digest in a [signer policy](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/model-integrity.md#operator-signature-policy) kept outside the scanned project. Here the digest comes from the checkout to show the mechanism; in real use, take it from a source you trust:
 
 ```bash
 policy_dir="$(mktemp -d)"   # outside the checkout: a policy inside the repository is refused
@@ -120,13 +126,13 @@ nexus-symbiote validate agentbom.json --project /path/to/agent --no-project-poli
 nexus-symbiote risk agentbom.json --project /path/to/agent --no-project-policy --accept-default-exclude root:.git --threshold 50
 ```
 
-The CLI applies checkout settings that tighten the governing gates, even when the same file also requests a relaxation. Use `--accept-project-policy` to accept reviewed relaxations within the operator policy. Pass `--no-project-policy` to ignore the checkout policy entirely. With `--project`, `validate` and `risk` collect fresh evidence and fail when the BOM disagrees with it. The [public-agent tutorial](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/tutorials/scanning-a-public-agent.md) walks through a real repository end to end.
+Checkout tightenings apply automatically. Pass `--accept-project-policy` to accept reviewed relaxations within the operator policy, or `--no-project-policy` to ignore checkout policy. With `--project`, `validate` and `risk` collect fresh evidence and fail when it disagrees with the BOM. Full walkthrough: [scanning a public agent](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/tutorials/scanning-a-public-agent.md).
 
 ## Why
 
 **AI agents are assembled from parts you did not write, and most of those parts never appear in a software bill of materials.**
 
-An agent's behavior depends on its configuration as much as its code — MCP servers, model weights, instruction files, retrieval sources, agent endpoints, IDE permissions — and each can change without a code review. Package SBOMs don't cover these. The [OWASP Top 10 for Agentic Applications](https://genai.owasp.org/) lists agentic supply-chain vulnerabilities (ASI04) among the top risks.
+An agent's behavior depends on its configuration as much as its code, and each piece can change without a code review. Package SBOMs don't cover MCP servers, model weights, instruction files, retrieval sources, agent endpoints or IDE permissions. The [OWASP Top 10 for Agentic Applications](https://genai.owasp.org/) lists agentic supply-chain vulnerabilities (ASI04) among the top risks.
 
 | Risk | What Nexus SymBiote does |
 | --- | --- |
@@ -160,11 +166,11 @@ Every row has limits: [known limitations](https://github.com/aisecnomad/Nexus-Sy
                                                SARIF · VEX
 ```
 
-1. **Collect.** Each collector reads its surfaces through confined, size-bounded file reads and returns components, findings and coverage status.
+1. **Collect.** Each collector reads its surfaces through confined, size-bounded file reads and returns components, findings and coverage.
 2. **Assemble.** Results merge into one AgentBOM. Every claim keeps its assurance level: declared, observed or verified.
-3. **Gate.** `validate` checks completeness and recorded local digests, bindings and operator-supplied signature policies for models and discovery reports; it does not authenticate MCP servers, so gate MCP server changes with `diff --fail-on-alert` against a reviewed baseline (see [gates and drift](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/known-limitations.md#gates-and-drift)); `risk` scores findings against your policy. Gaps fail closed.
+3. **Gate.** `validate` checks completeness, local digests, bindings and operator signer policies. It does not authenticate MCP servers — gate those with `diff --fail-on-alert` against a reviewed baseline ([gates and drift](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/known-limitations.md#gates-and-drift)). `risk` scores findings against your policy. Gaps fail closed.
 4. **Compare.** `diff` compares two snapshots semantically and rates each change.
-5. **Export.** Standard formats are generated from the same collection, so every export describes the same evidence.
+5. **Export.** Standard formats come from the same collection, so every export describes the same evidence.
 
 ### Collectors
 
@@ -179,7 +185,7 @@ Every row has limits: [known limitations](https://github.com/aisecnomad/Nexus-Sy
 | IDE agent settings | `ide_agents` | Permission modes, blanket grants, hooks, settings digests |
 | [ShadowScan](https://github.com/Hunzee-VC/Nexus-ShadowScan) reports | `shadowscan` | Imported discovery claims, kept separate from local evidence |
 
-Nothing a collector reads is executed, imported or loaded. The `mcp`, `rag` and `a2a` collectors also search source code for SDK and library references. Select a subset with `--scanner`; collectors you leave out are recorded as unknown, not clean. Every path each collector reads, and the coding-agent settings that raise findings, are in the [collector reference](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/collectors.md).
+Nothing a collector reads is executed, imported or loaded. The `mcp`, `rag` and `a2a` collectors also search source code for SDK references. Select a subset with `--scanner`; omitted collectors are recorded as unknown, not clean. Full reference: [collectors](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/collectors.md).
 
 ### Commands
 
@@ -215,9 +221,7 @@ Exit code `0` means every requested gate passed, `1` a gate or check failed or a
 | Framework crosswalk | `crosswalk` | Findings grouped by compliance framework |
 | Attestation envelope | `attest` | DSSE/in-toto signature over a reviewed inventory |
 
-Standard exports embed the native inventory in a digest-bound extension; keep it to recover full semantics. Detail: [standard exports](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/standard-exports.md).
-
-A scan is an inventory, not a verdict. Read [what results do and do not establish](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/security-model.md#what-results-do-and-do-not-establish) before using results in an approval process.
+Standard exports embed the native inventory in a digest-bound extension; keep it to recover full semantics ([standard exports](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/standard-exports.md)). A scan is an inventory, not a verdict — read [what results do and do not establish](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/security-model.md#what-results-do-and-do-not-establish) before using results in an approval process.
 
 ## CI integration
 
@@ -248,7 +252,7 @@ jobs:
           fail-on-severity: 'high'
 ```
 
-The Action installs its own hash-locked runtime off the job's `PATH`, ignores policy in the scanned checkout, and reports each gate in its `result` and `gates` outputs. `fail-on-severity` defaults to `high`, so a high finding fails the run even when the aggregate score, an unbounded sum of finding weights, stays under `risk-threshold`. Set `fail-on-severity: critical` to fail on severity only for critical findings. What each gate checks, how to supply a signer policy, and SARIF upload: [GitHub Action guide](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/github-action.md). Inputs and outputs: [action.yml](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/action.yml).
+The Action installs its own hash-locked runtime off the job's `PATH`, ignores checkout policy, and reports each gate in its `result` and `gates` outputs. `fail-on-severity` defaults to `high` — a high finding fails even when the aggregate score stays under `risk-threshold`. Set `fail-on-severity: critical` to fail on severity only for critical findings. Full guide: [GitHub Action](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/github-action.md). Inputs and outputs: [action.yml](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/action.yml).
 
 ### Gate drift in CI
 
@@ -270,49 +274,37 @@ nexus-symbiote scan . --no-project-policy --accept-default-exclude root:.git -o 
 nexus-symbiote diff "$RUNNER_TEMP/reviewed.json" "$RUNNER_TEMP/agentbom.json" --fail-on-alert
 ```
 
-`--fail-on-alert` fails on any recorded change rated medium or higher, including a removed component and a coverage regression. Without the binding key, an MCP server whose launch arguments, environment values or endpoint path were not bound is itself a medium alert, so a widened filesystem root cannot pass silently; the alert does not name the new value. Set `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` on both snapshots to compare those values. See [source binding](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/verification-source-binding.md). Run the comparison in a job the pull request cannot edit ([protect the gate](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md#protect-the-gate)), and sign the reviewed baseline to know who approved it ([inventory attestation](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/inventory-attestation.md#gate-a-pull-request-on-an-attested-baseline)). Full guide: [Gate drift in CI](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md).
+`--fail-on-alert` fails on any recorded change rated medium or higher, including a removed component and a coverage regression. Without the binding key, an MCP server whose launch arguments, environment values or endpoint path were not bound is itself a medium alert, so a widened filesystem root cannot pass silently; the alert does not name the new value. Set `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` on both snapshots to compare those values ([source binding](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/verification-source-binding.md)). Run the comparison in a job the pull request cannot edit ([protect the gate](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md#protect-the-gate)), and sign the reviewed baseline to know who approved it ([inventory attestation](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/inventory-attestation.md#gate-a-pull-request-on-an-attested-baseline)). Full guide: [Gate drift in CI](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md).
 
 ### Policy and live mode
 
-Every command is offline by default. Only `discover-mcp`, `advisories` and `verify-live` reach the network, and only in live mode (`--live` or `NEXUS_SYMBIOTE_MODE=live`); see [offline and live modes](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/offline-and-live-modes.md). Generate a project policy (`.nexus-symbiote.yaml`) with `nexus-symbiote init`. Stricter project gates apply automatically in the CLI. Review a relaxation before passing `--accept-project-policy`. See [policy reference](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/policy-reference.md). The [pre-commit hooks](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/cli-reference.md#pre-commit-hooks) are a convenience for your own tree, not a control.
+Every command is offline by default. Only `discover-mcp`, `advisories` and `verify-live` reach the network, and only in live mode (`--live` or `NEXUS_SYMBIOTE_MODE=live`). Generate a project policy (`.nexus-symbiote.yaml`) with `nexus-symbiote init`. Stricter project gates apply automatically; review relaxations before passing `--accept-project-policy`. See [policy reference](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/policy-reference.md) and [offline and live modes](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/offline-and-live-modes.md). The [pre-commit hooks](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/cli-reference.md#pre-commit-hooks) are a convenience for your own tree, not a control.
 
 ## Documentation
 
-The [documentation hub](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/README.md) organizes every guide by why, what and how.
+The [documentation hub](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/README.md) organizes every guide by why, what and how. Start here:
 
-| If you want to... | Read |
+| | |
 | --- | --- |
-| Understand the trust model and design principles | [Security model](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/security-model.md) |
-| See the architecture and threat model | [Architecture](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/architecture.md) · [Threat model](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/threat-model.md) |
-| Know what is not recorded, compared or verified | [Known limitations](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/known-limitations.md) |
-| Run the full offline demo | [Examples walkthrough](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/examples/README.md) |
-| Scan a real project end to end | [Scanning a public agent](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/tutorials/scanning-a-public-agent.md) |
-| Look up any command, option or exit code | [CLI reference](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/cli-reference.md) |
-| See every path a collector reads | [Collector reference](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/collectors.md) |
-| Configure the GitHub Action's gates and signer policy | [GitHub Action](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/github-action.md) |
-| Write a project policy or suppress a finding | [Policy reference](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/policy-reference.md) |
-| Raise a collection limit | [Collection limits](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/collection-limits.md) |
-| Keep a drift baseline out of a pull request's reach | [Gate drift in CI](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md) |
-| Sign a reviewed baseline and verify it before `diff` | [Inventory attestation](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/inventory-attestation.md) |
-| Compare what an agent's traces report with its inventory | [Trace evidence](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/trace-evidence.md) |
-| Map findings to compliance frameworks | [Framework crosswalk](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/framework-crosswalk.md) |
-| Import ShadowScan discovery | [ShadowScan integration](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/shadowscan-integration.md) |
-| Mediate tool calls with signed contracts | [Runtime assurance](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/runtime-assurance.md) |
-| Release or verify a release | [Releasing](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/releasing.md) · [Repository controls](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/repository-controls.md) |
+| **Understand** | [Security model](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/security-model.md) · [Architecture](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/architecture.md) · [Threat model](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/threat-model.md) · [Known limitations](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/known-limitations.md) |
+| **Learn** | [Examples walkthrough](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/examples/README.md) · [Scanning a public agent](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/tutorials/scanning-a-public-agent.md) |
+| **Reference** | [CLI reference](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/cli-reference.md) · [Collectors](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/collectors.md) · [Finding catalog](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/finding-catalog.md) · [Policy](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/policy-reference.md) · [Collection limits](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/collection-limits.md) · [Framework crosswalk](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/framework-crosswalk.md) |
+| **Integrate** | [GitHub Action](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/github-action.md) · [Drift gate](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/drift-gate.md) · [Attestation](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/inventory-attestation.md) · [Trace evidence](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/trace-evidence.md) · [ShadowScan](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/shadowscan-integration.md) |
+| **Operate** | [Runtime assurance](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/runtime-assurance.md) · [Releasing](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/releasing.md) · [Repository controls](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/repository-controls.md) |
 
 ## Project status
 
-**Alpha** with a single maintainer: APIs, formats and policy semantics may change. CI runs on every push and PR, testing Python 3.11 to 3.14 with the hash-locked dependency set and the declared floors. Releases go through the environment-gated [release workflow](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/releasing.md). Planned work: [roadmap](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/ROADMAP.md). Changes: [changelog](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/CHANGELOG.md).
+**Alpha** with a single maintainer — APIs, formats and policy semantics may change. CI tests Python 3.11–3.14 with hash-locked dependencies on every push. Releases go through the environment-gated [release workflow](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/releasing.md). [Roadmap](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/ROADMAP.md) · [Changelog](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/CHANGELOG.md).
 
-[Nexus-ShadowScan](https://github.com/Hunzee-VC/Nexus-ShadowScan) is the companion discovery engine — it finds agents across many surfaces, and Nexus SymBiote turns its reports into AgentBOMs with local artifact and supply-chain verification.
+[Nexus-ShadowScan](https://github.com/Hunzee-VC/Nexus-ShadowScan) is the companion discovery engine — it finds agents across many surfaces, and Nexus SymBiote turns its reports into AgentBOMs with local supply-chain verification.
 
 ## Security
 
-Report vulnerabilities privately as described in [SECURITY.md](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/SECURITY.md), never in a public issue.
+Report vulnerabilities privately: [SECURITY.md](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/SECURITY.md). Never in a public issue.
 
 ## Contributing
 
-Contributions are welcome — especially tested collector coverage, regression fixtures and documentation. See [CONTRIBUTING.md](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/CONTRIBUTING.md) for setup and review contract, [GOVERNANCE.md](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/GOVERNANCE.md) for decisions, and the [code of conduct](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/CODE_OF_CONDUCT.md).
+Contributions welcome — especially collector coverage, regression fixtures and documentation. [CONTRIBUTING.md](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/CONTRIBUTING.md) · [GOVERNANCE.md](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/GOVERNANCE.md) · [Code of conduct](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/CODE_OF_CONDUCT.md).
 
 ## Citation
 

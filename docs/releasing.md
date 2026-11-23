@@ -282,13 +282,14 @@ publication approval.
 
 **Build integrity.** The build job exports the checked-out commit with `git archive`
 and builds there with `SOURCE_DATE_EPOCH` set to the commit time. Nothing that a
-later step writes into the workspace, such as test output or release evidence, can
-reach the source distribution. Two local builds of the same commit produced
-identical files; reproducibility across runners is not attested. The job then
-checks that there is exactly one wheel and one sdist, runs `twine check --strict`,
-and uploads them **before** anything runs tests, writes evidence or installs
-anything but the hash-locked build environment and the checkout, which it installs
-first. Later jobs receive those bytes by their immutable artifact ID, so a step
+later step writes into the workspace can reach the source distribution. Two local
+builds of the same commit produced identical files; reproducibility across runners
+is not attested.
+
+The job checks that there is exactly one wheel and one sdist, runs
+`twine check --strict`, and uploads them **before** anything runs tests, writes
+evidence or installs anything but the hash-locked build environment and the
+checkout. Later jobs receive those bytes by their immutable artifact ID, so a step
 that misbehaves later in the build job cannot change the distributions that are
 attested or published. Before deriving benchmark and checksum evidence from `dist/`,
 the build re-checks the files against the digests recorded at staging and fails on
@@ -329,12 +330,14 @@ replace the candidate.
 
 **Evidence.** The release build installs the wheel into a fresh environment with
 hash-checked binaries from `requirements-action.lock`, then collects the SBOM and
-benchmark evidence. `project.cdx.json` is a static inventory of the checked-out
-project, not a guarantee of complete runtime or build dependency coverage. The build
-job sets `SOURCE_DATE_EPOCH` to the commit time, so `project.cdx.json` records that
-time, not the time of the scan, as its collection time; without it the inventory would
-record none. Its serial number is derived from its content either way (see
-[reproducible inventories](reproducible-inventories.md)).
+benchmark evidence.
+
+`project.cdx.json` is a static inventory of the checked-out project, not a guarantee
+of complete runtime or build dependency coverage. The build job sets `SOURCE_DATE_EPOCH`
+to the commit time, so `project.cdx.json` records that time, not the time of the scan;
+without the variable the inventory would record none. Its serial number is derived from
+its content either way (see [reproducible inventories](reproducible-inventories.md)).
+
 `installed-distributions.json` records that locked environment and
 `environment.cdx.json` is the same record as a CycloneDX 1.7 SBOM of the installed
 distributions, validated against the vendored schema. Writing it fails unless every
@@ -344,35 +347,40 @@ that lock's SHA-256. Its dependency edges come from each distribution's declared
 requirements, kept only where the requirement's marker holds for the inspected
 interpreter and an active extra; it describes what pip reports, not file
 authenticity, and carries no file hashes because pip does not record which of a
-lock entry's files it installed. `source-revision.json`
-requires the actual clean checkout to match the workflow's exact `GITHUB_SHA` and
-records the repository, ref and run identity. `SHA256SUMS` covers that source
-record, the release distributions and evidence files. The workflow bundles all
-candidate evidence, including the checksums, in `release-evidence.tar.gz` and
-attests that archive as well as the distributions and the inventory benchmark.
+lock entry's files it installed.
+
+`source-revision.json` requires the actual clean checkout to match the workflow's
+exact `GITHUB_SHA` and records the repository, ref and run identity. `SHA256SUMS`
+covers that source record, the release distributions and evidence files. The workflow
+bundles all candidate evidence, including the checksums, in
+`release-evidence.tar.gz` and attests that archive as well as the distributions and
+the inventory benchmark.
 
 Every candidate runs the committed per-case security-regression gate and keeps its
 complete `security-regressions.json` report, including failures, and rechecks every
 pin of `requirements-ci.lock` and `requirements-action.lock` against current OSV
 data, retaining that report even on failure. Passing those finite fixture contracts
-is a release prerequisite, not an estimate of production efficacy. The normal CI
-`Verified CI` check also requires the package and per-module coverage floors in
-`scripts/check_coverage.py`, the full suite at the declared dependency floors,
-complete dependency advisory lookups with no unwaived advisory, a successful CodeQL
-analysis with no high/critical security results, and every verification job to
+is a release prerequisite, not an estimate of production efficacy.
+
+The normal CI `Verified CI` check also requires the package and per-module coverage
+floors in `scripts/check_coverage.py`, the full suite at the declared dependency
+floors, complete dependency advisory lookups with no unwaived advisory, a successful
+CodeQL analysis with no high/critical security results, and every verification job to
 succeed. Publication checks those security job results for the exact source. See the
 precise acceptance policy and its knowledge limits in
 [repository controls](repository-controls.md).
 
 **Privilege separation.** The build job reads repository content and Actions run
 metadata only. A separate attest job holds OIDC and attestation-write permissions,
-and only the environment-gated publish job can upload, through the trusted
-publisher configured for its environment. Neither of those jobs checks out or runs
-project source or any shell step. On a `pypi` run, the image job, gated by the same
-environment, holds a token that can write packages but no OIDC; the image-attest job holds
-OIDC and attestation-write permissions for the digest that job pushed, and runs no
-shell either. Every job that receives artifacts downloads them
-by ID with `digest-mismatch: error`, so a corrupted transfer stops the run.
+and only the environment-gated publish job can upload, through the trusted publisher
+configured for its environment. Neither of those jobs checks out or runs project
+source or any shell step.
+
+On a `pypi` run, the image job, gated by the same environment, holds a token that
+can write packages but no OIDC; the image-attest job holds OIDC and
+attestation-write permissions for the digest that job pushed, and runs no shell
+either. Every job that receives artifacts downloads them by ID with
+`digest-mismatch: error`, so a corrupted transfer stops the run.
 
 **Attestation verification.** After attestation, a separate verification job with
 only read access to repository contents and attestations downloads the candidate

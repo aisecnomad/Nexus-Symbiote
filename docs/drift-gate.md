@@ -5,26 +5,11 @@ new collection and exits 1 when anything it rates medium or higher changed. This
 page says where the reviewed snapshot must come from, how to take both snapshots so
 they compare, and what each alert means.
 
-The gate compares what the inventory records. Content the collectors do not record,
-such as instruction files under names the `prompt` collector does not read, or what a
-local program or project script started as an MCP server runs, cannot alert. Without
-`NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`, neither can a changed MCP launch
-argument other than the launcher package, a changed environment or header value, an
-endpoint or package index path changed on the same host, a changed value of a project
-resolver setting such as an `.npmrc` entry, an A2A or RAG URL path changed on the same
-host that keeps its depth, changed inline RAG document content at the same count,
-the content of a prompt file whose content hash is withheld, such as an `@path` import
-that is not a Markdown file, or a value the settings digest of an IDE agent does not
-keep, such as an `env` value in `.claude/settings.json`, a token, a URL path in a hook
-or `notify` command, or the arguments of a command, an HTTP header value or the words
-of a permission rule, which it keeps by shape only; see
-[source binding](verification-source-binding.md). None of those changes alters the
-record, so a record that holds such values without the key carries a low `completeness`
-finding saying its values are not bound in this inventory, or, as a prompt template,
-shares one such finding with the other templates, and `diff` raises a medium alert for
-each such record on every comparison, changed or not. A keyless `diff --fail-on-alert`
-therefore fails on such a record; the alert says the values are unbound and records no
-value. The [known limitations](known-limitations.md) list those surfaces.
+The gate compares what the inventory records. Content the collectors do not record — instruction files under names the `prompt` collector does not read, or what a local program or project script started as an MCP server runs — cannot alert.
+
+**Without `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`**, the following changes also cannot alert: a changed MCP launch argument other than the launcher package, a changed environment or header value, an endpoint or package index path changed on the same host, a changed value of a project resolver setting such as an `.npmrc` entry, an A2A or RAG URL path changed on the same host that keeps its depth, changed inline RAG document content at the same count, the content of a prompt file whose content hash is withheld (such as an `@path` import that is not a Markdown file), or a value the settings digest of an IDE agent does not keep (such as an `env` value in `.claude/settings.json`, a token, a URL path in a hook or `notify` command, or the arguments of a command, an HTTP header value or the words of a permission rule, which it keeps by shape only). See [source binding](verification-source-binding.md).
+
+None of those changes alters the record. A record that holds such values without the key carries a low `completeness` finding saying its values are not bound, or (as a prompt template) shares one such finding with the other templates. `diff` raises a medium alert for each such record on every comparison, changed or not. A keyless `diff --fail-on-alert` therefore fails on such a record; the alert says the values are unbound and records no value. The [known limitations](known-limitations.md) list those surfaces.
 
 ## The trust anchor is the baseline
 
@@ -91,15 +76,16 @@ request with itself, and that gate can never fail.
 - **Use the same binding key for both.** Set one `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`
   of 32 or more characters for the baseline and every candidate scan. Without it, the
   values described above cannot alert on a change: every record that carries the low
-  `completeness` finding for unbound values, whether an MCP server, an IDE agent, a RAG
-  source, an A2A agent or client, or the repository agent when redaction changed an
-  `agent.yaml` field, and every prompt file whose content hash is withheld, with or
-  without that finding, raises a medium alert on every comparison instead, so `diff --fail-on-alert` fails on
-  it rather than reporting no change; the alert does not name the value. The same
-  alert is raised when only one of the two scans has the key, and the digests of the
-  IDE settings files digested as read then differ. With a different key, every MCP,
-  A2A, RAG, IDE settings and prompt file binding changes and alerts. The Action
-  refuses `reviewed-baseline` unless that key is set on the step or passed as
+  `completeness` finding for unbound values (MCP server, IDE agent, RAG source, A2A
+  agent or client, or repository agent when redaction changed an `agent.yaml` field),
+  and every prompt file whose content hash is withheld, raises a medium alert on every
+  comparison instead — so `diff --fail-on-alert` fails rather than reporting no change.
+  The alert does not name the value.
+
+  The same alert fires when only one of the two scans has the key and the digests of
+  the IDE settings files then differ. With a *different* key, every MCP, A2A, RAG, IDE
+  settings and prompt file binding changes and alerts. The Action refuses
+  `reviewed-baseline` unless that key is set on the step or passed as
   `source-binding-key`. Fork `pull_request` jobs receive no secrets, so they cannot
   satisfy that input; run the keyed drift gate on same-repository pull requests and
   trusted branches, as the example under [Protect the gate](#protect-the-gate) does.
@@ -224,4 +210,8 @@ jobs:
           reviewed-baseline: ${{ runner.temp }}/reviewed.json
 ```
 
-Avoid checking out `github.event.pull_request.head.sha` inside a `pull_request_target` workflow ("pwn request" hazard): `pull_request_target` runs in the base repository's security context, where adding any build, test, cache or secret step later turns an untrusted fork checkout into secret exfiltration or repository compromise. On `pull_request`, same-repository pull requests can supply `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` from repository secrets. Fork pull requests receive no secrets: the Action refuses `reviewed-baseline` without the key, and an unkeyed `diff --fail-on-alert` fails closed on unbound values, such as MCP launch values, IDE settings values or the content of a prompt file whose content hash is withheld, such as an `@path` import that is not Markdown, instead of comparing them, so run keyed comparisons only for same-repository pull requests and trusted branches. A job that `if:` skips counts as passed for a required check, so in a repository that accepts fork pull requests, also run the keyed gate on a trusted event before merging, such as `merge_group` with a merge queue. A second, keyless job for forks, comparing with a baseline recorded without the key, passes only while no record carries unbound values.
+**Avoid `pull_request_target` with an untrusted checkout** ("pwn request" hazard): `pull_request_target` runs in the base repository's security context, where adding any build, test, cache or secret step later turns an untrusted fork checkout into secret exfiltration or repository compromise.
+
+**Same-repository vs. fork pull requests.** On `pull_request`, same-repository pull requests can supply `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` from repository secrets. Fork pull requests receive no secrets: the Action refuses `reviewed-baseline` without the key, and an unkeyed `diff --fail-on-alert` fails closed on unbound values (MCP launch values, IDE settings values, prompt files whose content hash is withheld) instead of comparing them. Run keyed comparisons only for same-repository pull requests and trusted branches.
+
+**Required-check interaction.** A job that `if:` skips counts as passed for a required check, so in a repository that accepts fork pull requests, also run the keyed gate on a trusted event before merging, such as `merge_group` with a merge queue. A second, keyless job for forks, comparing with a baseline recorded without the key, passes only while no record carries unbound values.
