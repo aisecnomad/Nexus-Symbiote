@@ -2662,6 +2662,18 @@ def _hooks_stop_running(base_recs: list[dict[str, Any]], curr_recs: list[dict[st
     return False
 
 
+def _hooks_start_running(base_recs: list[dict[str, Any]], curr_recs: list[dict[str, Any]]) -> bool:
+    """Whether a current hook runs where its baseline counterpart did not, beyond a widening.
+
+    A hook that did not run, through `disableAllHooks`, its type, a matcher or an `if`,
+    was never exercised, so enabling it is as new as adding it. Widening a hook that
+    already ran keeps its reviewed behaviour and is not reported.
+    """
+    return _hooks_stop_running(curr_recs, base_recs) and (
+        not any(_hook_runs(rec) for rec in base_recs) or _hooks_stop_running(base_recs, curr_recs)
+    )
+
+
 def _group_hooks(
     recs: list[dict[str, Any]], key: Callable[[dict[str, Any]], tuple[str, ...]]
 ) -> dict[tuple[str, ...], list[dict[str, Any]]]:
@@ -2767,6 +2779,23 @@ def diff_control_plane_audits(
             f"Launch target '{key}' (baseline digest {base_targets[key][:12]}) "
             "is still bound but its hook no longer runs where it did.",
         )
+    base_target_hooks = _group_hooks(baseline.hook_targets, _target_event)
+    started_targets = sorted(
+        {
+            group[0]
+            for group, recs in curr_target_hooks.items()
+            if group[0] in base_targets
+            and _hooks_start_running(base_target_hooks.get(group, []), recs)
+        }
+    )
+    for key in started_targets:
+        _emit(
+            "launch_target_added",
+            RiskSeverity.CRITICAL,
+            f"agent-control:{key}",
+            f"Launch target '{key}' (digest {curr_targets[key][:12]}) "
+            "now runs from a hook that did not run where it does in the baseline.",
+        )
 
     def _hook_keys(s: ControlPlaneAuditSummary) -> set[tuple[str, str, str]]:
         return {(h["source_file"], h["event"], h["command_digest"]) for h in s.hook_commands}
@@ -2803,6 +2832,17 @@ def diff_control_plane_audits(
                 f"hook-command:{src}:{event}:{digest[:12]}",
                 f"Hook command for '{event}' in {src} (baseline digest {digest[:12]}) "
                 "is still declared but no longer runs where it did.",
+            )
+    base_hook_recs = _group_hooks(baseline.hook_commands, _hook_key)
+    for (src, event, digest), recs in sorted(curr_hook_recs.items()):
+        base_recs = base_hook_recs.get((src, event, digest))
+        if base_recs is not None and _hooks_start_running(base_recs, recs):
+            _emit(
+                "hook_command_changed",
+                RiskSeverity.CRITICAL,
+                f"hook-command:{src}:{event}:{digest[:12]}",
+                f"Hook command for '{event}' in {src} (digest {digest[:12]}) "
+                "now runs where the baseline hook did not.",
             )
 
     def _preamble_keys(s: ControlPlaneAuditSummary) -> set[tuple[str, str]]:

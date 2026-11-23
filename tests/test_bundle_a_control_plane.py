@@ -1469,7 +1469,11 @@ def test_hook_run_comparison_scales_linearly_with_matchers(tmp_path: Path) -> No
 
     def run(scale: int) -> None:
         alerts = diff_control_plane_audits(summary(2_000 * scale, "b"), summary(2_000 * scale, "c"))
-        assert [a["root_cause"] for a in alerts] == ["hook_command_removed"]
+        # Disjoint matchers neither cover nor are covered, so both directions alert.
+        assert sorted(a["root_cause"] for a in alerts) == [
+            "hook_command_changed",
+            "hook_command_removed",
+        ]
 
     assert scaling_ratio(run) < 10
 
@@ -1538,7 +1542,10 @@ def test_hook_if_comparison_finds_unfiltered_hooks_in_linear_time() -> None:
         count = 2_000 * scale
         assert diff_control_plane_audits(summary(count, "b"), summary(count, None)) == []
         changed = diff_control_plane_audits(summary(count, "b"), summary(count, "c"))
-        assert [alert["root_cause"] for alert in changed] == ["hook_command_removed"]
+        assert sorted(alert["root_cause"] for alert in changed) == [
+            "hook_command_changed",
+            "hook_command_removed",
+        ]
 
     assert scaling_ratio(run) < 10
 
@@ -1605,3 +1612,87 @@ def test_unresolvable_claude_link_is_a_coverage_gap(tmp_path: Path, target: str)
         gap.startswith(".claude: symlink cannot be resolved, so its settings were not read")
         for gap in summary.gaps
     )
+
+
+_ENABLED = frozenset({"hook_command_changed", "launch_target_added"})
+
+
+@pytest.mark.parametrize(
+    ("baseline", "current"),
+    [
+        (_guard_settings(disableAllHooks=True), _guard_settings()),
+        (_guard_settings(hook_type="prompt"), _guard_settings()),
+        (_guard_settings(matcher="NeverMatchesAnyTool"), _guard_settings()),
+        (
+            _guard_settings(condition="Bash(never-matches *)"),
+            _guard_settings(condition="Bash(git *)"),
+        ),
+    ],
+)
+def test_baseline_diff_alerts_when_a_kept_hook_starts_running(
+    tmp_path: Path, baseline: dict[str, object], current: dict[str, object]
+) -> None:
+    causes = _guard_alerts(tmp_path, current, baseline=baseline)
+    assert causes >= _ENABLED
+
+
+@pytest.mark.parametrize(
+    ("baseline", "current"),
+    [
+        (_guard_settings(), _guard_settings()),
+        (_guard_settings(), _guard_settings(matcher="*")),
+        (_guard_settings(), _guard_settings(matcher="Bash, Edit")),
+        (_guard_settings(condition="Bash(git *)"), _guard_settings()),
+        (_guard_settings(disableAllHooks=True), _guard_settings(disableAllHooks=True)),
+    ],
+)
+def test_baseline_diff_is_quiet_when_a_kept_hook_already_ran_or_still_does_not(
+    tmp_path: Path, baseline: dict[str, object], current: dict[str, object]
+) -> None:
+    assert not _guard_alerts(tmp_path, current, baseline=baseline) & _ENABLED
+
+
+def test_enabled_hook_alerts_reuse_the_added_hook_severity(tmp_path: Path) -> None:
+    (tmp_path / "base").mkdir()
+    (tmp_path / "curr").mkdir()
+    for root in (tmp_path / "base", tmp_path / "curr"):
+        (root / "guard.sh").write_text("echo guard\n", encoding="utf-8")
+    _write_json(
+        tmp_path / "base" / ".claude" / "settings.json", _guard_settings(hook_type="prompt")
+    )
+    _write_json(tmp_path / "curr" / ".claude" / "settings.json", _guard_settings())
+    alerts = diff_control_plane_audits(
+        audit_project_control_plane(tmp_path / "base"),
+        audit_project_control_plane(tmp_path / "curr"),
+    )
+    assert sorted((a["root_cause"], a["severity"]) for a in alerts) == [
+        ("hook_command_changed", "critical"),
+        ("launch_target_added", "critical"),
+    ]
+
+
+def test_hook_start_comparison_scales_linearly() -> None:
+    def summary(count: int, disabled: bool) -> ControlPlaneAuditSummary:
+        result = ControlPlaneAuditSummary()
+        result.hook_commands = [
+            {
+                "source_file": ".claude/settings.json",
+                "event": "PreToolUse",
+                "command_digest": "0" * 64,
+                "matcher_digest": f"m{index}",
+                "matcher_names": [f"n{index}"],
+                "if_digest": f"i{index}",
+                "runs_command": True,
+                "hooks_disabled": disabled,
+            }
+            for index in range(count)
+        ]
+        return result
+
+    def run(scale: int) -> None:
+        count = 2_000 * scale
+        alerts = diff_control_plane_audits(summary(count, True), summary(count, False))
+        assert [alert["root_cause"] for alert in alerts] == ["hook_command_changed"]
+        assert diff_control_plane_audits(summary(count, False), summary(count, False)) == []
+
+    assert scaling_ratio(run) < 10
