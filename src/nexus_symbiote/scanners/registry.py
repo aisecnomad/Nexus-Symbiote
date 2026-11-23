@@ -14,7 +14,7 @@ import re
 import shlex
 import unicodedata
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, NamedTuple
@@ -1609,29 +1609,48 @@ class RegistryScanner(Scanner):
         # Those a pnpm or Yarn record may resolve: fetched and not patched.
         registry: list[RegistryEntryComponent] = []
         gaps: dict[str, None] = {}
-        selected: list[tuple[str, list[tuple[str, str]], str, str, Any, str]] = []
+        selected: list[tuple[str, list[tuple[str, str]], str, str, Any, str, set[str], bool]] = []
         for key, specs in sorted(declared.items()):
-            spec = specs[-1][1]
-            kind, target, version_range = self._npm_spec(spec)
+            parsed_specs = [(section, item, *self._npm_spec(item)) for section, item in specs]
+            _, spec, kind, target, version_range = parsed_specs[-1]
             record = resolutions.get("node_modules/" + key)
             installed = self._installed_name(key, record, resolutions)
             package = target if kind == "alias" and target else key
+            alias_targets = {t for _, _, k, t, _ in parsed_specs if k == "alias" and t}
+            fetches = any(k in ("registry", "alias") for _, _, k, _, _ in parsed_specs)
             if not (
                 self._is_ai_package(key)
                 or self._is_ai_package(package)
+                or any(self._is_ai_package(t) for t in alias_targets)
                 or (installed is not None and self._is_ai_package(installed))
             ):
-                if kind in ("git", "url", "path") and installed is None:
+                if (
+                    any(k in ("git", "url", "path") for _, _, k, _, _ in parsed_specs)
+                    and installed is None
+                ):
                     # npm installs such a source under the key whatever package it
                     # holds; without a lock record naming it, it is not classified.
                     gaps[self._NPM_GAPS["unclassified"]] = None
                 continue
-            selected.append((key, specs, kind, version_range, record, package))
+            selected.append(
+                (key, specs, kind, version_range, record, package, alias_targets, fetches)
+            )
         # Without an inventoried npm package, the workspace gap already covers what
         # pnpm-workspace.yaml may patch, so a file pnpm would refuse fails nothing.
         patches = self._npm_patches(data, result, workspace=bool(selected) and has_pnpm_workspace)
-        for key, specs, kind, version_range, record, package in selected:
-            overridden = overrides is None or bool({key.lower(), package.lower()} & overrides[0])
+        for (
+            key,
+            specs,
+            kind,
+            version_range,
+            record,
+            package,
+            aliased,
+            fetches,
+        ) in selected:
+            # Every name the dependency is installed as, or an alias in any section installs.
+            installs = {key.lower(), package.lower(), *(t.lower() for t in aliased)}
+            overridden = overrides is None or bool(installs & overrides[0])
             if overridden:
                 gaps[self._NPM_GAPS["override"]] = None
             # Whichever package manager installs applies the patch to the registry
@@ -1639,7 +1658,7 @@ class RegistryScanner(Scanner):
             patched = [
                 source
                 for source, names in patches.items()
-                if names is None or not names.isdisjoint((key.lower(), package.lower()))
+                if names is None or not names.isdisjoint(installs)
             ]
             for source in patched:
                 gaps[f"{source}: {self._PATCHED_GAP}"] = None
@@ -1657,10 +1676,12 @@ class RegistryScanner(Scanner):
             if patched:
                 component.risks.append(self._npm_patch_risk(component.name, patched))
             components.append(component)
-            if kind in ("registry", "alias"):
+            if fetches:
+                # A registry spec in any section resolves through the project's registry
+                # settings when the install flags select that section.
                 fetched.append((component, package))
-                if not patched:
-                    registry.append(component)
+            if kind in ("registry", "alias") and not patched:
+                registry.append(component)
         if overrides is None or any(self._is_ai_package(t) for t in overrides[1]):
             # Too many overrides to read, or one that installs an AI package under
             # another package's name.
@@ -1876,11 +1897,24 @@ class RegistryScanner(Scanner):
                 f"{section}: {recorded_specs[value]}" for section, value in specs
             )
         claims: dict[str, ClaimEvidence] = {}
+        all_parsed = [(section, item, *self._npm_spec(item)) for section, item in specs]
+        nonregistry_entries: list[tuple[str, str]] = list(
+            dict.fromkeys(
+                (item_kind, item_spec)
+                for _, item_spec, item_kind, _, _ in all_parsed
+                if item_kind not in ("registry", "alias")
+            )
+        )
+        source_disagreement = self._sections_disagree(specs)
+        if source_disagreement:
+            result.surfaces_excluded.append(
+                f"package.json: conflicting dependency sources for '{name}' across sections are ambiguous"
+            )
         registry = kind in ("registry", "alias")
         version = redact_text(version_range if registry and version_range else spec)
         source = "package.json"
         resolution = None
-        if lock is not None and record is not None:
+        if lock is not None and record is not None and not source_disagreement:
             lock_name, _, lock_digest = lock
             # The key as the inventory records the name or alias it installs: redacted.
             locator = f"{lock_name}#/packages/" + _pointer_token("node_modules/" + key_name)
@@ -1930,6 +1964,21 @@ class RegistryScanner(Scanner):
                     "Check that the aliased package is the one the code expects to import.",
                 )
             )
+        for alias_target in dict.fromkeys(
+            item_target
+            for _, _, item_kind, item_target, _ in all_parsed
+            if item_kind == "alias" and item_target and item_target != package
+        ):
+            shown_alias, sensitive_alias = _identifier(alias_target)
+            alias_display = shown_alias if sensitive_alias else redact_text(alias_target)
+            risks.append(
+                _risk(
+                    RiskSeverity.LOW,
+                    "package_alias",
+                    f"npm dependency '{key_name}' installs '{alias_display}' under another name.",
+                    "Check that the aliased package is the one the code expects to import.",
+                )
+            )
         # npm takes the last section's spec, pnpm the first of optional, dependencies,
         # dev and peer, so a spec counts only when both take the same one.
         by_section = dict(specs)
@@ -1955,8 +2004,13 @@ class RegistryScanner(Scanner):
                     "Resolve and verify an immutable artifact with lockfile integrity evidence.",
                 )
             )
-        elif not registry:
+        if not registry:
             risks.append(self._npm_source_risk(name, kind, spec))
+        for item_kind, item_spec in nonregistry_entries:
+            if registry or (item_kind, item_spec) != (kind, spec):
+                risk = self._npm_source_risk(name, item_kind, item_spec)
+                if risk not in risks:
+                    risks.append(risk)
         package_url = None
         # A name the redaction changed is exported as the marker; no package URL may
         # spell it out.
@@ -1964,6 +2018,7 @@ class RegistryScanner(Scanner):
             not sensitive_name
             and name == package
             and not sensitive_version
+            and not source_disagreement
             and resolution is not None
             and resolution.consistent
             and not resolution.sensitive_origin
@@ -1973,6 +2028,7 @@ class RegistryScanner(Scanner):
             not sensitive_name
             and name == package
             and not sensitive_version
+            and not source_disagreement
             and registry
             and record is None
             and not in_doubt
@@ -2419,6 +2475,32 @@ class RegistryScanner(Scanner):
                 selections[name] = records[0]
         return selections
 
+    @staticmethod
+    def _bounded_yaml_loader(max_depth: int = 64) -> type[Any]:
+        """PyYAML SafeLoader subclass enforcing a strict flow-collection depth cap.
+
+        The scanner's own ``flow_level`` has no floor: a run of "]" drives it negative,
+        after which every "[" passes the cap while the scanner's simple-key bookkeeping
+        grows with each level, which is quadratic. A flow end at level 0 is a parse
+        error whatever follows it, so it is refused where it occurs.
+        """
+        import yaml
+
+        class _BoundedFlowLoader(yaml.SafeLoader):
+            def fetch_flow_collection_start(self, token_class: Any) -> None:
+                if self.flow_level >= max_depth:
+                    raise ValueError(f"YAML flow nesting exceeds depth limit ({max_depth})")
+                super().fetch_flow_collection_start(token_class)
+
+            def fetch_flow_collection_end(self, token_class: Any) -> None:
+                if self.flow_level <= 0:
+                    raise yaml.scanner.ScannerError(
+                        None, None, "found a flow collection end outside one", self.get_mark()
+                    )
+                super().fetch_flow_collection_end(token_class)
+
+        return _BoundedFlowLoader
+
     def _resolve_pnpm_lockfile(
         self,
         lock_bytes: bytes,
@@ -2441,7 +2523,8 @@ class RegistryScanner(Scanner):
 
         try:
             text = lock_bytes.decode("utf-8")
-            for index, token in enumerate(yaml.scan(text)):
+            loader = self._bounded_yaml_loader()
+            for index, token in enumerate(yaml.scan(text, Loader=loader)):
                 if index >= _MAX_PNPM_LOCK_TOKENS or isinstance(
                     token, (yaml.AliasToken, yaml.AnchorToken, yaml.TagToken)
                 ):
@@ -2671,6 +2754,13 @@ class RegistryScanner(Scanner):
                 result.surfaces_excluded.append(
                     f"pnpm-lock.yaml: selected non-registry source for {comp.name} is unverified"
                 )
+            elif self._sections_disagree((declared_specs or {}).get(comp.name)):
+                # The sections name different sources, so which one installs depends on
+                # the install flags: the record's checks run, its identity is not bound.
+                bind_identity = False
+                result.surfaces_excluded.append(
+                    f"pnpm-lock.yaml: conflicting dependency sources for {comp.name} are ambiguous"
+                )
             self._bind_npm_resolution(
                 comp,
                 "pnpm-lock.yaml",
@@ -2685,6 +2775,17 @@ class RegistryScanner(Scanner):
                 bind_identity=bind_identity,
             )
         return True
+
+    @classmethod
+    def _sections_disagree(cls, specs: Sequence[tuple[str, str]] | None) -> bool:
+        """Whether package.json's sections declare a name from different sources. Which
+        one installs then depends on the install flags (--omit=dev, --no-optional), so
+        no lockfile record decides the identity."""
+        identities: set[tuple[str, str | None]] = set()
+        for _, spec in specs or ():
+            kind, target, _ = cls._npm_spec(spec)
+            identities.add((kind, target if kind == "alias" and target else None))
+        return len(identities) > 1
 
     @staticmethod
     def _pnpm_spec_agrees(
@@ -2806,21 +2907,32 @@ class RegistryScanner(Scanner):
                         f"yarn.lock: multiple package resolutions for {comp.name} are ambiguous"
                     )
                     continue
-                selected = next((spec for spec in installed if spec not in ("", "*")), installed[0])
-                kind, alias_target, _ = self._npm_spec(selected)
-                if kind == "alias" and alias_target != comp.name:
+                parsed_installed = [(item, *self._npm_spec(item)) for item in installed]
+                if any(
+                    item_kind == "alias" and item_target != comp.name
+                    for _, item_kind, item_target, _ in parsed_installed
+                ):
                     comp.registry_uri = None
                     result.surfaces_excluded.append(
                         "yarn.lock: aliased package identity is unresolved"
                     )
                     continue
-                if kind not in ("registry", "alias"):
+                nonreg = [
+                    (item, item_kind)
+                    for item, item_kind, _, _ in parsed_installed
+                    if item_kind not in ("registry", "alias")
+                ]
+                if nonreg:
                     comp.registry_uri = None
-                    comp.risks.append(self._npm_source_risk(comp.name, kind, selected))
+                    if not any(r.category == "nonregistry_source" for r in comp.risks):
+                        comp.risks.append(
+                            self._npm_source_risk(comp.name, nonreg[0][1], nonreg[0][0])
+                        )
                     result.surfaces_excluded.append(
                         f"yarn.lock: selected non-registry source for {comp.name} is unverified"
                     )
                     continue
+                selected = next((spec for spec in installed if spec not in ("", "*")), installed[0])
                 req = selected.strip()
             entries = by_pkg.get(comp.name)
             if not entries:
@@ -2909,6 +3021,12 @@ class RegistryScanner(Scanner):
             # The selector that matched holds only the name and spec the inventory
             # records; another selector of the stanza may be a URL with a credential.
             locator = "yarn.lock#/" + _pointer_token(f"{comp.name}@{sel_spec}")
+            disputed = self._sections_disagree(raw_specs)
+            if disputed:
+                # As for pnpm: the record's checks run, its identity is not bound.
+                result.surfaces_excluded.append(
+                    f"yarn.lock: conflicting dependency sources for {comp.name} are ambiguous"
+                )
             # Yarn 1 reads `integrity` and not `checksum`, and Berry the reverse.
             self._bind_npm_resolution(
                 comp,
@@ -2923,6 +3041,7 @@ class RegistryScanner(Scanner):
                 checksum_recorded=metadata is not None
                 and _berry_checksum_checked(fields, metadata, cache_key),
                 requested=req,
+                bind_identity=not disputed,
             )
         return True
 
@@ -3001,8 +3120,9 @@ class RegistryScanner(Scanner):
             yaml.DocumentEndToken,
         )
         try:
+            loader = self._bounded_yaml_loader()
             empty = True
-            for index, token in enumerate(yaml.scan(text)):
+            for index, token in enumerate(yaml.scan(text, Loader=loader)):
                 if index >= _MAX_PNPM_LOCK_TOKENS or isinstance(
                     token, (yaml.AliasToken, yaml.AnchorToken, yaml.TagToken)
                 ):
@@ -3875,8 +3995,10 @@ class RegistryScanner(Scanner):
             package = packages_declared.get(comp.name)
             declarations = package.declarations if package is not None else []
             # A record is still checked for a package declared only under markers, or
-            # through a source, override or conflict the lockfile does not stand for,
-            # but it names no package URL or PyPI origin for it.
+            # through a source, override or conflict the lockfile does not stand for:
+            # unresolved packages receive neither a package URL nor a registry origin,
+            # while marker-conditional ones record the resolved index origin without
+            # claiming a package URL or version binding.
             # Rendering can redact the complete declared version, including its marker.
             conditional = (
                 bool(package.representative.marker)
@@ -4525,7 +4647,11 @@ class RegistryScanner(Scanner):
     )
 
     def _scan_docker(self, result: ScanResult) -> list[RegistryEntryComponent]:
-        environment = self._confined().read_bytes(".env", missing_ok=True)
+        environment = (
+            None
+            if self._withheld(".env", result)
+            else self._confined().read_bytes(".env", missing_ok=True)
+        )
         if environment is not None:
             # Read as bytes, so that no encoding fails the collector; nothing in it
             # is recorded.
@@ -4689,10 +4815,11 @@ class RegistryScanner(Scanner):
         except ImportError:
             return None
         try:
-            for index, _ in enumerate(yaml.scan(text, Loader=yaml.SafeLoader)):
+            loader = cls._bounded_yaml_loader()
+            for index, _ in enumerate(yaml.scan(text, Loader=loader)):
                 if index >= cls._COMPOSE_TOKENS:
                     return None
-            root = yaml.compose(text, Loader=yaml.SafeLoader)
+            root = yaml.compose(text, Loader=loader)
             if root is None:
                 return [], [], []
             return _ComposeWalk(cls._COMPOSE_STEPS).images(root)
