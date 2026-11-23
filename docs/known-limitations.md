@@ -1007,7 +1007,9 @@ A way around a limit that its entry does not describe is worth a
   `unsafe-code-execution`, and a NumPy header or ZIP archive left unread at the
   bounds below is rated `unknown`. A pickle renamed anywhere else, an unrecognized
   pickle, a numeric NumPy array, a ZIP archive with neither kind of member, and `.pb`
-  files other than `saved_model.pb` produce no component. A candidate ZIP archive is
+  files other than `saved_model.pb` produce no component. So do archive model formats
+  whose loaders unpickle a member, such as NeMo's `.nemo` and TorchServe's `.mar`, and
+  scikit-learn's conventional `.sav`, outside those directories. A candidate ZIP archive is
   read to its end and digested, as a model archive is, and a candidate larger than
   the `model-bytes` limit is a collection failure. A candidate that a model binds,
   such as ONNX external data or a SavedModel variables file, is rated the same way
