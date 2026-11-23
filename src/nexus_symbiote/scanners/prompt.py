@@ -1135,10 +1135,12 @@ _MAX_LISTED_IMPORT_CHARACTERS = 256 * 1024
 _IMPORT = re.compile(r"(?<!\S)@(\S+)")
 # JavaScript's \s, which Claude Code's import pattern uses.
 _JS_SPACE = "\t\n\x0b\x0c\r \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
-# An @ that can open a marked text token: after white space or any inline markup, an
-# escape or raw HTML, all of which end on ASCII punctuation. An @ after a backtick does
-# only when that backtick is escaped; the name after a code span is read where it closes.
-_HOST_START = re.compile(rf"(?<![^{_JS_SPACE}!-/:-?\[-`{{-~])@(?=[^{_JS_SPACE}\\]|\\ )")
+# An @ after white space or ASCII punctuation, of which ``_opens_text`` keeps those that
+# can open a marked text token.
+_HOST_START = re.compile(rf"(?<![^{_JS_SPACE}!-/:-@\[-`{{-~])@(?=[^{_JS_SPACE}\\]|\\ )")
+# What inline markup can end on: raw HTML and autolinks, links, reference links, link
+# text and emphasis.
+_MARKUP_END = re.compile(rf"[{_JS_SPACE}>)\]\[*_]")
 _HOST_NAME = re.compile(rf"(?:[^{_JS_SPACE}\\]|\\ )+")
 _MARKUP_START = re.compile(r"[`*\[\]<!\\]|_+")
 _MAX_HOST_STARTS = 2 * _MAX_IMPORTS
@@ -1202,6 +1204,27 @@ def _resolve_import(directory: tuple[str, ...], token: str) -> tuple[list[str], 
     return targets, outside, too_long
 
 
+def _backslashes_before(part: str, index: int) -> int:
+    start = index
+    while start and part[start - 1] == "\\":
+        start -= 1
+    return index - start
+
+
+def _opens_text(part: str, at: int) -> bool:
+    """Whether marked may start a text token at the ``@`` at ``at``: after white space,
+    markup or an escape. The name after a code span is read where the span closes, and
+    an escaped ``@`` starts none.
+    """
+    if not at:
+        return True
+    if slashes := _backslashes_before(part, at):
+        return slashes % 2 == 0
+    if _MARKUP_END.match(part, at - 1):
+        return True
+    return _backslashes_before(part, at - 1) % 2 == 1
+
+
 def _cuts(part: str, start: int, limit: int) -> Iterator[int]:
     """Each place in ``part[start:limit]`` where markup may end a marked text token.
 
@@ -1234,12 +1257,7 @@ def _import_readings(text: str) -> tuple[list[str], list[str], bool]:
         own.extend(_IMPORT.findall(part))
         end = 0
         for found in _HOST_START.finditer(part):
-            at = found.start()
-            tick = at > 0 and part[at - 1] == "`"
-            escape = at - tick
-            while escape and part[escape - 1] == "\\":
-                escape -= 1
-            if (at - tick - escape) % 2 != tick:
+            if not _opens_text(part, found.start()):
                 continue
             starts += 1
             if starts > _MAX_HOST_STARTS:

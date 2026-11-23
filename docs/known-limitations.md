@@ -1197,11 +1197,18 @@ A way around a limit that its entry does not describe is worth a
     also right after inline markup (`**@x.md**`, `_@x.md_`, the text of a link,
     a link, an escape such as `\#@x.md`, an escaped backtick, or raw
     HTML such as `<b>@x.md</b>`), even inside what CommonMark reads as one word.
+    The scanner reads one after white space, `>`, `)`, `]`, `[`, `*`, `_` or an
+    escaped punctuation character, which inline markup can end on, and after no other
+    character: Claude Code imports nothing from `(@x.md)`, `"@x.md"`, `x=@x.md` or
+    `https://unpkg.com/@x.md`, and imports `x.md` from `\@@x.md`.
   - The name ends where markup starts (`@x.md<br>` imports `x.md`) and at a
     backslash that escapes no space. `\ ` is a space, so `@my\ notes.md` imports
     `my notes.md`. A `#fragment` is dropped, so `@notes.md#rules` imports `notes.md`.
-    Trailing punctuation is kept, so `@notes.md.` imports `notes.md.` (the scanner
-    looks up both spellings).
+    Trailing punctuation is kept in the name, so Claude Code reads `notes.md.` from
+    `@notes.md.`, but it loads a file only when its suffix is empty or one of the text
+    suffixes it lists, so it skips `notes.md.` and `notes.md,` and loads `README)` from
+    `@README)`. The scanner looks up both spellings, so it can inventory a file such
+    as `notes.md.` that Claude Code does not load.
   - A list item's text is read raw, code spans included: ``- ` @notes.md ` ``
     imports `notes.md`, which GitHub shows as code. marked also keeps the lines after
     an item in it up to a blank line, and indented lines after that, where CommonMark

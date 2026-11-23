@@ -822,6 +822,14 @@ def test_a_name_both_readings_give_still_raises_its_gap(tmp_path):
     ]
 
 
+@pytest.mark.parametrize(
+    "text",
+    ["See (@x.md).", 'Say "@x.md".', "x=@x.md", "https://unpkg.com/@x.md", "{@x.md}", "x\\@x.md"],
+)
+def test_no_name_is_read_where_marked_starts_no_text_token(text):
+    assert prompt._import_tokens(text) == []
+
+
 def test_a_name_is_not_cut_at_underscores_inside_a_word():
     name = "a_" * 1_000 + "b.md"
     assert name in prompt._import_tokens(f"**@{name}**\n")
