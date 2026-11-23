@@ -816,7 +816,9 @@ _BASE64_DECODE = re.compile(
 )
 # `sudo -s`, `-i`, alone or in a bundle such as `-Es`, or their long forms; the letters
 # before the flag's leave it out for the same reason.
-_SUDO_SHELL_FLAG = re.compile(r"--(?:shell|login)|-[A-Za-hj-rt-z]*[si][A-Za-z]*")
+# sudo takes any unambiguous prefix of a long option: `--sh` is `--shell`; `--login`
+# has none, since `--login-class` shares every shorter one.
+_SUDO_SHELL_FLAG = re.compile(r"--sh(?:e(?:ll?)?)?|--login|-[A-Za-hj-rt-z]*[si][A-Za-z]*")
 _SCRIPT_FLAG = re.compile(r"(?i)-c(?:ommand(?:withargs)?)?\Z|-[A-Za-z]*c\Z")
 # An interpreter's flag that takes its program as the next argument: `-e`, `-E`, `-p`,
 # `-r` (PHP only: node and ruby load a module with it) and the long `--eval` and
@@ -883,17 +885,78 @@ _HOST_PATH = re.compile(r"(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+(?::[0-9]+)?/")
 _SEVERITY_RANK = {severity: index for index, severity in enumerate(RiskSeverity)}
 
 
-def _split_pipelines(command: str, *, respect_quotes: bool) -> list[list[str]]:
+_GROUP_KEYWORDS = {"if": "fi", "while": "done", "until": "done", "for": "done"}
+_GROUP_KEYWORDS |= {"select": "done", "case": "esac"}
+_GROUP_ENDS = frozenset(_GROUP_KEYWORDS.values())
+# A pipe can feed a group only where one opens: without a `{`, `(` or opening keyword
+# the group view equals the plain one, so it is not built.
+_GROUP_OPENER = re.compile(r"[{(]|\b(?:if|while|until|for|select|case)\b")
+# Reserved words that open a compound command's next part; the command after one is
+# the next word, as after `{`, `(` and `!`.
+_RESERVED_PREFIXES = frozenset({"if", "while", "until", "then", "do", "else", "elif"})
+
+
+def _split_pipelines(
+    command: str, *, respect_quotes: bool, piped_groups: bool = False
+) -> list[list[str]]:
+    """Pipelines in ``command``, as ``_command_pipelines`` describes.
+
+    With ``respect_quotes``, a separator inside quotes or after a backslash stays in
+    its segment; quoted text is never read as a group's opener or closer.
+    """
     pipelines: list[list[str]] = []
     segments: list[str] = []
     buf: list[str] = []
     length = len(command)
     index = 0
+    # Open groups, innermost last: (closer, whether a pipe feeds it). "$(" and the
+    # process substitutions are pushed as ")" too, so their ")" is not a group's.
+    groups: list[tuple[str, bool]] = []
+
+    # Where the current segment starts in `command`, for a bounded look back.
+    segment_start = [0, False]
+
+    def at_command_start() -> bool:
+        # Constant work per call: at most 40 characters back, a word of at most 6.
+        floor = max(segment_start[0], index - 40)
+        back = index
+        while back > floor and command[back - 1] in " \t\r\n":
+            back -= 1
+        if back == segment_start[0]:
+            return True
+        word_end = back
+        while back > floor and command[back - 1] not in " \t\r\n;&|":
+            back -= 1
+        if word_end - back > 6 or (back == floor and back != segment_start[0]):
+            return False
+        return command[back:word_end] in _RESERVED_PREFIXES | {"{", "(", "!"}
+
+    def word_at(position: int) -> str:
+        end = position
+        while end < length and command[end] not in " \t\r\n;&|()<>":
+            end += 1
+        return command[position:end]
+
+    # A count of the open groups a pipe feeds keeps each separator O(1); scanning the
+    # stack instead made `{ { { ...; ...; ...` quadratic.
+    fed = [0]
+
+    def piped() -> bool:
+        return fed[0] > 0
+
+    def push(closer: str, feeds: bool) -> None:
+        groups.append((closer, feeds))
+        fed[0] += feeds
+
+    def pop() -> None:
+        fed[0] -= groups.pop()[1]
+
     quote = ""
 
     def flush_segment() -> None:
         segments.append("".join(buf))
         buf.clear()
+        segment_start[1] = True
 
     def flush_command() -> None:
         flush_segment()
@@ -902,6 +965,8 @@ def _split_pipelines(command: str, *, respect_quotes: bool) -> list[list[str]]:
         segments.clear()
 
     while index < length:
+        if segment_start[1]:
+            segment_start[0], segment_start[1] = index, False
         char = command[index]
         nxt = command[index + 1] if index + 1 < length else ""
         if respect_quotes:
@@ -925,6 +990,32 @@ def _split_pipelines(command: str, *, respect_quotes: bool) -> list[list[str]]:
                 buf.append(nxt)
                 index += 2
                 continue
+        if piped_groups:
+            if char == "$" and nxt == "(" or char in "<>" and nxt == "(":
+                push(")", False)
+                buf.append(command[index : index + 2])
+                index += 2
+                continue
+            if char == ")" and groups and groups[-1][0] == ")":
+                pop()
+            elif char == "(" and nxt != "(" and at_command_start():
+                push(")", bool(segments) or piped())
+            elif (index == 0 or command[index - 1] in " \t\r\n;&|({") and at_command_start():
+                word = word_at(index)
+                if word == "{" or word in _GROUP_KEYWORDS:
+                    closer = "}" if word == "{" else _GROUP_KEYWORDS[word]
+                    push(closer, bool(segments) or piped())
+                elif groups and word == groups[-1][0] and word in _GROUP_ENDS | {"}"}:
+                    pop()
+        if (
+            piped_groups
+            and piped()
+            and (char == "|" and nxt == "|" or char == "&" and nxt == "&" or char in ";\n")
+        ):
+            # Inside a group a pipe feeds, the next command reads the same pipe.
+            flush_segment()
+            index += 2 if char in "|&" else 1
+            continue
         if char == "|" and nxt == "|":
             flush_command()
             index += 2
@@ -968,15 +1059,21 @@ def _split_pipelines(command: str, *, respect_quotes: bool) -> list[list[str]]:
     return pipelines
 
 
-def _command_pipelines(command: str) -> list[list[str]]:
+def _command_pipelines(command: str, *, piped_groups: bool = False) -> list[list[str]]:
     """Pipelines in ``command``.
 
     ``|`` and ``|&`` separate segments of one pipeline. A newline after either stays
     in that pipeline, as the shell reads it. ``||`` does not: it is a logical or, as
     ``&&``, ``;``, a newline elsewhere and a background ``&`` are command separators.
     ``>&``, ``<&`` and ``&>`` stay inside a segment.
+
+    With ``piped_groups``, a group or compound command that a pipe feeds (`{ ...; }`,
+    `( ... )`, `if`/`while`/`until`/`for`/`select`/`case`) passes the pipe to every
+    command inside it, so those commands stay later segments of the same pipeline
+    instead of starting new ones: `curl x | { true; sh; }` runs the download in `sh`.
+    The group is read lexically, so this view can only add segments after a pipe.
     """
-    return _split_pipelines(command, respect_quotes=False)
+    return _split_pipelines(command, respect_quotes=False, piped_groups=piped_groups)
 
 
 def _skip_pipe_gap(command: str, index: int) -> int:
@@ -996,6 +1093,11 @@ def _shell_word_spans(segment: str) -> list[tuple[int, int]]:
     quote = ""
     while index < length:
         char = segment[index]
+        if quote == "$'":
+            # In bash's ANSI-C quoting a backslash escapes the closing quote: `$'\''`.
+            index += 2 if char == "\\" else 1
+            quote = "" if char == "'" else quote
+            continue
         if quote:
             if char == quote:
                 quote = ""
@@ -1003,6 +1105,12 @@ def _shell_word_spans(segment: str) -> list[tuple[int, int]]:
                 index += 2
                 continue
             index += 1
+            continue
+        if char == "$" and segment.startswith("$'", index):
+            if start is None:
+                start = index
+            quote = "$'"
+            index += 2
             continue
         if char in "'\"":
             if start is None:
@@ -1014,6 +1122,12 @@ def _shell_word_spans(segment: str) -> list[tuple[int, int]]:
             if start is None:
                 start = index
             index += 2
+            continue
+        if char == "(" and start is None and (index == 0 or segment[index - 1] not in "<>"):
+            # `(X=1 sh)` and `(2>/dev/null sh)` open a subshell as `( X=1 sh )` does;
+            # `<(` and `>(` stay process substitutions.
+            spans.append((index, index + 1))
+            index += 1
             continue
         if char in "<>":
             if start is not None:
@@ -1039,11 +1153,21 @@ def _shell_words(segment: str) -> list[str]:
     return [segment[start:end] for start, end in _shell_word_spans(segment)]
 
 
-_NAMED_FD = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+_NAMED_FD = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\}")
 
 
 def _is_zero_fd(word: str) -> bool:
     return bool(word) and word.isdigit() and set(word) == {"0"}
+
+
+# Arguments that name standard input as the program, or as a file to read.
+_STDIN_PROGRAMS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
+
+
+def _fd_key(word: str) -> str:
+    """A descriptor number as bash reads it: `00` is 0, and `0-` (move) still names 0."""
+    word = word.removesuffix("-") if len(word) > 1 else word
+    return str(int(word)) if word.isdigit() else word
 
 
 def _redirections(segment: str, spans: list[tuple[int, int]]) -> list[str]:
@@ -1056,8 +1180,18 @@ def _redirections(segment: str, spans: list[tuple[int, int]]) -> list[str]:
     previous = 0
     continued = ""
     count = len(spans)
+    aliases = {"0"}
+    words = [segment[s:e] for s, e in spans]
+    through = -1
     for idx, (start, end) in enumerate(spans):
         word = segment[start:end]
+        if idx <= through:
+            # The splitter breaks a target's `$(...)`, backticks or `$((...))` at their
+            # spaces; every piece belongs to the same redirection.
+            marks.append(marks[-1])
+            previous = end
+            continued = ""
+            continue
         gap = segment[previous:start].rstrip(" \t")
         if gap.endswith(("<", "<>")):
             prev_is_non_stdin_fd = (
@@ -1065,21 +1199,37 @@ def _redirections(segment: str, spans: list[tuple[int, int]]) -> list[str]:
                 and marks[-1] == "&"
                 and not _is_zero_fd(segment[spans[idx - 1][0] : spans[idx - 1][1]])
             )
+            decoded = _decode_word(word, drop_ifs=False)
+            following = (
+                _decode_word(segment[spans[idx + 1][0] : spans[idx + 1][1]], drop_ifs=False)
+                if word == "&"
+                and idx + 1 < count
+                and not segment[end : spans[idx + 1][0]].rstrip(" \t")
+                else ""
+            )
             self_dup_stdin = (
                 not gap.endswith(("<<", "<>"))
                 and start > 0
                 and segment[start - 1] == "<"
                 and (
-                    (word.startswith("&") and _is_zero_fd(word[1:]))
-                    or (
-                        word == "&"
-                        and idx + 1 < count
-                        and not segment[end : spans[idx + 1][0]].rstrip(" \t")
-                        and _is_zero_fd(segment[spans[idx + 1][0] : spans[idx + 1][1]])
-                    )
+                    (decoded.startswith("&") and _fd_key(decoded[1:]) in aliases)
+                    or (word == "&" and _fd_key(following) in aliases)
                 )
             )
-            mark = ">" if (prev_is_non_stdin_fd or self_dup_stdin) else "<"
+            # `</dev/stdin` and `<>/dev/fd/0` reopen the pipe the command already reads,
+            # and `<<<"$(cat)"` hands the command what the pipe carried.
+            reopens_stdin = (not gap.endswith("<<") and decoded in _STDIN_PROGRAMS - {"-"}) or (
+                gap.endswith("<<<") and _reads_piped_stdin(word)
+            )
+            if prev_is_non_stdin_fd:
+                fd_word = segment[spans[idx - 1][0] : spans[idx - 1][1]]
+                fd = _fd_key(fd_word) if fd_word.isdigit() else ""
+                source = decoded[1:] if decoded.startswith("&") else following
+                if fd and (_fd_key(source) in aliases or reopens_stdin):
+                    aliases.add(fd)
+                elif fd:
+                    aliases.discard(fd)
+            mark = ">" if (prev_is_non_stdin_fd or self_dup_stdin or reopens_stdin) else "<"
         elif gap.endswith(">"):
             mark = ">"
         else:
@@ -1101,6 +1251,8 @@ def _redirections(segment: str, spans: list[tuple[int, int]]) -> list[str]:
             mark = "&"
         marks.append(mark)
         previous = end
+        if mark in {"<", ">"}:
+            through = _assignment_end(words, idx) - 1
     return marks
 
 
@@ -1129,6 +1281,25 @@ def _ifs_at(word: str, index: int) -> int:
     return 0
 
 
+_ANSI_C_ESCAPE = re.compile(r"\\(x[0-9A-Fa-f]{1,2}|[0-7]{1,3}|.)", re.DOTALL)
+_ANSI_C_NAMED = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n"}
+_ANSI_C_NAMED |= {"r": "\r", "t": "\t", "v": "\v"}
+
+
+def _ansi_c(body: str) -> str:
+    """The text bash makes of `$'body'`."""
+
+    def one(match: re.Match[str]) -> str:
+        code = match.group(1)
+        if code[0] == "x":
+            return chr(int(code[1:], 16))
+        if code[0] in "01234567":
+            return chr(int(code, 8) & 0xFF)
+        return _ANSI_C_NAMED.get(code, code)
+
+    return _ANSI_C_ESCAPE.sub(one, body)
+
+
 def _decode_word(word: str, *, drop_ifs: bool) -> str:
     """Remove quotes and backslash escapes. Optionally delete `${IFS}` / `$IFS`.
 
@@ -1145,6 +1316,17 @@ def _decode_word(word: str, *, drop_ifs: bool) -> str:
                 quote = ""
             else:
                 out.append(char)
+            index += 1
+            continue
+        # Testing the character first keeps the per-character cost of every word low.
+        if not quote and char == "$" and word.startswith("$'", index):
+            end = index + 2
+            while end < len(word) and word[end] != "'":
+                end += 2 if word[end] == "\\" else 1
+            out.append(_ansi_c(word[index + 2 : end]))
+            index = end + 1
+            continue
+        if not quote and char == "$" and word.startswith('$"', index):
             index += 1
             continue
         if char == "'" and not quote:
@@ -1302,6 +1484,10 @@ def _assignment_end(words: list[str], index: int) -> int:
     return index + 1
 
 
+_ENV_LONG_VALUES = frozenset({"--unset", "--chdir"})
+_ENV_SPLIT = frozenset({"--split-string"})
+
+
 def _unwrap_env_split_string(payload: str, depth: int) -> list[str]:
     """Split and unwrap the command and arguments carried inside ``env -S`` / ``--split-string``."""
     if depth >= 4:
@@ -1339,24 +1525,24 @@ def _skip_env(
         if word in {"-u", "-C"}:
             index += 2
             continue
-        if word in {"-S", "--split-string"}:
+        option, eq, value = word.partition("=")
+        # getopt_long takes any unambiguous prefix: `--split S` is `--split-string S`.
+        splits = word == "-S" or _long_value_option(option, _ENV_SPLIT)
+        if splits and eq:
+            unwrapped = _unwrap_env_split_string(value, depth)
+            if unwrapped:
+                return _splice(index, index + 1, unwrapped)
+            index += 1
+            continue
+        if splits:
             if index + 1 < len(words):
                 unwrapped = _unwrap_env_split_string(words[index + 1], depth)
                 if unwrapped:
                     return _splice(index, index + 2, unwrapped)
             index += 2
             continue
-        if word.startswith("--split-string="):
-            unwrapped = _unwrap_env_split_string(word.split("=", 1)[1], depth)
-            if unwrapped:
-                return _splice(index, index + 1, unwrapped)
-            index += 1
-            continue
-        if word.startswith(("--unset=", "--chdir=")):
-            index += 1
-            continue
-        if word in {"--unset", "--chdir"}:
-            index += 2
+        if _long_value_option(option, _ENV_LONG_VALUES):
+            index += 1 if eq else 2
             continue
         if word.startswith("-") and not word.startswith("--") and len(word) > 1:
             bundle = re.fullmatch(r"-([i0v]*)([uCS])(.*)", word)
@@ -1480,6 +1666,21 @@ _WRAPPERS: dict[str, tuple[frozenset[str], int]] = {
 }
 
 
+def _long_value_option(word: str, with_value: frozenset[str]) -> bool:
+    """Whether ``word`` is GNU getopt_long's abbreviation of a value-taking long option.
+
+    getopt_long takes any unambiguous prefix, so `timeout --sig KILL 5 sh` gives `--signal`
+    the value `KILL`. A prefix that another option shares is refused by the program, so
+    reading it as the value option can only over-rate.
+    """
+    return (
+        word.startswith("--")
+        and len(word) > 2
+        and "=" not in word
+        and any(option.startswith(word) for option in with_value if option.startswith("--"))
+    )
+
+
 def _skip_wrapper(words: list[str], index: int, name: str) -> int:
     with_value, operands = _WRAPPERS[name]
     while index < len(words):
@@ -1489,7 +1690,7 @@ def _skip_wrapper(words: list[str], index: int, name: str) -> int:
             break
         if not word.startswith("-") or word == "-":
             break
-        index += 2 if word in with_value else 1
+        index += 2 if word in with_value or _long_value_option(word, with_value) else 1
     return index + operands
 
 
@@ -1521,11 +1722,18 @@ def _option_command(words: list[str], index: int, runner: str) -> int | None:
     user = False
     while index < len(words):
         word = _decode_word(words[index], drop_ifs=True)
-        if word in {"-c", "--command"} or (
-            len(word) > 2 and word[0] == "-" and word[-1] == "c" and set(word[1:-1]) <= set(bundled)
+        if (
+            word in {"-c", "--command"}
+            or _long_value_option(word, frozenset({"--command"}))
+            or (
+                len(word) > 2
+                and word[0] == "-"
+                and word[-1] == "c"
+                and set(word[1:-1]) <= set(bundled)
+            )
         ):
             return index + 1
-        attached = re.match(rf"--command=|-[{bundled}]*c(?=.)", word)
+        attached = re.match(rf"--co(?:m(?:m(?:a(?:nd?)?)?)?)?=|-[{bundled}]*c(?=.)", word)
         if attached is not None:
             words[index] = word[attached.end() :]
             return index
@@ -1576,7 +1784,7 @@ def _executable_index(
             index += step
             continue
         raw = _decode_word(words[index], drop_ifs=True).strip()
-        if raw in {"(", "{", ")", "}"} or words[index] == "!":
+        if raw in {"(", "{", ")", "}"} or words[index] == "!" or words[index] in _RESERVED_PREFIXES:
             index += 1
             continue
         if words[index] == "time" and (
@@ -1719,8 +1927,6 @@ _DATA_MODULES = frozenset(
 # `python3 -ic0` and `node -i -e 0` do, and the Python modules that do: its consoles.
 _INSPECT_INTERPRETERS = _PYTHON_NAMES | {"node", "nodejs", "lua"}
 _CONSOLE_MODULES = frozenset({"code", "asyncio"})
-# Arguments that name standard input as the program.
-_STDIN_PROGRAMS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
 # Suffixes an interpreter tries for a program or module named without one: node runs
 # `node a` and `node -r ./a` from a.js, and ruby loads `ruby -r ./a` from a.rb.
 _RESOLVED_SUFFIXES = {
@@ -1831,14 +2037,37 @@ def _segment_executes(segment: str) -> bool:
     if index is None:
         return _sudo_shell(words)
     names = _name_variants(words[index])
-    # `su` or `runuser` left as the command has no `-c`: it runs the user's shell on stdin.
-    if names & (_SHELL_NAMES | _IEX_NAMES | {"su", "runuser"}):
+    # `su`, `runuser` or `script` left as the command has no `-c`: each runs the user's
+    # shell on standard input.
+    if names & (_SHELL_NAMES | _IEX_NAMES | {"su", "runuser", "script"}):
         return True
     interpreter = next(iter(sorted(names & _STDIN_INTERPRETERS.keys())), None)
-    # An output redirection's words, as in `python3 2>/dev/null`, are not the program.
-    return interpreter is not None and _reads_stdin(
-        interpreter, _unredirected(segment, spans, index + 1, inputs=True)
-    )
+    # An output redirection's words, as in `python3 2>/dev/null`, are not the program,
+    # nor is the `)` that closes a subshell, as in `( python3 )`.
+    args = _unredirected(segment, spans, index + 1, inputs=True)
+    while args and args[-1] == ")":
+        args.pop()
+    if names & {".", "source"}:
+        # `source /dev/stdin` runs what the pipe carries in this shell.
+        return bool(args) and _decode_word(args[0], drop_ifs=True) in _STDIN_PROGRAMS - {"-"}
+    if "eval" in names:
+        # `eval sh` runs a shell on the pipe; `eval "$(cat)"` runs the pipe's text.
+        operands = [word for word in args if word != "--"]
+        return any(
+            _name_variants(word) & _SHELL_NAMES or _reads_piped_stdin(word) for word in operands
+        )
+    return interpreter is not None and _reads_stdin(interpreter, args)
+
+
+# A command substitution whose output is what it reads from standard input.
+_PIPED_STDIN_TEXT = re.compile(
+    r"""["']?(?:\$\(\s*(?:cat(?:\s+(?:-|/dev/stdin|/dev/fd/0))?|<\s*/dev/stdin)\s*\)"""
+    r"""|`\s*cat(?:\s+(?:-|/dev/stdin|/dev/fd/0))?\s*`)["']?"""
+)
+
+
+def _reads_piped_stdin(word: str) -> bool:
+    return _PIPED_STDIN_TEXT.fullmatch(word) is not None
 
 
 def _sudo_shell(words: list[str]) -> bool:
@@ -2628,6 +2857,9 @@ def _fetch_exec(command: str) -> bool:
         extra = [p for p in _split_pipelines(command, respect_quotes=True) if tuple(p) not in seen]
         if extra:
             pipe_views = [*pipelines, *extra]
+    # A group a pipe feeds passes it on to every command inside it.
+    if "|" in command and _GROUP_OPENER.search(command):
+        pipe_views = [*pipe_views, *_command_pipelines(command, piped_groups=True)]
     for segments in pipe_views:
         # One forward pass: a fetch and an executor later in the same pipeline.
         fetched = False
