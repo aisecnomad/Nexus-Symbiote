@@ -168,7 +168,7 @@ A pull request that rewrites a whole file from an old branch can silently revert
 ### How a pull request merges
 
 - **One at a time.** Bring `main` into the branch with a merge commit; never rebase or force-push a branch someone else may hold. Wait for `Verified CI` on that head, then merge.
-- **The merge commit.** Since #236 (2026-11-16), `main` takes each pull request as a merge commit, `<title> (#N)`. Before that, most were squash-merged; the [2026-11-03 review](docs/audits/closed-pr-review-2026-11-03.md#findings) records how a squash merge silently reverted #99. `git log --first-parent main` lists one commit per directly merged pull request.
+- **The merge commit.** Since #236 (2026-11-16), `main` takes each pull request as a merge commit, `<title> (#N)`. Before that, most were squash-merged (the 2026-11-03 review in git history records how a squash merge silently reverted #99). `git log --first-parent main` lists one commit per directly merged pull request.
 - **Labels gate the merge.** A pull request merges only with `review: verified` at its current head and without `do-not-merge`. The [label guide](docs/labels.md) lists requirements.
 - **Integration pull requests.** An integration pull request carries several reviewed pull requests at their reviewed heads; the 1,500-line cap applies to the whole. Target each constituent at `main` so GitHub records it as merged when the integration lands. Otherwise, close each by hand with a comment naming the integration's merge commit, and label it `superseded`.
 - **Recording.** The [pull-request reviews](docs/README.md#project-records) under `docs/audits/` record how each pull request reached `main`.
@@ -199,6 +199,6 @@ The job also checks:
 - Vendored schemas' recorded SHA-256 digests
 - README links (must be absolute for PyPI; each must resolve to a tracked file and heading)
 
-These checks are offline and do not authenticate an upstream publisher. Review schema byte changes and their provenance manifest together. Keep experimental-branch merges and manually ported changes distinct from ancestry on `main`; the [closed-PR audit](docs/audits/closed-pr-review-2026-11-02.md) records that distinction.
+These checks are offline and do not authenticate an upstream publisher. Review schema byte changes and their provenance manifest together. Keep experimental-branch merges and manually ported changes distinct from ancestry on `main`.
 
 Read [SECURITY.md](SECURITY.md) before reporting security-sensitive defects. This project is licensed under MIT as specified in [LICENSE](LICENSE).

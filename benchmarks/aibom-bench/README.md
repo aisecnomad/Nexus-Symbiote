@@ -17,6 +17,4 @@ agent components, with the tool's own safety as a scored dimension.
 | `schemas/`, `SOURCES.json`, `fetch_schemas.py` | The CycloneDX, SARIF and SPDX schemas `score.py` validates against, vendored with their licences and digests so scoring runs offline; `fetch_schemas.py --refresh` compares them with upstream |
 | `results/` | Raw outputs per tool and mode (traces omitted), plus `scores.json` |
 
-See [SPEC.md](SPEC.md#running-the-benchmark) for how to run it.
-
-The feature enhancement plan derived from these results, with its roadmap and the benchmark criteria it would add, is [docs/enhancement-plan-2026-11-18.md](../../docs/enhancement-plan-2026-11-18.md).
+See [SPEC.md](SPEC.md#running-the-benchmark) for how to run it, and [ROADMAP.md](../../ROADMAP.md) for how benchmark gaps feed into the release train.

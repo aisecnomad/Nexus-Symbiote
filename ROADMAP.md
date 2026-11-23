@@ -7,14 +7,14 @@ This is the project's single roadmap. It consolidates the seven external reviews
 consolidated recommendations", "SymBiote Path to #1", "Blueprint to Undisputed #1", "Fixes, moves
 and roadmap" and the end-to-end audit of v0.1.0), the owner's release plan of 18 November 2026
 ("Unified Roadmap to #1", which dates 1.0.0 and splits discovery from proof between
-Nexus-ShadowScan and SymBiote) and the [enhancement plan](docs/enhancement-plan-2026-11-18.md)
+Nexus-ShadowScan and SymBiote) and the 18 November 2026 enhancement plan
 derived from [AIBOM-Bench](benchmarks/aibom-bench/README.md). Every statement in the three was
 checked against `main` at c64451d on 18 November 2026, and what survives is one release train,
 0.2.0 to 1.4, in which every item carries a test that can pass or fail.
 
 `main` at 7ca2235f (the merge of #249 on 18 November) carries native format 1.1.0 and package
-version 0.2.0, unpublished. AIBOM-Bench (`benchmarks/aibom-bench/`) and the enhancement plan
-(`docs/enhancement-plan-2026-11-18.md`) arrive with this page in pull request #267, on top of
+version 0.2.0, unpublished. AIBOM-Bench (`benchmarks/aibom-bench/`) and the 18 November 2026
+enhancement plan arrived with this page in pull request #267, on top of
 `main` at 7ca2235f with `src/` unchanged. Pointers of the form `file:line` are to the tree that
 holds this page unless they start with `main:`, and a line can move once a later pull request
 lands; the benchmark's own results were produced at a13b622, whose `src/` differs
@@ -684,8 +684,8 @@ Recorded on 12 November and still in force, except the last row, which is new.
 | Stop failing the walking collectors on a symbolic link out of the project that none of them would read (audit residue) | **Declined; confinement unchanged** | a link's name cannot show whether it names a directory, and all six walking collectors read names at any depth below directories of any name; finding out would mean examining a path outside the project chosen by the checkout, and the answer would hold only on the scanning machine, not on the one that later opens the checkout. Replace the link with the file or a relative link inside the project ([known limitations](docs/known-limitations.md#every-collector)) |
 | A per-tool permission and egress model, closed on 12 November because "per-tool egress has no source in a repository" | **Reopened for repository-resident sources only (R0.3.0-2, R1.1-1)** | allow and ask rules per tool, `alwaysAllow` arrays, subagent and skill front matter, MCP tool annotations, bridge URLs and sandbox domain lists are in the repository (enhancement-plan:137); a general egress model stays out, because host load orders are undocumented and settings outside the checkout override the project's (enhancement-plan:111, :119) |
 
-**Historical experimental work.** The [closed-PR audit](docs/audits/closed-pr-review-2026-11-02.md)
-records what reached the supported package and what remains separate. The experimental foundation's
+**Historical experimental work.** Git history and the 2026-11-02 closed-PR audit
+record what reached the supported package and what remains separate. The experimental foundation's
 salted Merkle disclosure protocol, full snapshot chain format, OPA/Rego export and parity suite, and
 Kubernetes/trace import contracts are not supported interfaces on `main`. Evaluate any future port
 against the current threat model and version its wire format; a merge into an experimental branch
@@ -790,8 +790,8 @@ as decided.
 
 ### Corrections to the enhancement plan
 
-What in the [enhancement plan](docs/enhancement-plan-2026-11-18.md) the tree or the decisions of
-18 November have overtaken. The plan stays as written; this roadmap is what changed.
+What in the 18 November 2026 enhancement plan the tree or the decisions of
+18 November have overtaken. The plan stays as written in git history; this roadmap is what changed.
 
 | The plan says | What is true |
 | --- | --- |
