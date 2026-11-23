@@ -310,10 +310,16 @@ _ASSIGNMENT = re.compile(
     r"(\"[^\"\n]{0,8192}\"|'[^'\n]{0,8192}'|[^\s,;\"'&|]{1,8192})"
 )
 _NETRC_WORDS = frozenset({"password", "passwd"})
-_BASE64 = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
+# URL-safe base64 uses "-" and "_" where the standard alphabet uses "+" and "/".
+_BASE64 = re.compile(r"[A-Za-z0-9+/_-]{40,}={0,2}")
 _ENCODED_LIMIT = 65536
-_KEY_WRAP_CHARS = frozenset("\u200b\ufeff\u2060\u200c\u200d\u00ad")
-_KEY_WRAP = re.compile(r"[\s\u200b\ufeff\u2060\u200c\u200d\u00ad]+")
+# Format characters that can be dropped from a wrapped key without changing its text,
+# including U+200E and the other bidi controls.
+_KEY_WRAP_CHARS = frozenset(
+    "\u00ad\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e"
+    "\u2060\u2066\u2067\u2068\u2069\ufeff"
+)
+_KEY_WRAP = re.compile("[" + re.escape("".join(sorted(_KEY_WRAP_CHARS))) + r"\s]+")
 _KEY_PREFIX_LENGTH = 16
 _WRAP_COMPARISON_FACTOR = 64
 JSON_LIMIT = 65536
@@ -669,7 +675,7 @@ def _private_key(value: str) -> str | None:
     if len(compact) > _ENCODED_LIMIT or _BASE64.fullmatch(compact) is None:
         return None
     try:
-        decoded = base64.b64decode(compact + "=" * (-len(compact) % 4))
+        decoded = base64.urlsafe_b64decode(compact + "=" * (-len(compact) % 4))
     except (binascii.Error, ValueError):
         return None
     text = decoded.decode("utf-8", "replace")
@@ -960,7 +966,11 @@ def _default_hits(name: str, value: str) -> list[Hit]:
     for match in _SHELL_DEFAULT.finditer(value):
         var_name = match.group(1)
         default = match.group(2).strip(" \"'")
-        if "$" in default or "`" in default:
+        # A default that is only another expansion is not a committed literal.
+        # A literal that contains "$" (``Hunte$r2...``) still is.
+        if "`" in default or "$(" in default:
+            continue
+        if _REFERENCE.fullmatch(default) or _SHELL_VARIABLE.fullmatch(default):
             continue
         found = _named_hits(name, default)
         if not found and credential_name(var_name):
