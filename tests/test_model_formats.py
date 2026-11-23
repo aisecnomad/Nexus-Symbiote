@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import io
+import os
 import random
 import re
+import subprocess
+import sys
 import time
-import tracemalloc
 
 import pytest
 
@@ -490,17 +492,30 @@ def test_joined_literal_stream_matches_dunder_pattern():
         )
 
 
+# The peak is measured in a child process: tracemalloc counts every thread's allocations, so
+# in a pytest-xdist worker under coverage the I/O thread and the tracer land in the window.
+_JOINED_LITERAL_PEAK = """
+import tracemalloc
+from nexus_symbiote.utils import model_formats
+template = "{{ " + "'a'~" * 100_000 + "'b' }}"
+model_formats._joined_literal_marker("{{ 'a' ~ 'b' }}")
+tracemalloc.start()
+before, _ = tracemalloc.get_traced_memory()
+tracemalloc.reset_peak()
+assert not model_formats._joined_literal_marker(template)
+_, peak = tracemalloc.get_traced_memory()
+print(peak - before)
+"""
+
+
 def test_long_joined_literal_chain_uses_bounded_auxiliary_memory():
-    template = "{{ " + "'a'~" * 100_000 + "'b' }}"
-    already_tracing = tracemalloc.is_tracing()
-    if not already_tracing:
-        tracemalloc.start()
-    try:
-        before, _ = tracemalloc.get_traced_memory()
-        tracemalloc.reset_peak()
-        assert not model_formats._joined_literal_marker(template)
-        _, peak = tracemalloc.get_traced_memory()
-    finally:
-        if not already_tracing:
-            tracemalloc.stop()
-    assert peak - before < 100_000
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("COV_CORE_", "COVERAGE"))}
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-I", "-c", _JOINED_LITERAL_PEAK],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+        check=True,
+    )
+    assert int(result.stdout) < 100_000
