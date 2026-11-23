@@ -771,6 +771,9 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         lambda scale: "x\n <div>\n`y`@z\n" * 10_000 * scale,
         lambda scale: "<a" + " b=c" * 50_000 * scale + "\t>\n",
         lambda scale: "> <p>\n x `y`@z\n" * 10_000 * scale,
+        lambda scale: " @a" + "_b" * 40_000 * scale,
+        lambda scale: (" @x" + "_" * 40 + "y") * 1_000 * scale,
+        lambda scale: " @" + "*" * 4_000 * scale,
     ],
     ids=[
         "blank lines under nested items",
@@ -784,12 +787,27 @@ def test_no_import_that_commonmark_reads_as_text_is_missed(pieces):
         "HTML starts marked reads as text",
         "attributes marked does not take",
         "lazy lines after quoted HTML",
+        "underscores inside a word",
+        "runs of underscores",
+        "a run of markup past the name budget",
     ],
 )
 def test_reading_markdown_grows_with_the_text_not_with_its_nesting(shape):
     texts = {scale: shape(scale) for scale in (1, 4)}
     growth = len(texts[4]) / len(texts[1])
     assert scaling_ratio(lambda scale: prompt._import_tokens(texts[scale])) < 2.5 * growth
+
+
+def test_a_name_is_not_cut_at_underscores_inside_a_word():
+    name = "a_" * 1_000 + "b.md"
+    assert name in prompt._import_tokens(f"**@{name}**\n")
+
+
+def test_names_past_the_per_file_budget_are_a_failure_not_dropped(tmp_path):
+    # 2,048 places a token may end in one name: its prefixes hold about 4 Mi characters.
+    _write(tmp_path, "CLAUDE.md", " @a" + "*b" * 2_048 + "\n")
+    result = PromptScanner().scan(tmp_path)
+    assert "CLAUDE.md: too many @path imports to inventory" in result.scan_failures
 
 
 def test_credential_shaped_imports_are_never_read_or_hashed(tmp_path):

@@ -1232,10 +1232,12 @@ A way around a limit that its entry does not describe is worth a
   right before an import, so a fenced example there can count as an import. A name that only Claude Code's reading gives and that names
   no file is skipped silently: it is looked up only by its exact spelling, so it
   raises no credential or case-variant gap, and a case variant of it on a
-  case-insensitive file system is not found. Each reference yields at most 16 names
-  cut at markup, so a name whose text token ends past its sixteenth markup character
-  is missed; a file with more than 2,000 places where such a reference can start is a
-  "too many @path imports" failure. In a seeded differential, the scanner missed 3
+  case-insensitive file system is not found. A name is cut at each markup character
+  except a run of `_` between two letters or digits, where marked opens no emphasis,
+  so `**@a_b_c.md**` imports `a_b_c.md`. A file with more than 2,000 places where such
+  a reference can start, or whose references yield more than 32,000 names or more
+  than 4 Mi characters of them, as a run of thousands of `*` after an `@` does, is a
+  "too many @path imports" failure, and none of its imports is followed. In a seeded differential, the scanner missed 3
   of 70,976 imports in 40,000 documents built from whole lines and 6 of 25,993 in
   24,000 documents built from inline fragments. Each miss follows backticks that
   marked pairs into code spans differently from CommonMark, such as `` `y`@x.md ``

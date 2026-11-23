@@ -9,8 +9,7 @@ import re
 import sys
 import unicodedata
 from collections import deque
-from collections.abc import Collection
-from itertools import islice
+from collections.abc import Collection, Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -1141,11 +1140,13 @@ _JS_SPACE = "\t\n\x0b\x0c\r \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u300
 # only when that backtick is escaped; the name after a code span is read where it closes.
 _HOST_START = re.compile(rf"(?<![^{_JS_SPACE}!-/:-?\[-`{{-~])@(?=[^{_JS_SPACE}\\]|\\ )")
 _HOST_NAME = re.compile(rf"(?:[^{_JS_SPACE}\\]|\\ )+")
-_MARKUP_START = re.compile(r"[`*_\[\]<!\\]")
-# Each start yields at most this many names plus its whole run, and a file at most
-# ``_MAX_HOST_STARTS`` starts, so the names read stay linear in the text.
-_MAX_HOST_CUTS = 16
+_MARKUP_START = re.compile(r"[`*\[\]<!\\]|_+")
 _MAX_HOST_STARTS = 2 * _MAX_IMPORTS
+# The names a file's references yield, and their characters, counted as they are read;
+# past either the file is a "too many @path imports" failure, so the work stays bounded
+# by the text and no name is dropped silently.
+_MAX_HOST_NAMES = 16 * _MAX_HOST_STARTS
+_MAX_HOST_NAME_CHARACTERS = 4 * 1024 * 1024
 _DRIVE = re.compile(r"[A-Za-z]:[\\/]")
 # Sentence punctuation after a reference; the file is inventoried without it.
 _TRAILING = ".,;:!?)]}\"'"
@@ -1201,6 +1202,19 @@ def _resolve_import(directory: tuple[str, ...], token: str) -> tuple[list[str], 
     return targets, outside, too_long
 
 
+def _cuts(part: str, start: int, limit: int) -> Iterator[int]:
+    """Each place in ``part[start:limit]`` where markup may end a marked text token.
+
+    marked opens and closes no emphasis at a run of ``_`` inside a word, between two
+    letters or digits, so that run ends no token.
+    """
+    for markup in _MARKUP_START.finditer(part, start, limit):
+        at, end = markup.span()
+        if part[at] == "_" and part[at - 1].isalnum() and end < len(part) and part[end].isalnum():
+            continue
+        yield from range(at, end)
+
+
 def _import_readings(text: str) -> tuple[list[str], list[str], bool]:
     """@path references in the text of a Markdown file, outside its code as CommonMark
     reads it, each name Claude Code may read from the same text, and whether it holds
@@ -1214,9 +1228,9 @@ def _import_readings(text: str) -> tuple[list[str], list[str], bool]:
     names no file is skipped, so extra names cost only a lookup.
     """
     own: list[str] = []
-    host: list[str] = []
-    starts = 0
-    for part in text_outside_code(text):
+    host: dict[str, None] = {}
+    starts = names = characters = 0
+    for part in dict.fromkeys(text_outside_code(text)):
         own.extend(_IMPORT.findall(part))
         end = 0
         for found in _HOST_START.finditer(part):
@@ -1229,7 +1243,7 @@ def _import_readings(text: str) -> tuple[list[str], list[str], bool]:
                 continue
             starts += 1
             if starts > _MAX_HOST_STARTS:
-                return own, host, True
+                return own, list(host), True
             start = found.end()
             # Every start inside one run of name characters ends where that run ends.
             if start >= end:
@@ -1238,14 +1252,14 @@ def _import_readings(text: str) -> tuple[list[str], list[str], bool]:
             limit = min(end, start + _MAX_PATH_BYTES + 1)
             if (fragment := part.find("#", start, limit)) >= 0:
                 limit = fragment
-            cuts = islice(
-                (markup.start() for markup in _MARKUP_START.finditer(part, start, limit)),
-                _MAX_HOST_CUTS,
-            )
-            for cut in dict.fromkeys((*cuts, limit)):
+            for cut in (*_cuts(part, start, limit), limit):
+                names += 1
+                characters += cut - start
+                if names > _MAX_HOST_NAMES or characters > _MAX_HOST_NAME_CHARACTERS:
+                    return own, list(host), True
                 if form := part[start:cut].replace("\\ ", " "):
-                    host.append(form)
-    return own, host, False
+                    host[form] = None
+    return own, list(host), False
 
 
 def _import_tokens(text: str) -> list[str]:

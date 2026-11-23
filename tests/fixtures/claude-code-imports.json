@@ -1655,6 +1655,48 @@
    "name": "text after a comment",
    "source": "<!-- c -->`x`@notes.md\n",
    "imports": []
+  },
+  {
+   "name": "R400 strong name with 17 underscores",
+   "source": "**@a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r.md**\n",
+   "imports": [
+    "a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r.md"
+   ]
+  },
+  {
+   "name": "R400 emphasized name with 17 underscores",
+   "source": "_@a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r.md_\n",
+   "imports": [
+    "a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r.md"
+   ]
+  },
+  {
+   "name": "R400 underscore runs inside a name",
+   "source": "**@a__b___c____d.md**\n",
+   "imports": [
+    "a__b___c____d.md"
+   ]
+  },
+  {
+   "name": "R400 underscore before punctuation ends emphasis",
+   "source": "_@a_.md_\n",
+   "imports": [
+    "a"
+   ]
+  },
+  {
+   "name": "R400 strong name with 17 exclamation marks",
+   "source": "**@a!b!c!d!e!f!g!h!i!j!k!l!m!n!o!p!q!r.md**\n",
+   "imports": [
+    "a!b!c!d!e!f!g!h!i!j!k!l!m!n!o!p!q!r.md"
+   ]
+  },
+  {
+   "name": "R400 strong name with 17 underscores after hyphens",
+   "source": "**@a-_b-_c-_d-_e-_f-_g-_h-_i-_j-_k-_l-_m-_n-_o-_p-_q-_r.md**\n",
+   "imports": [
+    "a-_b-_c-_d-_e-_f-_g-_h-_i-_j-_k-_l-_m-_n-_o-_p-_q-_r.md"
+   ]
   }
  ]
 }
