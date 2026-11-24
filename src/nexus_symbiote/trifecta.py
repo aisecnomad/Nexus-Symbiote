@@ -177,16 +177,19 @@ _SECRET_ENV_KEY_RE = re.compile(
 # A tool that requests a URL of the caller's choosing reads untrusted content and is also
 # a way out: the model can put private data in the URL it asks for.
 _URL_FETCH_NAMES = (
-    r"fetch|fetch_url|web_fetch|get_url|load_url|read_url|open_url|fetch_page|get_page|"
-    r"scrape|scrape_url|crawl|browse|browser|web_browse|http_get|curl|download|"
-    r"download_url|read_web"
+    r"fetch|fetch_urls?|web_fetch|get_urls?|load_urls?|read_urls?|open_urls?|fetch_pages?|get_pages?|"
+    r"scrape|scrape_urls?|crawl|browse|browser|web_browse|http_get|curl|download|"
+    r"download_urls?|read_web|fetch_html|fetch_content"
 )
-_URL_FETCH_TOOL_RE = re.compile(rf"(?:^|_)(?:{_URL_FETCH_NAMES})(?:$|_)")
+_VER_TAIL = r"(?:_v\d+)?(?:$|_)"
+_URL_FETCH_TOOL_RE = re.compile(rf"(?:^|_)(?:{_URL_FETCH_NAMES}){_VER_TAIL}")
 _UNTRUSTED_TOOL_RE = re.compile(
     r"(?:^|_)(?:" + _URL_FETCH_NAMES + r"|web_search|search_web|external_read|"
-    r"read_email|fetch_email|get_email|list_emails|read_issue|read_pr|"
-    r"read_comment|read_message|read_slack|read_webhook|receive_webhook"
-    r")(?:$|_)"
+    r"read_emails?|fetch_emails?|get_emails?|list_emails?|read_issues?|get_issues?|list_issues?|"
+    r"read_prs?|get_prs?|read_pull_requests?|get_pull_requests?|list_pull_requests?|"
+    r"read_comments?|list_comments?|read_messages?|list_messages?|read_slack|"
+    r"read_webhooks?|receive_webhooks?"
+    r")" + _VER_TAIL
 )
 _UNTRUSTED_DESC_RE = re.compile(
     r"(?:^|_)(?:fetch_external|web_page|web_pages|scrape|crawl|browse_web|"
@@ -194,25 +197,27 @@ _UNTRUSTED_DESC_RE = re.compile(
 )
 _PRIVATE_TOOL_RE = re.compile(
     r"(?:^|_)(?:"
-    r"read_file|file_read|read_files|cat_file|open_file|view_file|load_file|get_file|"
-    r"list_files|read_dir|search_files|grep_files|"
-    r"read_secret|read_secrets|get_secret|get_secrets|list_secret|list_secrets|"
-    r"fetch_secret|secret|secrets|vault|keychain|credential|credentials|"
-    r"env_read|read_env|get_env|dump_env|"
-    r"db_query|query_db|sql_query|run_sql|execute_sql|read_db|"
-    r"customer_data|private_data|internal_doc|internal_docs|"
-    r"read_email|list_emails|get_email|read_drive|read_s3|get_object|"
-    r"read_config|read_ssh|read_key|private_key"
-    r")(?:$|_)"
+    r"read_files?|file_read|read_text_file|read_media_file|read_multiple_files|"
+    r"cat_files?|open_files?|view_files?|load_files?|get_files?|get_file_info|"
+    r"list_files|read_dirs?|list_directory|list_directory_with_sizes|directory_tree|"
+    r"list_allowed_directories|search_files|grep_files|"
+    r"read_secrets?|get_secrets?|list_secrets?|fetch_secrets?|secrets?|vault|keychain|credentials?|"
+    r"env_read|read_envs?|get_envs?|dump_envs?|"
+    r"db_query|query_db|query_database|sql_query|run_sql|execute_sql|read_db|read_databases?|"
+    r"customer_data|private_data|internal_docs?|"
+    r"read_emails?|list_emails?|get_emails?|read_drive|read_s3|get_objects?|"
+    r"read_configs?|read_ssh|read_keys?|private_keys?"
+    r")" + _VER_TAIL
 )
 _EGRESS_TOOL_RE = re.compile(
     r"(?:^|_)(?:"
-    r"send_webhook|post_webhook|webhook_send|send_email|send_mail|email_send|"
-    r"send_message|post_message|post_slack|slack_post|send_report|send_data|"
-    r"http_post|http_put|http_patch|http_delete|http_request|post_data|upload|publish|"
-    r"notify|write_file|delete_file|exec|execute|shell|bash|run_command|eval|run_code|"
-    r"git_push|create_pr|create_issue"
-    r")(?:$|_)"
+    r"send_webhooks?|post_webhooks?|webhook_send|send_emails?|send_mail|email_send|"
+    r"send_messages?|post_messages?|post_slack|slack_post|send_reports?|send_data|"
+    r"http_post|http_put|http_patch|http_delete|http_request|post_data|uploads?|publish|"
+    r"notify|write_files?|edit_files?|move_file|delete_files?|push_files|create_or_update_file|"
+    r"exec|execute|shell|bash|run_commands?|eval|run_code|"
+    r"git_push|create_prs?|create_pull_requests?|create_issues?|add_issue_comment"
+    r")" + _VER_TAIL
 )
 
 # Token sets for static MCP server launcher packages and declared server names.
@@ -551,7 +556,7 @@ _BROAD_SELECTORS = _scope_selectors(
     | {quantifier + noun for quantifier in ("all", "any", "every") for noun in _NETWORK_NAMES}
 )
 _NETWORK_SELECTORS = _scope_selectors(_NETWORK_NAMES)
-_UNGATED_CLAUDE_MODES = frozenset({"bypassPermissions", "acceptEdits"})
+_UNGATED_CLAUDE_MODES = frozenset({"bypassPermissions", "acceptEdits", "auto"})
 _UNGATED_CODEX_POLICIES = frozenset({"never"})
 _UNCONFINED_CODEX_SANDBOXES = frozenset({"danger-full-access", "full-access"})
 EVIDENCE_LIMIT = 10
@@ -878,6 +883,12 @@ def _unexpired(record: AuthorizationRecord, now: datetime) -> bool:
     return expires is None or (expires.utcoffset() is not None and expires > now)
 
 
+_READONLY_DISQUALIFYING_DESC_RE = re.compile(
+    r"\b(?:post|put|patch|delete|upload|webhook|exfiltrat\w*|publish|submit|mutate|modify|write)\b",
+    re.IGNORECASE,
+)
+
+
 def _is_pure_readonly_network_reader(component: ToolComponent) -> bool:
     """True for a read-only search tool with no mutating, exfil or URL-fetching capability."""
     decl = component.capabilities
@@ -892,6 +903,8 @@ def _is_pure_readonly_network_reader(component: ToolComponent) -> bool:
         return False
     canon = canonical_tool_name(component.name)
     if _EGRESS_TOOL_RE.search(canon) or _URL_FETCH_TOOL_RE.search(canon):
+        return False
+    if component.description and _READONLY_DISQUALIFYING_DESC_RE.search(component.description):
         return False
     return CapabilityClass.NETWORK in caps and CapabilityClass.READ in caps
 

@@ -809,7 +809,7 @@ FASTMCP2_TOOL = FASTMCP2 + "mcp = FastMCP('x')\n@mcp.tool\n"
         + "server = MCPServer('x', resources=[extra])\n@server.tool()\ndef read_note(): pass\n",
         FASTMCP2 + "mcp = FastMCP('x', transforms=[Extra()])\n@mcp.tool\ndef read_note(): pass\n",
         "from mcp.server.mcpserver import MCPServer\n"
-        + "server = MCPServer('x', 'T', 'D', 'I', 'u', [], '1', provider)\n"
+        + "server = MCPServer('x', 'T', 'D', 'I', 'u', [], '1', False, None, provider)\n"
         + "@server.tool()\ndef read_note(): pass\n",
         "from fastmcp.server.dependencies import get_server\n"
         + FASTMCP2_TOOL

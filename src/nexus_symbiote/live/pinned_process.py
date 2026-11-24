@@ -1201,11 +1201,16 @@ def terminate_process_group(proc: subprocess.Popen[bytes]) -> bool:
                 # The group already exited; the caller's wait() still reaps the launcher.
                 pass
             except PermissionError:
-                # macOS refuses killpg when it signals no member, as when the group holds
-                # only the exited, unreaped launcher, which Linux signals without error. A
-                # launcher that still runs and cannot be signalled stays an error.
-                if sys.platform.startswith("linux") or proc.poll() is None:
+                # macOS refuses killpg with EPERM when the group holds only the exited
+                # zombie OR briefly while the leader is mid-exit (XNU P_WEXIT) before
+                # waitpid sees it. Wait briefly before concluding it is alive and unsignallable.
+                if sys.platform.startswith("linux"):
                     raise
+                if proc.poll() is None:
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=0.1)
+                    if proc.poll() is None:
+                        raise
         if not namespaced:
             _kill_descendants(proc.pid)
     finally:

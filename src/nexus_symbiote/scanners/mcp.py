@@ -3970,7 +3970,7 @@ class MCPScanner(Scanner):
                 known.add(wrapped_found)
             file_secrets = SecretScrubber(unique | overflow_unique)
             collected.append((dialect, data, read, file_secrets, server_hits))
-        # A name may repeat a literal of any client file, so every file is read first.
+        # A name may repeat a literal or credential of any client file, so every file is read first.
         names = _Names(literals)
         for dialect, data, read, file_secrets, server_hits in collected:
             file_names = names.scoped(file_secrets.values)
@@ -4011,6 +4011,17 @@ class MCPScanner(Scanner):
                     # The whole server record is dropped with its risk findings, so the
                     # failure must say which server a reviewer no longer sees.
                     shown = self._diagnostic_server_name(server_name, server_config, file_secrets)
+                    if (
+                        (known is not None and known.held_by(shown))
+                        or any(names.every.find(shown))
+                        or any(names.shaped.find(shown))
+                        or any(
+                            val and val in shown
+                            for _, _, _, fs, _ in collected
+                            for val in fs.values
+                        )
+                    ):
+                        shown = REDACTED
                     result.scan_failures.append(
                         f"{dialect.path}: invalid tool definition for server '{shown}'; "
                         "the server and its risks are not inventoried"

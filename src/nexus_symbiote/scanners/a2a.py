@@ -72,6 +72,7 @@ _CARD_MARKERS = frozenset(
         "supportedInterfaces",
         "supported_interfaces",
         "additionalInterfaces",
+        "additional_interfaces",
         "skills",
         "securitySchemes",
         "security_schemes",
@@ -707,8 +708,22 @@ def _provider_url(data: dict[str, Any]) -> str | None:
 
 
 def _client_methods(declared: Any) -> list[str]:
-    # The dict form names methods by key and enables each one by its value.
+    # Support both {"schemes": ["bearer"]} / {"type": "none"} and {"bearer": true} forms.
     if isinstance(declared, dict):
+        if any(k in declared for k in ("schemes", "type", "scheme")) and set(declared) <= {
+            "schemes",
+            "type",
+            "scheme",
+            "credentials",
+        }:
+            values: list[str] = []
+            for key in ("schemes", "type", "scheme"):
+                val = declared.get(key)
+                if isinstance(val, str):
+                    values.append(val)
+                elif isinstance(val, list):
+                    values.extend(_strings(val))
+            return values
         declared = [
             key for key, value in declared.items() if value not in (False, None, "", [], {})
         ]
@@ -1020,9 +1035,11 @@ class A2AScanner(Scanner):
         # that an endpoint actually enforces authentication.
         security = _security(data, skill_declarations)
         # Clients may send credentials to these alternative endpoints too.
-        interface_urls = [
-            _whatwg_form(url) for url in _declared_urls(data.get("additionalInterfaces"))
+        raw_interfaces = [
+            *_declared_urls(data.get("additionalInterfaces")),
+            *_declared_urls(data.get("additional_interfaces")),
         ]
+        interface_urls = [_whatwg_form(url) for url in raw_interfaces]
         supported = _supported_interfaces(data)
         supported_urls: list[str] = [_whatwg_form(entry["url"]) for entry in supported]
         endpoint = endpoint or (supported_urls[0] if supported_urls else None)

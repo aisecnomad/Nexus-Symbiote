@@ -176,7 +176,6 @@ _TYPE_SYNTAX = frozenset(
         "interface_declaration",
         "implements_clause",
         "extends_type_clause",
-        "ambient_declaration",
         "function_signature",
         "method_signature",
         "abstract_method_signature",
@@ -408,7 +407,18 @@ class _Index:
         return None if scope is None else self.hoists.get(scope.id)
 
 
-def _index(root: Node, limit: Bound) -> _Index:
+def _ambient_erased(node: Node, source: bytes, javascript: bool) -> bool:
+    """Erase ``ambient_declaration`` only in TypeScript with no ASI line terminator after ``declare``."""
+    if javascript or node.type != "ambient_declaration":
+        return False
+    children = [child for child in node.children if not child.is_extra]
+    if len(children) < 2 or children[0].text != b"declare":
+        return False
+    gap = source[children[0].end_byte : children[1].start_byte]
+    return not any(sep in gap for sep in (b"\n", b"\r", b"\xe2\x80\xa8", b"\xe2\x80\xa9"))
+
+
+def _index(root: Node, limit: Bound, *, source: bytes = b"", javascript: bool = False) -> _Index:
     index = _Index([], {}, {}, {}, set())
     pending: list[tuple[Node, Node | None]] = [(root, None)]
     while pending:
@@ -430,6 +440,7 @@ def _index(root: Node, limit: Bound) -> _Index:
         if (
             (parent is not None and parent.id in index.erased)
             or node.type in _TYPE_SYNTAX
+            or _ambient_erased(node, source, javascript)
             or (node.type in _TYPE_ONLY_CAPABLE and _type_only(node))
         ):
             index.erased.add(node.id)
@@ -1299,7 +1310,7 @@ def _collect_source(
             result.surfaces_excluded.append(f"{location}: {_UNPARSED_JAVASCRIPT}")
             return
         raise _RefusedError("invalid TypeScript syntax")
-    index = _index(root, limits.bound("ts-nodes"))
+    index = _index(root, limits.bound("ts-nodes"), source=source, javascript=javascript)
     if javascript:
         # JavaScript reads `a < b > (c)` as two comparisons, TypeScript as a call.
         reading = next((node for node in index.nodes if node.type == "type_arguments"), None)
@@ -1435,13 +1446,13 @@ def _collect_source(
     for node in index.nodes:
         if node.type != "call_expression" or node.id in index.erased:
             continue
-        member = node.child_by_field_name("function")
+        member = _operand(node.child_by_field_name("function"))
         if member is None or member.type not in {"member_expression", "subscript_expression"}:
             continue
         method = _called_method(member)
         if method is not None and method not in {"registerTool", "tool"}:
             continue
-        receiver_node = member.child_by_field_name("object")
+        receiver_node = _operand(member.child_by_field_name("object"))
         if method is None:
             # A computed method may register a tool. A parameter or alias in a server
             # file can carry a server whose exact binding remains unproved.

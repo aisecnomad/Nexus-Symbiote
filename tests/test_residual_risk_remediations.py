@@ -28,7 +28,7 @@ from nexus_symbiote.scanners.mcp_launch import _host_source_flag
 from nexus_symbiote.scanners.prompt import PromptScanner
 from nexus_symbiote.scanners.registry import RegistryScanner, _unparsed, _url_origin
 from nexus_symbiote.utils.model_formats import template_escape_markers
-from tests.support import ROOT, load_script
+from tests.support import ROOT, load_script, scaling_ratio
 
 
 def test_o154_01_pr_size_default_limit_and_workflow_pin():
@@ -369,15 +369,21 @@ def test_e156_01_nel_line_separator_detected(tmp_path):
     assert any("NEXT LINE (U+0085)" in r.detail for r in sep_risks)
 
 
-def test_b140_01_half_dunder_not_flagged_but_joined_dunder_still_flagged():
-    assert template_escape_markers(b"{{ x + 'class__' }}") is False
-    assert template_escape_markers(b"{{ '__cla' + y }}") is False
-    assert template_escape_markers(b"{{ 'a' + 'b__' }}") is False
+def test_b140_01_and_b166_01_half_dunder_variable_split_and_eof_joined_dunder_flagged():
+    # Variable-split half-dunder must remain detected (no sandbox-escape bypass).
+    assert template_escape_markers(b"{{ x + 'class__' }}") is True
+    assert template_escape_markers(b"{{ '__cla' ~ y }}") is True
     assert template_escape_markers(b"{{ '__' ~ 'class__' }}") is True
     assert template_escape_markers(b"{{ '__cla' + 'ss__' }}") is True
+    # B-166-01: unterminated final string literal after completing joined dunder at EOF.
+    assert template_escape_markers(b"{{ '__cla' ~ 'ss__") is True
+    # Benign literal concatenation without dunder stays False.
+    assert template_escape_markers(b"{{ 'hello_' + 'world' }}") is False
 
 
-def test_b231_01_unverified_teardown_raises_execution_outcome_unknown(monkeypatch):
+def test_b231_01_unverified_teardown_and_cleanup_oserror_raise_execution_outcome_unknown(
+    monkeypatch,
+):
     class _DummyStream:
         def close(self) -> None:
             pass
@@ -411,6 +417,20 @@ def test_b231_01_unverified_teardown_raises_execution_outcome_unknown(monkeypatc
     mac_session._called = True
     mac_session.__exit__(None, None, None)
 
+    class _FailingDir:
+        def cleanup(self) -> None:
+            raise OSError("scratch cleanup failed")
+
+    monkeypatch.setattr("nexus_symbiote.live.session.sys.platform", "linux")
+    monkeypatch.setattr("nexus_symbiote.live.session.terminate_process_group", lambda _p: True)
+    session2 = object.__new__(PinnedStdioSession)
+    session2._process = _DummyProc()  # type: ignore[assignment]
+    session2._directory = _FailingDir()  # type: ignore[assignment]
+    session2._called = True
+    with pytest.raises(ExecutionOutcomeUnknown) as exc_info2:
+        session2.__exit__(None, None, None)
+    assert isinstance(exc_info2.value.__cause__, OSError)
+
 
 def test_d107_01_claude_md_covers_all_top_level_and_live_modules():
     claude = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
@@ -424,3 +444,471 @@ def test_d107_01_claude_md_covers_all_top_level_and_live_modules():
         ):
             missing.append(rel)
     assert missing == []
+
+
+def test_a124_01_colon_heavy_input_without_at_sign_is_linear_time():
+    def _exercise(scale: int) -> None:
+        hostile = "https:" + ":a" * (2_000 * scale)
+        assert _unparsed(hostile) == hostile
+        assert _url_origin(hostile) == hostile
+
+    assert scaling_ratio(_exercise, factor=4) < 8.0
+
+
+def test_d180_01_cross_file_secret_scrubbed_from_malformed_mcp_server_diagnostic(tmp_path):
+    marker_val = "plainval" + "9" * 16
+    (tmp_path / ".cursor").mkdir()
+    (tmp_path / ".cursor/mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "helper": {"command": "node", "args": ["a.js"], "env": {"API_KEY": marker_val}}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    marker_val: {
+                        "command": "node",
+                        "tools": [{"name": "ok", "inputSchema": "not-a-dict"}],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = MCPScanner().scan(tmp_path, config_only=True)
+    dumped = json.dumps(result.scan_failures)
+    assert marker_val not in dumped
+    assert "***" in dumped
+
+
+def test_relative_runner_command_classified_as_unpinned_local_program(tmp_path):
+    from nexus_symbiote.scanners.mcp_launch import Launch, _classify
+
+    launch = Launch()
+    _classify(["./npx", "-y", "@acme/srv@1.0.0"], launch)
+    assert launch.launcher == "local"
+    assert launch.packages == []
+    assert launch.unknown == "command is a relative path in the working directory"
+
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "rel_npx": {
+                        "command": "./npx",
+                        "args": ["-y", "@acme/srv@1.0.0"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = MCPScanner().scan(tmp_path, config_only=True)
+    srv = next(c for c in result.components if isinstance(c, MCPServerComponent))
+    assert srv.package_url is None
+    assert any(r.category in {"version_pinning", "launcher_identity"} for r in srv.risks)
+
+
+def test_r161_01_codex_named_profile_escalation_detected(tmp_path):
+    d1 = tmp_path / "p_never"
+    (d1 / ".codex").mkdir(parents=True)
+    (d1 / ".codex/config.toml").write_text(
+        'approval_policy = "on-request"\n\n[profiles.ci]\napproval_policy = "never"\n',
+        encoding="utf-8",
+    )
+    r1 = IDEAgentScanner().scan(d1)
+    risks1 = [r for c in r1.components for r in c.risks]
+    assert any(
+        r.category == "permission_scope" and r.severity == RiskSeverity.MEDIUM for r in risks1
+    ), risks1
+
+    d2 = tmp_path / "p_full"
+    (d2 / ".codex").mkdir(parents=True)
+    (d2 / ".codex/config.toml").write_text(
+        'approval_policy = "on-request"\n\n[profiles.ci]\nsandbox_mode = "danger-full-access"\n',
+        encoding="utf-8",
+    )
+    r2 = IDEAgentScanner().scan(d2)
+    risks2 = [r for c in r2.components for r in c.risks]
+    assert any(
+        r.category == "permission_scope" and r.severity == RiskSeverity.HIGH for r in risks2
+    ), risks2
+
+
+def test_a163_01_39c9cbd2_and_h8_ide_permission_and_task_runner_escalation(tmp_path):
+    for idx, rule in enumerate(
+        (
+            "Bash(make:*)",
+            "Bash(npm run *)",
+            "Bash(ba* -c *)",
+            "WebSearch",
+            "PowerShell(*)",
+            "WebFetch(domain:*.com)",
+            "Read(~/.ssh/*)",
+            "Bash(npm test > /tmp/out *)",
+            "Bash(npm test\r; id *)",
+        )
+    ):
+        case_dir = tmp_path / f"case_{idx}"
+        (case_dir / ".claude").mkdir(parents=True)
+        (case_dir / ".claude/settings.json").write_text(
+            json.dumps({"permissions": {"allow": [rule]}}),
+            encoding="utf-8",
+        )
+        res = IDEAgentScanner().scan(case_dir)
+        perm_risks = [
+            r for c in res.components for r in c.risks if r.category == "permission_scope"
+        ]
+        assert perm_risks, f"Expected permission_scope risk for {rule}"
+
+    # Safe test/lint subcommands on task runners do not trigger broad command execution.
+    safe_dir = tmp_path / "safe"
+    (safe_dir / ".claude").mkdir(parents=True)
+    (safe_dir / ".claude/settings.json").write_text(
+        json.dumps({"permissions": {"allow": ["Bash(npm test:*)", "Bash(cargo clippy *)"]}}),
+        encoding="utf-8",
+    )
+    safe_res = IDEAgentScanner().scan(safe_dir)
+    assert not [r for c in safe_res.components for r in c.risks if r.category == "permission_scope"]
+
+
+def test_lane_b_h2_and_m2_ts_declare_asi_and_wrapped_receiver_collected(tmp_path):
+    (tmp_path / "server.ts").write_text(
+        "import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';\n"
+        "const srv = new McpServer({ name: 'demo', version: '1.0.0' });\n"
+        "declare\n"
+        "srv.tool('asi_tool', 'desc', async () => ({ content: [] }));\n"
+        "(srv!).tool('nonnull_tool', 'desc', async () => ({ content: [] }));\n",
+        encoding="utf-8",
+    )
+    result = MCPScanner().scan(tmp_path)
+    tool_names = {c.name for c in result.components if isinstance(c, ToolComponent)}
+    assert {"asi_tool", "nonnull_tool"} <= tool_names
+
+
+def test_d210_01_b210_02_and_h3_python_mcp_scanner_gaps(tmp_path):
+    # D-210-01: mcp.server.MCPServer recognized as factory
+    d1 = tmp_path / "d1"
+    d1.mkdir()
+    (d1 / "srv.py").write_text(
+        "from mcp.server import MCPServer\n"
+        "mcp = MCPServer('demo')\n"
+        "@mcp.tool()\n"
+        "def ping() -> str:\n"
+        "    return 'pong'\n",
+        encoding="utf-8",
+    )
+    r1 = MCPScanner().scan(d1)
+    assert {c.name for c in r1.components if isinstance(c, ToolComponent)} == {"ping"}
+
+    # Lane B H3: conditional/carrier low-level Server reference
+    d2 = tmp_path / "d2"
+    d2.mkdir()
+    (d2 / "low.py").write_text(
+        "import mcp.server as ms\ncls = ms.Server if True else object\napp = cls('demo')\n",
+        encoding="utf-8",
+    )
+    r2 = MCPScanner().scan(d2)
+    assert any("low-level" in g for g in r2.surfaces_excluded), r2.surfaces_excluded
+
+    # B-210-02: unrecognized local receiver with .tool() when MCP SDK is imported
+    d3 = tmp_path / "d3"
+    d3.mkdir()
+    (d3 / "unrec.py").write_text(
+        "import mcp\n"
+        "app = build_custom_wrapper()\n"
+        "@app.tool()\n"
+        "def secret_tool() -> str:\n"
+        "    return 'x'\n",
+        encoding="utf-8",
+    )
+    r3 = MCPScanner().scan(d3)
+    assert any(
+        "unsupported Python MCP binding or dynamic registration" in g for g in r3.surfaces_excluded
+    ), r3.surfaces_excluded
+
+
+def test_d211_01_lane_b_h5_and_uv_lock_artifact_origin_validation(tmp_path):
+    # D-211-01: Yarn v1 checksum alone does not satisfy integrity
+    y1 = tmp_path / "y1"
+    y1.mkdir()
+    (y1 / "package.json").write_text(
+        json.dumps({"dependencies": {"openai": "^4.0.0"}}), encoding="utf-8"
+    )
+    (y1 / "yarn.lock").write_text(
+        "# yarn lockfile v1\n\n"
+        "openai@^4.0.0:\n"
+        '  version "4.52.0"\n'
+        '  resolved "https://registry.yarnpkg.com/openai/-/openai-4.52.0.tgz"\n'
+        '  checksum "deadbeef"\n',
+        encoding="utf-8",
+    )
+    ry = RegistryScanner().scan(y1)
+    openai_comp = next(c for c in ry.components if c.name == "openai")
+    assert any(r.category == "missing_lockfile_integrity" for r in openai_comp.risks), (
+        openai_comp.risks
+    )
+
+    # Lane B H5: non-canonical package-lock.json packages key fails closed
+    n1 = tmp_path / "n1"
+    n1.mkdir()
+    (n1 / "package.json").write_text(
+        json.dumps({"dependencies": {"openai": "4.52.0"}}), encoding="utf-8"
+    )
+    (n1 / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"dependencies": {"openai": "4.52.0"}},
+                    "node_modules/./openai": {"version": "4.52.0"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    rn = RegistryScanner().scan(n1)
+    assert any("package-lock.json: invalid or unsupported lockfile" in f for f in rn.scan_failures)
+
+    # uv.lock external/cleartext wheel URL masquerading behind pypi.org
+    u1 = tmp_path / "u1"
+    u1.mkdir()
+    (u1 / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = ["openai>=1.0"]\n',
+        encoding="utf-8",
+    )
+    (u1 / "uv.lock").write_text(
+        "version = 1\n\n"
+        "[[package]]\n"
+        'name = "openai"\n'
+        'version = "1.50.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'wheels = [{ url = "http://mirror.attacker.invalid/openai-1.50.0-py3-none-any.whl", '
+        'hash = "sha256:' + "a" * 64 + '" }]\n',
+        encoding="utf-8",
+    )
+    ru = RegistryScanner().scan(u1)
+    py_comp = next(c for c in ru.components if c.name == "openai")
+    assert py_comp.package_url is None
+    assert py_comp.registry_uri is None
+    assert any(
+        r.category == "registry_origin" and r.severity == RiskSeverity.HIGH for r in py_comp.risks
+    ), py_comp.risks
+
+
+def test_b168_01_model_template_post_read_symlink_recheck(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from nexus_symbiote.scanners.model import ModelScanner
+    from nexus_symbiote.utils.confined import ConfinedCollection
+
+    (tmp_path / "model.safetensors").write_bytes(b"\x02\x00\x00\x00\x00\x00\x00\x00{}")
+    (tmp_path / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "chat_template.jinja").write_text("{{ messages[0]['content'] }}", encoding="utf-8")
+
+    # Simulate TOCTOU swap: regular file before read, followed in-root symlink to .env after read.
+    def _flipping_link_target(self, rel: str | Path) -> str | None:
+        if Path(rel).name == "chat_template.jinja":
+            return ".env"
+        return None
+
+    monkeypatch.setattr(ConfinedCollection, "link_target", _flipping_link_target)
+    res = ModelScanner().scan(tmp_path)
+    assert any("file changed during collection" in f for f in res.scan_failures), res.scan_failures
+
+
+def test_e186_01_rag_bare_high_entropy_identifier_redacted(tmp_path):
+    from nexus_symbiote.scanners.rag import RAGScanner
+
+    entropy_id = "Ab9Cd8Ef7Gh6Ij5Kl4Mn3Op2Qr1St0"
+    (tmp_path / "rag_config.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "name": "kb",
+                        "embedding_model": entropy_id,
+                        "source_uris": [f"./indices/{entropy_id}"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    res = RAGScanner().scan(tmp_path)
+    dumped = json.dumps([c.model_dump(mode="json") for c in res.components])
+    assert entropy_id not in dumped
+    assert "[redacted]" in dumped
+
+
+def test_a2a_additional_interfaces_snake_case_and_dict_auth_schemes(tmp_path):
+    from nexus_symbiote.scanners.a2a import A2AScanner
+
+    (tmp_path / "agent.json").write_text(
+        json.dumps(
+            {
+                "name": "snake-card",
+                "url": "https://primary.example.com/a2a",
+                "version": "1.0.0",
+                "capabilities": {},
+                "skills": [{"id": "s1", "name": "Skill"}],
+                "additional_interfaces": [
+                    {"url": "https://backup.example.com/a2a", "transport": "JSONRPC"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "a2a_config.json").write_text(
+        json.dumps(
+            {
+                "clients": [
+                    {
+                        "name": "cli",
+                        "url": "https://primary.example.com/a2a",
+                        "authentication": {"schemes": ["Bearer"]},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    res = A2AScanner().scan(tmp_path)
+    srv = next(c for c in res.components if isinstance(c, A2AServerComponent))
+    assert srv.properties.get("additional_interface_origins") == ["https://backup.example.com"]
+    cli = next(c for c in res.components if isinstance(c, A2AClientComponent))
+    assert cli.authentication_methods == ["Bearer"]
+
+
+def test_c7_01_and_m7_secret_redaction_escaped_quotes_and_enterprise_schemes():
+    from nexus_symbiote.utils.secrets import redact_text
+
+    escaped = r'api_key="prefix\"SuperSecretValue987654321"'
+    assert "SuperSecretValue987654321" not in redact_text(escaped)
+
+    for scheme in ("SSWS", "Splunk", "GenieKey"):
+        tok = "EnterpriseSecretToken123456789"
+        header = f"Authorization: {scheme} {tok}"
+        assert tok not in redact_text(header)
+
+
+def test_e303_1a_1b_and_m19_cli_attestation_and_trust_root_guards(tmp_path):
+    import hashlib
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from nexus_symbiote.operator_policy import EXIT_COLLECTION_FAILED, EXIT_USAGE_ERROR
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    bom_path = tmp_path / "bom.json"
+    AIBOM().save(bom_path)
+    env_path = tmp_path / "att.json"
+    env_path.write_text("{}", encoding="utf-8")
+
+    # E-303-1a: --require-attestation without --trusted-key is a UsageError (exit 2)
+    r_no_key = CliRunner().invoke(
+        main,
+        [
+            "validate",
+            str(bom_path),
+            "--require-attestation",
+            str(env_path),
+            "--detailed-exit-codes",
+        ],
+    )
+    assert r_no_key.exit_code == EXIT_USAGE_ERROR, r_no_key.output
+
+    # E-303-1b: missing/unreadable attestation envelope exits 4 under --detailed-exit-codes
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir()
+    pub_path = key_dir / "signer.pub"
+    priv = Ed25519PrivateKey.generate()
+    pub_bytes = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    pub_path.write_bytes(pub_bytes)
+    missing_env = tmp_path / "missing_att.json"
+    r_unreadable = CliRunner().invoke(
+        main,
+        [
+            "validate",
+            str(bom_path),
+            "--require-attestation",
+            str(missing_env),
+            "--trusted-key",
+            str(pub_path),
+            "--skip-integrity",
+            "--detailed-exit-codes",
+        ],
+    )
+    assert r_unreadable.exit_code == EXIT_COLLECTION_FAILED, r_unreadable.output
+
+    # Lane B M19: unpinned --trust-root inside --project is refused with UsageError (exit 2)
+    art = proj / "weights.bin"
+    art.write_bytes(b"hello")
+    digest = "sha256:" + hashlib.sha256(b"hello").hexdigest()
+    in_proj_tr = proj / "trusted_root.json"
+    in_proj_tr.write_text("{}", encoding="utf-8")
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text("{}", encoding="utf-8")
+    r_in_proj = CliRunner().invoke(
+        main,
+        [
+            "verify-artifact",
+            "weights.bin",
+            "--project",
+            str(proj),
+            "--sha256",
+            digest,
+            "--bundle",
+            str(bundle_path),
+            "--signer-identity",
+            "ci@example.com",
+            "--issuer",
+            "https://token.actions.githubusercontent.com",
+            "--trust-root",
+            str(in_proj_tr),
+        ],
+    )
+    assert r_in_proj.exit_code == EXIT_USAGE_ERROR, r_in_proj.output
+    assert "--trust-root must lie outside" in r_in_proj.output
+
+
+def test_darwin_mid_exit_killpg_eperm_reaped_without_error(monkeypatch):
+    import errno
+
+    from nexus_symbiote.live import pinned_process
+
+    class _MidExitProc:
+        pid = 999999
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    proc = _MidExitProc()
+    monkeypatch.setattr(pinned_process.sys, "platform", "darwin")
+    monkeypatch.setattr(pinned_process, "_kill_descendants", lambda _root: None)
+    monkeypatch.setattr(pinned_process, "_kill_session", lambda _sid: None)
+    monkeypatch.setattr(
+        pinned_process.os,
+        "killpg",
+        lambda _pgid, _sig: (_ for _ in ()).throw(
+            PermissionError(errno.EPERM, "Operation not permitted")
+        ),
+    )
+    pinned_process.terminate_process_group(proc)  # type: ignore[arg-type]
+    assert proc.returncode == 0
