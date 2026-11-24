@@ -92,6 +92,7 @@ COLLECTOR_OWNED_PROPERTIES = frozenset(
         "pinning_state",
         "rail_files",
         "requirement_hashes",
+        "schema_hash",
         "settings_hashes",
         "settings_hashes_profile",
         "source_values_bound",

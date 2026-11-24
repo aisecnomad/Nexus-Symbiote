@@ -56,7 +56,7 @@ _SUPPORTED_CDX_SPECS: Final[frozenset[str]] = frozenset(["1.4", "1.5", "1.6", "1
 _SUPPORTED_SPDX2_VERSIONS: Final[frozenset[str]] = frozenset(("SPDX-2.2", "SPDX-2.3"))
 _SHA256_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{64}", re.ASCII)
 _REQ_HASH_RE: Final[re.Pattern[str]] = re.compile(r"--hash=sha256:([0-9a-fA-F]{64})", re.ASCII)
-_REQ_OPT_RE: Final[re.Pattern[str]] = re.compile(r"(?:^|\s+)--[A-Za-z0-9_-]+(?:=\S+)?")
+_REQ_OPT_RE: Final[re.Pattern[str]] = re.compile(r"(?:^|(?<=\s))--[A-Za-z0-9_-]+(?:=\S+)?")
 _HIDDEN_SECRET_DIRS: Final[frozenset[str]] = frozenset(
     (".ssh", ".aws", ".gnupg", ".kube", ".docker")
 )
@@ -207,12 +207,19 @@ def _spec_to_pep440(spec: str) -> str | None:
     return s if any(c in s for c in "><~!*,") else None
 
 
-def _versions_conflict(peer_ver: str | None, cand_ver: str | None) -> bool:
+def _versions_conflict(
+    peer_ver: str | None, cand_ver: str | None, ecosystem: str | None = None
+) -> bool:
     if not peer_ver or not cand_ver:
         return False
     p_norm, c_norm = _clean_exact_spec(peer_ver) or "", _clean_exact_spec(cand_ver) or ""
     if p_norm == c_norm or p_norm.lstrip("v") == c_norm.lstrip("v"):
         return False
+    if ecosystem in {"npm", "cargo", "conda"}:
+        for spec_side, exact_side in ((peer_ver.strip(), c_norm), (cand_ver.strip(), p_norm)):
+            sat = _satisfies_nested_requirement(ecosystem, spec_side, exact_side)
+            if sat is not None:
+                return not sat
     for spec_side, exact_side in ((peer_ver.strip(), c_norm), (cand_ver.strip(), p_norm)):
         pep = _spec_to_pep440(spec_side)
         if pep is not None and is_exact_version(exact_side):
@@ -229,8 +236,12 @@ def _nested_version_ecosystem(component: AnyComponent) -> str | None:
     """Find declarations whose version grammar depends on the package manager."""
     if (
         not isinstance(component, RegistryEntryComponent)
-        or not component.properties.get("manifest_path")
-        or component.properties.get("pinning_state") != "manifest-only"
+        or component.properties.get("version_pinned") is True
+    ):
+        return None
+    if (
+        component.properties.get("manifest_path")
+        and component.properties.get("pinning_state") != "manifest-only"
     ):
         return None
     return component.registry_type if component.registry_type in {"conda", "cargo", "npm"} else None
@@ -1188,8 +1199,7 @@ def import_foreign_sbom(
             sha = existing.hashes.get("sha256") or existing.properties.get("declared_sha256")
             if isinstance(sha, str) and sha:
                 _record_bucket_item(b.digests, sha, existing.bom_ref, "extra_digest_conflicts", b)
-            if not existing.bom_ref.startswith("sbom:"):
-                b.unmarked_peers.append(existing)
+            b.unmarked_peers.append(existing)
 
     summary = SBOMImportSummary(
         aibom=bom,
@@ -1211,7 +1221,12 @@ def import_foreign_sbom(
     prefix_map = {"machine-learning-model": "sbom:model:", "data": "sbom:data:"}
     for index, (entry, purl) in enumerate(zip(entries, supplier_purls, strict=True)):
         raw_name: str = entry["name"]
-        raw_version = entry["version"] or (purl.version if purl is not None else None)
+        entry_ver = entry["version"]
+        purl_ver = purl.version if purl is not None else None
+        self_ver_mismatch = bool(entry_ver and purl_ver) and (
+            _clean_exact_spec(entry_ver) or ""
+        ).lstrip("v") != (_clean_exact_spec(purl_ver) or "").lstrip("v")
+        raw_version = entry_ver or purl_ver
         clean_ver = _clean_str(raw_version)[:128] if raw_version else None
         if shareable and clean_ver and not re.fullmatch(r"v?[0-9]+(?:\.[0-9]+){1,3}", clean_ver):
             clean_ver = None
@@ -1272,9 +1287,14 @@ def import_foreign_sbom(
             summary.bound_local_count += 1
 
         conflict_msgs: list[str] = []
+        if self_ver_mismatch and entry_ver and purl_ver:
+            conflict_msgs.append(
+                f"entry version ({_clean_str(entry_ver)}) disagrees with purl version ({_clean_str(purl_ver)})"
+            )
         seen_peer: set[tuple[str, str]] = set()
         overflow = 0
         unresolved_versions = False
+        cand_eco = eco if eco in {"npm", "cargo", "conda"} else None
         for k in cand_keys:
             bucket = buckets.setdefault(k, _IdentityBucket())
             if clean_ver:
@@ -1288,7 +1308,7 @@ def import_foreign_sbom(
                             continue
                         conflict = not satisfies
                     else:
-                        conflict = _versions_conflict(p_ver, clean_ver)
+                        conflict = _versions_conflict(p_ver, clean_ver, ecosystem=cand_eco)
                     if conflict:
                         seen_peer.add((p_ref, "ver"))
                         if len(conflict_msgs) < 3:
@@ -1421,6 +1441,8 @@ def import_foreign_sbom(
             comp = RegistryEntryComponent(
                 registry_type=reg_t, package_url=clean_purl if reveal_names else None, **kw
             )
+        for k in rec_keys:
+            buckets[k].unmarked_peers.append(comp)
         bom.components.append(comp)
         existing_refs.add(comp_ref)
         summary.imported_count += 1

@@ -141,6 +141,7 @@ class _Item:
     workload_identities: set[str] = field(default_factory=set)
     caller_identities: set[str] = field(default_factory=set)
     definition_hashes: set[str] = field(default_factory=set)
+    runtime_pairs: set[tuple[str, str]] = field(default_factory=set)
     unreadable_workload_identities: int = 0
     unreadable_definition_hashes: int = 0
 
@@ -255,9 +256,19 @@ class Observations:
         ident = values.get("gen_ai.agent.id")
         name = values.get("gen_ai.agent.name")
         named = ident is not None or name is not None
+        standalone_agent = (
+            operation is None
+            and method is None
+            and tool is None
+            and requested is None
+            and response is None
+            and all(values.get(k) is None for _, k in _NAMED)
+        )
         # Spans of other known operations may carry the name of the agent they run in, so
-        # only an operation name outside the convention makes a named agent a report.
-        custom = isinstance(operation, str) and operation not in GENAI_OPERATIONS
+        # only an operation name outside the convention (or a standalone agent span) reports one.
+        custom = (
+            isinstance(operation, str) and operation not in GENAI_OPERATIONS
+        ) or standalone_agent
         if operation in ("create_agent", "invoke_agent") or (custom and named):
             if not named:
                 self.without_identifier["agent"] += 1
@@ -294,8 +305,9 @@ class Observations:
         # resource's) spiffe.id is the caller's, reported apart, and only peer.identity
         # is compared as the callee's. An unreadable identity gates on every kind.
         client, own = span.kind in (3, 4), span.attributes.get("spiffe.id")
+        callee_id = span.attributes.get("peer.identity") if client else own
         for w_id, seen in (
-            (span.attributes.get("peer.identity") if client else own, item.workload_identities),
+            (callee_id, item.workload_identities),
             (own if client else None, item.caller_identities),
         ):
             if isinstance(w_id, Unreadable):
@@ -307,9 +319,13 @@ class Observations:
             t_hash = span.attributes.get("gen_ai.tool.definition_hash")
             if isinstance(t_hash, Unreadable):
                 item.unreadable_definition_hashes += 1
-            elif isinstance(t_hash, str) and t_hash not in item.definition_hashes:
-                self._record(span)
-                item.definition_hashes.add(t_hash)
+            elif isinstance(t_hash, str):
+                if t_hash not in item.definition_hashes:
+                    self._record(span)
+                    item.definition_hashes.add(t_hash)
+                if isinstance(callee_id, str) and (callee_id, t_hash) not in item.runtime_pairs:
+                    self._record(span)
+                    item.runtime_pairs.add((callee_id, t_hash))
         if span.start is not None:
             item.first = span.start if item.first is None else min(item.first, span.start)
             item.last = span.start if item.last is None else max(item.last, span.start)
@@ -568,34 +584,60 @@ class _RuntimeSummary:
     tool_count: int
     every_tool_hashed: bool
     tool_hashes: frozenset[str]
+    tool_tuples: frozenset[tuple[str | None, str | None]] = frozenset()
 
 
-def _summarize_runtime(candidates: Sequence[AnyComponent]) -> _RuntimeSummary:
+def _declared_workload_identity(
+    comp: AnyComponent, server_identities: Mapping[str, str]
+) -> str | None:
+    own = getattr(comp, "workload_identity", None)
+    if isinstance(own, str) and (trimmed := _trimmed(own)):
+        return trimmed
+    prop = comp.properties.get("workload_identity")
+    if isinstance(prop, str) and (trimmed := _trimmed(prop)):
+        return trimmed
+    if isinstance(comp, ToolComponent) and comp.mcp_server_ref:
+        return server_identities.get(comp.mcp_server_ref)
+    return None
+
+
+def _summarize_runtime(
+    candidates: Sequence[AnyComponent],
+    server_identities: Mapping[str, str] | None = None,
+) -> _RuntimeSummary:
+    lookup = server_identities or {}
     identities: set[str] = set()
     every_identity_declared = True
     tool_count = 0
     every_tool_hashed = True
     tool_hashes: set[str] = set()
+    tool_tuples: set[tuple[str | None, str | None]] = set()
     for comp in candidates:
-        declared = _trimmed(getattr(comp, "workload_identity", None))
+        declared = _declared_workload_identity(comp, lookup)
         if declared is None:
             every_identity_declared = False
         else:
             identities.add(declared)
         if isinstance(comp, ToolComponent):
             tool_count += 1
+            norm_hash: str | None = None
             if not comp.definition_hash:
                 every_tool_hashed = False
             else:
-                norm = _normalized_sha256(comp.definition_hash)
-                if norm:
-                    tool_hashes.add(norm)
+                norm_hash = _normalized_sha256(comp.definition_hash)
+                if norm_hash:
+                    tool_hashes.add(norm_hash)
+                else:
+                    # Malformed declared hash must fail closed (never wildcard-match None).
+                    norm_hash = ""
+            tool_tuples.add((declared, norm_hash))
     return _RuntimeSummary(
         frozenset(identities),
         every_identity_declared,
         tool_count,
         every_tool_hashed,
         frozenset(tool_hashes),
+        frozenset(tool_tuples),
     )
 
 
@@ -605,18 +647,21 @@ def _merge_runtime(summaries: Iterable[_RuntimeSummary]) -> _RuntimeSummary:
     tool_count = 0
     every_tool_hashed = True
     tool_hashes: set[str] = set()
+    tool_tuples: set[tuple[str | None, str | None]] = set()
     for summary in summaries:
         identities |= summary.identities
         every_identity_declared = every_identity_declared and summary.every_identity_declared
         tool_count += summary.tool_count
         every_tool_hashed = every_tool_hashed and summary.every_tool_hashed
         tool_hashes |= summary.tool_hashes
+        tool_tuples |= summary.tool_tuples
     return _RuntimeSummary(
         frozenset(identities),
         every_identity_declared,
         tool_count,
         every_tool_hashed,
         frozenset(tool_hashes),
+        frozenset(tool_tuples),
     )
 
 
@@ -645,6 +690,16 @@ def _apply_runtime_checks(entry: dict[str, Any], item: _Item, summary: _RuntimeS
             )
         else:
             entry["definition_hash_matched"] = None
+    if item.runtime_pairs and summary.tool_tuples and not _is_mismatched(entry):
+        for obs_wid, raw_hash in item.runtime_pairs:
+            obs_hash = _normalized_sha256(raw_hash)
+            if obs_hash is None or not any(
+                (c_wid is None or c_wid == obs_wid) and (c_hash is None or c_hash == obs_hash)
+                for c_wid, c_hash in summary.tool_tuples
+            ):
+                entry["workload_identity_matched"] = False
+                entry["definition_hash_matched"] = False
+                break
     if _is_mismatched(entry):
         entry["span_count"] = item.spans
 
@@ -659,6 +714,12 @@ def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str
     servers, hosted models and named agents that no item names are ``unobserved``.
     """
     inventory = _Inventory(bom)
+    server_identities: dict[str, str] = {}
+    for comp in bom.components:
+        if isinstance(comp, MCPServerComponent):
+            raw_wid = comp.properties.get("workload_identity")
+            if isinstance(raw_wid, str) and (wid := _trimmed(raw_wid)):
+                server_identities[comp.bom_ref] = wid
     result: dict[str, list[dict[str, Any]]] = {name: [] for name in _RECONCILIATION}
     mentioned: set[str] = set()
     marked: set[int] = set()
@@ -684,7 +745,9 @@ def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str
             }
             if item.caller_identities:
                 matched_entry["caller_workload_identities"] = sorted(item.caller_identities)
-            _apply_runtime_checks(matched_entry, item, _summarize_runtime((component,)))
+            _apply_runtime_checks(
+                matched_entry, item, _summarize_runtime((component,), server_identities)
+            )
             result["matched"].append(matched_entry)
             server = getattr(component, "mcp_server_ref", None)
             if isinstance(server, str):
@@ -707,7 +770,9 @@ def reconcile(observations: Observations, bom: AIBOM) -> dict[str, list[dict[str
                 for found, _basis in parts:
                     summary = summaries.get(id(found))
                     if summary is None:
-                        summary = summaries[id(found)] = _summarize_runtime(found)
+                        summary = summaries[id(found)] = _summarize_runtime(
+                            found, server_identities
+                        )
                     part_summaries.append(summary)
                 # A merge copies every identity and hash, so it is made once per
                 # combination of lists, not once per item.
