@@ -242,8 +242,13 @@ NEUTRALIZING_GATE_FLAGS = frozenset(
         "--funcargs",
         "--fixtures-per-test",
         "--markers",
+        "--deselect",
+        "--ignore",
+        "--ignore-glob",
+        "--plugin",
     }
 )
+ALLOWED_PYTEST_INI_KEYS = frozenset({"test_timeout", "faulthandler_timeout"})
 # Variables that load other code into, or change the arguments of, the gate's process.
 UNSAFE_GATE_ENV = frozenset(
     {
@@ -373,6 +378,32 @@ REVIEWED_GATE_STEPS: dict[str, dict[str, dict[str, tuple[str, dict[str, str]]]]]
                     "  '\n"
                 ),
                 {"PYTEST_LOG": "${{ runner.temp }}/pytest-offline-invariant.log"},
+            )
+        },
+        "verified": {
+            "sys.exit(bool(failed))": (
+                (
+                    "python - <<'PY'\n"
+                    "import json\n"
+                    "import os\n"
+                    "import sys\n"
+                    'results = json.loads(os.environ["CI_RESULTS"])\n'
+                    'expected = {"test", "macos", "floor", "coverage", "quality", '
+                    '"distribution", "security-regressions", "dependency-audit", "codeql", '
+                    '"action", "action-annotations", "offline-invariant"}\n'
+                    "if not isinstance(results, dict) or set(results) != expected:\n"
+                    '    print("Verification metadata does not contain exactly the required jobs")\n'
+                    "    sys.exit(1)\n"
+                    "failed = [\n"
+                    "    name for name, result in results.items()\n"
+                    '    if not isinstance(result, dict) or result.get("result") != "success"\n'
+                    "]\n"
+                    "if failed:\n"
+                    '    print("Verification did not succeed: " + ", ".join(sorted(failed)))\n'
+                    "sys.exit(bool(failed))\n"
+                    "PY\n"
+                ),
+                {"CI_RESULTS": "${{ toJSON(needs) }}"},
             )
         },
     },
@@ -1167,6 +1198,44 @@ def _may_name_a_builtin(program: str) -> bool:
     return "$" in literal or "`" in literal or "/" not in literal
 
 
+def _pytest_args_safe(program: str, args: list[str]) -> bool:
+    """Reject pytest plugin toggles (-p) and ini overrides (-o) outside timeout bounds."""
+    base = program.rsplit("/", 1)[-1]
+    is_pytest = base == "pytest" or (
+        PYTHON.fullmatch(base) is not None
+        and len(args) >= 2
+        and args[0] == "-m"
+        and args[1] == "pytest"
+    )
+    if not is_pytest:
+        return True
+    i = 2 if base != "pytest" else 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            break
+        if arg == "-p" or (arg.startswith("-p") and not arg.startswith("--")):
+            return False
+        if arg == "-o" or arg == "--override-ini":
+            if i + 1 >= len(args):
+                return False
+            key = args[i + 1].partition("=")[0].strip()
+            if key not in ALLOWED_PYTEST_INI_KEYS:
+                return False
+            i += 2
+            continue
+        if arg.startswith("-o") and not arg.startswith("--"):
+            key = arg[2:].partition("=")[0].strip()
+            if key not in ALLOWED_PYTEST_INI_KEYS:
+                return False
+        elif arg.startswith("--override-ini="):
+            key = arg.partition("=")[2].partition("=")[0].strip()
+            if key not in ALLOWED_PYTEST_INI_KEYS:
+                return False
+        i += 1
+    return True
+
+
 class _Gate:
     """A command whose failure fails the step: its program, arguments and here-documents."""
 
@@ -1177,6 +1246,8 @@ class _Gate:
 
     def runs(self, required: str) -> bool:
         """Whether this command runs the required command, or passes it what it needs."""
+        if not _pytest_args_safe(self.program, self.args):
+            return False
         for arg in self.args:
             if arg == "--":
                 break

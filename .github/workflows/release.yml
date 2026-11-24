@@ -95,7 +95,7 @@ jobs:
           python scripts/check_dependency_advisories.py
           --lock requirements-ci.lock --lock requirements-action.lock --lock requirements-floor.lock
           --out evidence/dependency-advisories.json
-      - run: python -m pytest --strict-skips
+      - run: python -m pytest -n auto --dist worksteal --strict-skips
       - name: Enforce committed security regression contracts
         run: python scripts/check_security_regressions.py --out evidence/security-regressions.json
       - name: Retain candidate security reports, including on failure

@@ -221,3 +221,23 @@ def test_a_run_from_a_subdirectory_still_refuses_binary_content(
     monkeypatch.chdir(repository / "src" / "sub")
     assert checker.main(["--base", base]) == 1
     assert "cannot be measured" in capsys.readouterr().out
+
+
+def test_default_limit_is_pinned_to_1500() -> None:
+    assert checker.DEFAULT_LIMIT == 1500
+
+
+def test_non_steering_doc_deletions_are_exempt_while_additions_and_steering_count() -> None:
+    listing = "\n".join(
+        [
+            "0\t3054\tdocs/audits/closed-pr-review-2026-11-02.json",
+            "120\t2542\tdocs/known-limitations.md",
+            "80\t1071\tROADMAP.md",
+            "0\t5\tSHADOWSCAN_INTEGRATION.md",
+            "10\t30\tCLAUDE.md",
+            "5\t15\tSECURITY.md",
+            "4\t6\tdocs/evil.py",
+        ]
+    )
+    # Counted: 120 (known-limitations added) + 80 (ROADMAP added) + 40 (CLAUDE.md) + 20 (SECURITY.md) + 10 (docs/evil.py) = 270
+    assert checker.changed_lines(listing) == 270

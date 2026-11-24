@@ -348,8 +348,8 @@ def fetch_tag_rulesets(repo: str, token: str) -> list[Any]:
     ]
 
 
-def _guards_release_tags(ruleset: Any) -> bool:
-    """Active, covering every v* tag and blocking updates and deletions."""
+def _covers_release_tags(ruleset: Any) -> bool:
+    """Active tag ruleset covering every v* tag without exclusions."""
     if (
         not isinstance(ruleset, dict)
         or ruleset.get("target") != "tag"
@@ -362,7 +362,12 @@ def _guards_release_tags(ruleset: Any) -> bool:
     exclude = names.get("exclude", []) if isinstance(names, dict) else None
     if not isinstance(include, list) or exclude:
         return False
-    if TAG_PATTERN not in include and "~ALL" not in include:
+    return TAG_PATTERN in include or "~ALL" in include
+
+
+def _guards_release_tags(ruleset: Any) -> bool:
+    """Active, covering every v* tag and blocking updates and deletions."""
+    if not _covers_release_tags(ruleset):
         return False
     rules = ruleset.get("rules")
     types = (
@@ -383,12 +388,22 @@ def evaluate_tag_rulesets(
     workflow reports it, and the administrator's check (``verify_bypass_actors``) fails on it.
     """
     for ruleset in rulesets:
-        if _guards_release_tags(ruleset) and any(
-            rule.get("type") == "creation" for rule in ruleset["rules"] if isinstance(rule, dict)
-        ):
+        if not _covers_release_tags(ruleset):
+            continue
+        rules = ruleset.get("rules")
+        has_creation = isinstance(rules, list) and any(
+            rule.get("type") == "creation" for rule in rules if isinstance(rule, dict)
+        )
+        if not has_creation:
+            continue
+        if _guards_release_tags(ruleset):
             return [
                 "release-tag creation must use a separate creation-only ruleset with an"
                 " authorized creator; the no-bypass immutability ruleset must allow creation"
+            ], []
+        if ruleset.get("bypass_actors") == []:
+            return [
+                "release-tag creation ruleset has no bypass actors, blocking all v* tag creation"
             ], []
     unknown_actors = unknown_caller = False
     for ruleset in rulesets:
