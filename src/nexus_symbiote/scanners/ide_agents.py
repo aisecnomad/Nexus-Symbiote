@@ -2859,7 +2859,163 @@ def _substitution_exec(pipelines: list[list[str]]) -> bool:
     return False
 
 
-def _fetch_exec(command: str) -> bool:
+_MAX_FETCH_EXEC_DEPTH = 4
+_MAX_EXTRACTED_SCRIPTS = 32
+_MAX_SUBSTITUTION_NESTING = 64
+
+
+def _unquote_one_layer(token: str) -> str:
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "'\"":
+        return token[1:-1]
+    return token
+
+
+def _extract_command_substitutions(command: str) -> list[str]:
+    """Extract top-level shell substitution bodies outside single quotes, linearly and bounded."""
+    if "$(" not in command and "<(" not in command and ">(" not in command and "`" not in command:
+        return []
+    found: list[str] = []
+    length = len(command)
+    i = 0
+    in_single = False
+    in_double = False
+    while i < length and len(found) < _MAX_EXTRACTED_SCRIPTS:
+        ch = command[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == '"':
+            in_double = not in_double
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = True
+            i += 1
+            continue
+        if command.startswith(("$(", "<(", ">("), i):
+            body_start = i + 2
+            j = body_start
+            depth = 1
+            sub_single = False
+            sub_double = False
+            exceeded = False
+            while j < length and depth > 0:
+                c = command[j]
+                if sub_single:
+                    if c == "'":
+                        sub_single = False
+                    j += 1
+                    continue
+                if c == "\\":
+                    j += 2
+                    continue
+                if c == '"':
+                    sub_double = not sub_double
+                    j += 1
+                    continue
+                if c == "'" and not sub_double:
+                    sub_single = True
+                    j += 1
+                    continue
+                if c == "(":
+                    depth += 1
+                    if depth > _MAX_SUBSTITUTION_NESTING:
+                        exceeded = True
+                        break
+                elif c == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if exceeded:
+                break
+            body = command[body_start:j].strip()
+            if body:
+                found.append(body)
+            i = j + 1
+            continue
+        if ch == "`":
+            body_start = i + 1
+            j = body_start
+            while j < length:
+                if command[j] == "\\":
+                    j += 2
+                    continue
+                if command[j] == "`":
+                    break
+                j += 1
+            body = command[body_start:j].strip()
+            if body:
+                found.append(body)
+            i = j + 1
+            continue
+        i += 1
+    return found
+
+
+def _extract_inline_scripts(pipelines: list[list[str]]) -> list[str]:
+    """Extract inline script arguments passed to a shell `-c`, `su -c`, or `eval`."""
+    scripts: list[str] = []
+    for segments in pipelines:
+        for segment in segments:
+            if len(scripts) >= _MAX_EXTRACTED_SCRIPTS:
+                return scripts
+            spans = _shell_word_spans(segment)
+            words = [segment[start:end] for start, end in spans]
+            index = _executable_index(words, _redirections(segment, spans), skip_inputs=True)
+            if index is None:
+                continue
+            unquoted_cmd = _unquote_one_layer(words[index]).strip()
+            if unquoted_cmd and unquoted_cmd != words[index]:
+                scripts.append(unquoted_cmd)
+            names = _name_variants(words[index])
+            rest = words[index + 1 :]
+            if names & _EVAL_NAMES:
+                operands = [w for w in rest if w != "--"]
+                if operands:
+                    joined = " ".join(_unquote_one_layer(w) for w in operands).strip()
+                    if joined:
+                        scripts.append(joined)
+                continue
+            if not (names & (_SHELL_NAMES | {"su"})):
+                continue
+            j = 0
+            while j < len(rest) and len(scripts) < _MAX_EXTRACTED_SCRIPTS:
+                word = rest[j]
+                if word == "--":
+                    break
+                if word.startswith("--command="):
+                    candidate = _unquote_one_layer(word.split("=", 1)[1]).strip()
+                    if candidate:
+                        scripts.append(candidate)
+                    break
+                if _SCRIPT_FLAG.fullmatch(word):
+                    if j + 1 < len(rest):
+                        candidate = _unquote_one_layer(rest[j + 1]).strip()
+                        if candidate:
+                            scripts.append(candidate)
+                    break
+                if (
+                    word.startswith("-")
+                    and not word.startswith("--")
+                    and len(word) > 2
+                    and word[1] == "c"
+                    and word[2] in "'\""
+                ):
+                    candidate = _unquote_one_layer(word[2:]).strip()
+                    if candidate:
+                        scripts.append(candidate)
+                    break
+                j += 1
+    return scripts
+
+
+def _fetch_exec(command: str, *, _depth: int = 0) -> bool:
     """Whether a command runs a download or a decoded payload in a shell.
 
     A pipeline is rated as a whole: a downloader or ``base64 -d`` in any segment and
@@ -2868,6 +3024,8 @@ def _fetch_exec(command: str) -> bool:
     A command or process substitution that itself downloads is the same shape
     without a pipe, as is saving the download and running that file later.
     """
+    if _depth > _MAX_FETCH_EXEC_DEPTH:
+        return False
     if (
         _runs_fetch(command)
         or _encoded_powershell(command)
@@ -2878,12 +3036,24 @@ def _fetch_exec(command: str) -> bool:
     # Every reference to a variable a download was assigned to is read as that download,
     # so `x=$(curl ...); eval "$x"` is `eval "$(curl ...)"`. The order of the assignment
     # and the reference is not tracked: a reference before it is read the same way.
-    return bool(held) and _runs_fetch(
+    if bool(held) and _runs_fetch(
         _VARIABLE_REFERENCE.sub(
             lambda match: _HELD if (match.group(1) or match.group(2)) in held else match[0],
             command,
         )
-    )
+    ):
+        return True
+    if _depth < _MAX_FETCH_EXEC_DEPTH:
+        for body in _extract_command_substitutions(command):
+            if body != command and _fetch_exec(body, _depth=_depth + 1):
+                return True
+        if any(
+            token in command.lower() for token in ("sh", "eval", "su", "zsh", "ksh", "dash", "bash")
+        ):
+            for script in _extract_inline_scripts(_split_pipelines(command, respect_quotes=True)):
+                if script != command and _fetch_exec(script, _depth=_depth + 1):
+                    return True
+    return False
 
 
 # The first word of a substitution that a variable is assigned, as in `x=$(curl ...`,
@@ -3838,9 +4008,14 @@ class IDEAgentScanner(Scanner):
                 continue
             for key in _AUTO_RUN_SETTINGS:
                 setting = data.get(key)
+                command_text: str | None = None
                 if isinstance(setting, dict) and isinstance(setting.get("command"), str):
+                    command_text = setting["command"]
+                elif isinstance(setting, str) and setting.strip():
+                    command_text = setting
+                if command_text is not None:
                     auto_run.add(key)
-                    hook_severity = _worse(hook_severity, _command_severity(setting["command"]))
+                    hook_severity = _worse(hook_severity, _command_severity(command_text))
             for key in _CREDENTIAL_HELPER_KEYS:
                 helper = data.get(key)
                 if isinstance(helper, str):

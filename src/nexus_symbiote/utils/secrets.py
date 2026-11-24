@@ -568,10 +568,12 @@ def _credential_like(token: str, scheme: str) -> bool:
 def _authorization_scheme_credential(match: re.Match[str]) -> bool:
     scheme, _space, token = match.groups()
     start = match.start()
-    header = _AUTHORIZATION_HEADER.search(
-        match.string, max(0, start - _AUTHORIZATION_LOOKBACK), start
-    )
-    return header is not None or _credential_like(token, scheme)
+    lo = max(0, start - _AUTHORIZATION_LOOKBACK)
+    if "author" in match.string[lo:start].lower():
+        header = _AUTHORIZATION_HEADER.search(match.string, lo, start)
+        if header is not None:
+            return True
+    return _credential_like(token, scheme)
 
 
 def _scheme_matches(value: str) -> Iterator[re.Match[str]]:
@@ -1005,11 +1007,13 @@ def _rule_matches(
         spans.extend(match.span() for match in _NAMED_TOKEN.finditer(value))
         return spans, rewrites
     for reading in readings:
-        for match in _RAW_AUTH_HEADER.finditer(reading):
-            if (span := _raw_auth_span(match)) is not None:
-                spans.append(span)
-    spans.extend(_url_clipped_cookie_spans(value, url_spans))
-    if url_spans:
+        if "author" in reading.lower():
+            for match in _RAW_AUTH_HEADER.finditer(reading):
+                if (span := _raw_auth_span(match)) is not None:
+                    spans.append(span)
+    if "cook" in value.lower():
+        spans.extend(_url_clipped_cookie_spans(value, url_spans))
+    if url_spans and "cook" in masked.lower():
         for match in _COOKIE_HEADER.finditer(masked):
             spans.extend(_cookie_spans(value, *_cookie_header_span(match)))
     spans.extend(match.span() for match in TOKEN_SHAPE.finditer(value))

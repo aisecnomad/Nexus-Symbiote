@@ -92,6 +92,14 @@ MODULE_FLOORS: dict[str, tuple[int, int | None]] = {
     "nexus_symbiote/evidence_profile.py": (98, 98),
     "nexus_symbiote/sbom_cli.py": (93, 88),
     "nexus_symbiote/policy_export.py": (95, 92),
+    # Security-critical modules measured on dedicated suites with 5-7% headroom:
+    "nexus_symbiote/live/pinned_process.py": (82, 78),
+    "nexus_symbiote/offline_advisories.py": (88, 82),
+    "nexus_symbiote/settings_precedence.py": (88, 80),
+    "nexus_symbiote/trifecta.py": (92, 86),
+    "nexus_symbiote/scanners/credential_files.py": (84, 75),
+    "nexus_symbiote/scanners/mcp_credentials.py": (78, 66),
+    "nexus_symbiote/vex_decisions.py": (85, 72),
 }
 COUNTS = (
     ("statement", "covered_lines", "num_statements"),

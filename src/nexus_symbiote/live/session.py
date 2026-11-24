@@ -19,6 +19,7 @@ import os
 import re
 import selectors
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping
@@ -325,7 +326,12 @@ class PinnedStdioSession:
             if proc is not None:
                 try:
                     try:
-                        terminate_process_group(proc)
+                        confirmed = terminate_process_group(proc)
+                        if sys.platform.startswith("linux") and self._called and confirmed is False:
+                            teardown = PinnedProcessError(
+                                "isolation-teardown-failed",
+                                "pinned MCP launcher process group teardown could not be verified",
+                            )
                     except Exception as err:
                         teardown = err
                 finally:
