@@ -376,6 +376,9 @@ def check(root: Path = ROOT) -> list[str]:
         *_inputs_issues(action, digest, f"{FLOOR_PYTHON}+"),
         *_inputs_issues(floor, digest, FLOOR_PYTHON),
     ]
+    tool_uv = pyproject.get("tool", {}).get("uv")
+    if isinstance(tool_uv, Mapping) and "sources" in tool_uv:
+        errors.append("pyproject.toml: [tool.uv.sources] is forbidden; resolve from PyPI only")
     cutoffs = {lock.inputs.get("cutoff") for lock in locks.values()}
     if len(cutoffs) != 1:
         errors.append("the three locks were resolved with different upload cut-offs")
@@ -513,6 +516,7 @@ def regenerate(root: Path, cutoff: str | None, upgrade: bool) -> None:
     common = [
         "--default-index",
         INDEX,
+        "--no-sources",
         "--generate-hashes",
         "--no-emit-index-url",
         "--only-binary",

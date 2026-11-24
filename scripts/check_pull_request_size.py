@@ -1,10 +1,14 @@
 """Fail a pull request that changes more than the cap outside tests and benchmarks.
 
-The count is insertions plus deletions. ``tests/`` and ``benchmarks/`` are excluded
-so a regression suite can be large. A binary file, which git reports as ``-``, is
-not counted in a tree where binaries are expected, and fails the check anywhere else,
-since its change cannot be measured. Run it in CI against the pull request's base, or
-pass ``--numstat-file`` for a review of a saved ``git diff --numstat`` listing.
+The count is insertions plus deletions across code, workflows, configuration, and agent
+steering files. ``tests/`` and ``benchmarks/`` are excluded so a regression suite can be
+large, and deleted lines in non-steering documentation (``docs/``, ``CHANGELOG.md``,
+``ROADMAP.md``, ``SHADOWSCAN_INTEGRATION.md``) are excluded so retiring historical notes
+or condensing prose is not penalized while every added documentation line still counts.
+A binary file, which git reports as ``-``, is not counted in a tree where binaries are
+expected, and fails the check anywhere else, since its change cannot be measured. Run it
+in CI against the pull request's base, or pass ``--numstat-file`` for a review of a saved
+``git diff --numstat`` listing.
 
 The pull request controls its own ``.gitattributes``, which would let ``src/** -diff``
 report every source change as binary, so git reads attributes from the base instead;
@@ -22,6 +26,7 @@ import subprocess
 from pathlib import Path
 
 SKIP_PREFIXES = ("tests/", "benchmarks/")
+DOC_DELETION_EXEMPT_FILES = frozenset({"CHANGELOG.md", "ROADMAP.md", "SHADOWSCAN_INTEGRATION.md"})
 # Trees whose binary files, such as images and model fixtures, are expected.
 BINARY_PREFIXES = (*SKIP_PREFIXES, "docs/assets/", "examples/")
 DEFAULT_LIMIT = 1500
@@ -32,6 +37,13 @@ class UnmeasuredChangeError(ValueError):
 
 
 Row = tuple[str, str, str]
+
+
+def _exempt_deletions(path: str) -> bool:
+    """Whether deleted lines in path are non-steering documentation reductions."""
+    return path in DOC_DELETION_EXEMPT_FILES or (
+        path.startswith("docs/") and path.endswith((".md", ".json"))
+    )
 
 
 def _rows(numstat: str) -> list[Row]:
@@ -46,7 +58,7 @@ def _rows(numstat: str) -> list[Row]:
 def changed_lines(
     numstat: str | list[Row], *, skip_prefixes: tuple[str, ...] = SKIP_PREFIXES
 ) -> int:
-    """Sum insertions and deletions, skipping test trees and binary rows."""
+    """Sum insertions and deletions, skipping test trees, binary rows, and pure doc deletions."""
     total = 0
     for added, deleted, path in _rows(numstat) if isinstance(numstat, str) else numstat:
         if path.startswith(skip_prefixes):
@@ -57,7 +69,7 @@ def changed_lines(
                     f"binary change outside {', '.join(BINARY_PREFIXES)}: {path!r}"
                 )
             continue
-        total += int(added) + int(deleted)
+        total += int(added) + (0 if _exempt_deletions(path) else int(deleted))
     return total
 
 

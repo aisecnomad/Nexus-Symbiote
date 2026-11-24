@@ -192,6 +192,7 @@ def _hidden(character: str) -> bool:
     point = ord(character)
     return (
         unicodedata.category(character) in {"Cf", "Zl", "Zp"}
+        or point == 0x0085
         or point in _BLANK
         or 0x180B <= point <= 0x180F
         or 0xFE00 <= point <= 0xFE0F

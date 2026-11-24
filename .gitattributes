@@ -24,7 +24,6 @@
 *.bash text eol=lf
 
 # CI and GitHub
-*.yml text eol=lf
 Dockerfile text eol=lf
 
 # Binary files
@@ -37,6 +36,7 @@ Dockerfile text eol=lf
 *.tar.gz binary
 *.zip binary
 *.gz binary
+*.safetensors binary
 
 # Vendored schemas — track but don't normalize. Only the large schema files skip
 # text diffs; the manifest, notice and license files must stay reviewable.

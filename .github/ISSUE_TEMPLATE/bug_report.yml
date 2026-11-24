@@ -66,8 +66,8 @@ body:
     id: os
     attributes:
       label: Operating system
-      description: Linux is the supported platform. Other platforms fail closed where POSIX primitives are unavailable.
-      placeholder: "Ubuntu 24.04"
+      description: Linux is the primary qualified platform; macOS 15 is supported for static CLI workflows (kernel namespace isolation is Linux-only).
+      placeholder: "Ubuntu 24.04 / macOS 15"
     validations:
       required: true
 
