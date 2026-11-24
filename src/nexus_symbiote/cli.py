@@ -2662,17 +2662,23 @@ def diff(
     old_bom = _load_bom(old_path)
     new_bom = _load_bom(new_path)
 
-    from nexus_symbiote.diff.differ import AIBOMDiffer
+    from nexus_symbiote.diff.differ import AIBOMDiffer, _values_unbound
     from nexus_symbiote.diff.upgrade_attribution import attribute_expected_upgrade
 
     result = AIBOMDiffer().diff(old_bom, new_bom)
     document = result.to_dict()
     if expect_upgrade is not None:
+        unbound_refs = frozenset(
+            comp.bom_ref
+            for comp in (*old_bom.components, *new_bom.components)
+            if _values_unbound(comp)
+        )
         try:
             document = attribute_expected_upgrade(
                 document,
                 expect_upgrade,
                 baseline_tool_version=old_bom.metadata.tool_version,
+                unbound_components=unbound_refs,
             )
         except ValueError as exc:
             raise click.UsageError(str(exc)) from None

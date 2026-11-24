@@ -287,7 +287,7 @@ PARALLEL = "-n auto --dist worksteal"
 
 def test_ci_and_make_run_the_suite_with_the_same_parallel_options():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
-    for job in ("test", "floor", "coverage"):
+    for job in ("test", "macos", "floor", "coverage"):
         runs = [s["run"] for s in workflow["jobs"][job]["steps"] if "pytest" in s.get("run", "")]
         assert len(runs) == 1 and runs[0].count(f"python -m pytest {PARALLEL} ") == 1
     offline = [
@@ -319,7 +319,7 @@ def test_each_ci_suite_dumps_tracebacks_only_just_before_its_test_timeout():
         for name in ("ci.yml", "dependencies.yml")
     }
     checked = 0
-    suites = [("ci.yml", "test"), ("ci.yml", "floor"), ("ci.yml", "coverage")]
+    suites = [("ci.yml", "test"), ("ci.yml", "macos"), ("ci.yml", "floor"), ("ci.yml", "coverage")]
     suites += [("dependencies.yml", "newest"), ("dependencies.yml", "fuzz")]
     for name, job in suites:
         for step in workflows[name]["jobs"][job]["steps"]:
@@ -332,7 +332,7 @@ def test_each_ci_suite_dumps_tracebacks_only_just_before_its_test_timeout():
             faulthandler = int(dump.group(1) if dump else options["faulthandler_timeout"])
             assert 0.9 * test_timeout <= faulthandler <= test_timeout, (job, run)
             checked += 1
-    assert checked == 5
+    assert checked == 6
 
 
 def test_the_time_limit_and_the_isolation_hold_in_a_parallel_worker(suite, monkeypatch):

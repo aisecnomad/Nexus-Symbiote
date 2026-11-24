@@ -325,7 +325,11 @@ class PinnedStdioSession:
             if proc is not None:
                 try:
                     try:
-                        terminate_process_group(proc)
+                        if terminate_process_group(proc) is False:
+                            teardown = PinnedProcessError(
+                                "isolation-teardown-failed",
+                                "pinned MCP launcher process group teardown could not be verified",
+                            )
                     except Exception as err:
                         teardown = err
                 finally:

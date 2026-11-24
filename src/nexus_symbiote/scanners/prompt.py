@@ -172,11 +172,11 @@ def _character_name(char: str) -> str:
     return unicodedata.name(char, unnamed)
 
 
-_LINE_SEPARATORS = ("\u2028", "\u2029")
+_LINE_SEPARATORS = ("\u0085", "\u2028", "\u2029")
 
 
 def _line_separator_counts(content: str) -> dict[str, int]:
-    if "\u2028" not in content and "\u2029" not in content:
+    if "\u0085" not in content and "\u2028" not in content and "\u2029" not in content:
         return {}
     return {char: content.count(char) for char in _LINE_SEPARATORS if char in content}
 
@@ -185,6 +185,7 @@ def _line_separator_risks(counts: dict[str, int], source_name: str) -> list[Risk
     if not counts:
         return []
     names = {
+        "\u0085": "NEXT LINE",
         "\u2028": "LINE SEPARATOR",
         "\u2029": "PARAGRAPH SEPARATOR",
     }

@@ -617,6 +617,19 @@ class AIBOMDiffer:
                         "severity": "critical",
                     }
                 )
+                if old_binding[0] == new_binding[0] and (
+                    _values_unbound(old) or _values_unbound(new)
+                ):
+                    modifications.append(
+                        {
+                            "detail": (
+                                "MCP server launch values are unbound in one snapshot; argument, "
+                                "environment and endpoint-path drift is undetectable. Set "
+                                "NEXUS_SYMBIOTE_SOURCE_BINDING_KEY during both collections."
+                            ),
+                            "severity": "medium",
+                        }
+                    )
             elif _values_unbound(old) or _values_unbound(new):
                 # Redacted arguments, environment values and endpoint paths are not in the
                 # structural hash. Without the keyed binding a widened filesystem root

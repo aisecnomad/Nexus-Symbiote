@@ -18,8 +18,8 @@ its own.
 The envelope, the pre-authentication encoding, key IDs and the order of checks are
 those of the runtime contracts (``nexus_symbiote.runtime``): signatures are verified
 before the payload is parsed. The statement differs: its subject is a file, not a
-contract digest. ``PREDICATE_TYPE`` is new and uses the repository's canonical
-namespace; the runtime predicate types keep their original namespace on purpose.
+contract digest. ``PREDICATE_TYPE`` and the runtime predicate types keep their original
+namespaces on purpose so existing attestations and verifiers remain stable.
 """
 
 from __future__ import annotations
