@@ -559,3 +559,14 @@ def test_a_tab_is_replaced_with_a_space_in_neutralized_text():
     from nexus_symbiote.utils.terminal import neutralize
 
     assert neutralize("name\tvalue") == "name value"
+
+
+def test_json_and_terminal_unsafe_character_sets_stay_aligned():
+    from nexus_symbiote.utils.terminal import _JSON_UNSAFE_TEXT, UNSAFE_TEXT
+
+    for code in range(0x110000):
+        ch = chr(code)
+        if ch in {"\t", "\n", "\r"}:
+            assert not _JSON_UNSAFE_TEXT.fullmatch(ch)
+            continue
+        assert bool(UNSAFE_TEXT.fullmatch(ch)) == bool(_JSON_UNSAFE_TEXT.fullmatch(ch)), hex(code)

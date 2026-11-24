@@ -657,11 +657,11 @@ def test_server_identity_and_capabilities_are_compared_after_recording(tmp_path)
 
 
 def test_descriptor_checks_share_the_session_deadline(tmp_path, monkeypatch):
-    monkeypatch.setattr(stdio, "DEADLINE_SECONDS", 2.0)
+    monkeypatch.setattr(stdio, "DEADLINE_SECONDS", 0.8)
     real = verify.check_served_tool
 
     def slow(raw, secrets=()):
-        time.sleep(0.5)
+        time.sleep(0.2)
         return real(raw, secrets)
 
     monkeypatch.setattr(verify, "check_served_tool", slow)

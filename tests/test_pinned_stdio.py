@@ -127,7 +127,10 @@ def test_no_project_policy_or_display_name_can_authorize_execution(tmp_path):
     assert not verify_mcp_servers(
         inventory(), trusted_launchers={"weather": next(iter(policy.values()))}
     ).complete
-    assert not verify_mcp_servers(inventory(), {"weather": next(iter(policy.values()))}).complete
+    with pytest.raises(ValueError, match="config_lookup"):
+        verify_mcp_servers(inventory(), {"weather": next(iter(policy.values()))})
+    with pytest.raises(ValueError, match="config_lookup"):
+        verify_mcp_servers(inventory(), config_lookup={"weather": next(iter(policy.values()))})
 
 
 def test_hash_substitution_symlink_and_extra_launch_arguments_are_refused(tmp_path):
