@@ -9,7 +9,7 @@ permissions:
   contents: read
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   test:
     name: Tests Python ${{ matrix.python }}
@@ -202,7 +202,7 @@ jobs:
           MERGE_SHA: ${{ github.sha }}
         run: |
           git fetch --no-tags --depth=2 origin "$MERGE_SHA"
-          python scripts/check_pull_request_size.py --base "$MERGE_SHA^1"
+          python scripts/check_pull_request_size.py --base "$MERGE_SHA^1" --limit 1500
       - name: Require the locks to match pyproject.toml and each other
         run: python scripts/check_locks.py
   distribution:

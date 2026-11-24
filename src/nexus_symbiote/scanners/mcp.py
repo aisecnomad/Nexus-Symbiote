@@ -29,6 +29,7 @@ import unicodedata
 from array import array
 from bisect import bisect_left
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import date
 from itertools import chain, pairwise
@@ -443,7 +444,7 @@ _CAMEL_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
 # Fixed width on purpose: "HTTPServer" splits before the capital that starts "Server".
 _ACRONYM_BOUNDARY = re.compile(r"([A-Z])([A-Z][a-z])")
 _WORD = re.compile(r"[a-z0-9]+")
-_WORD_ENDINGS = ("s", "es", "ed", "d", "ing")
+_WORD_ENDINGS = ("s", "es", "ed", "d", "ing", "er")
 
 
 _JS_INTERESTING = re.compile(r"""["'`\n]|/[/*]""")
@@ -783,6 +784,7 @@ _TRANSITIVE_RUNNERS = frozenset(
         "pnpm dlx",
         "yarn dlx",
         "uvx",
+        "uv run",
         "uv tool run",
         "pipx run",
     }
@@ -2648,6 +2650,7 @@ _CONTEXT_MEDIUM = {
     "added_capabilities": "added capabilities",
     "devices": "host devices",
     "broad_host_mount": "a broad host directory mount",
+    "credential_store_mount": "a host credential store mount",
     "preload_module": "a preloaded module",
     "code_loading_option": "an option that loads local code",
     "code_loading_environment": "environment that changes code loading",
@@ -3041,21 +3044,38 @@ def _environment_label(variable: str, launched: Iterable[str] = ()) -> str:
     return f"env:{variable}"
 
 
-def _absolute(value: str, *, windows: bool = False) -> bool:
-    """Whether a location names an absolute directory; any other may lie in the project.
+def _in_project(path: str, root: Path) -> bool:
+    """Whether a normalized POSIX absolute path lies inside the scanned checkout root."""
+    candidate = posixpath.normpath("/" + path.lstrip("/"))
+    roots = {posixpath.normpath(root.as_posix())}
+    with suppress(OSError):
+        roots.add(posixpath.normpath(root.resolve().as_posix()))
+    for base in roots:
+        if not base.startswith("/"):
+            continue
+        if candidate == base or candidate.startswith(base.rstrip("/") + "/"):
+            return True
+    return False
 
-    An empty, relative or ``~`` value is relative to the working directory, and an
-    expansion such as ``${workspaceFolder}`` or ``%USERPROFILE%`` may name the project.
+
+def _absolute(value: str, *, windows: bool = False, root: Path | None = None) -> bool:
+    """Whether a location names an absolute directory outside the project.
+
+    An empty, relative or ``~`` value is relative to the working directory, an
+    expansion such as ``${workspaceFolder}`` or ``%USERPROFILE%`` may name the project,
+    and an absolute path inside ``root`` is checkout content.
     """
     if not value or expands(value):
         return False
     if windows:
         return bool(_WINDOWS_ROOT.match(value))
-    return (
+    if not (
         value.startswith("/")
         and _PARENT.search(value) is None
         and _PROC.match(posixpath.normpath(value)) is None
-    )
+    ):
+        return False
+    return not (root is not None and _in_project(value, root))
 
 
 def _exported_function(variable: str, value: object) -> bool:
@@ -3065,15 +3085,15 @@ def _exported_function(variable: str, value: object) -> bool:
     )
 
 
-def _absolute_list(value: str) -> bool:
-    """Whether every entry of a directory list is absolute however it is split.
+def _absolute_list(value: str, *, root: Path | None = None) -> bool:
+    """Whether every entry of a directory list is absolute outside the project however split.
 
     POSIX splits at ``:`` and searches the working directory for an empty entry, so a
     Windows list such as ``C:\\bin`` names relative directories there; Windows splits
     at ``;``.
     """
-    return all(_absolute(entry) for entry in value.split(":")) and all(
-        _absolute(entry, windows=True) for entry in value.split(";") if entry
+    return all(_absolute(entry, root=root) for entry in value.split(":")) and all(
+        _absolute(entry, windows=True, root=root) for entry in value.split(";") if entry
     )
 
 
@@ -3083,6 +3103,7 @@ def _runner_environment(
     *,
     interactive: bool = False,
     xtrace: bool = False,
+    root: Path | None = None,
 ) -> tuple[list[tuple[str, str]], list[str]]:
     """Package sources a runner's environment adds, and why it leaves the identity unknown.
 
@@ -3090,7 +3111,7 @@ def _runner_environment(
     replacement of the package and any non-display setting of the runner's own
     namespace are sources. A location that may lie in the project, or a replacement,
     also makes the identity unknown: no file there is read, so a change would go
-    unseen. A PATH of absolute directories is the operator's own and adds nothing.
+    unseen. A PATH of absolute directories outside the project is the operator's own.
     """
     sources: list[tuple[str, str]] = []
     reasons: list[str] = []
@@ -3108,13 +3129,13 @@ def _runner_environment(
         elif name == _STARTUP_ENVIRONMENT or (
             interactive and name == _INTERACTIVE_STARTUP_ENVIRONMENT
         ):
-            if not _absolute(value):
+            if not _absolute(value, root=root):
                 reasons.append(_STARTUP_IN_PROJECT)
         elif name == "PS4":
             if traced and isinstance(value, str) and _TRACE_EXPANSION.search(value):
                 reasons.append(_TRACE_PROMPT)
         elif name == "PATH":
-            if not _absolute_list(value):
+            if not _absolute_list(value, root=root):
                 sources.append((_environment_label(variable), value))
                 reasons.append(_SEARCHED)
         elif (
@@ -3124,9 +3145,9 @@ def _runner_environment(
         ):
             sources.append((_environment_label(variable), value))
             inside = (
-                not _absolute_list(value)
+                not _absolute_list(value, root=root)
                 if name in _LOCATION_LISTS
-                else not _absolute(value, windows=windows)
+                else not _absolute(value, windows=windows, root=root)
             )
             if inside:
                 reasons.append(_RELOCATED)
@@ -3981,6 +4002,7 @@ class MCPScanner(Scanner):
                         server_hits.get(id(server_config)),
                         file_names,
                         launcher_unknown=read.unknown.get(server_name),
+                        root=files.root,
                     )
                 except SourceBindingKeyError as exc:
                     result.scan_failures.append(f"{dialect.path}: {exc}")
@@ -4384,6 +4406,7 @@ class MCPScanner(Scanner):
         names: _Names | None = None,
         *,
         launcher_unknown: str | None = None,
+        root: Path | None = None,
     ) -> tuple[MCPServerComponent, list[ToolComponent]]:
         config_scope = dialect.path
         command = config.get("command", "")
@@ -4423,6 +4446,7 @@ class MCPScanner(Scanner):
             environment,
             interactive=launch.interactive,
             xtrace=launch.xtrace,
+            root=root,
         )
         environment_file = "envFile" in config or launch.injected_environment
         view = self._resolver_view(launch, relocated, environment, environment_file)
@@ -5553,7 +5577,7 @@ class MCPScanner(Scanner):
                     continue
                 stem = word[: -len(ending)]
                 forms.add(stem)
-                if ending in {"ed", "ing"}:
+                if ending in {"ed", "ing", "er"}:
                     forms.add(stem + "e")
                     if stem[-1] == stem[-2]:
                         forms.add(stem[:-1])
@@ -5665,8 +5689,8 @@ _DESTRUCTIVE = _names(
 _MONEY_VERBS = _names("pay payout refund charge purchase checkout withdraw withdrawal deposit wire")
 _MONEY_NOUNS = _names("funds fund money payment balance cash invoice crypto coins usd eur")
 _STATE_CHANGING = _names(
-    "create update write send post put insert modify edit set add append move rename commit "
-    "push publish deploy merge approve"
+    "create creator update write send post put insert modify edit set add append move rename "
+    "commit push publish deploy merge approve"
 )
 _READING = _names("get list read search query fetch find lookup describe show view count inspect")
 _HARMFUL = frozenset({SideEffectProfile.DESTRUCTIVE, SideEffectProfile.FINANCIAL_TRANSACTION})

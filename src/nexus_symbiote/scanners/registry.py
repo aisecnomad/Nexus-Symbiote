@@ -373,10 +373,27 @@ def _sensitive_origin(origin: str | None) -> bool:
     )
 
 
+# A scheme-prefixed direct-reference URL without "//" (e.g., https:user:pass@host/path)
+# is parsed by packaging but missed by patterns requiring "://". Single-letter prefixes
+# (Windows drive letters), file:, and mailto: are excluded.
+_NOSLASH_CREDENTIAL_URL = re.compile(
+    r"(?<![A-Za-z0-9+.-])"
+    r"(?!file:|mailto:)[A-Za-z][A-Za-z0-9+.-]+:"
+    r"(?!//)"
+    r"[^\s/\"'<>@:]*:[^\s/\"'<>@]+@"
+    r"[^\s\"'<>]+",
+    re.IGNORECASE,
+)
+
+
 def _url_origin(url: str) -> str:
     # The parsed URL as one token: a pattern over the whole line stops at a quote
     # and would leave the rest of the path, query or a credential behind.
-    return redact_url(url) if "//" in url else url
+    if "//" in url:
+        return redact_url(url)
+    if _NOSLASH_CREDENTIAL_URL.search(url):
+        return "[redacted-url]"
+    return redact_text(url)
 
 
 def _unparsed(text: str) -> str:
@@ -387,10 +404,11 @@ def _unparsed(text: str) -> str:
     """
     cut = text.find("//")
     if cut < 0:
-        return redact_text(text)
+        return redact_text(_NOSLASH_CREDENTIAL_URL.sub("[redacted-url]", text))
     while cut and text[cut - 1] not in " \t":
         cut -= 1
-    return redact_text(text[:cut]) + "[redacted-url]"
+    prefix = _NOSLASH_CREDENTIAL_URL.sub("[redacted-url]", text[:cut])
+    return redact_text(prefix) + "[redacted-url]"
 
 
 def _identifier(text: str) -> tuple[str, bool]:
@@ -3735,6 +3753,18 @@ class RegistryScanner(Scanner):
         return any(path != [] for path in cls._local_paths(target))
 
     @classmethod
+    def _bare_archive(cls, reference: str) -> bool:
+        """Whether a requirements line is a bare local archive filename rather than a named package."""
+        if cls._NAMED_URL.match(reference) is not None:
+            return False
+        if cls._URL_SCHEME.match(reference.translate(cls._URL_DROPPED)):
+            return False
+        target = reference.split(";", 1)[0].strip()
+        if not target or any(c in target for c in "/\\") or target.startswith("."):
+            return False
+        return cls._without_extras(target).lower().endswith(cls._ARCHIVES)
+
+    @classmethod
     def _shadowed(cls, target: str, entries: set[str]) -> bool:
         """Whether pip may install "name @ URL" from a local path instead.
 
@@ -4246,6 +4276,7 @@ class RegistryScanner(Scanner):
                         # The variable can make the line any package, or an option.
                         gaps = ["environment variable not resolved"]
                     else:
+                        skip_declare = False
                         if any(o == "--editable" for o, _ in options) and not (
                             self._editable_covered(reference, folded)
                         ):
@@ -4255,7 +4286,9 @@ class RegistryScanner(Scanner):
                             # The gap never names the reference, which can carry a
                             # credential.
                             gaps = ["URL, VCS or path requirement not followed"]
-                        declare(filename, reference, "", hashes)
+                            skip_declare = self._bare_archive(args)
+                        if not skip_declare:
+                            declare(filename, reference, "", hashes)
                 for gap in gaps:
                     message = f"{filename}: {gap}"
                     if message not in noted:

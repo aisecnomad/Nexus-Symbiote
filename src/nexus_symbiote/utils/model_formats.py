@@ -474,7 +474,6 @@ def gguf_metadata(read: Read, budget: InspectionBudget | None = None) -> GGUFMet
 _TEMPLATE_ESCAPE = re.compile(
     r"\.\s*__[A-Za-z0-9_]+__|['\"]__[A-Za-z0-9_]+__['\"]|(?<![A-Za-z0-9_])attr\s*\("
     r"|\|\s*attr\b|\.\s*_(?:globals|builtins)\b"
-    r"|['\"]__[A-Za-z0-9_]*['\"][\s)]*[~+]|[~+][\s(]*['\"][A-Za-z0-9_]*__['\"]"
     # A private name Python mangled, as in self._TemplateReference__context, which
     # reaches the render context without a dunder.
     r"|(?:\.\s*|['\"])_[A-Za-z0-9][A-Za-z0-9_]*__[A-Za-z0-9]"

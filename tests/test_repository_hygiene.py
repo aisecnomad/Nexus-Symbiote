@@ -421,6 +421,9 @@ def test_code_ci_runs_and_files_that_do_not_decode_are_checked(tmp_path):
         "Dockerfile": "FROM x\u2060\n",
         "Makefile": "all:\u200b\n",
         ".github/CODEOWNERS": "* @owner\u200c\n",
+        ".editorconfig": "root = true\u200b\n",
+        ".gitattributes": "* text=auto\u202e\n",
+        ".gitignore": "*.pyc\u2060\n",
         "requirements-ci.lock": "a==1\u00ad\n",
         "config.json": '{"k": "\ufe0f"}\n',
     }

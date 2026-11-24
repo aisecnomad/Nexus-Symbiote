@@ -124,6 +124,30 @@ CASES = [
     ),
     ("undefined-keyword", {"type": "object", "maxProperites": 1}, {"a": 1, "b": 2}, "valid"),
     (
+        "homoglyph-keyword",
+        {"type": "object", "properties": {"v": {"type": "string", "maxL\u0435ngth": 1}}},
+        {"v": "ab"},
+        "schema-invalid",
+    ),
+    (
+        "invisible-keyword",
+        {"type": "object", "additionalPropert\u200bies": False},
+        {"a": 1},
+        "schema-invalid",
+    ),
+    (
+        "whitespace-keyword",
+        {"type": "object", "maxProperties ": 0},
+        {"a": 1},
+        "schema-invalid",
+    ),
+    (
+        "unicode-property-name-allowed",
+        {"type": "object", "properties": {"caf\u00e9": {"type": "string", "maxLength": 2}}},
+        {"caf\u00e9": "abc"},
+        "arguments-invalid",
+    ),
+    (
         "optional-false",
         {"type": "object", "properties": {"v": {"optional": False}}},
         {},

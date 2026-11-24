@@ -59,7 +59,9 @@ SUPPORTED_UPGRADE_VERSIONS: dict[str, UpgradeRule] = {
 _METADATA_UPGRADE_RE = re.compile(r"^(?:Native AIBOM format version|Tool version)\b")
 
 
-def _all_details_expected(details: list[str], rule: UpgradeRule) -> bool:
+def _all_details_expected(
+    details: list[str], rule: UpgradeRule, *, is_unbound: bool = False
+) -> bool:
     if not details:
         return False
     has_profile_bump = any(_PROFILE_BUMP_RE.match(d) for d in details)
@@ -67,8 +69,8 @@ def _all_details_expected(details: list[str], rule: UpgradeRule) -> bool:
     for detail in details:
         if detail == _STATIC_BINDING_MSG:
             # Only attribute the static-binding notice when the profile version bumped
-            # without any static_config_hash change; otherwise fail closed.
-            if not has_profile_bump or has_hash_change:
+            # without any static_config_hash change and values are bound; otherwise fail closed.
+            if is_unbound or not has_profile_bump or has_hash_change:
                 return False
             continue
         if not any(pattern.match(detail) for pattern in rule.detail_patterns):
@@ -81,6 +83,7 @@ def attribute_expected_upgrade(
     from_version: str,
     *,
     baseline_tool_version: str | None = None,
+    unbound_components: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Partition ``security_alerts`` into active alerts vs expected tool-upgrade transitions."""
     rule = SUPPORTED_UPGRADE_VERSIONS.get(from_version)
@@ -122,7 +125,11 @@ def attribute_expected_upgrade(
         elif comp_ref in modified_by_ref and (
             alert_text.startswith(("Medium change in ", "High change in ", "Critical change in "))
         ):
-            is_expected = _all_details_expected(modified_by_ref[comp_ref], rule)
+            is_expected = _all_details_expected(
+                modified_by_ref[comp_ref],
+                rule,
+                is_unbound=comp_ref in unbound_components,
+            )
         if is_expected:
             attributed.append({**entry, "attributed_to_upgrade": from_version})
         else:

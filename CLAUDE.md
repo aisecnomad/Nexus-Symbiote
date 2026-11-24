@@ -11,13 +11,15 @@ src/nexus_symbiote/
   generators/  — Exports & PURL projection: native JSON, CycloneDX 1.7, SPDX 3.0.1, SARIF 2.1.0, VEX
   validators/  — Completeness, integrity, and risk scoring
   diff/        — AIBOM version comparison and the snapshot alert gate
-  live/        — Opt-in observations and pinned stdio execution (`inventory.py`, `session.py`, `stdio.py`, `verify.py`)
+  live/        — Opt-in observations and pinned stdio execution (`inventory.py`, `pinned_process.py`, `session.py`, `stdio.py`, `verify.py`)
   utils/       — Confined `openat` reads (`confined.py`), Sigstore/Ed25519 verification (`crypto.py`), safe output writes (`files.py`), JSONC/model-header parsers, the CommonMark reader for `@path` imports (`markdown.py`), secret redaction, terminal neutralization
   runtime.py   — Signed, operation-bound authorization gateway (`canonical_arguments=True` by default)
   runtime_validation.py, runtime_cli.py — Isolated offline schema validation worker; `runtime` commands
-  policy.py, signature_policy.py       — Caller-selected policy and operator signer policy
+  policy.py, operator_policy.py, policy_export.py, signature_policy.py — Caller-selected policy, signed operator policy, policy export, and operator signer policy
+  settings_precedence.py               — IDE settings layer precedence and effective-policy resolution
   limits.py                            — Operator-controlled collection bounds (`--limit`, `NEXUS_SYMBIOTE_LIMITS`)
-  graph.py, lineage.py                 — Repository association graph, blast radius, lineage
+  graph.py, lineage.py, trifecta.py    — Repository association graph, blast radius, lineage, and toxic capability flows
+  instruction_diff.py                  — Instruction-surface normalization and diffing
   risk_classes.py, graph_view.py, graph_cli.py — Risk classes, exposure paths; the `graph` HTML/JSON view
   digest_cli.py                        — `digest`: file, canonical and content digests of an inventory
   attestation.py, attestation_cli.py   — DSSE/in-toto inventory attestations; `attest`, `verify-attestation`
@@ -28,7 +30,7 @@ src/nexus_symbiote/
   spdx_profiles.py, export_standard_cli.py — SPDX 3.0.1 AI/Dataset profiles, ISO 22989 mapping, `agent.yaml` declarations; `export-standard`
   control_plane_audit.py, control_plane_cli.py — Hook target/preamble binding, MCP bridges, steering surface, CI/hosted tools, identity blast radius (`audit-control-plane`)
   sbom_import.py, evidence_profile.py, sbom_cli.py — Foreign SBOM import, nested manifests, per-component evidence profile; `import-sbom`, `evidence-profile`
-  advisories.py                        — Explicit, bounded OSV queries for exact package identities
+  advisories.py, offline_advisories.py, vex_decisions.py — Explicit OSV queries, offline advisory matching, and VEX decision records
   modes.py                             — Offline by default; live mode is opt-in
   reporting.py                         — Neutralized text and JSON gate reporting
   scanner_catalog.py                   — Built-in collector universe for coverage checks

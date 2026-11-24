@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from referencing.exceptions import Unresolvable
 
@@ -252,6 +253,25 @@ class CycloneDXGenerator(Generator):
         ]
 
     @staticmethod
+    def _service_endpoint(url: str) -> str | None:
+        from nexus_symbiote.utils.secrets import holds_token_shape
+
+        if not _is_iri_reference(url):
+            return None
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return None
+        if not parts.scheme or not parts.netloc:
+            return None if holds_token_shape(url, require_sk_boundary=True) else url
+        hostport = parts.netloc.rpartition("@")[2]
+        if not hostport:
+            return None
+        path = "" if holds_token_shape(parts.path, require_sk_boundary=True) else parts.path
+        cleaned = urlunsplit((parts.scheme, hostport, path, "", ""))
+        return cleaned if _is_iri_reference(cleaned) else None
+
+    @staticmethod
     def _services(aibom: AIBOM) -> list[dict[str, Any]]:
         from nexus_symbiote.scanners.a2a import ANONYMOUS_AUTH_METHODS
 
@@ -261,15 +281,18 @@ class CycloneDXGenerator(Generator):
             endpoints: list[str] = []
             authenticated: bool | None = None
             if isinstance(comp, MCPServerComponent) and comp.endpoint_url:
-                if _is_iri_reference(comp.endpoint_url):
-                    endpoints.append(comp.endpoint_url)
+                sanitized = CycloneDXGenerator._service_endpoint(comp.endpoint_url)
+                if sanitized is not None:
+                    endpoints.append(sanitized)
             elif isinstance(comp, A2AServerComponent) and comp.endpoint_url:
-                if _is_iri_reference(comp.endpoint_url):
-                    endpoints.append(comp.endpoint_url)
+                sanitized = CycloneDXGenerator._service_endpoint(comp.endpoint_url)
+                if sanitized is not None:
+                    endpoints.append(sanitized)
                 authenticated = comp.authentication_required
             elif isinstance(comp, A2AClientComponent) and comp.agent_card_url:
-                if _is_iri_reference(comp.agent_card_url):
-                    endpoints.append(comp.agent_card_url)
+                sanitized = CycloneDXGenerator._service_endpoint(comp.agent_card_url)
+                if sanitized is not None:
+                    endpoints.append(sanitized)
                 # A client that declares no method is unauthenticated, as the collector's
                 # finding says; only a non-anonymous method makes the service authenticated.
                 authenticated = any(
@@ -278,8 +301,9 @@ class CycloneDXGenerator(Generator):
                 )
             elif isinstance(comp.properties.get("hosted_tool_origin"), str):
                 origin = comp.properties["hosted_tool_origin"]
-                if _is_iri_reference(origin):
-                    endpoints.append(origin)
+                sanitized = CycloneDXGenerator._service_endpoint(origin)
+                if sanitized is not None:
+                    endpoints.append(sanitized)
             if not endpoints:
                 continue
             service_ref = f"service:{comp.bom_ref}"

@@ -312,6 +312,7 @@ class LoopbackTLSServer(threading.Thread):
         self.reply = reply
         self.received = b""
         self.error: OSError | None = None
+        self._stop_event = threading.Event()
 
     def run(self) -> None:
         try:
@@ -323,7 +324,7 @@ class LoopbackTLSServer(threading.Thread):
         connection, _ = self.listener.accept()
         with connection:
             if self.reply is None:
-                time.sleep(2)
+                self._stop_event.wait(timeout=2)
                 return
             with self.context.wrap_socket(connection, server_side=True) as stream:
                 while b"\r\n\r\n" not in self.received:
@@ -341,6 +342,7 @@ class LoopbackTLSServer(threading.Thread):
                 stream.sendall(self.reply)
 
     def close(self) -> None:
+        self._stop_event.set()
         self.listener.close()
 
 
@@ -398,10 +400,11 @@ def test_tls_handshake_that_never_completes_stops_at_the_deadline(monkeypatch, t
                 timeout=0.5,
                 max_bytes=1000,
             )
+        elapsed = time.monotonic() - started
     finally:
-        server.join(10)
         server.close()
-    assert time.monotonic() - started < 2.5
+        server.join(10)
+    assert elapsed < 2.5
 
 
 def test_certificate_for_another_name_is_refused(monkeypatch, tmp_path):
