@@ -1207,10 +1207,8 @@ def terminate_process_group(proc: subprocess.Popen[bytes]) -> bool:
                 if sys.platform.startswith("linux"):
                     raise
                 if proc.poll() is None:
-                    try:
+                    with contextlib.suppress(subprocess.TimeoutExpired):
                         proc.wait(timeout=0.1)
-                    except subprocess.TimeoutExpired:
-                        pass
                     if proc.poll() is None:
                         raise
         if not namespaced:
