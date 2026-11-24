@@ -101,6 +101,7 @@ class _ProjectImports(NamedTuple):
 
 _FACTORIES = {
     ("mcp.server", "FastMCP"),
+    ("mcp.server", "MCPServer"),
     ("mcp.server.fastmcp", "FastMCP"),
     ("mcp.server.fastmcp.server", "FastMCP"),
     ("mcp.server.mcpserver", "MCPServer"),
@@ -307,10 +308,10 @@ _REGISTERING_KEYWORDS = _names(
 # positionals that are not handed the server; later `fastmcp` releases are unknown.
 _PLAIN_POSITIONALS = 2
 _SDK_POSITIONALS = {
-    "mcp.server": 7,
+    "mcp.server": 9,
     "mcp.server.fastmcp": 7,
     "mcp.server.fastmcp.server": 7,
-    "mcp.server.mcpserver": 7,
+    "mcp.server.mcpserver": 9,
 }
 # A request context hands handler and middleware code the server: `fastmcp` on a
 # context (`_fastmcp` in the `mcp` SDK), `mcp_server` on an `MCPServer` context, the
@@ -698,7 +699,7 @@ def _collect_agent_decorators(
     source_digest: str,
     seen_refs: set[str],
     result: ScanResult,
-) -> None:
+) -> set[str]:
     top_level = set(tree.body)
     calls = {
         node
@@ -725,7 +726,7 @@ def _collect_agent_decorators(
         result.scan_failures.append(
             f"{path.as_posix()}: Python SDK tool registration limit exceeded"
         )
-        return
+        return set()
     unsupported_factory = any(
         imported not in top_level or bindings[factory] != 1
         for factory, (imported, _) in agent_factories.items()
@@ -850,6 +851,7 @@ def _collect_agent_decorators(
         result.surfaces_excluded.append(
             f"{path.as_posix()}: unsupported Python SDK tool binding or dynamic registration"
         )
+    return set(agents)
 
 
 _LOW_LEVEL_MODULE = "mcp.server.lowlevel"
@@ -929,6 +931,20 @@ def _reaches_low_level(nodes: list[ast.AST]) -> bool:
         elif isinstance(node, ast.NamedExpr):
             assign_targets.setdefault(node.value, []).append(node.target.id)
             carriers.setdefault(node.value, []).append(node)
+        elif isinstance(node, ast.IfExp):
+            carriers.setdefault(node.body, []).append(node)
+            carriers.setdefault(node.orelse, []).append(node)
+        elif isinstance(node, ast.BoolOp):
+            for value in node.values:
+                carriers.setdefault(value, []).append(node)
+        elif (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, (ast.Tuple, ast.List))
+            and isinstance(node.slice, ast.Constant)
+            and type(node.slice.value) is int
+            and -len(node.value.elts) <= node.slice.value < len(node.value.elts)
+        ):
+            carriers.setdefault(node.value.elts[node.slice.value], []).append(node)
     if not bound:
         return False
     node_states: dict[ast.AST, set[str]] = {}
@@ -1820,6 +1836,25 @@ def _imported_receivers(tree: ast.Module) -> bool:
         if isinstance(node, (ast.Import, ast.ImportFrom))
         for alias in node.names
     }
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                if any(name.id in imported for name in _expr_roots(node.value)):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id not in imported:
+                            imported.add(target.id)
+                            changed = True
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and node.value is not None
+                and isinstance(node.target, ast.Name)
+                and node.target.id not in imported
+                and any(name.id in imported for name in _expr_roots(node.value))
+            ):
+                imported.add(node.target.id)
+                changed = True
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -1839,12 +1874,34 @@ def _imported_receivers(tree: ast.Module) -> bool:
     return False
 
 
-def _report_imported_receivers(tree: ast.Module, path: Path, result: ScanResult) -> None:
+def _unrecognized_tool_receivers(tree: ast.Module, known_agent_receivers: set[str]) -> bool:
+    """Whether a function carries a ``.tool`` decorator on an unrecognized receiver."""
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for deco in node.decorator_list:
+            target = deco.func if isinstance(deco, ast.Call) else deco
+            t_pair = _getattr_attr(target)
+            if isinstance(target, ast.Attribute) and target.attr == "tool":
+                recv = target.value
+            elif t_pair is not None and t_pair[1] == "tool":
+                recv = t_pair[0]
+            else:
+                continue
+            if isinstance(recv, ast.Name) and recv.id in known_agent_receivers:
+                continue
+            return True
+    return False
+
+
+def _report_imported_receivers(tree: ast.Module, path: Path, result: ScanResult) -> bool:
     """A file without a recognised server factory may still register tools on an imported one."""
     if _imported_receivers(tree):
         result.surfaces_excluded.append(
             f"{path.as_posix()}: Python MCP tools registered on an imported server"
         )
+        return True
+    return False
 
 
 def _sdk_module(module: str | None) -> bool:
@@ -2437,9 +2494,15 @@ def collect_python_tools(
     _report_context_handles(parsed, sdk_import, bindings, path, result, project_imports)
     _report_unused_factories(nodes, annotations, factories, path, result)
     if not factories and not decorators and not agent_factories:
-        _report_imported_receivers(tree, path, result)
-        if sdk_import and (
-            parsed.overflow or _reflective_access(parsed.all_nodes, parsed.all_parents, bindings)
+        imported_gap = _report_imported_receivers(tree, path, result)
+        if (
+            sdk_import
+            and not imported_gap
+            and (
+                parsed.overflow
+                or _reflective_access(parsed.all_nodes, parsed.all_parents, bindings)
+                or _unrecognized_tool_receivers(tree, set())
+            )
         ):
             result.surfaces_excluded.append(
                 f"{path.as_posix()}: unsupported Python MCP binding or dynamic registration"
@@ -2460,8 +2523,9 @@ def collect_python_tools(
         _collect_sdk_decorators(
             tree, nodes, decorators, bindings, path, source_digest, seen_refs, result
         )
+    agent_receivers: set[str] = set()
     if agent_factories:
-        _collect_agent_decorators(
+        agent_receivers = _collect_agent_decorators(
             tree,
             nodes,
             parents,
@@ -2475,9 +2539,15 @@ def collect_python_tools(
             result,
         )
     if not factories:
-        _report_imported_receivers(tree, path, result)
-        if sdk_import and (
-            parsed.overflow or _reflective_access(parsed.all_nodes, parsed.all_parents, bindings)
+        imported_gap = _report_imported_receivers(tree, path, result)
+        if (
+            sdk_import
+            and not imported_gap
+            and (
+                parsed.overflow
+                or _reflective_access(parsed.all_nodes, parsed.all_parents, bindings)
+                or _unrecognized_tool_receivers(tree, agent_receivers)
+            )
         ):
             result.surfaces_excluded.append(
                 f"{path.as_posix()}: unsupported Python MCP binding or dynamic registration"

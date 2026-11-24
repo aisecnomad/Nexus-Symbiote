@@ -62,7 +62,10 @@ _SCHEME_AND_VALUE = re.compile(r"([A-Za-z0-9-]{1,32})(\s++)(\S.*+)", re.DOTALL)
 # the upper-case forms count: a password may itself begin with "$".
 _REFERENCE = re.compile(r"\$\{[^{}\s]{1,128}\}|\$[A-Z][A-Z0-9_]{1,127}")
 _TEMPLATE = re.compile(r"\{\{[^{}]{1,128}\}\}")
-_AUTH = re.compile(r"(?i)\b(Bearer|Basic|Token|Bot|ApiKey|Api-Key)(\s++)([A-Za-z0-9_+/=.~-]{6,}+)")
+_AUTH = re.compile(
+    r"(?i)\b(Bearer|Basic|Token|Bot|ApiKey|Api-Key|SSWS|Splunk|GenieKey|Digest|AWS4-HMAC-SHA256)"
+    r"(\s*+\\++\s*+|\s++)([A-Za-z0-9_+/=.~:-]{6,}+)"
+)
 # After an Authorization or Proxy-Authorization header name the scheme's value is a
 # credential whatever its shape; the shape checks only tell prose from credentials.
 # Searched in a bounded window before each scheme, so the cost per match is constant.

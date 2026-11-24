@@ -2532,12 +2532,19 @@ def _unwrap_wsl(rest: list[str], launch: Launch) -> list[str] | None:
 
 
 def _classify(tokens: list[str], launch: Launch) -> None:
+    raw = tokens[0].strip().strip("\"'")
     name = normalize_command(tokens[0])
     rest = tokens[1:]
     launch.executable = name
     if expands(name) or expands(_basename_text(tokens[0])) or not name:
         launch.launcher = "unknown"
         launch.fail("command depends on the environment")
+        return
+    has_sep = "/" in raw or "\\" in raw
+    is_abs = raw.startswith("/") or bool(re.match(r"[A-Za-z]:[\\/]", raw))
+    if has_sep and (not is_abs or ".." in re.split(r"[\\/]+", raw)):
+        launch.launcher = "local"
+        launch.fail("command is a relative path in the working directory")
         return
     handler = _RUNNERS.get(name)
     if handler is not None:

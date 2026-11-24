@@ -353,9 +353,9 @@ class PinnedStdioSession:
             if self._directory is not None:
                 try:
                     self._directory.cleanup()
-                except OSError:
-                    if not isinstance(teardown, PinnedProcessError):
-                        raise
+                except OSError as err:
+                    if teardown is None:
+                        teardown = err
                 finally:
                     self._directory = None
         if teardown is None:
@@ -379,6 +379,7 @@ class PinnedStdioSession:
                 return
             raise AuthorizationError(str(teardown), reason=teardown.reason) from teardown
         if exc is not None:
+            exc.add_note(f"launcher cleanup failed: {teardown}")
             return
         raise teardown
 

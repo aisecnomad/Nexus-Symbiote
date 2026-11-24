@@ -249,12 +249,14 @@ _MAX_SETTINGS_DEPTH = 64
 # Tools whose unscoped grant gives a whole capability class, by Claude Code's names.
 _SCOPED_TOOL_CLASSES = {
     "bash": "shell commands",
+    "powershell": "shell commands",
     "edit": "file edits",
     "write": "file edits",
     "multiedit": "file edits",
     "notebookedit": "file edits",
     "read": "file reads",
     "webfetch": "web fetches",
+    "websearch": "web searches",
 }
 # A specifier made only of these characters names everything: Bash(*), Bash(:*),
 # Edit(//**), Read(~/**), Edit(./**).
@@ -287,8 +289,35 @@ _COMMAND_RUNNERS = frozenset(
         "eval", "exec", "command", "env", "sudo", "doas", "su", "xargs", "nohup",
         "timeout", "nice", "ionice", "setsid", "script", "watch",
         "docker", "podman", "nerdctl", "npx", "bunx", "uvx", "uv", "pipx",
+        "npm", "yarn", "pnpm", "cargo", "go", "make", "pip", "pip3", "gem", "bundle",
+        "composer", "gradle", "mvn", "dotnet",
     }
 )  # fmt: skip
+_TASK_RUNNERS_WITH_SAFE_SUBCOMMANDS = frozenset({"npm", "yarn", "pnpm", "cargo", "go", "dotnet"})
+_SAFE_TASK_SUBCOMMAND_RE = re.compile(
+    r"(?i)\A[\s:]*(?:run(?:-script)?\s+)?(?:test|tests|lint|typecheck|check|vet|clippy|fmt)(?:[:\s][^;&|`$()\n]*)?\Z"
+)
+_SHELL_GLOB_TARGETS = (
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "fish",
+    "ksh",
+    "csh",
+    "tcsh",
+    "ash",
+    "busybox",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "python",
+    "python3",
+    "node",
+    "nodejs",
+    "perl",
+    "ruby",
+)
 
 
 _RULE_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=\S*")
@@ -339,14 +368,24 @@ def _runs_any_command(program: str, arguments: str, wildcard: bool = False) -> b
     `wildcard` is set when the `*` is in the program's directory, which the program
     name no longer holds, as in `Bash(*/bash)`.
     """
-    if not wildcard and "*" not in program and "*" not in arguments:
+    from fnmatch import fnmatchcase
+
+    if not wildcard and "*" not in program and "?" not in program and "*" not in arguments:
         return False
     name = program.lower()
     if " " in name and _EVAL_ARGUMENT.match(arguments):
         # A locally named interpreter such as "my python.exe" with an evaluation switch.
         name = name.rsplit(" ", 1)[-1]
+    if ("*" in name or "?" in name) and any(
+        fnmatchcase(target, name) for target in _SHELL_GLOB_TARGETS
+    ):
+        return True
     # `Bash(python3*)` approves every python3 invocation, as `Bash(python3:*)` does.
     name = name.rstrip("*")
+    if name in _TASK_RUNNERS_WITH_SAFE_SUBCOMMANDS and _SAFE_TASK_SUBCOMMAND_RE.fullmatch(
+        arguments
+    ):
+        return False
     return name in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(name) is not None
 
 
@@ -392,18 +431,24 @@ def _broad_grants(allowed: list[str]) -> list[str]:
             # An unanchored allow glob such as `B*` or `Ba*(node:*)` is skipped too.
             continue
         broad = specifier is None or bool(_WILDCARD_SPECIFIER.fullmatch(specifier))
-        if key == "bash" and specifier is not None:
+        if key in {"bash", "powershell"} and specifier is not None:
             program, arguments = _rule_program(specifier)
-            broad |= _runs_any_command(program, arguments, "*" in specifier) or bool(
-                _SUBSHELL_SPECIFIER.fullmatch(program + arguments)
-            )
+            broad |= _runs_any_command(
+                program, arguments, "*" in specifier or "?" in specifier
+            ) or bool(_SUBSHELL_SPECIFIER.fullmatch(program + arguments))
         if key == "webfetch" and specifier is not None:
-            # `domain:**` and `domain:*.*` match every host, as `domain:*` does.
+            # `domain:**`, `domain:*.*`, and TLD-wide `domain:*.com` match arbitrary external hosts.
             domain = specifier.replace(" ", "")
-            broad |= domain.startswith("domain:") and not domain[7:].strip("*.")
-        if key == "read" and specifier is None:
-            # A bare Read grant covers the working directory, as reading does by default.
-            continue
+            if domain.startswith("domain:"):
+                host_pat = domain[7:]
+                broad |= not host_pat.strip("*.") or (
+                    host_pat.startswith("*.") and "." not in host_pat[2:].strip(".")
+                )
+        if key == "read":
+            if specifier is None:
+                # A bare Read grant covers the working directory, as reading does by default.
+                continue
+            broad |= specifier.startswith(("~/", "//"))
         if broad and key in _SCOPED_TOOL_CLASSES:
             classes.add(_SCOPED_TOOL_CLASSES[key])
     return sorted(classes)
@@ -4329,6 +4374,32 @@ class IDEAgentScanner(Scanner):
             if full_access
             else _UNPROMPTED_APPROVALS.get(approval or "")
         )
+        profiles = config.get("profiles")
+        if profiles is not None:
+            if not isinstance(profiles, dict):
+                result.scan_failures.append(f"{CODEX_CONFIG}: invalid profiles table")
+            else:
+                for profile_data in profiles.values():
+                    if not isinstance(profile_data, dict):
+                        result.scan_failures.append(f"{CODEX_CONFIG}: invalid profile entry")
+                        continue
+                    p_approval = profile_data.get("approval_policy")
+                    p_sandbox = profile_data.get("sandbox_mode")
+                    if p_approval is not None and (
+                        not isinstance(p_approval, str) or p_approval not in _PERMISSION_MODES
+                    ):
+                        result.scan_failures.append(f"{CODEX_CONFIG}: unsupported approval_policy")
+                        p_approval = None
+                    if p_sandbox is not None and (
+                        not isinstance(p_sandbox, str) or p_sandbox not in _PERMISSION_MODES
+                    ):
+                        result.scan_failures.append(f"{CODEX_CONFIG}: unsupported sandbox_mode")
+                        p_sandbox = None
+                    if p_sandbox in {"danger-full-access", "full-access"} or p_approval == "always":
+                        full_access = True
+                        declared = "an unsandboxed full-access mode"
+                    elif declared is None and p_approval:
+                        declared = _UNPROMPTED_APPROVALS.get(p_approval)
         if declared is not None:
             risks.append(
                 RiskAssessment(
