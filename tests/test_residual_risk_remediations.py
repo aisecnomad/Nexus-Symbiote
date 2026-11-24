@@ -551,6 +551,8 @@ def test_a163_01_39c9cbd2_and_h8_ide_permission_and_task_runner_escalation(tmp_p
             "PowerShell(*)",
             "WebFetch(domain:*.com)",
             "Read(~/.ssh/*)",
+            "Bash(npm test > /tmp/out *)",
+            "Bash(npm test\r; id *)",
         )
     ):
         case_dir = tmp_path / f"case_{idx}"
@@ -879,3 +881,34 @@ def test_e303_1a_1b_and_m19_cli_attestation_and_trust_root_guards(tmp_path):
     )
     assert r_in_proj.exit_code == EXIT_USAGE_ERROR, r_in_proj.output
     assert "--trust-root must lie outside" in r_in_proj.output
+
+
+def test_darwin_mid_exit_killpg_eperm_reaped_without_error(monkeypatch):
+    import errno
+
+    from nexus_symbiote.live import pinned_process
+
+    class _MidExitProc:
+        pid = 999999
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    proc = _MidExitProc()
+    monkeypatch.setattr(pinned_process.sys, "platform", "darwin")
+    monkeypatch.setattr(pinned_process, "_kill_descendants", lambda _root: None)
+    monkeypatch.setattr(pinned_process, "_kill_session", lambda _sid: None)
+    monkeypatch.setattr(
+        pinned_process.os,
+        "killpg",
+        lambda _pgid, _sig: (_ for _ in ()).throw(
+            PermissionError(errno.EPERM, "Operation not permitted")
+        ),
+    )
+    pinned_process.terminate_process_group(proc)  # type: ignore[arg-type]
+    assert proc.returncode == 0

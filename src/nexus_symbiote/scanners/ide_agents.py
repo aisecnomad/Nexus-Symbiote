@@ -295,7 +295,8 @@ _COMMAND_RUNNERS = frozenset(
 )  # fmt: skip
 _TASK_RUNNERS_WITH_SAFE_SUBCOMMANDS = frozenset({"npm", "yarn", "pnpm", "cargo", "go", "dotnet"})
 _SAFE_TASK_SUBCOMMAND_RE = re.compile(
-    r"(?i)\A[\s:]*(?:run(?:-script)?\s+)?(?:test|tests|lint|typecheck|check|vet|clippy|fmt)(?:[:\s][^;&|`$()\n]*)?\Z"
+    r"(?i)\A[\s:]*(?:run(?:-script)?\s+)?(?:test|tests|lint|typecheck|check|vet|clippy|fmt)"
+    r"(?:[:\s][^;&|`$(){}<>\r\v\f\n]*)?\Z"
 )
 _SHELL_GLOB_TARGETS = (
     "sh",
