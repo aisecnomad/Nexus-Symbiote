@@ -1830,34 +1830,35 @@ def _has_unsupported_registration(
 
 def _imported_receivers(tree: ast.Module) -> bool:
     """A ``.tool`` decorator whose receiver, or its root module, is bound by an import."""
-    imported = {
-        (alias.asname or alias.name).split(".")[0]
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.Import, ast.ImportFrom))
-        for alias in node.names
-    }
-    changed = True
-    while changed:
-        changed = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                if any(name.id in imported for name in _expr_roots(node.value)):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name) and target.id not in imported:
-                            imported.add(target.id)
-                            changed = True
-            elif (
-                isinstance(node, ast.AnnAssign)
-                and node.value is not None
-                and isinstance(node.target, ast.Name)
-                and node.target.id not in imported
-                and any(name.id in imported for name in _expr_roots(node.value))
-            ):
-                imported.add(node.target.id)
-                changed = True
+    imported: set[str] = set()
+    edges: dict[str, list[str]] = {}
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
     for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                imported.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.Assign):
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if targets:
+                for ref in _expr_roots(node.value):
+                    edges.setdefault(ref.id, []).extend(targets)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and node.value is not None
+            and isinstance(node.target, ast.Name)
+        ):
+            for ref in _expr_roots(node.value):
+                edges.setdefault(ref.id, []).append(node.target.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            functions.append(node)
+    queue = list(imported)
+    while queue:
+        src = queue.pop()
+        for dst in edges.get(src, ()):
+            if dst not in imported:
+                imported.add(dst)
+                queue.append(dst)
+    for node in functions:
         for deco in node.decorator_list:
             target = deco.func if isinstance(deco, ast.Call) else deco
             t_pair = _getattr_attr(target)
@@ -2463,6 +2464,7 @@ def collect_python_tools(
             or all(not project_imports.shadows(stmt.module, alias.name) for alias in stmt.names)
         )
     ]
+    prior_exclusions = len(result.surfaces_excluded)
     if len(resolved) != len(candidates):
         result.surfaces_excluded.append(
             f"{path.as_posix()}: Python SDK import may resolve to checkout code"
@@ -2493,6 +2495,15 @@ def collect_python_tools(
     _report_import_scope(imports, nodes, annotations, path, result, project_imports=project_imports)
     _report_context_handles(parsed, sdk_import, bindings, path, result, project_imports)
     _report_unused_factories(nodes, annotations, factories, path, result)
+    _factory_class_names = {name for _, name in _FACTORIES}
+    factory_class_elsewhere = any(
+        isinstance(stmt, ast.ImportFrom)
+        and any(
+            alias.name in _factory_class_names and (stmt.module, alias.name) not in _FACTORIES
+            for alias in stmt.names
+        )
+        for stmt in imports
+    )
     if not factories and not decorators and not agent_factories:
         imported_gap = _report_imported_receivers(tree, path, result)
         if (
@@ -2501,7 +2512,11 @@ def collect_python_tools(
             and (
                 parsed.overflow
                 or _reflective_access(parsed.all_nodes, parsed.all_parents, bindings)
-                or _unrecognized_tool_receivers(tree, set())
+                or (
+                    not factory_class_elsewhere
+                    and len(result.surfaces_excluded) == prior_exclusions
+                    and _unrecognized_tool_receivers(tree, set())
+                )
             )
         ):
             result.surfaces_excluded.append(
@@ -2546,7 +2561,11 @@ def collect_python_tools(
             and (
                 parsed.overflow
                 or _reflective_access(parsed.all_nodes, parsed.all_parents, bindings)
-                or _unrecognized_tool_receivers(tree, agent_receivers)
+                or (
+                    not factory_class_elsewhere
+                    and len(result.surfaces_excluded) == prior_exclusions
+                    and _unrecognized_tool_receivers(tree, agent_receivers)
+                )
             )
         ):
             result.surfaces_excluded.append(

@@ -256,7 +256,7 @@ _SCOPED_TOOL_CLASSES = {
     "notebookedit": "file edits",
     "read": "file reads",
     "webfetch": "web fetches",
-    "websearch": "web searches",
+    "websearch": "web fetches",
 }
 # A specifier made only of these characters names everything: Bash(*), Bash(:*),
 # Edit(//**), Read(~/**), Edit(./**).

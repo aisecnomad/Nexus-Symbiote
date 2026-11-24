@@ -2540,9 +2540,7 @@ def _classify(tokens: list[str], launch: Launch) -> None:
         launch.launcher = "unknown"
         launch.fail("command depends on the environment")
         return
-    has_sep = "/" in raw or "\\" in raw
-    is_abs = raw.startswith("/") or bool(re.match(r"[A-Za-z]:[\\/]", raw))
-    if has_sep and (not is_abs or ".." in re.split(r"[\\/]+", raw)):
+    if raw.startswith(("./", ".\\", "../", "..\\")):
         launch.launcher = "local"
         launch.fail("command is a relative path in the working directory")
         return
