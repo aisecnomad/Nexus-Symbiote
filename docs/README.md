@@ -1,11 +1,15 @@
 # Nexus SymBiote documentation
 
-Every page answers one of three questions: **why** Nexus SymBiote works the way it does, **what** it records and guarantees, or **how** to use, upgrade and release it. Start with the [README](../README.md), run the [offline demo](../examples/README.md), then follow the [public-agent tutorial](tutorials/scanning-a-public-agent.md). The [glossary](glossary.md) defines the terms these pages share.
+Every page answers one of three questions: **why** Nexus SymBiote works the way it does, **what** it records and guarantees, or **how** to run, integrate, upgrade, and release it.
 
-- [Why: principles and trust model](#why-principles-and-trust-model)
-- [What: formats, collectors and contracts](#what-formats-collectors-and-contracts)
-- [How: guides](#how-guides)
-- [Project records](#project-records)
+| New here? | Go to |
+| --- | --- |
+| 60-second overview & verified install | [README](../README.md) |
+| Run the offline demo end-to-end | [Examples walkthrough](../examples/README.md) |
+| Scan a real repository & wire CI | [Scanning a public agent](tutorials/scanning-a-public-agent.md) |
+| Learn core terms (`AgentBOM`, gaps, assurance) | [Glossary](glossary.md) |
+
+**Sections:** [Why: principles and trust model](#why-principles-and-trust-model) · [What: formats, collectors and contracts](#what-formats-collectors-and-contracts) · [How: guides](#how-guides) · [Project records](#project-records)
 
 ## Why: principles and trust model
 
@@ -91,15 +95,8 @@ Exact behavior, fields and limits.
 
 | Record | Contents |
 | --- | --- |
-| [Changelog](../CHANGELOG.md) | Notable changes, including breaking ones |
-| [Decisions](decisions.md) | Where each kind of decision is recorded and how to record a new one |
-| [Roadmap](../ROADMAP.md) | Release train (0.2.0–1.4), invariants, ShadowScan contract, delivered external review items, scorecard and traceability |
-| [Closed-PR audit, 2026-11-02](audits/closed-pr-review-2026-11-02.md) | Disposition of every closed pull request up to #73, and what reached the supported package |
-| [Pull-request, branch and issue review, 2026-11-03](audits/closed-pr-review-2026-11-03.md) | Pull requests #74–#116, every branch, and the issues still open on 2026-11-03 |
-| [Security audit of the whole repository, 2026-11-14](audits/security-audit-2026-11-14.md) | Every module, script, workflow and page at `4aaf727`: verdict, 35 ranked findings, the controls confirmed under hostile input, and what to do next |
-| [Status of the 2026-11-14 audit findings](audits/security-audit-2026-11-14-status.md) | Each finding on `main` at `a604c33` (batch 1, #202) and on the branch that carried the note: fixed and how it was verified, partly fixed, deferred, or awaiting an administrator or a decision |
-| [Repository audit and open pull request review, 2026-11-16](audits/repository-audit-2026-11-16.md) | `main` after #226 and #227, and pull requests #224, #228 and #229: automated checks of the whole tree, eight ranked findings with their fixes, and recommendations |
-| [Pull-request, branch and label review, 2026-11-19](audits/pull-request-review-2026-11-19.md) | Pull requests #117–#291: how each merged one reached `main` and whether its lines survive, why each closed one closed, the open ones against the roadmap with their overlaps, and every branch by whether deleting it loses a commit |
-| [Feature enhancement plan, 2026-11-18](enhancement-plan-2026-11-18.md) | Where Nexus SymBiote stands on AIBOM-Bench, the competitor advantages to close, standards and regulatory gaps, the gaps no tool fills, what the maintainer may have missed, and a prioritized roadmap whose acceptance criteria are benchmark cases |
+| [Changelog](../CHANGELOG.md) | Notable changes and breaking-change migration notes |
+| [Decisions](decisions.md) | Where architectural decisions live and how to record or revise one |
+| [Roadmap](../ROADMAP.md) | Release train (0.2.0–1.4), core invariants, and recorded non-goals |
 
-Documentation changes follow the same review as code. Local links, including links to headings, are checked in CI by `scripts/check_repository_hygiene.py`; run `make hygiene` before you open a pull request.
+Pull-request review records and historical audits live in Git history and pull-request descriptions. Documentation changes follow the same review as code; local links and heading anchors are verified in CI by `scripts/check_repository_hygiene.py` (`make hygiene`).
