@@ -311,7 +311,7 @@ def unordered_projection(value: Any, *, _depth: int = 0) -> Any:
     and authority conditions. Sorting never drops duplicate entries or fields.
     """
     if _depth > MAX_NATIVE_NESTING:
-        raise ValueError("projection is nested too deeply")
+        raise ValueError("projection is nested too deeply and cannot be recovered")
     if isinstance(value, list):
         return sorted(
             (unordered_projection(item, _depth=_depth + 1) for item in value), key=json_text

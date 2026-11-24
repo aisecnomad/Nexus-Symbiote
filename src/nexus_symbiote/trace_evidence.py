@@ -628,7 +628,8 @@ def _summarize_runtime(
                 if norm_hash:
                     tool_hashes.add(norm_hash)
                 else:
-                    every_tool_hashed = False
+                    # Malformed declared hash must fail closed (never wildcard-match None).
+                    norm_hash = ""
             tool_tuples.add((declared, norm_hash))
     return _RuntimeSummary(
         frozenset(identities),
