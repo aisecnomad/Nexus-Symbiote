@@ -57,7 +57,9 @@ HIDDEN_EXEMPT_PREFIXES = (Path("tests"), Path("benchmarks"))
 HIDDEN_SUFFIXES = frozenset(
     {".py", ".md", ".toml", ".yml", ".yaml", ".cff", ".cfg", ".txt", ".json", ".sh", ".lock"}
 )
-HIDDEN_NAMES = frozenset({"Dockerfile", "Makefile", "CODEOWNERS"})
+HIDDEN_NAMES = frozenset(
+    {"Dockerfile", "Makefile", "CODEOWNERS", ".editorconfig", ".gitattributes", ".gitignore"}
+)
 # Checked in tests/ and benchmarks/ too, outside a fixtures directory: CI runs them.
 HIDDEN_CODE_SUFFIXES = frozenset({".py", ".sh"})
 _BLANK = frozenset({0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0})

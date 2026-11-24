@@ -1013,6 +1013,13 @@ def _ignores_a_keyword(
             continue
         seen.add(id(node))
         nodes.append(node)
+        if any(
+            not isinstance(key, str)
+            or not key.isascii()
+            or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in key)
+            for key in node
+        ):
+            return True
         used = _EVERY_KEYWORD.intersection(node)
         # Draft-01 and draft-02 require every property whose schema does not say
         # "optional": true. That value asks for what every supported dialect does.

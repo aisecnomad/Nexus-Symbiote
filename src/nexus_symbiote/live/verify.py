@@ -703,6 +703,8 @@ def verify_mcp_servers(
     require_full_url_binding: bool = False,
 ) -> LiveVerifyReport:
     """Bind collection to the exact server reference in an independent launch policy."""
+    if config_lookup is not None:
+        raise ValueError("config_lookup is unsupported; pass trusted_launchers explicitly")
     report = LiveVerifyReport()
     if validate_graph(bom):
         report.results.append(
