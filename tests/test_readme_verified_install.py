@@ -25,17 +25,17 @@ echo "pip $*" >> "$STUB_LOG"
 case "$*" in
   *"pip download"*)
     if [ "$STUB_FAIL" = download ]; then exit 1; fi
-    mkdir -p dist && : > dist/nexus_symbiote-0.1.0-py3-none-any.whl ;;
+    mkdir -p dist && : > dist/nexus_symbiote-0.2.0-py3-none-any.whl ;;
   *"--require-hashes"*) if [ "$STUB_FAIL" = lock ]; then exit 1; fi ;;
   *"--no-deps dist/"*)
-    printf '#!/bin/sh\\necho "nexus-symbiote, version 0.1.0 (verified venv)"\\n' \\
+    printf '#!/bin/sh\\necho "nexus-symbiote, version 0.2.0 (verified venv)"\\n' \\
       > .venv/bin/nexus-symbiote
     chmod +x .venv/bin/nexus-symbiote
     if [ "$STUB_FAIL" = wheel ]; then exit 1; fi ;;
 esac
 """,
     "git": """#!/bin/sh
-if [ -n "$STUB_TAG" ]; then printf '%s\\trefs/tags/v0.1.0^{}\\n' "$STUB_TAG"; fi
+if [ -n "$STUB_TAG" ]; then printf '%s\\trefs/tags/v0.2.0^{}\\n' "$STUB_TAG"; fi
 if [ "$STUB_FAIL" = git ]; then exit 128; fi
 """,
     "gh": """#!/bin/sh
@@ -111,7 +111,9 @@ pytestmark = pytest.mark.skipif(BASH is None or os.name != "posix", reason="need
 def test_verified_install_prints_the_venv_version_after_every_step_succeeds(tmp_path):
     result, calls, work = _run(tmp_path)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "nexus-symbiote, version 0.1.0 (verified venv)"
+    assert result.stdout.strip() == "nexus-symbiote, version 0.2.0 (verified venv)"
+    assert "--repo aisecnomad/Nexus-Symbiote" in calls
+    assert "--signer-workflow aisecnomad/Nexus-Symbiote/.github/workflows/release.yml" in calls
     assert "--source-digest " + COMMIT in calls
     assert (work / ".venv/bin/nexus-symbiote").exists()
 
