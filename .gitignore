@@ -57,6 +57,7 @@ Thumbs.db
 # Local outputs
 evidence/
 benchmark-results.json
+precision-gate.json
 security-regressions.json
 .hypothesis/
 

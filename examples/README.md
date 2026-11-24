@@ -63,7 +63,7 @@ nexus-symbiote scan "$demo_copy" -o after.json
 nexus-symbiote diff before.json after.json --fail-on-alert
 ```
 
-`diff` raises two **CRITICAL** alerts (repointed `tickets` endpoint and floated `notes` package/binding change) and exits `1`. Because inventories record root-relative paths, snapshots compare cleanly across checkout locations. See [Gate drift in CI](../docs/drift-gate.md) for keeping baselines out of PR reach.
+`diff` raises four alerts — two **CRITICAL** alerts (repointed `tickets` endpoint and floated `notes` package/binding change) plus two **MEDIUM** unbound-values notices when run without `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` — and exits `1`. Because inventories record root-relative paths, snapshots compare cleanly across checkout locations. See [Gate drift in CI](../docs/drift-gate.md) for keeping baselines out of PR reach.
 
 ### 5. Import a ShadowScan report
 
