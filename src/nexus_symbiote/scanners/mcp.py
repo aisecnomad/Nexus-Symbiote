@@ -29,6 +29,7 @@ import unicodedata
 from array import array
 from bisect import bisect_left
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import date
 from itertools import chain, pairwise
@@ -3047,10 +3048,8 @@ def _in_project(path: str, root: Path) -> bool:
     """Whether a normalized POSIX absolute path lies inside the scanned checkout root."""
     candidate = posixpath.normpath("/" + path.lstrip("/"))
     roots = {posixpath.normpath(root.as_posix())}
-    try:
+    with suppress(OSError):
         roots.add(posixpath.normpath(root.resolve().as_posix()))
-    except OSError:
-        pass
     for base in roots:
         if not base.startswith("/"):
             continue

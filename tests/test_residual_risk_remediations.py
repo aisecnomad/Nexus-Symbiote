@@ -97,10 +97,12 @@ def test_a279_01_cyclonedx_services_strip_userinfo_query_fragment_and_token_path
     assert cred not in rendered
     assert gh_tok not in rendered
     assert "alice" not in rendered
-    assert "https://mcp.example.com/sse" in endpoints
-    assert "https://agent.example.com/rpc" in endpoints
-    assert "https://card.example.com/.well-known/agent.json" in endpoints
-    assert "https://tools.example.com" in endpoints
+    assert endpoints == {
+        "https://mcp.example.com/sse",
+        "https://agent.example.com/rpc",
+        "https://card.example.com/.well-known/agent.json",
+        "https://tools.example.com",
+    }
 
 
 def test_b4_268_01_expect_upgrade_refuses_to_attribute_unbound_mcp_profile_bump(tmp_path):
@@ -391,6 +393,7 @@ def test_b231_01_unverified_teardown_raises_execution_outcome_unknown(monkeypatc
             pass
 
     monkeypatch.setattr("nexus_symbiote.live.session.terminate_process_group", lambda _p: False)
+    monkeypatch.setattr("nexus_symbiote.live.session.sys.platform", "linux")
     session = object.__new__(PinnedStdioSession)
     session._process = _DummyProc()  # type: ignore[assignment]
     session._directory = None
@@ -399,6 +402,14 @@ def test_b231_01_unverified_teardown_raises_execution_outcome_unknown(monkeypatc
         session.__exit__(None, None, None)
     assert isinstance(exc_info.value.__cause__, PinnedProcessError)
     assert exc_info.value.__cause__.reason == "isolation-teardown-failed"
+
+    # On macOS, terminate_process_group returns False by design (no Linux subreaper/namespace).
+    monkeypatch.setattr("nexus_symbiote.live.session.sys.platform", "darwin")
+    mac_session = object.__new__(PinnedStdioSession)
+    mac_session._process = _DummyProc()  # type: ignore[assignment]
+    mac_session._directory = None
+    mac_session._called = True
+    mac_session.__exit__(None, None, None)
 
 
 def test_d107_01_claude_md_covers_all_top_level_and_live_modules():
