@@ -98,11 +98,15 @@ SCRIPT_SWITCHES = _words(
 INSTALLED_BIN_DIRS = _tup("node_modules/.bin/ .venv/bin/ venv/bin/")
 SCRIPT_SUFFIXES = _tup(".sh .py .js .mjs .cjs .jsx .ts .mts .cts .tsx .rb .pl")
 CODE_EXEC_HOSTED_TOOLS = _words("code_interpreter computer_use bash local_shell code_execution")
-UNTRUSTED_CI_TRIGGERS = _words("issue_comment discussion_comment pull_request_target workflow_run")
+UNTRUSTED_CI_TRIGGERS = _words(
+    "issue_comment issues discussion discussion_comment "
+    "pull_request_review pull_request_review_comment pull_request_target workflow_run"
+)
 STEERING_PREFIXES = _tup(".claude .cursor CLAUDE.md AGENTS.md .mcp.json mcp.json")
 _STEERING_PREFIXES_FOLDED = tuple(p.casefold() for p in STEERING_PREFIXES)
 HOOK_CONFIG_FILES = _tup(
-    ".claude/settings.json .claude/settings.local.json .cursor/hooks.json .claude/hooks.json"
+    ".claude/settings.json .claude/settings.local.json .cursor/hooks.json .claude/hooks.json "
+    ".claude-plugin/plugin.json hooks/hooks.json"
 )
 MCP_CONFIG_FILES = _tup(
     ".mcp.json mcp.json .cursor/mcp.json .vscode/mcp.json "
@@ -1361,7 +1365,11 @@ def _inspect_hooks_and_preambles(
                     summary.hook_targets.append({**rec, **state})
 
     for skill_path in [
-        p for p in all_paths if p == "SKILL.md" or p.endswith(("/SKILL.md", ".skill.md"))
+        p
+        for p in all_paths
+        if p == "SKILL.md"
+        or p.endswith(("/SKILL.md", ".skill.md"))
+        or (p.startswith(".claude/commands/") and p.endswith(".md"))
     ]:
         text = _read_confined_text(files, skill_path, summary.gaps)
         if text is None:
@@ -2441,10 +2449,11 @@ def _record_ci_agent(
     mcp_config_raw: str | None,
     source_file: str,
     assurance: AssuranceLevel,
+    pinned_override: bool | None = None,
 ) -> None:
     action_slug = action_ref.split("@", 1)[0].strip()
     ref_pin = action_ref.split("@", 1)[1].strip() if "@" in action_ref else ""
-    pinned = bool(_HEX_40_RE.match(ref_pin))
+    pinned = pinned_override if pinned_override is not None else bool(_HEX_40_RE.match(ref_pin))
     short_name = action_slug.split("/")[-1] or action_slug
     comp_name = f"ci.{short_name}:{_sha256_hex(f'{source_file}:{action_ref}'.encode())[:8]}"
     host_id = f"github-actions:{action_slug}"
@@ -2491,7 +2500,7 @@ def _record_ci_agent(
     props = _rec(
         host=host_id,
         action=action_slug,
-        ref=ref_pin or "unpinned",
+        ref=("cli-run" if pinned_override else (ref_pin or "unpinned")),
         pinned=pinned,
         triggers=sorted(set(triggers)),
         skip_permissions=skip_perms,
@@ -2521,6 +2530,24 @@ def _record_ci_agent(
     ):
         if hit:
             summary.flag(cat, RiskSeverity.HIGH, msg, source_file, comp_name)
+
+
+_CI_RUN_AGENT_RE = re.compile(
+    r"(?:^|[;&|()\n]\s*)(?:npx\s+(?:-y\s+|--yes\s+)?)?"
+    r"(?P<cli>@anthropic-ai/claude-code|@openai/codex|@google/gemini-cli|claude|codex|gemini)"
+    r"\b(?P<args>[^\n;|&]*)",
+    re.IGNORECASE,
+)
+_CI_RUN_PROMPT_FLAG_RE = re.compile(
+    r"(?:^|\s)(?:-p|--print|--prompt|exec|--dangerously-skip-permissions|--yolo|"
+    r"--permission-mode\s+bypasspermissions|--approval-mode\s+yolo|--full-auto)\b",
+    re.IGNORECASE,
+)
+_CI_RUN_SKIP_PERMS_RE = re.compile(
+    r"(?:--dangerously-skip-permissions|--permission-mode[\s=]+bypasspermissions|"
+    r"--yolo|--approval-mode[\s=]+yolo|--dangerously-bypass-approvals-and-sandbox)",
+    re.IGNORECASE,
+)
 
 
 def _inspect_workflows_and_claims(
@@ -2553,30 +2580,55 @@ def _inspect_workflows_and_claims(
                 if not isinstance(step, dict):
                     continue
                 uses = str(step.get("uses") or "").strip()
-                if not any(
+                if uses and any(
                     k in uses.lower()
-                    for k in ("claude-code-action", "codex-action", "gemini-cli", "agent-action")
+                    for k in (
+                        "claude-code-action",
+                        "claude-code-base-action",
+                        "codex-action",
+                        "gemini-cli",
+                        "agent-action",
+                    )
                 ):
+                    with_blk = _as_dict(step.get("with"))
+                    joined_with = " ".join(str(v) for v in with_blk.values()).lower()
+                    skip_perms = (
+                        "--dangerously-skip-permissions" in joined_with
+                        or "dangerously_skip_permissions: true" in joined_with
+                        or with_blk.get("dangerously_skip_permissions") is True
+                        or str(with_blk.get("approval_policy") or "").lower() == "never"
+                        or _CI_RUN_SKIP_PERMS_RE.search(joined_with) is not None
+                    )
+                    mcp_val = with_blk.get("mcp_config")
+                    mcp_cfg = str(mcp_val) if isinstance(mcp_val, str) else None
+                    _record_ci_agent(
+                        summary,
+                        action_ref=uses,
+                        triggers=triggers,
+                        skip_perms=skip_perms,
+                        mcp_config_raw=mcp_cfg,
+                        source_file=wf_path,
+                        assurance=AssuranceLevel.OBSERVED,
+                    )
                     continue
-                with_blk = _as_dict(step.get("with"))
-                joined_with = " ".join(str(v) for v in with_blk.values()).lower()
-                skip_perms = (
-                    "--dangerously-skip-permissions" in joined_with
-                    or "dangerously_skip_permissions: true" in joined_with
-                    or with_blk.get("dangerously_skip_permissions") is True
-                    or str(with_blk.get("approval_policy") or "").lower() == "never"
-                )
-                mcp_val = with_blk.get("mcp_config")
-                mcp_cfg = str(mcp_val) if isinstance(mcp_val, str) else None
-                _record_ci_agent(
-                    summary,
-                    action_ref=uses,
-                    triggers=triggers,
-                    skip_perms=skip_perms,
-                    mcp_config_raw=mcp_cfg,
-                    source_file=wf_path,
-                    assurance=AssuranceLevel.OBSERVED,
-                )
+                run_script = step.get("run")
+                if isinstance(run_script, str):
+                    for match in _CI_RUN_AGENT_RE.finditer(run_script):
+                        cli_name = match.group("cli").lower().rsplit("/", 1)[-1]
+                        args_tail = match.group("args")
+                        if not _CI_RUN_PROMPT_FLAG_RE.search(args_tail):
+                            continue
+                        skip_perms = _CI_RUN_SKIP_PERMS_RE.search(args_tail) is not None
+                        _record_ci_agent(
+                            summary,
+                            action_ref=f"run/{cli_name}",
+                            triggers=triggers,
+                            skip_perms=skip_perms,
+                            mcp_config_raw=None,
+                            source_file=wf_path,
+                            assurance=AssuranceLevel.OBSERVED,
+                            pinned_override=True,
+                        )
 
     for src_file, doc, assurance in decl_sources:
         for ht in _as_list(doc.get("hosted_tools")):

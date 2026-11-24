@@ -304,16 +304,20 @@ def imports_discovery(claim: CompletenessClaim) -> bool:
     )
 
 
-def unordered_projection(value: Any) -> Any:
+def unordered_projection(value: Any, *, _depth: int = 0) -> Any:
     """The arrays emitted by our standard projections are unordered collections.
 
     Native JSON in extension strings stays opaque, including ordered arguments
     and authority conditions. Sorting never drops duplicate entries or fields.
     """
+    if _depth > MAX_NATIVE_NESTING:
+        raise ValueError("projection is nested too deeply")
     if isinstance(value, list):
-        return sorted((unordered_projection(item) for item in value), key=json_text)
+        return sorted(
+            (unordered_projection(item, _depth=_depth + 1) for item in value), key=json_text
+        )
     if isinstance(value, dict):
-        return {key: unordered_projection(item) for key, item in value.items()}
+        return {key: unordered_projection(item, _depth=_depth + 1) for key, item in value.items()}
     return value
 
 

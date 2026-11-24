@@ -302,27 +302,6 @@ def render_authorization_policy(
         raise ValueError("invalid graph: " + "; ".join(graph_issues))
 
     allowed_assurance = {AssuranceLevel.OBSERVED, AssuranceLevel.VERIFIED}
-    tools = []
-    for c in sorted(bom.components, key=lambda x: x.bom_ref):
-        if not isinstance(c, ToolComponent):
-            continue
-        defn_hash = _valid_sha256(c.definition_hash, prefixed=True)
-        if defn_hash is None:
-            continue
-        if verified_only and (
-            c.assurance_level not in allowed_assurance
-            or c.bom_ref in unverified_refs
-            or (c.mcp_server_ref is not None and c.mcp_server_ref in unverified_refs)
-        ):
-            continue
-        tools.append(
-            {
-                "bom_ref": c.bom_ref,
-                "name": c.name,
-                "mcp_server_ref": c.mcp_server_ref,
-                "definition_hash": defn_hash,
-            }
-        )
     servers = [
         {
             "bom_ref": c.bom_ref,
@@ -342,6 +321,28 @@ def render_authorization_policy(
             )
         )
     ]
+    admitted_server_refs = {s["bom_ref"] for s in servers}
+    tools = []
+    for c in sorted(bom.components, key=lambda x: x.bom_ref):
+        if not isinstance(c, ToolComponent):
+            continue
+        defn_hash = _valid_sha256(c.definition_hash, prefixed=True)
+        if defn_hash is None:
+            continue
+        if verified_only and (
+            c.assurance_level not in allowed_assurance
+            or c.bom_ref in unverified_refs
+            or (c.mcp_server_ref is not None and c.mcp_server_ref not in admitted_server_refs)
+        ):
+            continue
+        tools.append(
+            {
+                "bom_ref": c.bom_ref,
+                "name": c.name,
+                "mcp_server_ref": c.mcp_server_ref,
+                "definition_hash": defn_hash,
+            }
+        )
     models = []
     for c in sorted(bom.components, key=lambda x: x.bom_ref):
         if not isinstance(c, ModelComponent):

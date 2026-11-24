@@ -148,14 +148,20 @@ class SARIFGenerator(Generator):
 
     def _uri(self, source: str | Path | None) -> str | None:
         """A %SRCROOT%-relative URI for a file path; None for URLs and escaping paths."""
+        from urllib.parse import unquote
+
         if source is None or str(source) in {"", "."}:
             return None
         text = source.as_posix() if isinstance(source, Path) else source
+        decoded = unquote(text)
         if (
             "\\" in text
+            or "\\" in decoded
             or "\x00" in text
+            or "\x00" in decoded
             or any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
-            or (not text.startswith("/") and _SCHEME.match(text))
+            or (not text.startswith("/") and (_SCHEME.match(text) or decoded.startswith("/")))
+            or ".." in PurePosixPath(decoded).parts
         ):
             return None
         path = Path(text)
@@ -166,7 +172,11 @@ class SARIFGenerator(Generator):
                 return None
         else:
             relative = self._prefix / PurePosixPath(path.as_posix())
-        if ".." in relative.parts or str(relative) in {"", "."}:
+        if (
+            ".." in relative.parts
+            or ".." in PurePosixPath(unquote(relative.as_posix())).parts
+            or str(relative) in {"", "."}
+        ):
             return None
         return quote(relative.as_posix(), safe="/")
 
