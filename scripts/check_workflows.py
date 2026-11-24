@@ -314,7 +314,7 @@ REVIEWED_GATE_STEPS: dict[str, dict[str, dict[str, tuple[str, dict[str, str]]]]]
         "quality": {
             "scripts/check_pull_request_size.py": (
                 'git fetch --no-tags --depth=2 origin "$MERGE_SHA"\n'
-                'python scripts/check_pull_request_size.py --base "$MERGE_SHA^1"\n',
+                'python scripts/check_pull_request_size.py --base "$MERGE_SHA^1" --limit 1500\n',
                 {"MERGE_SHA": "${{ github.sha }}"},
             )
         },

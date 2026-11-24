@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import Specifier
 from packaging.version import Version
 
@@ -208,6 +209,15 @@ def test_a_quote_inside_a_direct_url_does_not_leave_its_tail_behind(tmp_path):
         assert "PW3" not in text and "secret-path" not in text and "alice" not in text
 
 
+def _packaging_rejects_nbsp_url() -> bool:
+    """Return True when the installed `packaging` rejects NBSP in PEP 508 URLs (>=26.4)."""
+    try:
+        Requirement("safetensors @ https://h.example/a\u00a0alice:S3CR1@o.example/S3CR2")
+    except InvalidRequirement:
+        return True
+    return False
+
+
 @pytest.mark.parametrize(
     ("files", "failures"),
     [
@@ -241,7 +251,7 @@ def test_a_quote_inside_a_direct_url_does_not_leave_its_tail_behind(tmp_path):
                 "requirements.txt": "torch==2.3.0\n"
                 "safetensors @ https://h.example/a\u00a0alice:S3CR1@o.example/S3CR2\n"
             },
-            False,
+            _packaging_rejects_nbsp_url(),
         ),
         # A scheme-relative URL.
         ({"requirements.txt": "openai @ //alice:S3CR1@h.example/S3CR2/o.whl\n"}, False),

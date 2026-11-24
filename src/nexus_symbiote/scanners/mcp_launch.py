@@ -3303,8 +3303,13 @@ def _host_sources(spec: str, *, mount: bool) -> list[str]:
     return list(dict.fromkeys(sources))
 
 
+_CREDENTIAL_STORE_MOUNT = re.compile(
+    r"/(?:var/)?run/(?:secrets|credentials)(?:/.*)?", re.IGNORECASE
+)
+
+
 def _host_source_flag(source: str) -> str | None:
-    """The host root, runtime socket or broad host mount flag a source earns, if any."""
+    """The host root, runtime socket, broad host or credential store mount flag, if any."""
     if _WORKSPACE.match(source):
         source = _WORKSPACE.sub(".", source, count=1)
     normalized = source.rstrip("/\\") or ("/" if source.startswith("/") else "\\")
@@ -3340,6 +3345,8 @@ def _host_source_flag(source: str) -> str | None:
         )
     ):
         return "broad_host_mount"
+    if _CREDENTIAL_STORE_MOUNT.fullmatch(canonical):
+        return "credential_store_mount"
     return None
 
 
