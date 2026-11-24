@@ -15,10 +15,10 @@ a refused input, a rating or a missing feature, are deliberate, and the record s
 | Repository settings and the controls that are actually active | [Repository controls](repository-controls.md) |
 | Behaviour that is deliberately incomplete, and what to do about it | [Known limitations](known-limitations.md) and [collection limits](collection-limits.md) |
 | Breaking changes, and when inventories must be collected again | [Changelog](../CHANGELOG.md) entries marked **Breaking**, and [fingerprint migration](fingerprint-migration.md) |
-| Decisions an audit left to the maintainer | [Decisions for the maintainer](audits/security-audit-2026-11-14-status.md#decisions-for-the-maintainer) in the 2026-11-14 audit status, and the findings of each later [audit](README.md#project-records) |
+| Audit follow-up decisions | Maintainer review comments on the corresponding pull requests and [Project records](README.md#project-records) |
 | Dependency floors, upper bounds and ignored updates | The comment above `dependencies` in `pyproject.toml` for the floors; comments in `.github/dependabot.yml` for ignored updates and the tree-sitter cap |
-| CI time limits and job budgets | Comments beside the test and coverage limits in `.github/workflows/ci.yml`; other limits only in the pull request that set them, such as #233 and #271 |
-| Why a pull request was merged, reworked or closed | Its description and review record; the [pull-request reviews](README.md#project-records) under `docs/audits/` give the disposition of every pull request |
+| CI time limits and job budgets | Comments beside the test and coverage limits in `.github/workflows/ci.yml`; other limits in the pull request that set them |
+| Why a pull request was merged, reworked or closed | Its pull-request description, disposition label (`superseded`, `duplicate`, `wontfix`), and review record |
 
 ## How to record a new decision
 
