@@ -30,7 +30,6 @@ The following are not implemented and are not part of the current guarantees. Th
 - Broader collector coverage for high-value unrecognized forms (or explicit gaps).
 - Optional tighter time budgets or progressive timeout signaling.
 - Sandboxed or pure-Python alternative for the tree-sitter TypeScript parser.
-- An attestation required by the `validate` and `risk` gates, and attestation in the GitHub Action. Signing and verifying an inventory by hand is implemented; see [inventory attestation](inventory-attestation.md).
 - Additional runtime mediation adapters beyond the reference gateway.
 
 These do not change the current security model. A way around a documented control remains a private vulnerability report.

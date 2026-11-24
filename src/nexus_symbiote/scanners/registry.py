@@ -10,6 +10,7 @@ import base64
 import binascii
 import fnmatch
 import json
+import posixpath
 import re
 import shlex
 import unicodedata
@@ -378,12 +379,16 @@ def _sensitive_origin(origin: str | None) -> bool:
 # (Windows drive letters), file:, and mailto: are excluded.
 _NOSLASH_CREDENTIAL_URL = re.compile(
     r"(?<![A-Za-z0-9+.-])"
-    r"(?!file:|mailto:)[A-Za-z][A-Za-z0-9+.-]+:"
+    r"(?!file:|mailto:)[A-Za-z][A-Za-z0-9+.-]++:"
     r"(?!//)"
-    r"[^\s/\"'<>@:]*:[^\s/\"'<>@]+@"
-    r"[^\s\"'<>]+",
+    r"[^\s/\"'<>@:]*+:[^\s/\"'<>@:]++@"
+    r"[^\s\"'<>]++",
     re.IGNORECASE,
 )
+
+
+def _redact_noslash_url(text: str) -> str:
+    return _NOSLASH_CREDENTIAL_URL.sub("[redacted-url]", text) if "@" in text else text
 
 
 def _url_origin(url: str) -> str:
@@ -391,7 +396,7 @@ def _url_origin(url: str) -> str:
     # and would leave the rest of the path, query or a credential behind.
     if "//" in url:
         return redact_url(url)
-    if _NOSLASH_CREDENTIAL_URL.search(url):
+    if "@" in url and _NOSLASH_CREDENTIAL_URL.search(url):
         return "[redacted-url]"
     return redact_text(url)
 
@@ -404,11 +409,10 @@ def _unparsed(text: str) -> str:
     """
     cut = text.find("//")
     if cut < 0:
-        return redact_text(_NOSLASH_CREDENTIAL_URL.sub("[redacted-url]", text))
+        return redact_text(_redact_noslash_url(text))
     while cut and text[cut - 1] not in " \t":
         cut -= 1
-    prefix = _NOSLASH_CREDENTIAL_URL.sub("[redacted-url]", text[:cut])
-    return redact_text(prefix) + "[redacted-url]"
+    return redact_text(_redact_noslash_url(text[:cut])) + "[redacted-url]"
 
 
 def _identifier(text: str) -> tuple[str, bool]:
@@ -1268,7 +1272,7 @@ def _yarn_v1_field(content: str) -> tuple[str, _YarnToken | None]:
 
 
 def _yarn_source(fields: dict[str, str]) -> tuple[str | None, ...]:
-    return tuple(fields.get(k) for k in ("resolved", "integrity", "resolution", "checksum"))
+    return tuple(fields.get(k) for k in ("resolved", "integrity", "resolution"))
 
 
 def _yarn_lockfile_stanzas(
@@ -1539,6 +1543,20 @@ class RegistryScanner(Scanner):
             if (
                 not isinstance(lock, dict)
                 or not isinstance(lock.get("packages"), dict)
+                or any(
+                    not isinstance(k, str)
+                    or (
+                        k != ""
+                        and (
+                            "\\" in k
+                            or k.startswith(("/", "../"))
+                            or k.endswith("/")
+                            or k in {".", ".."}
+                            or posixpath.normpath(k) != k
+                        )
+                    )
+                    for k in lock["packages"]
+                )
                 or (
                     lock.get("lockfileVersion") is not None
                     and (
@@ -4132,6 +4150,63 @@ class RegistryScanner(Scanner):
                 if unresolved
                 else f"pkg:pypi/{quote(comp.name, safe='')}@{quote(resolved_version, safe='')}"
             )
+            artifact_mismatch = False
+            if method == "uv-lockfile":
+                sdist = record.get("sdist")
+                wheels = record.get("wheels")
+                if (sdist is not None and not isinstance(sdist, dict)) or (
+                    wheels is not None
+                    and (
+                        not isinstance(wheels, list)
+                        or not all(isinstance(item, dict) for item in wheels)
+                    )
+                ):
+                    comp.package_url = comp.registry_uri = None
+                    result.scan_failures.append(
+                        f"{lock_name}: invalid package artifact entry for {comp.name}"
+                    )
+                    continue
+                artifact_entries = [
+                    *([] if sdist is None else [sdist]),
+                    *([] if wheels is None else wheels),
+                ]
+                raw_artifact_urls = [entry["url"] for entry in artifact_entries if "url" in entry]
+                parsed_artifact_origins = [_index_origin(u) for u in raw_artifact_urls]
+                if any(ao is None for ao in parsed_artifact_origins):
+                    comp.package_url = comp.registry_uri = None
+                    result.surfaces_excluded.append(
+                        f"{lock_name}: package artifact URL of the selected record is not a plain "
+                        "http(s) URL; its origin is unverified"
+                    )
+                    continue
+                artifact_origins = [
+                    ao.removesuffix(":443") if ao.startswith("https://") else ao
+                    for ao in parsed_artifact_origins
+                    if ao is not None
+                ]
+                disallowed_artifacts = sorted(
+                    {
+                        ao
+                        for ao in artifact_origins
+                        if (registry_origin in _PYPI_ORIGINS and ao not in _PYPI_ORIGINS)
+                        or (not registry_origin.startswith("http://") and ao.startswith("http://"))
+                    }
+                )
+                if disallowed_artifacts:
+                    artifact_mismatch = True
+                    package_url = None
+                    cleartext_art = any(ao.startswith("http://") for ao in disallowed_artifacts)
+                    comp.risks.append(
+                        _risk(
+                            RiskSeverity.HIGH if cleartext_art else RiskSeverity.MEDIUM,
+                            "registry_origin",
+                            f"PyPI package '{redact_text(comp.name)}' declares index "
+                            f"{registry_origin} but downloads artifacts from "
+                            f"{', '.join(disallowed_artifacts)}.",
+                            "Confirm that every sdist/wheel download origin in uv.lock matches a "
+                            "trusted HTTPS package host.",
+                        )
+                    )
             if registry_origin not in _PYPI_ORIGINS:
                 # As for npm: the package URL names the index it was resolved from.
                 if package_url is not None:
@@ -4153,7 +4228,7 @@ class RegistryScanner(Scanner):
                         else "Confirm that this index is intended and trusted for this package.",
                     )
                 )
-            comp.registry_uri = None if unresolved else registry_origin
+            comp.registry_uri = None if (unresolved or artifact_mismatch) else registry_origin
             if conditional:
                 # The declared version keeps its markers; no exact identity is claimed.
                 continue

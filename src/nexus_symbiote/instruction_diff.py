@@ -129,9 +129,11 @@ _TOOL_FRONTMATTER_KEYS = (
 _POLICY_FRONTMATTER_KEYS = (
     "permissionMode",
     "permission_mode",
+    "mode",
     "hooks",
     "mcpServers",
     "mcp_servers",
+    "mcp-servers",
 )
 _PEM_BEGIN_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----")
 _PEM_END_RE = re.compile(r"-----END [A-Z0-9 _-]*PRIVATE KEY-----")
@@ -324,7 +326,7 @@ def _fallback_frontmatter_fields(raw_yaml: str) -> dict[str, Any]:
                 }:
                     current_list_key = key
                     meta[key] = []
-                elif key in {"hooks", "mcpServers", "mcp_servers"}:
+                elif key in {"hooks", "mcpServers", "mcp_servers", "mcp-servers"}:
                     meta[key] = {"<unparsed>": True}
             elif val.lower() == "true" and key == "alwaysApply":
                 meta[key] = True
@@ -1089,12 +1091,17 @@ def diff_instruction_trees(
         # 1. scope_widened
         if base is None:
             in_rule_dir = any(rel_path.startswith(d + "/") for d in _RULE_DIRECTORIES)
+            unconditional_instruction = (
+                rel_path in INSTRUCTION_FILES
+                or PurePosixPath(rel_path).name in NESTED_INSTRUCTION_NAMES
+            )
             # Only Cursor reads alwaysApply; other hosts load an unscoped rule file always.
             opted_out = head.always_apply_false and rel_path.startswith(".cursor/rules/")
             if (
                 head.always_apply
                 or any(_broad_glob(g) for g in head.globs)
                 or (in_rule_dir and not head.path_scoped and not opted_out)
+                or (unconditional_instruction and not head.path_scoped)
             ):
                 changes.append(
                     InstructionChange(

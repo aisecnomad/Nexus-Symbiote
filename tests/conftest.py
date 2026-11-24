@@ -103,7 +103,9 @@ NON_LINUX_SKIP_REASONS = (
 )
 # Expected only as root, which ignores directory modes: a test that needs the kernel to
 # refuse a traverse-only directory cannot simulate that refusal and skips.
-ROOT_SKIP_REASONS = (re.compile(r"\Aroot ignores directory mode 0o111\Z"),)
+ROOT_SKIP_REASONS = (
+    re.compile(r"\Aroot (?:ignores (?:directory )?mode (?:0o111|bits)|bypasses mode checks)\Z"),
+)
 DEFAULT_TIMEOUT_SECONDS = 300
 
 

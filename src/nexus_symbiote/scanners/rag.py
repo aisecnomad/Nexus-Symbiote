@@ -180,6 +180,20 @@ class _TooManyURLsError(_SourceError):
     """A configuration file declares more endpoint URLs than one file may describe."""
 
 
+_BARE_ENTROPY_SEGMENT = re.compile(r"[A-Za-z0-9_~-]{24,}")
+
+
+def _has_bare_secret_segment(text: str) -> bool:
+    for match in _BARE_ENTROPY_SEGMENT.finditer(text):
+        seg = match.group(0)
+        has_upper = any("A" <= c <= "Z" for c in seg)
+        has_lower = any("a" <= c <= "z" for c in seg)
+        has_digit = any("0" <= c <= "9" for c in seg)
+        if has_digit and (has_upper and has_lower):
+            return True
+    return False
+
+
 def _identifier(value: Any, field: str) -> str | None:
     if value is None:
         return None
@@ -189,6 +203,7 @@ def _identifier(value: Any, field: str) -> str | None:
     if (
         "://" in text
         or _TOKEN_SHAPE.search(text)
+        or _has_bare_secret_segment(text)
         or not _IDENTIFIER.fullmatch(text)
         or redact_text(text) != text
     ):
@@ -222,6 +237,7 @@ def _exported_uri(raw: str) -> tuple[str, bool]:
     if (
         _PLAIN_PATH.fullmatch(value)
         and not _TOKEN_SHAPE.search(value)
+        and not _has_bare_secret_segment(value)
         and redact_text(value) == value
     ):
         return value, False

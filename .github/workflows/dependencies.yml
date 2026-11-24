@@ -120,8 +120,8 @@ jobs:
       # with committed files; the newest releases differ from it by design.
       - name: Run the full suite on the newest allowed releases
         run: >-
-          python -m pytest -vv --strict-skips --durations=20 -o faulthandler_timeout=280
-          -m "not locked_only"
+          python -m pytest -n auto --dist worksteal -vv --strict-skips --durations=20
+          -o faulthandler_timeout=280 -m "not locked_only"
       - name: Retain the resolved versions
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -73,7 +73,7 @@ def _check_launch_policy(policy: Path, project: Path, inventory: Path) -> os.sta
     """
     resolved = policy.resolve()
     untrusted = [project.resolve()]
-    for start in (project.resolve(), inventory.resolve().parent):
+    for start in (project.resolve(), inventory.resolve().parent, Path.cwd().resolve()):
         # A nested checkout (a submodule or vendored repository) has its own .git, but
         # the change under review can still edit the repository around it.
         untrusted.extend(_repository_roots(start))
@@ -354,6 +354,7 @@ def register_supply_chain_commands(main: click.Group) -> None:
             project_path.resolve(),
             *_repository_roots(project_path.resolve()),
             *_repository_roots(inventory_path.resolve().parent),
+            *_repository_roots(Path.cwd().resolve()),
         ]
         for ev_path, att_path in zip(
             transport_evidence, transport_evidence_attestations, strict=True
@@ -979,6 +980,24 @@ def register_supply_chain_commands(main: click.Group) -> None:
             ) from exc
         try:
             if offline_db is not None:
+                advisory_trees = [
+                    *_repository_roots(aibom_path.resolve().parent),
+                    *_repository_roots(Path.cwd().resolve()),
+                ]
+                for feed_path, feed_flag in (
+                    (offline_db, "--offline-db"),
+                    *((kp, "--kev") for kp in kev_paths),
+                    *(([(epss_path, "--epss")]) if epss_path is not None else ()),
+                ):
+                    resolved_feed = feed_path.resolve()
+                    if any(
+                        resolved_feed == tree or resolved_feed.is_relative_to(tree)
+                        for tree in advisory_trees
+                    ):
+                        raise click.UsageError(
+                            f"{feed_flag} must lie outside every git repository enclosing "
+                            "AIBOM_PATH or the current directory"
+                        )
                 from nexus_symbiote.offline_advisories import (
                     DEFAULT_MAX_FEED_AGE_DAYS,
                     match_offline_advisories,

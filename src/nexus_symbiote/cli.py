@@ -1641,6 +1641,38 @@ def import_shadowscan(
     raise click.ClickException("Imported claims do not establish complete verified coverage")
 
 
+def _check_unpinned_trust_root(
+    trust_root: str | None,
+    trust_root_sha256: str | None,
+    untrusted_inputs: tuple[Path, ...],
+) -> None:
+    """Refuse an unpinned Sigstore trust root located inside an untrusted checkout or git tree."""
+    if trust_root is None or trust_root_sha256 is not None:
+        return
+    from nexus_symbiote.runtime_cli import _verify_outside_checkout
+
+    raw_path = Path(trust_root)
+    target = (
+        raw_path / "trusted_root.json"
+        if raw_path.is_dir() and os.path.lexists(raw_path / "trusted_root.json")
+        else raw_path
+    )
+    if target.is_dir():
+        resolved = target.resolve()
+        for inp in (*untrusted_inputs, Path.cwd()):
+            base = inp.resolve()
+            root_dir = base if base.is_dir() else base.parent
+            for candidate in (root_dir, *root_dir.parents):
+                if (candidate == root_dir and base.is_dir()) or os.path.lexists(candidate / ".git"):
+                    if resolved == candidate or resolved.is_relative_to(candidate):
+                        raise click.UsageError(
+                            "--trust-root must lie outside the target checkout and every git "
+                            "working tree that holds the checkout or the current directory"
+                        )
+        return
+    _verify_outside_checkout(target, untrusted_inputs, label="--trust-root")
+
+
 @main.command("verify-artifact")
 @click.argument("artifact_path")
 @click.option(
@@ -1726,6 +1758,7 @@ def verify_artifact(
     if not hmac.compare_digest(digest, expected_digest):
         raise click.ClickException("Artifact digest mismatch")
     if bundle:
+        _check_unpinned_trust_root(trust_root, trust_root_sha256, (Path(project), Path(bundle)))
         try:
             bundle_bytes = read_regular_text(Path(bundle)).encode("utf-8")
         except (OSError, UnicodeError) as exc:
@@ -1816,6 +1849,12 @@ def verify_discovery(
         raise click.UsageError("--bundle, --signer-identity and --issuer must be supplied together")
     if not bundle and (trust_root or trust_root_sha256):
         raise click.UsageError("--trust-root and --trust-root-sha256 require --bundle")
+    if bundle:
+        _check_unpinned_trust_root(
+            trust_root,
+            trust_root_sha256,
+            (Path(aibom_path), Path(report_path), Path(bundle)),
+        )
     try:
         doc = parse_json_strict(
             read_regular_text(Path(aibom_path), max_bytes=MAX_REPORT_BYTES),
@@ -1983,12 +2022,17 @@ def _resolve_attestation_gate_options(
         ):
             if supplied:
                 raise click.UsageError(f"{flag} requires --require-attestation")
+    elif not trusted_keys:
+        raise click.UsageError("--require-attestation requires at least one --trusted-key")
     return (
         "reviewed" if attestation_purpose is None else attestation_purpose,
         1 if attestation_threshold is None else attestation_threshold,
         "bytes" if attestation_match is None else attestation_match,
         attestation_max_age_days,
     )
+
+
+_ATTESTATION_COLLECTION_REASONS = frozenset({"key-invalid", "input-too-large", "input-unreadable"})
 
 
 def _raise_on_misplaced_attestation_key(attestation_report: Mapping[str, object]) -> None:
@@ -1999,6 +2043,14 @@ def _raise_on_misplaced_attestation_key(attestation_report: Mapping[str, object]
         "must lie outside" in detail or "hard links" in detail or "cannot be inspected" in detail
     ):
         raise click.UsageError(detail)
+
+
+def _attestation_collection_failed(attestation_report: Mapping[str, object] | None) -> bool:
+    return (
+        attestation_report is not None
+        and not attestation_report.get("verified")
+        and attestation_report.get("reason") in _ATTESTATION_COLLECTION_REASONS
+    )
 
 
 @main.command()
@@ -2273,7 +2325,7 @@ def validate(
         operator_source=policy_source if op_digest is not None else None,
     )
     if not passed:
-        _gate_exit(detailed)
+        _gate_exit(detailed, collection_failed=_attestation_collection_failed(attestation_report))
 
 
 @main.command()
@@ -2541,7 +2593,9 @@ def risk(
                 project=root,
                 operator_source=op_source_line,
             )
-            _gate_exit(detailed)
+            _gate_exit(
+                detailed, collection_failed=_attestation_collection_failed(attestation_report)
+            )
         basis = checked.basis
         supplier_claims = [
             {"subject": c.subject, "kind": c.kind, "detail": c.detail}
@@ -2583,7 +2637,7 @@ def risk(
             project=root,
             operator_source=op_source_line,
         )
-        _gate_exit(detailed)
+        _gate_exit(detailed, collection_failed=_attestation_collection_failed(attestation_report))
     scorer = RiskScorer.from_policy(
         policy.risk,
         # The scorer requires a finite threshold; none can be reached by a sum of weights.
@@ -2624,7 +2678,7 @@ def risk(
         operator_source=op_source_line,
     )
     if not passed:
-        _gate_exit(detailed)
+        _gate_exit(detailed, collection_failed=_attestation_collection_failed(attestation_report))
 
 
 @main.command()

@@ -2717,6 +2717,10 @@ class ModelScanner(Scanner):
             if raw is None:
                 self._digests[path] = None
                 return
+            if (followed := files.link_target(path)) is not None and credential_shaped(followed):
+                self._digests[path] = None
+                files._fail(path, "file changed during collection")
+                return
             digest = self._digests[path] = hash_bytes(raw)
             templates.append((source, digest))
             if template_escape_markers(raw):

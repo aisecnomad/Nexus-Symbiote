@@ -412,6 +412,9 @@ def _utf8_width(ch: str) -> int:
     return 4
 
 
+MAX_LEXICAL_NORMALIZED_CHARS = 8 * 1024 * 1024
+
+
 def normalize_for_lexical_scan(text: str) -> tuple[str, list[int]]:
     """Remove default-ignorable code points and NFKC-fold the rest in one O(N) pass.
 
@@ -420,15 +423,23 @@ def normalize_for_lexical_scan(text: str) -> tuple[str, list[int]]:
     mapping each of its characters back to the UTF-8 byte offset in ``text`` of the
     character it came from.
     """
+    cap = max(
+        min(len(text) + 65_536, MAX_LEXICAL_NORMALIZED_CHARS),
+        min(max(4 * len(text), 262_144), 4 * 1024 * 1024),
+    )
     folded: list[str] = []
     byte_offsets: list[int] = []
     byte_pos = 0
     for ch in text:
         if ch < "\x80":
+            if len(folded) >= cap:
+                raise ValueError("lexical normalization expansion limit exceeded")
             folded.append(ch)
             byte_offsets.append(byte_pos)
         elif unicodedata.category(ch) != "Cf" and HIDDEN_CHARACTERS.match(ch) is None:
             for part in _APOSTROPHES.get(ch) or unicodedata.normalize("NFKC", ch):
+                if len(folded) >= cap:
+                    raise ValueError("lexical normalization expansion limit exceeded")
                 folded.append(part)
                 byte_offsets.append(byte_pos)
         byte_pos += _utf8_width(ch)
@@ -669,12 +680,13 @@ def _json_strings_with_owners(
             inside_tool = (
                 inherited is not None and inherited.kind == "tool" and inherited.node is not node
             )
-            if not inside_tool and slot == "server":
+            keyed_server = slot == "server" and by_key is not None and by_key.node is node
+            if not inside_tool and slot == "server" and not keyed_server:
                 if isinstance(label, str) and label and (label in known or server is None):
                     server = label
                 elif server is None:
                     server = ""
-            if not inside_tool and isinstance(label, str) and label in known:
+            if not inside_tool and not keyed_server and isinstance(label, str) and label in known:
                 by_name = _SourceOwner(label, node, slot, server)
             elif (
                 not inside_tool

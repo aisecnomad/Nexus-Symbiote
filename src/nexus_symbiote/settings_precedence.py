@@ -94,6 +94,20 @@ _COMMAND_RUNNERS = frozenset(
         "uvx",
         "uv",
         "pipx",
+        "npm",
+        "yarn",
+        "pnpm",
+        "cargo",
+        "go",
+        "make",
+        "pip",
+        "pip3",
+        "gem",
+        "bundle",
+        "composer",
+        "gradle",
+        "mvn",
+        "dotnet",
     }
 )
 _VERSIONED_INTERPRETER = re.compile(r"(?:python|pypy|ruby|php|perl|node)[0-9.]*|py")
@@ -389,18 +403,34 @@ class _RuleBucket:
 def _spec_runs_arbitrary_command(spec: str) -> bool:
     if _SHELL_META_RE.search(spec):
         return True
-    from nexus_symbiote.scanners.ide_agents import _rule_program
+    from fnmatch import fnmatchcase
 
-    program_raw, _ = _rule_program(spec)
+    from nexus_symbiote.scanners.ide_agents import (
+        _SAFE_TASK_SUBCOMMAND_RE,
+        _SHELL_GLOB_TARGETS,
+        _TASK_RUNNERS_WITH_SAFE_SUBCOMMANDS,
+        _rule_program,
+    )
+
+    program_raw, arguments = _rule_program(spec)
     program = program_raw.lower()
     if not program:
         words = spec.split(":", 1)[0].split()
         if not words:
             return False
         program = words[0].rsplit("/", 1)[-1].lower()
+        arguments = spec[len(words[0]) :]
     if program.startswith("*"):
         return True
+    if ("*" in program or "?" in program) and any(
+        fnmatchcase(target, program) for target in _SHELL_GLOB_TARGETS
+    ):
+        return True
     stripped = program.rstrip("*")
+    if stripped in _TASK_RUNNERS_WITH_SAFE_SUBCOMMANDS and _SAFE_TASK_SUBCOMMAND_RE.fullmatch(
+        arguments
+    ):
+        return False
     return stripped in _COMMAND_RUNNERS or _VERSIONED_INTERPRETER.fullmatch(stripped) is not None
 
 
