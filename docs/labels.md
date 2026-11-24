@@ -88,4 +88,4 @@ one applies.
 
 | Label | Meaning |
 | --- | --- |
-| `audit-2026-11` | Fixes from the November 2026 audits: the [security audit of 2026-11-14](audits/security-audit-2026-11-14.md) and the [repository audit of 2026-11-16](audits/repository-audit-2026-11-16.md) |
+| `audit-2026-11` | Fixes from the November 2026 security and repository audits (historical audit snapshots are preserved in Git history) |

@@ -19,4 +19,4 @@ agent components, with the tool's own safety as a scored dimension.
 
 See [SPEC.md](SPEC.md#running-the-benchmark) for how to run it.
 
-The feature enhancement plan derived from these results, with its roadmap and the benchmark criteria it would add, is [docs/enhancement-plan-2026-11-18.md](../../docs/enhancement-plan-2026-11-18.md).
+The active roadmap and release milestones derived from these results are tracked in [ROADMAP.md](../../ROADMAP.md).
