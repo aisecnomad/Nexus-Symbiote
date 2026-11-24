@@ -116,15 +116,8 @@ core-metadata-version = "2.4"
 
 [tool.hatch.build.targets.sdist]
 core-metadata-version = "2.4"
-# README images are served from the repository by absolute URL; internal dated records
-# and benchmarks are not package build inputs.
-exclude = [
-    "/docs/assets",
-    "/docs/audits",
-    "/docs/enhancement-plan-2026-11-18.md",
-    "/SHADOWSCAN_INTEGRATION.md",
-    "/benchmarks/aibom-bench",
-]
+# README images are served from the repository by absolute URL; benchmarks are not build inputs.
+exclude = ["/docs/assets", "/benchmarks/aibom-bench"]
 
 [tool.ruff]
 target-version = "py311"
