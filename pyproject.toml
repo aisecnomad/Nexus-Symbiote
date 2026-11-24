@@ -35,6 +35,7 @@ classifiers = [
     "Intended Audience :: Information Technology",
     "Intended Audience :: System Administrators",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -115,7 +116,7 @@ core-metadata-version = "2.4"
 
 [tool.hatch.build.targets.sdist]
 core-metadata-version = "2.4"
-# README images are served from the repository by absolute URL; they are not build inputs.
+# README images are served from the repository by absolute URL; benchmarks are not build inputs.
 exclude = ["/docs/assets", "/benchmarks/aibom-bench"]
 
 [tool.ruff]

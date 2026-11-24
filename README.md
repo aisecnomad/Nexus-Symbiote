@@ -62,27 +62,27 @@ Activate with `cd Nexus-Symbiote && . .venv/bin/activate`. Optional extras: `.[s
 
 ### Install a verified release
 
-Requires Python 3.11–3.14, git, curl, and the [GitHub CLI](https://cli.github.com/) (`gh auth login`). Downloads the published `v0.1.0` wheel, verifies its GitHub build attestation against the tagged commit, and installs the hash-locked runtime (`0.2.0` is in preparation on `main`; use [Install from reviewed source](#install-from-reviewed-source) before publication):
+Requires Python 3.11–3.14, git, curl, and the [GitHub CLI](https://cli.github.com/) (`gh auth login`). Downloads the published `v0.2.0` wheel, verifies its GitHub build attestation against the signed `v0.2.0` tag commit, and installs the hash-locked runtime:
 
 ```bash
 (
   set -euo pipefail
   python3 -m venv --clear .venv
-  commit="$(git ls-remote https://github.com/aisecnomad/Nexus-Symbiote.git 'refs/tags/v0.1.0^{}' | cut -f1)"
-  test -n "$commit" || { echo "tag v0.1.0 not found" >&2; exit 1; }
-  .venv/bin/python -m pip download --no-deps --only-binary=:all: nexus-symbiote==0.1.0 -d dist
-  gh attestation verify dist/nexus_symbiote-0.1.0-py3-none-any.whl --repo Hunzee-VC/Nexus-Symbiote \
-    --signer-workflow Hunzee-VC/Nexus-Symbiote/.github/workflows/release.yml \
+  commit="$(git ls-remote https://github.com/aisecnomad/Nexus-Symbiote.git 'refs/tags/v0.2.0^{}' | cut -f1)"
+  test -n "$commit" || { echo "tag v0.2.0 not found" >&2; exit 1; }
+  .venv/bin/python -m pip download --no-deps --only-binary=:all: nexus-symbiote==0.2.0 -d dist
+  gh attestation verify dist/nexus_symbiote-0.2.0-py3-none-any.whl --repo aisecnomad/Nexus-Symbiote \
+    --signer-workflow aisecnomad/Nexus-Symbiote/.github/workflows/release.yml \
     --source-ref refs/heads/main --source-digest "$commit" --deny-self-hosted-runners
   curl -fsSL -o requirements-action.lock \
     "https://raw.githubusercontent.com/aisecnomad/Nexus-Symbiote/$commit/requirements-action.lock"
   .venv/bin/python -m pip install --require-hashes --only-binary=:all: -r requirements-action.lock
-  .venv/bin/python -m pip install --no-deps dist/nexus_symbiote-0.1.0-py3-none-any.whl
+  .venv/bin/python -m pip install --no-deps dist/nexus_symbiote-0.2.0-py3-none-any.whl
   .venv/bin/nexus-symbiote --version
 )
 ```
 
-`--repo` and `--signer-workflow` reference `Hunzee-VC` because `v0.1.0` was attested before the repository transferred to `aisecnomad`; subsequent releases attest under `aisecnomad`. See [Releasing](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/releasing.md) for attestation details.
+See [Releasing](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/releasing.md) for attestation details and offline verification with `--bundle`.
 
 ### Try it in 60 seconds
 

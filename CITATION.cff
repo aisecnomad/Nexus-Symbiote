@@ -15,7 +15,7 @@ url: https://github.com/aisecnomad/Nexus-Symbiote
 license: MIT
 # scripts/check_repository_hygiene.py requires this version to match pyproject.toml.
 version: 0.2.0
-date-released: "2026-11-12"
+date-released: "2026-11-25"
 keywords:
   - aibom
   - agent-bill-of-materials
