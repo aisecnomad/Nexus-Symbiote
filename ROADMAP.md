@@ -35,14 +35,14 @@ Every release preserves eleven non-negotiable engineering and security invariant
 
 Dates for upcoming milestones are target estimates for a single-maintainer project and prioritize security verification and soak windows over calendar dates.
 
-### 0.2.0 — Verification depth & public release (current)
+### 0.2.0 — Verification depth & public release (released 2026-11-25)
 
-Prepares the first hardened release from the canonical `aisecnomad` owner with full publication controls:
+The first hardened release from the canonical `aisecnomad` owner, published with full publication controls:
 
 - **Shipped in `0.2.0`:** Expanded static collectors across 8 surfaces (MCP dialects including Zed/Continue/opencode/Junie, Claude Code hooks/settings/subagents/skills, `prompts/` & `*.prompt.*`, identifier hygiene & mixed-script detection, content-inspected pickle/GGUF/SafeTensors ratings, credential exposure findings, deterministic text-poisoning rules, grouped coverage failures, `oversight_gap` & guardrail drift alerts, DSSE inventory attestation, `trace-diff`, G7 minimum-elements coverage, framework crosswalk, safe HTML graph view, `make precision` AIBOM-Bench recall-floor gate, parser fuzz smoke harness, and kernel network-denied `Offline invariant` CI verification).
 - **Publication controls:** Active branch protection requiring `Verified CI`, dual tag-protection rulesets, TestPyPI/PyPI protected environments (`can_admins_bypass: false`), OIDC trusted publishing, PEP 740 attestations, signed release tag, and 24-hour soak before PyPI promotion (see [releasing](docs/releasing.md) and [repository controls](docs/repository-controls.md)).
 
-### 0.3.0 — Precision depth, determinism & native format 1.2.0
+### 0.3.0 — Precision depth, determinism & native format 1.2.0 (current)
 
 - **Regression corpus & precision depth:** Expand per-category positive and negative fixtures (`model_drift`, `a2a_scope_drift`) and tighten per-class recall floors in `make precision` over `benchmarks/aibom-bench`.
 - **Settings & determinism finish:** Replace remaining TypeScript wall-clock parse deadlines with proportional node budgets, bound export work on adversarial graphs, and add `diff --expect-upgrade` attribution.
