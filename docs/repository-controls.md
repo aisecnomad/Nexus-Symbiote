@@ -48,6 +48,8 @@ It fails closed on missing, truncated, or malformed GitHub responses, redirects,
 
 Observed live through the GitHub API on **2026-11-24**. Always re-verify live settings before relying on any row; `--publish` preflights re-check the marked controls automatically.
 
+The preflight of the 0.2.0 `pypi` run (`45671527287`) passed on **2026-11-25**: it re-checked branch protection and `Verified CI` for the release commit, the release-tag immutability ruleset except its bypass list, and the `pypi` environment, and it required the 24-hour soak and the signed tag `v0.2.0`. Before approving the upload, the maintainer verified the ruleset's bypass list.
+
 | Control | Observed state (2026-11-24) | Action |
 | --- | --- | --- |
 | Branch protection on `main` | Active (interim profile): `Verified CI` required (`app_id: 15368`, `enforcement_level: everyone`), force-push and deletion disabled, no approving review required | Switch to target profile once a second reviewer exists |
@@ -56,7 +58,7 @@ Observed live through the GitHub API on **2026-11-24**. Always re-verify live se
 | Secret scanning & push protection | Enabled (`secret_scanning`, `secret_scanning_push_protection`, `dependabot_security_updates`) | None |
 | Auto-delete head branches | Enabled (`delete_branch_on_merge: true`) | None |
 | `testpypi` & `pypi` environments | Protected: `@aisecnomad` required reviewer, `can_admins_bypass: false`, custom branch policy restricted to `main` (checked at publication) | Enable *Prevent self-review* once a second reviewer exists |
-| Trusted publishers | Confirmed under owner `aisecnomad` on PyPI and TestPyPI for `Nexus-Symbiote`, `release.yml`, and `pypi` / `testpypi` environments | None |
+| Trusted publishers | Confirmed under owner `aisecnomad` on PyPI and TestPyPI for `Nexus-Symbiote`, `release.yml`, and `pypi` / `testpypi` environments; both indexes accepted the 0.2.0 uploads from them on 2026-11-25 | None |
 | Release tag rulesets (`refs/tags/v*`) | Both active: `release tags` (immutability, ID `26831613`, `bypass_actors: []`, `current_user_can_bypass: never`) and `release tag creation` (ID `27907590`, admin-only creation) | Re-verify `--verify-bypass-actors` before approving publication |
 
 ### Apply the outstanding controls

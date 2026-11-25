@@ -403,6 +403,37 @@ verified below.
 
 ## Release record
 
+- **0.2.0.** `release.yml` (environment `pypi`) published the wheel and sdist to
+  PyPI on 2026-11-25 at 18:56 UTC from the release commit `5be645f`, 25 hours and
+  30 minutes after it merged and 18 hours and 42 minutes after the TestPyPI
+  rehearsal. The publishing run (`45671527287`) passed its preflight: branch
+  protection, `Verified CI` for the exact commit, the release-tag ruleset, the
+  protected environment, the 24-hour soak and the signed tag. Before approving the
+  upload, the maintainer verified the ruleset's bypass list, which the preflight
+  cannot read. The PyPI files are byte-identical to the rehearsed TestPyPI files,
+  an independent rebuild of the commit reproduced them, and both carry PEP 740
+  provenance naming this workflow, the `pypi` environment and the release commit.
+  After a second approval, the same run pushed the container image at 19:33 UTC,
+  attested it and verified the attestation:
+  `ghcr.io/aisecnomad/nexus-symbiote@sha256:a136271cb72e31d4abfcfcdb5e76a949d0747db57cb883a9cb8a8f06342898ef`.
+  The package files in the image are byte-identical to the wheel's. What differed
+  from this procedure, or is worth knowing later:
+  - The last behavior-changing pull request
+    ([#436](https://github.com/aisecnomad/Nexus-Symbiote/pull/436)) merged 77
+    minutes before the release commit, so the upload followed it by 27 hours, not
+    the 72 hours that step 1 asks for.
+  - The tag `v0.2.0`, created 73 minutes before the upload, is signed with an SSH
+    key other than the one that signed `v0.1.0`
+    (`SHA256:GKBQ63vMrbmAooIj0qN1pXbCZoMoD+7QUks5Z82xpR8`). GitHub reports the tag
+    as verified only while that key stays registered as a signing key on the
+    maintainer's account.
+  - No second person reviewed the release. The rehearsal and the published files
+    were checked by digest, provenance, an independent rebuild, the test suite, and
+    installs on Python 3.11, 3.12 and 3.13.
+  - The publishing run was the first to build the image: no earlier run or CI job
+    builds the `Dockerfile`. The image's pinned base predates four Debian security
+    updates: glibc `2.41-12+deb13u5`, zlib (DSA-6613-1), libzstd (DSA-6657-1) and
+    shadow (DSA-6661-1).
 - **0.1.0.** `release.yml` (environment `pypi`) published the wheel and sdist to
   PyPI on 2026-11-08 at 01:28 UTC, 24 minutes after the TestPyPI rehearsal and
   100 minutes after the release commit `d8c54e4` merged; both files carry PEP 740
