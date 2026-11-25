@@ -422,18 +422,20 @@ verified below.
     ([#436](https://github.com/aisecnomad/Nexus-Symbiote/pull/436)) merged 77
     minutes before the release commit, so the upload followed it by 27 hours, not
     the 72 hours that step 1 asks for.
-  - The tag `v0.2.0`, created 73 minutes before the upload, is signed with an SSH
-    key other than the one that signed `v0.1.0`
-    (`SHA256:GKBQ63vMrbmAooIj0qN1pXbCZoMoD+7QUks5Z82xpR8`). GitHub reports the tag
-    as verified only while that key stays registered as a signing key on the
-    maintainer's account.
+  - The tag `v0.2.0`, created 73 minutes before the upload, is signed with the SSH
+    key `SHA256:GKBQ63vMrbmAooIj0qN1pXbCZoMoD+7QUks5Z82xpR8`, not the key that
+    signed `v0.1.0`. GitHub reports the tag as verified only while that key stays
+    registered as a signing key on the maintainer's account.
   - No second person reviewed the release. The rehearsal and the published files
     were checked by digest, provenance, an independent rebuild, the test suite, and
     installs on Python 3.11, 3.12 and 3.13.
   - The publishing run was the first to build the image: no earlier run or CI job
     builds the `Dockerfile`. The image's pinned base predates four Debian security
     updates: glibc `2.41-12+deb13u5`, zlib (DSA-6613-1), libzstd (DSA-6657-1) and
-    shadow (DSA-6661-1).
+    shadow (DSA-6661-1). The image also has two cosmetic defects: its process runs
+    with group ID 10001 while the `symbiote` group it creates has GID 999, and its
+    license label says `MIT` while the package declares
+    `MIT AND Apache-2.0 AND Community-Spec-1.0 AND CC-BY-3.0`.
 - **0.1.0.** `release.yml` (environment `pypi`) published the wheel and sdist to
   PyPI on 2026-11-08 at 01:28 UTC, 24 minutes after the TestPyPI rehearsal and
   100 minutes after the release commit `d8c54e4` merged; both files carry PEP 740
