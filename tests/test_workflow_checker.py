@@ -152,6 +152,7 @@ def ci_workflow():
         ("verified", "sys.exit(bool(failed))"),
         ("offline-invariant", "requirements-ci.lock"),
         ("offline-invariant", "unshare --net"),
+        ("distribution", "scripts/check_image.py"),
     ],
 )
 def test_a_gate_job_hollowed_out_under_its_name_is_rejected(tmp_path, job, command):
@@ -168,7 +169,10 @@ def test_a_gate_job_hollowed_out_under_its_name_is_rejected(tmp_path, job, comma
     "job,command",
     [
         ("build", "--strict-skips"),
+        ("build", "scripts/check_image.py"),
+        ("build", "scripts/image_base_updates.py"),
         ("verify", "gh attestation verify"),
+        ("image", "scripts/check_image.py"),
         ("image-verify", "gh attestation verify"),
     ],
 )
@@ -229,6 +233,9 @@ def condition(job, command, value):
         ),
         # The preflight's reviewed condition does not carry over to another gate.
         ("release.yml", "build", "python -m pytest", "inputs.publish != 'none'"),
+        # The image is rehearsed in every release run, not only in one that publishes.
+        ("release.yml", "build", "scripts/check_image.py", "inputs.publish != 'none'"),
+        ("release.yml", "image", "scripts/check_image.py", "inputs.publish == 'testpypi'"),
         ("release.yml", "compatibility", "scripts/check_installed_wheel.py", False),
         ("release.yml", "verify", "gh attestation verify", False),
         ("ci.yml", "verified", "sys.exit(bool(failed))", False),
@@ -246,6 +253,7 @@ def test_a_gate_step_that_a_condition_can_skip_is_rejected(tmp_path, name, job, 
         ("ci.yml", "test", "github.event_name == 'push'"),
         ("ci.yml", "action-annotations", "success() && false"),
         ("release.yml", "build", "github.ref == 'refs/heads/release'"),
+        ("release.yml", "image", "inputs.publish == 'pypi'"),
         ("release.yml", "compatibility", "${{ false }}"),
     ],
 )
@@ -299,6 +307,9 @@ HERE_STRING = "cat <<<EOF\nmypy src/nexus_symbiote scripts || true\nEOF"
         ("ci.yml", "action-annotations", "gh api --paginate", '/check-runs"\n', '/check-runs" &\n'),
         ("ci.yml", "action", "sys.exit(bool(failures))", "<<'PY'", "<<'PY' || true"),
         ("release.yml", "build", "check_repository_controls", '"$PUBLISH"', '"$PUBLISH" || echo'),
+        ("release.yml", "build", "check_image.py", "packages.json", "packages.json || true"),
+        ("release.yml", "image", "check_image.py", '"$GITHUB_OUTPUT"', '"$GITHUB_OUTPUT" || :'),
+        ("ci.yml", "distribution", "scripts/check_image.py", "dist", "dist || true"),
     ],
 )
 def test_a_gate_command_whose_status_is_discarded_is_rejected(

@@ -197,6 +197,35 @@ def test_vendored_schema_provenance_cannot_silently_drift(tmp_path, mutation):
     assert hygiene.vendor_issues(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "dockerfile,accepted",
+    [
+        ('LABEL org.opencontainers.image.licenses="MIT AND Apache-2.0"\n', True),
+        ('LABEL a="b" \\\n      org.opencontainers.image.licenses="MIT AND Apache-2.0"\n', True),
+        ('LABEL org.opencontainers.image.licenses="MIT"\n', False),
+        ("LABEL org.opencontainers.image.licenses=MIT\n", False),
+        ("FROM scratch\n", False),
+        ('LABEL org.opencontainers.image.licenses="MIT AND Apache-2.0"\n' * 2, False),
+        (None, False),
+    ],
+)
+def test_the_image_license_label_is_the_distribution_license_expression(
+    tmp_path, dockerfile, accepted
+):
+    (tmp_path / "pyproject.toml").write_text('[project]\nlicense = "MIT AND Apache-2.0"\n')
+    if dockerfile is not None:
+        (tmp_path / "Dockerfile").write_text(dockerfile)
+    issues = hygiene.image_license_issues(tmp_path)
+    assert (issues == []) == accepted
+    assert len(issues) <= 1
+    (tmp_path / "pyproject.toml").write_text("[project]\n")
+    assert len(hygiene.image_license_issues(tmp_path)) == 1
+
+
+def test_the_tracked_image_license_label_matches_the_tracked_project():
+    assert hygiene.image_license_issues(Path(__file__).parents[1]) == []
+
+
 def _project(root: Path, homepage: str = "https://github.com/Canonical-Org/Widget") -> None:
     root.joinpath("pyproject.toml").write_text(
         f'[project]\nname = "widget"\nversion = "1.0.0"\n[project.urls]\nHomepage = "{homepage}"\n'

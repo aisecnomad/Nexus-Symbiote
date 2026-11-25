@@ -4,6 +4,24 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Security
+
+- **Hardened run commands:** `docs/container-image.md` now runs the image with `--cap-drop ALL --security-opt no-new-privileges` besides `--network none --read-only`; the image check scans the demo agent under exactly those flags.
+- **No registry token while the image is built:** The release `image` job builds and checks the image in a step that receives no token; only the step that logs in and pushes holds it.
+
+### Added
+
+- **Base image record in the release evidence:** `image-packages.json` (the image's Debian source packages) and `image-base-updates.json` (the fixes OSV records for that Debian release which the pinned base predates, and the advisories without a fix) join the attested evidence bundle, and the build job's summary lists them for the release notes. `make image-smoke` builds and checks the image locally.
+
+### Changed
+
+- **Container image built and checked before publication:** Every release run (candidate, TestPyPI and PyPI) now builds the image from its staged wheel in the `build` job and checks it with `scripts/check_image.py` before anything is attested or uploaded, and CI does the same on every pull request, so a `Dockerfile`, lock or base digest that cannot produce a working image is no longer first found after the PyPI upload. The `image` job repeats the check before it pushes.
+
+### Fixed
+
+- **Image group and license label:** The image's `symbiote` group now has GID 10001, the id the image runs with (in the 0.2.0 image the group is 999 and the process group has no name), and `org.opencontainers.image.licenses` is the wheel's expression `MIT AND Apache-2.0 AND Community-Spec-1.0 AND CC-BY-3.0` instead of `MIT`; `make hygiene` compares the label with `pyproject.toml`.
+- **Release assets:** The release procedure's `gh release create` command no longer names three attestation bundles that are all called `attestation.json`; each is first renamed after its artifact, as `<artifact>.sigstore.json`.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

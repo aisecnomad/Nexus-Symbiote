@@ -108,6 +108,7 @@ REQUIRED_COMMANDS: dict[str, dict[str, tuple[str, ...]]] = {
             "twine check --strict",
             "scripts/check_wheel_security.py",
             "scripts/check_installed_wheel.py",
+            "scripts/check_image.py",
         ),
         "security-regressions": (
             "requirements-action.lock",
@@ -155,9 +156,15 @@ REQUIRED_COMMANDS: dict[str, dict[str, tuple[str, ...]]] = {
             "--strict-skips",
             "scripts/check_security_regressions.py",
             "scripts/check_wheel_security.py",
+            # The image is built and run before anything is attested or uploaded, and the
+            # base's pending Debian fixes are recorded with the evidence.
+            "scripts/check_image.py",
+            "scripts/image_base_updates.py",
         ),
         "compatibility": ("scripts/check_installed_wheel.py",),
         "verify": ("gh attestation verify",),
+        # The job that pushes runs the same check on the image it is about to push.
+        "image": ("scripts/check_image.py",),
         "image-verify": ("gh attestation verify",),
     },
     "codeql.yml": {
@@ -172,11 +179,15 @@ REQUIRED_COMMANDS: dict[str, dict[str, tuple[str, ...]]] = {
 # name and its commands but no longer tests macOS.
 REQUIRED_RUNNERS: dict[str, dict[str, str]] = {"ci.yml": {"macos": "macos-"}}
 # A gate job or step runs by default, with success() or with always(). Besides those, the
-# release build runs only from main, and its repository-controls preflight only for a run
-# that publishes, as the publish job does; neither condition may skip any other gate.
+# release build runs only from main, its repository-controls preflight only for a run that
+# publishes, as the publish job does, and the image job only for a PyPI release from main;
+# none of these conditions may skip any other gate.
 ALWAYS_RUNS = frozenset({"success()", "always()"})
 REVIEWED_JOB_CONDITIONS: dict[str, dict[str, str]] = {
-    "release.yml": {"build": "github.ref == 'refs/heads/main'"},
+    "release.yml": {
+        "build": "github.ref == 'refs/heads/main'",
+        "image": "inputs.publish == 'pypi' && github.ref == 'refs/heads/main'",
+    },
 }
 REVIEWED_STEP_CONDITIONS: dict[str, dict[str, frozenset[str]]] = {
     # A push has no pull request base to measure against.

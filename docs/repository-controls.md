@@ -1,6 +1,6 @@
 # Repository verification controls
 
-`Verified CI` aggregates every required verification job on pull requests and `main`: Python 3.11–3.14 test matrix, full macOS 15 suite, dependency-floor suite (`requirements-floor.lock`), branch coverage floors, quality (`ruff`, `mypy`, workflow/hygiene/lock/PR-size checks), built-wheel distribution & security checks, security regression contracts, AIBOM-Bench precision gate, parser fuzz smoke, OSV dependency advisories, CodeQL security policy, end-to-end composite Action tests (including injection-annotation checks), and kernel network-denied offline invariant tests (`unshare --net`). Missing, failed, cancelled, or skipped prerequisites fail `Verified CI`.
+`Verified CI` aggregates every required verification job on pull requests and `main`: Python 3.11–3.14 test matrix, full macOS 15 suite, dependency-floor suite (`requirements-floor.lock`), branch coverage floors, quality (`ruff`, `mypy`, workflow/hygiene/lock/PR-size checks), built-wheel distribution & security checks with the container image built from that wheel and run offline, security regression contracts, AIBOM-Bench precision gate, parser fuzz smoke, OSV dependency advisories, CodeQL security policy, end-to-end composite Action tests (including injection-annotation checks), and kernel network-denied offline invariant tests (`unshare --net`). Missing, failed, cancelled, or skipped prerequisites fail `Verified CI`.
 
 ## Branch protection profiles
 

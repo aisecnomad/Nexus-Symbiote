@@ -234,6 +234,11 @@ jobs:
           "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip check
           "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip freeze --all
           "$RUNNER_TEMP/wheel-smoke/bin/python" -I scripts/check_installed_wheel.py --source .
+      # The release run builds the image again from its own wheel before it attests or
+      # uploads anything; here a pull request that breaks the Dockerfile, the Action lock or
+      # the pinned base (Dependabot moves its digest) fails before it can merge.
+      - name: Build the container image from this wheel and run it offline
+        run: python -I scripts/check_image.py dist
   security-regressions:
     name: Committed security regression contracts
     runs-on: ubuntu-24.04

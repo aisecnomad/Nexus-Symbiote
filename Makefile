@@ -120,6 +120,12 @@ wheel-smoke: ## Build afresh and check the exact wheel in a temporary locked env
 	"$$smoke_dir/bin/python" -m pip install --no-index --no-deps --only-binary=:all: dist/*.whl; \
 	"$$smoke_dir/bin/python" -I scripts/check_wheel_security.py dist/*.whl
 
+.PHONY: image-smoke
+image-smoke: ## Build afresh, then build the container image from that wheel and run it offline (needs Docker)
+	$(MAKE) clean-dist
+	$(MAKE) build
+	python -I scripts/check_image.py dist
+
 # ── Clean ────────────────────────────────────────────────────
 
 .PHONY: clean-dist

@@ -12,10 +12,15 @@ RUN python -m venv /opt/nexus-symbiote \
     && /opt/nexus-symbiote/bin/python -m pip check
 
 FROM python:3.12.16-slim-trixie@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+# The license expression of the wheel this image delivers (pyproject.toml; `make hygiene`
+# compares them). The base image and the locked dependencies keep their own licenses.
 LABEL org.opencontainers.image.title="nexus-symbiote" \
-      org.opencontainers.image.licenses="MIT"
-RUN useradd --system --user-group --uid 10001 --home-dir /home/symbiote --create-home \
-        --shell /usr/sbin/nologin symbiote
+      org.opencontainers.image.licenses="MIT AND Apache-2.0 AND Community-Spec-1.0 AND CC-BY-3.0"
+# The group is created first, with the id USER names: --user-group would give it the next
+# free system id instead, and the process would run with a group that has no name.
+RUN groupadd --system --gid 10001 symbiote \
+    && useradd --system --uid 10001 --gid 10001 --no-user-group --home-dir /home/symbiote \
+        --create-home --shell /usr/sbin/nologin symbiote
 COPY --from=install /opt/nexus-symbiote /opt/nexus-symbiote
 ENV PATH=/opt/nexus-symbiote/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1

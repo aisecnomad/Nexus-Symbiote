@@ -32,6 +32,7 @@ Run `make help` to list every target. The most common checks:
 | `make precision` | Fresh drift-regression and class-recall precision gate (`scripts/check_precision_gate.py`) |
 | `make fuzz-smoke` | Deterministic bounded parser fuzz corpus (`scripts/fuzz_parsers.py`) |
 | `make wheel-smoke` | Fresh wheel build + isolated security acceptance (`scripts/check_wheel_security.py`) |
+| `make image-smoke` | Fresh wheel build + container image built from it and run offline (`scripts/check_image.py`; needs Docker) |
 
 ## Testing
 

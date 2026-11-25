@@ -78,8 +78,11 @@ def test_evidence_is_derived_only_from_the_uploaded_distribution_bytes():
     runs = [step.get("run", "") for step in steps]
     staged = next(i for i, run in enumerate(runs) if "distributions.sha256" in run)
     upload = next(i for i, step in enumerate(steps) if step.get("name") == "Upload distributions")
-    recheck = next(
-        i for i, run in enumerate(runs) if '-c "$RUNNER_TEMP/distributions.sha256"' in run
-    )
-    assert staged < upload < recheck
-    assert runs[recheck].index("distributions.sha256") < runs[recheck].index("evidence.py prepare")
+    rechecks = [i for i, run in enumerate(runs) if '-c "$RUNNER_TEMP/distributions.sha256"' in run]
+    assert rechecks and staged < upload < rechecks[0]
+    # The image check and the benchmark both write evidence from dist/ after the
+    # upload: each rechecks the staged bytes before it reads them.
+    for derived in ("check_image.py dist", "evidence.py prepare"):
+        [step] = [i for i, run in enumerate(runs) if derived in run]
+        assert step in rechecks
+        assert runs[step].index("distributions.sha256") < runs[step].index(derived)

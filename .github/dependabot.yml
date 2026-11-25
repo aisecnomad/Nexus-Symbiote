@@ -17,6 +17,7 @@ updates:
         patterns: ["*"]
 
   # The Dockerfile's base image, pinned by digest in both stages; move them together.
+  # CI's distribution job builds the image on the proposed digest and runs it.
   - package-ecosystem: docker
     directory: /
     schedule:

@@ -5,7 +5,7 @@
 
 | `publish` | What the run does |
 |---|---|
-| `none` (default) | Builds, tests and attests a release candidate. Uploads nothing to a package index. |
+| `none` (default) | Builds, tests and attests a release candidate, and builds its container image without pushing it. Uploads nothing to a package index. |
 | `testpypi` | The same candidate, then uploads it to [TestPyPI](https://test.pypi.org/p/nexus-symbiote) as a rehearsal. |
 | `pypi` | The same candidate, then uploads it to [PyPI](https://pypi.org/p/nexus-symbiote) and pushes its [container image](container-image.md) to `ghcr.io`. Refused until the release commit has been on `main` for 24 hours and its signed tag exists. |
 
@@ -13,8 +13,10 @@ A second input, `soak_override`, stays empty. To publish an urgent security fix 
 24 hours are up, give the reason there; the run log records it.
 
 TestPyPI and PyPI use the same pipeline, the same gates and the same kind of attested
-bytes, so a successful rehearsal exercises everything except the final index. This is
-the only workflow that publishes to either index.
+bytes, so a successful rehearsal exercises everything except the final index and the
+push of the image to `ghcr.io`, with its attestation, which only a `pypi` run performs;
+every run builds and checks the image itself. This is the only workflow that publishes
+to either index.
 
 Nothing in this repository configures GitHub environments, package-index
 ownership, trusted publishers or repository protection. A maintainer does that once,
@@ -80,7 +82,9 @@ as described below.
    changes only versions and records. Check that `NATIVE_SPEC_VERSION` in
    `core/models.py` has its schema digest pinned in `tests/test_native_contract.py`:
    that digest freezes when this release, the first to ship the version, is tagged,
-   and any later schema change needs a new spec version.
+   and any later schema change needs a new spec version. Merge an open Dependabot
+   `image` pull request before the release pull request: the release builds its image
+   on the base digest the release commit pins, and a published image is not rebuilt.
 2. Freeze `main`: after the release pull request merges, merge nothing else until
    the `pypi` run is approved. `workflow_dispatch --ref main` builds whatever `main`
    is at dispatch time and the preflight requires that exact head, so a Dependabot
@@ -90,8 +94,11 @@ as described below.
    runs must list identical distribution digests; compare them. Dispatch with
    `publish=none`. Inspect the run's wheel, source distribution,
    environment SBOM, exact source record, installed-distribution inventory,
-   dependency advisory report, checksums and build/evidence attestations. Test the
-   wheel in an isolated environment outside the checkout.
+   dependency advisory report, checksums and build/evidence attestations. Read the
+   build job's summary for the Debian fixes the image's base is behind
+   (`image-base-updates.json`), and decide here whether one of them needs a newer base
+   before this version is published. Test the wheel in an isolated environment outside
+   the checkout.
 3. Dispatch with `publish=testpypi` and approve the `testpypi` environment. Fetch
    only this project from TestPyPI, check it against the run's `SHA256SUMS`, then
    install it with dependencies from PyPI alone. Anyone can register project names
@@ -175,7 +182,8 @@ as described below.
    For an urgent security fix, set `soak_override` to the reason instead of waiting;
    say so in the release notes. Once the upload has succeeded, the `image` job waits for
    a second approval of the `pypi` environment: check the published files first. It
-   builds the image from the run's wheel, runs it without the network, pushes it to
+   builds the image from the run's wheel and checks it with `scripts/check_image.py`,
+   as the build job of this run already did, pushes it to
    `ghcr.io/<owner>/<repository>` (lowercased) under the version, and the shell-free
    `image-attest` job attests the pushed digest; `image-verify` then checks that
    attestation as step 6 does. After the first release, check the package's visibility:
@@ -206,12 +214,23 @@ as described below.
      --name release-distributions --name release-evidence \
      --name distribution-attestation --name release-evidence-attestation \
      --name inventory-benchmark-attestation
+   for name in distribution release-evidence inventory-benchmark; do
+     mv release-assets/"$name"-attestation/* release-assets/"$name"-attestation.sigstore.json
+   done
    gh release create v<version> --verify-tag --notes-file <notes> \
      release-assets/release-distributions/* \
      release-assets/release-evidence/SHA256SUMS \
      release-assets/release-evidence/release-evidence.tar.gz \
-     release-assets/*-attestation/*
+     release-assets/distribution-attestation.sigstore.json \
+     release-assets/release-evidence-attestation.sigstore.json \
+     release-assets/inventory-benchmark-attestation.sigstore.json
    ```
+
+   Each attestation artifact holds one file, and the attest action names all three
+   `attestation.json`; the attest job runs no shell, so it cannot rename them. A release
+   cannot hold two assets of one name, so the loop gives each bundle its artifact's
+   name, as the 0.1.0 release has them. It fails if an artifact holds anything but one
+   file, and `gh release create` creates nothing when a bundle it names is missing.
 
    Offline verification with `gh attestation verify --bundle` then stays possible
    after the run is gone. Fetch the Sigstore trusted root once while online, with
@@ -223,18 +242,18 @@ as described below.
    ```bash
    sed -n 's#  dist/#  release-assets/release-distributions/#p' \
      release-assets/release-evidence/SHA256SUMS | sha256sum --strict -c -
-   bundles=(release-assets/distribution-attestation/*)   # the run retains exactly one
    gh attestation verify \
      release-assets/release-distributions/nexus_symbiote-<version>-py3-none-any.whl \
      --repo aisecnomad/Nexus-Symbiote \
-     --bundle "${bundles[0]}" \
+     --bundle release-assets/distribution-attestation.sigstore.json \
      --custom-trusted-root trusted_root.jsonl \
      --signer-workflow aisecnomad/Nexus-Symbiote/.github/workflows/release.yml \
      --source-ref refs/heads/main --source-digest <release commit SHA> \
      --deny-self-hosted-runners
    ```
 
-   Name the image digest in the notes.
+   Name the image digest in the notes, and the Debian fixes its base was behind, from
+   `image-base-updates.json`.
 8. Update the records that describe the release, in one documentation pull request:
    the changelog heading's date (the day of the PyPI upload, in UTC), `date-released`
    in `CITATION.cff`, the dated rows of the
@@ -258,9 +277,12 @@ as described below.
   run: `publish` downloads that run's `release-distributions` artifact again instead
   of rebuilding. If the index still refuses the retry, leave the version incomplete
   and publish the next patch version.
-- Image failure after the PyPI upload: the upload stands. Use **Re-run failed jobs** on
-  the same run; the image job builds again from that run's wheel, the version's tag
-  moves to the new digest, and `image-attest` attests that digest.
+- Image failure after the PyPI upload: the upload stands. The build job of the same
+  run built and checked the image from the same wheel, `Dockerfile` and lock before
+  anything was uploaded, so look for a registry or network failure first. Use
+  **Re-run failed jobs** on the same run; the image job builds again from that run's
+  wheel, the version's tag moves to the new digest, and `image-attest` attests that
+  digest.
 - Burned TestPyPI version: PyPI can still take the version, but the published bytes
   would not be the rehearsed ones. Prefer bumping and rehearsing again.
 - Name rejected at upload time: the publish job fails before any file lands. Choose a
@@ -328,6 +350,17 @@ the candidate's own sdist). Its token has no repository or OIDC permissions, and
 must pass before attestation. Files a floating dependency modifies there cannot
 replace the candidate.
 
+**Image built before publication.** The build job of every run, a candidate included,
+builds the [container image](container-image.md) from the staged wheel before anything
+is attested or uploaded, and CI does the same on every pull request.
+`scripts/check_image.py` builds from a context that holds the `Dockerfile`, the lock and
+the wheel, then requires the image to print the wheel's version without a network, to
+run as user and group 10001, both named `symbiote`, to carry the wheel's license
+expression, and to scan the demo agent under the flags the guide recommends. The job
+logs in to no registry and pushes nothing. A `Dockerfile`, lock or base digest that
+cannot produce a working image therefore stops the candidate, not a release that is
+already on PyPI.
+
 **Evidence.** The release build installs the wheel into a fresh environment with
 hash-checked binaries from `requirements-action.lock`, then collects the SBOM and
 benchmark evidence.
@@ -348,6 +381,14 @@ requirements, kept only where the requirement's marker holds for the inspected
 interpreter and an active extra; it describes what pip reports, not file
 authenticity, and carries no file hashes because pip does not record which of a
 lock entry's files it installed.
+
+`image-packages.json` lists the Debian source packages in the image the build job
+built, and `image-base-updates.json` records what OSV knew about them at that moment:
+the packages with a fixed version in that Debian release that the pinned base predates,
+with their advisories, and the advisories that have no fix there. It is a record for
+the release notes and not a gate, because the base moves only through a reviewed pull
+request and a published image is not rebuilt: pending fixes do not fail the run, an
+incomplete lookup does.
 
 `source-revision.json` requires the actual clean checkout to match the workflow's
 exact `GITHUB_SHA` and records the repository, ref and run identity. `SHA256SUMS`
@@ -377,10 +418,12 @@ configured for its environment. Neither of those jobs checks out or runs project
 source or any shell step.
 
 On a `pypi` run, the image job, gated by the same environment, holds a token that
-can write packages but no OIDC; the image-attest job holds OIDC and
-attestation-write permissions for the digest that job pushed, and runs no shell
-either. Every job that receives artifacts downloads them by ID with
-`digest-mismatch: error`, so a corrupted transfer stops the run.
+can write packages but no OIDC. Its step that builds and checks the image receives no
+token; the step that logs in and pushes takes only the image name and version that
+step wrote. The image-attest job holds OIDC and attestation-write permissions for the
+digest that job pushed, and runs no shell either. Every job that receives artifacts
+downloads them by ID with `digest-mismatch: error`, so a corrupted transfer stops the
+run.
 
 **Attestation verification.** After attestation, a separate verification job with
 only read access to repository contents and attestations downloads the candidate

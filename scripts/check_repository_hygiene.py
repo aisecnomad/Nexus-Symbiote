@@ -1,4 +1,5 @@
-"""Check tracked source conflicts, doc links and anchors, versions and vendor digests offline."""
+"""Check tracked source conflicts, doc links and anchors, versions, the image's license label
+and vendor digests offline."""
 
 from __future__ import annotations
 
@@ -66,6 +67,7 @@ _BLANK = frozenset({0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFF
 # Dated audits record what was inspected under the owner live at the time.
 # Rewriting their links would falsify the record rather than fix a stale one.
 OWNER_EXEMPT_PREFIXES = (Path("docs/audits"),)
+IMAGE_LICENSES = re.compile(r'org\.opencontainers\.image\.licenses="([^"\n]*)"')
 # Type identifiers minted under an earlier owner. Signed evidence binds to them, so
 # a transfer keeps them; documents quote them verbatim and are not stale links.
 STABLE_IDENTIFIERS = ((Path("src/nexus_symbiote/attestation.py"), "PREDICATE_TYPE"),)
@@ -479,6 +481,21 @@ def citation_issues(root: Path, version: str) -> list[str]:
     return []
 
 
+def image_license_issues(root: Path) -> list[str]:
+    """The image's license label must be the license expression of the wheel it delivers."""
+    try:
+        project = tomllib.loads(read_file(root, Path("pyproject.toml")).decode())["project"]
+        labels = IMAGE_LICENSES.findall(read_file(root, Path("Dockerfile")).decode("utf-8"))
+    except (OSError, ValueError, KeyError, TypeError, UnicodeError):
+        return ["the image's license label could not be compared with pyproject.toml"]
+    if labels != [project.get("license")]:
+        return [
+            "Dockerfile: org.opencontainers.image.licenses must be set once, to the license"
+            " expression in pyproject.toml"
+        ]
+    return []
+
+
 def vendor_issues(root: Path) -> list[str]:
     errors = []
     try:
@@ -644,6 +661,7 @@ def main() -> int:
             *self_link_issues(root, files),
             *readme_link_issues(root),
             *version_issues(root),
+            *image_license_issues(root),
             *vendor_issues(root),
             *wall_clock_cost_bound_issues(root, files),
         ]
