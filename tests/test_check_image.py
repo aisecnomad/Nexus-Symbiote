@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import sys
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -83,8 +86,11 @@ def calls(stub: Path) -> list[str]:
 
 
 def test_a_correct_image_is_built_from_three_files_and_run_only_without_a_network(
-    stub, tmp_path, capsys
+    stub, tmp_path, capsys, monkeypatch
 ):
+    # Ids no runner has, so the scan is seen to run as the caller whoever runs the suite.
+    caller = SimpleNamespace(getuid=lambda: 4242, getgid=lambda: 4343)
+    monkeypatch.setattr(check_image, "os", caller)
     # The evidence directory need not exist yet: this is the first step that writes to it
     # when the advisory recheck before it is skipped or moved.
     output, packages = tmp_path / "output", tmp_path / "evidence" / "packages.json"
@@ -114,9 +120,10 @@ def test_a_correct_image_is_built_from_three_files_and_run_only_without_a_networ
     # The scan runs exactly as the documentation tells a user to run it.
     [scan] = [call for call in runs if " scan /work " in call]
     demo = ROOT / "examples" / "demo-agent"
-    assert (
-        " --read-only --cap-drop ALL --security-opt no-new-privileges --user " in scan
-        and f" --volume {demo}:/work:ro {tag} scan /work --no-project-policy -f cyclonedx" in scan
+    assert scan == (
+        "run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges"
+        f" --user 4242:4343 --volume {demo}:/work:ro {tag}"
+        " scan /work --no-project-policy -f cyclonedx"
     )
     assert output.read_text() == f"name=ghcr.io/owner/repo\nversion={VERSION}\n"
     record = json.loads(packages.read_text())
@@ -146,10 +153,13 @@ def test_an_image_that_does_not_behave_as_documented_fails(
     stub, tmp_path, capsys, answer, text, reported
 ):
     (stub / answer).write_text(text)
-    output = tmp_path / "output"
-    assert check_image.main([str(tmp_path / "dist"), "--github-output", str(output)]) == 1
+    output, packages = tmp_path / "output", tmp_path / "packages.json"
+    arguments = ["--github-output", str(output), "--packages-out", str(packages)]
+    assert check_image.main([str(tmp_path / "dist"), *arguments]) == 1
     assert reported in capsys.readouterr().out
-    assert not output.exists()
+    # An image that failed a check names no image to push and leaves no evidence behind.
+    assert not output.exists() and not packages.exists()
+    assert not any("dpkg-query" in call for call in calls(stub))
 
 
 @pytest.mark.parametrize(
@@ -274,6 +284,45 @@ def test_without_docker_the_check_fails_instead_of_passing(stub, tmp_path, monke
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     assert check_image.main([str(tmp_path / "dist")]) == 1
     assert "docker is not on PATH" in capsys.readouterr().out
+
+
+def test_the_script_needs_nothing_but_the_standard_library_and_is_run_without_site_packages():
+    # The job that pushes runs it with the runner's own Python, after the PyPI upload. An
+    # import of an installed package would pass wherever the project is installed and fail
+    # only there, so every caller passes -S and the imports are checked here as well.
+    tree = ast.parse((ROOT / "scripts" / "check_image.py").read_text(encoding="utf-8"))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0 and node.module
+            imported.add(node.module.split(".")[0])
+    assert imported and imported <= sys.stdlib_module_names
+    callers = (".github/workflows/ci.yml", ".github/workflows/release.yml", "Makefile")
+    invocations = [
+        line
+        for name in callers
+        for line in (ROOT / name).read_text(encoding="utf-8").splitlines()
+        if "scripts/check_image.py" in line and not line.lstrip().startswith("#")
+    ]
+    assert len(invocations) == 4
+    assert all(" -I -S scripts/check_image.py dist" in line for line in invocations)
+
+
+def test_the_documented_scan_commands_carry_the_flags_the_check_runs_with():
+    text = (ROOT / "docs" / "container-image.md").read_text(encoding="utf-8")
+    commands = [
+        " ".join(line.split())
+        for line in text.replace("\\\n", " ").splitlines()
+        if line.startswith("docker run ") and " scan /work " in line
+    ]
+    assert len(commands) == 2
+    flags = "docker run --rm --network none " + " ".join(check_image.HARDENING) + " "
+    for command in commands:
+        assert command.startswith(flags), command
+        assert ':/work:ro" ' in command
+        assert " scan /work --no-project-policy -f cyclonedx > " in command
 
 
 def test_the_checked_identity_is_the_one_the_dockerfile_declares():

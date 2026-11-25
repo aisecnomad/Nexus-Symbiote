@@ -80,8 +80,9 @@ def blocks() -> list[str]:
     return found
 
 
-# The macOS runners have no GNU sha256sum; the test checks the list it is given instead.
-SHA256SUM = '#!/bin/bash\ncat > "$CALLS.sums"\n'
+# The macOS runners have no GNU sha256sum; the test checks the list it is given, and that
+# the command was asked to check it strictly, instead.
+SHA256SUM = '#!/bin/bash\nprintf "%s\\n" "$*" > "$CALLS.sums-arguments"\ncat > "$CALLS.sums"\n'
 
 
 def run(tmp_path: Path, script: str, **extra: str) -> subprocess.CompletedProcess[str]:
@@ -146,6 +147,7 @@ def test_the_documented_commands_attach_each_bundle_under_its_artifact_name(tmp_
     # The offline verification that follows reads the files where the commands left them.
     result = run(tmp_path, "set -euo pipefail\n" + verify)
     assert result.returncode == 0, result.stderr
+    assert (tmp_path / "calls.sums-arguments").read_text() == "--strict -c -\n"
     # The checksum list names both distributions where the download put them, and only them.
     listed = dict(
         line.split("  ")[::-1] for line in (tmp_path / "calls.sums").read_text().splitlines()

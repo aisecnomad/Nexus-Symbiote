@@ -92,5 +92,5 @@ under the flags above.
   ([`image-base-updates.json`](releasing.md#what-the-pipeline-guarantees)).
 - The release pushes the image after the PyPI upload. Every release run has by then built
   and checked the image once, from the same wheel, `Dockerfile` and lock, before it
-  attested or uploaded anything. An image job that fails can be run again; it pushes a
+  attested or published anything. An image job that fails can be run again; it pushes a
   new digest under the same tag, which is why the commands above verify and run a digest.

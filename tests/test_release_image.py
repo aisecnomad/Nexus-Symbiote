@@ -19,8 +19,12 @@ SHA = "c" * 40
 WHEEL = "nexus_symbiote-0.2.0-py3-none-any.whl"
 
 
+def release():
+    return yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+
+
 def jobs():
-    return yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())["jobs"]
+    return release()["jobs"]
 
 
 def run_step(job: str, name: str | None = None) -> dict:
@@ -32,7 +36,7 @@ def ci_jobs():
     return yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]
 
 
-def test_every_release_run_builds_and_runs_the_image_before_anything_is_attested_or_uploaded():
+def test_every_release_run_builds_and_runs_the_image_before_it_attests_or_publishes():
     workflow = jobs()
     steps = workflow["build"]["steps"]
     [checked] = [i for i, step in enumerate(steps) if "check_image.py" in step.get("run", "")]
@@ -41,7 +45,7 @@ def test_every_release_run_builds_and_runs_the_image_before_anything_is_attested
     assert "if" not in step and "env" not in step and "continue-on-error" not in step
     assert step["run"].splitlines() == [
         'sha256sum --strict -c "$RUNNER_TEMP/distributions.sha256"',
-        "python -I scripts/check_image.py dist --packages-out evidence/image-packages.json",
+        "python -I -S scripts/check_image.py dist --packages-out evidence/image-packages.json",
         "python scripts/image_base_updates.py evidence/image-packages.json"
         " --out evidence/image-base-updates.json",
     ]
@@ -56,16 +60,20 @@ def test_every_release_run_builds_and_runs_the_image_before_anything_is_attested
     # After the distributions are uploaded, so it cannot change them; before the evidence
     # is summed and packed, so the attested bundle holds the image's records.
     assert index("Upload distributions") < checked < index("scripts/release_checksums.py")
-    # Nothing is attested, published or pushed unless the build job, and so the image, passed.
+    # Nothing is attested, published or pushed unless the build job, and so the image check,
+    # succeeded: each of those jobs needs it, and none sets a condition that runs it after
+    # a failed prerequisite.
     for job in ("attest", "verify", "publish", "image"):
         assert "build" in workflow[job]["needs"]
+        condition = str(workflow[job].get("if", "")).replace("!=", "")
+        assert not any(word in condition for word in ("always", "failure", "cancelled", "!"))
     assert "attest" in workflow["publish"]["needs"]
 
 
 def test_ci_builds_and_runs_the_image_from_the_wheel_it_built():
     steps = ci_jobs()["distribution"]["steps"]
     [step] = [step for step in steps if "check_image.py" in step.get("run", "")]
-    assert step["run"] == "python -I scripts/check_image.py dist"
+    assert step["run"] == "python -I -S scripts/check_image.py dist"
     assert "if" not in step and "continue-on-error" not in step
     built = next(i for i, s in enumerate(steps) if s.get("run") == "python -m build --no-isolation")
     assert built < steps.index(step)
@@ -85,9 +93,15 @@ def test_only_an_approved_pypi_release_pushes_an_image_and_only_its_attest_job_s
         "digest-mismatch": "error",
     }
     # The image is built and checked in a step that holds no token; only the step after it,
-    # which runs unless that one failed, logs in and pushes what that step named.
-    build, push = image["steps"][-2:]
+    # which runs unless that one failed, logs in and pushes what that step named. No
+    # environment set for the workflow or the job reaches the build step, and no step
+    # stands before it but the checkout and the download.
+    assert "env" not in release() and "env" not in image and "defaults" not in image
+    checkout, fetch, build, push = image["steps"]
+    assert checkout["uses"].startswith("actions/checkout@") and fetch is download
+    assert all(step.keys() <= {"uses", "with"} for step in (checkout, fetch))
     assert (build["id"], push["id"]) == ("build", "push")
+    assert "github.token" not in str(build) and "secrets." not in str(image)
     assert not {"env", "if", "continue-on-error"} & build.keys()
     assert not {"if", "continue-on-error"} & push.keys()
     assert push["env"] == {
@@ -166,7 +180,7 @@ def test_the_build_step_runs_the_same_check_on_the_downloaded_wheel(tmp_path, ca
     assert (process.returncode == 0) == (case == "success"), process.stderr
     # The step itself runs no docker command: the script builds, runs and checks.
     assert (tmp_path / "calls").read_text().splitlines() == [
-        "-I scripts/check_image.py dist --name ghcr.io/owner/repo"
+        "-I -S scripts/check_image.py dist --name ghcr.io/owner/repo"
         " --label org.opencontainers.image.source=https://github.com/Owner/Repo"
         f" --label org.opencontainers.image.revision={SHA} --github-output {output}"
     ]

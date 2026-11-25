@@ -156,7 +156,7 @@ REQUIRED_COMMANDS: dict[str, dict[str, tuple[str, ...]]] = {
             "--strict-skips",
             "scripts/check_security_regressions.py",
             "scripts/check_wheel_security.py",
-            # The image is built and run before anything is attested or uploaded, and the
+            # The image is built and run before anything is attested or published, and the
             # base's pending Debian fixes are recorded with the evidence.
             "scripts/check_image.py",
             "scripts/image_base_updates.py",

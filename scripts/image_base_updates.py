@@ -29,6 +29,7 @@ MAX_PACKAGES = 2000
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_PAGES = 10
 TOTAL_TIMEOUT_SECONDS = 300
+RETRY_PAUSE_SECONDS = 2.0
 HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
 # Every value below can reach the CI log, where a line break would start a workflow command.
 PACKAGE = re.compile(r"[a-z0-9][a-z0-9+.-]{0,127}")
@@ -90,8 +91,9 @@ def _fixes(vuln: dict[str, Any], ecosystem: str, source: str) -> list[str]:
 
 
 def _post(client: DiscoveryTransport, query: dict[str, Any], deadline: float) -> bytes:
-    """One query's reply. A request that fails is sent once more: there is one request per
-    package, and a single dropped connection should not cost a release run."""
+    """One query's reply. A request that fails is sent once more, after a pause: there is
+    one request per package, and a single dropped connection or busy reply should not cost a
+    release run."""
     for attempt in (1, 2):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -107,9 +109,11 @@ def _post(client: DiscoveryTransport, query: dict[str, Any], deadline: float) ->
         except (OSError, ValueError, http.client.HTTPException):
             if attempt == 2:
                 raise
-            continue
-        if reply.status == 200:
-            return reply.body
+        else:
+            if reply.status == 200:
+                return reply.body
+        if attempt == 1:
+            time.sleep(max(0.0, min(RETRY_PAUSE_SECONDS, deadline - time.monotonic())))
     raise ValueError("OSV query did not succeed before the deadline")
 
 
@@ -175,6 +179,7 @@ def lookup(
     }
     client = transport or PinnedHTTPTransport()
     deadline = time.monotonic() + TOTAL_TIMEOUT_SECONDS
+    source = ""
     try:
         for package in packages:
             source, version = package["source"], package["version"]
@@ -188,22 +193,36 @@ def lookup(
             if unfixed:
                 report["without_fix"].append({**entry, "advisories": unfixed})
         report["complete"] = True
-    except (OSError, ValueError, TypeError, RecursionError, http.client.HTTPException):
-        report["errors"].append("OSV lookup of the image's base packages is incomplete")
+    except (OSError, ValueError, TypeError, RecursionError, http.client.HTTPException) as error:
+        # Enough to tell an outage, which a re-run cures, from a reply this script no longer
+        # reads, which needs a change here. The message is reduced to plain characters.
+        cause = re.sub(r"[^A-Za-z0-9 .,()'-]", "?", str(error))[:120]
+        report["errors"].append(
+            "OSV lookup of the image's base packages is incomplete at"
+            f" {source}: {type(error).__name__}: {cause}"
+        )
     return report
 
 
 def summary(report: dict[str, Any]) -> list[str]:
-    """What the release notes can say about the base, as Markdown lines."""
+    """What the release notes can say about the base, as Markdown lines.
+
+    Versions are code spans: Debian versions hold tildes, which GitHub pairs as
+    strikethrough. The blank lines keep the list apart from the sentences around it.
+    """
     lines = [
         f"Base image `{report['base']}` ({report['ecosystem']}): {len(report['pending'])} of"
-        f" {report['packages']} source packages are behind a fix in that release."
+        f" {report['packages']} source packages are behind a fix in that release.",
+        "",
     ]
     for entry in report["pending"]:
+        fixed = ", ".join(f"`{version}`" for version in entry["fixed"])
         lines.append(
-            f"- `{entry['source']}` {entry['version']} is fixed in {', '.join(entry['fixed'])}"
+            f"- `{entry['source']}` `{entry['version']}` is fixed in {fixed}"
             f" ({', '.join(entry['advisories'])})"
         )
+    if report["pending"]:
+        lines.append("")
     without = sum(len(entry["advisories"]) for entry in report["without_fix"])
     lines.append(f"{without} more advisories have no fixed version in {report['ecosystem']}.")
     return lines

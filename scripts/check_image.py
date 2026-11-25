@@ -4,9 +4,10 @@ The build context holds the Dockerfile, ``requirements-action.lock`` and the whe
 else. The built image must print the wheel's version with the network removed, run as
 10001:10001 with both ids named ``symbiote``, carry the wheel's license expression, and write
 the demo agent's inventory under the flags docs/container-image.md recommends. CI runs this
-on every pull request, each release run before it attests or uploads anything, and the job
+on every pull request, each release run before it attests or publishes anything, and the job
 that pushes the image before it logs in to the registry. Nothing here pushes or needs a
-token, and it uses only the standard library, so the pushing job installs nothing.
+token. It uses only the standard library, so the pushing job installs nothing, and every
+caller runs it with ``-S`` so that it cannot come to depend on an installed package.
 """
 
 from __future__ import annotations

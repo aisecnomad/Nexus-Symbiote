@@ -124,7 +124,7 @@ wheel-smoke: ## Build afresh and check the exact wheel in a temporary locked env
 image-smoke: ## Build afresh, then build the container image from that wheel and run it offline (needs Docker)
 	$(MAKE) clean-dist
 	$(MAKE) build
-	python -I scripts/check_image.py dist
+	python -I -S scripts/check_image.py dist
 
 # ── Clean ────────────────────────────────────────────────────
 

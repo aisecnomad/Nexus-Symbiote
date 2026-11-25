@@ -352,7 +352,7 @@ replace the candidate.
 
 **Image built before publication.** The build job of every run, a candidate included,
 builds the [container image](container-image.md) from the staged wheel before anything
-is attested or uploaded, and CI does the same on every pull request.
+is attested or published, and CI does the same on every pull request.
 `scripts/check_image.py` builds from a context that holds the `Dockerfile`, the lock and
 the wheel, then requires the image to print the wheel's version without a network, to
 run as user and group 10001, both named `symbiote`, to carry the wheel's license

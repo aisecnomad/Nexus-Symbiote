@@ -95,7 +95,7 @@ jobs:
           python scripts/check_dependency_advisories.py
           --lock requirements-ci.lock --lock requirements-action.lock --lock requirements-floor.lock
           --out evidence/dependency-advisories.json
-      # Every run builds the image here, before anything is attested or uploaded, with the
+      # Every run builds the image here, before anything is attested or published, with the
       # script the image job runs again before it pushes: a Dockerfile, lock or base that
       # cannot produce a working image stops the candidate, not a release already on PyPI.
       # No registry is logged in to and nothing is pushed. It runs before the suite, like the
@@ -103,7 +103,7 @@ jobs:
       - name: Build and check the container image from the staged wheel and record its base packages
         run: |
           sha256sum --strict -c "$RUNNER_TEMP/distributions.sha256"
-          python -I scripts/check_image.py dist --packages-out evidence/image-packages.json
+          python -I -S scripts/check_image.py dist --packages-out evidence/image-packages.json
           python scripts/image_base_updates.py evidence/image-packages.json --out evidence/image-base-updates.json
       - run: python -m pytest -n auto --dist worksteal --strict-skips
       - name: Enforce committed security regression contracts
@@ -336,14 +336,15 @@ jobs:
           path: dist
           digest-mismatch: error
       # The build job's image check, again, on the verified wheel. This step holds no token and
-      # uses the runner's own Python: the script needs only the standard library.
+      # uses the runner's own Python: the script needs only the standard library, and every
+      # run of it passes -S so that an import of anything else fails before publication.
       - name: Build the verified wheel's image and run it offline
         id: build
         shell: bash
         run: |
           set -euo pipefail
           name="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
-          python3 -I scripts/check_image.py dist --name "$name" \
+          python3 -I -S scripts/check_image.py dist --name "$name" \
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --github-output "$GITHUB_OUTPUT"

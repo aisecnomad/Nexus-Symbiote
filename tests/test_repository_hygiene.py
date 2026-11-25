@@ -226,6 +226,12 @@ def test_the_tracked_image_license_label_matches_the_tracked_project():
     assert hygiene.image_license_issues(Path(__file__).parents[1]) == []
 
 
+def test_the_hygiene_run_reports_what_the_image_license_check_finds(monkeypatch, capsys):
+    monkeypatch.setattr(hygiene, "image_license_issues", lambda root: ["image label sentinel"])
+    assert hygiene.main() == 1
+    assert "image label sentinel" in capsys.readouterr().out
+
+
 def _project(root: Path, homepage: str = "https://github.com/Canonical-Org/Widget") -> None:
     root.joinpath("pyproject.toml").write_text(
         f'[project]\nname = "widget"\nversion = "1.0.0"\n[project.urls]\nHomepage = "{homepage}"\n'
