@@ -2,7 +2,7 @@
 # Build it from a context that holds only this file, requirements-action.lock and one
 # release wheel (docs/container-image.md); the release workflow pushes and attests it.
 # Both stages use the same base, pinned by digest; Dependabot proposes its updates.
-FROM python:3.12.16-slim-trixie@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS install
+FROM python:3.12.16-slim-trixie@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b AS install
 COPY requirements-action.lock nexus_symbiote-*-py3-none-any.whl /tmp/build/
 RUN python -m venv /opt/nexus-symbiote \
     && /opt/nexus-symbiote/bin/python -m pip install --no-cache-dir --disable-pip-version-check \
@@ -11,7 +11,7 @@ RUN python -m venv /opt/nexus-symbiote \
         --only-binary=:all: --no-index --no-deps /tmp/build/nexus_symbiote-*-py3-none-any.whl \
     && /opt/nexus-symbiote/bin/python -m pip check
 
-FROM python:3.12.16-slim-trixie@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+FROM python:3.12.16-slim-trixie@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b
 # The license expression of the wheel this image delivers (pyproject.toml; `make hygiene`
 # compares them). The base image and the locked dependencies keep their own licenses.
 LABEL org.opencontainers.image.title="nexus-symbiote" \

@@ -16,6 +16,7 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 ### Changed
 
 - **Container image built and checked before publication:** Every release run (candidate, TestPyPI and PyPI) now builds the image from its staged wheel in the `build` job and checks it with `scripts/check_image.py` before anything is attested or uploaded, and CI does the same on every pull request, so a `Dockerfile`, lock or base digest that cannot produce a working image is no longer first found after the PyPI upload. The `image` job repeats the check before it pushes.
+- **Image base:** The pinned `python:3.12.16-slim-trixie` digest moves from the build of 2026-11-05 (Debian 13.7) to the build of 2026-11-24 (Debian 13.8), which carries the glibc `2.41-12+deb13u5` and zlib (DSA-6613-1) fixes; the libzstd (DSA-6657-1) and shadow (DSA-6661-1) fixes are newer than any published build of that tag.
 
 ### Fixed
 
