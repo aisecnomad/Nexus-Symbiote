@@ -1199,11 +1199,14 @@ def classify_typescript(
     """
     seen = _Observed()
     parameters = _ts_parameters(handler)
+    # _ts_locals adds names bound from a parameter anywhere in the body, so that SQL built
+    # from them is caller-supplied; such a name in a nested block must not hide a call.
+    shadowed = set(parameters)
     local = _ts_locals(handler, parameters, skip)
     if local is None:
         return ToolCapabilities(unclassified=True)
     imports = {name: bound for name, bound in imports.items() if name not in local}
-    shadowed = parameters | local
+    shadowed |= local
     stack = [handler]
     visited = 0
     while stack:
