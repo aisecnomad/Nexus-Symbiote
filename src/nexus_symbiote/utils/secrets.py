@@ -1125,10 +1125,25 @@ _A2A_TOKEN_SHAPE = re.compile(
     r"[\w-]{12,})"
 )
 _MAX_OAUTH_SCOPE = 512
+# A URL written without a scheme is no URL to urlsplit or to the URL rules, yet it
+# names user information: "//user@host/..." always, and "user:pass@host" when a dot,
+# port, path, query or fragment follows the "@". A scope such as "files:read@v2" does not.
+_SCHEMELESS_USERINFO = re.compile(r"//[^\s/?#@]*+@|[^\s/?#@:]++:[^\s/?#@]++@[^\s/?#@.:]*+[.:/?#]")
 
 
 def redact_oauth_scope(value: str) -> str:
     """Show an OAuth scope (RFC 6749 section 3.3) unless it may contain a secret."""
+    shown = _shown_scope(value)
+    # A token glued to a letter or digit, or user information in a URL without a scheme,
+    # passes the rules below. A scope they already reduced keeps the form they gave it.
+    if shown == value and (
+        holds_token_shape(value, require_sk_boundary=True) or _SCHEMELESS_USERINFO.match(value)
+    ):
+        return REDACTED
+    return shown
+
+
+def _shown_scope(value: str) -> str:
     if len(value) > _MAX_OAUTH_SCOPE or _A2A_TOKEN_SHAPE.search(value):
         return REDACTED
     redacted = redact_text(value)
