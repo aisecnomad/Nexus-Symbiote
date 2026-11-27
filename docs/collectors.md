@@ -61,7 +61,8 @@ through to what follows when it is unset, so `os.environ.get("CHAT_MODEL") or
 Each model identifier becomes one `model` component for the project at `declared`
 assurance. Its `source_reference` claim names the file and the line of the argument,
 up to 16 places, and `references_unlisted` counts the rest. The environment variables
-that may give a model in place of a value read are listed in `environment_variables`.
+that may give a model in place of a value read are listed in `environment_variables`,
+unless a name is shaped like a key, which is never exported.
 The identifier is kept as written, routing prefix and all, and no provider is recorded.
 Any `trust_remote_code` but a false literal, given to a call or in a dict of its options,
 such as `model_kwargs`, records that the model may run its own code. A relative path or a
@@ -79,10 +80,11 @@ What the reader knows is there and cannot read is a coverage gap:
   makes rather than text or a path one returns: a parameter, whatever its default; an
   attribute, an item or a call other than those above; text joined to something unread,
   or built from itself, which may grow when run again; a loop, `with`, `except` or
-  pattern variable; a dict that is changed, handed on, spread from another or bound more
-  than once; `**options` without a model; a starred positional argument; a path on a
-  host, behind a routing prefix or not; a name of the module that the file also imports,
-  or that an import with `*` may bind; and text that is no identifier, or a default a
+  pattern variable; a dict that is changed, handed on, spread from another, bound more
+  than once or to two names at once, or given as options to a call that is not an
+  SDK's; `**options` without a model; a starred positional argument; a path on a host,
+  behind a routing prefix or not; a name of the module that the file also imports, or
+  that an import with `*` may bind; and text that is no identifier, or a default a
   variable that cannot be named may override;
 - a model that only an environment variable sets, once for each file that reads it so,
   as when its default names no model, such as `None`, `""` or `"default"`;

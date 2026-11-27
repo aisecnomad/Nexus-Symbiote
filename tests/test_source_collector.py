@@ -2984,3 +2984,183 @@ def plan(model: KnownModelName):
     )
     # An SDK's data types and its type of model names are text a caller may give.
     assert list(result.surfaces_excluded) == [unread("run.py", 9, 2)]
+
+
+@pytest.mark.parametrize(
+    ("files", "where"),
+    [
+        (
+            {
+                "app/__init__.py": "",
+                "app/hf.py": "def allow(model_kwargs):\n    model_kwargs.update(trust_remote_code=True)\n",
+                "app/embed.py": "from sentence_transformers import SentenceTransformer\n\n"
+                "from app.hf import allow\n\noptions = {'device': 'cpu'}\nallow(model_kwargs=options)\n"
+                "SentenceTransformer('someorg/custom-7b', model_kwargs=options)\n",
+            },
+            "app/embed.py:7",
+        ),
+        (
+            {
+                "settings_local.py": "MODEL_KWARGS = {'trust_remote_code': True}\n",
+                "app.py": "from sentence_transformers import SentenceTransformer\n\ntry:\n"
+                "    from settings_local import MODEL_KWARGS\nexcept ImportError:\n"
+                "    MODEL_KWARGS = {'device': 'cpu'}\n\n"
+                "SentenceTransformer('someorg/custom-7b', model_kwargs=MODEL_KWARGS)\n",
+            },
+            "app.py:8",
+        ),
+        (
+            {
+                "app.py": "from sentence_transformers import SentenceTransformer\n\n"
+                "options = defaults = {'device': 'cpu'}\ndefaults['trust_remote_code'] = True\n"
+                "SentenceTransformer('someorg/custom-7b', model_kwargs=options)\n",
+            },
+            "app.py:5",
+        ),
+    ],
+    ids=[
+        "changed-by-the-callee-it-is-handed-to",
+        "an-import-may-bind-it",
+        "changed-through-another-name",
+    ],
+)
+def test_options_another_name_or_callee_may_change_are_a_gap(
+    tmp_path: Path, files: dict[str, str], where: str
+):
+    result = scan(tmp_path, files)
+    assert models(result)["someorg/custom-7b"].trust_remote_code is None
+    assert list(result.surfaces_excluded) == [f"{where}: {REMOTE}"]
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "try:\n    from settings import LLM_KWARGS\nexcept ImportError:\n    LLM_KWARGS = {'model': 'gpt-4o'}\n",
+        "LLM_KWARGS = {'model': 'gpt-4o'}\nfrom settings_local import *\n",
+    ],
+    ids=["optional-import", "star-import"],
+)
+def test_an_import_may_bind_a_spread_dict_in_place_of_the_one_read(tmp_path: Path, binding: str):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": f"from openai import OpenAI\n{binding}"
+            "OpenAI().chat.completions.create(messages=[], **LLM_KWARGS)\n",
+            "settings.py": "LLM_KWARGS = {'model': 'o3'}\n",
+        },
+    )
+    assert list(result.surfaces_excluded) == [unread("run.py", binding.count("\n") + 2)]
+
+
+@pytest.mark.parametrize(
+    ("read", "gap"),
+    [
+        ('os.getenv("OPENAI_MODEL", DEFAULT_MODEL)', ONLY_BY),
+        ('os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)', ONLY_BY),
+        ('config("OPENAI_MODEL", default=DEFAULT_MODEL)', ONLY_BY),
+        # Through ``str()`` it is read as a value the reader cannot tell, never as silence.
+        ('str(os.getenv("OPENAI_MODEL", DEFAULT_MODEL))', f"a model argument is {UNREAD}"),
+    ],
+    ids=["getenv", "environ-get", "decouple", "str"],
+)
+def test_a_default_bound_to_what_names_no_model_leaves_it_to_the_environment(
+    tmp_path: Path, read: str, gap: str
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom decouple import config\nfrom openai import OpenAI\n"
+            f"DEFAULT_MODEL = None\nOpenAI().responses.create(model={read})\n"
+        },
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [f"run.py:5: {gap}"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["a94a8fe5ccb19ba61c4c0873d391e987982fbbd3", "Qx7rT2mLk9VwZp4NsYb8HcJd3FgEa6Ru"],
+    ids=["hex", "mixed-case-run"],
+)
+def test_a_variable_named_like_a_key_is_never_exported(tmp_path: Path, name: str):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom openai import OpenAI\n"
+            f'OpenAI().responses.create(model=os.getenv("{name}") or None)\n'
+            f'OpenAI().responses.create(model=os.getenv("{name}", "gpt-4o"))\n'
+        },
+    )
+    assert name not in exported(result) and name not in " ".join(result.surfaces_excluded)
+    assert set(models(result)) == {"gpt-4o"}
+    assert list(result.surfaces_excluded) == [unread("run.py", 3, 2)]
+
+
+def test_an_environment_variable_is_checked_once_however_many_operands_read_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    checked: list[str] = []
+    unchanged = source_references.unchanged_by_redaction
+
+    def counted(text: str) -> bool:
+        checked.append(text)
+        return unchanged(text)
+
+    source_references.environment_name.cache_clear()
+    monkeypatch.setattr(source_references, "unchanged_by_redaction", counted)
+    chain = " or ".join(["M"] * 200)
+    scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom openai import OpenAI\n"
+            f'M = os.getenv("CHAT_MODEL_NAME")\nX = {chain} or "gpt-4o"\n'
+            + "OpenAI().responses.create(model=X)\n"
+            * 50
+        },
+    )
+    assert checked.count("CHAT_MODEL_NAME") == 1
+
+
+@pytest.mark.parametrize(
+    ("annotation", "gaps"),
+    [
+        ("Optional[BaseChatModel] = None", 0),
+        ("BaseChatModel | None = None", 0),
+        ("Union[ChatOpenAI, ChatAnthropic]", 0),
+        ("Optional[ChatModel] = None", 1),
+    ],
+    ids=["optional", "or-none", "union-of-sdk-classes", "optional-model-name"],
+)
+def test_a_parameter_that_may_be_none_is_judged_by_its_class(
+    tmp_path: Path, annotation: str, gaps: int
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "from typing import Optional, Union\n"
+            "from langchain_anthropic import ChatAnthropic\n"
+            "from langchain_core.language_models import BaseChatModel\n"
+            "from langchain_openai import ChatOpenAI\nfrom langgraph.prebuilt import create_react_agent\n"
+            "from openai.types import ChatModel\n\n\n"
+            f"def build(tools, llm: {annotation}):\n"
+            "    return create_react_agent(model=llm, tools=tools)\n"
+        },
+    )
+    assert list(result.surfaces_excluded) == ([unread("run.py", 10)] if gaps else [])
+
+
+def test_a_variable_with_an_unread_fallback_does_not_set_the_model_alone(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "app/__init__.py": "",
+            "app/settings.py": "DEFAULT_MODEL = 'gpt-4o'\n",
+            "app/llm.py": "import os\n\nfrom langchain_openai import ChatOpenAI\n\n"
+            "from app import settings\n\n"
+            "llm = ChatOpenAI(model=os.getenv('OPENAI_MODEL') or settings.DEFAULT_MODEL)\n",
+        },
+    )
+    assert list(result.surfaces_excluded) == [
+        "app/llm.py:7: model argument is bound in another module of the project, which the "
+        + "collector does not follow; not inventoried"
+    ]

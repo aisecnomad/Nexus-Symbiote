@@ -5,6 +5,7 @@ declaration with the file and line it was read from.
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ MAX_RECORDS = 5_000
 
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{1,127}")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,63}")
+_RUN = re.compile(r"[A-Za-z0-9]{24,}")
 # A long run of hex or of base64 with no separator, or user information before an
 # ``@``: what a key, a token or a connection string looks like, and no model's name.
 _SECRET_SHAPED = re.compile(
@@ -92,11 +94,14 @@ def model_kind(name: str, *, embedding: bool = False) -> str | None:
     return None
 
 
+@functools.lru_cache(maxsize=4096)
 def environment_name(name: object) -> str | None:
-    """``name`` when it can be exported as the name of an environment variable."""
-    if isinstance(name, str) and _ENVIRONMENT_NAME.fullmatch(name) and unchanged_by_redaction(name):
-        return name
-    return None
+    """``name`` when it can be exported as the name of an environment variable: one shaped
+    like a key, a long run of hex or of letters and digits not all in capitals, is not."""
+    if not isinstance(name, str) or not _ENVIRONMENT_NAME.fullmatch(name):
+        return None
+    keylike = _SECRET_SHAPED.search(name) or any(not run.isupper() for run in _RUN.findall(name))
+    return None if keylike or not unchanged_by_redaction(name) else name
 
 
 def model_ref(name: str) -> str:
