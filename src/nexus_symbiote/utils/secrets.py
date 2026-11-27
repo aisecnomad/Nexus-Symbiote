@@ -1117,6 +1117,44 @@ def redact_text(
     return _redact(value, spans, rewrites)
 
 
+# Credential formats that redact_text leaves intact in short A2A identifiers.
+# Both alternatives start only where a word starts, so a long run is scanned once.
+_A2A_TOKEN_SHAPE = re.compile(
+    r"(?<![\w-])(?:eyJ[\w-]{8,}\.[\w-]{8,}"
+    r"|(?:gh[oprsu]_|github_pat_|glpat-|xox[abeoprs]-|sk-|[rs]k_live_|AKIA|ASIA|AIza)"
+    r"[\w-]{12,})"
+)
+_MAX_OAUTH_SCOPE = 512
+
+
+def redact_oauth_scope(value: str) -> str:
+    """Show an OAuth scope (RFC 6749 section 3.3) unless it may contain a secret."""
+    if len(value) > _MAX_OAUTH_SCOPE or _A2A_TOKEN_SHAPE.search(value):
+        return REDACTED
+    redacted = redact_text(value)
+    if redacted == value:
+        return value
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return redacted
+    # Scope URIs name the permission in their path, which redact_text would omit.
+    locator = parsed.netloc + parsed.path
+    if (
+        parsed.scheme
+        and parsed.netloc
+        and not any(char in "@?#" or char.isspace() for char in value)
+        and redact_text(locator) == locator
+    ):
+        return value
+    return redacted
+
+
+def a2a_header_has_credential(value: str) -> bool:
+    """Whether a short A2A signature header value looks like a pasted credential."""
+    return bool(_A2A_TOKEN_SHAPE.search(value)) or redact_text(value) != value
+
+
 def redact_keyed_text(
     key: str,
     value: str,

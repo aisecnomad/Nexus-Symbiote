@@ -32,6 +32,7 @@ from nexus_symbiote.utils.crypto import (
     SigningStatus,
     component_evidence_refs,
 )
+from nexus_symbiote.utils.secrets import redact_oauth_scope
 from nexus_symbiote.utils.terminal import neutralize
 
 SEVERITIES = ("info", "low", "medium", "high", "critical")
@@ -250,9 +251,9 @@ def _without_scopes(capabilities: object) -> dict[str, Any] | None:
     return declared.model_dump(mode="json") | {"oauth_scopes": []}
 
 
-def _listing(values: Iterable[str]) -> str:
+def _listing(values: Iterable[str], *, display: Callable[[str], str] = str) -> str:
     items = sorted(values)
-    shown = "; ".join(_clip(item) for item in items[:_LISTED])
+    shown = "; ".join(_clip(display(item)) for item in items[:_LISTED])
     return shown + (f"; and {len(items) - _LISTED} more" if len(items) > _LISTED else "")
 
 
@@ -861,10 +862,10 @@ class AIBOMDiffer:
             # so an absent block is compared as a declaration with no scopes.
             before_scopes = _oauth_scopes(old_caps)
             after_scopes = _oauth_scopes(new_caps)
-            added_scopes = sorted(after_scopes - before_scopes)
-            removed_scopes = sorted(before_scopes - after_scopes)
+            added_scopes = after_scopes - before_scopes
+            removed_scopes = before_scopes - after_scopes
             scope_changes = [
-                f"{word}: {_listing(scopes)}"
+                f"{word}: {_listing(scopes, display=redact_oauth_scope)}"
                 for word, scopes in (("added", added_scopes), ("removed", removed_scopes))
                 if scopes
             ]
@@ -873,10 +874,10 @@ class AIBOMDiffer:
                     {
                         "detail": "capabilities changed: OAuth scopes "
                         + " and ".join(scope_changes),
-                        "severity": "high" if added_scopes else "medium",
+                        "severity": "high",
                     }
                 )
-                if _without_scopes(old_caps) == _without_scopes(new_caps):
+                if _same(_without_scopes(old_caps), _without_scopes(new_caps), ("capabilities",)):
                     handled.add("capabilities")
         old_props, new_props = old_fields.get("properties"), new_fields.get("properties")
         if isinstance(old_props, dict) and isinstance(new_props, dict):

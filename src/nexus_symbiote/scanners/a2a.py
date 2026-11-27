@@ -11,7 +11,6 @@ import unicodedata
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, BinaryIO, NamedTuple
-from urllib.parse import urlsplit
 
 from nexus_symbiote.core.enums import RiskSeverity, TrustTier
 from nexus_symbiote.core.hashing import canonical_json, hash_canonical
@@ -42,7 +41,8 @@ from nexus_symbiote.scanners.source_binding import url_shapes as _url_shapes
 from nexus_symbiote.scanners.source_binding import value_binding as _value_binding
 from nexus_symbiote.scanners.source_binding import whatwg_form as _whatwg_form
 from nexus_symbiote.utils.confined import CollectionError, ConfinedCollection, fold_name
-from nexus_symbiote.utils.secrets import REDACTED, redact_text
+from nexus_symbiote.utils.secrets import a2a_header_has_credential, redact_text
+from nexus_symbiote.utils.secrets import redact_oauth_scope as _scope
 from nexus_symbiote.utils.terminal import neutralize
 
 # Python source is parsed only when the text Python reads can name the SDK.
@@ -133,18 +133,8 @@ class _BoundError(ValueError):
 
 TOO_DEEP = "A2A card nests too deeply"
 TOO_MANY_ENTRIES = "A2A card has too many entries"
-# OAuth scopes are short public identifiers; a longer value is withheld unmatched,
-# which also keeps the token-shape search linear.
-_MAX_SCOPE = 512
 _MAX_PROTECTED_HEADER = 8192
 _CARD_PATHS = _ORIGIN_PATHS | {"/.well-known/agent.json", "/.well-known/agent-card.json"}
-# Credential formats that redact_text leaves intact; no OAuth scope takes these forms.
-# Both alternatives start only where a word starts, so a long run is scanned once.
-_TOKEN_SHAPE = re.compile(
-    r"(?<![\w-])(?:eyJ[\w-]{8,}\.[\w-]{8,}"
-    r"|(?:gh[oprsu]_|github_pat_|glpat-|xox[abeoprs]-|sk-|[rs]k_live_|AKIA|ASIA|AIza)"
-    r"[\w-]{12,})"
-)
 _JWS_ALGORITHM = re.compile(r"[A-Za-z0-9+._-]{1,32}")
 _KEY_ID = re.compile(r"[\w.:#+=/-]{1,256}")
 _SERVER_CALLS = frozenset(
@@ -311,30 +301,6 @@ def _fields(declaration: dict[str, Any]) -> list[str]:
     if len(declaration) > _MAX_ENTRIES:
         raise _BoundError(TOO_MANY_ENTRIES)
     return sorted(redact_text(key) for key in declaration)
-
-
-def _scope(value: str) -> str:
-    """Export a scope, a public identifier (RFC 6749 section 3.3), unless it may be a secret."""
-    if len(value) > _MAX_SCOPE or _TOKEN_SHAPE.search(value):
-        return REDACTED
-    redacted = redact_text(value)
-    if redacted == value:
-        return value
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return redacted
-    # Scope URIs such as https://www.googleapis.com/auth/drive.readonly name the
-    # permission in their path, which redact_text would cut down to the origin.
-    locator = parsed.netloc + parsed.path
-    if (
-        parsed.scheme
-        and parsed.netloc
-        and not any(char in "@?#" or char.isspace() for char in value)
-        and redact_text(locator) == locator
-    ):
-        return value
-    return redacted
 
 
 def _declared_urls(value: Any, depth: int = 0) -> list[str]:
@@ -632,7 +598,9 @@ def _signatures(data: dict[str, Any]) -> list[dict[str, Any]]:
         records.append(
             {
                 "alg": alg
-                if isinstance(alg, str) and _JWS_ALGORITHM.fullmatch(alg) and not _secret(alg)
+                if isinstance(alg, str)
+                and _JWS_ALGORITHM.fullmatch(alg)
+                and not a2a_header_has_credential(alg)
                 else (None if alg is None else "[redacted]"),
                 "kid": _key_id(kid),
                 "header": "read",
@@ -648,12 +616,9 @@ def _key_id(value: Any) -> str | None:
         return "[redacted]"
     if "://" in value:
         return _origin(value)
-    return value if _KEY_ID.fullmatch(value) and not _secret(value) else "[redacted]"
-
-
-def _secret(value: str) -> bool:
-    """Whether a short header value takes the form of a credential pasted in by mistake."""
-    return bool(_TOKEN_SHAPE.search(value)) or redact_text(value) != value
+    return (
+        value if _KEY_ID.fullmatch(value) and not a2a_header_has_credential(value) else "[redacted]"
+    )
 
 
 def _capabilities(data: dict[str, Any]) -> tuple[dict[str, bool], list[dict[str, Any]], list[str]]:
