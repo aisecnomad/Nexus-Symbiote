@@ -2,8 +2,8 @@
 
 A tool the ``mcp`` collector records from a Python decorator or a TypeScript registration is
 classified by the calls in its own body: process execution, network egress and whether it
-sends data, filesystem writes and deletions, SQL statements, payment API writes and reads of
-secret-named environment variables. Names resolve only through the file's imports, names
+sends data, filesystem writes and deletions, payment API writes and reads of secret-named
+environment variables. Names resolve only through the file's imports, names
 bound from them and builtins, by the language's scoping rules; nothing is executed or
 imported. The classifier cannot show that a body does nothing else, so it records only what
 raises risk, never ``read`` or ``read-only``, and a body past a bound records a coverage gap.
@@ -12,7 +12,6 @@ raises risk, never ``read`` or ``read-only``, and a body past a bound records a 
 from __future__ import annotations
 
 import ast
-import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -60,12 +59,6 @@ _PAYMENT_LOCAL = frozenset({"Webhook", "WebhookSignature", "error", "util", "oau
 _PAYMENT_RESOURCES = frozenset(
     {"Charge", "Refund", "PaymentIntent", "Payout", "Transfer", "Transaction", "Payment"}
 )
-_DB_MODULES = frozenset(
-    {"sqlite3", "sqlalchemy", "psycopg", "psycopg2", "pymysql", "mysql", "asyncpg", "duckdb"}
-)
-_DB_RECEIVERS = frozenset({"cursor", "cur", "conn", "connection", "engine", "session", "db"})
-_DB_EXECUTE = frozenset({"execute", "executemany", "executescript", "exec_driver_sql"})
-_SQL_TEXT = frozenset({"sqlalchemy.text", "sqlalchemy.sql.text", "sqlalchemy.sql.expression.text"})
 # Distinctive on any receiver, such as a Path parameter.
 _FS_WRITE = frozenset(
     {"write_text", "write_bytes", "makedirs", "mkdir", "copyfile", "copytree", "touch"}
@@ -77,30 +70,6 @@ _FS_MODULES = frozenset({"os", "shutil", "pathlib", "tempfile"})
 # Ambiguous names, counted only as os.<name> or shutil.<name>.
 _FS_MODULE_WRITE = frozenset({"remove", "rename", "replace", "copy", "copy2", "move"})
 _FS_MODULE_DELETE = frozenset({"remove", "removedirs"})
-# SQL operations count where a statement or subquery starts, and only with the clause they
-# need, so prose that starts with the word, such as "update my profile", names nothing.
-_SQL_WRITES = frozenset(
-    {"INSERT", "REPLACE", "MERGE", "UPDATE", "ALTER", "CREATE", "GRANT", "REVOKE"}
-)
-_SQL_DESTRUCTIVE = frozenset({"DELETE", "DROP", "TRUNCATE"})
-_SQL_OPERATIONS = _SQL_WRITES | _SQL_DESTRUCTIVE
-_SQL_CLAUSE = {"INSERT": "INTO", "REPLACE": "INTO", "MERGE": "INTO", "UPDATE": "SET"}
-_SQL_CLAUSE["DELETE"] = "FROM"
-_SQL_DDL = frozenset({"ALTER", "CREATE", "DROP"})
-_SQL_OBJECTS = frozenset(
-    {"TABLE", "VIEW", "INDEX", "DATABASE", "SCHEMA", "SEQUENCE", "FUNCTION", "PROCEDURE"}
-    | {"TRIGGER", "TYPE", "USER", "ROLE", "EXTENSION", "MATERIALIZED", "UNIQUE", "TEMP"}
-    | {"TEMPORARY", "OR", "IF", "GLOBAL", "LOCAL", "VIRTUAL", "UNLOGGED", "COLUMN"}
-    | {"CONSTRAINT", "POLICY", "DOMAIN", "OWNED"}
-)
-# Words after which the next word still starts the statement.
-_SQL_PREFIXES = frozenset({"EXPLAIN", "ANALYZE", "VERBOSE", "BEGIN", "DO"})
-_SQL_WORD = re.compile(r"\w+")
-# Where a database call takes its statement when it is not the first argument.
-_SQL_ARGUMENTS = frozenset({"statement", "query", "sql", "operation"})
-_SQL_DOLLAR = re.compile(r"\$(?:[^\W\d]\w*)?\$")
-_SQL_RANK = {None: 0, "write": 1, "destructive": 2}
-
 _TS_EXECUTE = frozenset(
     {"exec", "execSync", "execFile", "execFileSync", "spawn", "spawnSync", "fork"}
 )
@@ -110,26 +79,12 @@ _TS_FS_WRITE = frozenset(
 )
 _TS_FS_DELETE = frozenset({"rm", "rmSync", "unlink", "unlinkSync", "rmdir", "rmdirSync"})
 _TS_HTTP = frozenset({"axios", "node-fetch", "got", "undici", "ky", "http", "https"})
-_TS_SQL = frozenset(
-    {"query", "execute", "raw", "unsafe", "$queryRawUnsafe", "$executeRawUnsafe", "queryRaw"}
-)
-# A receiver ``query`` or ``execute`` is SQL on: a client from one of these modules, or by name.
-_TS_DB_MODULES = frozenset(
-    {"pg", "mysql", "mysql2", "sqlite3", "better-sqlite3", "postgres", "@prisma/client", "knex"}
-    | {"sequelize", "drizzle-orm", "mssql", "kysely", "typeorm"}
-)
-_TS_DB_RECEIVERS = frozenset(
-    {"db", "pool", "client", "conn", "connection", "sql", "knex", "prisma", "tx", "trx"}
-    | {"sequelize", "database", "cursor"}
-)
 _TS_PAYMENT_RESOURCES = frozenset({"refunds", "charges", "paymentIntents", "payouts", "transfers"})
 _TS_PAYMENT_WRITE = frozenset({"create", "confirm", "capture"})
 _TS_GLOBALS = frozenset({"globalThis", "window", "global", "self"})
 _TS_HTTP_SERVER = frozenset({"createServer", "Server", "listen", "STATUS_CODES"})
 # A callee chain longer than this is not an API call; it names nothing, in constant time.
 MAX_CHAIN = 16
-# Nodes read to decide whether one SQL argument uses a parameter; past it, assume it does.
-_MAX_USE_NODES = 256
 _MODULE_HEAD = "\x00module:"
 
 
@@ -158,7 +113,6 @@ class _Observed:
     writes: bool = False
     destructive: bool = False
     payment: bool = False
-    raw_sql: bool = False
     execute: bool = False
 
     def add(self, *classes: CapabilityClass) -> None:
@@ -184,15 +138,6 @@ def _finish(label: str, seen: _Observed) -> ToolCapabilities:
                 recommendation="Confine the tool to an allow-list of commands and a sandbox.",
             )
         )
-    if seen.raw_sql:
-        risks.append(
-            RiskAssessment(
-                severity=RiskSeverity.HIGH,
-                category=CATEGORY,
-                detail=f"Tool '{label}' passes a caller-supplied statement to a database.",
-                recommendation="Parameterize queries and restrict the tool to read-only access.",
-            )
-        )
     if seen.payment:
         risks.append(
             RiskAssessment(
@@ -204,7 +149,7 @@ def _finish(label: str, seen: _Observed) -> ToolCapabilities:
         )
     if seen.payment:
         profile = SideEffectProfile.FINANCIAL_TRANSACTION
-    elif seen.destructive or seen.raw_sql:
+    elif seen.destructive:
         profile = SideEffectProfile.DESTRUCTIVE
     elif seen.writes or seen.execute:
         profile = SideEffectProfile.STATE_MODIFYING
@@ -219,84 +164,6 @@ def _secret_name(name: str) -> bool:
     return bool(name) and bool(SECRET_ENV_KEY_RE.search(name))
 
 
-def _sql_tokens(text: str) -> list[str]:
-    """Upper-cased words and ``(``, ``)``, ``;`` outside literals, quoted names and comments."""
-    tokens: list[str] = []
-    i, n = 0, len(text)
-    while i < n:
-        char = text[i]
-        if char in "'\"`":
-            # A doubled quote stays inside; an unterminated literal runs to the end.
-            end = i + 1
-            while (end := text.find(char, end)) >= 0 and text.startswith(char, end + 1):
-                end += 2
-            i = n if end < 0 else end + 1
-        elif text.startswith("--", i):
-            end = text.find("\n", i)
-            i = n if end < 0 else end + 1
-        elif text.startswith("/*", i):
-            end = text.find("*/", i + 2)
-            i = n if end < 0 else end + 2
-        elif char in "();":
-            tokens.append(char)
-            i += 1
-        elif tag := _SQL_DOLLAR.match(text, i):
-            # PostgreSQL dollar quoting; ``$1`` is a parameter, not a quote.
-            end = text.find(tag.group(), tag.end())
-            i = n if end < 0 else end + len(tag.group())
-        elif word := _SQL_WORD.match(text, i):
-            tokens.append(word.group().upper())
-            i = word.end()
-        else:
-            i += 1
-    return tokens
-
-
-def _sql_effect(text: str | None) -> str | None:
-    """``destructive``, ``write`` or None: what the statements in ``text`` do. An operation
-    counts where a statement or subquery starts, with the clause it needs."""
-    if not text:
-        return None
-    operations: set[str] = set()
-    tokens = _sql_tokens(text)
-    begin = 0
-    for end in [*(k for k, part in enumerate(tokens) if part == ";"), len(tokens)]:
-        statement, begin = tokens[begin:end], end + 1
-        words = set(statement)
-        analyze = statement.index("ANALYZE") if "ANALYZE" in words else -1
-        if statement[:1] == ["EXPLAIN"] and (
-            analyze < 0 or statement[analyze + 1 : analyze + 2] in (["FALSE"], ["OFF"], ["0"])
-        ):
-            continue  # A plan: the statement it describes does not run.
-        restart = statement[:1] in (["WITH"], ["EXPLAIN"])
-        start, depth = True, 0
-        for k, word in enumerate(statement):
-            if word == "(":
-                start, depth = True, depth + 1
-                continue
-            if word == ")":
-                depth = max(depth - 1, 0)
-                start = restart and depth == 0
-                continue
-            if start and word in _SQL_PREFIXES:
-                continue
-            if start and word in _SQL_OPERATIONS:
-                clause = _SQL_CLAUSE.get(word)
-                following = statement[k + 1] if k + 1 < len(statement) else ""
-                if clause is not None:
-                    shaped = clause in words
-                else:
-                    shaped = word not in _SQL_DDL or following in _SQL_OBJECTS
-                if shaped:
-                    operations.add(word)
-                    if word == "ALTER" and "DROP" in words:
-                        operations.add("DROP")
-            start = False
-    if operations & _SQL_DESTRUCTIVE:
-        return "destructive"
-    return "write" if operations else None
-
-
 _PY_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 _PY_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 _PY_SCOPES = (*_PY_FUNCTIONS, ast.ClassDef, *_PY_COMPREHENSIONS)
@@ -306,7 +173,7 @@ _SCOPE_KINDS = {ast.ClassDef: "class", **dict.fromkeys(_PY_COMPREHENSIONS, "comp
 _MAX_TARGETS = 32
 
 # A path a name may hold and whether it is reached through a call: after
-# ``conn = sqlite3.connect(db)``, ``conn`` is ``("sqlite3.connect", True)``.
+# ``client = requests.Session()``, ``client`` is ``("requests.Session", True)``.
 _Target = tuple[str, bool]
 
 
@@ -562,121 +429,10 @@ def _chain_through(node: ast.AST) -> tuple[str, bool] | None:
     return None
 
 
-def _names_in(node: ast.AST) -> set[str]:
-    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
-
-
 def _literal(node: ast.AST | None) -> str | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     return None
-
-
-class _PythonBody:
-    """A tool's parameters and the statements its body assigns, by program point."""
-
-    def __init__(
-        self,
-        function: ast.FunctionDef | ast.AsyncFunctionDef,
-        nodes: list[tuple[ast.AST, _Scope, int]],
-        parents: list[int],
-        scopes: PythonScopes,
-    ) -> None:
-        self.scopes = scopes
-        self.loops = [loop for _, _, loop in nodes]
-        self.at = 0  # The node being classified.
-        # Nodes are in source order, so each subtree ends where the next one not in it starts.
-        ends = list(range(1, len(nodes) + 1))
-        for index in range(len(nodes) - 1, -1, -1):
-            if parents[index] >= 0:
-                ends[parents[index]] = max(ends[parents[index]], ends[index])
-        position = {node: index for index, (node, _, _) in enumerate(nodes)}
-        last: dict[ast.AST, ast.AST] = dict.fromkeys(function.body, function.body[-1])
-        for node, _, _ in nodes:
-            for _, value in ast.iter_fields(node):
-                if isinstance(value, list) and value and isinstance(value[-1], ast.stmt):
-                    last.update(dict.fromkeys(value, value[-1]))
-        arguments = function.args
-        self.parameters = {
-            a.arg for a in arguments.posonlyargs + arguments.args + arguments.kwonlyargs
-        }
-        for extra in (arguments.vararg, arguments.kwarg):
-            if extra is not None:
-                self.parameters.add(extra.arg)
-        # Per scope and name, each statement assigned to it: where it starts and ends, where
-        # the block that always runs it ends, its outermost loop, whether it is
-        # caller-supplied, and the rank of what its text does.
-        self.values: dict[tuple[_Scope, str], list[tuple[int, int, int, int, bool, int]]] = {}
-        for index, (node, scope, loop) in enumerate(nodes):
-            targets: list[tuple[ast.expr, ast.expr | None]] = []
-            if isinstance(node, ast.Assign):
-                targets = [(target, node.value) for target in node.targets]
-            elif isinstance(node, ast.AnnAssign):
-                targets = [(node.target, node.value)]
-            elif isinstance(node, ast.With | ast.AsyncWith):
-                targets = [(i.optional_vars, i.context_expr) for i in node.items if i.optional_vars]
-            for target, value in targets:
-                if isinstance(target, ast.Name) and value is not None:
-                    text = self.unwrap(value, scope)
-                    rank = _SQL_RANK[_sql_effect(_literal(text))]
-                    block = ends[position[last[node]]] if node in last else ends[index]
-                    entry = (index, ends[index], block, loop, self.caller_supplied(text), rank)
-                    self.values.setdefault((scope, target.id), []).append(entry)
-
-    def reaching(self, scope: _Scope | None, name: str) -> tuple[bool, int]:
-        """Whether a statement ``name`` may hold at the current call is caller-supplied, and
-        the strongest rank. The last assignment that always runs before the call hides the
-        earlier ones; one later in the same loop reaches the call on the next iteration."""
-        while scope is not None and (scope, name) not in self.values and name not in scope.names:
-            scope = scope.parent
-        entries = self.values.get((scope, name), ()) if scope is not None else ()
-        at, loop = self.at, self.loops[self.at]
-        kill = max((entry[0] for entry in entries if entry[1] <= at < entry[2]), default=-1)
-        supplied, rank = False, 0
-        for index, end, _, assigned_loop, assigned_supplied, assigned_rank in entries:
-            if (kill <= index and end <= at) or (
-                end > at and loop >= 0 and assigned_loop == loop and kill < loop
-            ):
-                supplied, rank = supplied or assigned_supplied, max(rank, assigned_rank)
-        return supplied, rank
-
-    def unwrap(self, node: ast.AST | None, scope: _Scope) -> ast.AST | None:
-        """The text a SQLAlchemy ``text()`` wraps, through ``.bindparams()`` and the like."""
-        base = node
-        for _ in range(MAX_CHAIN):
-            if not isinstance(base, ast.Call):
-                return node
-            chain = _chain(base.func)
-            if chain is not None and any(
-                path in _SQL_TEXT for path, _ in self.scopes.resolve(scope, chain)[0]
-            ):
-                return next(iter(base.args), None) or next(
-                    (k.value for k in base.keywords if k.arg == "text"), None
-                )
-            if not isinstance(base.func, ast.Attribute):
-                return node
-            base = base.func.value
-        return node
-
-    def caller_supplied(self, node: ast.AST | None) -> bool:
-        """A statement that is a parameter, or text built from one."""
-        if isinstance(node, ast.Name):
-            return node.id in self.parameters
-        if isinstance(node, ast.JoinedStr):
-            interpolated = set().union(
-                *(_names_in(p) for p in node.values if isinstance(p, ast.FormattedValue))
-            )
-            return bool(interpolated & self.parameters)
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add | ast.Mod):
-            return bool(_names_in(node) & self.parameters)
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "format"
-        ):
-            arguments = [*node.args, *(k.value for k in node.keywords)]
-            return bool(set().union(*(_names_in(a) for a in arguments)) & self.parameters)
-        return False
 
 
 def _open_mode(call: ast.Call) -> str | None:
@@ -705,37 +461,26 @@ def _observe_python(
     function: ast.FunctionDef | ast.AsyncFunctionDef, scopes: PythonScopes
 ) -> _Observed | None:
     """What a body names that raises risk; None past a bound."""
-    # Each node with its scope and the index of its outermost enclosing loop, or -1.
-    nodes: list[tuple[ast.AST, _Scope, int]] = []
-    parents: list[int] = []
-    own = scopes.scope(function)
-    pending: list[tuple[ast.AST, _Scope, int, int]] = [
-        (s, own, -1, -1) for s in reversed(function.body)
+    nodes: list[tuple[ast.AST, _Scope]] = []
+    pending: list[tuple[ast.AST, _Scope]] = [
+        (s, scopes.scope(function)) for s in reversed(function.body)
     ]
     while pending:
-        node, scope, loop, parent = pending.pop()
-        nodes.append((node, scope, loop))
-        parents.append(parent)
+        node, scope = pending.pop()
+        nodes.append((node, scope))
         if len(nodes) > MAX_BODY_NODES:
             return None
-        here = len(nodes) - 1
-        if loop < 0 and isinstance(node, ast.For | ast.AsyncFor | ast.While):
-            loop = here
-        pending.extend((c, s, loop, here) for c, s in reversed(scopes.children(node, scope)))
+        pending.extend(reversed(scopes.children(node, scope)))
     seen = _Observed()
     try:
-        body = _PythonBody(function, nodes, parents, scopes)
-        for index, (node, scope, _) in enumerate(nodes):
-            body.at = index
-            _python_node(node, scope, scopes, body, seen)
+        for node, scope in nodes:
+            _python_node(node, scope, scopes, seen)
     except _TooManyTargetsError:
         return None
     return seen
 
 
-def _python_node(
-    node: ast.AST, scope: _Scope, scopes: PythonScopes, body: _PythonBody, seen: _Observed
-) -> None:
+def _python_node(node: ast.AST, scope: _Scope, scopes: PythonScopes, seen: _Observed) -> None:
     if isinstance(node, ast.Subscript):
         environ = _chain(node.value)
         if environ is not None and any(
@@ -751,28 +496,17 @@ def _python_node(
         return
     written, through_call = found
     names, unresolved = scopes.resolve(scope, written)
-    receiver = written.split(".")[0] if "." in written else ""
     if unresolved:
         last = written.rsplit(".", 1)[-1]
         if last in _FS_WRITE:
             seen.write(CapabilityClass.FILESYSTEM)
         elif last in _FS_DELETE:
             seen.delete(CapabilityClass.FILESYSTEM)
-        elif last in _DB_EXECUTE and receiver in _DB_RECEIVERS:
-            _python_sql(node, scope, body, seen)
     for name, via_call in names:
-        _python_call(node, scope, name, through_call or via_call, receiver, body, seen)
+        _python_call(node, name, through_call or via_call, seen)
 
 
-def _python_call(
-    node: ast.Call,
-    scope: _Scope,
-    name: str,
-    through_call: bool,
-    receiver: str,
-    body: _PythonBody,
-    seen: _Observed,
-) -> None:
+def _python_call(node: ast.Call, name: str, through_call: bool, seen: _Observed) -> None:
     """Classify one call against one target its callee may have."""
     parts = name.split(".")
     module = parts[0]
@@ -811,34 +545,10 @@ def _python_call(
         seen.delete(CapabilityClass.FILESYSTEM)
     elif module in {"os", "shutil"} and module_call and last in _FS_MODULE_WRITE:
         seen.write(CapabilityClass.FILESYSTEM)
-    # Building a statement, such as SQLAlchemy's ``text()``, is not running it.
-    if last in _DB_EXECUTE and (module in _DB_MODULES or receiver in _DB_RECEIVERS):
-        _python_sql(node, scope, body, seen)
     if name in {"os.getenv", "os.environ.get"}:
         key = _literal(node.args[0]) if node.args else None
         if key is not None and _secret_name(key):
             seen.add(CapabilityClass.CREDENTIALS)
-
-
-def _python_sql(call: ast.Call, scope: _Scope, body: _PythonBody, seen: _Observed) -> None:
-    named = (k.value for k in call.keywords if k.arg in _SQL_ARGUMENTS)
-    statement = body.unwrap(next(iter(call.args), None) or next(named, None), scope)
-    if isinstance(statement, ast.Name) and statement.id not in body.parameters:
-        supplied, rank = body.reaching(scope, statement.id)
-    else:
-        supplied = body.caller_supplied(statement)
-        rank = _SQL_RANK[_sql_effect(_literal(statement))]
-    if supplied:
-        seen.raw_sql = True
-        rank = 2
-    _sql_record(rank, seen)
-
-
-def _sql_record(rank: int, seen: _Observed) -> None:
-    if rank == 2:
-        seen.delete()
-    elif rank == 1:
-        seen.write()
 
 
 def _ts_text(node: Node | None) -> str:
@@ -1046,29 +756,6 @@ def _ts_parameters(handler: Node) -> set[str]:
     return names
 
 
-def _ts_uses(node: Node, parameters: set[str], *, assume: bool = True) -> bool:
-    """Whether ``node`` reads a parameter; past ``_MAX_USE_NODES`` nodes, ``assume``."""
-    if not parameters:
-        return False
-    stack = [node]
-    budget = _MAX_USE_NODES
-    while stack:
-        budget -= 1
-        if budget < 0:
-            return assume
-        current = stack.pop()
-        if current.type in {"identifier", "shorthand_property_identifier"}:
-            if _ts_text(current) in parameters:
-                return True
-        elif current.type == "member_expression":
-            obj = current.child_by_field_name("object")
-            if obj is not None:
-                stack.append(obj)
-            continue
-        stack.extend(current.named_children)
-    return False
-
-
 def _ts_method(options: Node | None) -> str:
     if options is None or options.type != "object":
         return ""
@@ -1127,9 +814,8 @@ def _ts_import_binding(value: Node | None) -> bool:
     return _ts_loaded_module(value) is not None or callee in {"promisify", "util.promisify"}
 
 
-def _ts_locals(handler: Node, parameters: set[str], skip: frozenset[int]) -> set[str] | None:
-    """Names the body binds at its top level, which shadow imports; a name bound from a
-    parameter anywhere is added to ``parameters`` as taint. None past the node bound."""
+def _ts_locals(handler: Node) -> set[str]:
+    """Names the body binds at its top level, which shadow imports."""
     names: set[str] = set()
     body = handler.child_by_field_name("body")
     if body is not None and body.type == "statement_block":
@@ -1143,21 +829,6 @@ def _ts_locals(handler: Node, parameters: set[str], skip: frozenset[int]) -> set
                     value = declarator.child_by_field_name("value")
                     if declarator.type == "variable_declarator" and not _ts_import_binding(value):
                         names.update(_ts_bound_names(declarator.child_by_field_name("name")))
-    stack = [handler]
-    visited = 0
-    declarators: list[Node] = []
-    while stack:
-        node = stack.pop()
-        visited += 1
-        if visited > MAX_BODY_NODES:
-            return None
-        if node.type == "variable_declarator":
-            declarators.append(node)
-        stack.extend(child for child in node.named_children if child.id not in skip)
-    for node in sorted(declarators, key=lambda n: n.start_byte):
-        value = node.child_by_field_name("value")
-        if value is not None and _ts_uses(value, parameters, assume=False):
-            parameters.update(_ts_bound_names(node.child_by_field_name("name")))
     return names
 
 
@@ -1190,16 +861,10 @@ def classify_typescript(
 ) -> ToolCapabilities:
     """Classify a handler by the calls in its syntax tree; ``skip`` holds other tools' ids."""
     seen = _Observed()
-    parameters = _ts_parameters(handler)
-    # _ts_locals adds names bound from a parameter anywhere in the body, so that SQL built
-    # from them is caller-supplied; such a name in a nested block must not hide a call.
-    shadowed = set(parameters)
-    own = frozenset(parameters)
-    local = _ts_locals(handler, parameters, skip)
-    if local is None:
-        return ToolCapabilities(unclassified=True)
+    parameters = frozenset(_ts_parameters(handler))
+    local = _ts_locals(handler)
     imports = {name: bound for name, bound in imports.items() if name not in local}
-    shadowed |= local
+    shadowed = parameters | local
     stack = [handler]
     visited = 0
     while stack:
@@ -1208,7 +873,7 @@ def classify_typescript(
         if visited > MAX_BODY_NODES:
             return ToolCapabilities(unclassified=True)
         if node.type == "call_expression":
-            _ts_call(node, imports, shadowed, parameters, seen, own)
+            _ts_call(node, imports, shadowed, parameters, seen)
         elif node.type == "new_expression":
             constructor = _ts_chain(node.child_by_field_name("constructor"))
             if (
@@ -1238,10 +903,9 @@ def classify_typescript(
 def _ts_call(
     node: Node,
     imports: Bindings,
-    shadowed: set[str],
-    parameters: set[str],
+    shadowed: frozenset[str],
+    parameters: frozenset[str],
     seen: _Observed,
-    own: frozenset[str] = frozenset(),
 ) -> None:
     """Classify one call against every binding its head may have."""
     chain = _ts_chain(node.child_by_field_name("function"))
@@ -1292,7 +956,7 @@ def _ts_call(
         seen.add(CapabilityClass.NETWORK)
         seen.write()
     if (
-        (stripe_bound or (head.lower() == "stripe" and head not in own))
+        (stripe_bound or (head.lower() == "stripe" and head not in parameters))
         and len(chain) >= 3
         and chain[-2] in _TS_PAYMENT_RESOURCES
         and last in _TS_PAYMENT_WRITE
@@ -1300,32 +964,3 @@ def _ts_call(
         seen.add(CapabilityClass.NETWORK)
         seen.write(CapabilityClass.PAYMENT)
         seen.payment = True
-    client = any(module in _TS_DB_MODULES for module, _ in candidates)
-    if last in _TS_SQL and len(chain) > 1 and values and (client or chain[-2] in _TS_DB_RECEIVERS):
-        statement = values[0]
-        interpolated = statement.type == "template_string" and any(
-            part.type == "template_substitution" and _ts_uses(part, parameters)
-            for part in statement.named_children
-        )
-        passed = statement.type == "identifier" and _ts_text(statement) in parameters
-        if interpolated or passed:
-            seen.raw_sql = True
-            seen.delete()
-        else:
-            _sql_record(_SQL_RANK[_sql_effect(_ts_literal_text(statement))], seen)
-
-
-def _ts_literal_text(node: Node) -> str | None:
-    """The text of a string or template literal, each substitution read as ``?``."""
-    if node.type not in {"string", "template_string"}:
-        return None
-    parts: list[str] = []
-    for child in node.named_children:
-        if child.type == "string_fragment":
-            parts.append(_ts_text(child))
-        elif child.type == "escape_sequence":
-            escaped = _ts_text(child)
-            parts.append("\n" if escaped in {"\\n", "\\r"} else escaped[1:2])
-        elif child.type == "template_substitution":
-            parts.append(" ? ")
-    return "".join(parts)
