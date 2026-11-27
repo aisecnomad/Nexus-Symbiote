@@ -130,8 +130,10 @@ _TS_FS_DELETE = frozenset({"rm", "rmSync", "unlink", "unlinkSync", "rmdir", "rmd
 _TS_HTTP = frozenset({"axios", "node-fetch", "got", "undici", "ky", "http", "https"})
 _TS_SQL = frozenset(
     {"query", "execute", "raw", "unsafe", "$queryRawUnsafe", "$executeRawUnsafe", "queryRaw"}
-    | {"prepare"}
+    | {"prepare", "$queryRaw", "$executeRaw"}
 )
+# What a prepared statement comes from; its other methods take bound values.
+_TS_PREPARED = frozenset({"prepare", "PreparedStatement"})
 # SQLite-family and pg-promise statement methods, too common to count on a name alone.
 _TS_SQL_CLIENT = frozenset(
     {"exec", "run", "all", "get", "each", "none", "one", "many", "any", "result", "batch"}
@@ -139,8 +141,6 @@ _TS_SQL_CLIENT = frozenset(
 )
 # Clients that are themselves a tag running its template, as postgres.js's ``sql`...```.
 _TS_TAGGED = frozenset({"postgres", "@vercel/postgres", "@neondatabase/serverless"})
-# Methods that run the template they tag, as Prisma's ``prisma.$executeRaw`...```.
-_TS_SQL_TAGS = _TS_SQL | {"$executeRaw", "$queryRaw"}
 # A receiver ``query`` or ``execute`` is SQL on: a client from one of these modules, or by name.
 _TS_DB_MODULES = frozenset(
     {"pg", "mysql", "mysql2", "sqlite3", "better-sqlite3", "postgres", "@prisma/client", "knex"}
@@ -1096,8 +1096,9 @@ def _ts_text(node: Node | None) -> str:
 
 
 def _ts_module(specifier: str) -> str:
-    module = specifier.removeprefix("node:")
-    return module.split("/", 1)[0] if not module.startswith("@") else module
+    """The package a specifier names, as ``@prisma/client`` for ``@prisma/client/edge``."""
+    parts = specifier.removeprefix("node:").split("/")
+    return "/".join(parts[:2]) if parts[0].startswith("@") else parts[0]
 
 
 Bindings = Mapping[str, tuple[tuple[str, str], ...]]
@@ -1409,11 +1410,11 @@ def _ts_derived(
     held = held or list(itertools.islice(names.get(head, ()), _MAX_TARGETS + 1))
     if not called:
         return held if len(chain) == 1 else [(module, chain[-1]) for module, _ in held]
+    made = chain[-1] if len(chain) > 1 else ""  # The method that made it, such as ``prepare``.
     return [
-        (module, export)
+        (module, made or export)
         for module, export in held
-        if module not in _TS_HTTP
-        or (chain[-1] if len(chain) > 1 else export) in _TS_HTTP_CLIENTS.get(module, ())
+        if module not in _TS_HTTP or (made or export) in _TS_HTTP_CLIENTS.get(module, ())
     ]
 
 
@@ -1807,7 +1808,7 @@ def _ts_call(
     if arguments is not None and arguments.type == "template_string":
         # A tag that runs its template; the substitutions are bound parameters.
         if any(module in _TS_TAGGED for module, _ in candidates) or (
-            len(chain) > 1 and last in _TS_SQL_TAGS and (client or named)
+            len(chain) > 1 and last in _TS_SQL and (client or named)
         ):
             _sql_record(_ts_statement(arguments, tainted, bound=True)[1], seen)
         return
@@ -1816,7 +1817,10 @@ def _ts_call(
         tag = receiver.child_by_field_name("arguments")
         if tag is not None and tag.type == "template_string":
             statement = receiver  # ``sql`...`.execute(db)`` runs the template
-    prepared = "prepare" in chain[:-1]  # A prepared statement's arguments are bound values.
+    # A prepared statement's arguments are bound values, all but the statement it is given.
+    prepared = last != "prepare" and (
+        "prepare" in chain[:-1] or any(export in _TS_PREPARED for _, export in candidates)
+    )
     if statement is None or prepared or len(chain) < 2:
         return
     if (last in _TS_SQL and (client or named)) or (last in _TS_SQL_CLIENT and client):

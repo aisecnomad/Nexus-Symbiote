@@ -2483,3 +2483,67 @@ def test_a_typescript_member_of_a_name_bound_in_many_functions_stays_in_each(
     )
     many += 'const x = require("child_process");\nconst run = x.execSync;\n'
     assert _caps(_ts(tmp_path, "(c) => run(c)", many)) == {E.EXECUTE}
+
+
+# ---- Verification of 62717237: TypeScript statements and drivers ---------------------------
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected", "raw"),
+    [
+        (
+            'import mysql from "mysql2/promise";\nconst conn = await mysql.createConnection({});\n',
+            "async (values) => { const stmt = await conn.prepare('SELECT * FROM t WHERE id = ?'); "
+            "return stmt.execute(values); }",
+            set(),
+            False,
+        ),
+        (
+            'import mssql from "mssql";\nconst ps = new mssql.PreparedStatement();\n',
+            "async (params) => { await ps.prepare('SELECT * FROM t WHERE id = @id'); "
+            "return ps.execute(params); }",
+            set(),
+            False,
+        ),
+        (
+            'import mssql from "mssql";\nconst ps = new mssql.PreparedStatement();\n',
+            "async (params) => { await ps.prepare('DELETE FROM t WHERE id = @id'); "
+            "return ps.execute(params); }",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            'import Database from "better-sqlite3";\nconst db = new Database("f.db");\n',
+            "async ({ id }) => { const stmt = db.prepare('DELETE FROM t WHERE id = ?'); "
+            "return stmt.run(id); }",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            'import { Prisma } from "@prisma/client/edge";\n',
+            "async ({ q }) => Prisma.raw(q)",
+            {E.WRITE, E.DESTRUCTIVE},
+            True,
+        ),
+        (
+            'import { PrismaClient, Prisma } from "@prisma/client";\nconst prisma = new PrismaClient();\n',
+            'async () => prisma.$executeRaw(Prisma.sql`DELETE FROM "Session"`)',
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+    ],
+    ids=[
+        "mysql2-prepared-execute",
+        "mssql-prepared-statement",
+        "mssql-prepared-delete-control",
+        "better-sqlite3-statement-held-in-a-name",
+        "prisma-edge-entry",
+        "prisma-execute-raw-of-a-sql-template",
+    ],
+)
+def test_typescript_prepared_statements_and_package_entries(
+    tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass], raw: bool
+) -> None:
+    tool = _ts(tmp_path, handler, header)
+    assert _caps(tool) == expected, handler
+    assert any("caller-supplied" in r.detail for r in tool.risks) is raw, handler
