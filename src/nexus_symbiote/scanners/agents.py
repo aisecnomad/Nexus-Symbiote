@@ -385,6 +385,9 @@ def _provider_for(model: str, hint: str) -> tuple[str, str]:
     """Split ``prefix/model`` and ``prefix:model`` routes and name the provider."""
     name = model
     provider = hint
+    if model.lower().startswith("accounts/fireworks/models/"):
+        # A Fireworks route carries the account path in the identifier itself.
+        return model, provider or "fireworks"
     for separator in ("/", ":"):
         head, sep, rest = model.partition(separator)
         if sep and head.lower() in _PREFIX_PROVIDERS and rest:

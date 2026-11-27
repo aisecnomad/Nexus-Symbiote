@@ -400,6 +400,17 @@ def test_a_checkout_without_agent_code_records_nothing_and_stays_complete(tmp_pa
     assert not result.surfaces_excluded
 
 
+def test_fireworks_routes_are_not_hugging_face_repositories() -> None:
+    assert _provider_for("accounts/fireworks/models/llama-v3p1-8b-instruct", "") == (
+        "accounts/fireworks/models/llama-v3p1-8b-instruct",
+        "fireworks",
+    )
+    assert _provider_for("meta-llama/Llama-3.1-8B-Instruct", "") == (
+        "meta-llama/Llama-3.1-8B-Instruct",
+        "huggingface",
+    )
+
+
 def test_project_reconciliation_accepts_the_collector_edges(tmp_path: Path) -> None:
     from click.testing import CliRunner
 
