@@ -41,16 +41,16 @@ not. Of an object the reader cannot tell, such as an untyped or `Any` parameter 
 framework's state, a call is read when it is named as SDK calls are (`create`, `chat`,
 `completions`, `invoke`, `generate_content` and the like), so a metrics label or an
 ORM query is not. A call of a name the reader cannot tell, such as a class chosen at run
-time, is read, though not a `**` spread a wrapper hands on that way. A method reached
-through a class, as an ORM's manager is, is the class's: a library's is not read, and a
-project's is a gap.
+time, is read, but not a `**` spread a wrapper hands a function it was given. A method
+reached through a class, as an ORM's manager is, is the class's: a library's is not
+read, and a project's is a gap.
 
 A model identifier written as a literal argument becomes one `model` component for the
 project at `declared` assurance. Its `source_reference` claim names the file and the
 line of the argument, up to 16 places, and `references_unlisted` counts the rest. The
 identifier is kept as written, routing prefix and all, and no provider is recorded. Any
-`trust_remote_code` but a false literal, given to a call or in its `model_kwargs` or
-`config_kwargs`, records that the model may run its own code. A relative path or a
+`trust_remote_code` but a false literal, given to a call or in a dict of its options,
+such as `model_kwargs`, records that the model may run its own code. A relative path or a
 weight file names a file in the project, which the model collector reads.
 
 What the reader knows is there and cannot read is a coverage gap:
@@ -65,7 +65,7 @@ What the reader knows is there and cannot read is a coverage gap:
   than text or a path one returns: a name, an attribute, a parameter, a call of another
   library, joined text, `**options` without a model, a starred positional argument, a
   path on a host, behind a routing prefix or not, or text that is no identifier;
-- options a weights library is given that the reader cannot read, such as
+- options a weights library loads a model with that the reader cannot read, such as
   `model_kwargs=options` or `**options`, which may let the model run its own code;
 - a model argument given to a function or class the project defines, or to a method of
   one of its classes, which the reader does not follow;

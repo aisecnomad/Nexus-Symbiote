@@ -40,9 +40,9 @@ AI_SUBMODULES = {
 # word not in an import statement, such as ``graphics`` or one in a string, names none.
 _GAP = r"(?:[ \t\f]|\\(?:\r\n?|\n))"
 # A name earlier in an import list may hold any character an identifier may, such as a
-# combining mark, so it runs to the next separator.
-_NAME = r"[^\s,;:\\#()]+"
+# combining mark, so it runs to the next separator, and its dots may have gaps around them.
 _DOT = rf"{_GAP}*\.{_GAP}*"
+_NAME = rf"[^\s,;:\\#().]+(?:{_DOT}[^\s,;:\\#().]+)*"
 _ROOT_NAMES = "|".join(sorted(map(re.escape, AI_ROOTS - {"google"})))
 SDK_IMPORT = re.compile(
     rf"(?:\A|[\r\n;:])[ \t\f]*(?:from|import)(?!\w){_GAP}*(?:{_NAME}(?:{_GAP}+as{_GAP}+{_NAME})?"
@@ -106,10 +106,11 @@ POSITIONAL_MODELS: dict[tuple[str, str], int] = {
     ("replicate", "run"): 0, ("diffusers", "from_pretrained"): 0, ("vllm", "LLM"): 0,
     ("peft", "PeftModel.from_pretrained"): 1, ("peft", "from_pretrained"): 0,
 }  # fmt: skip
-# SDK functions that return text or a path, not an object the SDK makes.
-TEXT_CALLS = frozenset(
-    {"get", "get_from_dict_or_env", "get_from_env", "hf_hub_download", "snapshot_download"}
-)
+# Calls that return text or a path, not an object an SDK makes: SDK helpers and str's methods.
+TEXT_CALLS = frozenset({
+    *dir(str), "cached_file", "get", "get_from_dict_or_env", "get_from_env", "get_secret",
+    "hf_hub_download", "hf_hub_url", "snapshot_download", "try_to_load_from_cache",
+})  # fmt: skip
 # Calls that call their first argument with the rest, so its keywords are that callee's.
 FORWARDERS = frozenset(
     {
