@@ -66,13 +66,17 @@ MODEL_CALLS = frozenset(
         "transcriptions", "with_options", "with_structured_output",
     }
 )  # fmt: skip
-# Callables that route by a prefix on the identifier, as LiteLLM reads ``anthropic/``. A
-# native owner/name, as Replicate and model hubs read it, and an OpenAI-compatible
-# gateway's names are no routes.
-ROUTERS = (
-    "crewai", "dspy", "langchain.chat_models", "langchain.embeddings", "litellm", "pydantic_ai",
-    "smolagents",
-)  # fmt: skip
+# Calls that route by a prefix on the identifier, as LiteLLM reads ``anthropic/``, to the
+# separators they read it by. A native owner/name, as Replicate and model hubs read it, an
+# OpenAI-compatible gateway's names and a model class given its provider are no routes.
+ROUTERS: dict[tuple[str, str], str] = {
+    ("crewai", "Agent"): "/", ("crewai", "Crew"): "/", ("crewai", "LLM"): "/",
+    ("dspy", "Embedder"): "/", ("dspy", "LM"): "/", ("litellm", "*"): "/",
+    ("smolagents", "LiteLLMModel"): "/", ("smolagents", "LiteLLMRouterModel"): "/",
+    ("langchain.chat_models", "init_chat_model"): ":",
+    ("langchain.embeddings", "init_embeddings"): ":",
+    ("pydantic_ai", "Agent"): ":", ("pydantic_ai", "infer_model"): ":",
+}  # fmt: skip
 # Libraries that load weights by an owner/name identifier, which is never a route.
 WEIGHT_ROOTS = (
     "diffusers", "huggingface_hub", "langchain_huggingface", "llama_cpp", "peft",

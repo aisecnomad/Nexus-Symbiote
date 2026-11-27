@@ -1104,7 +1104,9 @@ class PythonReader:
             self._given.update((value.lineno, value.col_offset) for value, _ in found)
             return
         self._unread.update((value.lineno, value.col_offset) for value in unread)
-        routes = origin is not None and any(_under(base, router) for router in ROUTERS)
+        # A call that names its provider by keyword reads no route off the identifier.
+        provided = keywords.keys() & {"model_provider", "provider"}
+        routes = "" if origin is None or provided else _row(base, ROUTERS) or ""
         flags, opaque = [keywords.get("trust_remote_code")], list(spread)
         given = [(value, key in _KWARGS) for key, value in keywords.items()]
         for options, named_options in given:
@@ -1141,7 +1143,7 @@ class PythonReader:
         return [] if options is None or isinstance(options, ast.Constant) else [(None, options)]
 
     def _model_references(
-        self, module: Module, expression: ast.expr, *, embedding: bool, routes: bool, remote: bool
+        self, module: Module, expression: ast.expr, *, embedding: bool, routes: str, remote: bool
     ) -> None:
         """Record each identifier a model argument can hold, and account for what else
         it can hold."""

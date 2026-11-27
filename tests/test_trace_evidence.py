@@ -2055,3 +2055,20 @@ def test_a_caller_span_reports_its_own_identity_and_gates_an_unreadable_one(tmp_
     hidden = _evidence(tmp_path, [agent], otlp_span({**own, "spiffe.id": secret}, kind=kind))
     assert hidden["reconciliation"]["matched"][0]["workload_identity_matched"] is False
     assert hidden["gate"]["passed"] is False
+
+
+@pytest.mark.parametrize(
+    ("declared", "reported"),
+    [
+        ("aws.bedrock", "aws.bedrock"),
+        ("aws.bedrock", "bedrock"),
+        ("gcp.vertex_ai", "vertex_ai"),
+        ("azure.ai.openai", "az.ai.openai"),
+        ("mistral_ai", "mistral"),
+    ],
+)
+def test_a_provider_spelled_another_way_by_a_router_still_matches(tmp_path, declared, reported):
+    span = otlp_span({"gen_ai.request.model": "model-x", "gen_ai.provider.name": reported})
+    evidence = _evidence(tmp_path, [_hosted("model:x", "model-x", declared)], span)
+    [entry] = _entries(evidence, "matched", "model")
+    assert (entry["inventory_ref"], entry["basis"]) == ("model:x", "name-and-provider")

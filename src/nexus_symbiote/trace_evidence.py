@@ -112,6 +112,14 @@ SARIF_HELP_URI = (
     "https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/trace-evidence.md#sarif"
 )
 _LOCAL_TRANSPORTS = ("pipe", "unix")
+# Names that instrumentations and model routers give a provider, to the one OpenTelemetry's
+# gen_ai.provider.name gives it, so that each side's spelling finds the other.
+_PROVIDER_ALIASES = {
+    "aws-bedrock": "aws.bedrock", "az.ai.openai": "azure.ai.openai", "azure": "azure.ai.openai",
+    "azure-openai": "azure.ai.openai", "bedrock": "aws.bedrock", "gemini": "gcp.gemini",
+    "google-vertex-ai": "gcp.vertex_ai", "mistral": "mistral_ai", "vertex_ai": "gcp.vertex_ai",
+    "watsonx": "ibm.watsonx.ai", "xai": "x_ai",
+}  # fmt: skip
 _DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 _TRIM = " \t\r\n"
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -366,6 +374,11 @@ def _time(nanoseconds: int | None) -> str | None:
     return moment.strftime("%Y-%m-%dT%H:%M:%S") + f".{fraction:09d}Z"
 
 
+def _provider_key(provider: str) -> str:
+    lowered = provider.lower()
+    return _PROVIDER_ALIASES.get(lowered, lowered)
+
+
 def _trimmed(value: str | None) -> str | None:
     text = value.strip(_TRIM) if value is not None else ""
     return text or None
@@ -461,7 +474,7 @@ class _Inventory:
                     if provider is None:
                         groups["models_open"][key].append(component)
                     else:
-                        groups["models_for"][(key, provider.lower())].append(component)
+                        groups["models_for"][(key, _provider_key(provider))].append(component)
             elif isinstance(component, AgentComponent) and not _inferred(component):
                 self.declared.append(("agent", component))
                 # A manifest that declares an id derives the agent's reference from it.
@@ -534,7 +547,7 @@ class _Inventory:
             model = None if raw is None else name_key(raw)
             if provider is None:
                 return [(self._get("models", model), "name")]
-            if exact := self._get("models_for", (model, provider.lower())):
+            if exact := self._get("models_for", (model, _provider_key(provider))):
                 return [(exact, "name-and-provider")]
             return [(self._get("models_open", model), "name")]
         if kind == "agent":

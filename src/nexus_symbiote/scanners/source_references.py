@@ -54,19 +54,22 @@ _FILE_SUFFIXES = (
 _EMBEDDING = re.compile(
     r"(?i)(?:embed|bge-|e5-|gte-|minilm|mpnet|gecko|arctic-embed|voyage-|jina-|rerank)"
 )
-# The routing prefix a model router reads off an identifier, and its provider.
+# The routing prefix a model router reads off an identifier, and its provider, named as
+# OpenTelemetry's ``gen_ai.provider.name`` names it where it names one.
 ROUTES: dict[str, str] = {
-    "anthropic": "anthropic", "azure": "azure-openai", "azure_ai": "azure-ai",
-    "bedrock": "aws-bedrock", "bedrock_converse": "aws-bedrock", "cerebras": "cerebras",
-    "cohere": "cohere", "cohere_chat": "cohere", "deepseek": "deepseek", "fireworks": "fireworks",
-    "fireworks_ai": "fireworks", "gemini": "google", "google-gla": "google",
-    "google-vertex": "google-vertex-ai", "google_genai": "google",
-    "google_vertexai": "google-vertex-ai", "groq": "groq", "huggingface": "huggingface",
-    "mistral": "mistral", "mistralai": "mistral", "nvidia_nim": "nvidia", "ollama": "ollama",
-    "ollama_chat": "ollama", "openai": "openai", "openrouter": "openrouter",
-    "perplexity": "perplexity", "replicate": "replicate", "sagemaker": "aws-sagemaker",
-    "together": "together", "together_ai": "together", "vertex_ai": "google-vertex-ai",
-    "watsonx": "ibm-watsonx", "xai": "xai",
+    "anthropic": "anthropic", "azure": "azure.ai.openai", "azure_ai": "azure.ai.inference",
+    "azure_openai": "azure.ai.openai", "bedrock": "aws.bedrock", "bedrock_converse": "aws.bedrock",
+    "cerebras": "cerebras", "cohere": "cohere", "cohere_chat": "cohere", "deepseek": "deepseek",
+    "fireworks": "fireworks", "fireworks_ai": "fireworks", "gemini": "gcp.gemini",
+    "google-gla": "gcp.gemini", "google-vertex": "gcp.vertex_ai", "google_anthropic_vertex":
+    "gcp.vertex_ai", "google_genai": "gcp.gemini", "google_vertexai": "gcp.vertex_ai",
+    "grok": "x_ai", "groq": "groq", "huggingface": "huggingface", "ibm": "ibm.watsonx.ai",
+    "mistral": "mistral_ai", "mistralai": "mistral_ai", "nvidia_nim": "nvidia", "ollama": "ollama",
+    "ollama_chat": "ollama", "openai": "openai", "openai-chat": "openai",
+    "openai-responses": "openai", "openrouter": "openrouter", "perplexity": "perplexity",
+    "replicate": "replicate", "sagemaker": "aws.sagemaker", "together": "together",
+    "together_ai": "together", "vertex_ai": "gcp.vertex_ai", "watsonx": "ibm.watsonx.ai",
+    "xai": "x_ai",
 }  # fmt: skip
 # Routing prefixes that are also the owner of weights on a model hub, with the names
 # that owner publishes there: such an identifier is the owner and the name together.
@@ -110,24 +113,25 @@ def placeholder(text: str) -> bool:
     return not text or text.lower() in _NOT_A_MODEL or local and not _ABSOLUTE.search(text)
 
 
-def split_route(literal: str) -> tuple[str, str | None]:
+def split_route(literal: str, separators: str = "/:") -> tuple[str, str | None]:
     """The model identifier and the provider a routing prefix on ``literal`` names:
-    ``openai/gpt-4o`` and ``anthropic:claude-sonnet-4-5`` are a route and an
-    identifier. Only a call that routes by prefix reads it so, and only as written: a
-    router's prefixes are lower case, so ``Groq/`` is an owner on a model hub."""
-    for separator in ("/", ":"):
+    ``openai/gpt-4o`` and ``anthropic:claude-sonnet-4-5`` are a route and an identifier.
+    Only a call that routes by prefix reads it so, by its own separators and only as
+    written: a router's prefixes are lower case, so ``Groq/`` is an owner on a model hub.
+    A route before what is no identifier gives no name."""
+    for separator in separators:
         prefix, found, rest = literal.partition(separator)
-        if not found or not rest:
-            continue
-        provider = ROUTES.get(prefix)
-        if provider is None:
-            continue
+        provider = ROUTES.get(prefix) if found else None
         owned = _HUB_OWNED.get(prefix) if separator == "/" else None
-        if owned is not None and owned.match(rest):
+        if provider is None or owned is not None and owned.match(rest):
             continue
-        if model_identifier(rest) is None:
-            continue
-        return rest, provider
+        if prefix == "bedrock":
+            # LiteLLM's ``converse/`` and ``invoke/`` choose Bedrock's API, not a model.
+            rest = rest.removeprefix("converse/").removeprefix("invoke/")
+        elif prefix == "huggingface" and rest.count("/") > 1:
+            # Before a hub's owner/name, a provider that serves it for Hugging Face.
+            rest = rest.split("/", 1)[1]
+        return (rest, provider) if model_identifier(rest) is not None else ("", provider)
     return literal, None
 
 
@@ -179,6 +183,7 @@ class Declarations:
         self.result = result
         self._models: dict[tuple[str, str | None], _Model] = {}
         self._written: dict[str, str | None] = {}
+        self._routed: dict[tuple[str, str], tuple[str, str | None]] = {}
         self._gaps: set[str] = set()
         self._full = False
         self._path = ""
@@ -200,14 +205,15 @@ class Declarations:
         *,
         method: str,
         embedding: bool = False,
-        routes: bool = False,
+        routes: str = "",
         remote_code: bool = False,
         environment: Iterable[str] = (),
     ) -> str | None:
-        """Record one reference to a model. ``routes`` says the call routes by a prefix on the
-        identifier, which then names the provider, so the model is one component for each
-        provider it is routed to; ``remote_code`` says its call lets it run its code, and
-        ``environment`` names the variables that, when set, give another model."""
+        """Record one reference to a model. ``routes`` holds the separators by which the call
+        reads a routing prefix on the identifier, which then names the provider, so the model
+        is one component for each provider it is routed to; ``remote_code`` says its call
+        lets it run its code, and ``environment`` names the variables that, when set, give
+        another model."""
         if not isinstance(literal, str):
             return None
         if literal not in self._written:
@@ -219,7 +225,15 @@ class Declarations:
         written = self._written[literal] if len(literal) <= 256 else self._written.pop(literal)
         if written is None:
             return None
-        name, routed = split_route(written) if routes else (written, None)
+        if (written, routes) not in self._routed:
+            # Each split is worked out once, as each text is judged once.
+            if len(self._routed) >= MAX_RECORDS:
+                self._routed.clear()
+            self._routed[(written, routes)] = split_route(written, routes)
+        name, routed = self._routed[(written, routes)]
+        if not name:
+            # A route this call reads, before what can be no model's name.
+            return None
         key = (name, routed)
         record = self._models.get(key)
         if record is None:
