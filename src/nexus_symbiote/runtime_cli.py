@@ -771,5 +771,60 @@ def register(
         raise click.ClickException(_safe_error(exc, "registration")) from None
 
 
+@runtime_group.command("verify-receipts")
+@click.argument("receipts_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--public-key",
+    "keys",
+    multiple=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Trusted Ed25519 public key PEM for signed receipts (repeatable).",
+)
+@click.option(
+    "--require-signatures",
+    is_flag=True,
+    help="Fail if any receipt in the chain is unsigned.",
+)
+@click.option(
+    "--expected-merkle-root",
+    default=None,
+    help="Fail unless the verified batch Merkle root equals this sha256:... digest.",
+)
+def verify_receipts(
+    receipts_path: Path,
+    keys: tuple[Path, ...],
+    require_signatures: bool,
+    expected_merkle_root: str | None,
+) -> None:
+    """Verify an offline hash-chained runtime receipt log and its Merkle root."""
+    from nexus_symbiote.runtime_receipts import verify_receipt_chain
+    from nexus_symbiote.utils.terminal import neutralize
+
+    if require_signatures and not keys:
+        raise click.UsageError("--require-signatures requires at least one --public-key")
+    if keys:
+        _check_key_placement(
+            keys,
+            (receipts_path,),
+            option="--public-key",
+            holders="RECEIPTS_PATH",
+        )
+    try:
+        ring = _ring(keys) if keys else None
+        result = verify_receipt_chain(
+            receipts_path,
+            trusted_keys=ring,
+            require_signatures=require_signatures,
+            expected_merkle_root=expected_merkle_root,
+        )
+    except _HANDLED as exc:
+        raise click.ClickException(_safe_error(exc, "receipt verification")) from None
+    click.echo(json_text(json.dumps(result.to_dict(), indent=2)))
+    if not result.verified:
+        raise click.ClickException(
+            "runtime receipt verification failed: " + neutralize("; ".join(result.errors))
+        )
+
+
 def register_runtime_commands(main: click.Group) -> None:
     main.add_command(runtime_group)

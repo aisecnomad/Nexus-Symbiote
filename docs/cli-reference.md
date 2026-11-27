@@ -78,6 +78,7 @@ change them. See [collection limits](collection-limits.md).
 | [`runtime digest`](#runtime-digest) | offline | Print the digest a runtime contract, approval or revocation list binds |
 | [`runtime key-id`](#runtime-key-id) | offline | Print the key ID of an Ed25519 public key |
 | [`runtime register`](#runtime-register) | offline | Make a newly issued runtime snapshot current in a gateway state store |
+| [`runtime verify-receipts`](#runtime-verify-receipts) | offline | Verify an offline hash-chained runtime receipt log and its Merkle root |
 | [`attest`](#attest) | offline | Sign a file's exact bytes, usually an inventory or a baseline, for a stated purpose |
 | [`verify-attestation`](#verify-attestation) | offline | Check that trusted keys attested a file's bytes or inventory content for a purpose |
 | [`trace-diff`](#trace-diff) | offline | Compare the runtime use that OpenTelemetry traces report with an AgentBOM |
@@ -955,6 +956,20 @@ git working tree that holds SNAPSHOT_PATH, the `--trust`, `--state` or
 `--signer-scopes` file or the current directory, or with other hard links, is a usage
 error (exit 2): a key planted there could register a snapshot or trust status at the
 highest serial and lock the tenant out of every gateway sharing the store.
+
+### `runtime verify-receipts`
+
+Verify an offline hash-chained runtime receipt log and its Merkle root.
+
+```text
+nexus-symbiote runtime verify-receipts [OPTIONS] RECEIPTS_PATH
+```
+
+| Option | Description |
+|---|---|
+| `--public-key` `PATH` | Trusted Ed25519 public key PEM for signed receipts (repeatable). |
+| `--require-signatures` | Fail if any receipt in the chain is unsigned. |
+| `--expected-merkle-root` `TEXT` | Fail unless the verified batch Merkle root equals this `sha256:...` digest. |
 
 ### `scan`
 

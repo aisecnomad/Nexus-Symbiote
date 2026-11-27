@@ -498,6 +498,7 @@ other code is permanent for the evidence presented.
 | `descriptor-too-large` | Served descriptor exceeds the supported JSON budget |
 | `descriptor-not-json` | Served descriptor is outside the canonical JSON domain |
 | `descriptor-changed` | Served descriptor changed since approval |
+| `descriptor-poisoned` | Served tool descriptor contains prompt-injection or poisoning patterns |
 | `isolation-unavailable` | The pinned launcher's process isolation is unavailable |
 | `isolation-teardown-failed` | The launcher's processes could not be confirmed ended |
 | `approval-required` | Operation requires a signed approval |
