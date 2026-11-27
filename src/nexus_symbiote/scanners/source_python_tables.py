@@ -79,17 +79,15 @@ ROUTERS: dict[tuple[str, str], str] = {
     ("langchain.embeddings", "init_embeddings"): ":",
     ("pydantic_ai", "Agent"): ":", ("pydantic_ai", "infer_model"): ":",
 }  # fmt: skip
-# Libraries that load weights by an owner/name identifier, which is never a route.
-WEIGHT_ROOTS = (
-    "diffusers", "huggingface_hub", "langchain_huggingface", "llama_cpp", "peft",
-    "sentence_transformers", "transformers", "vllm",
-)  # fmt: skip
+# Libraries, and classes elsewhere, that load a model to run here, where options may let it
+# run its own code. A hosted endpoint, a hub client and a GGUF or ONNX runtime run none.
+WEIGHT_ROOTS = ("diffusers", "peft", "sentence_transformers", "transformers", "vllm")
 WEIGHT_CLASSES = frozenset(
     {
-        "CrossEncoder", "FastEmbedEmbeddings", "HfApiModel", "HuggingFaceBgeEmbeddings",
-        "HuggingFaceEmbedding", "HuggingFaceEmbeddings", "HuggingFaceEndpoint", "HuggingFaceLLM",
-        "HuggingFacePipeline", "InferenceClient", "InferenceClientModel", "SentenceTransformer",
-        "SentenceTransformerEmbeddings", "TransformersModel",
+        "CrossEncoder", "HuggingFaceBgeEmbeddings", "HuggingFaceEmbedding", "HuggingFaceEmbeddings",
+        "HuggingFaceLLM", "HuggingFaceLocalChatGenerator", "HuggingFaceLocalGenerator",
+        "HuggingFacePipeline", "MLXModel", "SentenceTransformer", "SentenceTransformerEmbeddings",
+        "TransformersModel", "VLLM", "VLLMModel",
     }
 )  # fmt: skip
 # Keyword arguments that hold a model identifier in a call into an SDK.
