@@ -278,7 +278,7 @@ def test_a_project_module_named_like_an_sdk_is_not_the_sdk(tmp_path: Path, layou
     # Whether the project's module is the one imported depends on how it is run.
     assert list(result.surfaces_excluded) == [
         "main.py:1: imports an SDK by a name that a module of the project also has; "
-        "not read as the SDK"
+        + "not read as the SDK"
     ]
 
 
@@ -364,7 +364,7 @@ def test_source_that_names_an_sdk_and_cannot_be_read_is_a_gap(tmp_path: Path):
     assert sorted(result.surfaces_excluded) == [
         "broken.py:1: Python source could not be parsed; not read",
         "latin.py: source file cannot be decoded as its encoding declares; declarations in it "
-        "were not read",
+        + "were not read",
     ]
 
 
@@ -410,7 +410,7 @@ def test_a_file_over_the_syntax_limit_is_a_gap_only_when_it_names_an_sdk(tmp_pat
     assert result.components == []
     assert list(result.surfaces_excluded) == [
         "big.py: source file is larger than the syntax-bytes limit; declarations in it were "
-        "not read"
+        + "not read"
     ]
 
 
@@ -1140,7 +1140,7 @@ SentenceTransformer("all-MiniLM-L6-v2")
     [
         "try: import openai\nexcept ImportError: pass\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
         "from typing import TYPE_CHECKING\nif TYPE_CHECKING: from openai import OpenAI\n\n\n"
-        "def ask(client: OpenAI):\n    client.responses.create(model='gpt-4o')\n",
+        + "def ask(client: OpenAI):\n    client.responses.create(model='gpt-4o')\n",
         "import os; import openai\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
         "from \\\n    openai import OpenAI\nOpenAI().responses.create(model='gpt-4o')\n",
         "import os\r# one\rimport openai\ropenai.OpenAI().responses.create(model='gpt-4o')\r",
@@ -1173,7 +1173,7 @@ def test_a_codec_the_reader_does_not_follow_is_a_gap(tmp_path: Path):
     assert result.components == []
     assert list(result.surfaces_excluded) == [
         "seven.py: source file cannot be decoded as its encoding declares; declarations in it "
-        "were not read"
+        + "were not read"
     ]
 
 
@@ -1236,7 +1236,7 @@ def handle(metric, client, store, settings):
         "CLIENTS = {}\nCLIENTS.get('x').chat(model='nova')\n",
         "from contextvars import ContextVar\nCURRENT = ContextVar('c')\nCURRENT.get().chat(model='nova')\n",
         "from mypy_boto3_bedrock_runtime import BedrockRuntimeClient\n\n"
-        "def ask(client: BedrockRuntimeClient):\n    client.converse(modelId='nova')\n",
+        + "def ask(client: BedrockRuntimeClient):\n    client.converse(modelId='nova')\n",
     ],
     ids=["any", "object", "cast", "container", "context-variable", "type-stub"],
 )
