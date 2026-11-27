@@ -195,6 +195,131 @@ def register_graph_commands(main: click.Group) -> None:
             output=output,
         )
 
+    @main.command("security-graph")
+    @click.argument("inventory", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+    @click.option(
+        "-o",
+        "--output",
+        type=click.Path(path_type=Path),
+        help="Write the correlated security graph to this file; required for HTML.",
+    )
+    @click.option(
+        "--format",
+        "output_format",
+        type=click.Choice(["json", "html"]),
+        default="json",
+        show_default=True,
+        help="Output format: structured JSON (nexus-symbiote/security-graph/v1) or CSP-pinned HTML.",
+    )
+    @click.option(
+        "--advisories",
+        "advisories_path",
+        type=click.Path(exists=True, dir_okay=False, path_type=Path),
+        default=None,
+        help="Live or offline advisories report JSON bound to this inventory's SHA-256.",
+    )
+    @click.option(
+        "--allow-partial-advisories",
+        is_flag=True,
+        help="Accept an incomplete advisories report and record its partial status explicitly.",
+    )
+    @click.option(
+        "--project-root",
+        type=click.Path(exists=True, file_okay=False, path_type=Path),
+        default=None,
+        help="Scanned project root used to refuse advisory reports stored inside the checkout.",
+    )
+    @click.option(
+        "--max-nodes",
+        type=click.IntRange(1, MAX_NODES),
+        default=DEFAULT_MAX_NODES,
+        show_default=True,
+        help=f"Fail rather than correlate more components than this (at most {MAX_NODES}).",
+    )
+    @click.option(
+        "--fail-on-chain/--no-fail-on-chain",
+        default=False,
+        show_default=True,
+        help="Exit with status 1 when one or more multi-hop exposure chains are correlated.",
+    )
+    @click.option(
+        "--fail-on-kev/--no-fail-on-kev",
+        default=False,
+        show_default=True,
+        help="Exit with status 1 when a KEV-listed advisory reaches an agent.",
+    )
+    def security_graph(
+        inventory: Path,
+        output: Path | None,
+        output_format: str,
+        advisories_path: Path | None,
+        allow_partial_advisories: bool,
+        project_root: Path | None,
+        max_nodes: int,
+        fail_on_chain: bool,
+        fail_on_kev: bool,
+    ) -> None:
+        """Correlate advisories and poisoned surfaces to agents, credentials, data and tools."""
+        from nexus_symbiote.core.hashing import hash_bytes
+        from nexus_symbiote.security_graph import (
+            SecurityGraphError,
+            correlate_security_graph,
+            render_security_graph_html,
+        )
+
+        if output_format == "html" and output is None:
+            raise click.UsageError("the HTML security graph is written to a file: pass -o/--output")
+        if allow_partial_advisories and advisories_path is None:
+            raise click.UsageError("--allow-partial-advisories requires --advisories")
+        if project_root is not None and advisories_path is None:
+            raise click.UsageError("--project-root requires --advisories")
+        _refuse_source_overwrite(output, inventory)
+        if advisories_path is not None:
+            _refuse_source_overwrite(output, advisories_path)
+        bom, raw_bytes = _load_inventory_with_bytes(inventory)
+        try:
+            doc = correlate_security_graph(
+                bom,
+                inventory_sha256=hash_bytes(raw_bytes),
+                advisories_path=advisories_path,
+                allow_partial_advisories=allow_partial_advisories,
+                project_root=project_root,
+                inventory_path=inventory,
+                max_nodes=max_nodes,
+            )
+        except SecurityGraphError as exc:
+            raise click.ClickException(neutralize(exc)) from exc
+
+        text = (
+            render_security_graph_html(doc)
+            if output_format == "html"
+            else json.dumps(doc, indent=2, allow_nan=False)
+        )
+        if output is None:
+            click.echo(json_text(text))
+        else:
+            write_cli_output(output, text)
+            summary = doc["summary"]
+            echo_line(
+                "Security graph: ",
+                f"{summary['component_count']} components, {summary['advisory_count']} advisories, "
+                f"{summary['exposure_chain_count']} exposure chains",
+                err=True,
+            )
+        if (fail_on_chain and doc["summary"]["exposure_chain_count"] > 0) or (
+            fail_on_kev and doc["summary"]["kev_chain_count"] > 0
+        ):
+            raise SystemExit(1)
+
+
+def _load_inventory_with_bytes(path: Path) -> tuple[AIBOM, bytes]:
+    try:
+        return AIBOM.load_with_bytes(path)
+    except NativeFormatError as exc:
+        raise click.ClickException(
+            f"{neutralize(path)} is not a valid native AIBOM file. {neutralize(exc)}"
+        ) from exc
+
 
 def _load_inventory(path: str | Path) -> AIBOM:
     # The error names the class of problem; it never quotes the document.

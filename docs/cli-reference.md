@@ -60,6 +60,7 @@ change them. See [collection limits](collection-limits.md).
 | [`digest`](#digest) | offline | Print the digest of an AgentBOM's bytes, its canonical digest and its run-independent content digest |
 | [`blast-radius`](#blast-radius) | offline | List agents and components associated with one component |
 | [`graph`](#graph) | offline | Write a self-contained HTML or JSON view of an inventory's associations, risk classes and exposure paths |
+| [`security-graph`](#security-graph) | offline | Correlate advisories and poisoned surfaces across packages, MCP servers, agents, credentials, data stores and tools |
 | [`baseline`](#baseline) | offline | Write an unsigned snapshot only if the scan gate passes |
 | [`vex`](#vex) | offline | Export schema-validated VEX findings with optional operator decisions, advisories and trace evidence |
 | [`trifecta`](#trifecta) | offline | Analyze an inventory offline for lethal trifectas, chained toxic flows and tool shadowing |
@@ -159,6 +160,7 @@ What exit status 1 means for each gate:
 | `diff-instructions` | Any instruction surface or front-matter parse fails collection, or `--fail-on-change` is set and a security-relevant change or new excluded coverage gap is detected. |
 | `digest` | The file is a valid native inventory, but its canonical or content digest is undefined: the other values are printed, and the missing one as `unavailable` (`null` with `--json-output`). |
 | `graph` | The inventory's graph is invalid, `--focus` names no component, or the view would hold more components than `--max-nodes`. |
+| `security-graph` | The inventory's graph is invalid, `--advisories` is malformed or unbound to the inventory, `--max-nodes` is exceeded, `--fail-on-chain` is set with one or more exposure chains, or `--fail-on-kev` is set with a KEV-listed advisory reaching an agent. |
 | `minimum-elements` | `--fail-under` was given and fewer than that percentage of the assessable elements are present, or the inventory's CycloneDX export fails its checks. |
 | `baseline` | The scan gate failed, under the project policy or the built-in one. |
 | `verify-artifact`, `verify-discovery` | The digest, signature or projection does not match. |
@@ -705,6 +707,27 @@ Content-Security-Policy hash, and shows inventory text only escaped. A graph lar
 than `--max-nodes` fails with exit status 1 instead of being cut. The output may not
 be the inventory itself. [Graph view](graph-view.md) gives the risk-class rules, the
 ranking and the JSON document.
+
+### `security-graph`
+
+Correlate vulnerability advisories and poisoned or shadowed control-plane surfaces offline across packages, MCP servers, agents, declared credential names, data stores and high-risk tools, with traceable per-hop edge evidence.
+
+```text
+nexus-symbiote security-graph [OPTIONS] INVENTORY
+```
+
+| Option | Description |
+|---|---|
+| `-o`, `--output` `PATH` | Write the correlated security graph to this file; required for HTML. JSON goes to standard output without it. |
+| `--format` `json\|html` | Output format: `nexus-symbiote/security-graph/v1` JSON (default) or a self-contained Content-Security-Policy hash-pinned HTML page. |
+| `--advisories` `PATH` | Live or offline `advisories` report JSON bound to this inventory's SHA-256. |
+| `--allow-partial-advisories` | Accept an incomplete `--advisories` report and record its partial coverage status explicitly. |
+| `--project-root` `DIRECTORY` | Scanned project root used to refuse `--advisories` files stored inside the checkout or enclosing Git trees. |
+| `--max-nodes` `INTEGER RANGE` | Fail rather than correlate more components than this (default: 2000, at most 20000). |
+| `--fail-on-chain` / `--no-fail-on-chain` | Exit with status 1 when one or more multi-hop exposure chains are correlated (default: `--no-fail-on-chain`). |
+| `--fail-on-kev` / `--no-fail-on-kev` | Exit with status 1 when a KEV-listed advisory reaches an agent (default: `--no-fail-on-kev`). |
+
+Edges and chains restate declared or reported associations (`relationship`, `assurance`, `evidence_method`, `source_locator`, `target_locator`, `version_agreement`, and `conditions`); runtime execution and exploitability are unobserved. Credential surfaces list variable, header, scheme, or principal names only—secret values are never read or stored.
 
 ### `import-sbom`
 
