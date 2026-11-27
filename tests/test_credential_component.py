@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,8 @@ from click.testing import CliRunner
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
+import nexus_symbiote.scanners as scanners_module
+from nexus_symbiote import cli
 from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import (
     AIBOM,
@@ -38,6 +41,8 @@ from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
 from nexus_symbiote.generators.sarif import SARIFGenerator
 from nexus_symbiote.generators.spdx import SPDXGenerator
 from nexus_symbiote.generators.validation import spdx_errors, validate_cyclonedx
+from nexus_symbiote.scanners.base import Scanner, ScanResult
+from nexus_symbiote.scanners.rag import RAGScanner
 from nexus_symbiote.validators.risk import RiskScorer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -528,3 +533,92 @@ def test_a_runtime_observed_credential_with_no_checkout_fact_is_a_supplier_claim
     validated = _validated_with(tmp_path, credential)
     assert validated.exit_code == 0, validated.output
     assert "supplementary observation" in validated.output
+
+
+class _CredentialCollector(Scanner):
+    """Stands in for ``rag``: the credential that ``app.py`` reads, as a collector records it."""
+
+    name = "rag"
+    value_in_checkout: bool | None = None
+
+    def scan(self, project_root: Path) -> ScanResult:
+        result = ScanResult(scanner_name=self.name)
+        if (project_root / "app.py").is_file():
+            known = type(self).value_in_checkout
+            # A collector that cannot tell leaves the field unset rather than null.
+            fact = {} if known is None else {"value_in_checkout": known}
+            result.components.append(
+                CredentialComponent(
+                    bom_ref="credential:STRIPE_KEY",
+                    name="STRIPE_KEY",
+                    credential_kind="environment-variable",
+                    source_path="app.py",
+                    **fact,
+                )
+            )
+            result.surfaces_scanned.append("app.py")
+        return result
+
+
+@pytest.fixture
+def credential_collector(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_CredentialCollector]]:
+    registry = cli.SCANNER_REGISTRY
+    registry.clear()
+    cli._get_scanners()
+    saved = dict(registry)
+    registry["rag"] = _CredentialCollector
+    monkeypatch.setattr(
+        scanners_module,
+        "ALL_SCANNERS",
+        [_CredentialCollector if s is RAGScanner else s for s in scanners_module.ALL_SCANNERS],
+    )
+    yield _CredentialCollector
+    registry.clear()
+    registry.update(saved)
+
+
+@pytest.mark.parametrize(
+    ("collected", "supplied", "reconciles"),
+    [
+        (None, None, True),
+        (None, True, False),
+        (None, False, False),
+        (False, False, True),
+        (False, True, False),
+        (True, True, True),
+        (True, False, False),
+    ],
+)
+def test_a_matched_credential_s_checkout_fact_is_the_collector_s(
+    tmp_path: Path,
+    credential_collector: type[_CredentialCollector],
+    monkeypatch: pytest.MonkeyPatch,
+    collected: bool | None,
+    supplied: bool | None,
+    reconciles: bool,
+) -> None:
+    monkeypatch.setattr(credential_collector, "value_in_checkout", collected)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "app.py").write_text("import os\nos.environ['STRIPE_KEY']\n")
+    target = tmp_path / "bom.json"
+    scanned = CliRunner().invoke(
+        main, ["scan", str(project), "--no-project-policy", "--report-only", "-o", str(target)]
+    )
+    assert scanned.exit_code == 0, scanned.output
+    document = json.loads(target.read_text())
+    credential = _credential(document)
+    if supplied is None:
+        credential.pop("value_in_checkout", None)
+    else:
+        credential["value_in_checkout"] = supplied
+    target.write_text(json.dumps(document))
+    validated = CliRunner().invoke(
+        main, ["validate", str(target), "--project", str(project), "--no-project-policy"]
+    )
+    mismatch = "mismatched local component from credential: credential:STRIPE_KEY"
+    assert (mismatch not in validated.output) is reconciles, validated.output
+    # Reconciliation decides; the integrity check is unknown here, with no digest to verify.
+    basis = "project-reconciled" if reconciles else "project-reconciliation-failed"
+    assert f"Basis: {basis}\n" in validated.output, validated.output
+    assert "SUPPLIER-CLAIM [credential:STRIPE_KEY]" not in validated.output

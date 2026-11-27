@@ -833,6 +833,10 @@ class CompletenessValidator:
             fields -= {"tool_refs", "tool_count"}
         if isinstance(local, AgentComponent):
             fields -= set(AGENT_REFERENCE_FIELDS)
+        if isinstance(local, CredentialComponent):
+            # Only local collection establishes whether a value sits in the checkout; a
+            # supplier cannot fill in what the collector left unknown.
+            fields.add("value_in_checkout")
         if CompletenessValidator._signing_corroborated(supplied, local):
             # A newly supplied operator policy may corroborate an initially unsigned inventory.
             fields -= {"signing_status", "signing_identity", "trust_tier"}
