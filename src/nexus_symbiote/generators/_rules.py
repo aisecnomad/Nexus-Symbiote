@@ -72,6 +72,10 @@ RULES: dict[str, RuleInfo] = {
         "Unsigned model artifact",
         "A model artifact has no verified signature bound to its bytes.",
     ),
+    "known_vulnerability": RuleInfo(
+        "Known vulnerability in a pinned package",
+        "An offline OSV advisory affects the exact package version the inventory pins.",
+    ),
     "code_execution": RuleInfo(
         "Remote code execution enabled",
         "A model configuration lets the loader run code from the model repository.",

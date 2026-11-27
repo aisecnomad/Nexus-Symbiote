@@ -1130,6 +1130,24 @@ def _render_aibom(
         "required in CI."
     ),
 )
+@click.option(
+    "--all-packages",
+    is_flag=True,
+    help=(
+        "Inventory every declared or locked package and base image, not only the AI catalog, "
+        "so that advisory matching covers the whole dependency set the agent process loads."
+    ),
+)
+@click.option(
+    "--advisory-db",
+    type=click.Path(exists=True, path_type=Path),
+    help=(
+        "Offline OSV bundle (a JSON file or a flat directory of OSV records) matched against "
+        "every exact PyPI/npm pin in the inventory during the scan; matches are recorded as "
+        "known_vulnerability findings on the package and exported as CycloneDX vulnerabilities. "
+        "No network I/O."
+    ),
+)
 @_exit_code_options
 def scan(
     project_path: str,
@@ -1152,6 +1170,8 @@ def scan(
     allow_unsigned_discovery: bool = False,
     detailed_exit_codes: bool = False,
     legacy_exit_codes: bool = False,
+    all_packages: bool = False,
+    advisory_db: Path | None = None,
 ) -> tuple[Path, Policy, list[SigstoreArtifactPolicy]] | None:
     """Scan a project and generate an AIBOM."""
     detailed = _apply_exit_code_flags(detailed_exit_codes, legacy_exit_codes)
@@ -1243,11 +1263,14 @@ def scan(
     # tools, so index what this loop adds instead of searching for each component.
     collected: dict[str, Any] = {}
     for name in selected:
-        scanner = (
-            all_scanners[name](signature_policies=signature_policies)
-            if name == "model"
-            else all_scanners[name]()
-        )
+        if name == "model":
+            scanner = all_scanners[name](signature_policies=signature_policies)
+        elif name == "registry" and all_packages:
+            from nexus_symbiote.scanners.registry import AllPackagesRegistryScanner
+
+            scanner = AllPackagesRegistryScanner()
+        else:
+            scanner = all_scanners[name]()
         echo_line("  Running ", name, " scanner...", err=True)
         failure_count = len(scan_failures)
         try:
@@ -1338,6 +1361,15 @@ def scan(
     scan_failures.extend(graph_failures)
     if graph_failures:
         failures_by["graph"] = graph_failures
+    if advisory_db is not None:
+        from nexus_symbiote.scan_advisories import attach_offline_advisories
+
+        advisory_failures = attach_offline_advisories(aibom, advisory_db, root)
+        if advisory_failures:
+            scan_failures.extend(advisory_failures)
+            failures_by["advisories"] = advisory_failures
+        else:
+            surfaces_scanned.append(f"advisories: offline OSV bundle {advisory_db.name}")
     aibom.metadata.completeness = CompletenessClaim(
         scope="repository+shadowscan" if source_report_digest else "repository",
         source_report_digest=source_report_digest,

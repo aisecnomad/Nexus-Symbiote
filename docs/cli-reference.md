@@ -1016,6 +1016,14 @@ directory otherwise, so two SARIF files are identical too when the scanned direc
 lies at the same path below the working directory in both scans, or below it in
 neither. See [reproducible inventories](reproducible-inventories.md).
 
+`--all-packages` inventories every declared or locked package and base image, not only the
+[AI package catalog](registry-collector.md#ai-package-catalog), so that an advisory match
+covers the whole dependency set the agent process loads. `--advisory-db` `PATH` matches every
+exact PyPI/npm pin against an offline OSV bundle (a JSON file or a flat directory of OSV
+records, outside the scanned project) during the scan: each match is a `known_vulnerability`
+finding on the package, with the advisory's identifiers and severity, and the CycloneDX export
+lists it under `vulnerabilities`. Nothing leaves the machine.
+
 ### `summary`
 
 Print a summary of an AIBOM.

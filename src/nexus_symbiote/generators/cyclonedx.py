@@ -212,6 +212,11 @@ class CycloneDXGenerator(Generator):
             services = self._services(aibom)
             if services:
                 document["services"] = services
+        from nexus_symbiote.scan_advisories import cyclonedx_vulnerabilities
+
+        vulnerabilities = cyclonedx_vulnerabilities(aibom)
+        if vulnerabilities:
+            document["vulnerabilities"] = vulnerabilities
         return document
 
     @staticmethod

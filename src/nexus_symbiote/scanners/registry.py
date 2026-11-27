@@ -5449,3 +5449,16 @@ class _ComposeWalk:
         for gap in gaps:
             self.gaps[f"dockerfile_inline {gap}"] = None
         return images
+
+
+class AllPackagesRegistryScanner(RegistryScanner):
+    """The registry collector without its AI catalog filter.
+
+    Every declared or locked package and base image is inventoried, so that an offline
+    advisory match covers the whole dependency set an agent process loads, not only the
+    AI frameworks. The catalog still labels which entries are AI-related.
+    """
+
+    @classmethod
+    def _is_ai_package(cls, name: str) -> bool:
+        return True

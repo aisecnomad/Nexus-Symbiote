@@ -4,6 +4,11 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Added
+
+- **`scan --all-packages`:** inventories every declared or locked package and base image, not only the AI catalog.
+- **`scan --advisory-db PATH`:** matches every exact PyPI/npm pin against an offline OSV bundle during the scan, records `known_vulnerability` findings on the package and exports them as CycloneDX `vulnerabilities`. The bundle must lie outside the scanned project; no network I/O.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

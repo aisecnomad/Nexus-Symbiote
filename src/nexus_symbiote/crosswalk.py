@@ -252,6 +252,7 @@ FRAMEWORKS: tuple[Framework, ...] = (
             Entry("CWE-502", "Deserialization of Untrusted Data"),
             Entry("CWE-798", "Use of Hard-coded Credentials"),
             Entry("CWE-829", "Inclusion of Functionality from Untrusted Control Sphere"),
+            Entry("CWE-1395", "Dependency on Vulnerable Third-Party Component"),
             Entry(
                 "CWE-1336", "Improper Neutralization of Special Elements Used in a Template Engine"
             ),
@@ -426,6 +427,35 @@ CROSSWALK: dict[str, tuple[Reference, ...]] = {
             "A tool with these effects is available for the agent to invoke.",
         ),
         _ref(NIST_AI_RMF, "MEASURE-2.7", _EVALUATION),
+    ),
+    "known_vulnerability": (
+        _ref(
+            CWE,
+            "CWE-1395",
+            "A dependency with a known vulnerability is part of the agent's supply chain.",
+        ),
+        _ref(
+            OWASP_LLM_2025,
+            "LLM03:2025",
+            "A vulnerable package in the agent runtime is a supply chain weakness.",
+        ),
+        _ref(
+            OWASP_LLM_2026,
+            "LLM05:2026",
+            "A vulnerable package in the agent runtime is a supply chain weakness.",
+        ),
+        _ref(
+            OWASP_ASI_2026,
+            "ASI04",
+            "A compromised or vulnerable dependency reaches every agent that loads it.",
+        ),
+        _ref(
+            MITRE_ATLAS,
+            "AML.T0010",
+            "A vulnerable dependency is a supply chain compromise vector.",
+        ),
+        _ref(NIST_AI_RMF, "MEASURE-2.7", _EVALUATION),
+        _ref(EU_AI_ACT, "Art. 15", _RESILIENCE),
     ),
     "code_execution": (
         _ref(
