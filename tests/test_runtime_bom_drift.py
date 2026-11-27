@@ -907,7 +907,14 @@ def test_context_key_redaction_recognizes_nested_names(tmp_path):
     [
         ("http://hub.example", "http://hub.example:80/", True),
         ("https://hub.example/", "https://hub.example", True),
-        ("https://hub.example?view=public", "https://hub.example/?view=overview", True),
+        ("ws://hub.example:80", "ws://hub.example/", True),
+        ("https://hub.example?view=public", "https://hub.example/?view=overview", False),
+        ("https://hub.example/mcp?view=public", "https://hub.example/mcp?view=public", True),
+        (
+            "https://hub.example/mcp",
+            "https://hub.example/mcp?upstream=attacker.example",
+            False,
+        ),
         ("https://hub.example", "https://hub.example:8443/", False),
     ],
 )
@@ -921,9 +928,9 @@ def test_http_root_endpoint_identity(tmp_path, declared, observed, matches):
     )
     report = collect(inventory, [snapshot], fail_on="drift")
     assert report["gate"]["passed"] is matches
-    assert "?" not in report["observed"][0]["endpoints"][0]
     if matches:
         assert report["reconciliation"]["matched"][0]["inventory_refs"] == ["mcp:hub"]
+        assert report["reconciliation"]["matched"][0]["endpoint_comparison"] == "full"
     else:
         assert report["reconciliation"]["drifted"][0]["drift_reasons"] == ["endpoint_mismatch"]
 
@@ -1152,3 +1159,253 @@ def test_docker_purl_repository_url_may_name_only_the_registry(tmp_path):
     for qualifier in ("quay.io", "gcr.io/other/dockerimage"):
         with pytest.raises(RuntimeBOMInputError, match="repository disagree"):
             collect(inv, [snapshot("elsewhere.cdx.json", qualifier)])
+
+
+def test_pypi_package_repository_provenance_isolation(tmp_path):
+    static = AIBOM(
+        components=[
+            RegistryEntryComponent(
+                bom_ref="pkg:pypi/torch-default",
+                name="torch",
+                version="2.5.0",
+                registry_type="pypi",
+                package_url="pkg:pypi/torch@2.5.0?repository_url=https://pypi.org/simple",
+            ),
+            RegistryEntryComponent(
+                bom_ref="pkg:pypi/internal-sdk",
+                name="internal-ai-sdk",
+                version="1.0.0",
+                registry_type="pypi",
+                registry_uri="https://pypi.internal.example/simple",
+                package_url="pkg:pypi/internal-ai-sdk@1.0.0?repository_url=https://pypi.internal.example/simple",
+            ),
+        ]
+    )
+    inv = tmp_path / "static-pkgs.json"
+    inv.write_text(static.to_native_json(), encoding="utf-8")
+
+    matching_rt = tmp_path / "match.cdx.json"
+    matching_rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "purl": "pkg:pypi/torch@2.5.0?repository_url=https://files.pythonhosted.org",
+                    },
+                    {
+                        "type": "library",
+                        "name": "internal-ai-sdk",
+                        "purl": "pkg:pypi/internal-ai-sdk@1.0.0?repository_url=https://pypi.internal.example/simple/",
+                    },
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    matched = collect(inv, [matching_rt], fail_on="drift")
+    assert matched["gate"]["passed"] is True
+    assert len(matched["reconciliation"]["matched"]) == 2
+    assert {row["repository"] for row in matched["reconciliation"]["matched"]} == {
+        "https://pypi.org",
+        "https://pypi.internal.example",
+    }
+
+    mismatch_rt = tmp_path / "mismatch.cdx.json"
+    mismatch_rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "purl": "pkg:pypi/torch@2.5.0?repository_url=https://evil.example/simple",
+                    },
+                    {
+                        "type": "library",
+                        "name": "internal-ai-sdk",
+                        "purl": "pkg:pypi/internal-ai-sdk@1.0.0",
+                    },
+                    {
+                        "type": "library",
+                        "name": "internal-ai-sdk",
+                        "purl": "pkg:pypi/internal-ai-sdk@1.0.0?repository_url=https://pypi.internal.example/other",
+                    },
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "purl": "pkg:pypi/torch@2.5.0?repository_url=https://pypi.org/simple&platform=linux",
+                    },
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "purl": "pkg:pypi/torch@2.5.0?repository_url=https://pypi.org/simple#pkg/sub",
+                    },
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "purl": "pkg:pypi/torch@2.5.0?repository_url=https%3A%2F%2Fuser%3Asecretpass%40evil2.example%2Fsimple",
+                    },
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    mismatched = collect(inv, [mismatch_rt], fail_on="undeclared")
+    assert mismatched["gate"]["passed"] is False
+    assert len(mismatched["reconciliation"]["undeclared"]) == 6
+    assert mismatched["reconciliation"]["matched"] == []
+    assert "secretpass" not in render(mismatched)
+
+    clean_rt = tmp_path / "clean.cdx.json"
+    clean_rt.write_text(json.dumps(_cdx()), encoding="utf-8")
+    for bad_comp in (
+        RegistryEntryComponent(
+            bom_ref="pkg:bad-uri",
+            name="torch",
+            registry_type="pypi",
+            registry_uri="https://a.example/simple",
+            package_url="pkg:pypi/torch@2.5.0?repository_url=https://b.example/simple",
+        ),
+        RegistryEntryComponent(
+            bom_ref="pkg:empty-uri",
+            name="torch",
+            registry_type="pypi",
+            registry_uri="   ",
+        ),
+        RegistryEntryComponent(
+            bom_ref="pkg:bad-eco",
+            name="openai",
+            registry_type="pypi",
+            package_url="pkg:npm/openai@1.50.0",
+        ),
+        RegistryEntryComponent(
+            bom_ref="pkg:bad-name",
+            name="openai",
+            registry_type="pypi",
+            package_url="pkg:pypi/other-pkg@1.50.0",
+        ),
+    ):
+        bad_inv = tmp_path / f"{bad_comp.bom_ref.replace(':', '_')}.json"
+        bad_inv.write_text(AIBOM(components=[bad_comp]).to_native_json(), encoding="utf-8")
+        with pytest.raises(RuntimeBOMInputError):
+            collect(bad_inv, [clean_rt])
+
+
+def test_origin_only_scanner_inventory_matches_unchanged_runtime_and_redacts_query(tmp_path):
+    from nexus_symbiote.scanners.mcp import MCPScanner
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "tools-gateway": {
+                        "url": "https://tools.cluster.local:8443/mcp?tenant=prod&token=secretval123"
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    scan_res = MCPScanner().scan(project)
+    inv = tmp_path / "scanned.aibom.json"
+    inv.write_text(AIBOM(components=scan_res.components).to_native_json(), encoding="utf-8")
+
+    # Same configured origin matches without false drift and documents origin-only granularity.
+    same_origin_rt = tmp_path / "same-origin.cdx.json"
+    same_origin_rt.write_text(
+        json.dumps(
+            _cdx(
+                services=[
+                    {
+                        "name": "tools-gateway",
+                        "endpoints": [
+                            "https://tools.cluster.local:8443/mcp?tenant=prod&flag&token=secretval123"
+                        ],
+                    }
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    ok = collect(inv, [same_origin_rt], fail_on="drift")
+    assert ok["gate"]["passed"] is True
+    (matched_row,) = ok["reconciliation"]["matched"]
+    assert matched_row["endpoint_comparison"] == "origin-only"
+    assert matched_row["endpoint_path_query_unverified"] is True
+    assert "secretval123" not in render(ok)
+    assert matched_row["endpoints"] == ["https://tools.cluster.local:8443"]
+
+    # Origin fallback matches when runtime service name differs but origin matches.
+    renamed_rt = tmp_path / "renamed.cdx.json"
+    renamed_rt.write_text(
+        json.dumps(
+            _cdx(
+                services=[
+                    {"name": "gateway-pod", "endpoints": ["https://tools.cluster.local:8443/sse"]}
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    renamed = collect(inv, [renamed_rt], fail_on="drift")
+    assert renamed["gate"]["passed"] is True
+    assert renamed["reconciliation"]["matched"][0]["endpoint_comparison"] == "origin-only"
+
+    # Changing host, port, or scheme against origin-only static export still drifts.
+    changed_origin_rt = tmp_path / "changed-origin.cdx.json"
+    changed_origin_rt.write_text(
+        json.dumps(
+            _cdx(
+                services=[
+                    {"name": "tools-gateway", "endpoints": ["https://attacker.example:8443/mcp"]}
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    drifted = collect(inv, [changed_origin_rt], fail_on="drift")
+    assert drifted["gate"]["passed"] is False
+    assert drifted["reconciliation"]["drifted"][0]["drift_reasons"] == ["endpoint_mismatch"]
+    assert drifted["reconciliation"]["drifted"][0]["endpoint_comparison"] == "origin-only"
+
+    # Redacted static endpoint ("[redacted]" from env expansion) does not abort and flags mismatch.
+    redacted_inv = tmp_path / "redacted-static.json"
+    redacted_inv.write_text(
+        AIBOM(
+            components=[
+                MCPServerComponent(
+                    bom_ref="mcp:env",
+                    name="env-gw",
+                    endpoint_url="[redacted]",
+                    properties={"collection_mode": "static-config"},
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    env_rt = tmp_path / "env-rt.cdx.json"
+    env_rt.write_text(
+        json.dumps(_cdx(services=[{"name": "env-gw", "endpoints": ["https://env.example/mcp"]}])),
+        encoding="utf-8",
+    )
+    redacted_report = collect(redacted_inv, [env_rt], fail_on="drift")
+    assert redacted_report["gate"]["passed"] is False
+    assert redacted_report["reconciliation"]["drifted"][0]["drift_reasons"] == ["endpoint_mismatch"]
+
+    # Additional repository, subpath, empty repository_url and IPv6 endpoint edge branches.
+    from nexus_symbiote.runtime_bom_drift import _normalize_endpoint, _package_repository
+
+    assert _normalize_endpoint("https://[::1]/mcp") == "https://[::1]:443/mcp"
+    assert _package_repository("npm", None) == "https://registry.npmjs.org"
+    assert _package_repository("cargo", "pkg:cargo/candle-core@0.8.0") is None
+    for bad_purl in (
+        "pkg:pypi/torch@2.5.0?repository_url=",
+        "pkg:pypi/torch@2.5.0?repository_url=%20",
+        "pkg:pypi/torch@2.5.0?repository_url=https://pypi.org&repository_url=https://evil.example",
+    ):
+        with pytest.raises(RuntimeBOMInputError, match="Invalid package URL"):
+            _package_repository("pypi", bad_purl)
