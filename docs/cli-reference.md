@@ -81,6 +81,7 @@ change them. See [collection limits](collection-limits.md).
 | [`attest`](#attest) | offline | Sign a file's exact bytes, usually an inventory or a baseline, for a stated purpose |
 | [`verify-attestation`](#verify-attestation) | offline | Check that trusted keys attested a file's bytes or inventory content for a purpose |
 | [`trace-diff`](#trace-diff) | offline | Compare the runtime use that OpenTelemetry traces report with an AgentBOM |
+| [`k8s-drift`](#k8s-drift) | offline | Compare CycloneDX cluster/runtime ML-BOM snapshots with a static AgentBOM |
 | [`export-standard`](#export-standard) | offline | Export an AgentBOM to CycloneDX (1.6/1.7) or SPDX 3.0.1 with typed AI projections and producer declarations |
 | [`audit-control-plane`](#audit-control-plane) | offline | Audit hook targets, skill preambles, MCP bridges, steering surfaces, CI agents and identities |
 | [`discover-mcp`](#discover-mcp) | **live** | List the tools an HTTPS MCP server serves, without calling them |
@@ -1381,4 +1382,22 @@ A filesystem MCP server rooted at the project, a parent of it, or a steering pat
 For `npx` and `uvx`, the first operand is the package unless it is written as a path, and the script is the first later operand that is a path (`./x`, `dir/x`, or a script suffix such as `.ts`) and not the value of an option; a bare name is used only when the project lists it and nothing path-like follows. A project directory, such as a filesystem server root, is never read as a script. Other launchers (`node`, `python`, `sh`, `bash`, `deno`, `bun`, `tsx`) resolve their value-taking options, preloads and `-c` bodies first, read an unknown flag without `=` as boolean, and then bind their first operand that is a path, including one that starts with `@`.
 
 With `--baseline`, a hook or launcher target that is new or renamed raises `launch_target_added` and one whose digest changed raises `launch_target_changed` (both critical); a hook command whose text is not in the baseline, including an inline command that runs no script file, raises `hook_command_changed` (critical); a hook command, launch target or skill preamble that is gone raises `hook_command_removed`, `launch_target_removed` or `skill_preamble_removed` (critical), as does a hook that is still declared but no longer runs where it did: its layer sets `disableAllHooks` (`.claude/settings.local.json` overriding `.claude/settings.json`), its `type` is no longer `command`, its handler `if` filter was added or changed (removing it on a tool event only widens; on a non-tool event, an `if` filter prevents the hook from running at all), its event name changed (an event name not in the client's documented event set, or one containing whitespace or non-printable characters, is recorded as a coverage gap; whitespace or control variants are keyed separately with a raw-text digest, while `runs_command` still tracks `type` and `if` so changes on unrecognized events diff), or its matcher is not one the audit can show matches every tool the baseline matcher did (absent, empty, `*`, the same text, or a list of exact names matching `[A-Za-z0-9_|]+` split on `|` with empty segments dropped—so a trailing `|` such as `Edit|Bash|` keeps `{Edit, Bash}`, while an all-empty matcher such as `|` is digest-only—containing every baseline name; comma-separated, space-padded, hyphenated, and regular-expression matchers are compared by digest because older clients and `FileChanged`/`StopFailure` evaluate them as regular expressions); a hook that is still declared but now runs where its baseline counterpart did not (its layer no longer sets `disableAllHooks`, its `type` became `command`, its non-tool `if` filter was removed, or its matcher or `if` changed to one that neither covers nor is covered by the baseline's) raises `hook_command_changed` and `launch_target_added` (critical), while widening a hook that already ran stays quiet; a new identity raises `identity_added` and a widened one `delegation_widened` (both high). The baseline is audited with the same `--claims` file. What the baseline audit could not read is reported as a gap prefixed `baseline:` and fails the gate.
+
+### `k8s-drift`
+
+Reconcile one or more already-collected CycloneDX runtime or Kubernetes cluster ML-BOM JSON files against a static native AgentBOM offline. Evidence derived from runtime BOMs is tagged `reported`: missing runtime entries prove nothing about what was or was not deployed elsewhere.
+
+```text
+nexus-symbiote k8s-drift [OPTIONS] INVENTORY RUNTIME_BOM...
+```
+
+| Option | Description |
+|---|---|
+| `-o`, `--output` `PATH` | Write canonical reconciliation JSON to this file. |
+| `--json-output` | Print canonical reconciliation JSON instead of a human summary. |
+| `--sarif` `SARIF_PATH` | Write schema-valid SARIF 2.1.0 findings for undeclared, drifted and mutable-tag items. |
+| `--fail-on` `undeclared\|drift\|none` | Exit 1 on undeclared cluster items or empty BOMs (`undeclared`, default), also on version/SHA-256/endpoint drift and mutable image tags (`drift`), or report only (`none`). |
+
+Runtime inputs must be regular, single-link UTF-8 CycloneDX `1.4`–`1.7` JSON files inside size and nesting bounds. Outputs neutralize terminal sequences and redact secrets; SARIF messages defang URLs (`https[:]//`).
+
 
