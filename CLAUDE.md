@@ -31,7 +31,7 @@ src/nexus_symbiote/
   control_plane_audit.py, control_plane_cli.py — Hook target/preamble binding, MCP bridges, steering surface, CI/hosted tools, identity blast radius (`audit-control-plane`)
   sbom_import.py, evidence_profile.py, sbom_cli.py — Foreign SBOM import, nested manifests, per-component evidence profile; `import-sbom`, `evidence-profile`
   advisories.py, offline_advisories.py, vex_decisions.py — Explicit OSV queries, offline advisory matching, and VEX decision records
-  scan_advisories.py                   — Offline advisory matching inside `scan` (`--advisory-db`): known_vulnerability findings and CycloneDX vulnerabilities
+  scan_advisories.py                   — Offline advisory matching for `scan --advisory-db` and its `validate`/`risk --project` replay: known_vulnerability findings, the completeness receipt and how `diff` reads it, CycloneDX vulnerabilities and VEX entries
   modes.py                             — Offline by default; live mode is opt-in
   reporting.py                         — Neutralized text and JSON gate reporting
   scanner_catalog.py                   — Built-in collector universe for coverage checks

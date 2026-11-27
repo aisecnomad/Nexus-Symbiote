@@ -4,7 +4,7 @@ The `registry` collector records the AI-related packages and container images a 
 
 By default it inventories only the packages and images in the [AI package catalog](#ai-package-catalog) below. Every other dependency, including a malicious package outside the catalog or a look-alike name such as `langchian`, produces no component and no finding: the collector does not detect typosquats and is not a full software bill of materials. "registry (no AI-related dependencies found)" means that no declaration matched the catalog, not that the project has no dependencies. The catalog changes between releases, so a scan with a newer release can inventory packages an older baseline left out.
 
-With `scan --all-packages`, the registry collector also records PyPI, npm and image declarations outside the catalog from the same root manifests. Lockfiles supply resolution evidence for those declarations. Transitive dependencies found only in a lockfile stay outside this scope.
+With `scan --all-packages`, the registry collector also records PyPI, npm and image declarations outside the catalog from the same root manifests. Lockfiles supply resolution evidence for those declarations. Transitive dependencies found only in a lockfile stay outside this scope. In this mode an empty result reads "registry (no supported dependencies found)": no root manifest declared a PyPI, npm or image dependency the collector reads. It says nothing about subdirectory manifests or dependencies found only in a lockfile.
 
 ## What it reads
 

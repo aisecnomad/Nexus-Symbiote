@@ -1037,8 +1037,14 @@ warning and the receipt's coverage is at most `partial`. An MCP server whose npm
 launcher package has no exact package URL (no exact pin, or a registry other than the default)
 has an unknown version: `components_unidentified` counts it, and coverage is at most `partial`. The receipt records `registry_lockfile_only_dependencies` as
 `not-collected` even when every eligible inventory entry was checked. CycloneDX exposes the same receipt as
-`nexus-symbiote:advisories:collection`. A scan with zero exact targets records `coverage: none`
-under `unobserved_surfaces`. A record without a severity label takes its
+`nexus-symbiote:advisories:collection`. The CycloneDX `vulnerabilities` list is built only from
+advisories recorded against a bundle digest that a receipt in the inventory names, so an inventory
+without the receipt exports no `vulnerabilities`. A scan with zero exact targets records
+`coverage: none` under `unobserved_surfaces`. A PyPI or npm entry that is not one unconditional
+exact pin, such as a range, a wildcard, a pin with an environment marker, a URL or a bare name,
+is never reported as unaffected: it is recorded as the collection failure `exact package
+identity unavailable`, the receipt's coverage becomes `partial` (`none` when no entry is
+pinned), and the scan gate fails because collection is incomplete. A record without a severity label takes its
 severity from the highest CVSS v3.0 or v3.1 base score in OSV's `severity` array, using the
 CVSS 3.1 equations and rating ranges (a 0.0 score is low); CVSS v2 and v4 vectors are not
 scored. A severity the bundle states neither way is recorded as a medium finding that says so
@@ -1155,13 +1161,22 @@ Use `--all-packages` when checking an inventory collected with `scan --all-packa
 Both `validate --project` and `risk --project` take their collection scope from the
 operator's flag. The default uses the AI registry catalog. Pass the same independent
 `--advisory-db` used for the scan to reproduce the advisory findings and coverage.
-The replay compares the advisory coverage receipt, including the bundle digest.
+The replay compares the advisory coverage receipt, including the bundle digest. It applies the
+same 30-day feed age as `scan`, counted from the bundle's newest record to the current clock.
+`advisories --offline-db` takes `--max-feed-age-days`; `scan`, `validate` and `risk` do not.
+An inventory therefore replays against its own bundle only within 30 days of that record. After
+that the check fails with `offline advisory DB is N days old` and `Advisory coverage receipt is
+missing or differs from the offline bundle replay.`; scan again with a current bundle and keep
+that inventory as the new baseline.
 Without a bundle, advisory findings and coverage beyond the local collection appear
-as supplier claims. `risk` still evaluates the supplied findings against its policy.
+as supplier claims. `risk` still evaluates the supplied findings against its policy. The
+bundle path below is absolute because a bundle inside a Git working tree that encloses the
+project, the inventory or the working directory, such as `./osv.json` at a checkout root, is
+refused.
 
 ```sh
-nexus-symbiote validate inventory.json --project ./app --all-packages --advisory-db ./osv.json
-nexus-symbiote risk inventory.json --project ./app --all-packages --advisory-db ./osv.json
+nexus-symbiote validate inventory.json --project ./app --all-packages --advisory-db /srv/osv/osv.json
+nexus-symbiote risk inventory.json --project ./app --all-packages --advisory-db /srv/osv/osv.json
 ```
 
 ### `verify-artifact`

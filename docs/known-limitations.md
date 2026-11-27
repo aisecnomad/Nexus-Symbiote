@@ -42,7 +42,7 @@ Bypassing a documented control in a way not described here warrants a [private v
 
 ## Registry and containers
 
-- **AI-scoped catalog & root manifests.** `registry` inventories packages and base images matching its [AI catalog](registry-collector.md#ai-package-catalog) from root manifests, lockfiles (`npm`, `pnpm`, `yarn`, `uv`, `poetry` — see [lockfile evidence](npm-lockfile-evidence.md)), and Dockerfiles/Compose files; it is not a general-purpose language SBOM (use `import-sbom` for full dependency graphs) and does not read subdirectory requirements, `setup.py`, Helm/K8s manifests, or `postinstall` scripts. Lockfile claims are never fetched over the network.
+- **AI-scoped catalog & root manifests.** By default `registry` inventories packages and base images matching its [AI catalog](registry-collector.md#ai-package-catalog) from root manifests, lockfiles (`npm`, `pnpm`, `yarn`, `uv`, `poetry` — see [lockfile evidence](npm-lockfile-evidence.md)), and Dockerfiles/Compose files. `scan --all-packages` also inventories the PyPI, npm and image declarations outside the catalog in the same manifests. Neither mode is a general-purpose language SBOM (use `import-sbom` for full dependency graphs): dependencies present only in a lockfile are not inventoried, and the collector does not read subdirectory requirements, `setup.py`, Helm/K8s manifests, or `postinstall` scripts. `--advisory-db` checks only inventoried packages, so without `--all-packages` it checks catalog packages only and records its coverage as at most `partial`. Lockfile claims are never fetched over the network.
 
 ## A2A and RAG
 
