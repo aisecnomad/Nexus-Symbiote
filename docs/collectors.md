@@ -22,11 +22,12 @@ An optional [`agent.yaml` manifest](agent-manifest.md) at the project root names
 In a Codex `.codex/config.toml`, MCP servers can declare host environment-variable
 names through stdio `env_vars`, or through HTTP `bearer_token_env_var` and
 `env_http_headers`. The native server's `properties.env_vars_referenced` lists
-safe local names. Explicit remote stdio names for a remote MCP environment appear separately in
-`remote_env_vars_referenced`. A literal stdio environment override takes
-precedence. Remote HTTP configurations do not establish a local host credential. The collector reads the declarations without looking up the
-variables. `blast-radius` uses the local names to identify shared credential
-references. Runtime access and the equality of credential values remain unknown.
+safe local names. A literal stdio environment override takes precedence.
+Explicit remote stdio names appear in `properties.remote_env_vars_referenced`.
+`blast-radius` uses only the local names when identifying shared credential
+references. Remote HTTP configurations do not establish a local host credential.
+The collector reads the declarations without looking up the variables. Runtime
+access and the equality of credential values remain unknown.
 
 ## MCP servers declared in source
 

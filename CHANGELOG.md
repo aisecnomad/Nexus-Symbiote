@@ -4,7 +4,8 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
-- Codex MCP configurations expose safe names of forwarded environment variables for shared-credential analysis.
+- Codex MCP servers record local credential references in `properties.env_vars_referenced` for shared-credential analysis.
+- Re-collect reviewed Codex baselines that record a URL server as `sse`. The collector now records Codex URL servers as `streamable-http`, including URLs with an `/sse` path segment. Comparing a 0.2.0 baseline with a new scan can report critical transport drift on the same configuration.
 
 ## [0.2.0] - 2026-11-25
 

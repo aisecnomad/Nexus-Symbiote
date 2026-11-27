@@ -177,6 +177,24 @@ def test_codex_project_config_toml_is_inventoried(tmp_path):
     )
 
 
+def test_sse_path_transport_depends_on_client_dialect(tmp_path):
+    url = "https://catalog.example.test/namespace/sse"
+    result = scan(
+        tmp_path,
+        {
+            ".codex/config.toml": f'[mcp_servers.codex]\nurl = "{url}"\n',
+            ".zed/settings.json": json.dumps({"context_servers": {"zed": {"url": url}}}),
+            "opencode.json": json.dumps({"mcp": {"opencode": {"type": "remote", "url": url}}}),
+        },
+    )
+    assert not result.scan_failures and not result.surfaces_excluded
+    assert {name: server.transport for name, server in servers(result).items()} == {
+        "codex": "streamable-http",
+        "zed": "sse",
+        "opencode": "sse",
+    }
+
+
 def test_codex_environment_references_reach_blast_radius_without_reading_values(
     tmp_path, monkeypatch
 ):
