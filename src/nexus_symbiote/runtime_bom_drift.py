@@ -226,6 +226,16 @@ def _check_container_mutability(name: str, version: str | None, purl: str | None
     return "container workload has no immutable digest"
 
 
+def _names_repository(value: str, repository: str) -> bool:
+    reference = parse_image_reference(value)
+    return (
+        reference is not None
+        and reference.digest is None
+        and reference.tag is None
+        and reference.repository.lower() == repository.lower()
+    )
+
+
 def _image_key(name: str, version: str | None = None, purl: str | None = None) -> str:
     reference = parse_image_reference(name)
     package = _parse_purl(purl)
@@ -243,13 +253,12 @@ def _image_key(name: str, version: str | None = None, purl: str | None = None) -
             raise RuntimeBOMInputError("Container image name and package URL repository disagree.")
         repo_url = package.qualifiers.get("repository_url")
         if repo_url is not None:
-            repo_ref = parse_image_reference(repo_url)
-            if (
-                repo_ref is None
-                or repo_ref.digest is not None
-                or repo_ref.tag is not None
-                or repo_ref.repository.lower() != reference.repository.lower()
-            ):
+            candidates = [repo_url]
+            if package.type == "docker":
+                # A docker repository_url names the registry; namespace and name the path.
+                path = "/".join(part for part in (package.namespace, purl_leaf) if part)
+                candidates.append(f"{repo_url.rstrip('/')}/{path}")
+            if not any(_names_repository(value, reference.repository) for value in candidates):
                 raise RuntimeBOMInputError(
                     "Container image name and package URL repository disagree."
                 )

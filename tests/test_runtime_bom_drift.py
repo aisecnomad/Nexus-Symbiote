@@ -1092,3 +1092,44 @@ def test_oci_purl_repository_reconciliation_rejects_mismatches(tmp_path, image_n
     )
     with pytest.raises(RuntimeBOMInputError):
         collect(bad_static, [clean_runtime])
+
+
+def test_docker_purl_repository_url_may_name_only_the_registry(tmp_path):
+    # purl-spec: a docker repository_url names the registry (gcr.io); the namespace
+    # and name give the repository path.
+    image = f"gcr.io/customer/dockerimage@sha256:{_SHA_A}"
+    purl = f"pkg:docker/customer/dockerimage@sha256%3A{_SHA_A}?repository_url="
+
+    def snapshot(name: str, qualifier: str) -> Path:
+        path = tmp_path / name
+        path.write_text(
+            json.dumps(
+                _cdx(components=[{"type": "container", "name": image, "purl": purl + qualifier}])
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    inv = tmp_path / "static.json"
+    inv.write_text(
+        AIBOM(
+            components=[
+                RegistryEntryComponent(
+                    bom_ref="reg:dockerimage",
+                    name=image,
+                    package_url=purl + "gcr.io",
+                    registry_type="oci",
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    for qualifier in ("gcr.io", "gcr.io/customer/dockerimage"):
+        report = collect(inv, [snapshot(f"{qualifier.count('/')}.cdx.json", qualifier)])
+        assert report["gate"]["passed"] is True
+        assert [m["inventory_refs"] for m in report["reconciliation"]["matched"]] == [
+            ["reg:dockerimage"]
+        ]
+    for qualifier in ("quay.io", "gcr.io/other/dockerimage"):
+        with pytest.raises(RuntimeBOMInputError, match="repository disagree"):
+            collect(inv, [snapshot("elsewhere.cdx.json", qualifier)])
