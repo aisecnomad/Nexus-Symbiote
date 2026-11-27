@@ -305,24 +305,19 @@ _SHELL_READERS = frozenset(
 _SHELL_TOKEN_RE = re.compile(r"\S+")
 _SHELL_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)=(.+)", re.DOTALL)
 _SHELL_VARIABLE = re.compile(r"\$([A-Za-z_][A-Za-z_0-9]*)|\$\{([A-Za-z_][A-Za-z_0-9]*)\}")
-# A prohibition lowers a shell finding only when it is the words immediately before
-# the command. One of these verbs may sit between them: "never run cat".
+# One of these verbs may sit between a prohibition and its command: "never run cat".
 _PROHIBITION_FILLERS = frozenset({"run", "execute", "type", "use", "call", "invoke", "pipe"})
+# A prohibition lowers a shell finding only when it is the whole clause in front of the
+# command, so "never mind", "if you don't" and a word of the command itself never do.
 _GOVERNING_PROHIBITION_RE = re.compile(
-    r"(?i)(?:\bnever|\bdo\s+not|\bdon'?t|\bmust\s+not|\bavoid)\s*$"
+    r"(?i)[ \t]*(?:you[ \t]+)?(?:never|do[ \t]+not|don'?t|must[ \t]+not|avoid)[ \t]+"
+    r"(?:(?:" + "|".join(sorted(_PROHIBITION_FILLERS)) + r")[ \t]+)?"
 )
-# These shapes look like a prohibition and are not one. They never lower a finding.
-_PROHIBITION_IDIOM_RE = re.compile(
-    r"(?i)(?:"
-    r"\bnever\s+mind\b"
-    r"|\bdo\s+not\s+hesitate\b"
-    r"|\bdon'?t\s+(?:forget|worry)\b"
-    r"|\bdo\s+not\s+(?:forget|worry)\b"
-    r"|\bavoid\s+\S+\s+and\b"
-    r")"
-)
+# A clause ends at a sentence end, a shell separator, or any character str.splitlines
+# breaks at: a reader can render each of them as a new line.
+_CLAUSE_BREAKS = frozenset(".!?;|&\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
+_CLAUSE_LOOKBACK = 64
 _PROHIBITION_NOTE = "context: prohibition"
-_PROHIBITION_LOOKBACK = 48
 # A continued command or a substitution longer than this is a finding, not a miss.
 _SHELL_WINDOW_CHARS = 4096
 _SHELL_WINDOW_LINES = 32
@@ -787,19 +782,26 @@ def _shell_stages(text: str, start: int, end: int) -> list[tuple[str, list[tuple
     return stages
 
 
-def _pipeline_offset(text: str, start: int, end: int) -> int | None:
-    """A path connected to a network command by a pipe, input argument or redirect."""
-    assignments: dict[str, int] = {}
-    pipe_path: int | None = None
+_Stage = list[tuple[int, str]]
+
+
+def _pipeline_offset(
+    text: str, chain: list[_Stage], assignments: dict[str, int]
+) -> tuple[int, int, int] | None:
+    """A path connected to a network command by a pipe, input argument or redirect.
+
+    ``chain`` is one command: its stages joined by pipes. The result is the offset to
+    report with the stage and token that name the path. ``assignments`` carries the
+    credential paths that earlier commands in the window bound to variables.
+    """
+    pipe_path: tuple[int, int, int] | None = None
     pipe_sink = False
-    for separator, stage in _shell_stages(text, start, end):
-        if separator != "|":
-            pipe_path, pipe_sink = None, False
-        stage_path: int | None = None
+    for number, stage in enumerate(chain):
+        stage_path: tuple[int, int, int] | None = None
         sink = ""
         sink_index = -1
         copy_command = False
-        copy_source: int | None = None
+        copy_source: tuple[int, int, int] | None = None
         for index, (pos, token) in enumerate(stage):
             value = _shell_spell(token)
             word = _command_word(value)
@@ -837,8 +839,9 @@ def _pipeline_offset(text: str, start: int, end: int) -> int | None:
                 if copy_source is not None and ":" in value:
                     return copy_source
                 continue
+            point = (at, number, index)
             if stage_path is None:
-                stage_path = at
+                stage_path = point
             if not sink:
                 continue
             if (
@@ -846,15 +849,15 @@ def _pipeline_offset(text: str, start: int, end: int) -> int | None:
                 or "=@" in value
                 or previous in {"<", "-T", "--upload-file", "--post-file"}
             ):
-                return at
+                return point
             if index == sink_index + 1 and sink in {"curl", "wget"}:
-                return at
+                return point
             if (
                 copy_command
                 and not value.startswith("-")
                 and previous not in {"-i", "-F", "-e", "-o"}
             ):
-                copy_source = at
+                copy_source = point
         if (pipe_sink and stage_path is not None) or (sink and pipe_path is not None):
             return stage_path if stage_path is not None else pipe_path
         if stage_path is not None:
@@ -863,8 +866,11 @@ def _pipeline_offset(text: str, start: int, end: int) -> int | None:
     return None
 
 
-def _substitution_offsets(text: str, start: int, end: int) -> Iterator[int]:
-    """Command substitutions in ``text[start:end]``. An unclosed body past the cap is a hit."""
+def _substitution_offsets(text: str, start: int, end: int) -> Iterator[tuple[int, int | None]]:
+    """Command substitutions in ``text[start:end]``, each with its opener.
+
+    An unclosed body past the cap is a hit without an opener: no command holds it.
+    """
     if text.find("$(", start, end) == -1 and text.find("`", start, end) == -1:
         return
     index = start
@@ -918,7 +924,7 @@ def _substitution_offsets(text: str, start: int, end: int) -> Iterator[int]:
             # behavior. A bounded, unfinished explicit shell substitution is
             # still reported when the scan reached the actual size limit.
             if dollar and cap - index >= _SUBST_CHARS:
-                yield index
+                yield index, None
             index = body
             continue
         words = _SHELL_TOKEN_RE.finditer(text, index + opener, body)
@@ -931,7 +937,7 @@ def _substitution_offsets(text: str, start: int, end: int) -> Iterator[int]:
                 if _credential_path(token.group()) is not None and (
                     reader or sink_arguments or (dollar and has_verb)
                 ):
-                    yield token.start()
+                    yield token.start(), index
                     break
         index = body + 1
 
@@ -1006,64 +1012,83 @@ def _openers_around(text: str, start: int, end: int, anchors: list[int]) -> list
     return found
 
 
-def _exfil_command_start(text: str, start: int, end: int) -> int | None:
-    """Where the exfil command itself starts, outside any leading prose or prohibition.
+def _argument_word(token: str) -> bool:
+    """An option, redirect, upload reference, URL, path, assignment, variable or number."""
+    return (
+        token.startswith(("-", "<", ">", "@"))
+        or token.isdigit()
+        or any(mark in token for mark in "/:=$")
+    )
 
-    The anchor is the earliest sink, reader, path-naming program, or the substitution
-    opener that contains one of those. Words such as ``never`` and ``echo`` stay in
-    front of it, so a negation is judged only on that prefix.
+
+def _command_anchor(stage: _Stage, index: int, *, program: bool) -> int | None:
+    """Where the command that takes token ``index`` as an argument starts.
+
+    The walk goes back over argument words to the nearest network command or reader.
+    With ``program``, a bare word right before a path is the program that reads it.
+    Any other word, or a word that ends a sentence, ends the walk: prose and an
+    earlier command never lend their prohibition to this one.
     """
-    anchors: list[int] = []
-    for _, stage in _shell_stages(text, start, end):
-        for index, (pos, token) in enumerate(stage):
-            if _is_network_sink(token) or _shell_word(token) in _SHELL_READERS:
-                anchors.append(pos)
-            if index and _credential_path(token) is not None:
-                prev_pos, prev = stage[index - 1]
-                if not prev.startswith(("-", "<", "@")):
-                    anchors.append(prev_pos)
-    if not anchors:
-        return None
-    anchors.extend(_openers_around(text, start, end, anchors))
-    return min(anchors)
+    for step in range(index, -1, -1):
+        pos, token = stage[step]
+        if _is_network_sink(token) or _shell_word(token) in _SHELL_READERS:
+            return pos
+        if step < index and token.endswith((".", "!", "?")):
+            return None
+        if not _argument_word(token):
+            return pos if program and step == index else None
+    return None
 
 
-def _prohibition_prefix(text: str, command_at: int) -> str:
-    """The bounded words immediately before the command, after one filler verb."""
-    cursor = command_at
-    end = cursor
-    while end > 0 and text[end - 1].isspace():
-        end -= 1
-    word_at = end
-    while word_at > 0 and text[word_at - 1].isalpha():
-        word_at -= 1
-    if text[word_at:end].lower() in _PROHIBITION_FILLERS and (
-        word_at == 0 or not text[word_at - 1].isalpha()
-    ):
-        cursor = word_at
-    window = text[max(0, cursor - _PROHIBITION_LOOKBACK) : cursor]
-    break_at = max(window.rfind(mark) for mark in ".!?\n")
-    if break_at != -1:
-        window = window[break_at + 1 :]
-    return window
+def _substitution_anchors(
+    text: str, stages: list[tuple[str, _Stage]], subs: list[tuple[int, int | None]]
+) -> Iterator[tuple[int, int | None]]:
+    """Each substitution hit with the start of the command that holds it.
 
-
-def _command_is_prohibited(text: str, start: int, end: int) -> bool:
-    """Whether a prohibition immediately in front of this command may lower the finding.
-
-    The phrase has to sit outside the command's tokens and end at the command, with at
-    most one filler verb between them. A negation inside a URL, a quote, a comment, or
-    an argument is on the other side of the command start and cannot match. ``never
-    mind``, ``do not hesitate``, ``don't forget``, ``don't worry`` and ``avoid X and``
-    are not prohibitions. Anything less direct keeps full severity.
+    A substitution is an argument of the command before it when only argument words sit
+    between them, as in ``curl https://x/$(...)``. Otherwise it is a command of its own
+    and starts at its opener. A hit without an opener has no command.
     """
-    command_at = _exfil_command_start(text, start, end)
-    if command_at is None:
+    words = [
+        (pos, number, index)
+        for number, (_, stage) in enumerate(stages)
+        for index, (pos, _) in enumerate(stage)
+    ]
+    positions = [pos for pos, _, _ in words]
+    for offset, opener in subs:
+        if opener is None:
+            yield offset, None
+            continue
+        at = bisect_right(positions, opener) - 1
+        anchor = None
+        tick = text[opener] == "`"
+        # A ``$(`` sits inside the word that holds it. A backtick is a word boundary, so
+        # the word before it may be the command, unless a separator comes between them.
+        if at >= 0 and not (tick and at + 1 < len(words) and words[at + 1][1] != words[at][1]):
+            _, number, index = words[at]
+            first = index if tick else index - 1
+            anchor = _command_anchor(stages[number][1], first, program=False)
+        yield offset, opener if anchor is None else anchor
+
+
+def _governed_by_prohibition(text: str, start: int, end: int, anchor: int) -> bool:
+    """Whether the clause in front of the command at ``anchor`` is only a prohibition.
+
+    A command inside a substitution or code span starts at its outermost opener. The
+    clause reaches back to the nearest sentence end, shell separator or line break, so
+    an assignment or a wrapper such as ``sudo -u never`` in front of the command, and a
+    prohibition of another command, keep the finding at full severity.
+    """
+    opened = _openers_around(text, start, end, [anchor])
+    if opened:
+        anchor = opened[0]
+    floor = max(0, anchor - _CLAUSE_LOOKBACK)
+    clause = anchor
+    while clause > floor and text[clause - 1] not in _CLAUSE_BREAKS:
+        clause -= 1
+    if clause == floor and floor and text[floor - 1] not in _CLAUSE_BREAKS:
         return False
-    window = _prohibition_prefix(text, command_at)
-    if _PROHIBITION_IDIOM_RE.search(window) is not None:
-        return False
-    return _GOVERNING_PROHIBITION_RE.search(window) is not None
+    return _GOVERNING_PROHIBITION_RE.fullmatch(text, clause, anchor) is not None
 
 
 def _table_cells(text: str, start: int, end: int) -> Iterator[tuple[int, int]]:
@@ -1188,31 +1213,49 @@ def _shell_exfil_offsets(normalized: str) -> Iterator[tuple[int, bool]]:
 def _shell_region_offsets(normalized: str) -> Iterator[tuple[int, bool]]:
     """Offsets of a shell read of a credential path that reaches a network sink.
 
-    Each offset is paired with whether a prohibition immediately governs that command.
-    A prohibition never drops the finding. It only lowers one that it directly
-    precedes, outside the command's own tokens. A sentence that only mentions the
-    command, and a ``Never curl`` with no credential path, stay quiet because they
-    are not commands. A ``.pub`` path stays public. The walk is one pass.
+    Each offset is paired with whether a prohibition governs the command that holds it.
+    A prohibition never drops the finding. It only lowers a command whose own clause is
+    nothing but the prohibition, so each command of a line is judged on its own and a
+    parser limit is never lowered. A sentence that only mentions the command, and a
+    ``Never curl`` with no credential path, stay quiet because they are not commands.
+    A ``.pub`` path stays public.
     """
     for start, end, truncated in _logical_windows(normalized):
-        found = _pipeline_offset(normalized, start, end)
+        stages = _shell_stages(normalized, start, end)
+        chains: list[list[_Stage]] = []
+        for separator, stage in stages:
+            if separator != "|" or not chains:
+                chains.append([])
+            chains[-1].append(stage)
+        assignments: dict[str, int] = {}
+        found = [
+            (hit, chain)
+            for chain in chains
+            if (hit := _pipeline_offset(normalized, chain, assignments)) is not None
+        ]
         subs = list(_substitution_offsets(normalized, start, end))
         truncated_hit = truncated and _window_interesting(normalized, start, end)
-        if found is None and not subs and not truncated_hit:
+        if not found and not subs and not truncated_hit:
             continue
-        # Only a window that already hit pays for the prohibition check.
-        prohibited = _command_is_prohibited(normalized, start, end)
-        offsets = set(subs)
-        if found is not None:
-            offsets.add(found)
+        judged: list[tuple[int, int | None]] = [
+            (offset, _command_anchor(chain[number], index - 1, program=True))
+            for (offset, number, index), chain in found
+        ]
+        judged.extend(_substitution_anchors(normalized, stages, subs))
         if truncated_hit:
-            offsets.add(start)
-        for offset in sorted(offsets):
+            judged.append((start, None))
+        verdicts: dict[int, bool] = {}
+        for offset, anchor in judged:
             # The prose relay reports the raw path. Use that same offset when
             # this shell token contains it, even if home and quotes were expanded.
             token = _SHELL_TOKEN_RE.match(normalized, offset, end)
             path = _CRED_PATH_RE.search(normalized, offset, token.end()) if token else None
-            yield path.start() if path else offset, prohibited
+            at = path.start() if path else offset
+            lowered = anchor is not None and _governed_by_prohibition(
+                normalized, start, end, anchor
+            )
+            verdicts[at] = verdicts.get(at, True) and lowered
+        yield from sorted(verdicts.items())
 
 
 def scan_text_block(
