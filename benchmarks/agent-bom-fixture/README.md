@@ -31,9 +31,11 @@ python benchmarks/agent-bom-fixture/build_fixture.py --out /tmp/agent-bom-fixtur
 nexus-symbiote scan /tmp/agent-bom-fixture --no-project-policy --accept-default-excludes --report-only -o bom.json
 ```
 
-The output directory must not exist. The builder creates it with mode 0700 and writes every
-directory and file relative to descriptors it opened, without following symbolic links or
-replacing an existing entry. A path that would leave it, a digest mismatch, an unknown
+The output directory must not exist, and its parent must be yours or a sticky directory
+owned by root such as `/tmp`. The builder opens that parent without following a symbolic
+link, creates the output under it with mode 0700, and writes every directory and file
+relative to descriptors it opened, without following symbolic links or replacing an
+existing entry, setting each file's mode on its open descriptor. A path that would leave it, a digest mismatch, an unknown
 encoding or an oversized file stops the build before anything is written.
 
 ## What the test checks

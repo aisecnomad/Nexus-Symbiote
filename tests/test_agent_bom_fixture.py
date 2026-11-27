@@ -153,6 +153,16 @@ def test_the_builder_refuses_a_digest_mismatch_and_a_non_empty_output(tmp_path: 
         builder.build(existing)
 
 
+def test_the_builder_refuses_a_parent_another_user_could_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder = _builder()
+    monkeypatch.setattr(builder.os, "geteuid", lambda: 4242)
+    with pytest.raises(builder.CorpusError, match="neither yours nor a sticky directory"):
+        builder.build(tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
 def test_the_builder_writes_only_into_the_directory_it_creates(tmp_path: Path) -> None:
     out = tmp_path / "out"
     _builder().build(out)

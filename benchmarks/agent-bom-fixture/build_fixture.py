@@ -9,10 +9,13 @@ an editor would treat as live configuration.
 
     python benchmarks/agent-bom-fixture/build_fixture.py --out /tmp/agent-bom-fixture
 
-The output directory must not exist: the builder creates it with mode 0700 and writes
-every directory and file relative to descriptors it opened itself, without following
-symbolic links and without replacing an existing entry, so a path cannot leave it even if
-another process changes the tree while it runs. Every file is checked against the SHA-256
+The output directory must not exist, and its parent must be one the operator controls: a
+directory the operator owns, or a sticky directory owned by root such as ``/tmp``. The
+builder opens that parent without following a symbolic link, creates the output under it
+with mode 0700, and creates every directory and file relative to descriptors it opened,
+without following symbolic links, without replacing an existing entry, and setting each
+file's mode on its open descriptor. A path therefore cannot leave the output directory even
+if another process changes the tree while the builder runs. Every file is checked against the SHA-256
 the corpus records before anything is written, so the same corpus always produces
 byte-identical files. Nothing is executed: the pickle is an inert dictionary and every
 credential is a public synthetic sentinel.
@@ -25,6 +28,7 @@ import base64
 import hashlib
 import json
 import os
+import stat
 import sys
 from pathlib import Path, PurePosixPath
 
@@ -108,30 +112,49 @@ def _subdirectory(parent: int, name: str, opened: dict[tuple[int, str], int]) ->
     return opened[key]
 
 
+def _trusted_parent(descriptor: int, parent: Path) -> None:
+    """Refuse a parent another user could change: not ours, and not a root sticky directory."""
+    info = os.fstat(descriptor)
+    sticky = bool(info.st_mode & stat.S_ISVTX) and info.st_uid == 0
+    if info.st_uid != os.geteuid() and not sticky:
+        raise CorpusError(f"{parent} is neither yours nor a sticky directory owned by root")
+
+
 def build(out: Path, corpus: Path = CORPUS) -> list[PurePosixPath]:
     """Write the corpus under a new directory ``out`` and return the relative paths written."""
     entries = load(corpus)
     if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
         raise CorpusError("this platform cannot write without following symbolic links")
+    if out.name in {"", ".", ".."}:
+        raise CorpusError(f"{out} does not name a new directory")
+    parent_path = out.parent if str(out.parent) else Path(".")
     try:
-        out.mkdir(mode=0o700)
-    except FileExistsError:
-        raise CorpusError(f"{out} already exists; give a new output directory") from None
-    root = os.open(out, _DIRECTORY)
+        parent = os.open(parent_path, _DIRECTORY)
+    except OSError as exc:
+        raise CorpusError(f"{parent_path} cannot be opened as a directory: {exc}") from None
     opened: dict[tuple[int, str], int] = {}
+    root = -1
     try:
+        _trusted_parent(parent, parent_path)
+        try:
+            os.mkdir(out.name, 0o700, dir_fd=parent)
+        except FileExistsError:
+            raise CorpusError(f"{out} already exists; give a new output directory") from None
+        root = os.open(out.name, _DIRECTORY, dir_fd=parent)
         for relative, data, mode in entries:
-            parent = root
+            directory = root
             for name in relative.parts[:-1]:
-                parent = _subdirectory(parent, name, opened)
-            handle = os.open(relative.parts[-1], _FILE, mode, dir_fd=parent)
+                directory = _subdirectory(directory, name, opened)
+            handle = os.open(relative.parts[-1], _FILE, 0o600, dir_fd=directory)
             with os.fdopen(handle, "wb") as stream:
                 stream.write(data)
-            os.chmod(relative.parts[-1], mode, dir_fd=parent, follow_symlinks=False)
+                os.fchmod(stream.fileno(), mode)
     finally:
         for descriptor in opened.values():
             os.close(descriptor)
-        os.close(root)
+        if root >= 0:
+            os.close(root)
+        os.close(parent)
     return [relative for relative, _, _ in entries]
 
 
