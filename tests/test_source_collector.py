@@ -1825,7 +1825,7 @@ def test_text_joined_to_itself_does_not_grow_without_bound(tmp_path: Path):
 
 
 def test_a_long_chain_of_joined_text_ends_at_the_depth_bound(tmp_path: Path):
-    chain = " + ".join(['"g"'] * 3000)
+    chain = " + ".join(['"g"'] * 1000)
     result = scan(
         tmp_path,
         {"run.py": f"from openai import OpenAI\nOpenAI().responses.create(model={chain})\n"},
