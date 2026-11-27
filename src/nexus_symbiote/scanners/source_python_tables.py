@@ -51,6 +51,9 @@ SDK_IMPORT = re.compile(
     rf"{_GAP}*,{_GAP}*)*(?:(?:{_ROOT_NAMES})(?!\w)|google(?:\.cloud)?"
     rf"(?:\.(?:adk|genai|generativeai|aiplatform)(?!\w)|{_GAP}+import(?!\w)))"
 )
+# A root's name alone, searched for in text Python folds a slice at a time, where a
+# statement may span slices: any such word admits the file, and the tree decides.
+SDK_WORD = re.compile(r"(?<![\w.])(?:" + "|".join(sorted(map(re.escape, AI_ROOTS))) + r")(?!\w)")
 # Names along a callee that SDK calls use: of an object the reader cannot tell, a call
 # reached through one of them is read.
 MODEL_CALLS = frozenset(

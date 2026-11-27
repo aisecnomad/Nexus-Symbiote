@@ -33,7 +33,7 @@ from nexus_symbiote.scanners.mcp_sources import (
     _UnreadableError,
 )
 from nexus_symbiote.scanners.source_python import PythonReader
-from nexus_symbiote.scanners.source_python_tables import SDK_IMPORT
+from nexus_symbiote.scanners.source_python_tables import SDK_IMPORT, SDK_WORD
 from nexus_symbiote.scanners.source_references import Declarations
 from nexus_symbiote.utils.confined import ConfinedCollection
 
@@ -58,15 +58,16 @@ def eligible(path: PurePosixPath) -> bool:
 
 
 def _names_sdk(text: str) -> bool:
-    """Whether a word of the text may be an SDK's name once Python folds it to NFKC, a
-    slice at a time so that a character's expansion stays within its slice."""
+    """Whether an import statement may name an SDK once Python folds identifiers to NFKC.
+    Text that needs folding is folded a slice at a time, so that a character's expansion
+    stays within its slice; a statement may span slices there, so the name alone counts."""
     if SDK_IMPORT.search(text):
         return True
     if text.isascii() or unicodedata.is_normalized("NFKC", text):
         return False
     slices = range(0, len(text), 4096)
     return any(
-        SDK_IMPORT.search(unicodedata.normalize("NFKC", text[at : at + 4608])) for at in slices
+        SDK_WORD.search(unicodedata.normalize("NFKC", text[at : at + 4160])) for at in slices
     )
 
 
