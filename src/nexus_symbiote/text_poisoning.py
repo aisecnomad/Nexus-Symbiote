@@ -305,6 +305,22 @@ _SHELL_READERS = frozenset(
 _SHELL_TOKEN_RE = re.compile(r"\S+")
 _PLAIN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
 _SHELL_PLAIN_WORDS = 1
+# A prohibition governs the whole sentence, whatever word the pipeline starts with.
+# "Do not forget to" is an instruction to do it, so that shape is not a prohibition.
+_CLAUSE_PROHIBITION_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:never|avoid)\b"
+    r"|\bmust\s+not\b"
+    r"|\bdo\s+not\b"
+    r"|\bdon'?t\b"
+    r"|example\s+of\s+what\s+not\s+to"
+    r"|\bwhat\s+not\s+to\b"
+    r"|\bnot\s+to\s+(?:type|run|do|execute|enter|send)\b"
+    r")"
+)
+_CLAUSE_DOUBLE_NEGATIVE_RE = re.compile(
+    r"(?i)\b(?:never|do\s+not|don'?t|must\s+not)\s+(?:forget|fail|hesitate)\s+to\b"
+)
 # A continued command or a substitution longer than this is a finding, not a miss.
 _SHELL_WINDOW_CHARS = 4096
 _SHELL_WINDOW_LINES = 32
@@ -951,6 +967,41 @@ def _window_interesting(text: str, start: int, end: int) -> bool:
     return _window_has_verb(text, start, end)
 
 
+def _sentences_in(text: str, start: int, end: int) -> Iterator[tuple[int, int]]:
+    """Sentence slices inside ``text[start:end]``. A period inside a host is not a break."""
+    cursor = start
+    index = start
+    while index < end:
+        if text[index] in ".!?" and (index + 1 >= end or text[index + 1].isspace()):
+            nxt = index + 1
+            yield cursor, nxt
+            while nxt < end and text[nxt].isspace():
+                nxt += 1
+            cursor = nxt
+            index = nxt
+            continue
+        index += 1
+    if cursor < end:
+        yield cursor, end
+
+
+def _clause_prohibits(text: str, start: int, end: int) -> bool:
+    """Whether a prohibition in the same sentence governs this command window.
+
+    The scan stays inside the window, which is already capped. A negation in an
+    earlier sentence, such as ``Don't worry.``, does not govern the next one.
+    ``Do not forget to`` names the command rather than forbidding it.
+    """
+    for sent_start, sent_end in _sentences_in(text, start, end):
+        clause = text[sent_start:sent_end]
+        if _CRED_PATH_RE.search(clause) is None:
+            continue
+        kept = _CLAUSE_DOUBLE_NEGATIVE_RE.sub(" ", clause)
+        if _CLAUSE_PROHIBITION_RE.search(kept) is not None:
+            return True
+    return False
+
+
 def _shell_exfil_offsets(normalized: str) -> Iterator[int]:
     """Offsets of a shell read of a credential path that reaches a network sink.
 
@@ -964,6 +1015,9 @@ def _shell_exfil_offsets(normalized: str) -> Iterator[int]:
     """
     reported: set[int] = set()
     for start, end, truncated in _logical_windows(normalized):
+        # The prohibition has to govern this sentence, not merely the first sink word.
+        if _clause_prohibits(normalized, start, end):
+            continue
         verb = _first_shell_verb(normalized, start, end)
         if verb is not None and _verb_is_negated(normalized, verb):
             continue
