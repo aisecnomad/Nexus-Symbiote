@@ -47,11 +47,15 @@ def _locations(component: dict[str, Any]) -> set[tuple[str, int | None]]:
     if not isinstance(properties, dict) or not isinstance(claims, dict):
         return set()
     line = properties.get("declaration_line", properties.get("source_line"))
-    candidates = [
-        (component.get("source_path"), line),
-        (properties.get("reference_path"), line),
-        *((claim.get("locator"), None) for claim in claims.values() if isinstance(claim, dict)),
-    ]
+    candidates = [(component.get("source_path"), line)]
+    claim_names = ["declaration", "source_declaration"]
+    if component.get("component_type") == "model":
+        candidates.append((properties.get("reference_path"), line))
+        claim_names.append("source_reference")
+    for name in claim_names:
+        claim = claims.get(name)
+        if isinstance(claim, dict) and claim.get("scope") == "repository":
+            candidates.append((claim.get("locator"), None))
     locations = set()
     for path, line in candidates:
         if not isinstance(path, str):

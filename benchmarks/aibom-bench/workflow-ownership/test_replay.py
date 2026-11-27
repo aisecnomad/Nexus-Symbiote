@@ -40,6 +40,44 @@ def test_builder_or_uncompiled_graph_does_not_count(positive: dict, name: str, l
     assert score(positive)["score"] == 0
 
 
+@pytest.mark.parametrize(
+    ("claim", "scope"),
+    [
+        ("owner", "repository"),
+        ("source_declaration", "runtime"),
+        ("source_reference", "repository"),
+    ],
+)
+def test_workflow_requires_declaration_evidence(positive: dict, claim: str, scope: str) -> None:
+    workflow = positive["components"][0]
+    workflow["properties"]["source_line"] = 21
+    workflow["claims"] = {
+        claim: {"method": "static-source", "scope": scope, "locator": "agent.py:39"}
+    }
+    assert score(positive)["score"] == 0
+
+
+def test_native_source_declaration_and_model_reference_locators_count(positive: dict) -> None:
+    workflow, model = positive["components"][:2]
+    workflow["properties"].clear()
+    model["properties"].clear()
+    workflow["claims"] = {
+        "source_declaration": {
+            "method": "python-ast",
+            "scope": "repository",
+            "locator": "agent.py:39",
+        }
+    }
+    model["claims"] = {
+        "source_reference": {
+            "method": "python-ast",
+            "scope": "repository",
+            "locator": "agent.py:22",
+        }
+    }
+    assert score(positive)["passed"]
+
+
 def test_repository_and_wrong_owner_edges_do_not_count(positive: dict) -> None:
     repository = {
         "component_type": "agent",
