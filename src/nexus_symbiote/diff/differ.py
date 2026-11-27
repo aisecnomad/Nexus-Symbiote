@@ -837,6 +837,27 @@ class AIBOMDiffer:
                     "severity": "medium",
                 }
             )
+        old_caps, new_caps = old_fields.get("capabilities"), new_fields.get("capabilities")
+        if isinstance(old_caps, dict) and isinstance(new_caps, dict):
+            before_scopes = {s for s in old_caps.get("oauth_scopes") or () if isinstance(s, str)}
+            after_scopes = {s for s in new_caps.get("oauth_scopes") or () if isinstance(s, str)}
+            added_scopes = sorted(after_scopes - before_scopes)
+            removed_scopes = sorted(before_scopes - after_scopes)
+            scope_changes = [
+                f"{word}: {_listing(scopes)}"
+                for word, scopes in (("added", added_scopes), ("removed", removed_scopes))
+                if scopes
+            ]
+            if scope_changes:
+                modifications.append(
+                    {
+                        "detail": "capabilities changed: OAuth scopes "
+                        + " and ".join(scope_changes),
+                        "severity": "high" if added_scopes else "medium",
+                    }
+                )
+                if old_caps | {"oauth_scopes": []} == new_caps | {"oauth_scopes": []}:
+                    handled.add("capabilities")
         old_props, new_props = old_fields.get("properties"), new_fields.get("properties")
         if isinstance(old_props, dict) and isinstance(new_props, dict):
             before = old_props.pop(_DECLARED_AUTONOMY, None)
