@@ -61,7 +61,8 @@ _TAKES = (".choice", ".copy", ".deepcopy", ".get", ".max", ".min", ".next", ".po
           ".popleft", ".setdefault")  # fmt: skip
 _STUBS = ("botocore.", "mypy_boto3", "types_boto3")
 # Keywords that hold the options a model is loaded with, and what may hold such a dict.
-_KWARGS = ("config_kwargs", "model_kwargs")
+_KWARGS = ("config_kwargs", "huggingface_pipeline_kwargs", "model_kwargs", "pipeline_kwargs",
+           "tokenizer_kwargs")  # fmt: skip
 _DICTS = (ast.Dict, ast.Call)
 # Roots whose objects are not another library's: what they make may be text.
 _NOT_LIBRARIES = frozenset({"builtins", *sys.stdlib_module_names})
