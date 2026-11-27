@@ -1536,9 +1536,19 @@ def test_past_the_bound_every_binding_of_a_statement_counts(
         (
             'import { Client } from "@urql/core";\nconst client = new Client({});\n',
             "async ({ q }) => client.query(q)",
-            False,
+            True,
         ),
         ("", "async ({ q }) => client.query(q)", True),
+        ('import { pool } from "./db";\n', "async ({ q }) => pool.query(q)", True),
+        ('import { db } from "@/lib/db";\n', "async ({ q }) => db.query(q)", True),
+        ('import { sql } from "@vercel/postgres";\n', "async ({ q }) => sql.query(q)", True),
+        ('import { client } from "@acme/db";\n', "async ({ q }) => client.query(q)", True),
+        (
+            'import { createClient } from "@libsql/client";\nconst turso = createClient({});\n',
+            "async ({ q }) => turso.execute(q)",
+            True,
+        ),
+        ("", "async ({ q }) => searchClient.query(q)", False),
     ],
     ids=[
         "typeorm-data-source",
@@ -1548,8 +1558,14 @@ def test_past_the_bound_every_binding_of_a_statement_counts(
         "mssql-request",
         "prisma-under-another-name",
         "prisma-raw-method-on-any-receiver",
-        "non-database-client-named-client",
+        "another-sdk-client-named-client-counts",
         "unbound-client-by-name",
+        "pool-from-a-local-module",
+        "db-from-a-path-alias",
+        "vercel-postgres",
+        "client-from-a-wrapper-package",
+        "libsql-client-under-another-name",
+        "search-client-control",
     ],
 )
 def test_typescript_database_clients_resolve_through_derived_names(

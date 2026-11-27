@@ -118,7 +118,9 @@ _TS_SQL = frozenset(
 # A receiver ``query`` or ``execute`` is SQL on: a client from one of these modules, or by name.
 _TS_DB_MODULES = frozenset(
     {"pg", "mysql", "mysql2", "sqlite3", "better-sqlite3", "postgres", "@prisma/client", "knex"}
-    | {"sequelize", "drizzle-orm", "mssql", "kysely", "typeorm"}
+    | {"sequelize", "drizzle-orm", "mssql", "kysely", "typeorm", "@vercel/postgres", "oracledb"}
+    | {"@neondatabase/serverless", "@libsql/client", "@planetscale/database", "pg-promise"}
+    | {"bun:sqlite"}
 )
 _TS_DB_RECEIVERS = frozenset(
     {"db", "pool", "client", "conn", "connection", "sql", "knex", "prisma", "tx", "trx"}
@@ -1471,11 +1473,11 @@ def _ts_call(
         seen.add(CapabilityClass.NETWORK)
         seen.write(CapabilityClass.PAYMENT)
         seen.payment = True
-    # A receiver counts by its module, or by its name when nothing in the file binds it;
-    # Prisma's ``$``-prefixed raw methods exist on no other client.
+    # A receiver counts by its database module under any name, or by its own name, whatever
+    # it is bound to: a pool is often imported from the project's own ``./db``. Prisma's
+    # ``$``-prefixed raw methods exist on no other client.
     client = last.startswith("$") or any(module in _TS_DB_MODULES for module, _ in candidates)
     named = len(chain) > 1 and chain[-2] in _TS_DB_RECEIVERS
-    named = named and not (len(chain) == 2 and candidates)
     if last in _TS_SQL and len(chain) > 1 and values and (client or named):
         statement = values[0]
         interpolated = statement.type == "template_string" and any(
