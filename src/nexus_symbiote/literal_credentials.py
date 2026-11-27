@@ -2,15 +2,17 @@
 
 MCP launch positions stay with the MCP collector. Credential-shaped stores
 (``.env``, key files, ``secrets/``) are not read. A match is recorded by its
-location and the SHA-256 of its normalized spelling. The literal is not stored, logged, or
-placed in a finding. More than ``MAX_LITERALS`` matches in one file is a
+path and line. With ``NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`` set, the finding also
+carries a keyed HMAC of the normalized spelling. Without that key it says the
+value is unbound. An unkeyed digest is not recorded. The literal is not stored,
+logged, or placed in a finding. More than ``MAX_LITERALS`` matches in one file is a
 collection failure and produces no finding from that file.
 """
 
 from __future__ import annotations
 
-import hashlib
 import re
+import unicodedata
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -21,6 +23,7 @@ from nexus_symbiote.core.models import RiskAssessment
 from nexus_symbiote.credential_allowlist import bind_credential_path, credential_suppressed
 from nexus_symbiote.scanners.credential_files import credential_shaped
 from nexus_symbiote.scanners.mcp_credentials import normalize_credential
+from nexus_symbiote.scanners.source_binding import BindingError, value_binding
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.secrets import TOKEN_SHAPE, holds_token_shape
 from nexus_symbiote.utils.terminal import neutralize
@@ -54,6 +57,93 @@ _TEXT_SUFFIXES = frozenset(
         ".bash",
     }
 )
+_TOKEN_CHAR = re.compile(r"[\w-]")
+# A prefix a space may interrupt. The match itself still has to satisfy the shape table.
+_SPLIT_PREFIX = re.compile(
+    r"(?<![\w-])(?:"
+    r"sk-(?:proj-|svcacct-|admin-|ant-|or-v1-|lf-)?"
+    r"|github_pat_|gh[oprsu]_|glpat-|xox[abeoprs]-|hf_|npm_|AIza|(?:AKIA|ASIA)"
+    r")"
+)
+_BINDING_PROFILE = "vendor-token"
+
+
+def _visible(text: str) -> str:
+    """NFKC, then drop format characters and variation selectors. Whitespace stays.
+
+    ``normalize_credential`` also drops spaces, which glues a token to the words
+    around it. That form is only for a space or mark inside the token's own body.
+    """
+    folded = unicodedata.normalize("NFKC", text)
+    kept: list[str] = []
+    for char in folded:
+        code = ord(char)
+        if unicodedata.category(char) == "Cf":
+            continue
+        if 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF:
+            continue
+        kept.append(char)
+    return "".join(kept)
+
+
+def _split_bodies(visible: str, covered: list[tuple[int, int]]) -> list[str]:
+    """Tokens whose body is split by whitespace, not tokens separated from prose."""
+    found: list[str] = []
+    for prefix in _SPLIT_PREFIX.finditer(visible):
+        if any(start <= prefix.start() < end for start, end in covered):
+            continue
+        chars: list[str] = []
+        index = prefix.end()
+        limit = min(len(visible), prefix.start() + 256)
+        while index < limit:
+            char = visible[index]
+            if char.isspace():
+                nxt = index + 1
+                while nxt < limit and visible[nxt].isspace():
+                    nxt += 1
+                if holds_token_shape(prefix.group() + "".join(chars)):
+                    break
+                if nxt >= limit or _TOKEN_CHAR.fullmatch(visible[nxt]) is None:
+                    break
+                index = nxt
+                continue
+            if _TOKEN_CHAR.fullmatch(char) is None:
+                break
+            chars.append(char)
+            index += 1
+        candidate = normalize_credential(prefix.group() + "".join(chars))
+        if holds_token_shape(candidate) and TOKEN_SHAPE.fullmatch(candidate):
+            found.append(candidate)
+    return found
+
+
+def _literals(visible: str) -> list[str]:
+    found: list[str] = []
+    covered: list[tuple[int, int]] = []
+    for match in TOKEN_SHAPE.finditer(visible):
+        literal = match.group()
+        if not holds_token_shape(literal):
+            continue
+        found.append(normalize_credential(literal))
+        covered.append(match.span())
+    found.extend(_split_bodies(visible, covered))
+    return list(dict.fromkeys(found))
+
+
+def _commitment(rel_path: str, line_no: int, literal: str) -> str:
+    """A keyed binding when the operator key is set, otherwise location-only."""
+    try:
+        binding = value_binding(
+            _BINDING_PROFILE,
+            {"path": rel_path, "line": line_no, "token": literal},
+        )
+    except BindingError:
+        return "value unbound"
+    if not binding:
+        return "value unbound"
+    return f"{binding['static_value_binding']} key_id={binding['static_value_binding_key_id']}"
+
+
 _DOCKER_NAMES = frozenset({"dockerfile", "containerfile"})
 
 
@@ -105,17 +195,17 @@ def _collapse_joins(text: str) -> str:
     return _ADJACENT_QUOTES.sub("", collapsed)
 
 
-def _cut_off_token(normalized: str) -> bool:
-    """Whether ``normalized`` ends in a vendor prefix the window did not finish."""
-    found = _OPEN_PREFIX.search(normalized)
+def _cut_off_token(visible: str) -> bool:
+    """Whether ``visible`` ends in a vendor prefix the window did not finish."""
+    found = _OPEN_PREFIX.search(visible.rstrip())
     return found is not None and not holds_token_shape(found.group())
 
 
 def _literal_windows(text: str) -> Iterable[tuple[int, str, bool]]:
     """``(first line, normalized text, truncated)`` for each continued span.
 
-    Hidden characters and spaces are removed with ``normalize_credential`` after
-    string joins, so a token split by a mark or a newline is one spelling.
+    Hidden characters are removed and whitespace is kept, so a token in prose stays
+    a separate word. A space or mark inside the token body is joined afterwards.
     """
     lines = text.splitlines()
     index = 0
@@ -133,7 +223,7 @@ def _literal_windows(text: str) -> Iterable[tuple[int, str, bool]]:
                 break
             index += 1
             parts.append(lines[index])
-        normalized = normalize_credential(_collapse_joins("\n".join(parts)))
+        normalized = _visible(_collapse_joins("\n".join(parts)))
         yield start, normalized, truncated
         index += 1
 
@@ -195,15 +285,10 @@ def apply_literal_credential_findings(
                         )
                         refused = True
                         break
-                    for match in TOKEN_SHAPE.finditer(normalized):
-                        literal = match.group()
-                        # A vendor shape of valid length is a finding even when its body
-                        # looks like an example. The shape table already rejects sk-...,
-                        # xxxx and <YOUR_API_KEY>.
-                        if not holds_token_shape(literal) or credential_suppressed(literal):
+                    for literal in _literals(normalized):
+                        if credential_suppressed(literal):
                             continue
-                        digest = hashlib.sha256(literal.encode("utf-8")).hexdigest()
-                        found.append((line_no, digest))
+                        found.append((line_no, literal))
                         if len(found) > MAX_LITERALS:
                             own_failures.append(
                                 f"{neutralize(rel_path)}: more than {MAX_LITERALS} vendor "
@@ -222,14 +307,14 @@ def apply_literal_credential_findings(
                     f"{neutralize(rel_path)}: literal credential has no component to record it"
                 )
                 continue
-            for line_no, digest in found:
+            for line_no, literal in found:
                 risks.append(
                     RiskAssessment(
                         severity=RiskSeverity.HIGH,
                         category="credential_exposure",
                         detail=(
                             f"{neutralize(rel_path)}:{line_no}: a vendor token shape is "
-                            f"committed (sha256:{digest})."
+                            f"committed ({_commitment(rel_path, line_no, literal)})."
                         ),
                         recommendation=(
                             "Remove the literal, rotate the credential, and pass it by an "

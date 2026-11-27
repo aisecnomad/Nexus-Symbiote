@@ -25,7 +25,7 @@ Each entry has a `reason` (one line, at most 200 characters) and exactly one of:
 
 | Field | Matches |
 | --- | --- |
-| `fingerprint` | 64 lowercase hex digits. SHA-256 of the token after NFKC and after format characters, spaces and variation selectors are removed. The same digest a source finding records after `sha256:`. |
+| `fingerprint` | 64 lowercase hex digits. SHA-256 of the token after NFKC and after format characters, spaces and variation selectors are removed. The finding does not print this digest. |
 | `path` | A relative glob. `*` is one path segment, `**` is any number of segments. No absolute path, backslash, or `..`. |
 
 A path entry suppresses every vendor-shaped token in each matching file. A fingerprint entry suppresses that spelling wherever the active file path is set. At most 256 entries.
