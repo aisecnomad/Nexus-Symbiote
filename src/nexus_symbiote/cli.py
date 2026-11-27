@@ -48,6 +48,7 @@ from nexus_symbiote.reporting import (
 )
 from nexus_symbiote.runtime_cli import register_runtime_commands
 from nexus_symbiote.sbom_cli import register_sbom_commands
+from nexus_symbiote.source_unicode import apply_source_unicode_findings
 from nexus_symbiote.supply_chain_cli import STAGED_INVENTORY, register_supply_chain_commands
 from nexus_symbiote.text_poisoning import apply_text_poisoning_rules
 from nexus_symbiote.trace_cli import register_trace_commands
@@ -1334,6 +1335,15 @@ def scan(
         failures_by["text_poisoning"] = scan_failures[tp_failure_count:]
     if len(surfaces_excluded) > tp_exclusion_count:
         excluded_by["text_poisoning"] = surfaces_excluded[tp_exclusion_count:]
+    unicode_failure_count = len(scan_failures)
+    apply_source_unicode_findings(
+        aibom,
+        root,
+        exclude_paths=policy.scan.exclude_paths,
+        failures=scan_failures,
+    )
+    if len(scan_failures) > unicode_failure_count:
+        failures_by["source_unicode"] = scan_failures[unicode_failure_count:]
     graph_failures = validate_graph(aibom)
     scan_failures.extend(graph_failures)
     if graph_failures:

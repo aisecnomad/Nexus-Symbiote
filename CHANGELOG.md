@@ -4,6 +4,10 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Security
+
+- Code and Dockerfiles a collector already opened are checked for a mixed-script word and for hidden characters (bidi overrides, zero-width characters, and the other format characters the prompt collector rates). The finding names the file, the line, and the SHA-256 of that line, not the line. An emoji joiner stays ordinary. More than 32 hits in one file is a collection failure and adds no finding from that file. Instruction files stay on the prompt collector's existing check.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).
