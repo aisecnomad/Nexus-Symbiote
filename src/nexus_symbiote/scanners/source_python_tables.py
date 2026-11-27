@@ -78,6 +78,8 @@ POSITIONAL_MODELS: dict[tuple[str, str], int] = {
     ("sentence_transformers", "SentenceTransformer"): 0, ("transformers", "from_pretrained"): 0,
     ("vertexai", "GenerativeModel"): 0, ("vertexai", "TextEmbeddingModel.from_pretrained"): 0,
 }  # fmt: skip
+# Calls that read an environment variable: its name first, then its default.
+ENVIRONMENT_READS = frozenset({"decouple.config", "os.environ.get", "os.getenv"})
 # Calls that call their first argument with the rest, so its keywords are that callee's.
 FORWARDERS = frozenset(
     {

@@ -31,6 +31,7 @@ MAX_EVIDENCE_LOCATIONS = 16
 MAX_RECORDS = 5_000
 
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{1,127}")
+_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,63}")
 # A long run of hex or of base64 with no separator, or user information before an
 # ``@``: what a key, a token or a connection string looks like, and no model's name.
 _SECRET_SHAPED = re.compile(r"[0-9A-Fa-f]{32,}|[A-Za-z0-9+/]{40,}={0,2}|[^@:/]+:[^@/]*@.+")
@@ -138,6 +139,13 @@ def model_kind(name: str, *, embedding: bool = False) -> str | None:
     return None
 
 
+def environment_name(name: object) -> str | None:
+    """``name`` when it can be exported as the name of an environment variable."""
+    if isinstance(name, str) and _ENVIRONMENT_NAME.fullmatch(name) and unchanged_by_redaction(name):
+        return name
+    return None
+
+
 def model_ref(name: str) -> str:
     return f"model:source:{quote(name, safe='._:@+-')}"
 
@@ -149,6 +157,7 @@ class _Model:
     providers: set[str] = field(default_factory=set)
     kinds: set[str] = field(default_factory=set)
     aliases: set[str] = field(default_factory=set)
+    environment: set[str] = field(default_factory=set)
     methods: set[str] = field(default_factory=set)
     remote_code: bool = False
 
@@ -171,6 +180,10 @@ class Declarations:
         self._written: dict[str, str | None] = {}
         self._gaps: set[str] = set()
         self._full = False
+        # Variables that alone set a model, with where each is read; those that also
+        # override a value the project gives are not gaps.
+        self.unresolved_environment: dict[str, set[tuple[str, int]]] = {}
+        self._environment: set[str] = set()
 
     def gap(self, path: str, line: int, reason: str) -> None:
         text = f"{path}:{line}: {reason}"
@@ -188,11 +201,13 @@ class Declarations:
         embedding: bool = False,
         weights: bool = False,
         remote_code: bool = False,
+        environment: Iterable[str] = (),
     ) -> str | None:
         """Record one reference to a model and return its component reference.
 
         A provider is recorded only when a routing prefix on the identifier names it.
-        ``remote_code`` says the call that loads it lets the model run its own code.
+        ``remote_code`` says the call that loads it lets the model run its own code, and
+        ``environment`` names the variables that, when set, give a model in its place.
         """
         if not isinstance(literal, str):
             return None
@@ -226,7 +241,25 @@ class Declarations:
         if written != name:
             record.aliases.add(written)
         record.remote_code = record.remote_code or remote_code
+        for variable in environment:
+            if environment_name(variable):
+                record.environment.add(variable)
+                self._environment.add(variable)
         return model_ref(name)
+
+    def close(self) -> None:
+        """Name each model that only an environment variable sets, with no value in the
+        project: a variable that also overrides a value read is recorded with that one."""
+        for name in sorted(self.unresolved_environment):
+            if name in self._environment:
+                continue
+            path, line = min(self.unresolved_environment[name])
+            self.gap(
+                path,
+                line,
+                f"model set by environment variable {name}, which no file of the project "
+                "gives a value; not inventoried",
+            )
 
     def components(self) -> list[AnyComponent]:
         built: list[AnyComponent] = []
@@ -247,6 +280,8 @@ class Declarations:
                 properties["providers"] = sorted(model.providers)
             if len(model.aliases) > 1:
                 properties["requested_aliases"] = sorted(model.aliases)
+            if model.environment:
+                properties["environment_variables"] = sorted(model.environment)
             provider = next(iter(model.providers)) if len(model.providers) == 1 else None
             kind = (
                 "fine-tuned"

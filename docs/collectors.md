@@ -42,9 +42,22 @@ read, and so is a client reached through a framework's state or an untyped param
 A function of another library or of Python, such as a logger or a metrics label, and a
 method of what one returns are not read.
 
-A model identifier written as a literal argument becomes one `model` component for the
-project at `declared` assurance. Its `source_reference` claim names the file and the
-line of the argument, up to 16 places. A routing prefix is read off the identifier:
+A model argument is followed within its file, to each text it can hold: through names
+and `:=`, conditionals (`if`/`else`, `or`, `and`), an environment variable's default
+(`os.getenv`, `os.environ.get`, `decouple.config`), joined text (`+`, `+=` and
+f-strings), `str()`, `.lower()`, `.upper()` and `.strip()`, and a dict spread with `**`
+that is written out there or bound once to a name the file reads only to spread it. A
+name is looked up as Python looks it up: in its function, honouring `global` and
+`nonlocal`, then in the scopes around it, skipping a class body from its methods. A
+parameter's default and a decorator, annotation or base class are read in the scope
+around their function or class. In `or`, a variable read with no default falls
+through to what follows when it is unset, so `os.environ.get("CHAT_MODEL") or
+"gpt-4o"` gives `gpt-4o`.
+
+Each model identifier becomes one `model` component for the project at `declared`
+assurance. Its `source_reference` claim names the file and the line of the argument,
+up to 16 places. The environment variables that may give a model in place of a value
+read are listed in its `environment_variables` property. A routing prefix is read off the identifier:
 `anthropic/claude-sonnet-4-5` is the model `claude-sonnet-4-5` with provider
 `anthropic`, and the text as written is kept in `requested_alias`. No other provider is
 recorded. A reference has no `source_path`, which on a model names a weight file, unless
@@ -59,13 +72,20 @@ What the reader knows is there and cannot read is a coverage gap:
 - a file that imports an SDK by a name a module of the project also has, since which of
   the two the import loads depends on how the project is run;
 - a model argument bound in another module of the project;
-- a model argument that is not a literal, unless it is an object an SDK or another
-  library builds: a name, an attribute, a parameter, a call, joined text, `**options`
-  without a model keyword, a starred positional argument, or text that is no identifier;
+- what a model argument can hold besides the text read, unless it is an object an SDK
+  or another library makes: a parameter, whatever its default; an attribute, an item or
+  a call other than those above; text joined to something unread, or built from itself,
+  which may grow when run again; a loop, `with`, `except` or pattern variable; a dict
+  that is changed, handed on, spread from another or bound more than once; `**options`
+  without a model keyword; a starred positional argument; and text that is no
+  identifier, or a default a variable that cannot be named may override;
+- a model that only an environment variable sets, once for the variable, unless the
+  variable also overrides a value the project gives;
 - a model argument given to a function or class the project defines, or to a method of
   an object of a project class, which the reader does not follow;
-- a bound the reader reached: a callee depth of 32, the directories it looks in for a
-  module, a dotted name of 256 characters, or the steps one file allows.
+- a bound the reader reached: a callee depth of 32, a following depth of 12, 16 values
+  for one argument, 16 joined texts of up to 256 characters, the directories it looks in
+  for a module, a dotted name of 256 characters, or the steps one file allows.
 
 The arguments of each kind are counted in one gap for the file, at the first of them.
 

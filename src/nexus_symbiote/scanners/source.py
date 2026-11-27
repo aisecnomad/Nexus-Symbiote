@@ -80,6 +80,7 @@ class SourceScanner(Scanner):
             python = PythonReader(found, frozenset(modules))
             self._read(files.root, sorted(selected), result, python)
         python.read()
+        found.close()
         result.components.extend(found.components())
         result.surfaces_scanned.append(SURFACE)
         result.surfaces_scanned.append(SKIPPED_SURFACE)
