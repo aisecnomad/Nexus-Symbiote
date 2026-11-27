@@ -596,27 +596,237 @@ def test_one_unfollowed_argument_is_named_alone(tmp_path: Path):
     assert list(single.surfaces_excluded) == [unread("one.py", 5)]
 
 
-def test_a_model_bound_in_another_module_of_the_project_is_a_gap(tmp_path: Path):
+FOLLOWED = "model argument is bound in another module of the project, which the collector could not follow; not inventoried"
+
+
+def test_a_model_bound_in_another_module_of_the_project_is_followed(tmp_path: Path):
     result = scan(
         tmp_path,
         {
-            "app/settings.py": 'MODEL = "gpt-4o"\n',
+            "app/settings.py": 'MODEL = "gpt-4o"\nfrom .defaults import FALLBACK\n',
+            "app/defaults.py": 'FALLBACK = "o3"\n',
+            "app/__init__.py": "",
             "app/run.py": """\
 from openai import OpenAI
 from . import settings
-from .settings import MODEL
+from .settings import FALLBACK, MODEL
+import app.settings as configured
 
 OpenAI().chat.completions.create(model=MODEL, messages=[])
 OpenAI().chat.completions.create(model=settings.MODEL, messages=[])
+OpenAI().chat.completions.create(model=configured.FALLBACK, messages=[])
+OpenAI().chat.completions.create(model=FALLBACK, messages=[])
 """,
         },
     )
-    assert result.components == []
-    gap = (
-        "model argument is bound in another module of the project, which the collector does "
-        "not follow; not inventoried"
+    found = models(result)
+    assert set(found) == {"gpt-4o", "o3"}
+    # The place recorded is the argument that gives the model, in the analysed file.
+    assert found["gpt-4o"].claims["source_reference"].evidence_refs == [
+        "app/run.py:6",
+        "app/run.py:7",
+    ]
+    assert not result.surfaces_excluded
+
+
+@pytest.mark.parametrize(
+    ("files", "why"),
+    [
+        ({"app/settings.py": "MODEL = (\n"}, "unparsable"),
+        ({"app/settings.py": b"MODEL = '\xe9'\n"}, "not UTF-8"),
+        ({"tests/settings.py": 'MODEL = "gpt-4o"\n'}, "a test module"),
+        ({"app/settings.py": "from .elsewhere import *\n"}, "not bound there"),
+    ],
+)
+def test_a_model_bound_in_a_module_the_collector_cannot_follow_is_a_gap(
+    tmp_path: Path, files: dict[str, str | bytes], why: str
+):
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        data = text if isinstance(text, bytes) else text.encode()
+        (tmp_path / name).write_bytes(data)
+    caller = "app/run.py" if "tests/settings.py" not in files else "app/run.py"
+    module = "tests.settings" if "tests/settings.py" in files else "app.settings"
+    result = scan(
+        tmp_path,
+        {
+            caller: f"from openai import OpenAI\nfrom {module} import MODEL\n\nOpenAI().responses.create(model=MODEL)\n"
+        },
     )
-    assert list(result.surfaces_excluded) == [f"app/run.py:5: {gap}", f"app/run.py:6: {gap}"]
+    assert result.components == [], why
+    assert list(result.surfaces_excluded) == [f"app/run.py:4: {FOLLOWED}"], why
+
+
+ATTRIBUTES = """\
+from openai import OpenAI
+
+
+class Assistant:
+    tier = "gpt-4o-mini"
+
+    def __init__(self):
+        self.client = OpenAI()
+        self.model = "gpt-4.1"
+        self.helper = Settings()
+
+    def ask(self):
+        def inner():
+            return self.client.responses.create(model=self.model)
+
+        self.client.responses.create(model=self.tier)
+        self.client.responses.create(model=self.helper.chat)
+        return inner()
+
+
+class Settings:
+    chat = "o3"
+    embed: str = "text-embedding-3-small"
+
+
+def run(settings: Settings, client=OpenAI()):
+    client.embeddings.create(model=settings.embed)
+    client.responses.create(model=Settings.chat)
+"""
+
+
+def test_attributes_of_self_of_a_class_and_of_its_objects_are_followed(tmp_path: Path):
+    result = scan(tmp_path, {"assistant.py": ATTRIBUTES})
+    found = models(result)
+    assert set(found) == {"gpt-4.1", "gpt-4o-mini", "o3", "text-embedding-3-small"}
+    # What the client on ``self`` is decides that this is an embeddings call.
+    assert found["text-embedding-3-small"].model_type == "embedding"
+    assert not result.surfaces_excluded
+
+
+ITEMS_AND_RETURNS = """\
+import os
+from openai import OpenAI
+
+MODELS = {"chat": "gpt-4o", "embed": "text-embedding-3-large", **os.environ}
+PLAIN = {"chat": "o3"}
+
+
+def pick():
+    if os.environ.get("FAST"):
+        return "gpt-4o-mini"
+    return MODELS["chat"]
+
+
+def make_client():
+    return OpenAI()
+
+
+choose = lambda: "o1"  # noqa: E731
+client = make_client()
+client.responses.create(model=pick())
+client.responses.create(model=choose())
+client.responses.create(model=PLAIN["chat"])
+client.responses.create(model=PLAIN.get("embed", "gpt-4.1"))
+client.responses.create(model=MODELS["embed"])
+client.responses.create(model=os.environ.get("CHAT_MODEL", "gpt-4.1-mini"))
+client.responses.create(model=settings.get("chat", "gpt-4.1-nano"))
+"""
+
+
+def test_items_of_literal_dictionaries_and_returned_values_are_followed(tmp_path: Path):
+    result = scan(tmp_path, {"items.py": ITEMS_AND_RETURNS})
+    found = models(result)
+    assert set(found) == {
+        "gpt-4o",
+        "gpt-4o-mini",
+        "o1",
+        "o3",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "text-embedding-3-large",
+    }
+    # A dictionary it unpacks may hold any key; an unknown holder may hold any value.
+    assert list(result.surfaces_excluded) == [unread("items.py", 20, 3)]
+
+
+def test_a_client_made_in_another_module_is_that_client(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "app/clients.py": "from openai import OpenAI\n\nclient = OpenAI()\n\n\n"
+            "def make():\n    return OpenAI()\n",
+            "app/run.py": "import openai\nfrom app import clients\nfrom app.clients import client, make\n\n"
+            'client.embeddings.create(model="text-embedding-3-small")\n'
+            'clients.client.responses.create(model="gpt-4o")\n'
+            'make().responses.create(model="o3")\n',
+        },
+    )
+    found = models(result)
+    assert set(found) == {"text-embedding-3-small", "gpt-4o", "o3"}
+    assert found["text-embedding-3-small"].model_type == "embedding"
+    # Each call is the SDK's, not a callee the project defines.
+    assert not result.surfaces_excluded
+
+
+FOLLOWING_EDGES = """\
+from openai import OpenAI
+
+PLAIN = {"chat": "o3"}
+
+
+def helper(): ...
+
+
+def outside(self):
+    OpenAI().responses.create(model=self.model)
+
+
+OpenAI().responses.create(model=PLAIN.get("chat"))
+OpenAI().responses.create(model=PLAIN.get("missing"))
+OpenAI().responses.create(model=helper.model)
+for client in clients:
+    client.responses.create(model="gpt-4o")
+"""
+
+
+def test_what_following_cannot_reach_is_unread_and_what_it_rules_out_is_not(tmp_path: Path):
+    result = scan(tmp_path, {"edges.py": FOLLOWING_EDGES})
+    # A loop variable's client is unknown, so its model keyword is still read.
+    assert set(models(result)) == {"o3", "gpt-4o"}
+    # ``self`` outside a class and an attribute of a function are unread; a missing key
+    # of a literal dictionary gives ``None``, which names no model.
+    assert list(result.surfaces_excluded) == [unread("edges.py", 10, 2)]
+
+
+def test_reading_many_keys_of_one_dictionary_costs_its_size_once(tmp_path: Path):
+    # Scanned again at each read, the keys would spend the file's allowance.
+    table = ", ".join(f'"k{index}": "m-{index}"' for index in range(1000))
+    reads = "\n".join(f'OpenAI().responses.create(model=T["k{index}"])' for index in range(1000))
+    result = scan(tmp_path, {"t.py": f"from openai import OpenAI\nT = {{{table}}}\n{reads}\n"})
+    assert len(models(result)) == 1000
+    assert not result.surfaces_excluded
+
+
+def test_a_name_imported_from_outside_the_project_is_unread(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "app/run.py": "from openai import OpenAI\nfrom company_settings import MODEL\n\n"
+            "OpenAI().responses.create(model=MODEL)\n"
+        },
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [unread("app/run.py", 4)]
+
+
+def test_modules_that_import_each_other_are_read_once(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "app/a.py": "from app.b import B\nA = B\n",
+            "app/b.py": "from app.a import A\nB = A\n",
+            "app/run.py": "from openai import OpenAI\nfrom app.a import A\n\n"
+            "OpenAI().responses.create(model=A)\n",
+        },
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [unread("app/run.py", 4)]
 
 
 def test_source_that_names_an_sdk_and_cannot_be_read_is_a_gap(tmp_path: Path):
@@ -918,8 +1128,15 @@ async def reply(make):
         },
     )
     found = models(result)
-    # A subscript and a call of the project's own function are not followed.
-    assert set(found) == {"acme-search-v2", "gpt-4.1", "gpt-4o", "openai/clip-vit-base-patch32"}
+    # An item of a literal dictionary is followed; the argument of a project function is
+    # not read here, but where the function hands it to an SDK.
+    assert set(found) == {
+        "acme-search-v2",
+        "gpt-4.1",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "openai/clip-vit-base-patch32",
+    }
     # The annotated parameter is an OpenAI client, so the call is an embeddings call.
     assert found["acme-search-v2"].model_type == "embedding"
 

@@ -11,6 +11,7 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 ### Added
 
 - **Model identifiers in application source (`source` collector):** reads, without importing or running anything, the model identifiers that Python code gives a known SDK, following a name inside its file through constants, environment defaults, formatted strings and conditionals. Each is a `model` component at `declared` assurance whose `source_reference` claim names the file and line; a routing prefix such as `anthropic/` sets the provider. See the [collector reference](docs/collectors.md#declarations-in-application-source) and the [roadmap decision](ROADMAP.md#decisions-and-non-goals).
+- **Following a model argument through the project (`source` collector):** a model argument is followed into the project modules a file imports, the attributes of `self`, of a module and of an object of a project class, the items of literal dictionaries and the values the project's own functions return, so a model set in a settings module, on a client class or in a lookup table is recorded where the SDK is called. A client made in another module or by a factory function is that SDK's client.
 - **Validation of source references:** `validate --project` reports the absent artifact of a model identifier it read again from source as information, as it does for a cited model of an imported report.
 
 ## [0.2.0] - 2026-11-25

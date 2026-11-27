@@ -34,7 +34,10 @@ cannot name, such as a method of a client passed in as a parameter: `model=`,
 of a Hugging Face endpoint, `id=` of an Agno model, and the first argument of an entry
 point such as `init_chat_model`, `SentenceTransformer`, `litellm.completion`,
 `ollama.chat` or a PydanticAI `Agent`. A call into another library or a builtin, such
-as a logger or a metrics label, is not read. Each argument is followed inside its file
+as a logger or a metrics label, is not read. Each argument is followed through the
+names of its file and of the project modules it imports, the attributes of `self`, of a
+module and of an object of a project class, the items of a literal dictionary, `get`
+with its default, and the values the project's own functions return. It is followed
 to a constant, an environment default such as `os.getenv("CHAT_MODEL", "gpt-4o")`, a
 formatted string, a concatenation, text extended with `+=`, either side of a
 conditional or of `or`, `str()`, the default of a Pydantic `Field` or a dataclass
@@ -57,11 +60,14 @@ What the reader knows is there and cannot read is a coverage gap:
   of the two the import loads depends on how the project is run;
 - a model that only an environment variable sets, when no file of the project gives
   that variable a value;
-- a model argument bound in another module of the project;
+- a model argument bound in another module of the project that the collector could not
+  follow: one it does not read or cannot parse, or one that does not bind the name;
 - a model argument bound to a value the reader cannot give: a parameter, which a caller
-  may override whatever its default, an attribute, a subscript, a call it cannot read,
-  a name the file does not bind, a loop, comprehension or pattern variable, a name
-  unpacked from what is not a literal, or text that is no identifier;
+  may override whatever its default, an attribute of an object whose class it cannot
+  tell, an item of what is not a literal dictionary or of one that unpacks another, a
+  call it cannot read, a name neither the file nor the project binds, a loop,
+  comprehension or pattern variable, a name unpacked from what is not a literal, or
+  text that is no identifier;
 - a model argument given to a function or class the project defines, which the reader
   does not follow;
 - a bound the reader reached: the 16 values it keeps for one argument or one name, a

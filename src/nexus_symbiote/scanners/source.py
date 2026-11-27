@@ -16,6 +16,7 @@ reads.
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path, PurePosixPath
 
 from nexus_symbiote import limits
@@ -46,6 +47,21 @@ def eligible(path: PurePosixPath) -> bool:
     return not (path.name.startswith(_PYTHON_TESTS) or path.name.endswith("_test.py"))
 
 
+def _module_text(files: ConfinedCollection, admitted: set[str], path: str) -> str | None:
+    """A module of the project that analysed code imports, read again when it is followed.
+
+    Only a file the collector read within its budget is read again, and only when it is
+    UTF-8 and small enough to parse; otherwise what it binds is not followed.
+    """
+    raw = files.read_bytes(path) if path in admitted else None
+    if raw is None or len(raw) > limits.current().syntax_bytes:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
 class SourceScanner(Scanner):
     """Declarations in application source: the model identifiers code gives an SDK."""
 
@@ -62,9 +78,17 @@ class SourceScanner(Scanner):
                     modules.add(path.as_posix())
                 if eligible(PurePosixPath(path.as_posix())):
                     selected.append(path)
-            python = PythonReader(found, frozenset(modules))
-            self._read(files.root, sorted(selected), result, python)
-        python.read()
+            with ConfinedCollection(
+                files.root,
+                [],
+                exclude_paths=self._exclude_paths,
+                max_total_bytes=source_collection_bytes(),
+            ) as heuristic:
+                admitted: set[str] = set()
+                load = partial(_module_text, heuristic, admitted)
+                python = PythonReader(found, frozenset(modules), load)
+                self._read(heuristic, sorted(selected), result, python, admitted)
+                python.read()
         found.close()
         result.components.extend(found.components())
         result.surfaces_scanned.append(SURFACE)
@@ -72,7 +96,12 @@ class SourceScanner(Scanner):
         return result
 
     def _read(
-        self, root: Path, selected: list[Path], result: ScanResult, python: PythonReader
+        self,
+        heuristic: ConfinedCollection,
+        selected: list[Path],
+        result: ScanResult,
+        python: PythonReader,
+        admitted: set[str],
     ) -> None:
         """Hand each selected file that names an SDK to the reader, within the source budget.
 
@@ -82,40 +111,38 @@ class SourceScanner(Scanner):
         """
         budget = SourceBudget("source declarations", result)
         syntax = limits.current().syntax_bytes
-        with ConfinedCollection(
-            root, [], exclude_paths=self._exclude_paths, max_total_bytes=source_collection_bytes()
-        ) as heuristic:
-            for path in selected:
-                if budget.exhausted:
-                    break
-                location = path.as_posix()
-                found = None if credential_shaped(location) else heuristic.regular_file(path)
-                if found is None:
-                    continue
-                target = found[0].as_posix()
-                if credential_shaped(target) or not eligible(PurePosixPath(target)):
-                    # A link reaches a file named for credentials, a test or another kind.
-                    continue
-                large = found[1] > heuristic.max_file_bytes
-                raw = None if large else heuristic.read_bytes(path)
-                if raw is None:
-                    # Whether it names an SDK is unknown, so it is a gap, not silence.
-                    reason = "is larger than the file-bytes limit" if large else "could not be read"
-                    result.surfaces_excluded.append(f"{location}: source file {reason}; not read")
-                    continue
-                if not budget.admit(len(raw), path):
-                    continue
-                if not any(marker in raw for marker in AI_MARKERS):
-                    continue
-                if len(raw) > syntax:
-                    result.surfaces_excluded.append(
-                        f"{location}: source file is larger than the syntax-bytes limit; "
-                        "declarations in it were not read"
-                    )
-                    continue
-                try:
-                    python.add(location, raw.decode("utf-8"))
-                except UnicodeDecodeError:
-                    result.surfaces_excluded.append(
-                        f"{location}: source file is not UTF-8; declarations in it were not read"
-                    )
+        for path in selected:
+            if budget.exhausted:
+                break
+            location = path.as_posix()
+            found = None if credential_shaped(location) else heuristic.regular_file(path)
+            if found is None:
+                continue
+            target = found[0].as_posix()
+            if credential_shaped(target) or not eligible(PurePosixPath(target)):
+                # A link reaches a file named for credentials, a test or another kind.
+                continue
+            large = found[1] > heuristic.max_file_bytes
+            raw = None if large else heuristic.read_bytes(path)
+            if raw is None:
+                # Whether it names an SDK is unknown, so it is a gap, not silence.
+                reason = "is larger than the file-bytes limit" if large else "could not be read"
+                result.surfaces_excluded.append(f"{location}: source file {reason}; not read")
+                continue
+            if not budget.admit(len(raw), path):
+                continue
+            admitted.add(location)
+            if not any(marker in raw for marker in AI_MARKERS):
+                continue
+            if len(raw) > syntax:
+                result.surfaces_excluded.append(
+                    f"{location}: source file is larger than the syntax-bytes limit; "
+                    "declarations in it were not read"
+                )
+                continue
+            try:
+                python.add(location, raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                result.surfaces_excluded.append(
+                    f"{location}: source file is not UTF-8; declarations in it were not read"
+                )
