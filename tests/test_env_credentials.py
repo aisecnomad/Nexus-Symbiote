@@ -216,3 +216,29 @@ def test_env_display_budget_withholds_labels_but_preserves_findings(
     notes = _bom(tmp_path)
     assert apply_env_credential_findings(AIBOM(components=[notes]), tmp_path) == 2
     assert all(r.detail.startswith("an env file:1: a key name holds") for r in notes.risks)
+
+
+def test_shared_walk_failures_remain_private_and_do_not_hide_new_gaps(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / ".env").write_text("ZONE=north\n")
+    notes = _bom(root)
+    bom = AIBOM(components=[notes])
+    first = root / "ordinary-link"
+    first.symlink_to(tmp_path / "outside")
+    published = "ordinary-link: symlink target is absolute"
+    generic = "env collection could not safely read every path"
+
+    for recorded, expected in (([], [generic]), ([published], [published])):
+        assert apply_env_credential_findings(bom, root, failures=recorded) == 1
+        assert recorded == expected
+        assert notes.risks[-1].detail.startswith("an env file:1: a key name holds")
+
+    # Replay's sink starts empty, and only failures independently observed on the
+    # local project can satisfy the diagnostic. An additional gap still fails.
+    local: list[str] = []
+    assert apply_env_credential_findings(bom, root, failures=local, prior_failures={published}) == 1
+    assert local == []
+    (root / "north").symlink_to(tmp_path / "another")
+    assert apply_env_credential_findings(bom, root, failures=local, prior_failures={published}) == 1
+    assert local == [generic]

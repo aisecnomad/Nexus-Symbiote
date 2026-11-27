@@ -177,6 +177,7 @@ def apply_env_credential_findings(
     exclude_paths: Iterable[str | Path] = (),
     failures: list[str] | None = None,
     exclusions: list[str] | None = None,
+    prior_failures: Iterable[str] = (),
 ) -> int:
     """Record ``.env`` assignments and vendor shapes in ``.env`` templates."""
     if root is None or not root.is_dir():
@@ -226,7 +227,10 @@ def apply_env_credential_findings(
     # Confined collection summaries may include several paths, even in the reason.
     # Their contents cannot be displayed when the set of values is incomplete.
     diagnostics = [f"an env file: {reason}" for reason in read_failures]
-    if own_failures:
+    # Scan shares the failure sink across collectors. Replay has a separate sink
+    # and supplies the failures its local collectors actually observed. Compare
+    # before masking so two different paths cannot silently hide each other.
+    if set(own_failures).difference(prior_failures, failures or ()):
         diagnostics.append("env collection could not safely read every path")
     gaps = [
         _display_text(message, scrubber, "env path excluded during collection")
