@@ -1683,3 +1683,394 @@ def test_a_typescript_name_with_too_many_bindings_is_unclassified(tmp_path: Path
     at_the_bound = "".join(f'import {{ x }} from "m{i}";\n' for i in range(31))
     at_the_bound += 'import { exec as x } from "child_process";\n'
     assert _caps(_ts(tmp_path / "bound", "(c) => x(c)", at_the_bound)) == {E.EXECUTE}
+
+
+# ---- Round-5 SQL reader findings ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("statement", "expected"),
+    [
+        ("EXPLAIN ANALYSE DELETE FROM t", {E.WRITE, E.DESTRUCTIVE}),
+        ("explain (analyse) delete from t", {E.WRITE, E.DESTRUCTIVE}),
+        ("EXPLAIN (ANALYSE TRUE) UPDATE t SET a = 1", {E.WRITE}),
+        ("EXPLAIN (ANALYZE OFF, ANALYZE ON) DELETE FROM t", {E.WRITE, E.DESTRUCTIVE}),
+        ("EXPLAIN (ANALYZE FALSE, ANALYZE) DELETE FROM t", {E.WRITE, E.DESTRUCTIVE}),
+        ("EXPLAIN (ANALYZE, ANALYSE FALSE) DELETE FROM t", set()),
+        ("SELECT a$b$c FROM t; DELETE FROM t", {E.WRITE, E.DESTRUCTIVE}),
+        ("SELECT 1 AS a$x$; DELETE FROM t; SELECT 1 AS b$x$", {E.WRITE, E.DESTRUCTIVE}),
+        ("SELECT $x$ DELETE FROM t $x$", set()),
+        ("DELETE FROM t WHERE id = $1", {E.WRITE, E.DESTRUCTIVE}),
+    ],
+    ids=[
+        "analyse-spelling",
+        "analyse-option-lowercase",
+        "analyse-true",
+        "last-analyze-on",
+        "last-analyze-bare",
+        "last-analyse-false",
+        "dollar-inside-a-name",
+        "dollar-names-around-a-delete",
+        "dollar-quote-control",
+        "positional-parameter-control",
+    ],
+)
+def test_sql_reader_spellings_and_dollar_names(
+    statement: str, expected: set[CapabilityClass]
+) -> None:
+    found = _classify(f"def tool(conn):\n    conn.execute({statement!r})\n")
+    assert set(found.capabilities) == expected, statement
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected"),
+    [
+        ('"UPDATE accounts\\n\\tSET balance = 0\\n\\tWHERE id = 2"', {E.WRITE}),
+        ('"DELETE\\tFROM t"', {E.WRITE, E.DESTRUCTIVE}),
+        ('"SELECT 1;\\tDROP TABLE t"', {E.WRITE, E.DESTRUCTIVE}),
+        ("`UPDATE t\\tSET a = 1`", {E.WRITE}),
+        ('"\\u0044ELETE FROM t"', {E.WRITE, E.DESTRUCTIVE}),
+        ('"SELECT \\x27; DROP TABLE t\\x27"', set()),
+        ('"UPDATE t \\\nSET a = 1"', {E.WRITE}),
+    ],
+    ids=[
+        "tab-indented",
+        "tab-separated",
+        "tab-after-semicolon",
+        "template-tab",
+        "unicode-escape",
+        "hex-quote",
+        "line-continuation",
+    ],
+)
+def test_typescript_escapes_read_as_what_they_stand_for(
+    tmp_path: Path, literal: str, expected: set[CapabilityClass]
+) -> None:
+    assert _caps(_ts(tmp_path, f"(id) => db.query({literal}, [id])")) == expected, literal
+
+
+@pytest.mark.parametrize(
+    ("statement", "rank"),
+    [
+        ("SELECT E'it\\'s'; DELETE FROM t", "destructive"),
+        ("SELECT E'\\''; DELETE FROM t", "destructive"),
+        ("SELECT 1 AS [it's]; DELETE FROM t", "destructive"),
+        ("SELECT 'it\\'s'; DELETE FROM t", "destructive"),
+        ("SELECT 'C:\\'; DELETE FROM t", "destructive"),
+        ("SELECT 'it''s; DROP TABLE x'", None),
+        ("SELECT a[1] FROM t", None),
+        ("DROP FOREIGN TABLE ft", "destructive"),
+        ("DROP SERVER s CASCADE", "destructive"),
+        ("DROP EVENT TRIGGER et", "destructive"),
+        ("CREATE CLUSTERED INDEX i ON t (a)", "write"),
+        ("ALTER SYSTEM SET log_statement = 'none'", "write"),
+        ("ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO r", "write"),
+        ("drop me a line", None),
+        ("create a new account", None),
+        (
+            "WITH x AS (WITH y AS (SELECT 1) DELETE FROM t RETURNING *) SELECT * FROM x",
+            "destructive",
+        ),
+        (
+            "WITH x AS (WITH y AS (SELECT 1) UPDATE t SET a = 1 RETURNING *) SELECT * FROM x",
+            "write",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) "
+            "SEARCH DEPTH FIRST BY n SET ord DELETE FROM t WHERE id IN (SELECT n FROM r)",
+            "destructive",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) "
+            "CYCLE n SET is_cycle USING path DELETE FROM t",
+            "destructive",
+        ),
+        ("WITH a AS (SELECT 1), b AS (SELECT 2) DELETE FROM t", "destructive"),
+        ("SELECT * FROM t WHERE a IN (SELECT 1) AND b = 'UPDATE t SET x = 1'", None),
+    ],
+    ids=[
+        "e-string-escaped-quote",
+        "e-string-escaped-quote-only",
+        "bracketed-name-with-a-quote",
+        "backslash-escaped-quote",
+        "standard-string-ending-in-a-backslash",
+        "doubled-quote-control",
+        "array-subscript-control",
+        "drop-foreign-table",
+        "drop-server",
+        "drop-event-trigger",
+        "create-clustered-index",
+        "alter-system",
+        "alter-default-privileges",
+        "prose-drop",
+        "prose-create",
+        "nested-with-delete",
+        "nested-with-update",
+        "search-clause",
+        "cycle-clause",
+        "second-cte",
+        "subquery-and-literal-control",
+    ],
+)
+def test_sql_reader_quoting_objects_and_with_clauses(statement: str, rank: str | None) -> None:
+    from nexus_symbiote.scanners.tool_capabilities import _sql_effect
+
+    assert _sql_effect(statement) == rank, statement
+
+
+# ---- Round-5 TypeScript statement and driver findings --------------------------------------
+
+_PG = 'import { Pool } from "pg";\nconst pool = new Pool();\n'
+_SQLITE = 'import Database from "better-sqlite3";\nconst db = new Database("f.db");\n'
+_SQLITE3 = 'import sqlite3 from "sqlite3";\nconst db = new sqlite3.Database("f.db");\n'
+_PGP = 'import pgp from "pg-promise";\nconst db = pgp()("url");\n'
+_DELETES = {E.WRITE, E.DESTRUCTIVE}
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected", "raw"),
+    [
+        (_PG, 'async ({ id }) => pool.query("DELETE FROM t WHERE id = " + id)', _DELETES, True),
+        (
+            _PG,
+            "async ({ name }) => pool.query('SELECT * FROM u WHERE n = ' + name)",
+            _DELETES,
+            True,
+        ),
+        (_PG, "async ({ table }) => pool.query('DELETE FROM ' + table)", _DELETES, True),
+        (_PG, "async (args) => pool.query(args.sql)", _DELETES, True),
+        (_PG, "async ({ q }) => pool.query(q as string)", _DELETES, True),
+        (_PG, "async ({ q }) => pool.query(q!)", _DELETES, True),
+        (_PG, "async ({ q }) => pool.query(q.trim())", _DELETES, True),
+        (_PG, "async () => pool.query('DELETE FROM ' + 't')", _DELETES, False),
+        (
+            _PG,
+            "async ({ hard }) => pool.query(hard ? 'DELETE FROM t' : 'SELECT 1')",
+            _DELETES,
+            False,
+        ),
+        (
+            _PG + "const QUERIES = { a: 'SELECT 1' };\n",
+            "async ({ name }) => pool.query(QUERIES[name])",
+            set(),
+            False,
+        ),
+        (_PG, "async ({ id }) => pool.query('DELETE FROM t WHERE id = $1', [id])", _DELETES, False),
+        (
+            _PG,
+            "async ({ id }) => pool.query({ text: 'DELETE FROM t WHERE id = $1', values: [id] })",
+            _DELETES,
+            False,
+        ),
+        (_PG, "async ({ q }) => pool.query({ text: q, rowMode: 'array' })", _DELETES, True),
+        (
+            'import mysql from "mysql2";\nconst connection = mysql.createConnection({});\n',
+            "async ({ q }) => connection.query({ sql: q, timeout: 40000 })",
+            _DELETES,
+            True,
+        ),
+        (_PG, "async (a) => { let q; return pool.query(q = a); }", _DELETES, True),
+        (_PG, "async () => { let q; return pool.query(q = 'DELETE FROM t'); }", _DELETES, False),
+        (_PG, "async (a) => pool.query((log(a), a))", _DELETES, True),
+        (_PG, "async (a) => pool.query((log(a), 'SELECT 1'))", set(), False),
+        ("", "async ({ q }) => searchClient.query(q)", set(), False),
+    ],
+    ids=[
+        "concatenated-parameter",
+        "concatenated-quoted-value",
+        "concatenated-table",
+        "member-of-a-parameter",
+        "as-expression",
+        "non-null-assertion",
+        "method-of-a-parameter",
+        "concatenated-literals",
+        "conditional-literals",
+        "allow-listed-statement",
+        "parameterized-control",
+        "config-text-literal",
+        "config-text-parameter",
+        "config-sql-parameter",
+        "assignment-value",
+        "assignment-literal",
+        "comma-value",
+        "comma-literal-control",
+        "search-client-control",
+    ],
+)
+def test_typescript_statement_forms(
+    tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass], raw: bool
+) -> None:
+    tool = _ts(tmp_path, handler, header)
+    assert _caps(tool) == expected, handler
+    assert any("caller-supplied" in r.detail for r in tool.risks) is raw, handler
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected", "raw"),
+    [
+        (
+            'import postgres from "postgres";\nconst sql = postgres("url");\n',
+            "async ({ id }) => sql`DELETE FROM t WHERE id = ${id}`",
+            _DELETES,
+            False,
+        ),
+        (
+            'import { sql } from "@vercel/postgres";\n',
+            "async ({ id }) => sql`INSERT INTO t VALUES (${id})`",
+            {E.WRITE},
+            False,
+        ),
+        (
+            'import { neon } from "@neondatabase/serverless";\nconst sql = neon("url");\n',
+            "async ({ id }) => sql`DELETE FROM t WHERE id = ${id}`",
+            _DELETES,
+            False,
+        ),
+        (
+            'import { PrismaClient } from "@prisma/client";\nconst prisma = new PrismaClient();\n',
+            "async ({ id }) => prisma.$executeRaw`DELETE FROM t WHERE id = ${id}`",
+            _DELETES,
+            False,
+        ),
+        (
+            'import { sql } from "drizzle-orm";\nimport { drizzle } from "drizzle-orm/node-postgres";\n'
+            'const db = drizzle("url");\n',
+            "async ({ id }) => db.execute(sql`DELETE FROM t WHERE id = ${id}`)",
+            _DELETES,
+            False,
+        ),
+        (
+            'import { sql } from "drizzle-orm";\n',
+            "async ({ id }) => { const s = sql`DELETE FROM t WHERE id = ${id}`; return s; }",
+            set(),
+            False,
+        ),
+        (
+            'import { sql } from "kysely";\n',
+            "async ({ id }) => sql`DELETE FROM t WHERE id = ${id}`.execute(db)",
+            _DELETES,
+            False,
+        ),
+        (
+            'import { gql } from "graphql-tag";\n',
+            "async () => gql`query { users { id } }`",
+            set(),
+            False,
+        ),
+        (_SQLITE, "async ({ q }) => db.exec(q)", _DELETES, True),
+        (_SQLITE, "async ({ q }) => db.prepare(q).run()", _DELETES, True),
+        (
+            _SQLITE,
+            "async ({ id }) => db.prepare('DELETE FROM notes WHERE id = ?').run(id)",
+            _DELETES,
+            False,
+        ),
+        (_SQLITE3, "async ({ q }) => db.run(q)", _DELETES, True),
+        (_SQLITE3, "async () => db.exec('DROP TABLE notes')", _DELETES, False),
+        (
+            "",
+            "async ({ id }, env) => env.DB.prepare('DELETE FROM t WHERE id = ?').bind(id).run()",
+            _DELETES,
+            False,
+        ),
+        (_PGP, "async ({ id }) => db.none('DELETE FROM t WHERE id = $1', [id])", _DELETES, False),
+        (_PGP, "async ({ q }) => db.any(q)", _DELETES, True),
+        ("", "async ({ key }) => db.get(key)", set(), False),
+        ("", "async ({ key }) => cache.get(key)", set(), False),
+    ],
+    ids=[
+        "postgres-js-tag",
+        "vercel-postgres-tag",
+        "neon-tag",
+        "prisma-execute-raw-tag",
+        "drizzle-execute",
+        "drizzle-builder-alone",
+        "kysely-execute",
+        "graphql-tag-control",
+        "better-sqlite3-exec",
+        "better-sqlite3-prepare-run",
+        "better-sqlite3-prepared-literal",
+        "sqlite3-run",
+        "sqlite3-exec-literal",
+        "d1-prepare-bind-run",
+        "pg-promise-none",
+        "pg-promise-any",
+        "key-value-get-control",
+        "map-get-control",
+    ],
+)
+def test_typescript_tagged_templates_and_sqlite_family_drivers(
+    tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass], raw: bool
+) -> None:
+    tool = _ts(tmp_path, handler, header)
+    assert _caps(tool) == expected, handler
+    assert any("caller-supplied" in r.detail for r in tool.risks) is raw, handler
+
+
+@pytest.mark.parametrize(
+    ("handler", "raw"),
+    [
+        ("async ({ statements }) => { for (const s of statements) await pool.query(s); }", True),
+        ("async ({ statements }) => { statements.forEach((s) => pool.query(s)); }", True),
+        ("async ({ statements }) => statements.forEach(s => pool.query(s))", True),
+        ("async (args) => { let q; q = args.sql; return pool.query(q); }", True),
+        (
+            "async ({ w }) => { let q = 'SELECT * FROM t WHERE '; q += w; return pool.query(q); }",
+            True,
+        ),
+        (
+            "async (args) => { const c = { text: '' }; c.text = args.sql; return pool.query(c); }",
+            True,
+        ),
+        ("async (args) => { let q; ({ q } = args); return pool.query(q); }", True),
+        ("async (args) => { for (const k in args) await pool.query(k); }", True),
+        (
+            "async ({ tables }) => { for (const t of tables) await pool.query(`DROP TABLE ${t}`); }",
+            True,
+        ),
+        (
+            "async ({ ids }) => Promise.all(ids.map((id) => pool.query(`DELETE FROM t WHERE id = ${id}`)))",
+            True,
+        ),
+        (
+            "async (args) => { const q = String(args.sql"
+            + " + 0" * 300
+            + "); return pool.query(q); }",
+            True,
+        ),
+        (
+            "async ({ ids }) => Promise.all(ids.map((id) => pool.query('DELETE FROM t WHERE id = $1', [id])))",
+            False,
+        ),
+        (
+            "async ({ ids }) => { const q = 'DELETE FROM t WHERE id = $1'; "
+            "ids.forEach(id => pool.query(q, [id])); }",
+            False,
+        ),
+        (
+            "async ({ ids }) => { const q = 'DELETE FROM t'; ids.forEach((id = q) => pool.query(q)); }",
+            False,
+        ),
+    ],
+    ids=[
+        "for-of-target",
+        "callback-parameter",
+        "unparenthesized-callback-parameter",
+        "assignment",
+        "augmented-assignment",
+        "member-assignment",
+        "destructuring-assignment",
+        "for-in-key",
+        "for-of-template",
+        "map-callback-template",
+        "value-past-the-walk-bound",
+        "map-callback-parameterized-control",
+        "callback-body-control",
+        "callback-default-control",
+    ],
+)
+def test_typescript_taint_flows_through_loops_callbacks_and_assignments(
+    tmp_path: Path, handler: str, raw: bool
+) -> None:
+    tool = _ts(tmp_path, handler, _PG)
+    assert any("caller-supplied" in r.detail for r in tool.risks) is raw, handler

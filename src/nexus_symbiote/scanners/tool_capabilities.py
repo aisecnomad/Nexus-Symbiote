@@ -93,15 +93,31 @@ _SQL_OBJECTS = frozenset(
     {"TABLE", "VIEW", "INDEX", "DATABASE", "SCHEMA", "SEQUENCE", "FUNCTION", "PROCEDURE"}
     | {"TRIGGER", "TYPE", "USER", "ROLE", "EXTENSION", "MATERIALIZED", "UNIQUE", "TEMP"}
     | {"TEMPORARY", "OR", "IF", "GLOBAL", "LOCAL", "VIRTUAL", "UNLOGGED", "COLUMN"}
-    | {"CONSTRAINT", "POLICY", "DOMAIN", "OWNED"}
+    | {"CONSTRAINT", "POLICY", "DOMAIN", "OWNED", "FOREIGN", "TABLESPACE", "SERVER", "EVENT"}
+    | {"RULE", "ROUTINE", "AGGREGATE", "PUBLICATION", "SUBSCRIPTION", "GROUP", "COLLATION"}
+    | {"LANGUAGE", "STATISTICS", "LOGIN", "SYNONYM", "CLUSTERED", "NONCLUSTERED", "FULLTEXT"}
+    | {"SPATIAL", "DEFINER", "SYSTEM", "DEFAULT", "OPERATOR", "CAST", "CONVERSION", "TEXT"}
 )
 # Words after which the next word still starts the statement.
-_SQL_PREFIXES = frozenset({"EXPLAIN", "ANALYZE", "VERBOSE", "BEGIN", "DO"})
-_SQL_WORD = re.compile(r"\w+")
+_SQL_PREFIXES = frozenset({"EXPLAIN", "ANALYZE", "ANALYSE", "VERBOSE", "BEGIN", "DO"})
+# ``$`` continues a name, so ``a$b$`` is an identifier, not a dollar quote.
+_SQL_WORD = re.compile(r"[\w$]+")
 # Where a database call takes its statement when it is not the first argument.
 _SQL_ARGUMENTS = frozenset({"statement", "query", "sql", "operation"})
 _SQL_DOLLAR = re.compile(r"\$(?:[^\W\d]\w*)?\$")
 _SQL_RANK = {None: 0, "write": 1, "destructive": 2}
+# A literal or quoted name, by its opening character and whether a backslash escapes: a
+# doubled closing character stays inside, and an unterminated one runs to the end.
+_SQL_QUOTED = {
+    (q, e): re.compile(
+        rf"{re.escape(q)}(?:[^{re.escape(c)}{chr(92) * 2 if e else ''}]++|{re.escape(c) * 2}"
+        + (r"|\\." if e else "")
+        + rf")*+{re.escape(c)}?",
+        re.S,
+    )
+    for q, c in (("'", "'"), ('"', '"'), ("`", "`"), ("[", "]"))
+    for e in (False, True)
+}
 
 _TS_EXECUTE = frozenset(
     {"exec", "execSync", "execFile", "execFileSync", "spawn", "spawnSync", "fork"}
@@ -114,7 +130,17 @@ _TS_FS_DELETE = frozenset({"rm", "rmSync", "unlink", "unlinkSync", "rmdir", "rmd
 _TS_HTTP = frozenset({"axios", "node-fetch", "got", "undici", "ky", "http", "https"})
 _TS_SQL = frozenset(
     {"query", "execute", "raw", "unsafe", "$queryRawUnsafe", "$executeRawUnsafe", "queryRaw"}
+    | {"prepare"}
 )
+# SQLite-family and pg-promise statement methods, too common to count on a name alone.
+_TS_SQL_CLIENT = frozenset(
+    {"exec", "run", "all", "get", "each", "none", "one", "many", "any", "result", "batch"}
+    | {"oneOrNone", "manyOrNone"}
+)
+# Clients that are themselves a tag running its template, as postgres.js's ``sql`...```.
+_TS_TAGGED = frozenset({"postgres", "@vercel/postgres", "@neondatabase/serverless"})
+# Methods that run the template they tag, as Prisma's ``prisma.$executeRaw`...```.
+_TS_SQL_TAGS = _TS_SQL | {"$executeRaw", "$queryRaw"}
 # A receiver ``query`` or ``execute`` is SQL on: a client from one of these modules, or by name.
 _TS_DB_MODULES = frozenset(
     {"pg", "mysql", "mysql2", "sqlite3", "better-sqlite3", "postgres", "@prisma/client", "knex"}
@@ -223,18 +249,17 @@ def _secret_name(name: str) -> bool:
     return bool(name) and bool(SECRET_ENV_KEY_RE.search(name))
 
 
-def _sql_tokens(text: str) -> list[str]:
-    """Upper-cased words and ``(``, ``)``, ``;`` outside literals, quoted names and comments."""
+def _sql_tokens(text: str, escapes: bool = False) -> list[str]:
+    """Upper-cased words and ``(``, ``)``, ``;`` outside literals, quoted names and comments.
+    With ``escapes``, a backslash escapes the next character in a literal and ``[name]`` is a
+    quoted name, as in MySQL, PostgreSQL ``E''`` strings, SQLite and T-SQL."""
     tokens: list[str] = []
     i, n = 0, len(text)
     while i < n:
         char = text[i]
-        if char in "'\"`":
-            # A doubled quote stays inside; an unterminated literal runs to the end.
-            end = i + 1
-            while (end := text.find(char, end)) >= 0 and text.startswith(char, end + 1):
-                end += 2
-            i = n if end < 0 else end + 1
+        if char in "'\"`" or (escapes and char == "["):
+            quoted = _SQL_QUOTED[char, escapes].match(text, i)
+            i = quoted.end() if quoted else n
         elif text.startswith("--", i):
             end = text.find("\n", i)
             i = n if end < 0 else end + 1
@@ -257,30 +282,52 @@ def _sql_tokens(text: str) -> list[str]:
 
 
 def _sql_effect(text: str | None) -> str | None:
-    """``destructive``, ``write`` or None: what the statements in ``text`` do. An operation
-    counts where a statement or subquery starts, with the clause it needs."""
+    """``destructive``, ``write`` or None: what the statements in ``text`` do, read with and
+    without backslash escapes, whichever does more. An operation counts where a statement or
+    subquery starts, with the clause it needs."""
     if not text:
         return None
+    # The two readings differ only where a backslash or a bracket can open or escape text.
+    modes = (False, True) if "\\" in text or "[" in text else (False,)
+    effects = {_sql_operations(_sql_tokens(text, escapes)) for escapes in modes}
+    return max(effects, key=lambda effect: _SQL_RANK[effect])
+
+
+def _sql_operations(tokens: list[str]) -> str | None:
     operations: set[str] = set()
-    tokens = _sql_tokens(text)
     begin = 0
     for end in [*(k for k, part in enumerate(tokens) if part == ";"), len(tokens)]:
         statement, begin = tokens[begin:end], end + 1
         words = set(statement)
-        analyze = statement.index("ANALYZE") if "ANALYZE" in words else -1
+        # The last ANALYZE (or ANALYSE) option is the one that applies.
+        analyze = max(
+            (k for k, w in enumerate(statement) if w in {"ANALYZE", "ANALYSE"}), default=-1
+        )
         if statement[:1] == ["EXPLAIN"] and (
             analyze < 0 or statement[analyze + 1 : analyze + 2] in (["FALSE"], ["OFF"], ["0"])
         ):
             continue  # A plan: the statement it describes does not run.
-        restart = statement[:1] in (["WITH"], ["EXPLAIN"])
-        start, depth = True, 0
+        # Per depth, whether a ")" back to it starts a statement again: after a WITH clause's
+        # last CTE, nested or not, and after EXPLAIN's options.
+        restarts = [statement[:1] in (["WITH"], ["EXPLAIN"])]
+        start, skip = True, 0
         for k, word in enumerate(statement):
+            if k < skip:
+                continue
             if word == "(":
-                start, depth = True, depth + 1
+                start = True
+                restarts.append(False)
                 continue
             if word == ")":
-                depth = max(depth - 1, 0)
-                start = restart and depth == 0
+                restarts.pop() if len(restarts) > 1 else None
+                start = restarts[-1]
+                continue
+            if start and word == "WITH":
+                restarts[-1] = True
+            if start and word in {"SEARCH", "CYCLE"} and "SET" in statement[k:]:
+                # A recursive query's SEARCH or CYCLE clause ends at SET <name> [USING <name>].
+                skip = statement.index("SET", k) + 2
+                skip += 2 if statement[skip : skip + 1] == ["USING"] else 0
                 continue
             if start and word in _SQL_PREFIXES:
                 continue
@@ -1309,20 +1356,78 @@ def _ts_locals(
                         names.update(_ts_bound_names(declarator.child_by_field_name("name")))
     stack = [handler]
     visited = 0
-    declarators: list[Node] = []
+    flows: list[Node] = []
+    reads: dict[str, list[int]] = {}
     while stack:
         node = stack.pop()
         visited += 1
         if visited > MAX_BODY_NODES:
             return None
-        if node.type == "variable_declarator":
-            declarators.append(node)
+        if node.type in _TS_READS:
+            reads.setdefault(_ts_text(node), []).append(node.start_byte)
+        elif node.type in _TS_FLOWS or node.type == "call_expression":
+            flows.append(node)
         stack.extend(child for child in node.named_children if child.id not in skip)
-    for node in sorted(declarators, key=lambda n: n.start_byte):
-        value = node.child_by_field_name("value")
-        if value is not None and _ts_uses(value, tainted, assume=False):
-            tainted.update(_ts_bound_names(node.child_by_field_name("name")))
+    _ts_taint(flows, reads, tainted)
     return names
+
+
+_TS_READS = frozenset({"identifier", "shorthand_property_identifier"})
+_TS_FLOWS = {
+    "variable_declarator": ("name", "value"),
+    "assignment_expression": ("left", "right"),
+    "augmented_assignment_expression": ("left", "right"),
+    "for_in_statement": ("left", "right"),
+}
+_TS_CALLBACKS = frozenset({"arrow_function", "function_expression", "function"})
+_TS_HOLDERS = frozenset(
+    {"member_expression", "subscript_expression", "parenthesized_expression", "non_null_expression"}
+)
+
+
+def _ts_taint(flows: list[Node], reads: dict[str, list[int]], tainted: set[str]) -> None:
+    """Add to ``tainted``, in source order, each name a flow binds from a value that reads a
+    tainted name. Reads are found by their offsets, so a flow costs one bisection whatever
+    the size of its value."""
+    marked = sorted(offset for name in tainted for offset in reads.pop(name, ()))
+    for node in sorted(flows, key=lambda flow: flow.start_byte):
+        for bound, source in _ts_flows(node):
+            if source is None:
+                continue
+            at = bisect.bisect_left(marked, source.start_byte)
+            if at == len(marked) or marked[at] >= source.end_byte:
+                continue
+            for name in bound:
+                if name not in tainted:
+                    tainted.add(name)
+                    for offset in reads.pop(name, ()):
+                        bisect.insort(marked, offset)
+
+
+def _ts_flows(node: Node) -> list[tuple[Iterable[str], Node | None]]:
+    """Where a value flows into names: a declaration, an assignment, a ``for ... in`` or
+    ``for ... of`` target, or the parameters of a callback given to a method of the value."""
+    fields = _TS_FLOWS.get(node.type)
+    if fields is not None:
+        target, source = (node.child_by_field_name(field) for field in fields)
+        return [(_ts_assigned(target), source)]
+    callee, arguments = node.child_by_field_name("function"), node.child_by_field_name("arguments")
+    if callee is None or callee.type != "member_expression" or arguments is None:
+        return []
+    receiver = callee.child_by_field_name("object")
+    return [
+        (_ts_parameters(callback), receiver)
+        for callback in arguments.named_children
+        if callback.type in _TS_CALLBACKS
+    ]
+
+
+def _ts_assigned(target: Node | None) -> list[str]:
+    """The names a declaration or assignment binds; assigning to a member or item of a name
+    binds that name."""
+    while target is not None and target.type in _TS_HOLDERS:
+        target = target.child_by_field_name("object") or target.named_child(0)
+    return _ts_bound_names(target)
 
 
 def _ts_bound_names(target: Node | None) -> list[str]:
@@ -1477,19 +1582,117 @@ def _ts_call(
     # it is bound to: a pool is often imported from the project's own ``./db``. Prisma's
     # ``$``-prefixed raw methods exist on no other client.
     client = last.startswith("$") or any(module in _TS_DB_MODULES for module, _ in candidates)
-    named = len(chain) > 1 and chain[-2] in _TS_DB_RECEIVERS
-    if last in _TS_SQL and len(chain) > 1 and values and (client or named):
-        statement = values[0]
-        interpolated = statement.type == "template_string" and any(
-            part.type == "template_substitution" and _ts_uses(part, tainted)
-            for part in statement.named_children
-        )
-        passed = statement.type == "identifier" and _ts_text(statement) in tainted
-        if interpolated or passed:
+    named = len(chain) > 1 and chain[-2].lower() in _TS_DB_RECEIVERS  # D1's binding is ``env.DB``
+    callee = node.child_by_field_name("function")
+    receiver = callee.child_by_field_name("object") if callee is not None else None
+    if arguments is not None and arguments.type == "template_string":
+        # A tag that runs its template; the substitutions are bound parameters.
+        if any(module in _TS_TAGGED for module, _ in candidates) or (
+            len(chain) > 1 and last in _TS_SQL_TAGS and (client or named)
+        ):
+            _sql_record(_ts_statement(arguments, tainted, bound=True)[1], seen)
+        return
+    statement = values[0] if values else None
+    if receiver is not None and receiver.type == "call_expression" and last in _TS_SQL:
+        tag = receiver.child_by_field_name("arguments")
+        if tag is not None and tag.type == "template_string":
+            statement = receiver  # ``sql`...`.execute(db)`` runs the template
+    prepared = "prepare" in chain[:-1]  # A prepared statement's arguments are bound values.
+    if statement is None or prepared or len(chain) < 2:
+        return
+    if (last in _TS_SQL and (client or named)) or (last in _TS_SQL_CLIENT and client):
+        supplied, rank = _ts_statement(statement, tainted)
+        if supplied:
             seen.raw_sql = True
-            seen.delete()
+            rank = 2
+        _sql_record(rank, seen)
+
+
+def _ts_statement(node: Node, tainted: set[str], *, bound: bool = False) -> tuple[bool, int]:
+    """Whether a statement may be caller-supplied, and the rank of its text: the parts of a
+    concatenation, template or conditional, the object a member or item is read from, a
+    method's receiver, the value of an assignment or comma expression and a query config's
+    ``text``, ``sql`` or ``query``. A tagged template's substitutions are bound parameters;
+    past ``_MAX_USE_NODES`` nodes, assume the worst."""
+    supplied, budget = False, _MAX_USE_NODES * 4
+    runs: list[list[str]] = [[]]
+    pending: list[Node | None] = [node]
+    while pending:
+        budget -= 1
+        if budget < 0:
+            return True, 2
+        part = pending.pop()
+        kind = part.type if part is not None else ""
+        if part is None:
+            runs.append([])
+        elif kind in {"string", "template_string"}:
+            runs[-1].append(_ts_literal_text(part) or "")
+            supplied = (
+                supplied
+                or not bound
+                and any(
+                    child.type == "template_substitution" and _ts_uses(child, tainted)
+                    for child in part.named_children
+                )
+            )
+        elif kind == "identifier":
+            supplied = supplied or _ts_text(part) in tainted
+            runs[-1].append("?")
+        elif kind == "binary_expression" and _ts_text(part.child_by_field_name("operator")) == "+":
+            pending += [part.child_by_field_name("right"), part.child_by_field_name("left")]
+        elif kind in {"member_expression", "subscript_expression"}:
+            pending.append(part.child_by_field_name("object"))
+        elif kind == "call_expression":
+            callee, arguments = (
+                part.child_by_field_name("function"),
+                part.child_by_field_name("arguments"),
+            )
+            if arguments is not None and arguments.type == "template_string":
+                runs[-1].append(_ts_literal_text(arguments) or "")
+            elif callee is not None and callee.type == "member_expression":
+                if _ts_property(callee) in {"join", "concat"} and arguments is not None:
+                    supplied = supplied or _ts_uses(arguments, tainted)
+                pending.append(callee.child_by_field_name("object"))
+            else:
+                runs[-1].append("?")
+        elif kind == "ternary_expression":
+            pending += [None, part.child_by_field_name("alternative"), None]
+            pending += [part.child_by_field_name("consequence"), None]
+        elif kind == "array":
+            pending.extend(reversed(part.named_children))
+        elif kind == "object":
+            for pair in part.named_children:
+                key = _ts_text(pair.child_by_field_name("key")).strip("'\"`")
+                if pair.type == "pair" and key in {"text", "sql", "query"}:
+                    pending += [None, pair.child_by_field_name("value"), None]
+        elif kind in _TS_WRAPPERS:
+            pending.extend(part.named_children[:1])
+        elif kind in {"assignment_expression", "sequence_expression"}:
+            pending.extend(part.named_children[-1:])
         else:
-            _sql_record(_SQL_RANK[_sql_effect(_ts_literal_text(statement))], seen)
+            runs[-1].append("?")
+    return supplied, max(_SQL_RANK[_sql_effect("".join(run))] for run in runs)
+
+
+_TS_WRAPPERS = frozenset(
+    {"parenthesized_expression", "as_expression", "satisfies_expression"}
+    | {"non_null_expression", "await_expression", "type_assertion"}
+)
+
+
+def _ts_unescape(escaped: str) -> str:
+    """What a JavaScript escape stands for: a control character as a space, ``\\xHH``
+    and ``\\u`` forms as their character, a line continuation as nothing."""
+    body = escaped[1:]
+    if body[:1] in {"n", "r", "t", "v", "f", "b", "0"} and len(body) == 1:
+        return " "
+    if body[:1] in {"x", "u"}:
+        digits = body[1:].strip("{}")
+        try:
+            return chr(int(digits, 16))
+        except (ValueError, OverflowError):
+            return "?"
+    return "" if body in {"\n", "\r", "\r\n", "\u2028", "\u2029"} else body[:1]
 
 
 def _ts_literal_text(node: Node) -> str | None:
@@ -1501,8 +1704,7 @@ def _ts_literal_text(node: Node) -> str | None:
         if child.type == "string_fragment":
             parts.append(_ts_text(child))
         elif child.type == "escape_sequence":
-            escaped = _ts_text(child)
-            parts.append("\n" if escaped in {"\\n", "\\r"} else escaped[1:2])
+            parts.append(_ts_unescape(_ts_text(child)))
         elif child.type == "template_substitution":
             parts.append(" ? ")
     return "".join(parts)
