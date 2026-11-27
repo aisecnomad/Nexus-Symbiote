@@ -9,6 +9,9 @@ recorded as read-only, because the classifier cannot show that it writes nothing
 from __future__ import annotations
 
 import ast
+import importlib.util
+import sys
+import types
 from dataclasses import replace
 from pathlib import Path
 
@@ -21,9 +24,9 @@ from nexus_symbiote.scanners.mcp import MCPScanner
 from nexus_symbiote.scanners.tool_capabilities import (
     EVIDENCE,
     MAX_BODY_NODES,
+    PythonScopes,
     ToolCapabilities,
     classify_python,
-    import_map,
 )
 
 IMPORT = 'import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";\n'
@@ -34,7 +37,7 @@ E = CapabilityClass
 def _classify(source: str) -> ToolCapabilities:
     tree = ast.parse(source)
     function = next(n for n in tree.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef))
-    return classify_python(function, import_map(tree))
+    return classify_python(function, PythonScopes(tree))
 
 
 def _tools(root: Path) -> dict[str, ToolComponent]:
@@ -557,3 +560,293 @@ def test_a_local_too_large_to_read_is_not_tainted(tmp_path: Path) -> None:
     template = "(id) => { const cols = [COLUMNS]; return db.query(`SELECT ${cols.join(',')} FROM t`, [id]); }"
     tool = _ts(tmp_path, template.replace("COLUMNS", columns))
     assert not [r for r in tool.risks if r.category == "capability_scope"]
+
+
+# ---- Review of 17cd06df: Python scoping and destructured TypeScript bindings ---------------
+
+
+def _classify_named(source: str, name: str) -> ToolCapabilities:
+    tree = ast.parse(source)
+    function = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef) and n.name == name
+    )
+    return classify_python(function, PythonScopes(tree))
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "import subprocess as runner\n\ndef helper():\n    import math as runner\n"
+            "    return runner.sqrt(9)\n\ndef tool(cmd):\n    return runner.run(cmd, shell=True)\n",
+            {E.EXECUTE},
+        ),
+        (
+            "from subprocess import run\n\ndef tool(cmd):\n    def inner():\n"
+            "        run = lambda x: x\n        return run\n    return run(cmd)\n",
+            {E.EXECUTE},
+        ),
+        (
+            "from subprocess import run\n\ndef tool(x):\n    def run(v):\n        return v\n    return run(x)\n",
+            set(),
+        ),
+        (
+            "from subprocess import run\n\ndef tool(items):\n    for run in items:\n        run()\n",
+            set(),
+        ),
+        ("from subprocess import run\n\ndef tool(fs):\n    return [run() for run in fs]\n", set()),
+        (
+            "from subprocess import run\n\ndef tool(cs):\n    return [run(c) for c in cs]\n",
+            {E.EXECUTE},
+        ),
+        (
+            "from subprocess import run\n\ndef tool(ctx):\n    with ctx() as run:\n        run()\n",
+            set(),
+        ),
+        (
+            "import subprocess\n\ndef tool(c):\n    run = subprocess.run\n    return run(c)\n",
+            {E.EXECUTE},
+        ),
+        (
+            "import subprocess\n\ndef register(mcp):\n    import shutil\n\n    @mcp.tool()\n"
+            "    def tool(p):\n        shutil.rmtree(p)\n        return subprocess.run(p)\n",
+            {E.EXECUTE, E.DESTRUCTIVE},
+        ),
+        (
+            "import subprocess\n\nclass Tools:\n    subprocess = None\n\n"
+            "    def tool(self, c):\n        return subprocess.run(c)\n",
+            {E.EXECUTE},
+        ),
+        (
+            "from subprocess import run\n\ndef tool(cmd):\n    class K:\n        if False:\n"
+            "            run = None\n        out = run(cmd)\n    return K.out\n",
+            {E.EXECUTE},
+        ),
+        (
+            "import subprocess\nrunner = None\n\ndef tool(c):\n    global runner\n"
+            "    runner = subprocess.run\n    return runner(c)\n",
+            {E.EXECUTE},
+        ),
+        (
+            "try:\n    from subprocess import run\nexcept ImportError:\n    run = None\n\n"
+            "def tool(c):\n    return run(c)\n",
+            {E.EXECUTE},
+        ),
+        (
+            "from subprocess import run\nfrom math import prod as run\n\ndef tool(c):\n    return run(c)\n",
+            {E.EXECUTE},
+        ),
+        ("from subprocess import run\n\ndef tool(c, run):\n    return run(c)\n", set()),
+        (
+            "from subprocess import run\nfrom .local import run\n\ndef tool(c):\n    return run(c)\n",
+            {E.EXECUTE},
+        ),
+        ("from .local import run\n\ndef tool(c):\n    return run(c)\n", set()),
+    ],
+    ids=[
+        "import-in-another-function",
+        "binding-in-a-nested-function",
+        "local-def",
+        "loop-target",
+        "comprehension-target",
+        "comprehension-reads-the-import",
+        "with-target",
+        "local-alias",
+        "enclosing-function-import",
+        "class-names-are-not-method-locals",
+        "class-body-falls-through",
+        "global-declaration",
+        "conditional-module-import",
+        "every-module-binding-is-kept",
+        "parameter",
+        "relative-import-adds-nothing",
+        "relative-import-alone",
+    ],
+)
+def test_python_names_follow_python_scoping(source: str, expected: set[CapabilityClass]) -> None:
+    found = _classify_named(source, "tool")
+    assert expected <= set(found.capabilities), source
+    if not expected:
+        assert found.declaration is None and not found.risks, source
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "    if False:\n        from math import prod as run\n    return run(cmd)\n",
+        "    if False:\n        run = lambda x: x\n    return run(cmd)\n",
+    ],
+    ids=["import", "assignment"],
+)
+def test_a_binding_in_a_branch_that_never_runs_makes_the_name_local(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str
+) -> None:
+    # Python makes ``run`` local to the whole function, so the call cannot reach the import.
+    found = _classify_named(f"from subprocess import run\n\ndef tool(cmd):\n{body}", "tool")
+    assert found.declaration is None and not found.risks
+    stand_in = types.ModuleType("stand_in")
+    stand_in.run = lambda command: command  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "stand_in", stand_in)
+    path = tmp_path / "dead_branch.py"
+    path.write_text(f"from stand_in import run\n\ndef tool(cmd):\n{body}")
+    spec = importlib.util.spec_from_file_location("dead_branch", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with pytest.raises(UnboundLocalError):
+        module.tool("x")
+
+
+def test_a_name_with_too_many_targets_is_unclassified(tmp_path: Path) -> None:
+    imports = "".join(f"from m{i} import f as run\n" for i in range(40))
+    source = imports + "from subprocess import run\n\ndef tool(c):\n    return run(c)\n"
+    assert _classify_named(source, "tool").unclassified
+    (tmp_path / "server.py").write_text(
+        "from mcp.server.fastmcp import FastMCP\n"
+        + source.replace("def tool", "mcp = FastMCP('t')\n\n\n@mcp.tool()\ndef tool")
+    )
+    result = MCPScanner().scan(tmp_path)
+    (tool,) = [c for c in result.components if isinstance(c, ToolComponent)]
+    assert tool.capabilities is None
+    assert any("tool: tool body too large" in gap for gap in result.surfaces_excluded)
+
+
+def test_bindings_in_many_functions_do_not_leak_into_a_tool() -> None:
+    helpers = "".join(
+        f"def helper{i}():\n    import math as runner\n    runner = {i}\n    return runner\n\n"
+        for i in range(2000)
+    )
+    source = f"import subprocess as runner\n\n{helpers}def tool(c):\n    return runner.run(c)\n"
+    assert set(_classify_named(source, "tool").capabilities) == {E.EXECUTE}
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected"),
+    [
+        (
+            "",
+            '(c) => { const { execSync: runCmd } = require("child_process"); return runCmd(c); }',
+            {E.EXECUTE},
+        ),
+        (
+            "",
+            '(p) => { const { unlink: delFile } = require("node:fs/promises"); return delFile(p); }',
+            {E.FILESYSTEM, E.WRITE, E.DESTRUCTIVE},
+        ),
+        (
+            "",
+            'async (c) => { const { execSync: runCmd } = await import("child_process"); return runCmd(c); }',
+            {E.EXECUTE},
+        ),
+        (
+            'const { execSync: run = null } = require("child_process");\n',
+            "(c) => run(c)",
+            {E.EXECUTE},
+        ),
+        (
+            'const { promises: { unlink: del } } = require("fs");\n',
+            "(p) => del(p)",
+            {E.FILESYSTEM, E.WRITE, E.DESTRUCTIVE},
+        ),
+        (
+            'const { unlink } = require("fs").promises;\n',
+            "(p) => unlink(p)",
+            {E.FILESYSTEM, E.WRITE, E.DESTRUCTIVE},
+        ),
+        ('const { ...cp } = require("child_process");\n', "(c) => cp.exec(c)", {E.EXECUTE}),
+        ('const { execSync: runCmd } = require("./safe");\n', "(c) => runCmd(c)", set()),
+    ],
+    ids=[
+        "require-alias",
+        "fs-promises-alias",
+        "dynamic-import-alias",
+        "alias-with-default",
+        "nested-pattern",
+        "require-member-pattern",
+        "rest-pattern",
+        "local-module",
+    ],
+)
+def test_typescript_destructured_module_bindings(
+    tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass]
+) -> None:
+    assert _caps(_ts(tmp_path, handler, header)) == expected, handler
+
+
+@pytest.mark.parametrize(
+    ("body", "expected", "raw"),
+    [
+        ("    return text(q)\n", set(), False),
+        ("    stmt = text(q)\n    return stmt\n", set(), False),
+        ("    return session.execute(text(q))\n", {E.WRITE, E.DESTRUCTIVE}, True),
+        (
+            "    stmt = text(f'DELETE FROM t WHERE id = {q}')\n    return conn.execute(stmt)\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            True,
+        ),
+        ("    return conn.execute(text(q).bindparams(a=1))\n", {E.WRITE, E.DESTRUCTIVE}, True),
+        ("    return conn.execute(text('SELECT 1').bindparams(a=q))\n", set(), False),
+        ("    return conn.execute('SELECT * FROM t -- DELETE later', (q,))\n", set(), False),
+        ("    return conn.execute(\"SELECT * FROM t WHERE note = 'DROP me'\")\n", set(), False),
+        ("    return conn.execute('/* UPDATE */ SELECT * FROM t FOR UPDATE')\n", set(), False),
+        ("    return conn.execute('SELECT 1; DROP TABLE t')\n", {E.WRITE, E.DESTRUCTIVE}, False),
+        (
+            "    return conn.execute('ALTER TABLE t DROP COLUMN c')\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    return conn.execute('CREATE TABLE t (id INT REFERENCES u ON DELETE CASCADE)')\n",
+            {E.WRITE},
+            False,
+        ),
+        (
+            "    return conn.execute('WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d')\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+    ],
+    ids=[
+        "text-preview",
+        "text-bound-and-returned",
+        "text-executed",
+        "text-of-an-f-string-executed",
+        "text-bindparams-executed",
+        "literal-text-bindparams",
+        "comment-prose",
+        "literal-prose",
+        "lock-clause",
+        "second-statement",
+        "alter-drop",
+        "referential-action",
+        "data-modifying-cte",
+    ],
+)
+def test_sql_is_read_as_statements_and_only_executed_sql_counts(
+    body: str, expected: set[CapabilityClass], raw: bool
+) -> None:
+    found = _classify(f"from sqlalchemy import text\n\ndef tool(q, session, conn):\n{body}")
+    assert set(found.capabilities) == expected, body
+    assert any("caller-supplied" in r.detail for r in found.risks) is raw, body
+
+
+@pytest.mark.parametrize(
+    ("handler", "expected"),
+    [
+        ('(id) => db.query("UPDATE t SET seen = 1 WHERE id = $1", [id])', {E.WRITE}),
+        ("() => db.query('DELETE FROM sessions')", {E.WRITE, E.DESTRUCTIVE}),
+        ("(id) => db.query(`UPDATE t SET n = ${LIMIT} WHERE id = $1`, [id])", {E.WRITE}),
+        ("() => db.query('SELECT * FROM t -- DELETE later')", set()),
+        ("() => db.query(\"SELECT * FROM t WHERE note = 'please DROP it'\")", set()),
+        ("(q) => index.query('Update my profile')", set()),
+    ],
+    ids=["update", "delete", "constant-substitution", "comment", "literal", "prose"],
+)
+def test_typescript_literal_sql_is_classified_by_its_statement(
+    tmp_path: Path, handler: str, expected: set[CapabilityClass]
+) -> None:
+    tool = _ts(tmp_path, handler)
+    assert _caps(tool) == expected, handler
+    assert not [r for r in tool.risks if r.category == "capability_scope"], handler

@@ -35,22 +35,17 @@ process execution (`subprocess.run`, `os.system`, `eval`; `child_process.execSyn
 SQL that writes or that is built from a parameter, payment API writes (`stripe.Refund.create`,
 `stripe.refunds.create`) and reads of secret-named environment variables. The profile is
 `financial-transaction`, `destructive` or `state-modifying` by the strongest of these, and
-the record says `capability_evidence: source-body-call-names`.
+the record says `capability_evidence: source-body-call-names`. SQL counts only when it is passed to a database call such as `execute` or `query`; building a statement, such as with SQLAlchemy `text()`, runs nothing. A literal statement is read as SQL tokens: words in string literals, quoted names and comments count for nothing, and an operation counts where a statement or subquery starts, with the clause it needs (`INSERT INTO`, `UPDATE ... SET`, `DELETE FROM`, or `DROP`, `CREATE` or `ALTER` and what they act on). So `SELECT ... FOR UPDATE` and `ON DELETE CASCADE` write nothing, while a second statement such as `; DROP TABLE t` or a data-modifying `WITH` clause does.
 
-Names are resolved only through the file's imports (in TypeScript also `require`, dynamic
-`import()` and `promisify` of an imported function), a client or connection the body binds
-from an imported call, and builtins, so a parameter, a name the handler declares at the top
-of its body, a local function or an unimported name spelled like a module names nothing. A
-name bound to a module more than once, in any scope, keeps every binding, so a second
-binding, such as an unused `require` of the same name, cannot hide the first. A method of a value a
-module returns is not the module's function: `os.getenv(...).replace(...)` writes nothing.
+Names are resolved only through the file's imports (in TypeScript also `require`, dynamic `import()`, destructuring of either, and `promisify` of an imported function), a name bound from an imported call or name, such as a client, a connection or `run = subprocess.run`, and builtins. Python names follow Python's scoping: a name a function binds anywhere in its own body (a parameter, an assignment, a loop, `with` or `except` target, an `import`, a `def` or a `class`) is local to it, so it never reaches an import of the same name in the module or in another function, and a nested function's or comprehension's bindings stay its own. A binding in a branch that never runs still makes the name local, as it does in Python, where reading it then raises `UnboundLocalError`.
+A TypeScript parameter or a name the handler declares at the top of its body shadows an import. So a parameter, a local function, a loop target or an unimported name spelled like a module names nothing. A module-level name, and a TypeScript name bound to a module in any scope, keeps every binding it has, so a second binding, such as an unused `require` or a fallback import of the same name, cannot hide the first. A method of a value a module returns is not the module's function: `os.getenv(...).replace(...)` writes nothing.
 TypeScript is read from its syntax tree, so comments and strings name nothing either, and a
 callee chain of more than 16 steps names nothing, which keeps every node's cost constant. The classifier cannot show that a body does nothing else:
 it does not follow helpers, dynamic dispatch, a handler bound elsewhere or another file. It
 therefore never records `read` or `read-only`; a body that names only reads, or nothing it
 knows, keeps no declaration and stays `unknown`, which the graph and trifecta rules treat as
-not safe. A body of more than 20,000 syntax nodes is not classified and records a coverage
-gap. A shell or evaluation call and a caller-supplied SQL statement are `capability_scope`
+not safe. A body of more than 20,000 syntax nodes, or one that reads a Python name with more
+than 32 distinct targets in one scope, is not classified and records a coverage gap. A shell or evaluation call and a caller-supplied SQL statement are `capability_scope`
 findings at high, a payment write at medium.
 
 The `mcp` collector names a server it finds in Python, TypeScript or JavaScript

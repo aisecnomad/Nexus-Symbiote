@@ -6,7 +6,7 @@ import ast
 import re
 import warnings
 from collections import Counter, deque
-from collections.abc import Container, Iterable, Mapping, Sequence
+from collections.abc import Container, Iterable, Sequence
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import quote
@@ -22,8 +22,8 @@ from nexus_symbiote.scanners.base import KnownValues, ScanResult, declared_serve
 from nexus_symbiote.scanners.tool_capabilities import (
     EVIDENCE,
     UNCLASSIFIED,
+    PythonScopes,
     classify_python,
-    import_map,
 )
 
 PYTHON_TOOL_HINTS = (
@@ -506,7 +506,7 @@ def _record_decorator(
     source_digest: str,
     result: ScanResult,
     func_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None,
-    imports: Mapping[str, str] | None = None,
+    imports: PythonScopes | None = None,
 ) -> None:
     keywords = deco.keywords if isinstance(deco, ast.Call) else []
     options = {kw.arg: kw.value for kw in keywords}
@@ -535,7 +535,7 @@ def _record_decorator(
     risks = _declaration_text_risks(deco, func_node, f"{path.as_posix()}:{deco.lineno} ({name})")
     capabilities = None
     if func_node is not None:
-        classified = classify_python(func_node, imports or {}, name)
+        classified = classify_python(func_node, imports, name)
         if classified.unclassified:
             result.surfaces_excluded.append(
                 f"{path.as_posix()}:{deco.lineno} ({name}: {UNCLASSIFIED})"
@@ -580,7 +580,7 @@ def _record_sdk_decorator(
     result: ScanResult,
     owner: str | None = None,
     func_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None,
-    imports: Mapping[str, str] | None = None,
+    imports: PythonScopes | None = None,
 ) -> None:
     """Record one decorated tool; ``owner`` names the agent it is registered on."""
     lineno = getattr(deco, "lineno", 1)
@@ -622,7 +622,7 @@ def _record_sdk_decorator(
     risks = _declaration_text_risks(deco, func_node, f"{path.as_posix()}:{lineno} ({name})")
     capabilities = None
     if func_node is not None:
-        classified = classify_python(func_node, imports or {}, name)
+        classified = classify_python(func_node, imports, name)
         if classified.unclassified:
             result.surfaces_excluded.append(f"{path.as_posix()}:{lineno} ({name}: {UNCLASSIFIED})")
         risks = [*risks, *classified.risks]
@@ -662,7 +662,7 @@ def _collect_sdk_decorators(
     source_digest: str,
     seen_refs: set[str],
     result: ScanResult,
-    imports: Mapping[str, str] | None = None,
+    imports: PythonScopes | None = None,
 ) -> None:
     top_level = set(tree.body)
     valid: dict[str, tuple[int, str]] = {}
@@ -736,7 +736,7 @@ def _collect_agent_decorators(
     source_digest: str,
     seen_refs: set[str],
     result: ScanResult,
-    imports: Mapping[str, str] | None = None,
+    imports: PythonScopes | None = None,
 ) -> set[str]:
     top_level = set(tree.body)
     calls = {
@@ -1239,7 +1239,7 @@ def _record_decorated_tools(
     path: Path,
     source_digest: str,
     result: ScanResult,
-    imports: Mapping[str, str] | None = None,
+    imports: PythonScopes | None = None,
 ) -> None:
     unwrapped = _unwrapped(
         [
@@ -2580,7 +2580,7 @@ def collect_python_tools(
         return
 
     source_digest = hash_bytes(source.encode("utf-8"))
-    import_names = import_map(tree)
+    import_names = PythonScopes(tree)
     seen_refs: set[str] = set()
     if decorators:
         _collect_sdk_decorators(
