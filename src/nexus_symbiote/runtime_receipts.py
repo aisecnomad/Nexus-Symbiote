@@ -16,17 +16,23 @@ import hashlib
 import json
 import os
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import Field
 
-from nexus_symbiote.core.hashing import open_directory_nofollow, open_regular_file
+from nexus_symbiote.core.hashing import (
+    descriptor_binding,
+    open_directory_nofollow,
+    open_regular_file,
+)
 from nexus_symbiote.runtime import (
+    REASONS,
     AuthorizationError,
     Contract,
     ContractSigner,
@@ -44,6 +50,7 @@ RECEIPT_SCHEMA_VERSION: Literal["nexus-symbiote/runtime-receipt/v1"] = (
     "nexus-symbiote/runtime-receipt/v1"
 )
 GENESIS_HASH = "sha256:" + "0" * 64
+EMPTY_MERKLE_ROOT = "sha256:" + hashlib.sha256(b"").hexdigest()
 _RECEIPT_SIGNING_PREFIX = b"nexus-symbiote/runtime-receipt/v1\n"
 _MERKLE_LEAF_PREFIX = b"\x00"
 _MERKLE_NODE_PREFIX = b"\x01"
@@ -51,7 +58,7 @@ MAX_RECEIPT_FILE_BYTES = 64 * 1024 * 1024
 MAX_RECEIPT_LINE_BYTES = 128 * 1024
 MAX_RECEIPTS = 250_000
 MAX_VERIFICATION_ERRORS = 64
-_MAX_LABEL_CHARS = 1024
+_LABELS_WITHHELD = "[withheld]"
 
 
 class ReceiptError(ValueError):
@@ -84,9 +91,9 @@ class ExecutionReceipt(Contract):
     snapshot_digest: Sha256Digest | None = None
     approval_digest: Sha256Digest | None = None
     approval_actor: str | None = None
-    trust_signers: tuple[str, ...] = ()
-    snapshot_signers: tuple[str, ...] = ()
-    approval_signers: tuple[str, ...] = ()
+    trust_signers: tuple[KeyId, ...] = ()
+    snapshot_signers: tuple[KeyId, ...] = ()
+    approval_signers: tuple[KeyId, ...] = ()
     signer_key_id: KeyId | None = None
     signature: str | None = Field(default=None, max_length=1024)
 
@@ -103,6 +110,8 @@ class ReceiptVerificationResult:
     signed_count: int
     signers: tuple[str, ...]
     errors: tuple[str, ...] = ()
+    presented_signers: tuple[str, ...] = ()
+    verified_signature_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -113,6 +122,8 @@ class ReceiptVerificationResult:
             "merkle_root": self.merkle_root,
             "signed_count": self.signed_count,
             "signers": list(self.signers),
+            "presented_signers": list(self.presented_signers),
+            "verified_signature_count": self.verified_signature_count,
             "errors": list(self.errors),
         }
 
@@ -148,7 +159,7 @@ def compute_merkle_root(hashes: Sequence[str]) -> str:
     duplicate tail cannot produce a second-preimage collision (CVE-2012-2459).
     """
     if not hashes:
-        return GENESIS_HASH
+        return EMPTY_MERKLE_ROOT
     level = [hashlib.sha256(_MERKLE_LEAF_PREFIX + item.encode("utf-8")).digest() for item in hashes]
     while len(level) > 1:
         next_level: list[bytes] = []
@@ -170,6 +181,8 @@ def _signing_message(body: Mapping[str, Any]) -> bytes:
 def _check_safe_log_file(info: os.stat_result) -> None:
     if not stat.S_ISREG(info.st_mode):
         raise ReceiptError("receipt log must be a regular file")
+    if info.st_nlink != 1:
+        raise ReceiptError("receipt log must have one link")
     if os.name == "posix":
         if info.st_uid != os.geteuid():
             raise ReceiptError("receipt log must be owned by the current user")
@@ -177,29 +190,37 @@ def _check_safe_log_file(info: os.stat_result) -> None:
             raise ReceiptError("receipt log must not be accessible to group or others (0600)")
 
 
-def _open_append_0600(path: Path) -> int:
-    target = path.absolute()
-    parent_path = target.parent
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-    parent_fd = open_directory_nofollow(parent_path)
+def _lock_receipt_file(fd: int, *, shared: bool) -> None:
     try:
-        fd = os.open(target.name, flags, 0o600, dir_fd=parent_fd)
+        import fcntl
+    except ImportError as exc:
+        raise OSError("receipt locking requires POSIX advisory locks") from exc
+    fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+
+
+@contextmanager
+def _locked_log(path: Path) -> Iterator[BinaryIO]:
+    """Hold a writer lock on the same private file used to inspect and append the chain."""
+    parent = open_directory_nofollow(path.parent)
+    try:
+        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+        fd = os.open(path.name, flags, 0o600, dir_fd=parent)
+        with os.fdopen(fd, "r+b", buffering=0) as stream:
+            _check_safe_log_file(os.fstat(fd))
+            _lock_receipt_file(fd, shared=False)
+            opened = os.fstat(fd)
+            _check_safe_log_file(opened)
+            if not os.path.samestat(
+                opened, os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            ):
+                raise ReceiptError("receipt log changed before append")
+            yield stream
+            if not os.path.samestat(
+                opened, os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            ):
+                raise ReceiptError("receipt log changed during append")
     finally:
-        os.close(parent_fd)
-    try:
-        info = os.fstat(fd)
-        _check_safe_log_file(info)
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
-
-
-def _clip_label(value: str) -> str:
-    if len(value) <= _MAX_LABEL_CHARS:
-        return value
-    digest_tail = hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:16]
-    return f"{value[: _MAX_LABEL_CHARS - 25]}...[sha256:{digest_tail}]"
+        os.close(parent)
 
 
 class ReceiptChainSink:
@@ -217,25 +238,41 @@ class ReceiptChainSink:
         self._hashes: list[str] = []
         self._last_hash = GENESIS_HASH
         self._next_seq = 0
-        if os.path.lexists(self.path):
-            resume_keys = trusted_keys
-            if resume_keys is None and signer is not None:
-                pub = signer.public_key()
-                resume_keys = {key_id(pub): pub}
-            existing, hashes = _verify_receipt_chain_with_hashes(
-                self.path,
-                trusted_keys=resume_keys,
-                require_signatures=signer is not None,
-                allow_empty=True,
-                check_owner_0600=True,
-            )
-            if not existing.verified:
-                raise ReceiptError(
-                    "refusing to append to tampered receipt chain: " + "; ".join(existing.errors)
-                )
-            self._hashes = hashes
-            self._next_seq = existing.count
-            self._last_hash = existing.last_hash or GENESIS_HASH
+        self._ring = dict(trusted_keys or {})
+        if signer is not None:
+            public = signer.public_key()
+            if trusted_keys is not None and (
+                key_id(public) not in trusted_keys
+                or any(key_id(pub) != kid for kid, pub in trusted_keys.items())
+            ):
+                raise ReceiptError("receipt signer is not trusted by the supplied ring")
+            self._ring[key_id(public)] = public
+        elif trusted_keys is not None:
+            raise ReceiptError("a trusted receipt writer requires a signer")
+        self._stamp: tuple[int, ...] | None = None
+        with _locked_log(self.path) as stream:
+            self._refresh(stream)
+
+    def _refresh(self, stream: BinaryIO) -> None:
+        stamp = descriptor_binding(os.fstat(stream.fileno()))
+        if self._stamp == stamp:
+            return
+        stream.seek(0)
+        result, hashes = _verify_stream(
+            stream, self._ring or None, self.signer is not None, None, allow_empty=True
+        )
+        if not result.verified:
+            raise ReceiptError("cannot resume receipt chain: " + "; ".join(result.errors))
+        if result.signed_count and self.signer is None:
+            raise ReceiptError("resuming a signed chain requires a trusted signer")
+        if self._next_seq and (
+            result.count < self._next_seq or hashes[self._next_seq - 1] != self._last_hash
+        ):
+            raise ReceiptError("receipt log no longer contains this writer's committed prefix")
+        self._hashes = hashes
+        self._next_seq = result.count
+        self._last_hash = result.last_hash or GENESIS_HASH
+        self._stamp = stamp
 
     @property
     def count(self) -> int:
@@ -253,29 +290,40 @@ class ReceiptChainSink:
         return self.record(decision)
 
     def record(self, decision: Decision) -> ExecutionReceipt:
+        with _locked_log(self.path) as stream:
+            self._refresh(stream)
+            return self._append(stream, decision)
+
+    def _append(self, stream: BinaryIO, decision: Decision) -> ExecutionReceipt:
+        if self._next_seq >= MAX_RECEIPTS:
+            raise ReceiptError("receipt log exceeds its record limit")
         body: dict[str, Any] = {
             "schema_version": RECEIPT_SCHEMA_VERSION,
             "seq": self._next_seq,
             "prev_hash": self._last_hash,
             "admitted": decision.admitted,
-            "reason": _clip_label(decision.reason)[:128],
+            "reason": decision.reason
+            if decision.reason in REASONS or decision.reason == "admitted"
+            else "denied",
             "time": decision.time.isoformat(),
-            "server_id": _clip_label(decision.server_id),
-            "tool_name": _clip_label(decision.tool_name),
-            "action": _clip_label(decision.action),
-            "resource": _clip_label(decision.resource),
-            "store_id": decision.store_id,
+            "server_id": _LABELS_WITHHELD,
+            "tool_name": _LABELS_WITHHELD,
+            "action": _LABELS_WITHHELD,
+            "resource": _LABELS_WITHHELD,
+            "store_id": _LABELS_WITHHELD if decision.store_id is not None else None,
             "request_digest": decision.request_digest,
-            "tenant": decision.tenant,
-            "deployment_id": decision.deployment_id,
-            "agent_id": decision.agent_id,
-            "workload_identity": decision.workload_identity,
+            "tenant": _LABELS_WITHHELD if decision.tenant is not None else None,
+            "deployment_id": _LABELS_WITHHELD if decision.deployment_id is not None else None,
+            "agent_id": _LABELS_WITHHELD if decision.agent_id is not None else None,
+            "workload_identity": _LABELS_WITHHELD
+            if decision.workload_identity is not None
+            else None,
             "trust_serial": decision.trust_serial,
             "trust_digest": decision.trust_digest,
             "snapshot_serial": decision.snapshot_serial,
             "snapshot_digest": decision.snapshot_digest,
             "approval_digest": decision.approval_digest,
-            "approval_actor": decision.approval_actor,
+            "approval_actor": _LABELS_WITHHELD if decision.approval_actor is not None else None,
             "trust_signers": list(decision.trust_signers),
             "snapshot_signers": list(decision.snapshot_signers),
             "approval_signers": list(decision.approval_signers),
@@ -285,252 +333,166 @@ class ReceiptChainSink:
         signature_b64: str | None = None
         if self.signer is not None:
             public = self.signer.public_key()
+            signer_kid = key_id(public)
+            if signer_kid not in self._ring:
+                raise ReceiptError("current receipt signer is not trusted by the configured ring")
             msg = _signing_message(body)
             raw_sig = self.signer.sign(msg)
             public.verify(raw_sig, msg)
-            signer_kid = key_id(public)
             signature_b64 = base64.b64encode(raw_sig).decode("ascii")
 
-        receipt = ExecutionReceipt(
+        envelope = {
             **body,
-            receipt_hash=receipt_hash,
-            signer_key_id=signer_kid,
-            signature=signature_b64,
+            "receipt_hash": receipt_hash,
+            "signer_key_id": signer_kid,
+            "signature": signature_b64,
+        }
+        encoded = (json.dumps(envelope, separators=(",", ":"), sort_keys=True) + "\n").encode(
+            "utf-8"
         )
-        encoded = (
-            json.dumps(receipt.model_dump(mode="json"), separators=(",", ":"), sort_keys=True)
-            + "\n"
-        ).encode("utf-8")
         if len(encoded) > MAX_RECEIPT_LINE_BYTES:
             raise ReceiptError("serialized receipt exceeds maximum line byte limit")
-        fd = _open_append_0600(self.path)
-        with os.fdopen(fd, "ab") as stream:
-            stream.write(encoded)
+        receipt = ExecutionReceipt.model_validate_json(encoded, strict=True)
+        fd = stream.fileno()
+        size = os.fstat(fd).st_size
+        if size + len(encoded) > MAX_RECEIPT_FILE_BYTES:
+            raise ReceiptError("receipt log exceeds its byte limit")
+        try:
+            if stream.write(encoded) != len(encoded):
+                raise ReceiptError("incomplete receipt write")
             stream.flush()
-            os.fsync(stream.fileno())
+            os.fsync(fd)
+        except BaseException:
+            self._stamp = None
+            os.ftruncate(fd, size)
+            os.fsync(fd)
+            raise
+        self._stamp = descriptor_binding(os.fstat(fd))
         self._hashes.append(receipt_hash)
         self._last_hash = receipt_hash
         self._next_seq += 1
         return receipt
 
 
-def _verify_receipt_chain_with_hashes(
-    path: Path,
-    *,
-    trusted_keys: Mapping[str, Ed25519PublicKey] | None = None,
-    require_signatures: bool = False,
-    expected_merkle_root: str | None = None,
-    allow_empty: bool = False,
-    check_owner_0600: bool = False,
-) -> tuple[ReceiptVerificationResult, list[str]]:
-    """Single-open fail-closed verifier returning both result and verified receipt hashes."""
-    errors: list[str] = []
-    omitted_errors = 0
+def _failed(reason: str) -> ReceiptVerificationResult:
+    return ReceiptVerificationResult(False, 0, None, None, EMPTY_MERKLE_ROOT, 0, (), (reason,))
 
-    def add_error(message: str) -> None:
-        nonlocal omitted_errors
+
+def _verify_stream(
+    stream: BinaryIO,
+    trusted_keys: Mapping[str, Ed25519PublicKey] | None,
+    require_signatures: bool,
+    expected_merkle_root: str | None,
+    *,
+    allow_empty: bool = False,
+) -> tuple[ReceiptVerificationResult, list[str]]:
+    before = os.fstat(stream.fileno())
+    if before.st_size > MAX_RECEIPT_FILE_BYTES:
+        return _failed("receipt log exceeds maximum size limit"), []
+    ring = dict(trusted_keys or {})
+    if (require_signatures or trusted_keys is not None) and (
+        not ring or any(key_id(pub) != kid for kid, pub in ring.items())
+    ):
+        return _failed("signature verification requires a valid trusted Ed25519 key ring"), []
+
+    errors: list[str] = []
+    omitted = 0
+
+    def error(message: str) -> None:
+        nonlocal omitted
         if len(errors) < MAX_VERIFICATION_ERRORS:
             errors.append(message)
         else:
-            omitted_errors += 1
-
-    ring = (
-        {kid: pub for kid, pub in trusted_keys.items() if key_id(pub) == kid}
-        if trusted_keys
-        else {}
-    )
-    if (require_signatures or trusted_keys is not None) and not ring:
-        return (
-            ReceiptVerificationResult(
-                verified=False,
-                count=0,
-                first_hash=None,
-                last_hash=None,
-                merkle_root=GENESIS_HASH,
-                signed_count=0,
-                signers=(),
-                errors=("signature verification requires at least one trusted Ed25519 public key",),
-            ),
-            [],
-        )
+            omitted += 1
 
     hashes: list[str] = []
-    signers: set[str] = set()
-    signed_count = 0
-
-    try:
-        with open_regular_file(path) as handle:
-            info = os.fstat(handle.fileno())
-            if check_owner_0600:
-                _check_safe_log_file(info)
-            if info.st_size > MAX_RECEIPT_FILE_BYTES:
-                return (
-                    ReceiptVerificationResult(
-                        verified=False,
-                        count=0,
-                        first_hash=None,
-                        last_hash=None,
-                        merkle_root=GENESIS_HASH,
-                        signed_count=0,
-                        signers=(),
-                        errors=("receipt log exceeds maximum size limit",),
-                    ),
-                    [],
-                )
-            raw = handle.read(MAX_RECEIPT_FILE_BYTES + 1)
-    except ReceiptError as exc:
-        return (
-            ReceiptVerificationResult(
-                verified=False,
-                count=0,
-                first_hash=None,
-                last_hash=None,
-                merkle_root=GENESIS_HASH,
-                signed_count=0,
-                signers=(),
-                errors=(str(exc),),
-            ),
-            [],
-        )
-    except OSError:
-        return (
-            ReceiptVerificationResult(
-                verified=False,
-                count=0,
-                first_hash=None,
-                last_hash=None,
-                merkle_root=GENESIS_HASH,
-                signed_count=0,
-                signers=(),
-                errors=("receipt log could not be read safely",),
-            ),
-            [],
-        )
-
-    if len(raw) > MAX_RECEIPT_FILE_BYTES:
-        return (
-            ReceiptVerificationResult(
-                verified=False,
-                count=0,
-                first_hash=None,
-                last_hash=None,
-                merkle_root=GENESIS_HASH,
-                signed_count=0,
-                signers=(),
-                errors=("receipt log exceeds maximum size limit",),
-            ),
-            [],
-        )
-
-    lines = [line for line in raw.splitlines() if line.strip()]
-    if not lines:
-        if allow_empty:
-            return (
-                ReceiptVerificationResult(
-                    verified=True,
-                    count=0,
-                    first_hash=None,
-                    last_hash=None,
-                    merkle_root=GENESIS_HASH,
-                    signed_count=0,
-                    signers=(),
-                    errors=(),
-                ),
-                [],
-            )
-        return (
-            ReceiptVerificationResult(
-                verified=False,
-                count=0,
-                first_hash=None,
-                last_hash=None,
-                merkle_root=GENESIS_HASH,
-                signed_count=0,
-                signers=(),
-                errors=("receipt log is empty",),
-            ),
-            [],
-        )
-    if len(lines) > MAX_RECEIPTS:
-        return (
-            ReceiptVerificationResult(
-                verified=False,
-                count=0,
-                first_hash=None,
-                last_hash=None,
-                merkle_root=GENESIS_HASH,
-                signed_count=0,
-                signers=(),
-                errors=(f"receipt log exceeds {MAX_RECEIPTS} entries",),
-            ),
-            [],
-        )
-
-    expected_prev = GENESIS_HASH
-    for idx, line in enumerate(lines):
+    presented: set[str] = set()
+    authenticated: set[str] = set()
+    signed_count = verified_count = total = count = 0
+    previous = GENESIS_HASH
+    while line := stream.readline(MAX_RECEIPT_LINE_BYTES + 1):
+        total += len(line)
+        if total > MAX_RECEIPT_FILE_BYTES:
+            return _failed("receipt log exceeds maximum size limit"), []
         if len(line) > MAX_RECEIPT_LINE_BYTES:
-            add_error(f"entry {idx}: line exceeds maximum byte limit")
+            error("line exceeds maximum byte limit")
+            break
+        if not line.endswith(b"\n"):
+            error("final receipt line is missing its newline")
+            break
+        if not line.strip():
             continue
+        if count >= MAX_RECEIPTS:
+            error(f"receipt log exceeds {MAX_RECEIPTS} entries")
+            break
+        index = count
+        count += 1
         try:
             obj = strict_json(line)
-            if not isinstance(obj, dict):
-                raise ReceiptError("entry is not a JSON object")
-            receipt = ExecutionReceipt.model_validate(obj)
-        except (AuthorizationError, ReceiptError, ValueError) as exc:
-            add_error(f"entry {idx}: malformed receipt ({type(exc).__name__})")
+            if not isinstance(obj, dict) or set(obj) != ExecutionReceipt.model_fields.keys():
+                raise ReceiptError("v1 receipt fields are missing or unknown")
+            # Strict JSON mode accepts JSON arrays for tuples, but never coerces
+            # strings or numbers into other JSON types. Sign the original wire body.
+            receipt = ExecutionReceipt.model_validate_json(line, strict=True)
+        except (AuthorizationError, ValueError) as exc:
+            error(f"entry {index}: malformed receipt ({type(exc).__name__})")
             continue
 
-        if receipt.seq != idx:
-            add_error(f"entry {idx}: expected seq {idx}, got {receipt.seq}")
-        if receipt.prev_hash != expected_prev:
-            add_error(f"entry {idx}: prev_hash mismatch (chain broken)")
+        if receipt.seq != index:
+            error(f"entry {index}: expected seq {index}, got {receipt.seq}")
+        if receipt.prev_hash != previous:
+            error(f"entry {index}: prev_hash mismatch (chain broken)")
+        body = _receipt_body(obj)
+        if compute_receipt_hash(body) != receipt.receipt_hash:
+            error(f"entry {index}: receipt_hash mismatch (tampered payload)")
+        previous = receipt.receipt_hash
+        hashes.append(previous)
 
-        body = _receipt_body(receipt.model_dump(mode="json"))
-        computed = compute_receipt_hash(body)
-        if receipt.receipt_hash != computed:
-            add_error(f"entry {idx}: receipt_hash mismatch (tampered payload)")
+        kid, signature = receipt.signer_key_id, receipt.signature
+        if kid is None and signature is None:
+            if require_signatures or ring:
+                error(f"entry {index}: missing required Ed25519 signature")
+            continue
+        if kid is None or signature is None:
+            error(f"entry {index}: incomplete signature fields")
+            continue
+        signed_count += 1
+        presented.add(kid)
+        try:
+            sig_bytes = base64.b64decode(signature, validate=True)
+            if len(sig_bytes) != 64 or base64.b64encode(sig_bytes).decode("ascii") != signature:
+                raise ValueError("incorrect Ed25519 signature encoding")
+            if ring:
+                if kid not in ring:
+                    error(f"entry {index}: signer key is not in trusted ring")
+                    continue
+                ring[kid].verify(sig_bytes, _signing_message(body))
+                verified_count += 1
+                authenticated.add(kid)
+        except (binascii.Error, ValueError, InvalidSignature):
+            error(f"entry {index}: invalid Ed25519 signature")
 
-        if receipt.signature is not None or receipt.signer_key_id is not None:
-            if receipt.signature is None or receipt.signer_key_id is None:
-                add_error(f"entry {idx}: incomplete signature fields")
-            else:
-                signed_count += 1
-                signers.add(receipt.signer_key_id)
-                if ring:
-                    pub = ring.get(receipt.signer_key_id)
-                    if pub is None:
-                        add_error(f"entry {idx}: signer key is not in trusted ring")
-                    else:
-                        try:
-                            sig_bytes = base64.b64decode(receipt.signature, validate=True)
-                            pub.verify(sig_bytes, _signing_message(body))
-                        except (binascii.Error, ValueError, InvalidSignature):
-                            add_error(f"entry {idx}: invalid Ed25519 signature")
-        elif require_signatures or ring:
-            add_error(f"entry {idx}: missing required Ed25519 signature")
-
-        hashes.append(receipt.receipt_hash)
-        expected_prev = receipt.receipt_hash
-
+    if not allow_empty and not count:
+        error("receipt log is empty")
+    if descriptor_binding(before) != descriptor_binding(os.fstat(stream.fileno())):
+        error("receipt log changed during verification")
     root = compute_merkle_root(hashes)
     if expected_merkle_root is not None and root != expected_merkle_root:
-        add_error("merkle_root does not match --expected-merkle-root")
-    if omitted_errors:
-        errors.append(f"{omitted_errors} further verification error(s) omitted")
-
-    return (
-        ReceiptVerificationResult(
-            verified=not errors,
-            count=len(hashes),
-            first_hash=hashes[0] if hashes else None,
-            last_hash=hashes[-1] if hashes else None,
-            merkle_root=root,
-            signed_count=signed_count,
-            signers=tuple(sorted(signers)),
-            errors=tuple(errors),
-        ),
-        hashes,
-    )
+        error("merkle_root does not match --expected-merkle-root")
+    if omitted:
+        errors.append(f"{omitted} further verification error(s) omitted")
+    return ReceiptVerificationResult(
+        verified=not errors,
+        count=len(hashes),
+        first_hash=hashes[0] if hashes else None,
+        last_hash=hashes[-1] if hashes else None,
+        merkle_root=root,
+        signed_count=signed_count,
+        signers=tuple(sorted(authenticated)),
+        errors=tuple(errors),
+        presented_signers=tuple(sorted(presented)),
+        verified_signature_count=verified_count,
+    ), hashes
 
 
 def verify_receipt_chain(
@@ -540,14 +502,16 @@ def verify_receipt_chain(
     require_signatures: bool = False,
     expected_merkle_root: str | None = None,
 ) -> ReceiptVerificationResult:
-    """Verify an offline runtime receipt JSONL chain, failing closed on any tamper."""
-    result, _ = _verify_receipt_chain_with_hashes(
-        path,
-        trusted_keys=trusted_keys,
-        require_signatures=require_signatures,
-        expected_merkle_root=expected_merkle_root,
-    )
-    return result
+    """Check v1 wire hashes and any requested key-ring or Merkle-root assurance."""
+    try:
+        with open_regular_file(path) as stream:
+            _lock_receipt_file(stream.fileno(), shared=True)
+            result, _ = _verify_stream(
+                stream, trusted_keys, require_signatures, expected_merkle_root
+            )
+            return result
+    except OSError:
+        return _failed("receipt log could not be read safely")
 
 
 def sanitize_tool_output(text: str, *, source_name: str = "tool-output") -> ToolOutputScanResult:

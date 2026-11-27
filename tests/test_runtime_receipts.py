@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import stat
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import rfc8785
 from click.testing import CliRunner
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
+from nexus_symbiote import runtime_receipts
 from nexus_symbiote.cli import main
 from nexus_symbiote.runtime import (
     ApprovedSnapshot,
@@ -218,7 +224,9 @@ def test_receipt_chain_rejects_unsigned_when_required_wrong_key_and_bad_root(
     empty_path = tmp_path / "empty.jsonl"
     empty_path.write_text("\n", encoding="utf-8")
     assert verify_receipt_chain(empty_path).verified is False
-    assert compute_merkle_root([]) == GENESIS_HASH
+    assert compute_merkle_root([]) == (
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    )
 
 
 def test_reference_gateway_blocks_poisoned_descriptor_and_records_receipt(tmp_path: Path) -> None:
@@ -383,13 +391,12 @@ def test_receipt_chain_edge_cases_and_fail_closed_checks(tmp_path: Path) -> None
     assert any("expected seq 0" in e for e in res_skip.errors)
     assert any("prev_hash mismatch" in e for e in res_skip.errors)
 
-    # Group/world-readable receipt log is refused immediately by ReceiptChainSink on POSIX.
+    # Exercise the mode policy with synthetic metadata and a real owner-only log.
     if os.name == "posix":
-        loose = tmp_path / "loose.jsonl"
-        loose.write_text(lines[0] + "\n", encoding="utf-8")
-        os.chmod(loose, 0o644)
+        info = list(log_path.stat())
+        info[stat.ST_MODE] |= stat.S_IROTH
         with pytest.raises(ReceiptError, match="0600"):
-            ReceiptChainSink(loose)
+            runtime_receipts._check_safe_log_file(os.stat_result(info))
 
     # Error list is bounded cleanly when > MAX_VERIFICATION_ERRORS malformed lines appear.
     noisy = tmp_path / "noisy.jsonl"
@@ -495,3 +502,191 @@ def test_audit_regressions_signature_bypass_merkle_collision_and_key_poisoning(
     )
     ring = {key_id(signer.public_key()): signer.public_key()}
     assert verify_receipt_chain(zero_log, trusted_keys=ring, require_signatures=True).verified
+
+
+def test_previous_v1_wire_format_and_signer_assurance(tmp_path: Path) -> None:
+    signer = Ed25519PrivateKey.generate()
+    kid = key_id(signer.public_key())
+    path = tmp_path / "wire.jsonl"
+    receipt = ReceiptChainSink(path, signer=signer)(_make_decision())
+    record = receipt.model_dump(mode="json")
+    # Original v1 writers included freeform request labels. Re-encode the
+    # original wire fields independently, including JSON nulls and arrays.
+    record["tool_name"] = "catalog"
+    body = {
+        k: v for k, v in record.items() if k not in {"receipt_hash", "signature", "signer_key_id"}
+    }
+    wire = rfc8785.dumps(body)
+    record["receipt_hash"] = "sha256:" + hashlib.sha256(wire).hexdigest()
+    record["signature"] = base64.b64encode(
+        signer.sign(b"nexus-symbiote/runtime-receipt/v1\n" + wire)
+    ).decode("ascii")
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    structural = verify_receipt_chain(path)
+    assert structural.verified and structural.signed_count == 1
+    assert structural.presented_signers == (kid,)
+    assert structural.signers == () and structural.verified_signature_count == 0
+
+    authenticated = verify_receipt_chain(path, trusted_keys={kid: signer.public_key()})
+    assert authenticated.verified and authenticated.signers == (kid,)
+    assert authenticated.verified_signature_count == 1
+    with pytest.raises(ReceiptError, match="trusted signer"):
+        ReceiptChainSink(path)
+    rotated = Ed25519PrivateKey.generate()
+    ring = {kid: signer.public_key(), key_id(rotated.public_key()): rotated.public_key()}
+    appended = ReceiptChainSink(path, signer=rotated, trusted_keys=ring)(_make_decision())
+    assert appended.prev_hash == record["receipt_hash"]
+    assert verify_receipt_chain(path, trusted_keys=ring).verified_signature_count == 2
+
+
+def test_receipt_multiple_writers_and_withheld_labels(tmp_path: Path) -> None:
+    path = tmp_path / "decisions.jsonl"
+    signer = Ed25519PrivateKey.generate()
+    writers = [ReceiptChainSink(path, signer=signer) for _ in range(3)]
+    decision = replace(
+        _make_decision(reason="review example"), store_id="archive", approval_actor="reviewer"
+    )
+    with ThreadPoolExecutor(max_workers=len(writers)) as pool:
+        written = list(pool.map(lambda i: writers[i % len(writers)](decision), range(15)))
+    assert sorted(item.seq for item in written) == list(range(15))
+    assert all(item.reason == "denied" and item.tool_name == "[withheld]" for item in written)
+    assert written[0].store_id == written[0].approval_actor == "[withheld]"
+    for label in [
+        decision.server_id,
+        decision.tool_name,
+        decision.resource,
+        decision.tenant,
+        decision.deployment_id,
+        decision.agent_id,
+        decision.workload_identity,
+        decision.approval_actor,
+    ]:
+        assert label and label not in path.read_text(encoding="utf-8")
+    ring = {key_id(signer.public_key()): signer.public_key()}
+    summary = verify_receipt_chain(path, trusted_keys=ring, require_signatures=True)
+    assert summary.verified and summary.verified_signature_count == 15
+    assert summary.merkle_root == ReceiptChainSink(path, signer=signer).merkle_root
+
+
+def test_append_limits_and_incomplete_final_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "decisions.jsonl"
+    sink = ReceiptChainSink(path)
+    sink(_make_decision())
+    original = path.read_bytes()
+    for field, maximum, message in [
+        ("MAX_RECEIPTS", 1, "record limit"),
+        ("MAX_RECEIPT_FILE_BYTES", len(original), "byte limit"),
+        ("MAX_RECEIPT_LINE_BYTES", len(original) - 1, "line byte limit"),
+    ]:
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime_receipts, field, maximum)
+            with pytest.raises(ReceiptError, match=message):
+                sink(_make_decision())
+            assert path.read_bytes() == original and sink.count == 1
+
+    path.write_bytes(original.removesuffix(b"\n"))
+    assert not verify_receipt_chain(path).verified
+    with pytest.raises(ReceiptError, match="newline"):
+        sink(_make_decision())
+    assert path.read_bytes() == original[:-1]
+
+
+def test_required_wire_fields_and_types(tmp_path: Path) -> None:
+    path = tmp_path / "decisions.jsonl"
+    record = ReceiptChainSink(path)(_make_decision()).model_dump(mode="json")
+    for changed in [
+        record | {"seq": "0"},
+        {k: v for k, v in record.items() if k != "approval_actor"},
+    ]:
+        path.write_text(json.dumps(changed) + "\n", encoding="utf-8")
+        summary = verify_receipt_chain(path)
+        assert not summary.verified and "malformed" in summary.errors[0]
+
+
+def test_writer_retry_after_local_io_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "decisions.jsonl"
+    sink = ReceiptChainSink(path)
+    first = sink(_make_decision())
+    before = path.read_bytes()
+    fsync = os.fsync
+    attempts = 0
+
+    def fail_once(fd: int) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("simulated storage failure")
+        fsync(fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fsync", fail_once)
+        with pytest.raises(OSError, match="simulated storage failure"):
+            sink(_make_decision())
+    assert path.read_bytes() == before
+    assert sink.count == 1
+    second = sink(_make_decision())
+    assert second.seq == 1 and second.prev_hash == first.receipt_hash
+    assert verify_receipt_chain(path).verified
+    path.write_bytes(before)
+    with pytest.raises(ReceiptError, match="committed prefix"):
+        sink(_make_decision())
+
+
+def test_writer_key_configuration_and_verification_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "decisions.jsonl"
+    signer = Ed25519PrivateKey.generate()
+    another = Ed25519PrivateKey.generate()
+    ring = {key_id(signer.public_key()): signer.public_key()}
+    with pytest.raises(ReceiptError, match="requires a signer"):
+        ReceiptChainSink(path, trusted_keys=ring)
+    with pytest.raises(ReceiptError, match="not trusted"):
+        ReceiptChainSink(path, signer=another, trusted_keys=ring)
+    sink = ReceiptChainSink(path, signer=signer, trusted_keys=ring)
+    sink(_make_decision())
+    sink(_make_decision())
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_receipts, "MAX_RECEIPT_FILE_BYTES", path.stat().st_size - 1)
+        assert "maximum size" in verify_receipt_chain(path).errors[0]
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_receipts, "MAX_RECEIPTS", 1)
+        assert "entries" in verify_receipt_chain(path).errors[0]
+
+
+def test_managed_signer_rotation_uses_the_configured_ring(tmp_path: Path) -> None:
+    class ManagedSigner:
+        def __init__(self, active: Ed25519PrivateKey) -> None:
+            self.active = active
+
+        def public_key(self) -> Ed25519PublicKey:
+            return self.active.public_key()
+
+        def sign(self, data: bytes) -> bytes:
+            return self.active.sign(data)
+
+    current = Ed25519PrivateKey.generate()
+    next_key = Ed25519PrivateKey.generate()
+    ring = {key_id(key.public_key()): key.public_key() for key in [current, next_key]}
+    signer = ManagedSigner(current)
+    log = tmp_path / "decisions.jsonl"
+    sink = ReceiptChainSink(log, signer=signer, trusted_keys=ring)
+    sink(_make_decision())
+    before = log.read_bytes()
+    signer.active = Ed25519PrivateKey.generate()
+    with pytest.raises(ReceiptError, match="not trusted"):
+        sink(_make_decision())
+    assert log.read_bytes() == before and sink.count == 1
+    signer.active = next_key
+    sink(_make_decision())
+    result = verify_receipt_chain(log, trusted_keys=ring)
+    assert (
+        result.verified
+        and result.signers == tuple(sorted(ring))
+        and result.verified_signature_count == 2
+    )

@@ -1654,7 +1654,7 @@ class ReferenceGateway(Generic[T]):
         trust_threshold: int = 1,
         signer_scopes: Mapping[str, SignerScope] | None = None,
         allow_shared_keys: bool = False,
-        on_decision: Callable[[Decision], None] | None = None,
+        on_decision: Callable[[Decision], object] | None = None,
         canonical_arguments: bool = True,
         reject_poisoned_descriptors: bool = True,
     ) -> None:
