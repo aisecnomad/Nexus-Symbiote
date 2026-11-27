@@ -2816,3 +2816,23 @@ def test_a_variable_is_checked_once_for_a_model_however_often_it_is_read(
         },
     )
     assert checked == ["CHAT_MODEL"]
+
+
+def test_the_answers_kept_across_files_are_bounded(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(source_python, "MAX_CACHED", 10)
+    files = {
+        f"app/m{index}.py": "".join(
+            f"from openai import sub{index}_{part}\nsub{index}_{part}.chat(model='gpt-4o')\n"
+            for part in range(20)
+        )
+        for index in range(5)
+    }
+    reader = source_python.PythonReader(
+        Declarations(ScanResult(scanner_name="source")), frozenset(files)
+    )
+    kept = []
+    for path, text in sorted(files.items()):
+        reader.add(path, text)
+        kept.append(len(reader._resolved) + len(reader._local))
+    # Each file asks of its own imports; what earlier files kept is let go past the bound.
+    assert max(kept) == kept[0] and kept[0] > 10
