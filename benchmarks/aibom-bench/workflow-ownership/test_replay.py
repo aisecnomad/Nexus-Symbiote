@@ -109,7 +109,11 @@ def test_swapped_model_and_untyped_tool_ref_do_not_count(positive: dict) -> None
 
 
 @pytest.mark.parametrize("representation", ["dependency", "tool_refs"])
-def test_unregistered_tool_contradicts_acceptance(positive: dict, representation: str) -> None:
+@pytest.mark.parametrize("kind", ["tool", "mcp-server"])
+def test_unregistered_tool_contradicts_acceptance(
+    positive: dict, representation: str, kind: str
+) -> None:
+    positive["components"][-1]["component_type"] = kind
     if representation == "dependency":
         positive["dependencies"].append(
             {
@@ -124,6 +128,38 @@ def test_unregistered_tool_contradicts_acceptance(positive: dict, representation
     assert receipt["score"] == 4
     assert receipt["decoys"] == [{"id": "unregistered-tool", "bom_ref": "tool:sample-lookup"}]
     assert not receipt["passed"]
+
+
+@pytest.mark.parametrize(
+    ("relationship", "conditions"),
+    [("configured-with", "repository association; runtime use unobserved"), ("depends-on", None)],
+)
+def test_unowned_decoy_does_not_disqualify_workflow(
+    positive: dict, relationship: str, conditions: str | None
+) -> None:
+    positive["dependencies"].append(
+        {
+            "source_ref": "agent:order-router",
+            "target_ref": "tool:sample-lookup",
+            "relationship": relationship,
+            "conditions": conditions,
+        }
+    )
+    assert score(positive)["passed"]
+
+
+@pytest.mark.parametrize("json_version", ["1e999", "42", '["0.2.0"]'])
+def test_invalid_tool_version_does_not_produce_a_receipt(
+    positive: dict, tmp_path: Path, json_version: str
+) -> None:
+    positive["metadata"]["tool_version"] = "VERSION_PLACEHOLDER"
+    path = tmp_path / "input.json"
+    path.write_text(
+        json.dumps(positive).replace('"VERSION_PLACEHOLDER"', json_version), encoding="utf-8"
+    )
+    out = tmp_path / "receipt.json"
+    assert main(["--bom", str(path), "--out", str(out)]) == 2
+    assert not out.exists()
 
 
 def test_retired_model_contradicts_acceptance_even_without_an_edge(positive: dict) -> None:

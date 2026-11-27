@@ -21,9 +21,10 @@ from typing import Any
 FIXTURE = Path(__file__).resolve().parent / "fixture"
 FIXTURE_FILES = ("agent.py", "examples/unregistered.py", "prompts/order_policy.md")
 MAX_BOM_BYTES = 16 * 1024 * 1024
+TOOL_RELATIONSHIPS = ("invokes", "configured-with")
 RELATIONSHIPS = (
     ("chat", "model", "gpt-4o-mini", "agent.py", {22}, {"uses-model"}),
-    ("tool", "tool", "lookup_order", "agent.py", {15, 16}, {"invokes", "configured-with"}),
+    ("tool", "tool", "lookup_order", "agent.py", {15, 16}, TOOL_RELATIONSHIPS),
     ("prompt", "prompt-template", None, "prompts/order_policy.md", None, {"reads-instructions"}),
 )
 WORKFLOW_REF_TYPES = {
@@ -138,9 +139,11 @@ def score(document: dict[str, Any]) -> dict[str, Any]:
     ]
     owner_ref = owners[0]["bom_ref"] if len(owners) == 1 else None
     owned_edges = [
-        edge for edge in edges if owner_ref is not None and edge.get("source_ref") == owner_ref
+        edge for edge in edges if edge["source_ref"] == owner_ref and _workflow_edge(edge)
     ]
-    owned_targets = {edge["target_ref"] for edge in owned_edges}
+    owned_tools = {
+        edge["target_ref"] for edge in owned_edges if edge.get("relationship") in TOOL_RELATIONSHIPS
+    }
     if owner_ref is not None:
         for field, kinds in WORKFLOW_REF_TYPES.items():
             refs = by_ref[owner_ref].get(field, [])
@@ -154,7 +157,7 @@ def score(document: dict[str, Any]) -> dict[str, Any]:
                     f"The workflow's {field} must resolve to the expected component kinds"
                 )
             if field == "tool_refs":
-                owned_targets.update(refs)
+                owned_tools.update(refs)
     checks: list[dict[str, Any]] = [
         {"id": "workflow", "passed": owner_ref is not None, "evidence": owners}
     ]
@@ -172,7 +175,6 @@ def score(document: dict[str, Any]) -> dict[str, Any]:
                     if edge.get("target_ref") == targets[0]["bom_ref"]
                     and isinstance(edge.get("relationship"), str)
                     and edge["relationship"] in predicates
-                    and _workflow_edge(edge)
                 }
             )
             if len(targets) == 1
@@ -195,9 +197,9 @@ def score(document: dict[str, Any]) -> dict[str, Any]:
     decoys.extend(
         {"id": "unregistered-tool", "bom_ref": ref}
         for ref, component in by_ref.items()
-        if component.get("component_type") == "tool"
+        if component["component_type"] in WORKFLOW_REF_TYPES["tool_refs"]
         and component.get("name") == "sample_order_lookup"
-        and ref in owned_targets
+        and ref in owned_tools
     )
     earned = sum(check["passed"] for check in checks)
     return {
@@ -291,14 +293,17 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("Native AgentBOM needs a JSON object")
         receipt = score(document)
         metadata = document.get("metadata")
-        receipt["tool_version"] = (
-            metadata.get("tool_version") if isinstance(metadata, dict) else None
-        )
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError("Native AgentBOM metadata must be an object")
+        version = metadata.get("tool_version") if metadata else None
+        if version is not None and not isinstance(version, str):
+            raise ValueError("Native AgentBOM tool_version must be a string or null")
+        receipt["tool_version"] = version
         receipt["inventory_sha256"] = hashlib.sha256(contents).hexdigest()
         receipt["fixture_files"] = {
             name: hashlib.sha256(contents).hexdigest() for name, contents in fixture.items()
         }
-        output = json.dumps(receipt, indent=2) + "\n"
+        output = json.dumps(receipt, indent=2, allow_nan=False) + "\n"
         if args.out is None:
             print(output, end="")
         else:
