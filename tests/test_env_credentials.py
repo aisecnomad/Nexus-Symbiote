@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+from click.testing import CliRunner
+
+from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.models import PromptComponent
 from nexus_symbiote.credential_allowlist import bind_credential_allowlist, load_credential_allowlist
@@ -74,6 +78,67 @@ def test_a_non_utf8_env_and_a_huge_env_fail_closed(tmp_path: Path) -> None:
     )
     assert any("line bound" in failure for failure in failures)
     assert _SAMPLE not in " ".join(failures)
+
+
+def test_keys_are_checked_against_all_assignment_values_before_export(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(
+        "SAME_LABEL=SAME_LABEL\nA_SHORT_KEY=one\nPUBLIC_NAME=two\n", encoding="utf-8"
+    )
+    (tmp_path / ".env.local").write_text(
+        'FIRST="SHORT" # inert label\nSECOND=PUBLIC_NAME # another label\n', encoding="utf-8"
+    )
+    notes = _bom(tmp_path)
+    assert apply_env_credential_findings(AIBOM(components=[notes]), tmp_path) == 5
+    details = [risk.detail for risk in notes.risks]
+    assert all("a key name holds" in line for line in details[:3])
+    assert "FIRST holds" in details[3] and "SECOND holds" in details[4]
+    assert all(
+        name not in notes.model_dump_json() for name in ("SAME_LABEL", "SHORT", "PUBLIC_NAME")
+    )
+
+
+def test_env_aliases_preserve_store_and_template_policies(tmp_path: Path) -> None:
+    (tmp_path / ".env.local").write_text("PORT=3000\n", encoding="utf-8")
+    (tmp_path / ".env").symlink_to(".env.local")
+    (tmp_path / ".env.sample").symlink_to(".env.local")
+    notes = _bom(tmp_path)
+    failures: list[str] = []
+    assert (
+        apply_env_credential_findings(AIBOM(components=[notes]), tmp_path, failures=failures) == 2
+    )
+    assert failures == [".env.sample: env symlink crosses the file's credential policy"]
+    assert [r.detail for r in notes.risks] == [
+        ".env:1: a key name holds an unspecified credential.",
+        ".env.local:1: a key name holds an unspecified credential.",
+    ]
+
+
+def test_project_gates_corroborate_env_findings_and_report_collection_failures(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "CLAUDE.md").write_text("Be helpful.\n", encoding="utf-8")
+    env_file = project / ".env"
+    env_file.write_text("PORT=3000\n", encoding="utf-8")
+    out = tmp_path / "bom.json"
+    runner = CliRunner()
+    scanned = runner.invoke(
+        main, ["scan", str(project), "--no-project-policy", "--report-only", "-o", str(out)]
+    )
+    assert scanned.exit_code == 0, scanned.output
+    assert any("PORT holds" in r.detail for c in AIBOM.load(out).components for r in c.risks)
+    common = ["--no-project-policy", "--project", str(project), str(out)]
+    for command in ("validate", "risk"):
+        result = runner.invoke(main, [command, "--json-output", *common])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["assessment_basis"] == "project-reconciled"
+
+    env_file.write_bytes(b"\xff")
+    for command in ("validate", "risk"):
+        result = runner.invoke(main, [command, *common])
+        assert result.exit_code == 1, result.output
+        assert "env credentials were not read (not UTF-8)" in result.output
 
 
 def test_a_path_allowlist_suppresses_the_env_file(tmp_path: Path) -> None:

@@ -363,6 +363,7 @@ class CompletenessValidator:
         a supplier claim, never presented as reconciled. The report's coverage is the
         local collection's. Integrity and signer policy are checked separately.
         """
+        from nexus_symbiote.env_credentials import apply_env_credential_findings
         from nexus_symbiote.graph import assemble_repository_agent
         from nexus_symbiote.literal_credentials import apply_literal_credential_findings
         from nexus_symbiote.scanners import ALL_SCANNERS, ModelScanner
@@ -443,6 +444,12 @@ class CompletenessValidator:
         )
         for reason in literal_failures:
             incomplete("literal_credentials", f"Local collection incomplete: {reason}")
+        env_failures: list[str] = []
+        apply_env_credential_findings(
+            expected, root, exclude_paths=exclude_paths, failures=env_failures
+        )
+        for reason in env_failures:
+            incomplete("env_credentials", f"Local collection incomplete: {reason}")
         coverage = self._local_coverage(
             report_digest,
             surfaces,

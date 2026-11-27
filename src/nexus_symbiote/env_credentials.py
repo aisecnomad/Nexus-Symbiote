@@ -2,15 +2,14 @@
 
 A ``.env`` store is often a low-entropy password. Publishing its unsalted SHA-256
 would let a reader attack the value. The finding names the path, line, key and
-vendor type. ``.env.example``, ``.env.sample`` and ``.env.template`` are not
-stores: they get the same vendor-shape check as other files, including the
-SHA-256 of a high-entropy token and never the token.
+vendor type. Templates use the same keyed or unbound commitment as source findings.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -19,8 +18,9 @@ from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.models import RiskAssessment
 from nexus_symbiote.credential_allowlist import bind_credential_path, credential_suppressed
 from nexus_symbiote.literal_credentials import MAX_LITERALS, _commitment
+from nexus_symbiote.scanners.base import KnownValues, declared_server_name
 from nexus_symbiote.scanners.mcp_credentials import normalize_credential
-from nexus_symbiote.utils.confined import ConfinedCollection
+from nexus_symbiote.utils.confined import ConfinedCollection, LimitExceededError
 from nexus_symbiote.utils.secrets import TOKEN_SHAPE, holds_token_shape
 from nexus_symbiote.utils.terminal import neutralize
 
@@ -29,6 +29,7 @@ MAX_ENV_LINES = 10_000
 MAX_ENV_LINE_CHARS = 8_192
 _TEMPLATE_SUFFIXES = frozenset({".example", ".sample", ".template"})
 _KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_QUOTED_VALUE = re.compile(r"""(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')\s*(?:#.*)?""")
 _PREFIXES = (
     ("github_pat_", "github"),
     ("ghp_", "github"),
@@ -87,8 +88,10 @@ def _assignment(line: str) -> tuple[str, str] | None:
     key, _, value = body.partition("=")
     key = key.strip()
     value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        value = value[1:-1]
+    if quoted := _QUOTED_VALUE.fullmatch(value):
+        value = quoted[1] if quoted[1] is not None else quoted[2]
+    elif not value.startswith(('"', "'")):
+        value = re.split(r"(?<=\s)#", value, maxsplit=1)[0].rstrip()
     if not _KEY.fullmatch(key) or TOKEN_SHAPE.search(key):
         key = "a key name"
     return key, value
@@ -109,6 +112,32 @@ def _owner(components: list[Any], path: str) -> Any | None:
     return min(pool, key=lambda component: str(getattr(component, "bom_ref", "")))
 
 
+def _read_env(files: ConfinedCollection, path: str, failures: list[str]) -> bytes | None:
+    entry = files.regular_file(path)
+    if entry is None:
+        failures.append(f"{neutralize(path)}: env file unavailable during collection")
+        return None
+    target, size = entry
+    if _kind(target.name) != _kind(PurePosixPath(path).name):
+        failures.append(f"{neutralize(path)}: env symlink crosses the file's credential policy")
+        return None
+    if size > MAX_ENV_BYTES:
+        failures.append(
+            f"{neutralize(path)}: env file exceeds {MAX_ENV_BYTES} bytes; not collected"
+        )
+        return None
+    try:
+        with files.open_regular(
+            path,
+            max_bytes=min(files.max_file_bytes, MAX_ENV_BYTES),
+            expected_link_target=target if target.as_posix() != path else None,
+        ) as stream:
+            return b"".join(iter(lambda: stream.read(65536), b""))
+    except (OSError, LimitExceededError):
+        # The confined reader records the reason and checks the target through the read.
+        return None
+
+
 def apply_env_credential_findings(
     aibom: AIBOM,
     root: Path | None = None,
@@ -120,7 +149,8 @@ def apply_env_credential_findings(
     """Record ``.env`` assignments and vendor shapes in ``.env`` templates."""
     if root is None or not root.is_dir():
         return 0
-    added = 0
+    known = KnownValues()
+    pending: list[tuple[Any, str, list[_EnvFinding]]] = []
     own_failures: list[str] = []
     own_exclusions: list[str] = []
     with ConfinedCollection(
@@ -131,13 +161,8 @@ def apply_env_credential_findings(
         )
         for rel_path in paths:
             kind = _kind(PurePosixPath(rel_path).name)
-            raw = files.read_bytes(rel_path, missing_ok=True, report_coexisting_variants=False)
+            raw = _read_env(files, rel_path, own_failures)
             if raw is None:
-                continue
-            if len(raw) > MAX_ENV_BYTES:
-                own_failures.append(
-                    f"{neutralize(rel_path)}: env file exceeds {MAX_ENV_BYTES} bytes; not collected"
-                )
                 continue
             try:
                 text = raw.decode("utf-8")
@@ -159,35 +184,59 @@ def apply_env_credential_findings(
                 )
                 continue
             with bind_credential_path(rel_path):
-                risks = _line_risks(rel_path, lines, kind == "template", own_failures)
-            if risks is None:
-                continue
-            component.risks.extend(risks)
-            added += len(risks)
+                findings = _line_findings(rel_path, lines, kind == "template", own_failures, known)
+            if findings:
+                pending.append((component, rel_path, findings))
+    # A key can repeat a value declared later, even in another file or an allowed entry.
+    # If collection was incomplete we cannot establish which keys are safe to export.
+    if own_failures:
+        known.refuse()
+    for component, rel_path, findings in pending:
+        component.risks.extend(finding.assessment(rel_path, known) for finding in findings)
     for target_list, own in ((failures, own_failures), (exclusions, own_exclusions)):
         if target_list is None:
             continue
-        known = set(target_list)
+        recorded = set(target_list)
         for msg in own:
-            if msg not in known:
+            if msg not in recorded:
                 target_list.append(msg)
-                known.add(msg)
-    return added
+                recorded.add(msg)
+    return sum(len(findings) for _, _, findings in pending)
 
 
-def _line_risks(
+@dataclass(frozen=True)
+class _EnvFinding:
+    line: int
+    key: str | None
+    description: str
+
+    def assessment(self, path: str, known: KnownValues) -> RiskAssessment:
+        subject = "a vendor token shape"
+        if self.key is not None:
+            subject = declared_server_name(self.key, known) or "a key name"
+        return RiskAssessment(
+            severity=RiskSeverity.HIGH,
+            category="credential_exposure",
+            detail=f"{neutralize(path)}:{self.line}: {subject} {self.description}",
+            recommendation="Remove the value from the repository and pass it by an environment reference.",
+        )
+
+
+def _line_findings(
     rel_path: str,
     lines: list[str],
     template: bool,
     failures: list[str],
-) -> list[RiskAssessment] | None:
-    found: list[RiskAssessment] = []
+    known: KnownValues,
+) -> list[_EnvFinding] | None:
+    found: list[_EnvFinding] = []
     where = neutralize(rel_path)
     for line_no, line in enumerate(lines, start=1):
         parsed = _assignment(line)
         if parsed is None:
             continue
         key, value = parsed
+        known.add((value,))
         if credential_suppressed(value):
             continue
         if template:
@@ -195,27 +244,17 @@ def _line_risks(
             match = TOKEN_SHAPE.search(normalized)
             if match is None or not holds_token_shape(match.group()):
                 continue
-            detail = (
-                f"{where}:{line_no}: a vendor token shape is committed "
-                f"({_commitment(rel_path, line_no, match.group())})."
+            finding = _EnvFinding(
+                line_no, None, f"is committed ({_commitment(rel_path, line_no, match.group())})."
             )
         else:
             vendor = _vendor(value)
             article = "an" if vendor[:1] in "aeiou" else "a"
-            detail = f"{where}:{line_no}: {key} holds {article} {vendor} credential."
-        if len(value) >= 16 and value not in {key, "a key name"} and value in detail:
-            failures.append(f"{where}: env finding would have copied a value; not collected")
+            finding = _EnvFinding(line_no, key, f"holds {article} {vendor} credential.")
+        if len(value) >= 16 and value in where:
+            failures.append("env finding path would have copied a value; not collected")
             return None
-        found.append(
-            RiskAssessment(
-                severity=RiskSeverity.HIGH,
-                category="credential_exposure",
-                detail=detail,
-                recommendation=(
-                    "Remove the value from the repository and pass it by an environment reference."
-                ),
-            )
-        )
+        found.append(finding)
         if len(found) > MAX_LITERALS:
             failures.append(f"{where}: more than {MAX_LITERALS} env credentials; not collected")
             return None

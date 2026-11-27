@@ -14,13 +14,16 @@ import re
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from nexus_symbiote import limits
 from nexus_symbiote.policy import PolicyError, parse_yaml_mapping
 from nexus_symbiote.utils.confined import ConfinedCollection
+from nexus_symbiote.utils.secrets import normalize_credential
 
 ALLOWLIST_NAMES = (
     ".nexus-symbiote-credential-allowlist.yaml",
@@ -33,7 +36,6 @@ _MAX_PATTERN = 200
 _MAX_PATTERN_PARTS = 32
 _MAX_PATH_PARTS = 64
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}")
-_SEGMENT = re.compile(r"[^/]*")
 
 _ALLOW: ContextVar[CredentialAllowlist | None] = ContextVar("ns_credential_allowlist", default=None)
 _PATH: ContextVar[str] = ContextVar("ns_credential_allowlist_path", default="")
@@ -106,16 +108,13 @@ def path_glob_matches(pattern: str, path: str) -> bool:
                 seen = seen or flag
                 nxt[index] = seen
         else:
+            # fnmatch bounds wildcard backtracking. Only * and ? are special here.
+            pattern = part.replace("[", "[[]")
             for index, flag in enumerate(matched[:-1]):
-                if flag and _segment_matches(part, segs[index]):
+                if flag and fnmatchcase(segs[index], pattern):
                     nxt[index + 1] = True
         matched = nxt
     return matched[-1]
-
-
-def _segment_matches(pattern: str, segment: str) -> bool:
-    regex = "^" + re.escape(pattern).replace(r"\*", "[^/]*").replace(r"\?", "[^/]") + "$"
-    return re.fullmatch(regex, segment) is not None and _SEGMENT.fullmatch(segment) is not None
 
 
 def load_credential_allowlist(
@@ -124,30 +123,35 @@ def load_credential_allowlist(
     exclude_paths: Iterable[str | Path] = (),
 ) -> tuple[CredentialAllowlist, str | None]:
     """Read the allowlist. A missing file suppresses nothing and is not a failure."""
-    present = [name for name in ALLOWLIST_NAMES if (root / name).is_file()]
-    if not present:
-        return CredentialAllowlist(), None
-    if len(present) > 1:
-        return CredentialAllowlist(), (
-            "credential allowlist: both .yaml and .yml are present; nothing is suppressed"
-        )
-    name = present[0]
     failures: list[str] = []
+    raw = None
     try:
-        with ConfinedCollection(root, failures, [], exclude_paths=exclude_paths) as files:
-            raw = files.read_bytes(name, missing_ok=True, report_coexisting_variants=False)
+        with ConfinedCollection(
+            root,
+            failures,
+            [],
+            exclude_paths=exclude_paths,
+            max_file_bytes=min(_MAX_BYTES, limits.current().file_bytes),
+        ) as files:
+            present = [name for name in ALLOWLIST_NAMES if files.entry_exists(name)]
+            if len(present) > 1:
+                return CredentialAllowlist(), (
+                    "credential allowlist: both .yaml and .yml are present; nothing is suppressed"
+                )
+            if present:
+                raw = files.read_bytes(
+                    present[0], missing_ok=True, report_coexisting_variants=False
+                )
+            elif not failures:
+                return CredentialAllowlist(), None
     except (OSError, ValueError):
-        raw = None
+        pass
     if failures:
         return CredentialAllowlist(), f"credential allowlist: {failures[0]}"
     if raw is None:
         return (
             CredentialAllowlist(),
             "credential allowlist: file could not be read; nothing is suppressed",
-        )
-    if len(raw) > _MAX_BYTES:
-        return CredentialAllowlist(), (
-            "credential allowlist: file exceeds 64 KiB; nothing is suppressed"
         )
     try:
         text = raw.decode("utf-8")
@@ -178,12 +182,10 @@ def bind_credential_path(path: str) -> Iterator[None]:
         _PATH.reset(token)
 
 
-def credential_suppressed(literal: str) -> bool:
+def credential_suppressed(literal: str, *, rel_path: str | None = None) -> bool:
     """Whether the active allowlist names this token or the file that holds it."""
     allow = _ALLOW.get()
     if allow is None or not allow.allow:
         return False
-    from nexus_symbiote.scanners.mcp_credentials import normalize_credential
-
     digest = hashlib.sha256(normalize_credential(literal).encode("utf-8")).hexdigest()
-    return allow.suppresses(_PATH.get(), digest)
+    return allow.suppresses(_PATH.get() if rel_path is None else rel_path, digest)

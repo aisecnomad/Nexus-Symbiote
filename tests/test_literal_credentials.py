@@ -112,6 +112,34 @@ def test_a_non_utf8_file_is_a_failure_and_not_a_guess(tmp_path: Path) -> None:
     assert failures == ["app.py: literal credentials were not read (not UTF-8)"]
 
 
+def test_one_window_stops_matching_at_the_findings_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nexus_symbiote import literal_credentials
+
+    monkeypatch.setattr(literal_credentials, "MAX_LITERALS", 1)
+    normalizations = 0
+
+    def counted(value: str) -> str:
+        nonlocal normalizations
+        normalizations += 1
+        return normalize_credential(value)
+
+    monkeypatch.setattr(literal_credentials, "normalize_credential", counted)
+    tokens = [_TOKEN, _TOKEN, _TOKEN + "1", _TOKEN + "2"]
+    (tmp_path / "app.py").write_text(" ".join(tokens), encoding="utf-8")
+    server = _server("app.py")
+    failures: list[str] = []
+    assert (
+        apply_literal_credential_findings(AIBOM(components=[server]), tmp_path, failures=failures)
+        == 0
+    )
+    assert len(failures) == 1 and server.risks == []
+    # Two occurrences of the first spelling consume one slot. The third
+    # occurrence exceeds the budget, so the fourth is never normalized.
+    assert normalizations == 3
+
+
 @pytest.mark.parametrize("mark", ["\u200b", "\ufe0e", "\u00a0"])
 def test_a_mark_or_space_inside_a_token_is_still_a_finding(tmp_path: Path, mark: str) -> None:
     marked = "sk-proj-a1b2" + mark + "c3d4e5f6g7h8i9j0"
@@ -251,3 +279,63 @@ def test_deleting_the_finding_fails_project_reconciliation(tmp_path: Path) -> No
         main, ["risk", "--no-project-policy", str(out), "--project", str(project)]
     )
     assert gated.exit_code != 0, gated.output
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_repeated_shapes_in_one_window_keep_their_physical_lines(
+    tmp_path: Path, newline: str
+) -> None:
+    # NFKC expands the ligature and removes the format mark from the view
+    # before the vendor prefixes. U+2028 does not advance a physical source line.
+    parts = ['notes = "ﬀ\u200b\u2028start', f"first {_TOKEN}", f'second {_TOKEN}"']
+    (tmp_path / "app.py").write_bytes(newline.join(parts).encode())
+    server = _server("app.py")
+    assert apply_literal_credential_findings(AIBOM(components=[server]), tmp_path) == 2
+    assert [risk.detail.split(": ", 1)[0] for risk in server.risks] == ["app.py:2", "app.py:3"]
+
+
+@pytest.mark.parametrize("join", [" +\n", " \\\n"])
+def test_match_start_survives_joins_and_internal_whitespace(tmp_path: Path, join: str) -> None:
+    text = f'header = "ﬀ\u200b" {join}" note: sk-proj-a1b2 c3d4e5f6g7h8i9j0"\n'
+    (tmp_path / "app.py").write_text(text, encoding="utf-8")
+    server = _server("app.py")
+    assert apply_literal_credential_findings(AIBOM(components=[server]), tmp_path) == 1
+    assert server.risks[0].detail.startswith("app.py:2:")
+
+
+def test_scan_and_sarif_locate_a_match_on_the_continuation_line(tmp_path: Path) -> None:
+    import json
+
+    from click.testing import CliRunner
+
+    from nexus_symbiote.cli import main
+
+    project = tmp_path / "project"
+    skill = project / ".claude" / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(f'# Notes\n\ntext = "start\nexample: {_TOKEN}"\n')
+    runner = CliRunner()
+    for fmt in ("native", "sarif"):
+        output = tmp_path / f"result-{fmt}.json"
+        args = ["scan", str(project), "--report-only", "--no-project-policy", "-o", str(output)]
+        if fmt == "sarif":
+            args += ["-f", "sarif"]
+        result = runner.invoke(main, args)
+        assert result.exit_code == 0, result.output
+        document = output.read_text(encoding="utf-8")
+        assert _TOKEN not in document
+        if fmt == "native":
+            messages = [
+                risk.detail
+                for component in AIBOM.load(output).components
+                for risk in component.risks
+                if risk.category == "credential_exposure"
+            ]
+        else:
+            messages = [
+                item["message"]["text"]
+                for item in json.loads(document)["runs"][0]["results"]
+                if item["ruleId"] == "nexus_symbiote/credential_exposure/high"
+            ]
+        assert len(messages) == 1
+        assert messages[0].startswith(".claude/skills/demo/SKILL.md:4:")
