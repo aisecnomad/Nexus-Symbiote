@@ -378,6 +378,7 @@ class CompletenessValidator:
         accepted_default_names: set[str] = set()
         status: dict[str, str] = {}
         report_digest: str | None = None
+        collected_edges: list[DependencyEdge] = []
 
         for scanner_type in ALL_SCANNERS:
             scanner = (
@@ -408,9 +409,23 @@ class CompletenessValidator:
                 if not problems:
                     report.bound_imports = frozenset(c.bom_ref for c in local.components)
             failed = bool(local.scan_failures)
+            accepted: set[str] = set()
             for component in local.components:
                 if merge_collected(collected, component, scanner.name, None) == "conflict":
                     incomplete(scanner.name, f"Conflicting local reference: {component.bom_ref}")
+                    failed = True
+                    continue
+                accepted.add(component.bom_ref)
+            # scan imports a collector's own edges between the components it accepted;
+            # the local assembly must hold the same edges or every one reads as unevidenced.
+            for edge in local.dependencies:
+                if edge.source_ref in accepted and edge.target_ref in accepted:
+                    collected_edges.append(edge)
+                else:
+                    incomplete(
+                        scanner.name,
+                        "Local collection incomplete: dependency endpoint was not imported",
+                    )
                     failed = True
             surfaces.extend(local.surfaces_scanned)
             excluded.extend(local.surfaces_excluded)
@@ -420,7 +435,7 @@ class CompletenessValidator:
                 "failed" if failed else "partial" if local.surfaces_excluded else "complete"
             )
 
-        expected = AIBOM(components=list(collected.values()))
+        expected = AIBOM(components=list(collected.values()), dependencies=collected_edges)
         agent: AgentComponent | None = None
         try:
             agent = assemble_repository_agent(
