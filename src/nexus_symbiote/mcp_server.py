@@ -745,6 +745,9 @@ class OfflineMCPServer:
 
     def _tool_blast_radius(self, args: Mapping[str, Any]) -> dict[str, Any]:
         component_ref = args["component_ref"]
+        if all(comp.bom_ref != component_ref for comp in self.bom.components):
+            # The graph error quotes the reference; tool errors never echo client input.
+            raise ValueError("Unknown component_ref")
         raw = compute_blast_radius(self.bom, component_ref)
         reachable_set = {component_ref, *raw.get("reachable_components", [])}
         reachable_advisories = [
