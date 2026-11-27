@@ -308,3 +308,89 @@ def test_a_nested_registration_is_classified_by_its_own_handler_only(tmp_path: P
 def test_a_handler_bound_elsewhere_stays_unknown(tmp_path: Path) -> None:
     tool = _ts(tmp_path, "handler", 'import { execSync } from "child_process";\n')
     assert tool.capabilities is None
+
+
+# ---- Re-review of 0a81b273 ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "    return os.getenv('NAME', '').replace('-', '_')\n",
+        "    return os.environ.copy()\n",
+        "    return os.path.join('x', name).replace('\\\\', '/')\n",
+        "    return quote(name)\n",
+        "    return socket.gethostname()\n",
+        "    return redis.Redis().unlink(name)\n",
+    ],
+    ids=["getenv-replace", "environ-copy", "path-replace", "url-quote", "hostname", "redis"],
+)
+def test_values_returned_by_a_module_and_unrelated_modules_name_nothing(body: str) -> None:
+    found = _classify(
+        "import os\nimport socket\nimport redis\nfrom urllib.parse import quote\n\n"
+        "def tool(name: str) -> object:\n" + body
+    )
+    assert found.declaration is None, body
+
+
+def test_only_payment_resources_are_payments() -> None:
+    customer = _classify(
+        "import stripe\n\ndef c(e: str) -> object:\n    return stripe.Customer.create(email=e)\n"
+    )
+    assert customer.profile is not SideEffectProfile.FINANCIAL_TRANSACTION and not customer.risks
+    assert customer.capabilities == [E.NETWORK]
+
+
+@pytest.mark.parametrize(
+    ("header", "handler"),
+    [
+        ("", "(c) => require('child_process').execSync(c)"),
+        ("", "async (c) => { const { execSync } = await import('child_process'); execSync(c); }"),
+        (
+            'import { exec } from "child_process";\nimport { promisify } from "util";\nconst run = promisify(exec);\n',
+            "(c) => run(c)",
+        ),
+        ("", "(c) => (0, eval)(c)"),
+    ],
+    ids=["inline-require", "dynamic-import", "promisify", "comma-eval"],
+)
+def test_typescript_loaded_and_wrapped_execution(tmp_path: Path, header: str, handler: str) -> None:
+    assert E.EXECUTE in _caps(_ts(tmp_path, handler, header)), handler
+
+
+def test_typescript_handler_bindings_shadow_imports_and_carry_taint(tmp_path: Path) -> None:
+    shadow = _ts(
+        tmp_path / "shadow",
+        "(c) => { const exec = (x) => x; const fetch = cache.get; exec(c); return fetch(c); }",
+        'import { exec } from "child_process";\n',
+    )
+    assert shadow.capabilities is None
+    tainted = _ts(
+        tmp_path / "taint",
+        "(args) => { const { id } = args; return db.query(`DELETE FROM t WHERE id = ${id}`); }",
+    )
+    assert any("caller-supplied" in r.detail for r in tainted.risks)
+
+
+@pytest.mark.parametrize("kind", ["member", "call", "template"])
+def test_long_chains_and_nested_templates_stay_linear(tmp_path: Path, kind: str) -> None:
+    import time
+
+    def handler(n: int) -> str:
+        if kind == "member":
+            return "async () => x" + ".a" * n
+        if kind == "call":
+            return "async () => x" + ".a()" * n
+        inner = "1"
+        for _ in range(n):
+            inner = "db.query(`${" + inner + "}`)"
+        return "async () => " + inner
+
+    def cost(n: int) -> float:
+        root = tmp_path / f"{kind}{n}"
+        start = time.process_time()
+        _ts(root, handler(n))
+        return time.process_time() - start
+
+    small, large = cost(500), cost(2000)
+    assert large < max(small, 0.05) * 12, (small, large)
