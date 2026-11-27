@@ -280,7 +280,25 @@ _EXFIL_URL_RE = re.compile(
 # Network sinks and the commands that read a credential path into a pipe.
 # Order does not matter: ``cat file | curl`` and ``base64 file | curl`` are the
 # same finding. A sentence that only mentions both is not a pipeline.
-_SHELL_SINKS = frozenset({"curl", "wget", "nc"})
+# Names are the command word; ``/dev/tcp`` and ``/dev/udp`` are bash redirections.
+_SHELL_SINK_NAMES = (
+    "curl",
+    "wget",
+    "nc",
+    "scp",
+    "rsync",
+    "sftp",
+    "ftp",
+    "socat",
+    "ncat",
+    "telnet",
+    "ssh",
+)
+_SHELL_SINKS = frozenset(_SHELL_SINK_NAMES)
+_DEV_NET_REDIRECTS = ("/dev/tcp", "/dev/udp")
+# ``~``, ``$HOME`` and ``${HOME}`` become this marker so every spelling of a home
+# path contains ``/.ssh`` the credential-path rule already matches.
+_HOME_MARKER = "/home"
 _SHELL_READERS = frozenset(
     {"cat", "base64", "xxd", "gzip", "openssl", "od", "dd", "head", "tail", "cut"}
 )
@@ -528,19 +546,51 @@ def _verb_is_negated(text: str, verb_start: int) -> bool:
     return _has_negated_prefix(text, end)
 
 
+def _expand_home(fragment: str) -> str:
+    """Expand a leading ``~`` and every ``$HOME`` / ``${HOME}`` to one marker."""
+    if fragment.startswith("~") and (len(fragment) == 1 or fragment[1] == "/"):
+        fragment = _HOME_MARKER + fragment[1:]
+    return fragment.replace("${HOME}", _HOME_MARKER).replace("$HOME", _HOME_MARKER)
+
+
 def _shell_word(token: str) -> str:
     """The command word of a token, ignoring a glued ``$(`` or a closing paren."""
-    word = token.lower().strip("$#@()|;<>")
+    word = _expand_home(token).lower().strip("$#@()|;<>\"'")
     if "/" in word:
-        word = word.rsplit("/", 1)[-1].strip("$#@()|;<>")
+        word = word.rsplit("/", 1)[-1].strip("$#@()|;<>\"'")
     return word
 
 
+def _is_network_sink(token: str) -> bool:
+    if _shell_word(token) in _SHELL_SINKS:
+        return True
+    lowered = token.lower()
+    return any(redirect in lowered for redirect in _DEV_NET_REDIRECTS)
+
+
 def _credential_path(token: str) -> re.Match[str] | None:
-    found = _CRED_PATH_RE.search(token)
+    found = _CRED_PATH_RE.search(_expand_home(token.strip("\"'")))
     if found is None or found.group().lower().endswith(".pub"):
         return None
     return found
+
+
+def _matching_quote(text: str, open_at: int, end: int) -> int | None:
+    """Index of the closer for the quote at ``open_at``, or None when it never closes.
+
+    Double quotes treat a backslash as an escape. The scan is one forward pass and
+    stops at ``end``, which is already the window cap.
+    """
+    quote = text[open_at]
+    index = open_at + 1
+    while index < end:
+        if quote == '"' and text[index] == "\\" and index + 1 < end:
+            index += 2
+            continue
+        if text[index] == quote:
+            return index
+        index += 1
+    return None
 
 
 def _line_ends_continued(text: str, line_start: int, line_end: int) -> bool:
@@ -573,7 +623,7 @@ def _next_is_lone_path(text: str, index: int) -> bool:
 
 def _window_has_verb(text: str, start: int, end: int) -> bool:
     for token in _SHELL_TOKEN_RE.findall(text[start:end]):
-        if _shell_word(token) in _SHELL_SINKS or _shell_word(token) in _SHELL_READERS:
+        if _is_network_sink(token) or _shell_word(token) in _SHELL_READERS:
             return True
     return False
 
@@ -616,32 +666,40 @@ def _logical_windows(text: str) -> Iterator[tuple[int, int, bool]]:
 
 
 def _shell_stages(text: str, start: int, end: int) -> list[list[tuple[int, str]]]:
-    """Stages of one command, split on ``|``, ``||``, ``&&`` and ``;`` outside quotes.
+    """Stages of one command, split on ``|``, ``||``, ``&&`` and ``;``.
 
-    Bytes inside ``$(...)`` or backticks are left to the substitution scan. A
+    Single and double quotes are removed and ``~``, ``$HOME`` and ``${HOME}``
+    expand to one home marker, so ``cat "$HOME/.ssh/id_rsa" | "curl"`` is the
+    same pair of words as the unquoted command. An unbalanced quote does not
+    swallow the rest: the raw remainder is tokenised. Bytes inside ``$(...)``
+    or a one-backtick substitution are left to the substitution scan. A
     backslash-newline is whitespace. The walk is one pass.
     """
     stages: list[list[tuple[int, str]]] = [[]]
     index = start
-    quote = ""
     subst = 0
     tick = False
+    word_at: int | None = None
+    parts: list[str] = []
+
+    def flush() -> None:
+        nonlocal word_at
+        if parts:
+            stages[-1].append((word_at if word_at is not None else index, "".join(parts)))
+            parts.clear()
+            word_at = None
+
     while index < end:
         char = text[index]
         if char == "\\" and index + 1 < end and text[index + 1] == "\n":
             index += 2
-            continue
-        if quote:
-            if char == quote and text[index - 1] != "\\":
-                quote = ""
-            index += 1
             continue
         if tick:
             if char == "`":
                 tick = False
             index += 1
             continue
-        if text.startswith("$(", index):
+        if text.startswith("$(", index) and subst == 0 and not parts:
             subst += 1
             index += 2
             continue
@@ -653,21 +711,42 @@ def _shell_stages(text: str, start: int, end: int) -> list[list[tuple[int, str]]
             subst -= 1
             index += 1
             continue
-        if char in "\"'":
-            quote = char
+        if subst:
             index += 1
             continue
         if char == "`":
+            run = index + 1
+            while run < end and text[run] == "`":
+                run += 1
+            if run - index != 1:
+                flush()
+                index = run
+                continue
             tick = True
             index += 1
             continue
-        if subst == 0 and (text.startswith(("&&", "||"), index) or char in "|;"):
+        if char in "\"'":
+            close = _matching_quote(text, index, end)
+            if close is None:
+                # The quote never closes. Keep the following bytes in the raw scan.
+                index += 1
+                continue
+            if word_at is None:
+                word_at = index
+            parts.append(_expand_home(text[index + 1 : close]))
+            index = close + 1
+            continue
+        if text.startswith(("&&", "||"), index) or char in "|;":
+            flush()
             stages.append([])
             index += 2 if text.startswith(("&&", "||"), index) else 1
             continue
         if char.isspace():
+            flush()
             index += 1
             continue
+        if word_at is None:
+            word_at = index
         token_end = index + 1
         while (
             token_end < end and not text[token_end].isspace() and text[token_end] not in "|;`'\"()"
@@ -675,8 +754,9 @@ def _shell_stages(text: str, start: int, end: int) -> list[list[tuple[int, str]]
             if text.startswith(("&&", "||"), token_end):
                 break
             token_end += 1
-        stages[-1].append((index, text[index:token_end]))
+        parts.append(_expand_home(text[index:token_end]))
         index = token_end
+    flush()
     return stages
 
 
@@ -708,12 +788,12 @@ def _stage_reads(tokens: list[tuple[int, str]]) -> int | None:
 
 
 def _stage_sink(tokens: list[tuple[int, str]]) -> bool:
-    return any(_shell_word(token) in _SHELL_SINKS for _, token in tokens)
+    return any(_is_network_sink(token) for _, token in tokens)
 
 
 def _sink_near_path(tokens: list[tuple[int, str]]) -> int | None:
     """A sink and a credential-path token with at most one plain word between them."""
-    sinks = [i for i, (_, token) in enumerate(tokens) if _shell_word(token) in _SHELL_SINKS]
+    sinks = [i for i, (_, token) in enumerate(tokens) if _is_network_sink(token)]
     paths = [
         (i, pos + found.start())
         for i, (pos, token) in enumerate(tokens)
@@ -728,8 +808,7 @@ def _sink_near_path(tokens: list[tuple[int, str]]) -> int | None:
 
 def _first_shell_verb(text: str, start: int, end: int) -> int | None:
     for pos, token in (token for stage in _shell_stages(text, start, end) for token in stage):
-        word = _shell_word(token)
-        if word in _SHELL_SINKS or word in _SHELL_READERS:
+        if _is_network_sink(token) or _shell_word(token) in _SHELL_READERS:
             return pos
     index = start
     while index < end:
@@ -747,7 +826,7 @@ def _first_shell_verb(text: str, start: int, end: int) -> int | None:
             while body < cap and text[body] not in " \t\n|;`'\"()":
                 body += 1
             word = _shell_word(text[index + opener : body])
-            if word in _SHELL_SINKS or word in _SHELL_READERS:
+            if word in _SHELL_SINKS or word in _SHELL_READERS or _is_network_sink(word):
                 return index + opener
         index += 1
     return None
@@ -809,9 +888,8 @@ def _substitution_offsets(text: str, start: int, end: int) -> Iterator[int]:
         for token in _SHELL_TOKEN_RE.finditer(fragment):
             if _shell_word(token.group()) in _SHELL_READERS and verb is None:
                 verb = token.start()
-            found = _credential_path(token.group())
-            if found is not None and path_at is None:
-                path_at = token.start() + found.start()
+            if _credential_path(token.group()) is not None and path_at is None:
+                path_at = token.start()
         if (
             verb is not None
             and path_at is not None
