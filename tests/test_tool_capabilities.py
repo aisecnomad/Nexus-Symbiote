@@ -477,3 +477,83 @@ def test_a_typescript_body_past_the_bound_records_a_gap(tmp_path: Path) -> None:
     (tool,) = [c for c in result.components if isinstance(c, ToolComponent)]
     assert tool.capabilities is None
     assert any("too large to classify" in gap for gap in result.surfaces_excluded)
+
+
+# ---- Final check of ca4c0f6b ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from shutil import rmtree as nuke\n\ndef t(p):\n    nuke(p)\n", {E.DESTRUCTIVE}),
+        ("from os import remove as rmf\n\ndef t(p):\n    rmf(p)\n", {E.DESTRUCTIVE}),
+        ("from requests import post as send\n\ndef t(u):\n    send(u)\n", {E.WRITE}),
+        ("ROOT = 1\n\ndef t(name):\n    (ROOT / name).unlink()\n", {E.DESTRUCTIVE}),
+        ("import stripe\n\ndef t(i):\n    stripe.Invoice.pay(i)\n", {E.PAYMENT}),
+    ],
+    ids=["alias-rmtree", "alias-remove", "alias-post", "expression-receiver", "invoice-pay"],
+)
+def test_python_aliases_and_expression_receivers(
+    source: str, expected: set[CapabilityClass]
+) -> None:
+    assert expected <= set(_classify(source).capabilities), source
+
+
+def test_a_second_binding_of_a_name_cannot_hide_the_first(tmp_path: Path) -> None:
+    path = tmp_path / "src" / "server.ts"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        IMPORT
+        + 'import { execSync } from "child_process";\n'
+        + SERVER
+        + 'server.tool("a", {}, (c) => execSync(c));\n'
+        + 'server.tool("b", {}, (c) => { const { execSync } = require("./safe"); return execSync(c); });\n'
+        + 'function unused() { const { execSync } = require("./noop"); return execSync; }\n'
+    )
+    tools = _tools(tmp_path)
+    assert E.EXECUTE in _caps(tools["a"])
+    assert E.EXECUTE in _caps(tools["b"])
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected"),
+    [
+        (
+            'import { execSync } from "child_process";\n',
+            "async ({ c }, _ = execSync) => execSync(c)",
+            {E.EXECUTE},
+        ),
+        (
+            'import { execSync } from "child_process";\n',
+            "(c) => { if (c) { const execSync = 1; } return execSync(c); }",
+            {E.EXECUTE},
+        ),
+        (
+            "",
+            '(c) => { const run = require("child_process").execSync; return run(c); }',
+            {E.EXECUTE},
+        ),
+        ("", "() => globalThis.process.env.API_KEY", {E.CREDENTIALS}),
+        ("", "() => process['env'].API_KEY", {E.CREDENTIALS}),
+        ('import http from "http";\n', "() => http.createServer(handler)", set()),
+    ],
+    ids=[
+        "default-value",
+        "nested-block",
+        "require-member",
+        "global-process",
+        "env-subscript",
+        "server",
+    ],
+)
+def test_typescript_final_check_forms(
+    tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass]
+) -> None:
+    assert _caps(_ts(tmp_path, handler, header)) == expected, handler
+
+
+def test_a_local_too_large_to_read_is_not_tainted(tmp_path: Path) -> None:
+    columns = ", ".join(f"'c{i}'" for i in range(130))
+    template = "(id) => { const cols = [COLUMNS]; return db.query(`SELECT ${cols.join(',')} FROM t`, [id]); }"
+    tool = _ts(tmp_path, template.replace("COLUMNS", columns))
+    assert not [r for r in tool.risks if r.category == "capability_scope"]

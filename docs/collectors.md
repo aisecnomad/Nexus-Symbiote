@@ -39,8 +39,10 @@ the record says `capability_evidence: source-body-call-names`.
 
 Names are resolved only through the file's imports (in TypeScript also `require`, dynamic
 `import()` and `promisify` of an imported function), a client or connection the body binds
-from an imported call, and builtins, so a parameter, a name the body binds itself, a local
-function or an unimported name spelled like a module names nothing. A method of a value a
+from an imported call, and builtins, so a parameter, a name the handler declares at the top
+of its body, a local function or an unimported name spelled like a module names nothing. A
+name bound to a module more than once, in any scope, keeps every binding, so a second
+binding, such as an unused `require` of the same name, cannot hide the first. A method of a value a
 module returns is not the module's function: `os.getenv(...).replace(...)` writes nothing.
 TypeScript is read from its syntax tree, so comments and strings name nothing either, and a
 callee chain of more than 16 steps names nothing, which keeps every node's cost constant. The classifier cannot show that a body does nothing else:

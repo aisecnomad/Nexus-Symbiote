@@ -140,6 +140,7 @@ _TS_SQL = frozenset(
 _TS_PAYMENT_RESOURCES = frozenset({"refunds", "charges", "paymentIntents", "payouts", "transfers"})
 _TS_PAYMENT_WRITE = frozenset({"create", "confirm", "capture"})
 _TS_GLOBALS = frozenset({"globalThis", "window", "global", "self"})
+_TS_HTTP_SERVER = frozenset({"createServer", "Server", "listen", "STATUS_CODES"})
 # A callee chain longer than this is not an API call; it names nothing, in constant time.
 MAX_CHAIN = 16
 # Nodes read to decide whether one SQL argument uses a parameter; past it, assume it does.
@@ -278,6 +279,10 @@ def _chain_through(node: ast.AST) -> tuple[str, bool] | None:
             node = node.func
         elif isinstance(node, ast.Name):
             parts.append(node.id)
+            return ".".join(reversed(parts)), through_call
+        elif parts:
+            # A base that is not a name, such as ``(root / name)``, resolves to nothing.
+            parts.append("?")
             return ".".join(reversed(parts)), through_call
         else:
             return None
@@ -422,6 +427,7 @@ def classify_python(
             continue
         parts = name.split(".")
         module = parts[0]
+        last = parts[-1]
         # os.<name> or shutil.<name> itself, not a method of a value one of them returns.
         module_call = len(parts) == 2 and not through_call
         if name in _PY_EXECUTE:
@@ -437,7 +443,9 @@ def classify_python(
                 seen.write()
         if module in _PAYMENT_MODULES and not set(parts) & _PAYMENT_LOCAL and last[:1].islower():
             seen.add(CapabilityClass.NETWORK)
-            if last in _PAYMENT_WRITE and set(parts) & _PAYMENT_RESOURCES:
+            if last in _PAYMENT_WRITE and (
+                set(parts) & _PAYMENT_RESOURCES or ("Invoice" in parts and last == "pay")
+            ):
                 seen.write(CapabilityClass.PAYMENT)
                 seen.payment = True
         if name == "open":
@@ -492,9 +500,24 @@ def _ts_module(specifier: str) -> str:
     return module.split("/", 1)[0] if not module.startswith("@") else module
 
 
-def typescript_imports(nodes: Iterable[Node]) -> dict[str, tuple[str, str]]:
-    """Local names bound by ``import`` or ``require``: name -> (module, export or '')."""
-    names: dict[str, tuple[str, str]] = {}
+Bindings = Mapping[str, tuple[tuple[str, str], ...]]
+
+
+def _bind(names: dict[str, list[tuple[str, str]]], name: str, binding: tuple[str, str]) -> None:
+    known = names.setdefault(name, [])
+    if binding not in known:
+        known.append(binding)
+
+
+def typescript_imports(nodes: Iterable[Node]) -> dict[str, tuple[tuple[str, str], ...]]:
+    """Every (module, export or '') a name is bound to by ``import`` or ``require``.
+
+    A name keeps every binding the file gives it, in any scope, so a second binding, such
+    as an unused ``require`` of the same name elsewhere, adds a candidate and never hides
+    the first.
+    """
+    nodes = list(nodes)
+    names: dict[str, list[tuple[str, str]]] = {}
     for node in nodes:
         if node.type == "import_statement":
             source = node.child_by_field_name("source")
@@ -506,11 +529,11 @@ def typescript_imports(nodes: Iterable[Node]) -> dict[str, tuple[str, str]]:
                     continue
                 for part in clause.named_children:
                     if part.type == "identifier":
-                        names[_ts_text(part)] = (module, "")
+                        _bind(names, _ts_text(part), (module, ""))
                     elif part.type == "namespace_import":
                         for ident in part.named_children:
                             if ident.type == "identifier":
-                                names[_ts_text(ident)] = (module, "")
+                                _bind(names, _ts_text(ident), (module, ""))
                     elif part.type == "named_imports":
                         for spec in part.named_children:
                             if spec.type != "import_specifier":
@@ -518,38 +541,41 @@ def typescript_imports(nodes: Iterable[Node]) -> dict[str, tuple[str, str]]:
                             imported = spec.child_by_field_name("name")
                             alias = spec.child_by_field_name("alias")
                             local = _ts_text(alias or imported)
-                            names[local] = (module, _ts_text(imported))
+                            _bind(names, local, (module, _ts_text(imported)))
         elif node.type == "variable_declarator":
-            value = node.child_by_field_name("value")
-            while value is not None and value.type == "await_expression":
-                value = value.named_children[0] if value.named_children else None
-            if value is None or value.type != "call_expression":
-                continue
-            callee = value.child_by_field_name("function")
-            arguments = value.child_by_field_name("arguments")
-            loader = callee is not None and (
-                callee.type == "import" or _ts_text(callee) == "require"
-            )
-            if not loader or arguments is None or not arguments.named_children:
-                continue
-            first = arguments.named_children[0]
-            if first.type != "string":
-                continue
-            module = _ts_module(_ts_text(first).strip("'\"`"))
             target = node.child_by_field_name("name")
-            if target is None:
+            value = _ts_unwrap_await(node.child_by_field_name("value"))
+            if target is None or value is None:
+                continue
+            export = ""
+            if value.type == "member_expression":
+                # const run = require("child_process").execSync
+                export = _ts_text(value.child_by_field_name("property"))
+                value = _ts_unwrap_await(value.child_by_field_name("object"))
+            loaded = (
+                _ts_loaded_module(value)
+                if value is not None and value.type == "call_expression"
+                else None
+            )
+            if loaded is None:
                 continue
             if target.type == "identifier":
-                names[_ts_text(target)] = (module, "")
-            elif target.type == "object_pattern":
+                _bind(names, _ts_text(target), (loaded, export))
+            elif target.type == "object_pattern" and not export:
                 for part in target.named_children:
                     if part.type == "shorthand_property_identifier_pattern":
-                        names[_ts_text(part)] = (module, _ts_text(part))
+                        _bind(names, _ts_text(part), (loaded, _ts_text(part)))
     _bind_promisified(nodes, names)
-    return names
+    return {name: tuple(bindings) for name, bindings in names.items()}
 
 
-def _bind_promisified(nodes: Iterable[Node], names: dict[str, tuple[str, str]]) -> None:
+def _ts_unwrap_await(node: Node | None) -> Node | None:
+    while node is not None and node.type == "await_expression":
+        node = node.named_children[0] if node.named_children else None
+    return node
+
+
+def _bind_promisified(nodes: Iterable[Node], names: dict[str, list[tuple[str, str]]]) -> None:
     """``const run = promisify(exec)`` runs what ``exec`` runs."""
     for node in nodes:
         if node.type != "variable_declarator":
@@ -565,7 +591,8 @@ def _bind_promisified(nodes: Iterable[Node], names: dict[str, tuple[str, str]]) 
             continue
         first = arguments.named_children[0] if arguments.named_children else None
         if first is not None and first.type == "identifier" and _ts_text(first) in names:
-            names[_ts_text(target)] = names[_ts_text(first)]
+            for binding in list(names[_ts_text(first)]):
+                _bind(names, _ts_text(target), binding)
 
 
 def _ts_loaded_module(call: Node) -> str | None:
@@ -592,9 +619,14 @@ def _ts_chain(callee: Node | None) -> list[str]:
     """
     parts: list[str] = []
     node = callee
-    for _ in range(MAX_CHAIN):
+    steps = 0
+    for _ in range(MAX_CHAIN * 8):
         if node is None:
             return []
+        if node.type in {"member_expression", "subscript_expression", "call_expression"}:
+            steps += 1
+            if steps > MAX_CHAIN:
+                return []
         if node.type in {"member_expression", "subscript_expression"}:
             prop = node.child_by_field_name("property") or node.child_by_field_name("index")
             parts.append(_ts_text(prop).strip("'\"`"))
@@ -621,6 +653,7 @@ def _ts_chain(callee: Node | None) -> list[str]:
 
 
 def _ts_parameters(handler: Node) -> set[str]:
+    """The names a handler's parameters bind, not their default values or types."""
     names: set[str] = set()
     parameters = handler.child_by_field_name("parameters") or handler.child_by_field_name(
         "parameter"
@@ -628,18 +661,27 @@ def _ts_parameters(handler: Node) -> set[str]:
     stack = [parameters] if parameters is not None else []
     while stack:
         node = stack.pop()
-        if node.type in {
-            "identifier",
-            "shorthand_property_identifier_pattern",
-            "shorthand_property_identifier",
-        }:
+        if node.type in {"identifier", "shorthand_property_identifier_pattern"}:
             names.add(_ts_text(node))
-        stack.extend(node.named_children)
+        elif node.type in {"assignment_pattern", "object_assignment_pattern"}:
+            left = node.child_by_field_name("left")
+            if left is not None:
+                stack.append(left)
+        elif node.type in {"required_parameter", "optional_parameter"}:
+            pattern = node.child_by_field_name("pattern")
+            if pattern is not None:
+                stack.append(pattern)
+        elif node.type == "pair_pattern":
+            value = node.child_by_field_name("value")
+            if value is not None:
+                stack.append(value)
+        elif node.type != "type_annotation":
+            stack.extend(node.named_children)
     return names
 
 
-def _ts_uses(node: Node, parameters: set[str]) -> bool:
-    """Whether ``node`` reads a parameter; past ``_MAX_USE_NODES`` nodes, assume it does."""
+def _ts_uses(node: Node, parameters: set[str], *, assume: bool = True) -> bool:
+    """Whether ``node`` reads a parameter; past ``_MAX_USE_NODES`` nodes, ``assume``."""
     if not parameters:
         return False
     stack = [node]
@@ -647,7 +689,7 @@ def _ts_uses(node: Node, parameters: set[str]) -> bool:
     while stack:
         budget -= 1
         if budget < 0:
-            return True
+            return assume
         current = stack.pop()
         if current.type in {"identifier", "shorthand_property_identifier"}:
             if _ts_text(current) in parameters:
@@ -673,30 +715,46 @@ def _ts_method(options: Node | None) -> str:
     return ""
 
 
+def _ts_property(node: Node) -> str:
+    """The property ``a.b`` or ``a["b"]`` names, or '' for a computed one."""
+    if node.type == "member_expression":
+        return _ts_text(node.child_by_field_name("property"))
+    index = node.child_by_field_name("index")
+    return _ts_text(index).strip("'\"`") if index is not None and index.type == "string" else ""
+
+
 def _ts_is_env(node: Node | None) -> bool:
-    """Whether ``node`` is ``process.env``, read at constant depth."""
-    if node is None or node.type != "member_expression":
+    """Whether ``node`` is ``process.env`` (or ``globalThis.process["env"]``), at constant depth."""
+    if node is None or node.type not in {"member_expression", "subscript_expression"}:
         return False
-    obj, prop = node.child_by_field_name("object"), node.child_by_field_name("property")
-    return _ts_text(obj) == "process" and _ts_text(prop) == "env"
+    if _ts_property(node) != "env":
+        return False
+    obj = node.child_by_field_name("object")
+    if obj is not None and obj.type == "identifier":
+        return _ts_text(obj) == "process"
+    if obj is not None and obj.type in {"member_expression", "subscript_expression"}:
+        base = obj.child_by_field_name("object")
+        return (
+            _ts_property(obj) == "process"
+            and base is not None
+            and base.type == "identifier"
+            and _ts_text(base) in _TS_GLOBALS
+        )
+    return False
 
 
 def _ts_env_name(node: Node) -> str | None:
     """The variable name of ``process.env.NAME`` or ``process.env["NAME"]``, else None."""
     if not _ts_is_env(node.child_by_field_name("object")):
         return None
-    if node.type == "member_expression":
-        return _ts_text(node.child_by_field_name("property"))
-    index = node.child_by_field_name("index")
-    if index is None or index.type != "string":
-        return None
-    return _ts_text(index).strip("'\"`")
+    return _ts_property(node) or None
 
 
 def _ts_import_binding(value: Node | None) -> bool:
     """Whether a declarator binds a module or a promisified export, as imports do."""
-    while value is not None and value.type == "await_expression":
-        value = value.named_children[0] if value.named_children else None
+    value = _ts_unwrap_await(value)
+    if value is not None and value.type == "member_expression":
+        value = _ts_unwrap_await(value.child_by_field_name("object"))
     if value is None or value.type != "call_expression":
         return False
     callee = _ts_text(value.child_by_field_name("function"))
@@ -704,12 +762,26 @@ def _ts_import_binding(value: Node | None) -> bool:
 
 
 def _ts_locals(handler: Node, parameters: set[str], skip: frozenset[int]) -> set[str] | None:
-    """Names the handler binds itself, which shadow imports and globals.
+    """Names the handler's body binds at its top level, which shadow imports and globals.
 
-    A local bound from a parameter, such as ``const { id } = args``, is added to
-    ``parameters`` too, so SQL built from it is caller-supplied. None past the node bound.
+    Only a declaration directly in the body shadows, so a binding in a nested block or a
+    dead branch cannot hide a call. A local bound from a parameter anywhere in the body,
+    such as ``const { id } = args``, is added to ``parameters`` so SQL built from it is
+    caller-supplied. None past the node bound.
     """
     names: set[str] = set()
+    body = handler.child_by_field_name("body")
+    if body is not None and body.type == "statement_block":
+        for statement in body.named_children:
+            if statement.type in {"function_declaration", "class_declaration"}:
+                name = statement.child_by_field_name("name")
+                if name is not None:
+                    names.add(_ts_text(name))
+            elif statement.type in {"lexical_declaration", "variable_declaration"}:
+                for declarator in statement.named_children:
+                    value = declarator.child_by_field_name("value")
+                    if declarator.type == "variable_declarator" and not _ts_import_binding(value):
+                        names.update(_ts_bound_names(declarator.child_by_field_name("name")))
     stack = [handler]
     visited = 0
     declarators: list[Node] = []
@@ -720,31 +792,38 @@ def _ts_locals(handler: Node, parameters: set[str], skip: frozenset[int]) -> set
             return None
         if node.type == "variable_declarator":
             declarators.append(node)
-        elif node.type in {"function_declaration", "class_declaration"}:
-            name = node.child_by_field_name("name")
-            if name is not None:
-                names.add(_ts_text(name))
         stack.extend(child for child in node.named_children if child.id not in skip)
     for node in sorted(declarators, key=lambda n: n.start_byte):
-        target, value = node.child_by_field_name("name"), node.child_by_field_name("value")
-        if target is None or _ts_import_binding(value):
-            continue
-        bound: list[str] = []
-        pending = [target]
-        while pending:
-            part = pending.pop()
-            if part.type in {"identifier", "shorthand_property_identifier_pattern"}:
-                bound.append(_ts_text(part))
-            pending.extend(part.named_children)
-        names.update(bound)
-        if value is not None and _ts_uses(value, parameters):
-            parameters.update(bound)
+        value = node.child_by_field_name("value")
+        if value is not None and _ts_uses(value, parameters, assume=False):
+            parameters.update(_ts_bound_names(node.child_by_field_name("name")))
     return names
+
+
+def _ts_bound_names(target: Node | None) -> list[str]:
+    bound: list[str] = []
+    pending = [target] if target is not None else []
+    while pending:
+        part = pending.pop()
+        if part.type in {"identifier", "shorthand_property_identifier_pattern"}:
+            bound.append(_ts_text(part))
+        elif part.type in {"object_assignment_pattern", "assignment_pattern"}:
+            left = part.child_by_field_name("left")
+            if left is not None:
+                pending.append(left)
+            continue
+        elif part.type == "pair_pattern":
+            value = part.child_by_field_name("value")
+            if value is not None:
+                pending.append(value)
+            continue
+        pending.extend(part.named_children)
+    return bound
 
 
 def classify_typescript(
     handler: Node,
-    imports: Mapping[str, tuple[str, str]],
+    imports: Bindings,
     label: str,
     skip: frozenset[int] = frozenset(),
 ) -> ToolCapabilities:
@@ -796,55 +875,64 @@ def classify_typescript(
 
 def _ts_call(
     node: Node,
-    imports: Mapping[str, tuple[str, str]],
+    imports: Bindings,
     shadowed: set[str],
     parameters: set[str],
     seen: _Observed,
 ) -> None:
-    """Classify one call. ``shadowed`` holds the names the handler binds itself."""
+    """Classify one call against every binding its head may have.
+
+    ``shadowed`` holds the names the handler binds itself.
+    """
     chain = _ts_chain(node.child_by_field_name("function"))
     if not chain:
         return
     head, last = chain[0], chain[-1]
     if head in _TS_GLOBALS and len(chain) > 1:
         chain, head = chain[1:], chain[1]
-    bound: tuple[str, str] | None
+    candidates: tuple[tuple[str, str], ...]
     if head.startswith(_MODULE_HEAD):
-        bound = (head.removeprefix(_MODULE_HEAD), "")
+        candidates = ((head.removeprefix(_MODULE_HEAD), ""),)
     else:
-        bound = imports.get(head) if head not in shadowed else None
-    unbound_global = bound is None and head not in shadowed
-    module, export = bound if bound is not None else ("", "")
-    resolved = ([export] if export else []) + chain[1:] if bound is not None else chain
-    name = resolved[-1] if resolved else last
+        candidates = () if head in shadowed else imports.get(head, ())
+    unbound_global = not candidates and head not in shadowed
     arguments = node.child_by_field_name("arguments")
     values = (
         [child for child in arguments.named_children if child.type != "comment"]
         if arguments is not None and arguments.type == "arguments"
         else []
     )
-    executes = module == "child_process" and name in _TS_EXECUTE
     evaluates = unbound_global and head == "eval" and len(chain) == 1
-    if executes or evaluates:
+    if evaluates:
         seen.add(CapabilityClass.EXECUTE)
         seen.execute = True
-    if module == "fs":
-        if name in _TS_FS_DELETE:
-            seen.delete(CapabilityClass.FILESYSTEM)
-        elif name in _TS_FS_WRITE:
-            seen.write(CapabilityClass.FILESYSTEM)
-    if (unbound_global and head == "fetch" and len(chain) == 1) or module in _TS_HTTP:
+    if unbound_global and head == "fetch" and len(chain) == 1:
         seen.add(CapabilityClass.NETWORK)
         method = _ts_method(values[1]) if len(values) > 1 else ""
-        if method in {"POST", "PUT", "PATCH", "DELETE"} or (
-            module in _TS_HTTP and name in _HTTP_WRITE
-        ):
+        if method in {"POST", "PUT", "PATCH", "DELETE"}:
             seen.write()
+    for module, export in candidates:
+        resolved = ([export] if export else []) + chain[1:]
+        name = resolved[-1] if resolved else last
+        if module == "child_process" and name in _TS_EXECUTE:
+            seen.add(CapabilityClass.EXECUTE)
+            seen.execute = True
+        if module == "fs":
+            if name in _TS_FS_DELETE:
+                seen.delete(CapabilityClass.FILESYSTEM)
+            elif name in _TS_FS_WRITE:
+                seen.write(CapabilityClass.FILESYSTEM)
+        if module in _TS_HTTP and name not in _TS_HTTP_SERVER:
+            seen.add(CapabilityClass.NETWORK)
+            method = _ts_method(values[1]) if len(values) > 1 else ""
+            if method in {"POST", "PUT", "PATCH", "DELETE"} or name in _HTTP_WRITE:
+                seen.write()
+    stripe_bound = any(module == "stripe" for module, _ in candidates)
     if last in {"sendMail", "sendEmail"} and len(chain) > 1:
         seen.add(CapabilityClass.NETWORK)
         seen.write()
     if (
-        (module == "stripe" or head.lower() == "stripe")
+        (stripe_bound or head.lower() == "stripe")
         and len(chain) >= 3
         and chain[-2] in _TS_PAYMENT_RESOURCES
         and last in _TS_PAYMENT_WRITE
