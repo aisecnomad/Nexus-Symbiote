@@ -27,7 +27,10 @@ from nexus_symbiote.core.models import MCPServerComponent, RiskAssessment
 ADVISORY_CATEGORY = "known_vulnerability"
 ADVISORY_PROPERTY = "advisories"
 ADVISORY_SURFACE_PREFIX = "advisories: offline OSV bundle "
-UNKNOWN_SEVERITY_NOTE = "Severity is not stated in the advisory data; recorded as medium."
+UNKNOWN_SEVERITY_NOTE = (
+    "Severity is not stated in the advisory data as a label or a CVSS v3 vector; "
+    "recorded as medium."
+)
 UNDECIDABLE_RANGE_NOTE = "The affected version range could not be decided; matched conservatively."
 _RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "unknown": 0}
 _FINDING_SEVERITY = {

@@ -322,3 +322,19 @@ def test_the_catalog_predicate_is_unchanged_in_all_packages_mode() -> None:
     assert AllPackagesRegistryScanner._inventoried("requests") is True
     assert RegistryScanner._inventoried("requests") is False
     assert RegistryScanner._inventoried("langchain") is True
+
+
+def test_a_cvss_v3_vector_sets_the_severity_from_its_base_score(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    record = _record("CVE-2099-9999", [("pillow", "9.0.1")], severity=None)
+    record["severity"] = [
+        {"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:N/I:N/A:P"},
+        {"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"},
+    ]
+    bom = _scan(project, _write_bundle(tmp_path, [record]), tmp_path / "inventory.json")
+    (pillow,) = [c for c in bom.components if c.name == "pillow"]
+    (finding,) = [r for r in pillow.risks if r.category == "known_vulnerability"]
+    assert finding.severity.value == "critical"
+    assert "Severity is not stated" not in finding.detail
+    (vulnerability,) = CycloneDXGenerator().generate(bom)["vulnerabilities"]
+    assert vulnerability["ratings"] == [{"severity": "critical"}]

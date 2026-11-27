@@ -1038,9 +1038,11 @@ launcher package has no exact package URL (no exact pin, or a registry other tha
 has an unknown version: `components_unidentified` counts it, and coverage is at most `partial`. The receipt records `registry_lockfile_only_dependencies` as
 `not-collected` even when every eligible inventory entry was checked. CycloneDX exposes the same receipt as
 `nexus-symbiote:advisories:collection`. A scan with zero exact targets records `coverage: none`
-under `unobserved_surfaces`. A severity
-the bundle does not state is recorded as a medium finding that says so and exported with an
-`unknown` rating. The feed-age check uses the current clock, so a bundle older than the
+under `unobserved_surfaces`. A record without a severity label takes its
+severity from the highest CVSS v3.0 or v3.1 base score in OSV's `severity` array, using the
+CVSS 3.1 equations and rating ranges (a 0.0 score is low); CVSS v2 and v4 vectors are not
+scored. A severity the bundle states neither way is recorded as a medium finding that says so
+and exported with an `unknown` rating. The feed-age check uses the current clock, so a bundle older than the
 matcher's default feed age turns the match into a collection failure even under
 `SOURCE_DATE_EPOCH`. Under `--all-packages` every PyPI or npm entry records
 `properties.ai_catalog`. Use the same flags when independently checking the inventory
