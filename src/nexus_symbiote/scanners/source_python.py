@@ -59,6 +59,7 @@ MAX_ORIGIN = 256
 # How far above the importing file, and how deep into a package, a module is looked for.
 MAX_ANCESTORS = 32
 MAX_PACKAGES = 8
+MAX_CACHED = 100_000
 _FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 _SCOPES = (*_FUNCTIONS, ast.ClassDef, *_COMPREHENSIONS)
@@ -281,6 +282,9 @@ class PythonReader:
     def add(self, path: str, text: str) -> None:
         """Analyse one file that may import a known SDK; files come one at a time, in order."""
         self._cut = self._shallow = False
+        if len(self._resolved) + len(self._local) > MAX_CACHED:
+            self._resolved.clear()
+            self._local.clear()
         module = self._load(path, text)
         if module is None:
             return

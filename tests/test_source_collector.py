@@ -2931,3 +2931,23 @@ def test_a_prefix_is_read_as_routers_write_it_and_a_bare_name_keeps_no_provider(
     assert (bare.requested_alias, bare.model_type) == (None, None)
     assert bare.claims["source_reference"].locator == "a.py:3"
     assert found[("gpt-4o", "openai")].requested_alias == "openai/gpt-4o"
+
+
+def test_the_answers_kept_across_files_are_bounded(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(source_python, "MAX_CACHED", 10)
+    files = {
+        f"app/m{index}.py": "".join(
+            f"from openai import sub{index}_{part}\nsub{index}_{part}.chat(model='gpt-4o')\n"
+            for part in range(20)
+        )
+        for index in range(5)
+    }
+    reader = source_python.PythonReader(
+        Declarations(ScanResult(scanner_name="source")), frozenset(files)
+    )
+    kept = []
+    for path, text in sorted(files.items()):
+        reader.add(path, text)
+        kept.append(len(reader._resolved) + len(reader._local))
+    # Each file asks of its own imports; what earlier files kept is let go past the bound.
+    assert max(kept) == kept[0] and kept[0] > 10
