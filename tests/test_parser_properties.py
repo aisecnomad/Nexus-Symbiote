@@ -849,7 +849,8 @@ def test_python_source_that_is_not_text_is_nothing_or_a_gap(payload):
     except UnicodeDecodeError:
         assert result.components == []
         assert list(result.surfaces_excluded) == [
-            "app/unit.py: source file is not UTF-8; declarations in it were not read"
+            "app/unit.py: source file cannot be decoded as its encoding declares; "
+            "declarations in it were not read"
         ]
 
 

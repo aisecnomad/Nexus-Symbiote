@@ -6,17 +6,22 @@ reader cannot name, is followed to a constant, an environment default, a formatt
 string, a concatenation, text extended with ``+=`` or either side of a conditional:
 through the names of its file and of the project modules it imports, the attributes of
 ``self``, of a module and of an object of a project class, the items of a literal
-dictionary, and the values the project's own functions return. A call into another
-library or a builtin is not read. What the reader knows is there and cannot read, such
-as an argument bound to a parameter, is a coverage gap, and so is a bound it reached.
-Each expression, and each name in each scope, is worked out once, so the work is linear
-in the size of what is read.
+dictionary, and the values the project's own functions return. What a callee is comes
+from the names, attributes and calls it is reached through, so a client made in the
+file, a parameter annotated with an SDK class, a method handed to ``functools.partial``
+and ``super()`` in a subclass of an SDK class are read; a call straight into another
+library or a builtin is not. What the reader knows is there and cannot read, such as an
+argument bound to a parameter, is a coverage gap, unless an SDK or another library
+builds the object it holds, and so is a bound it reached. Each expression, and each
+name in each scope, is worked out once, so the work is linear in the size of what is
+read.
 """
 
 from __future__ import annotations
 
 import ast
 import builtins
+import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -30,6 +35,7 @@ from nexus_symbiote.scanners.source_python_tables import (
     CLASS_METHODS,
     EMBEDDING_KEYWORDS,
     ENVIRONMENT_READS,
+    FORWARDERS,
     MODEL_KEYWORDS,
     POSITIONAL_MODELS,
     REPO_ID_CLASSES,
@@ -46,7 +52,7 @@ from nexus_symbiote.scanners.source_references import (
 METHOD = "python-ast"
 LOCAL = "<project>"
 MAX_DEPTH = 12
-# What a callee is, is followed further: each step is one attribute, call or alias.
+# What a callee is, is followed this far: each step is one attribute, call or alias.
 MAX_ORIGIN_DEPTH = 32
 MAX_CANDIDATES = 16
 MAX_STRINGS = 8
@@ -63,15 +69,6 @@ _FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 _SCOPES = (*_FUNCTIONS, ast.ClassDef, *_COMPREHENSIONS)
 _DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-# Bindings whose value the reader cannot give, each bound as the statement that makes
-# it: a loop or comprehension target, a name unpacked from what is not a literal, an
-# exception, a pattern capture, and text extended other than by ``+=``.
-_OPAQUE = (
-    *(ast.For, ast.AsyncFor, ast.comprehension, ast.ExceptHandler, ast.Assign, ast.AugAssign),
-    *(ast.With, ast.AsyncWith, ast.MatchAs, ast.MatchStar, ast.MatchMapping),
-)
-# What a model argument can be bound to that holds a value the reader cannot give.
-_UNREAD = (*_OPAQUE, ast.arg, ast.Name, ast.Attribute, ast.Subscript, ast.JoinedStr, ast.BinOp)
 _DISPLAYS: dict[type[ast.AST], str] = {
     ast.List: "list", ast.ListComp: "list", ast.Dict: "dict", ast.DictComp: "dict",
     ast.Set: "set", ast.SetComp: "set", ast.Tuple: "tuple", ast.JoinedStr: "str",
@@ -80,6 +77,8 @@ _TRANSFORMS: dict[str, Callable[[str], str]] = {
     "lower": str.lower, "strip": str.strip, "upper": str.upper,
 }  # fmt: skip
 _BUILTINS = frozenset(dir(builtins))
+# Roots whose objects are not another library's: what they make may be text.
+_NOT_LIBRARIES = frozenset({"builtins", *sys.stdlib_module_names})
 _T = TypeVar("_T")
 _K = TypeVar("_K")
 
@@ -92,7 +91,12 @@ class Module:
     tree: ast.Module
     nodes: list[ast.AST] = field(default_factory=list)
     imports: dict[str, str] = field(default_factory=dict)
+    # The modules its import statements name, and the names they import from them.
+    modules: set[str] = field(default_factory=set)
+    members: set[str] = field(default_factory=set)
     scopes: dict[ast.AST, ast.AST | None] = field(default_factory=dict)
+    # Names a scope declares ``global`` or ``nonlocal``, which bind in another scope.
+    declared: dict[ast.AST | None, dict[str, str]] = field(default_factory=dict)
     bindings: dict[ast.AST | None, dict[str, list[ast.AST]]] = field(default_factory=dict)
     definitions: dict[ast.AST | None, dict[str, ast.AST]] = field(default_factory=dict)
     parameters: dict[ast.AST, dict[str, ast.arg]] = field(default_factory=dict)
@@ -155,6 +159,26 @@ def _sdk(origin: str | None) -> bool:
     return origin is not None and _ai_import(origin.split("()", 1)[0])
 
 
+def _library(origin: str | None) -> bool:
+    """Whether an origin is another library's, outside the SDKs, the project and Python."""
+    if origin is None or origin.startswith(LOCAL) or _sdk(origin):
+        return False
+    return not _python(origin)
+
+
+def _python(origin: str | None) -> bool:
+    """Whether an origin is a builtin's or the standard library's."""
+    return origin is not None and origin.split(".", 1)[0].split("(", 1)[0] in _NOT_LIBRARIES
+
+
+def _hops(node: ast.AST) -> int:
+    """The attributes read on the way to a callee: one is a method, more a container."""
+    count = 0
+    while isinstance(node, ast.Attribute):
+        node, count = node.value, count + 1
+    return count
+
+
 def _loads_weights(origin: str) -> bool:
     base = origin.split("()", 1)[0]
     _, symbol, _ = _split(base)
@@ -206,7 +230,7 @@ class PythonReader:
     # -- files -------------------------------------------------------------------
 
     def add(self, path: str, text: str) -> None:
-        """Offer the text of one source file that names an SDK."""
+        """Offer the text of one source file that imports an SDK."""
         self._texts[path] = text
 
     def read(self) -> None:
@@ -220,7 +244,7 @@ class PythonReader:
             self._steps = self._allowance(module)
             if self._imports_sdk(module):
                 self._analyse(module)
-            elif self._steps > 0 and any(_ai_import(name) for name in module.imports.values()):
+            elif self._steps > 0 and any(self._shadowed(name, module) for name in module.modules):
                 self._found.gap(
                     path,
                     1,
@@ -283,6 +307,9 @@ class PythonReader:
             if len(module.nodes) > bound:
                 return False
             module.scopes[node] = scope
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                kind = "global" if isinstance(node, ast.Global) else "nonlocal"
+                module.declared.setdefault(scope, {}).update(dict.fromkeys(node.names, kind))
             inner = node if isinstance(node, _SCOPES) else scope
             stack.extend((child, inner) for child in reversed(list(ast.iter_child_nodes(node))))
         package = PurePosixPath(module.path).parent.parts
@@ -294,15 +321,18 @@ class PythonReader:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 bound = alias.asname or alias.name.split(".", 1)[0]
+                module.modules.add(alias.name)
                 self._bind_import(module, bound, alias.name if alias.asname else bound)
         elif isinstance(node, ast.ImportFrom):
             base = node.module or ""
             if node.level:
                 kept = package[: len(package) - (node.level - 1)] if node.level > 1 else package
                 base = ".".join([*kept, base] if base else kept)
+            module.modules.add(base)
             for alias in node.names:
                 if alias.name != "*":
                     name = f"{base}.{alias.name}" if base else alias.name
+                    module.members.add(name)
                     self._bind_import(module, alias.asname or alias.name, name)
         elif isinstance(node, ast.Assign):
             for target in node.targets:
@@ -349,6 +379,13 @@ class PythonReader:
             self._cut = True
 
     def _bind_name(self, module: Module, name: str, value: ast.AST, scope: ast.AST | None) -> None:
+        kind = module.declared.get(scope, {}).get(name)
+        if kind == "global":
+            scope = None
+        elif kind == "nonlocal":
+            scope = module.scopes.get(scope) if scope is not None else None
+            while scope is not None and not isinstance(scope, _FUNCTIONS):
+                scope = module.scopes.get(scope)
         module.bindings.setdefault(scope, {}).setdefault(name, []).append(value)
 
     def _bind_target(
@@ -388,7 +425,21 @@ class PythonReader:
     def _imports_sdk(self, module: Module) -> bool:
         return any(
             _ai_import(dotted) and not self._in_project(dotted, module)
-            for dotted in module.imports.values()
+            for dotted in (*module.modules, *module.members)
+        )
+
+    def _shadowed(self, dotted: str, module: Module) -> bool:
+        """Whether an import of an SDK's name may load a project module instead.
+
+        A module of the project at an import root shares the SDK's name. A deeper path
+        that resolves only in the project, as ``agents.researcher`` may, is the project's.
+        """
+        directory = module.path.rpartition("/")[0]
+        top = dotted.split(".", 1)[0]
+        return (
+            _ai_import(dotted)
+            and self._project_file(top, directory) is not None
+            and (dotted == top or self._project_file(dotted, directory) is None)
         )
 
     def _in_project(self, dotted: str, importer: Module) -> bool:
@@ -397,7 +448,10 @@ class PythonReader:
         key = (dotted, directory)
         known = self._local.get(key)
         if known is None:
-            parts = dotted.split(".", MAX_PACKAGES)[:MAX_PACKAGES]
+            parts = dotted.split(".", MAX_PACKAGES)
+            if len(parts) > MAX_PACKAGES:
+                self._cut = True
+            parts = parts[:MAX_PACKAGES]
             known = self._local[key] = any(
                 self._project_file(".".join(parts[:count]), directory) is not None
                 for count in range(len(parts), 0, -1)
@@ -407,16 +461,25 @@ class PythonReader:
     def _project_file(self, dotted: str, directory: str) -> str | None:
         """The project file a dotted module name resolves to from ``directory``, if any:
         beside the importer, in each directory above it nearest first, at the root and
-        in the usual source directories, each place a step of the file's allowance."""
+        in the usual source directories. A directory inside a package is no import root.
+        Each place looked in is a step of the file's allowance."""
         key = (dotted, directory)
         if key in self._resolved:
             return self._resolved[key]
         relative = dotted.replace(".", "/")
         bases: list[str] = []
-        while directory and len(bases) < MAX_ANCESTORS:
-            bases.append(directory + "/")
+        searched = 0
+        while directory and searched < MAX_ANCESTORS:
+            searched += 1
+            if f"{directory}/__init__.py" not in self._files:
+                bases.append(directory + "/")
             directory = directory.rpartition("/")[0]
-        bases.extend(("", "src/", "lib/", "app/"))
+        if directory:
+            self._cut = True
+        bases.append("")
+        bases.extend(
+            root for root in ("src/", "lib/", "app/") if f"{root}__init__.py" not in self._files
+        )
         self._steps -= len(bases)
         found: str | None = None
         for base in bases:
@@ -681,13 +744,17 @@ class PythonReader:
             self._returns_of[key] = found
         return self._returns_of[key]
 
-    def _single_origin(self, values: Iterable[_Value], depth: int) -> str | None:
+    def _single_origin(
+        self, values: Iterable[_Value], depth: int, also: str | None = None
+    ) -> str | None:
         # A binding to None says nothing about what the name calls.
         origins = {
             self._value_origin(value, depth + 1)
             for value in values
             if not (isinstance(value.node, ast.Constant) and value.node.value is None)
         }
+        if also is not None:
+            origins.add(also)
         return origins.pop() if len(origins) == 1 else None
 
     def origin(self, module: Module, node: ast.AST, depth: int = 0) -> str | None:
@@ -722,7 +789,15 @@ class PythonReader:
                     return found
             return None if base is None else f"{base}.{node.attr}"
         if isinstance(node, ast.Call):
-            base = self.origin(module, node.func, depth + 1)
+            function = node.func
+            if isinstance(function, ast.Name) and function.id == "super":
+                owner = self._owner(module, node)
+                if self._resolve(module, "super", function) is None and owner is not None:
+                    # ``super()`` in a subclass is an object of the class it derives from.
+                    bases = getattr(owner, "bases", ())
+                    base = self.origin(module, bases[0], depth + 1) if bases else None
+                    return None if base is None else f"{base}()"
+            base = self.origin(module, function, depth + 1)
             if base is not None and base.startswith(LOCAL):
                 # A project function that returns an SDK's object is that object.
                 returned, unknown = self._derived(module, node, depth)
@@ -748,7 +823,14 @@ class PythonReader:
                 return f"builtins.{node.id}"
             return found
         key, values = resolved
-        return self._once(self._named, key, None, lambda: self._single_origin(values, depth))
+        # A module that binds an imported name too, as an optional import's fallback does,
+        # may still hold what it imported.
+        also = (
+            self._import_origin(module, node.id)
+            if key == _scope_key(module, None, node.id)
+            else None
+        )
+        return self._once(self._named, key, None, lambda: self._single_origin(values, depth, also))
 
     def _import_origin(self, module: Module, name: str) -> str | None:
         """The dotted name an imported name stands for; a module of the project is marked."""
@@ -909,19 +991,42 @@ class PythonReader:
 
     def _summarise(self, module: Module, points: set[tuple[int, int]], what: str) -> None:
         if points:
-            subject = (
-                "a model argument is" if len(points) == 1 else f"{len(points)} model arguments are"
-            )
+            many = len(points)
+            subject = "a model argument is" if many == 1 else f"{many} model arguments are"
             self._found.gap(module.path, min(points)[0], f"{subject} {what}; not inventoried")
             points.clear()
 
+    def _project_callee(self, module: Module, function: ast.expr, origin: str | None) -> bool:
+        """Whether a callee is a function or class the project defines, or a method of an
+        object of a project class. What a project function returns may be an SDK's client,
+        so a method of it is not: by convention a class is named in capitals."""
+        if origin is None or not origin.startswith(LOCAL):
+            return False
+        made = origin[len(LOCAL) + 1 :].split("()", 1)
+        if len(made) > 1:
+            return made[0].rsplit(".", 1)[-1][:1].isupper()
+        if isinstance(function, ast.Name) or "." not in made[0]:
+            # A name, or a definition an attribute was followed to.
+            return True
+        base = function.value if isinstance(function, ast.Attribute) else None
+        dotted = module.imports.get(base.id) if isinstance(base, ast.Name) else None
+        directory = module.path.rpartition("/")[0]
+        return dotted is not None and self._project_file(dotted, directory) is not None
+
     def _models(self, module: Module, call: ast.Call) -> None:
-        """Record the model identifiers a call into an SDK, or an unknown callee, names."""
-        origin = self.origin(module, call.func)
-        base = "" if origin is None else origin.split("()", 1)[0]
-        local = base.startswith(LOCAL)
-        if origin is not None and not local and not _sdk(origin):
+        """Record the literal model identifiers a call into an SDK, or an unknown callee, gives."""
+        function, arguments = call.func, list(call.args)
+        origin = self.origin(module, function)
+        if origin in FORWARDERS and arguments:
+            # ``partial(create, model=...)`` gives ``create`` what it is given.
+            function, arguments = arguments[0], arguments[1:]
+            origin = self.origin(module, function)
+        local = self._project_callee(module, function, origin)
+        if (_library(origin) or _python(origin)) and _hops(function) <= 1:
+            # A function of another library or of Python, or a method of what one
+            # returns: no model is given. A longer path may reach any object.
             return
+        base = "" if origin is None else origin.split("()", 1)[0]
         _, symbol, _ = _split(base)
         keywords = _keywords(call)
         embedding = "embed" in (origin or "").lower()
@@ -932,19 +1037,36 @@ class PythonReader:
         position = (
             _row(base, POSITIONAL_MODELS) if origin is not None and "(" not in origin else None
         )
-        if position is not None and len(call.args) > position and "model" not in keywords:
-            found.append((call.args[position], embedding))
+        unread: list[ast.expr] = []
+        if position is not None and len(arguments) > position and "model" not in keywords:
+            if any(isinstance(argument, ast.Starred) for argument in arguments[: position + 1]):
+                unread.append(arguments[0])
+            else:
+                found.append((arguments[position], embedding))
         if "id" in keywords and any(_under(base, root) for root in ("agno.models", "phi.model")):
             found.append((keywords["id"], False))
+        if not any(key in keywords for key in MODEL_KEYWORDS):
+            # What ``**options`` holds may be the model.
+            unread.extend(keyword.value for keyword in call.keywords if keyword.arg is None)
         if local:
             self._given.update((value.lineno, value.col_offset) for value, _ in found)
             return
+        self._unread.update((value.lineno, value.col_offset) for value in unread)
         weights = origin is not None and _loads_weights(origin)
+        remote = weights and _constant(keywords.get("trust_remote_code")) is True
         for expression, embeds in found:
-            self._model_references(module, expression, embedding=embeds, weights=weights)
+            self._model_references(
+                module, expression, embedding=embeds, weights=weights, remote=remote
+            )
 
     def _model_references(
-        self, module: Module, expression: ast.expr, *, embedding: bool, weights: bool
+        self,
+        module: Module,
+        expression: ast.expr,
+        *,
+        embedding: bool,
+        weights: bool,
+        remote: bool,
     ) -> None:
         """Record each identifier a model argument can hold, and count what it holds besides."""
         point = (expression.lineno, expression.col_offset)
@@ -969,11 +1091,17 @@ class PythonReader:
                     embedding=embedding,
                     weights=weights,
                     environment=variable,
+                    remote_code=remote,
                 )
                 if ref is None and not placeholder(text):
                     self._unread.add(point)
             if not texts:
                 self._unread_value(module, value, point)
+
+    def _built(self, module: Module, node: ast.AST) -> bool:
+        """Whether a value is an object an SDK or another library builds, not a name."""
+        origin = self.origin(module, node)
+        return _sdk(origin) or _library(origin)
 
     def _imported_leaf(self, value: _Value) -> bool:
         """Whether a value is a name, or an attribute of one, imported from a project module."""
@@ -1003,8 +1131,9 @@ class PythonReader:
                 "model argument is bound in another module of the project, which the "
                 "collector could not follow; not inventoried",
             )
-        elif isinstance(node, _UNREAD) or (
-            # A call into an SDK builds an object that is read where it is built.
-            isinstance(node, ast.Call) and not _sdk(self.origin(value.module, node.func))
+        elif not isinstance(node, ast.Constant) and not (
+            # Whatever else spells no model is unread, unless it is a call by which an SDK
+            # or another library builds an object, which is read where it is built.
+            isinstance(node, ast.Call) and self._built(value.module, node)
         ):
             self._unread.add(point)

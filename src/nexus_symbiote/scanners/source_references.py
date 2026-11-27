@@ -32,6 +32,9 @@ MAX_RECORDS = 5_000
 
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{1,127}")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,63}")
+# A long run of hex or of base64 with no separator, or user information before an
+# ``@``: what a key, a token or a connection string looks like, and no model's name.
+_SECRET_SHAPED = re.compile(r"[0-9A-Fa-f]{32,}|[A-Za-z0-9+/]{40,}={0,2}|[^@:/]+:[^@/]*@.+")
 # Words a model argument holds that name no model on purpose.
 _NOT_A_MODEL = frozenset(
     {
@@ -93,6 +96,8 @@ def model_identifier(literal: object) -> str | None:
         return None
     if text.startswith(("./", "../", "/", "~")) or not unchanged_by_redaction(text):
         return None
+    if _SECRET_SHAPED.fullmatch(text):
+        return None
     return text
 
 
@@ -153,6 +158,7 @@ class _Model:
     aliases: set[str] = field(default_factory=set)
     environment: set[str] = field(default_factory=set)
     methods: set[str] = field(default_factory=set)
+    remote_code: bool = False
 
 
 def _evidence(locations: Iterable[tuple[str, int]]) -> list[str]:
@@ -192,10 +198,12 @@ class Declarations:
         embedding: bool = False,
         weights: bool = False,
         environment: str | None = None,
+        remote_code: bool = False,
     ) -> str | None:
         """Record one reference to a model and return its component reference.
 
         A provider is recorded only when a routing prefix on the identifier names it.
+        ``remote_code`` says the call that loads it lets the model run its own code.
         """
         if not isinstance(literal, str):
             return None
@@ -231,6 +239,7 @@ class Declarations:
         if environment and environment_name(environment):
             record.environment.add(environment)
             self._environment.add(environment)
+        record.remote_code = record.remote_code or remote_code
         return model_ref(name)
 
     def close(self) -> None:
@@ -288,6 +297,8 @@ class Declarations:
                     ),
                     trust_tier=TrustTier.UNKNOWN,
                     assurance_level=AssuranceLevel.DECLARED,
+                    # Code that lets a model run its own code says so; it is no bare name.
+                    trust_remote_code=True if model.remote_code else None,
                     properties=properties,
                     claims={
                         REFERENCE_CLAIM: ClaimEvidence(
