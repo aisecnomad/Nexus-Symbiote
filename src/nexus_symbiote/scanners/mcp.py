@@ -2644,6 +2644,9 @@ _CONTEXT_HIGH = {
     "host_root_mount": "a host root mount",
     "security_options_disabled": "disabled confinement",
     "dangerous_capabilities": "a host-level capability",
+    "deno_all_permissions": "unrestricted Deno permissions",
+    "deno_dangerous_permissions": "unrestricted Deno host permissions (run/ffi/sys)",
+    "tls_verification_disabled": "disabled TLS certificate verification",
 }
 _CONTEXT_MEDIUM = {
     "host_namespaces": "a host namespace",
@@ -2658,6 +2661,8 @@ _CONTEXT_MEDIUM = {
     "container_environment_file": "container environment from a file the inventory does not read",
     "container_command": "a health-check command the engine runs in the container",
     "custom_security_profile": "a seccomp profile from a file",
+    "deno_broad_permissions": "unscoped Deno permissions",
+    "debugger_enabled": "an enabled runtime debugger",
 }
 
 

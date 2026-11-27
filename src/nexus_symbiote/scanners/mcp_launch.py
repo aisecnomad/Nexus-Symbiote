@@ -82,6 +82,9 @@ _JSR = re.compile(r"(@[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*)(?:@([^/]+))?(?:/.
 
 _NODE_INLINE = frozenset({"-e", "--eval", "-p", "--print", "-pe", "-ep", "-"})
 _NODE_PRELOAD = frozenset({"-r", "--require", "--import", "--loader", "--experimental-loader"})
+_NODE_DEBUGGERS = frozenset(
+    {"--inspect", "--inspect-brk", "--inspect-wait", "--inspect-port", "--debug-port"}
+)
 # Node options that take a value as the next word (node --help); the value is never the script.
 _NODE_VALUES = _NODE_PRELOAD | _set(
     "--allow-fs-read --allow-fs-write --build-snapshot-config -C --conditions --cpu-prof-dir"
@@ -1009,6 +1012,7 @@ _DENO_RUN = _table(
     flag_patterns=(
         r"--(?:allow|deny)-[a-z-]+",
         r"--unstable-[a-z-]+",
+        r"--unsafely-ignore-certificate-errors",
         r"--(?:reload|lock|node-modules-dir|env-file|inspect|inspect-brk|inspect-wait"
         r"|allow-scripts|check|watch|watch-hmr|v8-flags|frozen|cached-only)",
         r"-r",
@@ -1495,14 +1499,19 @@ def _interpreter_reason(
         follows = words[index + 1] if index + 1 < len(words) else ""
         step = 1
         if family in {"node", "ts-node"}:
+            norm = "--" + option[2:].replace("_", "-") if option.startswith("--") else option
             target = value if equals else follows
-            if option in _NODE_INLINE or (
-                option in _NODE_PRELOAD and target.lower().startswith(_INLINE_SOURCES)
+            if norm in _NODE_INLINE or (
+                norm in _NODE_PRELOAD and target.lower().startswith(_INLINE_SOURCES)
             ):
                 return _inline(family, launch)
-            if option in _NODE_PRELOAD and launch is not None:
+            if norm in _NODE_PRELOAD and launch is not None:
                 launch.mark("preload_module")
-            takes = option in _NODE_VALUES or (family == "ts-node" and option in _TS_NODE_VALUES)
+            if norm in _NODE_DEBUGGERS and launch is not None:
+                launch.mark("debugger_enabled")
+            takes = norm in _NODE_VALUES or (
+                family == "ts-node" and (option in _TS_NODE_VALUES or norm in _TS_NODE_VALUES)
+            )
             step = 2 if takes and not equals else 1
         elif family == "python":
             if word == "-":
@@ -3643,6 +3652,12 @@ _DENO_SUBCOMMANDS = _set(
     " update upgrade vendor x"
 )
 _DENO_SOURCES = frozenset({"--import-map", "--cert"})
+_DENO_ALL_PERMISSIONS = frozenset({"-A", "--allow-all"})
+_DENO_DANGEROUS_PERMISSIONS = frozenset({"-S", "--allow-run", "--allow-ffi", "--allow-sys"})
+_DENO_BROAD_PERMISSIONS = frozenset(
+    {"-R", "-W", "-N", "-E", "--allow-read", "--allow-write", "--allow-net", "--allow-env"}
+)
+_DENO_DEBUGGERS = frozenset({"--inspect", "--inspect-brk", "--inspect-wait"})
 _DENO_TASK_VALUES = frozenset({"-c", "--config", "--cwd", "-f", "--filter", "-L", "--log-level"})
 # A short-option cluster ending in one that takes a value, with the value attached or
 # not: clap reads -qc deno.json and -cdeno.json as -c with its value.
@@ -3732,6 +3747,16 @@ def _deno(name: str, rest: list[str], launch: Launch) -> None:
                 launch.fail("explicit Deno import-map selection is not collected")
         elif option in {"--preload", "--require"}:
             launch.mark("preload_module")
+        elif option in _DENO_ALL_PERMISSIONS:
+            launch.mark("deno_all_permissions")
+        elif option in _DENO_DANGEROUS_PERMISSIONS:
+            launch.mark("deno_dangerous_permissions")
+        elif option in _DENO_BROAD_PERMISSIONS and not value:
+            launch.mark("deno_broad_permissions")
+        elif option == "--unsafely-ignore-certificate-errors":
+            launch.mark("tls_verification_disabled")
+        elif option in _DENO_DEBUGGERS:
+            launch.mark("debugger_enabled")
         elif option == "--env-file":
             # Deno loads the file before it resolves npm: specifiers, so it may set
             # NPM_CONFIG_REGISTRY or DENO_DIR where the inventory cannot read them.
