@@ -103,6 +103,77 @@ def test_every_result_is_located_relative_to_the_source_root(tmp_path):
     assert _by_component(anchored)["rag:import-chroma"][0] == "services/agent/aibom.json"
 
 
+def test_sarif_uses_the_collected_declaration_line_for_python_and_typescript(tmp_path):
+    from nexus_symbiote.scanners.mcp import MCPScanner
+
+    (tmp_path / "server.py").write_text(
+        "from mcp.server.fastmcp import FastMCP\n"
+        "srv = FastMCP('catalog')\n"
+        "@srv.tool()\ndef lookup():\n    return 'ok'\n"
+    )
+    (tmp_path / "index.ts").write_text(
+        'import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";\n'
+        'const srv = new McpServer({name:"catalog",version:"1.0.0"});\n'
+        '\nsrv.registerTool("lookup", {}, async () => ({content: []}));\n'
+    )
+    tools = [c for c in MCPScanner().scan(tmp_path).components if isinstance(c, ToolComponent)]
+    assert {t.source_path for t in tools} == {"server.py", "index.ts"}
+    for tool in tools:
+        tool.risks = [_risk(HIGH)]
+    output = SARIFGenerator(tmp_path).generate(AIBOM(components=tools))
+    assert validate_sarif(output) == []
+    observed = {}
+    for row in _results(output):
+        location = row["locations"][0]["physicalLocation"]
+        observed[location["artifactLocation"]["uri"]] = location["region"]["startLine"]
+    assert observed == {"server.py": 3, "index.ts": 4}
+
+
+@pytest.mark.parametrize("line", [None, True, "12", 0, -1, 1.5, 2**31])
+def test_sarif_invalid_lines_keep_the_same_file_location_and_fingerprint(tmp_path, line):
+    tool = ToolComponent(
+        bom_ref="t",
+        name="lookup",
+        source_path="src/agent.py",
+        risks=[_risk(HIGH)],
+        properties={"collection_mode": "static-source-declaration", "declaration_line": 12},
+    )
+    generator = SARIFGenerator(tmp_path)
+
+    def finding():
+        return _results(generator.generate(AIBOM(components=[tool])))[0]
+
+    original = finding()
+    tool.properties["declaration_line"] = line
+    result = finding()
+    assert result["locations"][0]["physicalLocation"] == {
+        "artifactLocation": {"uri": "src/agent.py", "uriBaseId": "%SRCROOT%"}
+    }
+    assert result["partialFingerprints"] == original["partialFingerprints"]
+
+
+def test_sarif_never_transplants_a_line_to_a_server_or_anchor_or_config_file(tmp_path):
+    props = {"collection_mode": "static-source-declaration", "declaration_line": 14}
+    server = MCPServerComponent(bom_ref="server", name="s", source_path="mcp.json")
+    tools = [
+        ToolComponent(bom_ref="via-server", name="t", mcp_server_ref="server", properties=props),
+        ToolComponent(
+            bom_ref="via-anchor", name="t", source_path="../external.py", properties=props
+        ),
+        ToolComponent(
+            bom_ref="config",
+            name="t",
+            source_path="mcp.json",
+            properties={**props, "collection_mode": "static-config"},
+        ),
+    ]
+    for tool in tools:
+        tool.risks = [_risk(HIGH)]
+    results = _results(SARIFGenerator(tmp_path).generate(AIBOM(components=[server, *tools])))
+    assert len(results) == 3
+    assert all("region" not in r["locations"][0]["physicalLocation"] for r in results)
+
+
 def test_a_scan_root_outside_the_source_root_becomes_the_source_root(tmp_path):
     project = tmp_path / "checkout"
     project.mkdir()
