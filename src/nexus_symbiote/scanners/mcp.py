@@ -32,7 +32,7 @@ from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, S
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import date
-from itertools import chain, pairwise
+from itertools import chain, islice, pairwise
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
@@ -2479,6 +2479,7 @@ _LIST_FIELDS = _names(
 )
 _MAP_FIELDS = frozenset({"env", "headers", "http_headers", "env_http_headers"})
 _CODEX_FORWARDING_FIELDS = frozenset({"env_vars", "env_http_headers", "bearer_token_env_var"})
+_CODEX_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 # http::HeaderName::from_bytes accepts ASCII field-name tokens up to 65,535 bytes.
 _CODEX_HTTP_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~A-Za-z0-9-]{1,65535}")
 # Codex's NON_INHERITABLE_ENV_VARS, pinned in docs/collectors.md.
@@ -2911,7 +2912,7 @@ def _codex_env_references(
         shown = sorted(
             name
             for name in candidates
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name)
+            if _CODEX_ENV_NAME.fullmatch(name)
             and names.shown(name, finding=True)
             and not protected.held_by(name)
         )
@@ -3821,6 +3822,8 @@ def _text_credentials(text: str) -> list[str]:
 
 # Nodes of one configuration document read for the values a declared name must not hold.
 _KNOWN_VALUE_NODES = 1 << 17
+# Across all client files, bound the distinct literals checked by exact name.
+_MAX_FORWARDED_NAME_VALUES = 1 << 17
 # Maps whose values a client passes to a server or sends with its requests, and which
 # no record publishes: environments (opencode's `environment` too), headers and Codex's
 # query parameters and `shell_environment_policy.set`.
@@ -3831,20 +3834,58 @@ _HOST_SETTINGS = frozenset(
 )
 
 
-def _configured_values(document: Any, *, codex_references: bool = False) -> list[str] | None:
+class _ForwardedNameValues(KnownValues):
+    """Extend the usual name checks with exact matches for masked maps and credential options."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._exact: set[str] = set()
+
+    def add_exact(self, value: str) -> None:
+        if len(self._exact) <= _MAX_FORWARDED_NAME_VALUES and _CODEX_ENV_NAME.fullmatch(value):
+            self._exact.add(value)
+            if len(self._exact) > _MAX_FORWARDED_NAME_VALUES:
+                self.refuse()
+
+    def add_arguments(self, arguments: Iterable[Any]) -> None:
+        """Index separate and inline credential options in a client's argument vector."""
+        previous = ""
+        for item in arguments:
+            if isinstance(item, str):
+                if _is_credential_flag(previous) and credential_name(previous):
+                    self.add_exact(item)
+                assigned = _assigned(item)
+                if assigned is not None:
+                    name, value, variable = assigned
+                    # Keep short flag spellings such as -k. An environment
+                    # assignment uses the variable name inside its option.
+                    if credential_name(name if variable else item.partition("=")[0]):
+                        self.add_exact(value)
+            previous = item if isinstance(item, str) else ""
+
+    def held_by(self, name: str) -> bool:
+        return name in self._exact or super().held_by(name)
+
+
+def _configured_values(
+    document: Any, *, forwarding_shape: str = "", forwarded: _ForwardedNameValues | None = None
+) -> list[str] | None:
     """Values of a configuration document that a server name declared in source must not hold.
 
     Beyond what a server's parsing collects: a credential-named value in any field, as
     Codex's `experimental_bearer_token` or a server's own `apiKey`, URL user
     information, `NAME=value` and `--flag value` arguments, and every value of at least
     ``MIN_SECRET_LENGTH`` characters in an environment, header or parameter map, none
-    of which the inventory shows. The whole document is read, a server map that is not
-    collected too. ``None`` past ``_KNOWN_VALUE_NODES`` nodes.
+    of which the inventory shows. For forwarding declarations, also index exact matches
+    of any length in masked maps and credential options. The whole document is read,
+    including uncollected server maps. ``None`` past ``_KNOWN_VALUE_NODES`` nodes.
     """
     # When checking forwarded names, a declaration of the name itself is public.
     # Keep every other occurrence eligible as a value, including in sibling servers.
     servers = (
-        document.get("mcp_servers") if codex_references and isinstance(document, dict) else None
+        document.get("mcp_servers")
+        if forwarding_shape == "codex" and isinstance(document, dict)
+        else None
     )
     declarations = (
         {id(server) for server in servers.values() if isinstance(server, dict)}
@@ -3865,6 +3906,10 @@ def _configured_values(document: Any, *, codex_references: bool = False) -> list
                     key: value for key, value in node.items() if key not in _CODEX_FORWARDING_FIELDS
                 }
             values.extend(secret_values(node))
+            if forwarded is not None:
+                for field, item in node.items():
+                    if isinstance(item, str) and (key in _VALUE_MAPS or credential_name(field)):
+                        forwarded.add_exact(item)
             if key in _VALUE_MAPS:
                 values.extend(
                     item
@@ -3874,6 +3919,11 @@ def _configured_values(document: Any, *, codex_references: bool = False) -> list
             pending.extend(node.items())
         elif isinstance(node, list):
             pending.extend((None, item) for item in node)
+            if forwarded is not None:
+                if key == "args":
+                    forwarded.add_arguments(node)
+                elif forwarding_shape == "opencode" and key == "command":
+                    forwarded.add_arguments(islice(node, 1, None))
             for flag, word in pairwise(node):
                 if (
                     isinstance(flag, str)
@@ -4088,7 +4138,7 @@ class MCPScanner(Scanner):
             collected.append((dialect, data, read, file_secrets, server_hits))
         # A name may repeat a literal or credential of any client file, so every file is read first.
         names = _Names(literals)
-        protected = KnownValues()
+        protected = _ForwardedNameValues()
         if any(
             dialect.shape == "codex"
             and any(
@@ -4099,7 +4149,9 @@ class MCPScanner(Scanner):
         ):
             for dialect, data, _, scrubber, _hits in collected:
                 protected.add(scrubber.values)
-                configured = _configured_values(data, codex_references=dialect.shape == "codex")
+                configured = _configured_values(
+                    data, forwarding_shape=dialect.shape, forwarded=protected
+                )
                 if configured is None:
                     protected.refuse()
                     break

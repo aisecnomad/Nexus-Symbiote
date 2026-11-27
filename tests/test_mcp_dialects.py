@@ -440,6 +440,84 @@ env_vars = ["LOCAL_TOKEN", { name = "FOREIGN_TOKEN", source = "remote" }]
     )
 
 
+def test_codex_withholds_exact_masked_values_across_forwarding_forms(tmp_path):
+    codex = """
+[mcp_servers.local]
+command = "catalog"
+environment_id = "managed"
+env_vars = ["a", "a_label", "page", "beige", "coral", "sand", "stone", {name = "rose", source = "remote"}]
+[mcp_servers.web]
+url = "https://catalog.example.test"
+bearer_token_env_var = "linen"
+env_http_headers = { X-One = "mint", X-Two = "leaf", X-Three = "meadow" }
+[mcp_servers.sibling]
+command = "catalog"
+env = { COLOR = "rose" }
+"""
+    other = {
+        "mcpServers": {
+            "worker": {
+                "command": "catalog",
+                "env": {"DISPLAY": "a"},
+                "args": ["page", "--api-key", "linen", "--api-key=mint", "API_KEY=leaf"],
+            }
+        }
+    }
+    opencode = {
+        "mcp": {
+            "colors": {
+                "type": "local",
+                "command": [
+                    "catalog",
+                    "--api-key",
+                    "beige",
+                    "--api-key=coral",
+                    "-k",
+                    "sand",
+                    "-k=stone",
+                ],
+            }
+        }
+    }
+    result = scan(
+        tmp_path,
+        {
+            ".codex/config.toml": codex,
+            ".mcp.json": json.dumps(other),
+            "opencode.json": json.dumps(opencode),
+        },
+    )
+    assert not result.scan_failures
+    found = servers(result)
+    assert found["local"].properties["env_vars_referenced"] == ["a_label", "page"]
+    assert "remote_env_vars_referenced" not in found["local"].properties
+    assert found["web"].properties["env_vars_referenced"] == ["meadow"]
+
+
+def test_codex_withholds_forwarded_names_when_exact_value_index_overflows(tmp_path, monkeypatch):
+    from nexus_symbiote.scanners import mcp
+
+    monkeypatch.setattr(mcp, "_MAX_FORWARDED_NAME_VALUES", 2)
+    codex = """
+[mcp_servers.local]
+command = "catalog"
+env_vars = ["PUBLIC_LABEL"]
+[mcp_servers.sibling]
+command = "catalog"
+env = { FIRST = "one", SECOND = "two" }
+"""
+    result = scan(tmp_path, {".codex/config.toml": codex})
+    assert servers(result)["local"].properties["env_vars_referenced"] == ["PUBLIC_LABEL"]
+    codex += 'env_vars = ["OTHER_LABEL"]\n'
+    other = {"mcpServers": {"worker": {"command": "catalog", "env": {"THIRD": "three"}}}}
+    result = scan(tmp_path, {".codex/config.toml": codex, ".mcp.json": json.dumps(other)})
+    assert not result.scan_failures
+    assert "local" in servers(result)
+    assert all(
+        "env_vars_referenced" not in server.properties for server in servers(result).values()
+    )
+
+
 def test_codex_respects_forwarded_header_bounds_and_withholds_names_when_context_is_unreadable(
     tmp_path,
 ):

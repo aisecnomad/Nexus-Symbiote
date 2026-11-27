@@ -36,8 +36,10 @@ header name is valid HTTP syntax. Case variants of the same header can reference
 different variables, so the inventory lists each candidate. [Codex header handling](https://github.com/openai/codex/blob/57b493a648aa44547f5debf6e3344fcd2b2af529/codex-rs/rmcp-client/src/utils.rs#L101-L155)
 `blast-radius` uses only the local names when identifying shared credential
 references. Remote HTTP configurations do not establish a local host credential.
-The collector reads the declarations without looking up the variables. Runtime
-access and the equality of credential values remain unknown.
+The collector withholds a forwarding name that exactly repeats a masked environment,
+header or parameter value, or a credential option's literal, including short values
+from other collected MCP client files. It reads declarations without looking up
+the variables. Runtime access and the equality of credential values remain unknown.
 
 ## MCP servers declared in source
 
