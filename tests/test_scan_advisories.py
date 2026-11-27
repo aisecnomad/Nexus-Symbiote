@@ -10,8 +10,6 @@ from click.testing import CliRunner
 
 from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import AIBOM
-from nexus_symbiote.core.models import A2AServerComponent, CapabilityDeclaration
-from nexus_symbiote.diff.differ import AIBOMDiffer
 from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
 from nexus_symbiote.scanners.registry import AllPackagesRegistryScanner, RegistryScanner
 
