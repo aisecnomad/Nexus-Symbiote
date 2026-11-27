@@ -700,9 +700,9 @@ class PythonReader:
         if "id" in keywords and any(_under(base, root) for root in ("agno.models", "phi.model")):
             found.append((keywords["id"], False))
         spreads = [keyword.value for keyword in call.keywords if keyword.arg is None]
-        named = (
-            self._resolve(module, function.id, function) if isinstance(function, ast.Name) else None
-        )
+        named = None
+        if isinstance(function, ast.Name) and self._steps > 0:
+            named = self._resolve(module, function.id, function)
         handed = named is not None and all(isinstance(value.node, ast.arg) for value in named[1])
         if not (found or unread or keywords.keys() & MODEL_KEYWORDS) and (origin or not handed):
             # What ``**options`` holds may be the model, though not where a wrapper calls a

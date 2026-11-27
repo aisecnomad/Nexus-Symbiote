@@ -930,10 +930,25 @@ def _cut_augmented(size: int) -> str:
     return "x = a" + ".a" * 40 + "\n" + "x += 0\n" * size + "x()\n" * size
 
 
+def _nested_spreads(size: int) -> str:
+    # Each spread looks its dict up through every scope around it.
+    spreads = "lambda: f(**d), " * size
+    return "d = dict(model='gpt-4o')\ng = " + "lambda: " * size + "(" + spreads + ")\n"
+
+
 @pytest.mark.no_cover
 @pytest.mark.parametrize(
     "shape",
-    [_rebinds, _wide_or, _deep_plus, _joined_bindings, _cut_names, _nested_owners, _cut_augmented],
+    [
+        _rebinds,
+        _wide_or,
+        _deep_plus,
+        _joined_bindings,
+        _cut_names,
+        _nested_owners,
+        _cut_augmented,
+        _nested_spreads,
+    ],
     ids=[
         "rebinds",
         "wide-or",
@@ -942,6 +957,7 @@ def _cut_augmented(size: int) -> str:
         "cut-names",
         "nested-owners",
         "cut-augmented",
+        "nested-spreads",
     ],
 )
 def test_reading_python_source_is_linear_in_its_size(tmp_path, shape):
