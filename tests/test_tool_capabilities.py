@@ -789,7 +789,11 @@ def test_typescript_destructured_module_bindings(
         ("    return conn.execute(text(q).bindparams(a=1))\n", {E.WRITE, E.DESTRUCTIVE}, True),
         ("    return conn.execute(text('SELECT 1').bindparams(a=q))\n", set(), False),
         ("    return conn.execute('SELECT * FROM t -- DELETE later', (q,))\n", set(), False),
-        ("    return conn.execute(\"SELECT * FROM t WHERE note = 'please DROP it'\")\n", set(), False),
+        (
+            "    return conn.execute(\"SELECT * FROM t WHERE note = 'please DROP it'\")\n",
+            set(),
+            False,
+        ),
         ("    return conn.execute('/* UPDATE */ SELECT * FROM t FOR UPDATE')\n", set(), False),
         ("    return conn.execute('SELECT 1; DROP TABLE t')\n", {E.WRITE, E.DESTRUCTIVE}, False),
         (
