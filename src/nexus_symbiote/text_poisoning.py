@@ -529,9 +529,10 @@ def _verb_is_negated(text: str, verb_start: int) -> bool:
 
 
 def _shell_word(token: str) -> str:
-    word = token.lower()
+    """The command word of a token, ignoring a glued ``$(`` or a closing paren."""
+    word = token.lower().strip("$#@()|;<>")
     if "/" in word:
-        word = word.rsplit("/", 1)[-1]
+        word = word.rsplit("/", 1)[-1].strip("$#@()|;<>")
     return word
 
 
