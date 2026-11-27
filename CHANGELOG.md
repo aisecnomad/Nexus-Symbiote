@@ -4,6 +4,10 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Fixed
+
+- **`validate --project`:** the local assembly now imports the edges a collector records between the components it accepted, as `scan` does, so an inventory from a collector that records `uses-model` or `invokes` edges no longer fails reconciliation with "Supplied relationship between local components has no local evidence". An edge the collector did not record is still unevidenced.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).
