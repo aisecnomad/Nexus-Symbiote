@@ -1010,9 +1010,8 @@ _DENO_RUN = _table(
         r"--(?:allow|deny)-[a-z-]+",
         r"--unstable-[a-z-]+",
         r"--(?:reload|lock|node-modules-dir|env-file|inspect|inspect-brk|inspect-wait"
-        r"|unsafely-ignore-certificate-errors|allow-scripts|check|watch|watch-hmr|v8-flags"
-        r"|frozen|cached-only|permission-set)",
-        r"-[rRWNESP]",
+        r"|allow-scripts|check|watch|watch-hmr|v8-flags|frozen|cached-only)",
+        r"-r",
     ),
 )
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "fish"})
@@ -1503,21 +1502,6 @@ def _interpreter_reason(
                 return _inline(family, launch)
             if option in _NODE_PRELOAD and launch is not None:
                 launch.mark("preload_module")
-            if launch is not None:
-                if option in {
-                    "--inspect",
-                    "--inspect-brk",
-                    "--inspect-wait",
-                    "--inspect-publish-uid",
-                }:
-                    launch.mark("inspector_exposed")
-                elif option in {
-                    "--allow-child-process",
-                    "--allow-addons",
-                    "--allow-wasi",
-                    "--allow-worker",
-                } or (option in {"--allow-fs-read", "--allow-fs-write"} and target in {"*", "/"}):
-                    launch.mark("unrestricted_sandbox")
             takes = option in _NODE_VALUES or (family == "ts-node" and option in _TS_NODE_VALUES)
             step = 2 if takes and not equals else 1
         elif family == "python":
@@ -3752,30 +3736,6 @@ def _deno(name: str, rest: list[str], launch: Launch) -> None:
             # Deno loads the file before it resolves npm: specifiers, so it may set
             # NPM_CONFIG_REGISTRY or DENO_DIR where the inventory cannot read them.
             launch.injected_environment = True
-        elif (
-            option in {"-A", "--allow-all", "--allow-run", "--allow-ffi"}
-            or (option in {"-S", "--allow-sys"} and (value is None or value in {"", "*"}))
-            or (option in {"-R", "-W", "--allow-read", "--allow-write"} and value in {"*", "/"})
-            or (option in {"-N", "--allow-net"} and value == "*")
-        ):
-            launch.mark("unrestricted_sandbox")
-        elif option == "--unsafely-ignore-certificate-errors":
-            launch.mark("tls_verification_disabled")
-        elif option in {"--inspect", "--inspect-brk", "--inspect-wait"}:
-            launch.mark("inspector_exposed")
-        elif option in {
-            "-R",
-            "-W",
-            "-N",
-            "-E",
-            "-P",
-            "--allow-read",
-            "--allow-write",
-            "--allow-net",
-            "--allow-env",
-            "--permission-set",
-        } and (value is None or value == ""):
-            launch.mark("widened_sandbox")
     script = rest[position]
     if script == "-" or script.lower().startswith(_INLINE_SOURCES[:1]):
         launch.fail(_inline("deno", launch))

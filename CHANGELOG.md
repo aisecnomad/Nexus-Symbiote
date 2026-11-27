@@ -6,7 +6,7 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ### Security
 
-- **MCP launch confinement & tool-schema poisoning depth:** Flagged unrestricted Deno/Node sandboxes (`-A`, `--allow-all`, `--allow-run`, `--allow-ffi`, `--allow-child-process`, `--allow-addons`, `--allow-worker`, root/wildcard `--allow-*`), disabled TLS verification (`--unsafely-ignore-certificate-errors`), exposed debuggers (`--inspect*`), and unscoped Deno `-R`/`-W`/`-N`/`-E`/`-P`/`--allow-*` permissions under `launch_context` while supporting scoped `-N=host`/`-R=/path` short flags; extended `TP-SIDENOTE-004` across `$defs`, `definitions`, `patternProperties`, `prefixItems`, `dependentSchemas`, and `if`/`then`/`else` subtrees; applied `text_poisoning` rules across `discover-mcp --record` live server instructions, `serverInfo`, prompts, resource templates, and full tool descriptors (`title`, `outputSchema`, `annotations`, `_meta`).
+- **Tool-schema `$defs`/`sidenote` poisoning & live MCP recording parity:** Extended `TP-SIDENOTE-004` across `$defs`, `definitions`, `patternProperties`, `prefixItems`, `dependentSchemas`, `dependencies`, and `if`/`then`/`else` subtrees while binding evidence directly to the side-channel parameter's own subtree; applied unified single-pass `text_poisoning` consolidation across `discover-mcp --record` live server declarations (`instructions`, `serverInfo`, `prompts`, `resourceTemplates`) and full tool descriptors (`description`, `inputSchema`, `title`, `outputSchema`, `annotations`, `_meta`).
 
 ## [0.2.0] - 2026-11-25
 

@@ -20,7 +20,7 @@ import tokenize
 import unicodedata
 from bisect import bisect_left, bisect_right
 from collections import Counter, deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -1052,24 +1052,29 @@ def _escape_decoded_hits(
 
 def _collect_schema_properties(
     schema: dict[str, Any] | None,
-) -> list[tuple[str, dict[str, Any] | None]]:
+) -> list[tuple[str, dict[str, Any] | None, str]]:
     if not isinstance(schema, dict):
         return []
-    found: list[tuple[str, dict[str, Any] | None]] = []
+    found: list[tuple[str, dict[str, Any] | None, str]] = []
     seen: set[int] = {id(schema)}
-    queue: deque[dict[str, Any]] = deque([schema])
+    queue: deque[tuple[dict[str, Any], str]] = deque([(schema, "")])
     visited = 0
+
+    def _join(prefix: str, segment: str) -> str:
+        return f"{prefix}.{segment}" if prefix else segment
+
     while queue and visited < 4096:
-        node = queue.popleft()
+        node, prefix = queue.popleft()
         visited += 1
         props = node.get("properties")
         if isinstance(props, dict):
             for k, v in props.items():
                 if isinstance(k, str):
-                    found.append((k, v if isinstance(v, dict) else None))
-                if isinstance(v, dict) and id(v) not in seen:
-                    seen.add(id(v))
-                    queue.append(v)
+                    prop_path = _join(prefix, f"properties.{k}")
+                    found.append((k, v if isinstance(v, dict) else None, prop_path))
+                    if isinstance(v, dict) and id(v) not in seen:
+                        seen.add(id(v))
+                        queue.append((v, prop_path))
         for def_key in (
             "$defs",
             "definitions",
@@ -1079,19 +1084,19 @@ def _collect_schema_properties(
         ):
             defs = node.get(def_key)
             if isinstance(defs, dict):
-                for sub_schema in defs.values():
+                for sub_name, sub_schema in defs.items():
                     if isinstance(sub_schema, dict) and id(sub_schema) not in seen:
                         seen.add(id(sub_schema))
-                        queue.append(sub_schema)
+                        queue.append((sub_schema, _join(prefix, f"{def_key}.{sub_name}")))
         items_val = node.get("items")
         if isinstance(items_val, dict) and id(items_val) not in seen:
             seen.add(id(items_val))
-            queue.append(items_val)
+            queue.append((items_val, _join(prefix, "items")))
         elif isinstance(items_val, list):
-            for item in items_val:
+            for idx, item in enumerate(items_val):
                 if isinstance(item, dict) and id(item) not in seen:
                     seen.add(id(item))
-                    queue.append(item)
+                    queue.append((item, _join(prefix, f"items[{idx}]")))
         for combiner in (
             "additionalProperties",
             "unevaluatedProperties",
@@ -1105,29 +1110,93 @@ def _collect_schema_properties(
             sub = node.get(combiner)
             if isinstance(sub, dict) and id(sub) not in seen:
                 seen.add(id(sub))
-                queue.append(sub)
+                queue.append((sub, _join(prefix, combiner)))
         for list_key in ("anyOf", "oneOf", "allOf", "prefixItems"):
             items = node.get(list_key)
             if isinstance(items, list):
-                for item in items:
+                for idx, item in enumerate(items):
                     if isinstance(item, dict) and id(item) not in seen:
                         seen.add(id(item))
-                        queue.append(item)
+                        queue.append((item, _join(prefix, f"{list_key}[{idx}]")))
     return found
 
 
 def _collect_schema_property_names(schema: dict[str, Any] | None) -> set[str]:
-    return {k for k, _ in _collect_schema_properties(schema)}
+    return {k for k, _, _ in _collect_schema_properties(schema)}
 
 
-def _subschema_has_tool_poisoning(subschema: dict[str, Any], *, surface: str) -> bool:
-    for path, text in extract_json_text_entries(subschema, max_depth=64, max_entries=512):
-        if text and any(
-            h.category == CATEGORY_TOOL_POISONING
-            for h in scan_text_block(text, surface=surface, is_tool_surface=True, where=path)
-        ):
-            return True
-    return False
+def _side_channel_subtree_hit(
+    side_entries: Sequence[tuple[str, dict[str, Any] | None, str]],
+    *,
+    surface: str,
+    existing_hits: Sequence[TextPoisoningHit],
+    matched_values: Sequence[tuple[str, list[TextPoisoningHit]]] = (),
+) -> TextPoisoningHit | None:
+    for _, sub, dot_prefix in side_entries:
+        in_mem_prefix = f"input_schema.{dot_prefix}"
+        for hit in existing_hits:
+            if hit.category == CATEGORY_TOOL_POISONING and (
+                hit.where == in_mem_prefix or hit.where.startswith(f"{in_mem_prefix}.")
+            ):
+                return hit
+        if sub is None:
+            continue
+        for sub_path, sub_text in extract_json_text_entries(sub, max_depth=64, max_entries=512):
+            if not sub_text:
+                continue
+            fallback_where = f"{in_mem_prefix}.{sub_path}" if sub_path else in_mem_prefix
+            sub_hits = [
+                sh
+                for sh in scan_text_block(
+                    sub_text, surface=surface, is_tool_surface=True, where=fallback_where
+                )
+                if sh.category == CATEGORY_TOOL_POISONING
+            ]
+            if not sub_hits:
+                continue
+            schema_match: TextPoisoningHit | None = None
+            any_match: TextPoisoningHit | None = None
+            for val, val_hits in matched_values:
+                if val != sub_text:
+                    continue
+                for vh in val_hits:
+                    if vh.category != CATEGORY_TOOL_POISONING:
+                        continue
+                    if any_match is None:
+                        any_match = vh
+                    if any(
+                        seg in vh.where
+                        for seg in ("/inputSchema", "/input_schema", "/parameters", "input_schema.")
+                    ):
+                        schema_match = vh
+                        break
+                if schema_match is not None:
+                    break
+            return schema_match or any_match or sub_hits[0]
+    return None
+
+
+def _prose_named_side_channel_hit(
+    side_props: Sequence[str],
+    combined_text: str,
+    *,
+    existing_hits: Sequence[TextPoisoningHit],
+    matched_values: Sequence[tuple[str, list[TextPoisoningHit]]] = (),
+) -> TextPoisoningHit | None:
+    patterns = [re.compile(rf"\b{re.escape(prop)}\b", re.IGNORECASE) for prop in side_props]
+    for val, val_hits in matched_values:
+        poison_in_val = next(
+            (vh for vh in val_hits if vh.category == CATEGORY_TOOL_POISONING), None
+        )
+        if poison_in_val is None:
+            continue
+        norm_val, _ = normalize_for_lexical_scan(val)
+        if any(pat.search(norm_val) is not None for pat in patterns):
+            return poison_in_val
+    normalized, _ = normalize_for_lexical_scan(combined_text)
+    if any(pat.search(normalized) is not None for pat in patterns):
+        return next((h for h in existing_hits if h.category == CATEGORY_TOOL_POISONING), None)
+    return None
 
 
 def check_sidenote_tool_schema(
@@ -1137,6 +1206,7 @@ def check_sidenote_tool_schema(
     *,
     surface: str,
     existing_hits: list[TextPoisoningHit],
+    matched_values: Sequence[tuple[str, list[TextPoisoningHit]]] = (),
 ) -> list[TextPoisoningHit]:
     """Detect Sidenote cross-property escalation on tool schemas and annotations.
 
@@ -1148,42 +1218,46 @@ def check_sidenote_tool_schema(
     2) A declared side-channel parameter (``sidenote``, ``note``, ``debug``, ``query``,
        ``context``, ``metadata`` ...) that the tool's text names beside such a directive
        or whose own schema subtree houses the poisoning directive.
-    The finding is located at the poisoning hit that triggered it.
+    The finding is located at the side-channel subtree or prose hit that triggered it.
     """
     poison = next((h for h in existing_hits if h.category == CATEGORY_TOOL_POISONING), None)
     if poison is None:
         return []
     ann = annotations or {}
-    flagged = ann.get("readOnlyHint") is True or ann.get("destructiveHint") is False
-    if not flagged:
-        side_entries = [
-            (prop, sub)
-            for prop, sub in _collect_schema_properties(schema)
-            if prop.lower() in _SIDE_CHANNEL_PARAM_NAMES
-        ]
-        if side_entries:
-            if any(
-                sub is not None and _subschema_has_tool_poisoning(sub, surface=surface)
-                for _, sub in side_entries
-            ):
-                flagged = True
-            else:
-                normalized, _ = normalize_for_lexical_scan(combined_text)
-                flagged = any(
-                    re.search(rf"\b{re.escape(prop)}\b", normalized, re.IGNORECASE) is not None
-                    for prop, _ in {(p, None) for p, _ in side_entries}
-                )
-    if not flagged:
+    side_entries = [
+        entry
+        for entry in _collect_schema_properties(schema)
+        if entry[0].lower() in _SIDE_CHANNEL_PARAM_NAMES
+    ]
+    trigger: TextPoisoningHit | None = None
+    if side_entries:
+        trigger = _side_channel_subtree_hit(
+            side_entries,
+            surface=surface,
+            existing_hits=existing_hits,
+            matched_values=matched_values,
+        )
+        if trigger is None:
+            unique_props = sorted({prop for prop, _, _ in side_entries})
+            trigger = _prose_named_side_channel_hit(
+                unique_props,
+                combined_text,
+                existing_hits=existing_hits,
+                matched_values=matched_values,
+            )
+    if trigger is None and (ann.get("readOnlyHint") is True or ann.get("destructiveHint") is False):
+        trigger = poison
+    if trigger is None:
         return []
     return [
         TextPoisoningHit(
             rule_id="TP-SIDENOTE-004",
             category=CATEGORY_TOOL_POISONING,
             severity=RiskSeverity.HIGH,
-            byte_offset=poison.byte_offset,
+            byte_offset=trigger.byte_offset,
             surface=surface,
             summary=_RULE_DESCRIPTIONS["TP-SIDENOTE-004"],
-            where=poison.where,
+            where=trigger.where,
         )
     ]
 
@@ -1504,6 +1578,7 @@ def _scan_component_fields(comp: ComponentWithRisks) -> list[TextPoisoningHit]:
     if isinstance(comp, ToolComponent):
         surface = comp.source_path or comp.name
         hits: list[TextPoisoningHit] = []
+        matched_values: list[tuple[str, list[TextPoisoningHit]]] = []
         parts: list[str] = []
         fields = [("description", comp.description_text), ("description", comp.description)]
         fields += [
@@ -1515,15 +1590,19 @@ def _scan_component_fields(comp: ComponentWithRisks) -> list[TextPoisoningHit]:
         for field, text in fields:
             if text:
                 parts.append(text)
-                hits.extend(
-                    scan_text_block(text, surface=surface, is_tool_surface=True, where=field)
+                field_hits = scan_text_block(
+                    text, surface=surface, is_tool_surface=True, where=field
                 )
+                hits.extend(field_hits)
+                if field_hits:
+                    matched_values.append((text, field_hits))
         return hits + check_sidenote_tool_schema(
             comp.input_schema,
             "\n".join(parts),
             comp.annotations,
             surface=surface,
             existing_hits=hits,
+            matched_values=matched_values,
         )
     if isinstance(comp, A2AServerComponent):
         surface = comp.source_path or comp.agent_card_path or comp.name
@@ -1680,7 +1759,7 @@ def _scan_structured_source(
             where=pointer or ("$" if include_keys else ""),
         )
         group.hits.extend(hits)
-        if raw_matches is not None and hits:
+        if (raw_matches is not None or has_tool_schema) and hits:
             group.matched_values.append((value, hits))
         if has_tool_schema and not is_key:
             group.text_values.append(value)
@@ -1707,6 +1786,7 @@ def _scan_structured_source(
                 ann if isinstance(ann, dict) else None,
                 surface=rel_path,
                 existing_hits=hits,
+                matched_values=group.matched_values,
             )
         unresolved = ordinal if group.unresolved else 0
         if raw_matches is not None and group.matched_values:

@@ -184,13 +184,33 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
             )
         )
     from nexus_symbiote.text_poisoning import (
+        TextPoisoningHit,
         _append_consolidated_risks,
-        apply_text_poisoning_rules,
+        _hit_sort_key,
+        check_sidenote_tool_schema,
         extract_json_text_entries,
         scan_text_block,
     )
 
-    server_hits = []
+    def _dedupe_distinct_hits(
+        raw_hits: list[TextPoisoningHit], max_per_group: int = 16
+    ) -> list[TextPoisoningHit]:
+        seen_exact: set[tuple[str, str, str, str, int]] = set()
+        counts: dict[tuple[str, str], int] = {}
+        unique: list[TextPoisoningHit] = []
+        for hit in sorted(raw_hits, key=_hit_sort_key):
+            exact = (hit.category, hit.surface, hit.rule_id, hit.where, hit.byte_offset)
+            if exact in seen_exact:
+                continue
+            seen_exact.add(exact)
+            group = (hit.category, hit.surface)
+            if counts.get(group, 0) >= max_per_group:
+                continue
+            counts[group] = counts.get(group, 0) + 1
+            unique.append(hit)
+        return unique
+
+    server_hits: list[TextPoisoningHit] = []
     if isinstance(result.instructions, str) and result.instructions:
         server_hits.extend(
             scan_text_block(
@@ -218,7 +238,7 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
         ("resourceTemplates", result.resource_templates),
     ):
         if items:
-            for item in items:
+            for item_idx, item in enumerate(items):
                 for path, text in extract_json_text_entries(
                     item.descriptor, max_depth=32, max_entries=512
                 ):
@@ -228,33 +248,56 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
                                 text,
                                 surface=origin,
                                 is_tool_surface=True,
-                                where=f"{surface_label}.{path}",
+                                where=f"{surface_label}[{item_idx}].{path}",
                             )
                         )
     if server_hits:
-        _append_consolidated_risks(server, server_hits)
+        _append_consolidated_risks(server, _dedupe_distinct_hits(server_hits))
 
     for observed, tool_comp in zip(result.tools, tools, strict=True):
+        tool_hits: list[TextPoisoningHit] = []
+        matched_values: list[tuple[str, list[TextPoisoningHit]]] = []
+        parts: list[str] = []
+        tool_fields: list[tuple[str, str | None]] = [
+            ("description", tool_comp.description_text),
+            ("description", tool_comp.description),
+        ]
+        tool_fields.extend(
+            (f"input_schema.{path}", val)
+            for path, val in extract_json_text_entries(
+                tool_comp.input_schema, max_depth=64, max_entries=2048
+            )
+        )
         extra_fields = {
             k: v
             for k, v in observed.descriptor.items()
             if k not in {"name", "description", "inputSchema"}
         }
-        extra_hits = []
-        for path, text in extract_json_text_entries(extra_fields, max_depth=64, max_entries=1024):
-            if text:
-                extra_hits.extend(
-                    scan_text_block(
-                        text,
-                        surface=tool_comp.name,
-                        is_tool_surface=True,
-                        where=path,
-                    )
+        tool_fields.extend(extract_json_text_entries(extra_fields, max_depth=64, max_entries=1024))
+        for field_where, field_text in tool_fields:
+            if field_text:
+                parts.append(field_text)
+                fh = scan_text_block(
+                    field_text,
+                    surface=tool_comp.name,
+                    is_tool_surface=True,
+                    where=field_where,
                 )
-        if extra_hits:
-            _append_consolidated_risks(tool_comp, extra_hits)
-
-    apply_text_poisoning_rules(bom)
+                tool_hits.extend(fh)
+                if fh:
+                    matched_values.append((field_text, fh))
+        tool_hits.extend(
+            check_sidenote_tool_schema(
+                tool_comp.input_schema,
+                "\n".join(parts),
+                tool_comp.annotations,
+                surface=tool_comp.name,
+                existing_hits=tool_hits,
+                matched_values=matched_values,
+            )
+        )
+        if tool_hits:
+            _append_consolidated_risks(tool_comp, _dedupe_distinct_hits(tool_hits))
     surfaces = ["initialize", "tools/list"]
     if result.prompts is not None:
         surfaces.append("prompts/list")
