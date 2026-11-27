@@ -133,6 +133,8 @@ def test_a_literal_model_argument_is_recorded_with_where_it_was_read(client: Sca
         ("OpenAIChatModel('gpt-4.1')", ["gpt-4.1"], 0),
         ("get_peft_model(base)", [], 0),
         ("[NAME]", [], 1),
+        ("DEFAULT_MODEL", [], 1),
+        ("pydantic_ai.DEFAULT", [], 1),
     ],
 )
 def test_a_literal_is_read_and_any_other_value_is_unread_unless_a_library_builds_it(
@@ -143,17 +145,20 @@ def test_a_literal_is_read_and_any_other_value_is_unread_unless_a_library_builds
         {
             "run.py": f"""\
 import os
+import pydantic_ai
 from openai import OpenAI
 from peft import get_peft_model
 from pydantic_ai.models.openai import OpenAIChatModel
+from shared_defaults import DEFAULT_MODEL
 
 NAME = "gpt-4.1"
 OpenAI().chat.completions.create(model={argument}, messages=[])
 """
         },
     )
+    # An object a library makes is no text; a library's name or attribute may be.
     assert sorted(models(result)) == sorted(expected)
-    assert list(result.surfaces_excluded) == ([unread_gap("run.py", 7)] if unread else [])
+    assert list(result.surfaces_excluded) == ([unread_gap("run.py", 9)] if unread else [])
 
 
 def test_a_docstring_and_a_comment_declare_nothing(client: ScanResult):
@@ -995,6 +1000,20 @@ def test_a_name_bound_again_in_any_form_is_not_taken_for_a_library_alone(
     source = 'import logging\nfrom openai import OpenAI\n\nclient = logging.getLogger("x")\n'
     result = scan(tmp_path, {"run.py": source + bound})
     assert set(models(result)) == {"gpt-4o"}
+
+
+def test_a_starred_parameter_is_the_functions_own_name(tmp_path: Path):
+    source = (
+        "import logging\nfrom openai import OpenAI\n\n"
+        'log = logging.getLogger("x")\n\n\n'
+        "def run(*log, **clients):\n"
+        '    log.create(model="gpt-4o")\n'
+        '    clients.create(model="o3")\n\n\n'
+        'clients = logging.getLogger("y")\n'
+    )
+    result = scan(tmp_path, {"run.py": source})
+    # Inside ``run`` neither name is the module's logger, so the calls are not skipped.
+    assert set(models(result)) == {"gpt-4o", "o3"}
 
 
 def test_a_method_of_what_python_builds_is_not_read(tmp_path: Path):

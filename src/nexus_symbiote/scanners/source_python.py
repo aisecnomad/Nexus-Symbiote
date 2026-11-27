@@ -305,7 +305,8 @@ class PythonReader:
             arguments = node.args
             positional = [*arguments.posonlyargs, *arguments.args]
             named = module.parameters.setdefault(node, {})
-            for argument in (*positional, *arguments.kwonlyargs):
+            starred = filter(None, (arguments.vararg, arguments.kwarg))
+            for argument in (*positional, *arguments.kwonlyargs, *starred):
                 named[argument.arg] = argument
             for argument, default in zip(
                 positional[len(positional) - len(arguments.defaults) :],
@@ -698,9 +699,10 @@ class PythonReader:
             self._unread.add(point)
 
     def _built(self, module: Module, node: ast.AST) -> bool:
-        """Whether a value is an object an SDK or another library builds, not a name."""
+        """Whether a value is an object an SDK or another library makes. A name or an
+        attribute of one, such as a library's default model, may hold text."""
         origin = self.origin(module, node)
-        return _sdk(origin) or _library(origin)
+        return origin is not None and origin.endswith("()") and (_sdk(origin) or _library(origin))
 
     def _imported_leaf(self, module: Module, node: ast.AST) -> bool:
         """Whether a value is a name, or an attribute of one, imported from a project module."""
