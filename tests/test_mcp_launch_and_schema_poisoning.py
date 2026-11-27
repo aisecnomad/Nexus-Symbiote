@@ -6,13 +6,20 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from nexus_symbiote.core.aibom import AIBOM
+from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.hashing import hash_canonical, hash_tool_definition
 from nexus_symbiote.core.models import MCPServerComponent, ToolComponent
 from nexus_symbiote.live.inventory import observation_inventory
 from nexus_symbiote.scanners.live_mcp import DiscoveryResult, ObservedItem, ObservedTool
 from nexus_symbiote.scanners.mcp import MCPScanner
-from nexus_symbiote.text_poisoning import apply_text_poisoning_rules
+from nexus_symbiote.text_poisoning import (
+    CATEGORY_TOOL_POISONING,
+    TextPoisoningHit,
+    apply_text_poisoning_rules,
+)
 
 
 def test_sidenote_schema_poisoning_catches_defs_and_attributes_side_channel_subtree(
@@ -250,3 +257,71 @@ def test_live_observation_inventory_consolidates_once_and_retains_distinct_evide
     ]
     assert len(out_risks) == 1
     assert {"rule:TP-TAG-001", "rule:TP-SIDENOTE-004"} <= set(out_risks[0].references)
+
+
+@pytest.mark.parametrize("from_source", [True, False])
+def test_subtype_requires_evidence_in_the_exact_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, from_source: bool
+) -> None:
+    marker = "calibration sample"
+
+    def annotated(
+        text: str, *, surface: str, where: str = "", is_tool_surface: bool = False
+    ) -> list[TextPoisoningHit]:
+        if marker not in text:
+            return []
+        return [
+            TextPoisoningHit(
+                "TP-CALIBRATION",
+                CATEGORY_TOOL_POISONING,
+                RiskSeverity.HIGH,
+                len(text.partition(marker)[0].encode()),
+                surface,
+                "Calibration sample",
+                where,
+            )
+        ]
+
+    monkeypatch.setattr("nexus_symbiote.text_poisoning.scan_text_block", annotated)
+    repeated = "µ " + marker
+    schemas = {
+        "repeated": (
+            "Calibration",
+            {
+                "properties": {"label": {"description": repeated}},
+                "$defs": {"Reference": {"properties": {"sidenote": {"description": repeated}}}},
+            },
+        ),
+        "dotted": (
+            "Calibration",
+            {
+                "properties": {
+                    "sidenote": {"description": "Units"},
+                    "sidenote.extra": {"description": marker},
+                }
+            },
+        ),
+        "separate": (marker, {"properties": {"query": {"description": "Optional query"}}}),
+        "together": (marker + " about the query", {"properties": {"query": {"type": "string"}}}),
+    }
+    tools = [
+        {"name": name, "description": description, "inputSchema": schema}
+        for name, (description, schema) in schemas.items()
+    ]
+    config = {"mcpServers": {"catalog": {"command": "catalog", "tools": tools}}}
+    (tmp_path / ".mcp.json").write_text(json.dumps(config), encoding="utf-8")
+    bom = AIBOM(components=MCPScanner().scan(tmp_path).components)
+    apply_text_poisoning_rules(bom, root=tmp_path if from_source else None)
+    findings = {
+        comp.name: [risk for risk in comp.risks if "rule:TP-SIDENOTE-004" in risk.references]
+        for comp in bom.components
+        if isinstance(comp, ToolComponent)
+    }
+    assert findings["dotted"] == findings["separate"] == []
+    assert len(findings["together"]) == len(findings["repeated"]) == 1
+    position = (
+        "/mcpServers/*/tools/0/inputSchema/$defs/*/properties/*/description"
+        if from_source
+        else "input_schema.$defs.Reference.properties.sidenote.description"
+    )
+    assert "TP-SIDENOTE-004 at byte_offset=3 of " + position in findings["repeated"][0].detail

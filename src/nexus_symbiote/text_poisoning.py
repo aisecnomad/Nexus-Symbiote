@@ -674,8 +674,8 @@ def _pointer_segment(key: str | tuple[str, int]) -> str:
 
 def _json_strings_with_owners(
     data: object, names: Iterable[str], *, keys: bool = False
-) -> Iterator[tuple[str, str, _SourceOwner | None, bool]]:
-    """``(JSON pointer, string, owner, is_key)`` for every nonblank string, and with
+) -> Iterator[tuple[str, str, _SourceOwner | None, int]]:
+    """``(JSON pointer, string, owner, parent_id)`` for every nonblank string, and with
     ``keys`` every nonblank key at the pointer of its value, in O(size).
 
     The owner is the innermost enclosing object whose ``name`` names a component in
@@ -685,14 +685,14 @@ def _json_strings_with_owners(
     indexes and known field names only, and stop growing past the printed length.
     """
     known = frozenset(names)
-    queue: deque[tuple[str, object, _SourceOwner | None, _SourceOwner | None, str, str | None]] = (
-        deque([("", data, None, None, "", None)])
-    )
+    queue: deque[
+        tuple[str, object, _SourceOwner | None, _SourceOwner | None, str, str | None, int]
+    ] = deque([("", data, None, None, "", None, 0)])
     while queue:
-        pointer, node, by_name, by_key, slot, server = queue.popleft()
+        pointer, node, by_name, by_key, slot, server, parent_id = queue.popleft()
         if isinstance(node, str):
             if node.strip():
-                yield pointer, node, by_name or by_key, False
+                yield pointer, node, by_name or by_key, parent_id
             continue
         long = len(pointer) > _MAX_WHERE_CHARS
         if isinstance(node, dict):
@@ -721,9 +721,9 @@ def _json_strings_with_owners(
                 child = pointer if long else f"{pointer}/{_pointer_segment(key)}"
                 text = key[0] if isinstance(key, tuple) else key
                 if keys and isinstance(text, str) and text.strip():
-                    yield child, text, by_name or by_key, True
+                    yield child, text, by_name or by_key, id(node)
                 if inside_tool:
-                    queue.append((child, val, by_name, by_key, "", server))
+                    queue.append((child, val, by_name, by_key, "", server, id(node)))
                     continue
                 kind, host = "", server
                 if slot == "servers":
@@ -745,13 +745,22 @@ def _json_strings_with_owners(
                         inner,
                         kind,
                         host,
+                        id(node),
                     )
                 )
         elif isinstance(node, list):
             kind = {"servers": "server", "tools": "tool"}.get(slot, "")
             for idx, item in enumerate(node):
                 queue.append(
-                    (pointer if long else f"{pointer}/{idx}", item, by_name, by_key, kind, server)
+                    (
+                        pointer if long else f"{pointer}/{idx}",
+                        item,
+                        by_name,
+                        by_key,
+                        kind,
+                        server,
+                        id(node),
+                    )
                 )
 
 
@@ -1129,50 +1138,42 @@ def _side_channel_subtree_hit(
     side_entries: Sequence[tuple[str, dict[str, Any] | None, str]],
     *,
     surface: str,
-    existing_hits: Sequence[TextPoisoningHit],
-    matched_values: Sequence[tuple[str, list[TextPoisoningHit]]] = (),
+    source_hits: dict[int, TextPoisoningHit] | None,
 ) -> TextPoisoningHit | None:
-    for _, sub, dot_prefix in side_entries:
-        in_mem_prefix = f"input_schema.{dot_prefix}"
-        for hit in existing_hits:
-            if hit.category == CATEGORY_TOOL_POISONING and (
-                hit.where == in_mem_prefix or hit.where.startswith(f"{in_mem_prefix}.")
-            ):
-                return hit
+    if source_hits is not None:
+        # Printed source pointers mask arbitrary keys. Retain the hit assigned to
+        # the actual parsed container, even when siblings contain identical text.
+        pending: deque[dict[Any, Any] | list[Any]] = deque(
+            sub for _, sub, _ in side_entries if sub is not None
+        )
+        visited: set[int] = set()
+        while pending and len(visited) < 4096:
+            current = pending.popleft()
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            if identity in source_hits:
+                return source_hits[identity]
+            children = current.values() if isinstance(current, dict) else current
+            pending.extend(child for child in children if isinstance(child, (dict, list)))
+        return None
+
+    # A component field is displayed as a dotted path. A literal dot in a key
+    # makes that rendering ambiguous, so only inspect the actual subtree.
+    for _, sub, path in side_entries:
         if sub is None:
             continue
-        for sub_path, sub_text in extract_json_text_entries(sub, max_depth=64, max_entries=512):
-            if not sub_text:
-                continue
-            fallback_where = f"{in_mem_prefix}.{sub_path}" if sub_path else in_mem_prefix
-            sub_hits = [
-                sh
-                for sh in scan_text_block(
-                    sub_text, surface=surface, is_tool_surface=True, where=fallback_where
-                )
-                if sh.category == CATEGORY_TOOL_POISONING
-            ]
-            if not sub_hits:
-                continue
-            schema_match: TextPoisoningHit | None = None
-            any_match: TextPoisoningHit | None = None
-            for val, val_hits in matched_values:
-                if val != sub_text:
-                    continue
-                for vh in val_hits:
-                    if vh.category != CATEGORY_TOOL_POISONING:
-                        continue
-                    if any_match is None:
-                        any_match = vh
-                    if any(
-                        seg in vh.where
-                        for seg in ("/inputSchema", "/input_schema", "/parameters", "input_schema.")
-                    ):
-                        schema_match = vh
-                        break
-                if schema_match is not None:
-                    break
-            return schema_match or any_match or sub_hits[0]
+        for sub_path, value in extract_json_text_entries(sub, max_depth=64, max_entries=512):
+            hits = scan_text_block(
+                value,
+                surface=surface,
+                is_tool_surface=True,
+                where=f"input_schema.{path}.{sub_path}",
+            )
+            for hit in hits:
+                if hit.category == CATEGORY_TOOL_POISONING:
+                    return hit
     return None
 
 
@@ -1181,21 +1182,21 @@ def _prose_named_side_channel_hit(
     combined_text: str,
     *,
     existing_hits: Sequence[TextPoisoningHit],
-    matched_values: Sequence[tuple[str, list[TextPoisoningHit]]] = (),
+    matched_values: Sequence[tuple[str, list[TextPoisoningHit]]] | None,
 ) -> TextPoisoningHit | None:
     patterns = [re.compile(rf"\b{re.escape(prop)}\b", re.IGNORECASE) for prop in side_props]
-    for val, val_hits in matched_values:
-        poison_in_val = next(
-            (vh for vh in val_hits if vh.category == CATEGORY_TOOL_POISONING), None
-        )
-        if poison_in_val is None:
-            continue
-        norm_val, _ = normalize_for_lexical_scan(val)
-        if any(pat.search(norm_val) is not None for pat in patterns):
-            return poison_in_val
-    normalized, _ = normalize_for_lexical_scan(combined_text)
-    if any(pat.search(normalized) is not None for pat in patterns):
-        return next((h for h in existing_hits if h.category == CATEGORY_TOOL_POISONING), None)
+    if matched_values is None:
+        # Direct single-text callers have no field map. Structured callers pass
+        # each matched field explicitly, including an empty list when none match.
+        if any(hit.where for hit in existing_hits):
+            return None
+        matched_values = [(combined_text, list(existing_hits))]
+    for value, hits in matched_values:
+        poison = next((hit for hit in hits if hit.category == CATEGORY_TOOL_POISONING), None)
+        if poison is not None:
+            normalized, _ = normalize_for_lexical_scan(value)
+            if any(pattern.search(normalized) for pattern in patterns):
+                return poison
     return None
 
 
@@ -1206,7 +1207,8 @@ def check_sidenote_tool_schema(
     *,
     surface: str,
     existing_hits: list[TextPoisoningHit],
-    matched_values: Sequence[tuple[str, list[TextPoisoningHit]]] = (),
+    matched_values: Sequence[tuple[str, list[TextPoisoningHit]]] | None = None,
+    source_hits: dict[int, TextPoisoningHit] | None = None,
 ) -> list[TextPoisoningHit]:
     """Detect Sidenote cross-property escalation on tool schemas and annotations.
 
@@ -1234,8 +1236,7 @@ def check_sidenote_tool_schema(
         trigger = _side_channel_subtree_hit(
             side_entries,
             surface=surface,
-            existing_hits=existing_hits,
-            matched_values=matched_values,
+            source_hits=source_hits,
         )
         if trigger is None:
             unique_props = sorted({prop for prop, _, _ in side_entries})
@@ -1579,7 +1580,6 @@ def _scan_component_fields(comp: ComponentWithRisks) -> list[TextPoisoningHit]:
         surface = comp.source_path or comp.name
         hits: list[TextPoisoningHit] = []
         matched_values: list[tuple[str, list[TextPoisoningHit]]] = []
-        parts: list[str] = []
         fields = [("description", comp.description_text), ("description", comp.description)]
         fields += [
             (f"input_schema.{path}", val)
@@ -1589,7 +1589,6 @@ def _scan_component_fields(comp: ComponentWithRisks) -> list[TextPoisoningHit]:
         ]
         for field, text in fields:
             if text:
-                parts.append(text)
                 field_hits = scan_text_block(
                     text, surface=surface, is_tool_surface=True, where=field
                 )
@@ -1598,7 +1597,7 @@ def _scan_component_fields(comp: ComponentWithRisks) -> list[TextPoisoningHit]:
                     matched_values.append((text, field_hits))
         return hits + check_sidenote_tool_schema(
             comp.input_schema,
-            "\n".join(parts),
+            "",
             comp.annotations,
             surface=surface,
             existing_hits=hits,
@@ -1679,7 +1678,7 @@ class _DeclarationFindings:
     has_tool_schema: bool
     unresolved: bool
     hits: list[TextPoisoningHit] = field(default_factory=list)
-    text_values: list[str] = field(default_factory=list)
+    poison_by_container: dict[int, TextPoisoningHit] = field(default_factory=dict)
     matched_values: list[tuple[str, list[TextPoisoningHit]]] = field(default_factory=list)
 
 
@@ -1707,7 +1706,7 @@ def _scan_structured_source(
     file_owner = _file_level_owner(comps, root_agent)
     fallback = _fallback_component(comps, root_agent) if comps else root_agent
     groups: dict[tuple[str | None, int], _DeclarationFindings] = {}
-    for pointer, value, owner, is_key in _json_strings_with_owners(
+    for pointer, value, owner, parent_id in _json_strings_with_owners(
         parsed, known_names, keys=include_keys
     ):
         target, node, ambiguous = fallback, None, False
@@ -1761,8 +1760,11 @@ def _scan_structured_source(
         group.hits.extend(hits)
         if (raw_matches is not None or has_tool_schema) and hits:
             group.matched_values.append((value, hits))
-        if has_tool_schema and not is_key:
-            group.text_values.append(value)
+        if has_tool_schema and parent_id not in group.poison_by_container:
+            for hit in hits:
+                if hit.category == CATEGORY_TOOL_POISONING:
+                    group.poison_by_container[parent_id] = hit
+                    break
     results: _SourceFindings = []
     for ordinal, group in enumerate(groups.values(), start=1):
         target, hits = group.target, group.hits
@@ -1782,11 +1784,12 @@ def _scan_structured_source(
             )
             hits = hits + check_sidenote_tool_schema(
                 schema if isinstance(schema, dict) else None,
-                "\n".join(group.text_values),
+                "",
                 ann if isinstance(ann, dict) else None,
                 surface=rel_path,
                 existing_hits=hits,
                 matched_values=group.matched_values,
+                source_hits=group.poison_by_container,
             )
         unresolved = ordinal if group.unresolved else 0
         if raw_matches is not None and group.matched_values:
