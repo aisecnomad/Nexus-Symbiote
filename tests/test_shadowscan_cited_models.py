@@ -1112,11 +1112,14 @@ def _validate(bom, project):
 def test_project_validation_reproduces_the_cited_models(tmp_path):
     project = _project(tmp_path, _report(_evidence("app.py:3", MODEL)))
     bom = _merged(tmp_path, "bom", project)
-    assert [
-        c.name
+    named = [
+        c.bom_ref
         for c in AIBOM.model_validate(json.loads(bom.read_text())).components
         if c.name == MODEL
-    ] == [MODEL]
+    ]
+    # The report's cited claim stays its own record beside the code collector's.
+    assert sorted(ref.startswith(MODEL_REF_PREFIX) for ref in named) == [False, True]
+    assert f"model:hosted:openai:{MODEL}" in named
     unchanged = _validate(bom, project).output
     assert "discovery report" not in unchanged
 

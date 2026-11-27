@@ -73,6 +73,7 @@ Every gate prints each of its failure reasons. How many findings the console lis
 | `a2a` | Supported | Static A2A agent cards, client configurations and SDK references |
 | `ide_agents` | Supported | Coding-agent permissions, settings, hooks and credential helpers read as data |
 | `shadowscan` | Supported | Imports producer-verified Nexus-ShadowScan discovery reports as `declared` claims |
+| `code` | Experimental | Framework agents, hosted and hub models, tools, MCP servers, guardrails and credential names that source and AI configuration construct through a resolved framework import; read heuristically, never executed |
 
 ### CLI commands
 

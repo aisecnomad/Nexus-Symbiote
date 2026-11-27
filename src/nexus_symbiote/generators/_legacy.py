@@ -78,6 +78,7 @@ COMPONENT_TYPE_MAP: dict[ComponentType, str] = {
     ComponentType.MEMORY_STORE: "data",
     ComponentType.RAG_SOURCE: "data",
     ComponentType.DATA_SOURCE: "data",
+    ComponentType.CREDENTIAL: "data",
     ComponentType.REGISTRY_ENTRY: "platform",
     ComponentType.SKILL_PACKAGE: "library",
 }

@@ -68,7 +68,7 @@ if TYPE_CHECKING:
     from nexus_symbiote.utils.crypto import SigstoreArtifactPolicy
 
 DEBUG_KEY = "nexus_symbiote.debug"
-BUILTIN_SCANNERS = "mcp, model, prompt, rag, registry, a2a, ide_agents, shadowscan"
+BUILTIN_SCANNERS = "mcp, model, prompt, rag, registry, a2a, ide_agents, code, shadowscan"
 # Gate reports name the agent manifest and the graph check like collectors.
 MANIFEST = "agent.yaml"
 
@@ -550,6 +550,7 @@ def _signer_policies(path: Path | None, project: Path | None) -> list[SigstoreAr
 def _get_scanners() -> dict[str, type]:
     if not SCANNER_REGISTRY:
         from nexus_symbiote.scanners.a2a import A2AScanner
+        from nexus_symbiote.scanners.code_inventory import CodeInventoryScanner
         from nexus_symbiote.scanners.ide_agents import IDEAgentScanner
         from nexus_symbiote.scanners.mcp import MCPScanner
         from nexus_symbiote.scanners.model import ModelScanner
@@ -568,6 +569,7 @@ def _get_scanners() -> dict[str, type]:
                 "registry": RegistryScanner,
                 "a2a": A2AScanner,
                 "ide_agents": IDEAgentScanner,
+                "code": CodeInventoryScanner,
             }
         )
     return SCANNER_REGISTRY
@@ -1304,6 +1306,9 @@ def scan(
             scan_failures.append(f"{name}: {summary}")
             failures_by[name] = scan_failures[failure_count:]
             scanner_status[name] = "failed"
+    from nexus_symbiote.core.collection import settle_references
+
+    settle_references(aibom.components)
     failure_count, exclusion_count = len(scan_failures), len(surfaces_excluded)
     try:
         # Manifest problems are recorded like collector failures; the inventory is still written.

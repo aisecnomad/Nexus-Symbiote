@@ -40,6 +40,12 @@ Bypassing a documented control in a way not described here warrants a [private v
 
 - **Bounded lexical matching.** `instruction_injection` and `tool_description_poisoning` run linear-time NFKC-folded (bounded expansion) regex rules over collected component text and decoded JSONC/YAML/TOML/front-matter strings ([finding catalog](finding-catalog.md)). Paraphrased overrides, homoglyphs without Latin context, uncollected files, or payloads past tag/comment window bounds (800 / 1,200 chars; 64 matches per surface) can evade detection, while benign examples quoting `"ignore previous instructions"` or `"never tell the user"` require policy suppression.
 
+## Code collector
+
+- **Heuristic, file-local wiring.** The [code collector](code-collector.md) links an agent to its model, tools and MCP servers within one file, through literals, module-level assignments and environment defaults; a model or tool chosen at run time, or wired across modules, is not linked. Java, Kotlin, Go and C# are read without a parser, so an agent there is linked only when its file holds one agent and one model.
+- **What is not read.** Directories the source searches skip (`tests`, `examples`, `dist` and the like), files larger than `file-bytes`, minified bundles and `.env` files are not read; only a file that holds a recognised declaration and cannot be read is a gap.
+- **Hosted models are locators.** A hosted alias or hub reference the collector records names a model that no byte in the checkout identifies; `validate` reports it as a `model_locator` warning, and the provider can change what the alias serves.
+
 ## Registry and containers
 
 - **AI-scoped catalog & root manifests.** `registry` inventories packages and base images matching its [AI catalog](registry-collector.md#ai-package-catalog) from root manifests, lockfiles (`npm`, `pnpm`, `yarn`, `uv`, `poetry` — see [lockfile evidence](npm-lockfile-evidence.md)), and Dockerfiles/Compose files; it is not a general-purpose language SBOM (use `import-sbom` for full dependency graphs) and does not read subdirectory requirements, `setup.py`, Helm/K8s manifests, or `postinstall` scripts. Lockfile claims are never fetched over the network.

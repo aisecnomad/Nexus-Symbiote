@@ -35,10 +35,11 @@ from nexus_symbiote.core.enums import (
 )
 from nexus_symbiote.core.evidence import DeploymentProfile, Timestamp
 
-NATIVE_SPEC_VERSION = "1.1.0"
-"""Version written by this build. 1.1.0 records scan-root-relative POSIX paths."""
+NATIVE_SPEC_VERSION = "1.2.0"
+"""Version written by this build. 1.1.0 records scan-root-relative POSIX paths; 1.2.0 adds
+credential components, which record a credential by name and never its value."""
 
-SUPPORTED_SPEC_MINORS = {1: (0, 1)}
+SUPPORTED_SPEC_MINORS = {1: (0, 1, 2)}
 """Native format versions this build reads, as major -> supported minor versions."""
 
 MAX_REFERENCE_CHARS = 16_384
@@ -580,6 +581,44 @@ class VerifiedExtensionComponent(ComponentBase):
     risks: list[RiskAssessment] = Field(default_factory=list)
 
 
+MODEL_REFERENCE = "model_reference"
+"""Property naming a model recorded as a locator: ``hosted`` (a provider alias) or ``hub``."""
+
+
+def model_locator(component: ModelComponent) -> bool:
+    """Whether a collector recorded a model as a reference that source code requests.
+
+    A hosted alias or a hub reference fetched at run time is a locator, not a measured
+    weight identity: there are no bytes in the checkout to digest, inspect or bind to a
+    signer. A hosted model an ``agent.yaml`` manifest declares is not such a record; the
+    operator declared it, and its integrity stays unknown.
+    """
+    return component.properties.get(MODEL_REFERENCE) in {"hosted", "hub"}
+
+
+class CredentialComponent(ComponentBase):
+    """A credential a component authenticates with, recorded by name and never by value."""
+
+    component_type: Literal[ComponentType.CREDENTIAL] = ComponentType.CREDENTIAL
+    credential_kind: str | None = Field(
+        default=None,
+        description=(
+            "What the name is: environment-variable (a variable read by source, listed in a "
+            ".env template or named by a ${NAME} placeholder), workflow-credential (a "
+            "credential a workflow tool stores under this label) or source-literal (a literal "
+            "passed in source, named by its parameter)"
+        ),
+    )
+    value_in_checkout: StrictBool | None = Field(
+        default=None,
+        description=(
+            "A literal value sits beside the reference in the scanned checkout; the value "
+            "itself is never recorded"
+        ),
+    )
+    risks: list[RiskAssessment] = Field(default_factory=list)
+
+
 class DiscoveryVerification(InventoryModel):
     """How imported ShadowScan discovery evidence was authenticated at import.
 
@@ -756,6 +795,7 @@ AnyComponent = Annotated[
         | A2AServerComponent
         | IDEAgentComponent
         | VerifiedExtensionComponent
+        | CredentialComponent
     ),
     Field(discriminator="component_type"),
 ]

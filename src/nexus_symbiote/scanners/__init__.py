@@ -7,6 +7,7 @@ remain available for fine-grained, project-local verification.
 
 from nexus_symbiote.scanners.a2a import A2AScanner
 from nexus_symbiote.scanners.base import Scanner, ScanResult
+from nexus_symbiote.scanners.code_inventory import CodeInventoryScanner
 from nexus_symbiote.scanners.ide_agents import IDEAgentScanner
 from nexus_symbiote.scanners.mcp import MCPScanner
 from nexus_symbiote.scanners.model import ModelScanner
@@ -24,11 +25,13 @@ ALL_SCANNERS: list[type[Scanner]] = [
     RegistryScanner,
     A2AScanner,
     IDEAgentScanner,
+    CodeInventoryScanner,
 ]
 
 __all__ = [
     "ALL_SCANNERS",
     "A2AScanner",
+    "CodeInventoryScanner",
     "IDEAgentScanner",
     "MCPScanner",
     "ModelScanner",

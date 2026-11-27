@@ -116,7 +116,8 @@ def test_a_dense_module_within_syntax_bytes_reaches_the_default(tmp_path):
     project = _project(tmp_path / "project", {"server.py": source})
     result, document = _scan(project, tmp_path / "out.json")
     assert result.exit_code == 1
-    assert _failures(document) == [f"server.py: {OVER_DEFAULT}"]
+    # The mcp and code collectors each record the declaration they could not read.
+    assert _failures(document) == [f"server.py: {OVER_DEFAULT}"] * 2
     # Nothing is collected from the file: no server, tool or launch gap.
     assert not [c for c in document["components"] if c.get("source_path") == "server.py"]
 
@@ -142,7 +143,8 @@ def test_nothing_in_the_checkout_raises_the_limit(tmp_path):
     )
     result, document = _scan(project, tmp_path / "out.json")
     assert result.exit_code == 1
-    assert _failures(document) == [f"server.py: {OVER_DEFAULT}"]
+    # The mcp and code collectors each record the declaration they could not read.
+    assert _failures(document) == [f"server.py: {OVER_DEFAULT}"] * 2
     (project / ".nexus-symbiote.yaml").write_text("limits:\n  python-nodes: 10000000\n")
     refused = CliRunner().invoke(
         main, ["scan", str(project), "--accept-project-policy", "-o", str(tmp_path / "p.json")]

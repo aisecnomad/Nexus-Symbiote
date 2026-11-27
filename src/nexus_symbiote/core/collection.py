@@ -73,6 +73,38 @@ def collection_claim(
     )
 
 
+# Collectors whose references may name what another collector records: the code
+# collector links an agent to a decorated tool that the MCP collector reads.
+SETTLING_COLLECTORS = frozenset({"code"})
+_SETTLED_FIELDS = (
+    "tool_refs",
+    "model_refs",
+    "sub_agent_refs",
+    "mcp_server_refs",
+    "server_refs",
+    "guardrail_refs",
+    "data_refs",
+    "prompt_refs",
+)
+
+
+def settle_references(components: list[AnyComponent]) -> None:
+    """Drop each reference a settling collector made to a component no collector recorded.
+
+    Such a reference stands only when the collector that records its target ran and
+    recorded it, so a scan of selected collectors holds no dangling reference. A scan
+    and a reconciliation both settle after every collector has been merged.
+    """
+    present = {component.bom_ref for component in components}
+    for component in components:
+        if not any(claim.collector in SETTLING_COLLECTORS for claim in component.claims.values()):
+            continue
+        for field_name in _SETTLED_FIELDS:
+            refs = getattr(component, field_name, None)
+            if isinstance(refs, list) and any(ref not in present for ref in refs):
+                refs[:] = [ref for ref in refs if ref in present]
+
+
 def merge_collected(
     collected: dict[str, AnyComponent],
     component: AnyComponent,

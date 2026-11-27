@@ -17,6 +17,7 @@ from nexus_symbiote.core.collection import (
     IMPORTED_MODE,
     is_imported,
     merge_collected,
+    settle_references,
 )
 from nexus_symbiote.core.coverage import assess_coverage
 from nexus_symbiote.core.enums import AssuranceLevel, ComponentType, TrustTier
@@ -378,6 +379,7 @@ class CompletenessValidator:
         accepted_default_names: set[str] = set()
         status: dict[str, str] = {}
         report_digest: str | None = None
+        edges: list[DependencyEdge] = []
 
         for scanner_type in ALL_SCANNERS:
             scanner = (
@@ -408,10 +410,19 @@ class CompletenessValidator:
                 if not problems:
                     report.bound_imports = frozenset(c.bom_ref for c in local.components)
             failed = bool(local.scan_failures)
+            accepted: set[str] = set()
             for component in local.components:
                 if merge_collected(collected, component, scanner.name, None) == "conflict":
                     incomplete(scanner.name, f"Conflicting local reference: {component.bom_ref}")
                     failed = True
+                else:
+                    accepted.add(component.bom_ref)
+            # A collector's own edges join the assembly as a scan imports them.
+            edges.extend(
+                edge
+                for edge in local.dependencies
+                if edge.source_ref in accepted and edge.target_ref in accepted
+            )
             surfaces.extend(local.surfaces_scanned)
             excluded.extend(local.surfaces_excluded)
             accepted_default_exclusions.update(local.accepted_default_exclusions)
@@ -420,7 +431,8 @@ class CompletenessValidator:
                 "failed" if failed else "partial" if local.surfaces_excluded else "complete"
             )
 
-        expected = AIBOM(components=list(collected.values()))
+        settle_references(list(collected.values()))
+        expected = AIBOM(components=list(collected.values()), dependencies=edges)
         agent: AgentComponent | None = None
         try:
             agent = assemble_repository_agent(

@@ -4,6 +4,19 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Native format `1.2.0`:** Adds the `credential` component type, which records a credential by name (`credential_kind`, `value_in_checkout`) and never its value. Builds before this one refuse a `1.2.0` inventory with the supported-version message.
+- **A ninth built-in collector:** `code` joins the coverage catalogue, so a completeness claim that lists only the eight earlier collectors as complete now reads as partial. Re-collect stored baselines after upgrading.
+
+### Added
+
+- **`code` collector (Experimental):** Agents, hosted and hub models, tools, MCP servers, guardrails, datasets and credential names that Python, TypeScript/JavaScript, Java/Kotlin, Go and C# code and AI configuration (Spring AI, CrewAI, NeMo Guardrails, n8n, subagents, KServe, Terraform) construct through a resolved framework import, with `uses-model`, `invokes`, `delegates-to`, `uses-guardrail`, `retrieves-from` and `acts-as-identity` edges. A recognised declaration that cannot be read is a named collection failure; other files declare nothing. `validate` reports a hosted alias or hub reference the collector records as one `model_locator` warning, as a remote MCP endpoint is; a hosted model an `agent.yaml` manifest declares keeps its unknown integrity ([code collector](docs/code-collector.md)).
+
+### Fixed
+
+- **Reconciliation keeps collector edges:** `validate --project` and `risk --project` now assemble a collector's own dependency edges as `scan` imports them, instead of reporting them as relationships without local evidence.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

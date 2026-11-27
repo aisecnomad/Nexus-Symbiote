@@ -115,6 +115,7 @@ _COLUMNS: tuple[tuple[str, tuple[ComponentType, ...]], ...] = (
             ComponentType.GUARDRAIL_POLICY,
         ),
     ),
+    ("Credentials", (ComponentType.CREDENTIAL,)),
     ("Packages and extensions", (ComponentType.REGISTRY_ENTRY, ComponentType.VERIFIED_EXTENSION)),
 )
 _PLACE = {
@@ -997,6 +998,7 @@ _GLYPHS = {
     ComponentType.DATA_SOURCE: "DS",
     ComponentType.MEMORY_STORE: "MEM",
     ComponentType.GUARDRAIL_POLICY: "GR",
+    ComponentType.CREDENTIAL: "KEY",
     ComponentType.REGISTRY_ENTRY: "PKG",
     ComponentType.VERIFIED_EXTENSION: "EXT",
 }

@@ -155,7 +155,8 @@ def test_candidates_that_fail_to_parse_are_listed_within_the_bounds(tmp_path):
         f"pkg/m{MAX_LISTED_FAILURES:04d}.py: invalid Python syntax (and 199 more not listed)"
     )
     _, bom = _scan(project, tmp_path / "out.json")
-    assert _counted([f for f in _failures(bom) if "invalid Python syntax" in f]) == count
+    # The mcp and code collectors each read every declaration and record its failure.
+    assert _counted([f for f in _failures(bom) if "invalid Python syntax" in f]) == 2 * count
 
 
 def test_failures_a_collector_appends_itself_are_listed_within_the_bounds(tmp_path):

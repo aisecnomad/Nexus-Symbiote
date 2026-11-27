@@ -100,7 +100,7 @@ def test_digest_prints_every_field_on_its_own_line(tmp_path):
     assert result.stderr == ""
     expected = _expected(inventory)
     assert result.stdout.splitlines() == [f"{name}: {expected[name]}" for name in FIELDS]
-    assert expected["components"] == 11 and expected["spec_version"] == "1.1.0"
+    assert expected["components"] == 11 and expected["spec_version"] == "1.2.0"
 
 
 def test_json_output_is_one_object_with_the_same_values(tmp_path):
@@ -250,14 +250,14 @@ INVALID: dict[str, tuple[Callable[[Path], Path], str]] = {
         "It does not match the native AgentBOM schema.",
     ),
     "unsupported version": (
-        _write_text(json.dumps({"metadata": {"spec_version": "1.2.0"}, "components": []})),
-        "Native format version 1.2.0 is not supported by this build (supported: 1.0.x, "
-        "1.1.x); upgrade nexus-symbiote or re-collect the inventory.",
+        _write_text(json.dumps({"metadata": {"spec_version": "1.3.0"}, "components": []})),
+        "Native format version 1.3.0 is not supported by this build (supported: 1.0.x, "
+        "1.1.x, 1.2.x); upgrade nexus-symbiote or re-collect the inventory.",
     ),
     "hostile version": (
         _write_text(json.dumps({"metadata": {"spec_version": HOSTILE}, "components": []})),
         "Native format an unrecognised version is not supported by this build (supported: "
-        "1.0.x, 1.1.x); upgrade nexus-symbiote or re-collect the inventory.",
+        "1.0.x, 1.1.x, 1.2.x); upgrade nexus-symbiote or re-collect the inventory.",
     ),
     "oversized": (
         _write_bytes(b" " * MAX_NATIVE_BYTES + b"{}"),

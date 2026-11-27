@@ -91,6 +91,7 @@ COMPONENT_TYPE_MAP: dict[ComponentType, str] = {
     ComponentType.DATA_SOURCE: "data",
     ComponentType.REGISTRY_ENTRY: "library",
     ComponentType.SKILL_PACKAGE: "library",
+    ComponentType.CREDENTIAL: "data",
 }
 # Package registries hold libraries; image registries hold containers. Any other
 # registry keeps the neutral "library" type.

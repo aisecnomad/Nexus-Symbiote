@@ -140,9 +140,9 @@ Every control has explicit bounds: see [known limitations](https://github.com/ai
 
 ```text
              ┌──────────────────────────────────────────────┐
-  agent      │ 8 static collectors (nothing is executed)    │
+  agent      │ 9 static collectors (nothing is executed)    │
   project ──>│ mcp · model · prompt · rag · registry        │
- (read-only) │ a2a · ide_agents · shadowscan                │
+ (read-only) │ a2a · ide_agents · shadowscan · code         │
              └──────────────────────┬───────────────────────┘
                                     v
              ┌──────────────────────────────────────────────┐
@@ -173,6 +173,7 @@ Every control has explicit bounds: see [known limitations](https://github.com/ai
 | `a2a` | A2A agent cards | Endpoints, security schemes, OAuth scopes, card signature status |
 | `ide_agents` | IDE agent settings | Permission modes, blanket grants, hook commands, settings digests |
 | `shadowscan` | [ShadowScan](https://github.com/Hunzee-VC/Nexus-ShadowScan) reports | Imported discovery claims kept separate from local evidence |
+| `code` | Agent code & AI config | [Framework agents](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/code-collector.md), hosted models, tools, MCP servers, handoffs and credential names, never values |
 
 Nothing read is executed, imported, or loaded. Omitting a collector via `--scanner` records it as `unknown`, never clean. Full path coverage: [collector reference](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/collectors.md).
 

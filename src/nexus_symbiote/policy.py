@@ -16,7 +16,7 @@ from nexus_symbiote import limits
 from nexus_symbiote.core.models import MAX_REFERENCE_CHARS
 
 ScannerName = Literal[
-    "mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents"
+    "mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents", "code"
 ]
 OutputFormat = Literal["json", "cyclonedx", "spdx", "sarif"]
 POLICY_FILE_NAMES = (".nexus-symbiote.yaml", ".nexus-symbiote.yml")
@@ -60,7 +60,7 @@ class PolicySection(BaseModel):
 
 
 def _default_scanners() -> list[ScannerName]:
-    return ["mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents"]
+    return ["mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents", "code"]
 
 
 class ScanPolicy(PolicySection):
@@ -574,7 +574,7 @@ DEFAULT_POLICY_YAML = """\
 version: "1.0"  # quote it: an unquoted 1.0 is a number and is refused
 scan:
   # Removing a collector leaves coverage partial, which fails the gates.
-  scanners: ["mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents"]
+  scanners: ["mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents", "code"]
   # These four directories, and venv, are always skipped. Any other path listed here is a
   # recorded coverage gap, so the scan gate fails; use it only with report-only scans.
   exclude_paths: ["node_modules", ".git", "__pycache__", ".venv"]

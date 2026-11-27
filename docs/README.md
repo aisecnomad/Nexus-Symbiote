@@ -32,6 +32,7 @@ Exact behavior, fields and limits.
 | --- | --- |
 | [CLI reference](cli-reference.md) | Every command, option and exit code, kept in sync with the CLI by a test |
 | [Collector reference](collectors.md) | Every path each built-in collector reads, kept in sync with the collectors by a test, and what `ide_agents` records from coding-agent settings |
+| [Code collector](code-collector.md) | Agents, hosted models, tools, MCP servers and credential names that source code and AI configuration construct through a framework, and what is a gap |
 | [Glossary](glossary.md) | Terms used across these pages: AgentBOM, content digest, collectors, evidence levels, gates, policies, risk classes and more |
 | [Finding catalog](finding-catalog.md) | Every finding category: severity, collector, meaning, remediation and gate effects |
 | [Known limitations](known-limitations.md) | What each collector, gate, export and integration does not cover, and what to do about each limit |

@@ -31,6 +31,7 @@ from nexus_symbiote.core.models import (
     ModelComponent,
     PromptComponent,
     ToolComponent,
+    model_locator,
 )
 from nexus_symbiote.scanners.mcp import SOURCE_BINDING_KEY_ENV, MCPScanner
 from nexus_symbiote.scanners.model import (
@@ -349,6 +350,19 @@ class IntegrityValidator:
         for comp in bom.components:
             report.components_checked += 1
             first_issue = len(report.issues)
+            if isinstance(comp, ModelComponent) and model_locator(comp) and not is_imported(comp):
+                # Like a remote MCP endpoint: nothing in the checkout to measure or bind.
+                # An imported claim keeps the binding rules for imported evidence.
+                report.issues.append(
+                    IntegrityIssue(
+                        comp.bom_ref,
+                        "model_locator",
+                        "Hosted or hub model reference is a locator, not a measured identity; "
+                        "the provider-side model and its behavior remain unverified",
+                        "warning",
+                    )
+                )
+                continue
             if isinstance(comp, ModelComponent) and not self._admit_model(
                 comp, project_root, report
             ):
