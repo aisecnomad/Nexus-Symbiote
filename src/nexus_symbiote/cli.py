@@ -28,6 +28,7 @@ from nexus_symbiote.core.models import (
 )
 from nexus_symbiote.crosswalk_cli import register_crosswalk_commands
 from nexus_symbiote.digest_cli import register_digest_commands, source_date_epoch
+from nexus_symbiote.env_credentials import apply_env_credential_findings
 from nexus_symbiote.export_standard_cli import register_export_standard_commands
 from nexus_symbiote.graph import validate_graph
 from nexus_symbiote.graph_cli import register_graph_commands
@@ -1356,8 +1357,17 @@ def scan(
             exclude_paths=policy.scan.exclude_paths,
             failures=scan_failures,
         )
+        env_failure_count = len(scan_failures)
+        apply_env_credential_findings(
+            aibom,
+            root,
+            exclude_paths=policy.scan.exclude_paths,
+            failures=scan_failures,
+        )
     if len(scan_failures) > literal_failure_count:
-        failures_by["literal_credentials"] = scan_failures[literal_failure_count:]
+        failures_by["literal_credentials"] = scan_failures[literal_failure_count:env_failure_count]
+    if len(scan_failures) > env_failure_count:
+        failures_by["env_credentials"] = scan_failures[env_failure_count:]
     graph_failures = validate_graph(aibom)
     scan_failures.extend(graph_failures)
     if graph_failures:

@@ -37,6 +37,7 @@ src/nexus_symbiote/
   text_poisoning.py                    — Deterministic O(N) text-poisoning and injection rules
   literal_credentials.py               — Vendor token shapes in collected sources, recorded by line and SHA-256 fingerprint
   credential_allowlist.py              — Explicit fingerprint or path-glob allowlist for vendor-shaped credential findings
+  env_credentials.py                   — `.env` assignments by key and vendor type; values are not hashed
   cli.py, live_cli.py, runtime_cli.py, supply_chain_cli.py — Click CLI entrypoints
 ```
 
