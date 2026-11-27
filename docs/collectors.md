@@ -30,8 +30,8 @@ import root named like an SDK, such as its own `agents` package, is not taken fo
 SDK, and a path only the project has, such as `agents.researcher`, is the project's.
 
 It reads the model arguments of a call (`model=` and its variants, a deployment name,
-`llm=`, and `repo_id=` or `id=` where they name a model) and the first argument of an
-entry point such as `init_chat_model`, `SentenceTransformer` or `litellm.completion`. What
+`llm=` and CrewAI's `*_llm=`, `repo_id=` or `id=` where they name a model) and the first
+argument of an entry point such as `init_chat_model` or `litellm.completion`. What
 a callee is comes from the names, attributes and calls it is reached through, each
 import in the scope it binds: a client made in the file, a parameter annotated with an
 SDK class, a method handed to `functools.partial`, `asyncio.to_thread` or an executor,

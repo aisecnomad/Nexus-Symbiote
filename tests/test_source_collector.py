@@ -1398,6 +1398,8 @@ def test_a_relative_import_past_the_top_package_binds_nothing(tmp_path: Path):
         (".\\checkpoints\\final", False, False),
         ("hosted_vllm//home/alice/models/Meta-Llama-3-8B-Instruct", False, True),
         ("openai//models/Meta-Llama-3-8B-Instruct", False, True),
+        ("ollama/svc:Tr0ub4dor3@gpu-box", False, True),
+        ("openai//models/llama-3-8b-instruct.Q4_K_M.gguf", False, True),
     ],
     ids=[
         "drive",
@@ -1416,6 +1418,8 @@ def test_a_relative_import_past_the_top_package_binds_nothing(tmp_path: Path):
         "windows-relative",
         "root-behind-a-slash-route",
         "root-after-a-slash-route",
+        "user-information-after-a-route",
+        "host-weight-file-after-a-route",
     ],
 )
 def test_a_path_or_a_key_is_never_a_model_and_a_project_file_is_no_gap(
@@ -3164,3 +3168,21 @@ def test_a_variable_with_an_unread_fallback_does_not_set_the_model_alone(tmp_pat
         "app/llm.py:7: model argument is bound in another module of the project, which the "
         + "collector does not follow; not inventoried"
     ]
+
+
+def test_a_router_and_a_crews_other_models_are_read_or_a_gap(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "crew.py": "from crewai import Agent, Crew, Process\n\n"
+            'researcher = Agent(role="r", goal="g", backstory="b", function_calling_llm="groq/llama-3.1-8b")\n'
+            'Crew(agents=[researcher], tasks=[], process=Process.hierarchical, manager_llm="o3",\n'
+            '     planning_llm="gpt-4o")\n',
+            "proxy.py": "import litellm\nfrom litellm import Router\n\n"
+            'Router(model_list=[{"model_name": "chat", "litellm_params": {"model": "azure/gpt-4o"}}])\n'
+            'litellm.completion(model="gpt-4o-mini", messages=[], fallbacks=["claude-3-5-haiku"])\n',
+        },
+    )
+    # A router's deployments and fallbacks are read by a later slice; until then, a gap.
+    assert set(models(result)) == {"groq/llama-3.1-8b", "o3", "gpt-4o", "gpt-4o-mini"}
+    assert list(result.surfaces_excluded) == [unread("proxy.py", 4, 2)]
