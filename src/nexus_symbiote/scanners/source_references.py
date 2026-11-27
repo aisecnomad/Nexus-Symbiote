@@ -112,6 +112,7 @@ class _Model:
     locations: set[tuple[str, int]] = field(default_factory=set)
     kinds: set[str] = field(default_factory=set)
     environment: set[str] = field(default_factory=set)
+    environment_unlisted: bool = False
     methods: set[str] = field(default_factory=set)
     remote_code: bool = False
     count: int = 0
@@ -193,6 +194,10 @@ class Declarations:
         record.environment.update(
             filter(environment_name, frozenset(environment) - record.environment)
         )
+        if len(record.environment) > MAX_EVIDENCE_LOCATIONS:
+            # The first names in order are kept, as the first places are.
+            record.environment = set(sorted(record.environment)[:MAX_EVIDENCE_LOCATIONS])
+            record.environment_unlisted = True
         return model_ref(name)
 
     def close(self) -> None:
@@ -218,6 +223,8 @@ class Declarations:
                 properties["references_unlisted"] = model.count - MAX_EVIDENCE_LOCATIONS
             if model.environment:
                 properties["environment_variables"] = sorted(model.environment)
+            if model.environment_unlisted:
+                properties["environment_variables_unlisted"] = True
             kind = "fine-tuned" if "fine-tuned" in model.kinds else min(model.kinds, default=None)
             built.append(
                 ModelComponent(

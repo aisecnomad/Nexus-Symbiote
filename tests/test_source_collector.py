@@ -3234,3 +3234,16 @@ def test_a_model_given_when_a_partial_is_called_is_read(tmp_path: Path):
         },
     )
     assert set(models(result)) == {"gpt-4o", "o3"}
+
+
+def test_the_variables_of_one_model_are_listed_up_to_the_bound(tmp_path: Path):
+    calls = "".join(
+        f'OpenAI().responses.create(model=os.getenv("MODEL_{index:03d}", "gpt-4o"))\n'
+        for index in range(40)
+    )
+    result = scan(tmp_path, {"run.py": f"import os\nfrom openai import OpenAI\n{calls}"})
+    (model,) = models(result).values()
+    assert model.properties["environment_variables"] == [
+        f"MODEL_{index:03d}" for index in range(16)
+    ]
+    assert model.properties["environment_variables_unlisted"] is True
