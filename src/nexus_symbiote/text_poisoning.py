@@ -305,22 +305,24 @@ _SHELL_READERS = frozenset(
 _SHELL_TOKEN_RE = re.compile(r"\S+")
 _PLAIN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
 _SHELL_PLAIN_WORDS = 1
-# A prohibition governs the whole sentence, whatever word the pipeline starts with.
-# "Do not forget to" is an instruction to do it, so that shape is not a prohibition.
-_CLAUSE_PROHIBITION_RE = re.compile(
+# A prohibition lowers a shell finding only when it is the words immediately before
+# the command. One of these verbs may sit between them: "never run cat".
+_PROHIBITION_FILLERS = frozenset({"run", "execute", "type", "use", "call", "invoke", "pipe"})
+_GOVERNING_PROHIBITION_RE = re.compile(
+    r"(?i)(?:\bnever|\bdo\s+not|\bdon'?t|\bmust\s+not|\bavoid)\s*$"
+)
+# These shapes look like a prohibition and are not one. They never lower a finding.
+_PROHIBITION_IDIOM_RE = re.compile(
     r"(?i)(?:"
-    r"\b(?:never|avoid)\b"
-    r"|\bmust\s+not\b"
-    r"|\bdo\s+not\b"
-    r"|\bdon'?t\b"
-    r"|example\s+of\s+what\s+not\s+to"
-    r"|\bwhat\s+not\s+to\b"
-    r"|\bnot\s+to\s+(?:type|run|do|execute|enter|send)\b"
+    r"\bnever\s+mind\b"
+    r"|\bdo\s+not\s+hesitate\b"
+    r"|\bdon'?t\s+(?:forget|worry)\b"
+    r"|\bdo\s+not\s+(?:forget|worry)\b"
+    r"|\bavoid\s+\S+\s+and\b"
     r")"
 )
-_CLAUSE_DOUBLE_NEGATIVE_RE = re.compile(
-    r"(?i)\b(?:never|do\s+not|don'?t|must\s+not)\s+(?:forget|fail|hesitate)\s+to\b"
-)
+_PROHIBITION_NOTE = "context: prohibition"
+_PROHIBITION_LOOKBACK = 48
 # A continued command or a substitution longer than this is a finding, not a miss.
 _SHELL_WINDOW_CHARS = 4096
 _SHELL_WINDOW_LINES = 32
@@ -543,23 +545,6 @@ def _directive_tag_hits(normalized: str) -> Iterator[int]:
             chain_end = max(chain_end, end)
         elif not _has_negated_prefix(normalized, opened.start()):
             chain, chain_end = (opened.start(), start), end
-
-
-def _verb_is_negated(text: str, verb_start: int) -> bool:
-    """Whether a prohibition ends at ``verb_start``, as the credential-path rule reads it.
-
-    A substitution opener (``$(`` or a backtick) sitting on the verb is not a word, so
-    the prohibition is read at the opener: ``must not $(cat`` is still a prohibition.
-    """
-    end = verb_start
-    if text[max(0, verb_start - 2) : verb_start] == "$(":
-        end = verb_start - 2
-    elif verb_start > 0 and text[verb_start - 1] == "`":
-        end = verb_start - 1
-    start = max(0, end - 80)
-    if _VERB_NEGATED_RE.search(text, start, end) is not None:
-        return True
-    return _has_negated_prefix(text, end)
 
 
 def _expand_home(fragment: str) -> str:
@@ -841,32 +826,6 @@ def _sink_near_path(tokens: list[tuple[int, str]]) -> int | None:
     return None
 
 
-def _first_shell_verb(text: str, start: int, end: int) -> int | None:
-    for pos, token in (token for stage in _shell_stages(text, start, end) for token in stage):
-        if _is_network_sink(token) or _shell_word(token) in _SHELL_READERS:
-            return pos
-    index = start
-    while index < end:
-        if text[index] == "`":
-            run = index + 1
-            while run < end and text[run] == "`":
-                run += 1
-            if run - index != 1:
-                index = run
-                continue
-        if text.startswith("$(", index) or text[index] == "`":
-            opener = 2 if text.startswith("$(", index) else 1
-            body = index + opener
-            cap = min(end, index + _SUBST_CHARS)
-            while body < cap and text[body] not in " \t\n|;`'\"()":
-                body += 1
-            word = _shell_word(text[index + opener : body])
-            if word in _SHELL_SINKS or word in _SHELL_READERS or _is_network_sink(word):
-                return index + opener
-        index += 1
-    return None
-
-
 def _stage_path(tokens: list[tuple[int, str]]) -> int | None:
     """Offset of a credential path named in this stage, whatever command names it."""
     for pos, token in tokens:
@@ -937,24 +896,19 @@ def _substitution_offsets(text: str, start: int, end: int) -> Iterator[int]:
             continue
         fragment = text[index + opener : body]
         path_at: int | None = None
-        negated = False
         for token in _SHELL_TOKEN_RE.finditer(fragment):
             if _credential_path(token.group()) is None:
                 continue
             path_at = token.start()
-            negated = _verb_is_negated(text, index + opener + token.start())
             break
         # Naming the path is the read. A sink in the same window supplies the exfil;
         # a known reader verb still counts when the substitution is the whole command.
-        if (
-            path_at is not None
-            and not negated
-            and (
-                _window_has_verb(text, start, end)
-                or any(
-                    _shell_word(token.group()) in _SHELL_READERS
-                    for token in _SHELL_TOKEN_RE.finditer(fragment)
-                )
+        # A prohibition does not drop the hit; the caller may only lower it.
+        if path_at is not None and (
+            _window_has_verb(text, start, end)
+            or any(
+                _shell_word(token.group()) in _SHELL_READERS
+                for token in _SHELL_TOKEN_RE.finditer(fragment)
             )
         ):
             yield index + opener + path_at
@@ -967,67 +921,140 @@ def _window_interesting(text: str, start: int, end: int) -> bool:
     return _window_has_verb(text, start, end)
 
 
-def _sentences_in(text: str, start: int, end: int) -> Iterator[tuple[int, int]]:
-    """Sentence slices inside ``text[start:end]``. A period inside a host is not a break."""
-    cursor = start
+_MAX_SUBST_DEPTH = 32
+
+
+def _openers_around(text: str, start: int, end: int, anchors: list[int]) -> list[int]:
+    """Outermost ``$(`` or backtick still open at each anchor. One forward pass.
+
+    A deeper nest than the cap is not tracked, so a confused opener cannot lower a
+    finding. No substitution in the window costs one membership test.
+    """
+    if not anchors:
+        return []
+    window = text[start:end]
+    if "$(" not in window and "`" not in window:
+        return []
+    wanted = set(anchors)
+    found: list[int] = []
+    dollars: list[int] = []
+    tick: int | None = None
     index = start
     while index < end:
-        if text[index] in ".!?" and (index + 1 >= end or text[index + 1].isspace()):
-            nxt = index + 1
-            yield cursor, nxt
-            while nxt < end and text[nxt].isspace():
-                nxt += 1
-            cursor = nxt
-            index = nxt
+        if text.startswith("$(", index):
+            # The ``(`` is the token start, so it is not visited by the step below.
+            if index in wanted or index + 1 in wanted:
+                found.append(dollars[0] if dollars else index)
+            if len(dollars) < _MAX_SUBST_DEPTH:
+                dollars.append(index)
+            index += 2
             continue
+        if text[index] == "`":
+            run = index + 1
+            while run < end and text[run] == "`":
+                run += 1
+            if run - index == 1:
+                if index in wanted:
+                    found.append(tick if tick is not None else index)
+                tick = None if tick is not None else index
+            index = run
+            continue
+        if text[index] == ")" and dollars:
+            dollars.pop()
+        if index in wanted:
+            if dollars:
+                found.append(dollars[0])
+            elif tick is not None:
+                found.append(tick)
         index += 1
-    if cursor < end:
-        yield cursor, end
+    return found
 
 
-def _clause_prohibits(text: str, start: int, end: int) -> bool:
-    """Whether a prohibition in the same sentence governs this command window.
+def _exfil_command_start(text: str, start: int, end: int) -> int | None:
+    """Where the exfil command itself starts, outside any leading prose or prohibition.
 
-    The scan stays inside the window, which is already capped. A negation in an
-    earlier sentence, such as ``Don't worry.``, does not govern the next one.
-    ``Do not forget to`` names the command rather than forbidding it.
+    The anchor is the earliest sink, reader, path-naming program, or the substitution
+    opener that contains one of those. Words such as ``never`` and ``echo`` stay in
+    front of it, so a negation is judged only on that prefix.
     """
-    for sent_start, sent_end in _sentences_in(text, start, end):
-        clause = text[sent_start:sent_end]
-        if _CRED_PATH_RE.search(clause) is None:
-            continue
-        kept = _CLAUSE_DOUBLE_NEGATIVE_RE.sub(" ", clause)
-        if _CLAUSE_PROHIBITION_RE.search(kept) is not None:
-            return True
-    return False
+    anchors: list[int] = []
+    for stage in _shell_stages(text, start, end):
+        for index, (pos, token) in enumerate(stage):
+            if _is_network_sink(token) or _shell_word(token) in _SHELL_READERS:
+                anchors.append(pos)
+            if index and _credential_path(token) is not None:
+                prev_pos, prev = stage[index - 1]
+                if not prev.startswith(("-", "<", "@")):
+                    anchors.append(prev_pos)
+    if not anchors:
+        return None
+    anchors.extend(_openers_around(text, start, end, anchors))
+    return min(anchors)
 
 
-def _shell_exfil_offsets(normalized: str) -> Iterator[int]:
+def _prohibition_prefix(text: str, command_at: int) -> str:
+    """The bounded words immediately before the command, after one filler verb."""
+    cursor = command_at
+    end = cursor
+    while end > 0 and text[end - 1].isspace():
+        end -= 1
+    word_at = end
+    while word_at > 0 and text[word_at - 1].isalpha():
+        word_at -= 1
+    if text[word_at:end].lower() in _PROHIBITION_FILLERS and (
+        word_at == 0 or not text[word_at - 1].isalpha()
+    ):
+        cursor = word_at
+    window = text[max(0, cursor - _PROHIBITION_LOOKBACK) : cursor]
+    break_at = max(window.rfind(mark) for mark in ".!?\n")
+    if break_at != -1:
+        window = window[break_at + 1 :]
+    return window
+
+
+def _command_is_prohibited(text: str, start: int, end: int) -> bool:
+    """Whether a prohibition immediately in front of this command may lower the finding.
+
+    The phrase has to sit outside the command's tokens and end at the command, with at
+    most one filler verb between them. A negation inside a URL, a quote, a comment, or
+    an argument is on the other side of the command start and cannot match. ``never
+    mind``, ``do not hesitate``, ``don't forget``, ``don't worry`` and ``avoid X and``
+    are not prohibitions. Anything less direct keeps full severity.
+    """
+    command_at = _exfil_command_start(text, start, end)
+    if command_at is None:
+        return False
+    window = _prohibition_prefix(text, command_at)
+    if _PROHIBITION_IDIOM_RE.search(window) is not None:
+        return False
+    return _GOVERNING_PROHIBITION_RE.search(window) is not None
+
+
+def _shell_exfil_offsets(normalized: str) -> Iterator[tuple[int, bool]]:
     """Offsets of a shell read of a credential path that reaches a network sink.
 
-    A pipeline or command list hits when any stage reads the path (``cat``,
-    ``base64``, ``xxd``, ``gzip``, ``openssl`` and the other readers, or a
-    redirect) and any stage is ``curl``, ``wget`` or ``nc``, in either order.
-    Continuations, including a backslash newline, are one bounded window. A
-    substitution is scanned in full up to its cap; a body the cap cuts off is a
-    hit rather than a miss. A prohibition and a sentence that only mentions the
-    command stay quiet. A ``.pub`` path stays public. The walk is one pass.
+    Each offset is paired with whether a prohibition immediately governs that command.
+    A prohibition never drops the finding. It only lowers one that it directly
+    precedes, outside the command's own tokens. A sentence that only mentions the
+    command, and a ``Never curl`` with no credential path, stay quiet because they
+    are not commands. A ``.pub`` path stays public. The walk is one pass.
     """
-    reported: set[int] = set()
+    reported: dict[int, bool] = {}
     for start, end, truncated in _logical_windows(normalized):
-        # The prohibition has to govern this sentence, not merely the first sink word.
-        if _clause_prohibits(normalized, start, end):
-            continue
-        verb = _first_shell_verb(normalized, start, end)
-        if verb is not None and _verb_is_negated(normalized, verb):
-            continue
         found = _pipeline_offset(normalized, start, end)
+        subs = list(_substitution_offsets(normalized, start, end))
+        truncated_hit = truncated and _window_interesting(normalized, start, end)
+        if found is None and not subs and not truncated_hit:
+            continue
+        # Only a window that already hit pays for the prohibition check.
+        prohibited = _command_is_prohibited(normalized, start, end)
         if found is not None:
-            reported.add(found)
-        reported.update(_substitution_offsets(normalized, start, end))
-        if truncated and _window_interesting(normalized, start, end):
-            reported.add(start)
-    yield from sorted(reported)
+            reported[found] = prohibited
+        for sub in subs:
+            reported[sub] = prohibited
+        if truncated_hit:
+            reported[start] = prohibited
+    yield from ((offset, reported[offset]) for offset in sorted(reported))
 
 
 def scan_text_block(
@@ -1049,16 +1076,26 @@ def scan_text_block(
     hits: list[TextPoisoningHit] = []
     base_category = _default_category(is_tool_surface)
 
-    def record(rule_id: str, category: str, char_index: int) -> None:
+    def record(
+        rule_id: str,
+        category: str,
+        char_index: int,
+        *,
+        severity: RiskSeverity = RiskSeverity.HIGH,
+        note: str = "",
+    ) -> None:
         if len(hits) < max_hits:
+            summary = _RULE_DESCRIPTIONS[rule_id]
+            if note:
+                summary = f"{summary} {note}"
             hits.append(
                 TextPoisoningHit(
                     rule_id=rule_id,
                     category=category,
-                    severity=RiskSeverity.HIGH,
+                    severity=severity,
                     byte_offset=_byte_offset_at(byte_offsets, char_index),
                     surface=surface,
-                    summary=_RULE_DESCRIPTIONS[rule_id],
+                    summary=summary,
                     where=where,
                 )
             )
@@ -1111,8 +1148,15 @@ def scan_text_block(
         if not _has_negated_prefix(normalized, exfil_match.start()):
             record("TP-CRED-002", base_category, exfil_match.start())
 
-    for at in _shell_exfil_offsets(normalized):
-        record("TP-CRED-002", base_category, at)
+    for at, prohibited in _shell_exfil_offsets(normalized):
+        # A governing prohibition lowers the finding. It never removes it.
+        record(
+            "TP-CRED-002",
+            base_category,
+            at,
+            severity=RiskSeverity.MEDIUM if prohibited else RiskSeverity.HIGH,
+            note=_PROHIBITION_NOTE if prohibited else "",
+        )
 
     # 4. TP-CONCEAL-003: Concealment instructions ("never tell the user", "do not mention this to the user")
     for conceal_match in _CONCEAL_RE.finditer(normalized):
@@ -1835,6 +1879,20 @@ def _hit_sort_key(hit: TextPoisoningHit) -> tuple[str, int, bool, str]:
     return (hit.where, hit.byte_offset, hit.rule_id == "TP-SIDENOTE-004", hit.rule_id)
 
 
+_SEVERITY_RANK = {
+    RiskSeverity.INFO: 0,
+    RiskSeverity.LOW: 1,
+    RiskSeverity.MEDIUM: 2,
+    RiskSeverity.HIGH: 3,
+    RiskSeverity.CRITICAL: 4,
+}
+
+
+def _strongest_severity(hits: list[TextPoisoningHit]) -> RiskSeverity:
+    """The group keeps its strongest hit, so one lowered finding cannot hide another."""
+    return max((hit.severity for hit in hits), key=_SEVERITY_RANK.__getitem__)
+
+
 def _append_consolidated_risks(
     component: ComponentWithRisks,
     hits: list[TextPoisoningHit],
@@ -1880,7 +1938,7 @@ def _append_consolidated_risks(
         references = list(dict.fromkeys(f"{_RULE_REFERENCE_PREFIX}{hit.rule_id}" for hit in order))
         component.risks.append(
             RiskAssessment(
-                severity=RiskSeverity.HIGH,
+                severity=_strongest_severity(order),
                 category=category,
                 detail=detail,
                 recommendation=recommendation,
