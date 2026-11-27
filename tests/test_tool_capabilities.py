@@ -908,6 +908,11 @@ def test_a_body_registered_under_many_names_is_read_once(tmp_path: Path) -> None
             "(c) => { const exec = (x) => x; return exec(c); }",
             set(),
         ),
+        (
+            'import { exec } from "child_process";\n',
+            "(exec) => { const run = exec; return run('x'); }",
+            set(),
+        ),
     ],
     ids=[
         "member-alias",
@@ -923,6 +928,7 @@ def test_a_body_registered_under_many_names_is_read_once(tmp_path: Path) -> None
         "server-is-not-a-client",
         "child-process-handle",
         "local-function-shadows",
+        "alias-of-a-parameter-named-like-an-import",
     ],
 )
 def test_typescript_names_taken_from_an_import_hold_what_it_holds(

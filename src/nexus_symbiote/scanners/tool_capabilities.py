@@ -883,7 +883,8 @@ def classify_typescript(
     """Classify a handler by the calls in its syntax tree; ``skip`` holds other tools' ids."""
     seen = _Observed()
     parameters = frozenset(_ts_parameters(handler))
-    local = _ts_locals(handler, imports)
+    # A name taken from one of the handler's parameters is not taken from an import.
+    local = _ts_locals(handler, {name: b for name, b in imports.items() if name not in parameters})
     imports = {name: bound for name, bound in imports.items() if name not in local}
     shadowed = parameters | local
     stack = [handler]
