@@ -905,7 +905,9 @@ def test_context_key_redaction_recognizes_nested_names(tmp_path):
 def test_trailing_slash_route_identity_preserved(tmp_path):
     from nexus_symbiote.runtime_bom_drift import _normalize_endpoint
 
-    assert _normalize_endpoint("https://a.example/") != _normalize_endpoint("https://a.example")
+    assert _normalize_endpoint("https://a.example/v1/") != _normalize_endpoint(
+        "https://a.example/v1"
+    )
     assert _normalize_endpoint("https://tools.cluster.local:8443/mcp/") != _normalize_endpoint(
         "https://tools.cluster.local:8443/mcp"
     )
@@ -1133,3 +1135,41 @@ def test_docker_purl_repository_url_may_name_only_the_registry(tmp_path):
     for qualifier in ("quay.io", "gcr.io/other/dockerimage"):
         with pytest.raises(RuntimeBOMInputError, match="repository disagree"):
             collect(inv, [snapshot("elsewhere.cdx.json", qualifier)])
+
+
+def test_empty_http_path_is_the_root_path(tmp_path):
+    # RFC 3986 section 6.2.3: an empty http(s) path is "/". The scanners record
+    # endpoint origins, so a snapshot that adds only that slash still matches.
+    from nexus_symbiote.runtime_bom_drift import _normalize_endpoint
+
+    assert _normalize_endpoint("https://a.example") == _normalize_endpoint("https://a.example/")
+    assert _normalize_endpoint("ws://a.example:80") == _normalize_endpoint("ws://a.example/")
+    assert _normalize_endpoint("https://a.example/") != _normalize_endpoint("https://a.example//")
+
+    inv = tmp_path / "static.json"
+    inv.write_text(
+        AIBOM(
+            components=[
+                MCPServerComponent(
+                    bom_ref="mcp:tools",
+                    name="tools-gateway",
+                    endpoint_url="https://tools.cluster.local:8443",
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    snapshot = tmp_path / "cluster.cdx.json"
+    snapshot.write_text(
+        json.dumps(
+            _cdx(
+                services=[
+                    {"name": "tools-gateway", "endpoints": ["https://tools.cluster.local:8443/"]}
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    report = collect(inv, [snapshot], fail_on="drift")
+    assert report["gate"]["passed"] is True
+    assert [m["name"] for m in report["reconciliation"]["matched"]] == ["tools-gateway"]
