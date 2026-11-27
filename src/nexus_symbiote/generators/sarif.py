@@ -221,6 +221,15 @@ class SARIFGenerator(Generator):
                     }
                 ).split(":", 1)[1]
                 uri, source = self._location(comp, by_ref)
+                physical: dict[str, Any] = {"artifactLocation": {"uri": uri, "uriBaseId": SRCROOT}}
+                declaration_line = comp.properties.get("declaration_line")
+                if (
+                    source == "component"
+                    and comp.properties.get("collection_mode") == "static-source-declaration"
+                    and type(declaration_line) is int
+                    and 1 <= declaration_line <= 2**31 - 1
+                ):
+                    physical["region"] = {"startLine": declaration_line}
                 properties: dict[str, Any] = {
                     "component_ref": comp.bom_ref,
                     "trust_tier": comp.trust_tier.value,
@@ -238,13 +247,7 @@ class SARIFGenerator(Generator):
                             "text": plain_text(risk.detail)
                             or rules[rule_id]["shortDescription"]["text"]
                         },
-                        "locations": [
-                            {
-                                "physicalLocation": {
-                                    "artifactLocation": {"uri": uri, "uriBaseId": SRCROOT}
-                                }
-                            }
-                        ],
+                        "locations": [{"physicalLocation": physical}],
                         "partialFingerprints": {
                             "nexus_symbiote/v1": fingerprint,
                             "primaryLocationLineHash": fingerprint[:16] + ":1",
