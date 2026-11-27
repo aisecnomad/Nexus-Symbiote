@@ -1036,6 +1036,24 @@ class PythonReader:
                             credentials.append(name)
         return endpoint, credentials
 
+    def _named_provider(self, module: Module, node: ast.AST) -> str | None:
+        """The provider a ``provider=`` argument names; None when it cannot be read."""
+        found: set[str | None] = set()
+        for value in self._follow(module, node):
+            current = value.node
+            if isinstance(current, ast.Constant) and isinstance(current.value, str):
+                found.add(SEGMENT_PROVIDERS.get(current.value.lower().replace("-", "_")))
+            elif isinstance(current, ast.Call):
+                origin = self.origin(value.module, current.func) or ""
+                symbol = _split(origin.split("()", 1)[0])[1]
+                found.add(
+                    provider_of(origin)
+                    or SEGMENT_PROVIDERS.get(symbol.removesuffix("Provider").lower())
+                )
+            else:
+                found.add(None)
+        return found.pop() if len(found) == 1 else None
+
     def _bedrock(self, module: Module, call: ast.Call) -> bool:
         for owner, client in self._client_calls(module, call):
             if not _under(self.origin(owner, client.func) or "", "boto3"):
@@ -1073,6 +1091,10 @@ class PythonReader:
         if not found:
             return refs
         provider = provider_of(origin) if origin else None
+        if "provider" in keywords:
+            # A provider argument says where the call is sent, whatever the class is
+            # named for: ``OpenAIChatModel(..., provider=DeepSeekProvider())``.
+            provider = self._named_provider(module, keywords["provider"])
         if provider is None and self._bedrock(module, call):
             provider = "aws-bedrock"
         endpoint, credentials = self._client_settings(module, call)

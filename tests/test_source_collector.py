@@ -540,6 +540,41 @@ reviewer = create_react_agent(
     assert approval.guardrail_type == "human-approval"
 
 
+def test_a_provider_argument_overrides_the_provider_a_class_is_named_for(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "factory.py": """\
+import os
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.deepseek import DeepSeekProvider
+
+
+def runtime_provider():
+    return load_provider_from_registry()
+
+
+budget = OpenAIChatModel(
+    "deepseek-chat", provider=DeepSeekProvider(api_key=os.environ["DEEPSEEK_API_KEY"])
+)
+named = OpenAIChatModel("mistral-small-latest", provider="mistral")
+unread = OpenAIChatModel("qwen-max", provider=runtime_provider())
+plain = OpenAIChatModel("gpt-4.1")
+planner = Agent(budget, name="planner")
+"""
+        },
+    )
+    found = models(result)
+    assert found["deepseek-chat"].provider == "deepseek"
+    assert found["deepseek-chat"].properties["credential_environment_names"] == ["DEEPSEEK_API_KEY"]
+    assert found["mistral-small-latest"].provider == "mistral"
+    # A provider the collector cannot read is not replaced by the class's own.
+    assert found["qwen-max"].provider is None
+    assert found["gpt-4.1"].provider == "openai"
+    assert not any(model.provider == "openai" for name, model in found.items() if name != "gpt-4.1")
+
+
 def test_tools_taken_from_an_mcp_client_are_its_servers(tmp_path: Path):
     result = scan(
         tmp_path,
