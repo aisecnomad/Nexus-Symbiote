@@ -1,0 +1,1306 @@
+{
+ "category_weights": {
+  "agent": 6,
+  "credential": 3,
+  "data": 2,
+  "framework": 1,
+  "infra": 1,
+  "mcp_server": 8,
+  "model": 5,
+  "prompt": 3,
+  "skill": 2,
+  "tool": 4
+ },
+ "changelog": [
+  "1.1 (2026-11-27): the local package `agents/` was renamed `acme_agents/` because its name shadowed the `agents` (openai-agents) SDK import in billing.py, which made the fixture unrunnable and penalized tools that model Python import resolution correctly. Weak agent identifiers updated. All tools re-run.",
+  "1.0 (2026-11-26): initial corpus.",
+  "1.1-sentinel: planted secret values replaced with public synthetic sentinels for the in-repository copy; value-shape detectors do not fire on them."
+ ],
+ "expectations": {
+  "cves": [
+   {
+    "id": "CVE1",
+    "identifiers": [
+     "CVE-2022-22815",
+     "CVE-2022-22816",
+     "CVE-2022-22817",
+     "CVE-2022-24303",
+     "CVE-2022-45198",
+     "CVE-2022-45199",
+     "CVE-2023-44271",
+     "CVE-2023-50447",
+     "CVE-2024-28219",
+     "PYSEC-2022-"
+    ],
+    "package": "pillow",
+    "version": "9.0.0"
+   },
+   {
+    "id": "CVE2",
+    "identifiers": [
+     "CVE-2020-14343",
+     "PYSEC-2021-142"
+    ],
+    "package": "PyYAML",
+    "version": "5.3.1"
+   },
+   {
+    "id": "CVE3",
+    "identifiers": [
+     "CVE-2020-8203",
+     "CVE-2021-23337",
+     "CVE-2020-28500"
+    ],
+    "package": "lodash",
+    "version": "4.17.15"
+   }
+  ],
+  "drift_v2": [
+   {
+    "id": "DR1",
+    "identifiers": [
+     "exfil-helper",
+     "totally-legit-mcp"
+    ],
+    "name": "added MCP server exfil-helper (totally-legit-mcp@latest)"
+   },
+   {
+    "id": "DR2",
+    "identifiers": [
+     "mcp.acme-support.example"
+    ],
+    "name": "acme-crm endpoint host moved"
+   },
+   {
+    "id": "DR3",
+    "identifiers": [
+     "run_sql"
+    ],
+    "name": "run_sql tool description changed"
+   },
+   {
+    "id": "DR4",
+    "identifiers": [
+     "pillow",
+     "10.4.0"
+    ],
+    "name": "pillow bumped 9.0.0 -> 10.4.0"
+   },
+   {
+    "id": "DR5",
+    "identifiers": [
+     "support:admin"
+    ],
+    "name": "A2A OAuth scope widened (support:admin)"
+   }
+  ],
+  "injection": [
+   {
+    "id": "INJ1",
+    "identifiers": [
+     "injected.md"
+    ],
+    "keywords": [
+     "hidden",
+     "zero-width",
+     "zero width",
+     "invisible",
+     "unicode",
+     "tag character",
+     "homoglyph"
+    ],
+    "name": "hidden Unicode in prompts/injected.md"
+   },
+   {
+    "id": "INJ2",
+    "identifiers": [
+     "data-export"
+    ],
+    "keywords": [
+     "injection",
+     "exfiltrat",
+     "id_rsa",
+     "credentials",
+     "ignore any instruction"
+    ],
+    "name": "plain-text injection in data-export SKILL.md"
+   },
+   {
+    "id": "INJ3",
+    "name": "JSONC .vscode/mcp.json parsed (servers found despite comments)",
+    "requires_items": [
+     "M9",
+     "M10"
+    ]
+   }
+  ],
+  "permissions": [
+   {
+    "id": "PERM1",
+    "identifiers": [
+     "Bash(*)"
+    ],
+    "name": "Claude Code Bash(*) allow rule"
+   },
+   {
+    "id": "PERM2",
+    "identifiers": [
+     "bypassPermissions"
+    ],
+    "name": "bypassPermissions (settings + Claude Agent SDK)"
+   },
+   {
+    "id": "PERM3",
+    "identifiers": [
+     "danger-full-access",
+     "approval_policy"
+    ],
+    "name": "Codex approval_policy=never / danger-full-access"
+   },
+   {
+    "id": "PERM4",
+    "identifiers": [
+     "telemetry.acme.example"
+    ],
+    "name": "PostToolUse hook piping curl to sh"
+   }
+  ],
+  "pins": [
+   {
+    "id": "PIN1",
+    "identifiers": [
+     "@latest"
+    ],
+    "name": "MCP package with @latest"
+   },
+   {
+    "id": "PIN2",
+    "identifiers": [
+     "github-mcp-server:latest"
+    ],
+    "name": "container image :latest"
+   },
+   {
+    "id": "PIN3",
+    "keywords": [
+     "unpinned",
+     "not pinned",
+     "floating",
+     "no version"
+    ],
+    "name": "unpinned MCP packages (no version)"
+   },
+   {
+    "id": "PIN4",
+    "keywords": [
+     "digest"
+    ],
+    "name": "base image without digest"
+   }
+  ],
+  "relationships": [
+   {
+    "id": "R1",
+    "name": "agent -> model binding (any agent linked to its model)"
+   },
+   {
+    "id": "R2",
+    "name": "agent -> tool binding (any agent linked to its tools)"
+   },
+   {
+    "id": "R3",
+    "name": "MCP server -> credential/env reference"
+   },
+   {
+    "id": "R4",
+    "name": "MCP server -> package/version or image"
+   }
+  ],
+  "secret_keywords": [
+   "secret",
+   "credential",
+   "api key",
+   "api_key",
+   "hardcoded",
+   "hard-coded",
+   "token"
+  ],
+  "secrets": [
+   {
+    "file_identifiers": [
+     "claude_desktop_config.json"
+    ],
+    "id": "SEC1",
+    "name": "hardcoded Brave API key in claude_desktop_config.json",
+    "value_identifiers": [
+     "SYMBIOTE_PUBLIC_SYNTHETIC_SECRET_SENTINEL_01"
+    ]
+   },
+   {
+    "file_identifiers": [
+     "quick_test.py"
+    ],
+    "id": "SEC2",
+    "name": "hardcoded OpenAI key in scripts/quick_test.py",
+    "value_identifiers": [
+     "SYMBIOTE_PUBLIC_SYNTHETIC_SECRET_SENTINEL_02"
+    ]
+   },
+   {
+    "file_identifiers": [
+     "docker-compose.yml"
+    ],
+    "id": "SEC3",
+    "name": "hardcoded GitHub PAT in docker-compose.yml",
+    "value_identifiers": [
+     "SYMBIOTE_PUBLIC_SYNTHETIC_SECRET_SENTINEL_03"
+    ]
+   }
+  ],
+  "unsafe_formats": [
+   {
+    "id": "UNS1",
+    "identifiers": [
+     "classifier.pkl"
+    ],
+    "keywords": [
+     "pickle",
+     "unsafe",
+     "deserializ"
+    ],
+    "name": "pickle model file"
+   }
+  ]
+ },
+ "fixture": "acme-support-agents",
+ "fixture_version": "1.1-sentinel",
+ "items": [
+  {
+   "category": "agent",
+   "id": "A1",
+   "identifiers": [
+    "triage_agent",
+    "TriageState"
+   ],
+   "name": "triage agent (LangGraph)",
+   "weak_identifiers": [
+    "acme_agents/triage.py"
+   ]
+  },
+  {
+   "category": "agent",
+   "id": "A2",
+   "identifiers": [
+    "Research Analyst",
+    "research_crew"
+   ],
+   "name": "research agent (CrewAI)",
+   "weak_identifiers": [
+    "acme_agents/research.py"
+   ]
+  },
+  {
+   "category": "agent",
+   "id": "A3",
+   "identifiers": [
+    "Billing Agent",
+    "billing_agent"
+   ],
+   "name": "billing agent (OpenAI Agents SDK)",
+   "weak_identifiers": [
+    "acme_agents/billing.py"
+   ]
+  },
+  {
+   "category": "agent",
+   "id": "A4",
+   "identifiers": [
+    "coding-assistant"
+   ],
+   "name": "coding assistant (Vercel AI SDK, TypeScript)"
+  },
+  {
+   "category": "agent",
+   "id": "A5",
+   "identifiers": [
+    "ClaudeAgentOptions",
+    "ops_agent",
+    "ops agent"
+   ],
+   "name": "ops agent (Claude Agent SDK)",
+   "weak_identifiers": [
+    "acme_agents/ops.py"
+   ]
+  },
+  {
+   "category": "agent",
+   "id": "A6",
+   "identifiers": [
+    "scheduler_agent"
+   ],
+   "name": "scheduler agent (Google ADK)",
+   "weak_identifiers": [
+    "acme_agents/scheduler.py"
+   ]
+  },
+  {
+   "category": "agent",
+   "id": "A7",
+   "identifiers": [
+    "kb_agent"
+   ],
+   "name": "knowledge-base agent (Pydantic AI)",
+   "weak_identifiers": [
+    "acme_agents/kb.py"
+   ]
+  },
+  {
+   "category": "agent",
+   "id": "A8",
+   "identifiers": [
+    "Acme Support Orchestrator",
+    "agents.acme.example",
+    ".well-known/agent.json"
+   ],
+   "name": "A2A agent card"
+  },
+  {
+   "category": "agent",
+   "id": "A9",
+   "identifiers": [
+    "support-assistant.json",
+    "n8n-nodes-langchain"
+   ],
+   "name": "n8n AI Agent workflow"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M1",
+   "identifiers": [
+    "server-filesystem"
+   ],
+   "name": "filesystem (.mcp.json, unpinned)",
+   "pin": "unpinned"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M2",
+   "identifiers": [
+    "server-github"
+   ],
+   "name": "github (.mcp.json, pinned, env token)",
+   "pin": "pinned"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M3",
+   "identifiers": [
+    "mcp-server-fetch"
+   ],
+   "name": "fetch (.mcp.json, uvx)"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M4",
+   "identifiers": [
+    "mcp.acme.example"
+   ],
+   "name": "acme-crm (.mcp.json, remote http, bearer)"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M5",
+   "identifiers": [
+    "legacy.acme.example"
+   ],
+   "name": "legacy-sse (.mcp.json, remote sse)"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M6",
+   "identifiers": [
+    "server-slack"
+   ],
+   "name": "slack (.mcp.json, disabled:true)",
+   "notes": "Detection is fine; should be marked disabled (manual check)."
+  },
+  {
+   "category": "mcp_server",
+   "id": "M7",
+   "identifiers": [
+    "server-postgres"
+   ],
+   "name": "postgres (.cursor/mcp.json, @latest, DSN with secret ref)",
+   "pin": "@latest"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M8",
+   "identifiers": [
+    "@playwright/mcp"
+   ],
+   "name": "playwright (.cursor/mcp.json, pinned)",
+   "pin": "pinned"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M9",
+   "identifiers": [
+    "server-memory"
+   ],
+   "name": "memory (.vscode/mcp.json, JSONC file)"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M10",
+   "identifiers": [
+    "mcp/sqlite"
+   ],
+   "name": "docker-sqlite (.vscode/mcp.json, docker transport)"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M11",
+   "identifiers": [
+    "server-brave-search"
+   ],
+   "name": "brave-search (configs/claude_desktop_config.json, hardcoded key)"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M12",
+   "identifiers": [
+    "context7-mcp"
+   ],
+   "name": "context7 (.codex/config.toml)"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M13",
+   "identifiers": [
+    "server-sequential-thinking"
+   ],
+   "name": "sequential-thinking (.gemini/settings.json)"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M14",
+   "identifiers": [
+    "mcp-server-time"
+   ],
+   "name": "time (.continue/config.yaml)"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M15",
+   "identifiers": [
+    "acme-tickets",
+    "acme_tickets_mcp"
+   ],
+   "name": "acme-tickets in-house FastMCP server (code + server.json + ops.py)"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M16",
+   "identifiers": [
+    "notify-mcp"
+   ],
+   "name": "notify-mcp in-house TypeScript server (code + MCPB manifest)"
+  },
+  {
+   "category": "mcp_server",
+   "id": "M17",
+   "identifiers": [
+    "github-mcp-server"
+   ],
+   "name": "github-mcp-server container (docker-compose, :latest)",
+   "pin": ":latest"
+  },
+  {
+   "category": "model",
+   "id": "L1",
+   "identifiers": [
+    "gpt-4o-mini"
+   ],
+   "name": "gpt-4o-mini (triage, n8n)"
+  },
+  {
+   "category": "model",
+   "id": "L2",
+   "identifiers": [
+    "claude-sonnet-4-5"
+   ],
+   "name": "claude-sonnet-4-5 (research, ops, continue)"
+  },
+  {
+   "category": "model",
+   "id": "L3",
+   "identifiers": [
+    "gpt-4.1"
+   ],
+   "name": "gpt-4.1 (billing)"
+  },
+  {
+   "category": "model",
+   "id": "L4",
+   "identifiers": [
+    "claude-opus-4-1"
+   ],
+   "name": "claude-opus-4-1 (coding assistant)"
+  },
+  {
+   "category": "model",
+   "id": "L5",
+   "identifiers": [
+    "gemini-2.5-flash"
+   ],
+   "name": "gemini-2.5-flash (scheduler)"
+  },
+  {
+   "category": "model",
+   "id": "L6",
+   "identifiers": [],
+   "name": "gpt-4o (kb agent)",
+   "regexes": [
+    "gpt-4o(?![-\\w])"
+   ]
+  },
+  {
+   "category": "model",
+   "id": "L7",
+   "identifiers": [
+    "text-embedding-3-small"
+   ],
+   "name": "text-embedding-3-small (embeddings)"
+  },
+  {
+   "category": "model",
+   "id": "L8",
+   "identifiers": [
+    "all-MiniLM-L6-v2"
+   ],
+   "name": "sentence-transformers/all-MiniLM-L6-v2 (HF)"
+  },
+  {
+   "category": "model",
+   "id": "L9",
+   "identifiers": [
+    "ms-marco-MiniLM-L-6-v2"
+   ],
+   "name": "cross-encoder/ms-marco-MiniLM-L-6-v2 (HF)"
+  },
+  {
+   "category": "model",
+   "id": "L10",
+   "identifiers": [
+    "model.safetensors",
+    "intent-classifier"
+   ],
+   "name": "local fine-tuned intent classifier (safetensors)"
+  },
+  {
+   "category": "model",
+   "id": "L11",
+   "identifiers": [
+    "classifier.pkl"
+   ],
+   "name": "legacy pickle classifier (unsafe format)"
+  },
+  {
+   "category": "model",
+   "id": "L12",
+   "identifiers": [
+    "llama3.1",
+    "Modelfile"
+   ],
+   "name": "Ollama llama3.1:8b (Modelfile)"
+  },
+  {
+   "category": "model",
+   "id": "L13",
+   "identifiers": [
+    "acme-gpt4o"
+   ],
+   "name": "Azure OpenAI deployment acme-gpt4o (code + LiteLLM)"
+  },
+  {
+   "category": "model",
+   "id": "L14",
+   "identifiers": [
+    "claude-3-5-sonnet-20241022-v2:0"
+   ],
+   "name": "Bedrock claude-3-5-sonnet (LiteLLM)"
+  },
+  {
+   "category": "model",
+   "id": "L15",
+   "identifiers": [
+    "claude-3-5-haiku-20241022-v1:0"
+   ],
+   "name": "Bedrock claude-3-5-haiku (boto3)"
+  },
+  {
+   "category": "model",
+   "id": "L16",
+   "identifiers": [
+    "distilbert-base-uncased"
+   ],
+   "name": "distilbert-base-uncased (training base)"
+  },
+  {
+   "category": "model",
+   "id": "L17",
+   "identifiers": [
+    "gpt-5-codex"
+   ],
+   "name": "gpt-5-codex (.codex/config.toml)"
+  },
+  {
+   "capability": "network",
+   "category": "tool",
+   "id": "T1",
+   "identifiers": [
+    "escalate_to_human"
+   ],
+   "name": "escalate_to_human (HTTP egress)"
+  },
+  {
+   "capability": "data-read",
+   "category": "tool",
+   "id": "T2",
+   "identifiers": [
+    "search_knowledge_base"
+   ],
+   "name": "search_knowledge_base (vector search)"
+  },
+  {
+   "capability": "db-read",
+   "category": "tool",
+   "id": "T3",
+   "identifiers": [
+    "lookup_invoice"
+   ],
+   "name": "lookup_invoice (DB read)"
+  },
+  {
+   "capability": "payment",
+   "category": "tool",
+   "id": "T4",
+   "identifiers": [
+    "issue_refund"
+   ],
+   "name": "issue_refund (payment + DB write)"
+  },
+  {
+   "capability": "shell",
+   "category": "tool",
+   "id": "T5",
+   "identifiers": [
+    "run_shell"
+   ],
+   "name": "run_shell (shell exec, TS)"
+  },
+  {
+   "capability": "fs-write",
+   "category": "tool",
+   "id": "T6",
+   "identifiers": [
+    "write_file"
+   ],
+   "name": "write_file (fs write, TS)"
+  },
+  {
+   "capability": "db-read",
+   "category": "tool",
+   "id": "T7",
+   "identifiers": [
+    "search_tickets"
+   ],
+   "name": "search_tickets (MCP tool)"
+  },
+  {
+   "capability": "db-write",
+   "category": "tool",
+   "id": "T8",
+   "identifiers": [
+    "close_ticket"
+   ],
+   "name": "close_ticket (MCP tool, write)"
+  },
+  {
+   "capability": "db-admin",
+   "category": "tool",
+   "id": "T9",
+   "identifiers": [
+    "run_sql"
+   ],
+   "name": "run_sql (MCP tool, arbitrary SQL)"
+  },
+  {
+   "capability": "email",
+   "category": "tool",
+   "id": "T10",
+   "identifiers": [
+    "send_email"
+   ],
+   "name": "send_email (MCP tool, TS)"
+  },
+  {
+   "capability": "write",
+   "category": "tool",
+   "id": "T11",
+   "identifiers": [
+    "book_callback"
+   ],
+   "name": "book_callback (ADK)"
+  },
+  {
+   "capability": "data-read",
+   "category": "tool",
+   "id": "T12",
+   "identifiers": [
+    "search_kb"
+   ],
+   "name": "search_kb (Pydantic AI)"
+  },
+  {
+   "capability": "network",
+   "category": "tool",
+   "id": "T13",
+   "identifiers": [
+    "google_search"
+   ],
+   "name": "google_search (ADK built-in)"
+  },
+  {
+   "capability": "network",
+   "category": "tool",
+   "id": "T14",
+   "identifiers": [
+    "SerperDevTool",
+    "serper"
+   ],
+   "name": "SerperDevTool (CrewAI web search)"
+  },
+  {
+   "capability": "fs-read",
+   "category": "tool",
+   "id": "T15",
+   "identifiers": [
+    "FileReadTool"
+   ],
+   "name": "FileReadTool (CrewAI)"
+  },
+  {
+   "category": "prompt",
+   "id": "P1",
+   "identifiers": [
+    "triage_system.md"
+   ],
+   "name": "prompts/triage_system.md"
+  },
+  {
+   "category": "prompt",
+   "id": "P2",
+   "identifiers": [
+    "research_system.txt"
+   ],
+   "name": "prompts/research_system.txt"
+  },
+  {
+   "category": "prompt",
+   "id": "P3",
+   "identifiers": [
+    "billing.jinja2"
+   ],
+   "name": "prompts/billing.jinja2"
+  },
+  {
+   "category": "prompt",
+   "id": "P4",
+   "identifiers": [
+    "prompts.yaml"
+   ],
+   "name": "prompts/prompts.yaml"
+  },
+  {
+   "category": "prompt",
+   "id": "P5",
+   "identifiers": [
+    "injected.md"
+   ],
+   "name": "prompts/injected.md (hidden Unicode)"
+  },
+  {
+   "category": "prompt",
+   "id": "P6",
+   "identifiers": [
+    "summarize_ticket"
+   ],
+   "name": "MCP prompt primitive summarize_ticket"
+  },
+  {
+   "category": "prompt",
+   "id": "I1",
+   "identifiers": [
+    "CLAUDE.md"
+   ],
+   "name": "CLAUDE.md"
+  },
+  {
+   "category": "prompt",
+   "id": "I2",
+   "identifiers": [
+    "AGENTS.md"
+   ],
+   "name": "AGENTS.md"
+  },
+  {
+   "category": "prompt",
+   "id": "I3",
+   "identifiers": [
+    ".cursorrules"
+   ],
+   "name": ".cursorrules"
+  },
+  {
+   "category": "prompt",
+   "id": "I4",
+   "identifiers": [
+    "python.mdc"
+   ],
+   "name": ".cursor/rules/python.mdc"
+  },
+  {
+   "category": "prompt",
+   "id": "I5",
+   "identifiers": [
+    "copilot-instructions.md"
+   ],
+   "name": ".github/copilot-instructions.md"
+  },
+  {
+   "category": "prompt",
+   "id": "I6",
+   "identifiers": [
+    "GEMINI.md"
+   ],
+   "name": "GEMINI.md"
+  },
+  {
+   "category": "prompt",
+   "id": "I7",
+   "identifiers": [
+    ".windsurfrules"
+   ],
+   "name": ".windsurfrules"
+  },
+  {
+   "category": "skill",
+   "id": "S1",
+   "identifiers": [
+    "deploy-helper"
+   ],
+   "name": "deploy-helper skill (script + allowed-tools)"
+  },
+  {
+   "category": "skill",
+   "id": "S2",
+   "identifiers": [
+    "data-export"
+   ],
+   "name": "data-export skill (contains prompt injection)"
+  },
+  {
+   "category": "skill",
+   "id": "S3",
+   "identifiers": [
+    "skills/summarize"
+   ],
+   "name": "summarize skill (.agents/skills)"
+  },
+  {
+   "category": "credential",
+   "id": "C1",
+   "identifiers": [
+    "OPENAI_API_KEY"
+   ],
+   "name": "OPENAI_API_KEY"
+  },
+  {
+   "category": "credential",
+   "id": "C2",
+   "identifiers": [
+    "ANTHROPIC_API_KEY"
+   ],
+   "name": "ANTHROPIC_API_KEY"
+  },
+  {
+   "category": "credential",
+   "id": "C3",
+   "identifiers": [
+    "GITHUB_TOKEN",
+    "GITHUB_PERSONAL_ACCESS_TOKEN"
+   ],
+   "name": "GITHUB token for MCP"
+  },
+  {
+   "category": "credential",
+   "id": "C4",
+   "identifiers": [
+    "ACME_CRM_TOKEN"
+   ],
+   "name": "ACME_CRM_TOKEN (remote MCP bearer)"
+  },
+  {
+   "category": "credential",
+   "id": "C5",
+   "identifiers": [
+    "PGPASSWORD"
+   ],
+   "name": "PGPASSWORD (in MCP DSN)"
+  },
+  {
+   "category": "credential",
+   "id": "C6",
+   "identifiers": [
+    "SERPER_API_KEY"
+   ],
+   "name": "SERPER_API_KEY"
+  },
+  {
+   "category": "credential",
+   "id": "C7",
+   "identifiers": [
+    "GOOGLE_API_KEY"
+   ],
+   "name": "GOOGLE_API_KEY"
+  },
+  {
+   "category": "credential",
+   "id": "C8",
+   "identifiers": [
+    "AZURE_OPENAI_API_KEY"
+   ],
+   "name": "AZURE_OPENAI_API_KEY"
+  },
+  {
+   "category": "credential",
+   "id": "C9",
+   "identifiers": [
+    "STRIPE_SECRET_KEY"
+   ],
+   "name": "STRIPE_SECRET_KEY"
+  },
+  {
+   "category": "credential",
+   "id": "C10",
+   "identifiers": [
+    "SMTP_PASSWORD"
+   ],
+   "name": "SMTP_PASSWORD (MCP server env)"
+  },
+  {
+   "category": "credential",
+   "id": "C11",
+   "identifiers": [
+    "PINECONE_API_KEY"
+   ],
+   "name": "PINECONE_API_KEY"
+  },
+  {
+   "category": "credential",
+   "id": "C12",
+   "identifiers": [
+    "ZENDESK_TOKEN"
+   ],
+   "name": "ZENDESK_TOKEN (tool egress)"
+  },
+  {
+   "category": "credential",
+   "id": "C13",
+   "identifiers": [
+    "SUPPORT_DATABASE_URL"
+   ],
+   "name": "SUPPORT_DATABASE_URL (DSN)"
+  },
+  {
+   "category": "credential",
+   "id": "C14",
+   "identifiers": [
+    "BRAVE_API_KEY"
+   ],
+   "name": "BRAVE_API_KEY (hardcoded)"
+  },
+  {
+   "category": "data",
+   "id": "D1",
+   "identifiers": [
+    "product-docs",
+    "chromadb"
+   ],
+   "name": "Chroma collection product-docs"
+  },
+  {
+   "category": "data",
+   "id": "D2",
+   "identifiers": [
+    "acme-kb",
+    "pinecone"
+   ],
+   "name": "Pinecone index acme-kb"
+  },
+  {
+   "category": "data",
+   "id": "D3",
+   "identifiers": [
+    "banking77"
+   ],
+   "name": "HF dataset banking77"
+  },
+  {
+   "category": "data",
+   "id": "D4",
+   "identifiers": [
+    "intents.jsonl"
+   ],
+   "name": "private dataset intents.jsonl"
+  },
+  {
+   "category": "data",
+   "id": "D5",
+   "identifiers": [
+    "acme-support-transcripts"
+   ],
+   "name": "S3 bucket acme-support-transcripts"
+  },
+  {
+   "category": "data",
+   "id": "D6",
+   "identifiers": [
+    "db.internal"
+   ],
+   "name": "Postgres support DB (db.internal)"
+  },
+  {
+   "category": "data",
+   "id": "D7",
+   "identifiers": [
+    "PyPDFLoader",
+    "docs/kb"
+   ],
+   "name": "PDF knowledge base loader"
+  },
+  {
+   "category": "framework",
+   "id": "F1",
+   "identifiers": [
+    "langgraph"
+   ],
+   "name": "LangGraph / LangChain"
+  },
+  {
+   "category": "framework",
+   "id": "F2",
+   "identifiers": [
+    "crewai"
+   ],
+   "name": "CrewAI"
+  },
+  {
+   "category": "framework",
+   "id": "F3",
+   "identifiers": [
+    "openai-agents",
+    "openai_agents"
+   ],
+   "name": "OpenAI Agents SDK"
+  },
+  {
+   "category": "framework",
+   "id": "F4",
+   "identifiers": [
+    "claude-agent-sdk",
+    "claude_agent_sdk"
+   ],
+   "name": "Claude Agent SDK"
+  },
+  {
+   "category": "framework",
+   "id": "F5",
+   "identifiers": [
+    "google-adk",
+    "google.adk",
+    "google_adk"
+   ],
+   "name": "Google ADK"
+  },
+  {
+   "category": "framework",
+   "id": "F6",
+   "identifiers": [
+    "pydantic-ai",
+    "pydantic_ai"
+   ],
+   "name": "Pydantic AI"
+  },
+  {
+   "category": "framework",
+   "id": "F7",
+   "identifiers": [
+    "@ai-sdk/anthropic",
+    "ai-sdk"
+   ],
+   "name": "Vercel AI SDK"
+  },
+  {
+   "category": "framework",
+   "id": "F8",
+   "identifiers": [
+    "@modelcontextprotocol/sdk"
+   ],
+   "name": "MCP TypeScript SDK"
+  },
+  {
+   "category": "framework",
+   "id": "F9",
+   "identifiers": [
+    "FastMCP",
+    "mcp==1.16.0",
+    "pkg:pypi/mcp@"
+   ],
+   "name": "MCP Python SDK (FastMCP)"
+  },
+  {
+   "category": "framework",
+   "id": "F10",
+   "identifiers": [
+    "litellm"
+   ],
+   "name": "LiteLLM"
+  },
+  {
+   "category": "infra",
+   "id": "N1",
+   "identifiers": [
+    "python:3.11-slim"
+   ],
+   "name": "Dockerfile base image python:3.11-slim (no digest)"
+  },
+  {
+   "category": "infra",
+   "id": "N2",
+   "identifiers": [
+    "claude-code-action"
+   ],
+   "name": "GitHub Actions claude-code-action with API key secret"
+  },
+  {
+   "category": "infra",
+   "id": "N3",
+   "identifiers": [
+    "io.github.acme-example/acme-tickets",
+    "server.json"
+   ],
+   "name": "MCP Registry server.json manifest"
+  },
+  {
+   "category": "infra",
+   "id": "N4",
+   "identifiers": [
+    "Acme Notify",
+    "manifest_version",
+    "mcpb"
+   ],
+   "name": "MCPB bundle manifest (notify-mcp)"
+  }
+ ],
+ "matching": "An item is DETECTED when any string in `identifiers` occurs (case-insensitive substring) in any string value of the tool's BOM output, or any `regexes` pattern matches. `weak_identifiers` (file paths) prove only that the tool touched the file; a match on a weak identifier alone earns half credit. Classification correctness is adjudicated manually where noted.",
+ "schema_version": "1.0",
+ "traps": [
+  {
+   "id": "X1",
+   "identifiers": [
+    "webapp/models.py"
+   ],
+   "name": "Django ORM models.py reported as ML model",
+   "severity": "hard"
+  },
+  {
+   "id": "X2",
+   "identifiers": [
+    "webapp/staff.py",
+    "SupportAgent"
+   ],
+   "name": "Human SupportAgent dataclass reported as AI agent",
+   "severity": "hard"
+  },
+  {
+   "id": "X3",
+   "identifiers": [
+    "products.json"
+   ],
+   "name": "products.json 'model' field reported as model/dataset",
+   "severity": "soft"
+  },
+  {
+   "id": "X4",
+   "identifiers": [
+    "mcp.json.example",
+    "example-weather",
+    "weather-mcp"
+   ],
+   "name": "docs/examples/mcp.json.example reported as configured MCP server",
+   "severity": "hard"
+  },
+  {
+   "id": "X5",
+   "identifiers": [
+    "node_modules/@modelcontextprotocol"
+   ],
+   "name": "vendored node_modules MCP package reported as configured server",
+   "severity": "soft"
+  },
+  {
+   "id": "X6",
+   "identifiers": [
+    "test-model-stub"
+   ],
+   "name": "test mock 'test-model-stub' reported as model",
+   "severity": "hard"
+  },
+  {
+   "id": "X7",
+   "identifiers": [
+    "gpt-3.5-turbo"
+   ],
+   "name": "CHANGELOG mention of removed gpt-3.5-turbo reported as model",
+   "severity": "soft"
+  },
+  {
+   "id": "X8",
+   "identifiers": [
+    "bump_version"
+   ],
+   "name": "tools/bump_version.py reported as agent tool",
+   "severity": "hard"
+  },
+  {
+   "id": "X9",
+   "identifiers": [
+    "AcmeStatusBot",
+    "http_client.py"
+   ],
+   "name": "HTTP User-Agent helper reported as agent",
+   "severity": "hard"
+  },
+  {
+   "id": "X10",
+   "identifiers": [
+    "jira-mcp"
+   ],
+   "name": "commented-out JSONC server reported as configured",
+   "severity": "hard"
+  }
+ ]
+}

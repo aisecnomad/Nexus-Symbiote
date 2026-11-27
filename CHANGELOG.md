@@ -4,6 +4,10 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Added
+
+- **Agent BOM regression fixture:** `benchmarks/agent-bom-fixture/` holds the 109-item, ten-decoy fixture of the external Agent BOM benchmark as hashed data with a builder; a test scans it on every run and fails if a decoy is reported, a recorded discovery floor drops, or a planted secret value reaches an export.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).
