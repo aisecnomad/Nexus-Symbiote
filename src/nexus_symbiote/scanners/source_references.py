@@ -1,13 +1,6 @@
-"""Vocabulary and records of the source collector.
-
-The source collector reads what application source declares. Every record is a
-declaration read from a file, never an observation of a running system, so each is
-recorded at declared assurance with the file and line it was read from, and what a
-reader could not resolve is a named coverage gap.
-
-This module holds what the readers share: what an identifier must look like to be
-recorded, the routing prefixes a model router reads off the front of one, and the
-accumulator that turns the readers' records into components.
+"""Vocabulary and records of the source collector: what an identifier must look like to
+be recorded, and the accumulator that turns the readers' records into components, each a
+declaration with the file and line it was read from.
 """
 
 from __future__ import annotations
@@ -39,9 +32,9 @@ _SECRET_SHAPED = re.compile(
 )
 # A model pinned by its version's digest, which is a hash, not a key.
 _PINNED = re.compile(r"[\w.-]+/[\w.-]+:[0-9a-f]{64}")
-# A path on this or another host, after a routing prefix or none: a drive, a share, the
-# root or a home directory.
-_ABSOLUTE = re.compile(r"(?:^|:)(?:[A-Za-z]:|\\\\|/|~)")
+# A path on this or another host, after a routing prefix or none: a drive with a path, a
+# share, the root or a home directory. No identifier holds ``//``.
+_ABSOLUTE = re.compile(r"(?:^|[:/@])(?:[A-Za-z]:(?=[^:]*[\\/])|\\\\|/|~)")
 # Words a model argument holds that name no model on purpose.
 _NOT_A_MODEL = frozenset(
     {

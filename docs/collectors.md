@@ -41,19 +41,20 @@ not. Of an object the reader cannot tell, such as an untyped or `Any` parameter 
 framework's state, a call is read when it is named as SDK calls are (`create`, `chat`,
 `completions`, `invoke`, `generate_content` and the like), so a metrics label or an
 ORM query is not. A call of a name the reader cannot tell, such as a class chosen at run
-time, is read, though not a `**` spread a wrapper hands on that way. A method reached
-through a class, as an ORM's manager is, is the class's: a library's is not read, and a
-project's is a gap.
+time, is read, but not a `**` spread a wrapper hands a function it was given. A method
+reached through a class, as an ORM's manager is, is the class's: a library's is not
+read, and a project's is a gap.
 
 A model argument is followed within its file, to each text it can hold: through names
 and `:=`, conditionals (`if`/`else`, `or`, `and`), an environment variable's default
 (`os.getenv`, `os.environ.get`, `decouple.config`), joined text (`+`, `+=` and
 f-strings), `str()`, `.lower()`, `.upper()` and `.strip()`, and a dict spread with `**`
 that is written out there or bound once to a name the file reads only to spread it. A
-dict of `model_kwargs` or `config_kwargs` is read the same way. A name is looked up as Python looks it up: in its function, honouring `global` and
-`nonlocal`, then in the scopes around it, skipping a class body from its methods. A
-parameter's default and a decorator, annotation or base class are read in the scope
-around their function or class. In `or`, a variable read with no default falls
+dict given as `model_kwargs` or `config_kwargs` is read the same way where only SDK calls
+are given it. A name is looked up as Python looks it up: in its function, honouring
+`global` and `nonlocal`, then in the scopes around it, skipping a class body from its
+methods. A parameter's default and a decorator, annotation or base class are read in the
+scope around their function or class. In `or`, a variable read with no default falls
 through to what follows when it is unset, so `os.environ.get("CHAT_MODEL") or
 "gpt-4o"` gives `gpt-4o`.
 
@@ -62,8 +63,8 @@ assurance. Its `source_reference` claim names the file and the line of the argum
 up to 16 places, and `references_unlisted` counts the rest. The environment variables
 that may give a model in place of a value read are listed in `environment_variables`.
 The identifier is kept as written, routing prefix and all, and no provider is recorded.
-Any `trust_remote_code` but a false literal, given to a call or in its `model_kwargs` or
-`config_kwargs`, records that the model may run its own code. A relative path or a
+Any `trust_remote_code` but a false literal, given to a call or in a dict of its options,
+such as `model_kwargs`, records that the model may run its own code. A relative path or a
 weight file names a file in the project, which the model collector reads.
 
 What the reader knows is there and cannot read is a coverage gap:
@@ -85,7 +86,7 @@ What the reader knows is there and cannot read is a coverage gap:
   variable that cannot be named may override;
 - a model that only an environment variable sets, once for each file that reads it so,
   as when its default names no model, such as `None`, `""` or `"default"`;
-- options a weights library is given that the reader cannot read, such as
+- options a weights library loads a model with that the reader cannot read, such as
   `model_kwargs=options` or `**options`, which may let the model run its own code;
 - a model argument given to a function or class the project defines, or to a method of
   one of its classes, which the reader does not follow;
