@@ -42,7 +42,7 @@ from nexus_symbiote.scanners.base import YAML_TOKEN_LIMIT
 from nexus_symbiote.scanners.prompt import HIDDEN_CHARACTERS
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.jsonc import strip_jsonc
-from nexus_symbiote.utils.markdown import front_matter_candidates
+from nexus_symbiote.utils.markdown import MarkdownParagraphs, front_matter_candidates
 from nexus_symbiote.utils.terminal import neutralize
 from nexus_symbiote.utils.toml import loads as toml_loads
 
@@ -1092,7 +1092,10 @@ def _table_cells(text: str, start: int, end: int) -> Iterator[tuple[int, int]]:
 
 _TABLE_DELIMITER = re.compile(r"[ \t]*:?-+:?[ \t]*")
 _TABLE_DELIMITER_LINE = re.compile(r"[|:\- \t]+")
-_TABLE_BLOCK_START = re.compile(r" {0,3}(?:#{1,6}(?:[ \t]|$)|>|(?:[-*+]|[0-9]{1,9}[.)])[ \t])")
+_TABLE_BLOCK_START = re.compile(
+    r"^ {0,3}(?:#{1,6}(?:[ \t]|$)|(?P<container>>|(?:[-*+]|[0-9]{1,9}[.)])(?:[ \t]|$)))",
+    re.M,
+)
 
 
 def _shell_regions(text: str) -> Iterator[tuple[int, int]]:
@@ -1100,7 +1103,13 @@ def _shell_regions(text: str) -> Iterator[tuple[int, int]]:
     if "|" not in text or "-" not in text:
         yield 0, len(text)
         return
-    previous = previous_end = regular = start = 0
+    paragraphs = (
+        MarkdownParagraphs(len(text))
+        if any(marker.group("container") for marker in _TABLE_BLOCK_START.finditer(text))
+        else None
+    )
+    previous = previous_content = previous_end = regular = start = 0
+    previous_paragraph = table_paragraph = 0
     header_candidate = in_table = False
     fence = ""
     while start < len(text):
@@ -1113,13 +1122,22 @@ def _shell_regions(text: str) -> Iterator[tuple[int, int]]:
             if in_table:
                 yield start, stop
                 regular = end + 1
+            if paragraphs is not None:
+                paragraphs.read(None)
             header_candidate = False
             start = end + 1
             continue
-        has_pipe = text.find("|", start, stop) != -1
-        eligible = not text.startswith(("    ", "\t"), start) and not _TABLE_BLOCK_START.match(
-            text, start, stop
-        )
+        parsed = paragraphs.read(text[start:stop]) if paragraphs is not None else None
+        if parsed is None:
+            content, paragraph = start, 0
+            eligible = not text.startswith(("    ", "\t"), start) and not _TABLE_BLOCK_START.match(
+                text, start, stop
+            )
+        else:
+            offset, paragraph = parsed
+            content = start + offset
+            eligible = True
+        has_pipe = text.find("|", content, stop) != -1
         if fence:
             closer = _FENCE_CLOSE_RE.match(text, start, end)
             if closer and closer.group(1).startswith(fence):
@@ -1128,23 +1146,34 @@ def _shell_regions(text: str) -> Iterator[tuple[int, int]]:
         elif opener := _FENCE_OPEN_RE.match(text, start, end):
             fence = opener.group(1)
             header_candidate = in_table = False
-        elif in_table and eligible and text[start:stop].strip():
-            yield from _table_cells(text, start, stop)
+        elif in_table and eligible and paragraph == table_paragraph and text[content:stop].strip():
+            yield from _table_cells(text, content, stop)
             regular = end + 1
         else:
             in_table = False
-            if header_candidate and eligible and _TABLE_DELIMITER_LINE.fullmatch(text, start, stop):
-                columns = text[start:stop].strip().removeprefix("|").removesuffix("|").split("|")
+            if (
+                header_candidate
+                and eligible
+                and paragraph == previous_paragraph
+                and _TABLE_DELIMITER_LINE.fullmatch(text, content, stop)
+            ):
+                columns = text[content:stop].strip().removeprefix("|").removesuffix("|").split("|")
                 if all(_TABLE_DELIMITER.fullmatch(col) for col in columns):
-                    header = list(_table_cells(text, previous, previous_end))
+                    header = list(_table_cells(text, previous_content, previous_end))
                     if len(header) == len(columns):
                         if regular < previous:
                             yield regular, previous
                         yield from header
                         in_table = True
+                        table_paragraph = paragraph
                         regular = end + 1
             header_candidate = has_pipe and eligible
-        previous, previous_end = start, stop
+        previous, previous_content, previous_end, previous_paragraph = (
+            start,
+            content,
+            stop,
+            paragraph,
+        )
         start = end + 1
     if regular < len(text):
         yield regular, len(text)
