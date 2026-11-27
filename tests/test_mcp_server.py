@@ -306,10 +306,11 @@ def test_initialize_ping_notifications_and_tool_list():
         }
 
 
-@pytest.mark.parametrize("requested", ["2025-11-25", "1999-01-01", 7, None])
+@pytest.mark.parametrize("requested", ["2025-11-25", "2025-03-26", "1999-01-01", 7, None])
 def test_unsupported_protocol_version_negotiates_the_latest_supported(requested):
     # MCP lifecycle: answer an unsupported request with another supported version,
-    # the latest one. 2025-03-26 also obliges servers to accept JSON-RPC batches.
+    # the latest one. 2025-03-26 is not supported: it obliges servers to accept
+    # JSON-RPC batches, which this server refuses.
     server = OfflineMCPServer(_build_rich_bom())
     params = {} if requested is None else {"protocolVersion": requested}
     reply = server.handle_message(
@@ -1071,3 +1072,29 @@ def test_mcp_server_cli_unexpected_io_and_digest_fallbacks(tmp_path, runner, mon
     res_bom_io = runner.invoke(main, ["mcp-server", str(inv_path)])
     assert res_bom_io.exit_code == 1
     assert "is not a valid native AIBOM file." in res_bom_io.output
+
+
+def test_every_advertised_version_is_one_whose_rules_the_server_follows():
+    server = OfflineMCPServer(_build_rich_bom())
+    for version in SUPPORTED_PROTOCOL_VERSIONS:
+        reply = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": version},
+            }
+        )
+        assert reply is not None and reply["result"]["protocolVersion"] == version
+    # Batches are refused, so no version that requires them may be negotiated.
+    assert "2025-03-26" not in SUPPORTED_PROTOCOL_VERSIONS
+    batch = [
+        {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+        {"jsonrpc": "2.0", "id": 3, "method": "ping"},
+    ]
+    out = io.BytesIO()
+    run_mcp_server_streams(
+        server, client_in=io.BytesIO(json.dumps(batch).encode() + b"\n"), client_out=out
+    )
+    (refused,) = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+    assert refused["error"]["code"] == -32600

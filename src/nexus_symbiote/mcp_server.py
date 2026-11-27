@@ -40,7 +40,9 @@ DEFAULT_LIST_LIMIT = 50
 MAX_OFFSET = 100_000
 DEFAULT_MAX_REQUESTS = 10_000
 MAX_ALLOWED_REQUESTS = 100_000
-SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+# 2025-03-26 is not offered: it obliges a server to accept JSON-RPC batches, which this
+# server refuses; a client asking for it is answered with the latest version, per the spec.
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2024-11-05")
 
 _SEVERITY_ORDER: dict[str, int] = {
     "critical": 4,
