@@ -783,6 +783,35 @@ def _shell_stages(text: str, start: int, end: int) -> list[tuple[str, list[tuple
 
 
 _Stage = list[tuple[int, str]]
+# Options of scp, rsync and sftp whose value is a file the command itself reads or
+# writes, such as a key, filter, password or log file, rather than one it transfers.
+_COPY_OPTION_VALUES = frozenset(
+    {
+        "-i",
+        "-F",
+        "-e",
+        "-o",
+        "-S",
+        "-J",
+        "-b",
+        "-f",
+        "--rsh",
+        "--exclude",
+        "--include",
+        "--exclude-from",
+        "--include-from",
+        "--files-from",
+        "--filter",
+        "--password-file",
+        "--log-file",
+        "--temp-dir",
+        "--backup-dir",
+        "--link-dest",
+        "--compare-dest",
+        "--copy-dest",
+        "--partial-dir",
+    }
+)
 
 
 def _pipeline_offset(
@@ -850,13 +879,10 @@ def _pipeline_offset(
                 or previous in {"<", "-T", "--upload-file", "--post-file"}
             ):
                 return point
-            if index == sink_index + 1 and sink in {"curl", "wget"}:
+            # ``--netrc-file=`` or ``--cert=`` names a file the sink reads for itself.
+            if index == sink_index + 1 and sink in {"curl", "wget"} and not value.startswith("-"):
                 return point
-            if (
-                copy_command
-                and not value.startswith("-")
-                and previous not in {"-i", "-F", "-e", "-o"}
-            ):
+            if copy_command and not value.startswith("-") and previous not in _COPY_OPTION_VALUES:
                 copy_source = point
         if (pipe_sink and stage_path is not None) or (sink and pipe_path is not None):
             return stage_path if stage_path is not None else pipe_path
