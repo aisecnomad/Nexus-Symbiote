@@ -74,7 +74,7 @@ def command(arguments: list[str], environment: dict[str, str], prefix: Path, cwd
 def replay(nexus: str, output: Path, operator_dir: Path | None) -> bool:
     output.mkdir(parents=True, exist_ok=False)
     with TemporaryDirectory(prefix="aibom-advisories-", dir=operator_dir) as temporary:
-        operator = Path(temporary)
+        operator = Path(temporary).resolve()
         home = operator / "home"
         home.mkdir()
         env = {"PATH": os.environ["PATH"], "HOME": str(home), "NO_COLOR": "1", "TZ": "UTC"}
@@ -139,24 +139,30 @@ def replay(nexus: str, output: Path, operator_dir: Path | None) -> bool:
             matches = sorted(
                 (r["id"], r["ecosystem"], r["package"], r["version"]) for r in result["advisories"]
             )
+            queries = sorted((r["ecosystem"], r["name"], r["version"]) for r in result["queries"])
+            expected_queries = [("npm", NPM, npm_version)]
+            expected_errors = []
+            if python_requirement.startswith("=="):
+                expected_queries.append(("PyPI", PYPI, python_requirement.removeprefix("==")))
+            else:
+                expected_errors.append(f"registry:pypi/{PYPI}: exact package identity unavailable")
             provenance = result["provenance"]
             checks = {
                 "exact_matches": matches == sorted(expected),
+                "exact_queries": queries == sorted(expected_queries),
                 "expected_exit_and_coverage": advisory_exit == exit_status
                 and result["complete"] is complete,
                 "offline_feed_binding": provenance["offline"] is True
                 and provenance["db_sha256"] == feed_digest,
                 "inventory_binding": result["inventory_sha256"] == sha256(bom),
-                "expected_errors": not result["errors"]
-                if complete
-                else any(
-                    "exact package identity unavailable" in error for error in result["errors"]
-                ),
+                "expected_errors": result["errors"] == expected_errors,
             }
             summary[name] = {
                 "exit_status": advisory_exit,
                 "complete": result["complete"],
                 "matches": matches,
+                "queries": queries,
+                "errors": result["errors"],
                 "checks": checks,
             }
         write_json(

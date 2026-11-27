@@ -28,6 +28,6 @@ result_parent=$(mktemp -d)
 python replay_advisories.py --out "$result_parent/advisories"
 ```
 
-The check scans synthetic PyPI and npm manifests and runs the advisory CLI against an operator-side OSV bundle. It expects two matches and a failing gate for the affected pins, zero matches and a passing gate for the fixed pins, and incomplete coverage for a floating PyPI version. Each report must bind both the scanned inventory and the advisory bundle by digest. The output includes the fixture inputs, individual reports, and `summary.json`.
+The check scans synthetic PyPI and npm manifests and runs the advisory CLI against an operator-side OSV bundle. It expects two matches and a failing gate for the affected pins, zero matches and a passing gate for the fixed pins, and the exact PyPI package identity diagnostic for a floating version. It verifies the exact package queries in each case and requires each report to bind both the scanned inventory and the advisory bundle by digest. The output includes the fixture inputs, individual reports, and `summary.json`.
 
 The fixture packages and CVE identifiers are synthetic. This check supplements the leaderboard's existing criteria. Set `--operator-dir` when the host's default temporary directory would put the operator feed inside a repository enclosing the output directory.
