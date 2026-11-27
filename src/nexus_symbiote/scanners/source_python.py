@@ -1578,6 +1578,17 @@ class PythonReader:
         origin = self.origin(module, call.func)
         keywords = _keywords(call)
         function = call.func
+        if isinstance(function, ast.Attribute) and function.attr != "as_tool":
+            # Tools an MCP client object hands out are its servers' tools: the agent is
+            # given the servers, and the client object itself is no tool.
+            for holder in self._follow(module, function.value):
+                if not isinstance(holder.node, ast.Call):
+                    continue
+                declared_servers = self._servers(holder.module, holder.node)
+                held = self.origin(holder.module, holder.node.func) or ""
+                if declared_servers or _split(held)[1] in _MCP_SYMBOLS:
+                    refs |= declared_servers
+                    return None
         if isinstance(function, ast.Attribute) and function.attr == "as_tool":
             owners = self._agent_refs(module, function.value)
             if agent is not None:

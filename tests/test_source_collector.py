@@ -540,6 +540,30 @@ reviewer = create_react_agent(
     assert approval.guardrail_type == "human-approval"
 
 
+def test_tools_taken_from_an_mcp_client_are_its_servers(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "agent.py": """\
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.prebuilt import create_react_agent
+
+client = MultiServerMCPClient(
+    {"orders": {"command": "uvx", "args": ["mcp-server-sqlite==2025.4.25"], "transport": "stdio"}}
+)
+
+
+async def build():
+    tools = await client.get_tools()
+    return create_react_agent("openai:gpt-4.1", tools, name="orders_agent")
+"""
+        },
+    )
+    agent = agents(result)["orders_agent"]
+    assert agent.tool_refs == [servers(result)["orders"].bom_ref]
+    assert tools(result) == {}
+
+
 SCRIPT = """\
 import { Agent, tool, MCPServerStdio, webSearchTool, hostedMcpTool } from "@openai/agents";
 import { anthropic } from "@ai-sdk/anthropic";
