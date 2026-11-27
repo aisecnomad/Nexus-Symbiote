@@ -1108,6 +1108,8 @@ def test_an_excluded_path_is_not_read(tmp_path: Path):
         ("two words", False),
         ("./models/llama", False),
         ("~/models/llama", False),
+        ("C:/Users/alice/models/all-MiniLM-L6-v2", False),
+        ("d:\\models\\bge-small", False),
         ("weights.safetensors", False),
         ("https://api.example.com/v1", False),
         ("a" * 129, False),
@@ -1118,6 +1120,17 @@ def test_an_excluded_path_is_not_read(tmp_path: Path):
 )
 def test_what_can_be_recorded_as_a_model_identifier(literal: object, accepted: bool):
     assert (model_identifier(literal) is not None) is accepted
+
+
+def test_a_windows_directory_is_a_gap_and_never_a_model_name(tmp_path: Path):
+    text = (
+        "from sentence_transformers import SentenceTransformer\n\n"
+        'SentenceTransformer("C:/Users/alice.smith/models/all-MiniLM-L6-v2")\n'
+    )
+    result = scan(tmp_path, {"app/embed.py": text})
+    assert result.components == []
+    assert "alice.smith" not in exported(result)
+    assert list(result.surfaces_excluded) == [unread("app/embed.py", 3)]
 
 
 @pytest.mark.parametrize(

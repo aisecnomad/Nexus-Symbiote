@@ -34,6 +34,8 @@ _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{1,127}")
 # A long run of hex or of base64 with no separator, or user information before an
 # ``@``: what a key, a token or a connection string looks like, and no model's name.
 _SECRET_SHAPED = re.compile(r"[0-9A-Fa-f]{32,}|[A-Za-z0-9+/]{40,}={0,2}|[^@:/]+:[^@/]*@.+")
+# A drive-rooted Windows path, which names a local directory or file and no model.
+_DRIVE = re.compile(r"[A-Za-z]:[/\\]")
 # Words a model argument holds that name no model on purpose.
 _NOT_A_MODEL = frozenset(
     {
@@ -93,7 +95,8 @@ def model_identifier(literal: object) -> str | None:
     lowered = text.lower()
     if lowered in _NOT_A_MODEL or lowered.endswith(_FILE_SUFFIXES) or "://" in text:
         return None
-    if text.startswith(("./", "../", "/", "~")) or not unchanged_by_redaction(text):
+    local = text.startswith(("./", "../", "/", "~")) or _DRIVE.match(text) is not None
+    if local or not unchanged_by_redaction(text):
         return None
     if _SECRET_SHAPED.fullmatch(text):
         return None
