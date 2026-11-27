@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.models import MCPServerComponent, PromptComponent
 from nexus_symbiote.literal_credentials import MAX_LITERALS, apply_literal_credential_findings
@@ -83,6 +85,52 @@ def test_a_non_utf8_file_is_a_failure_and_not_a_guess(tmp_path: Path) -> None:
     assert added == 0
     assert server.risks == []
     assert failures == ["app.py: literal credentials were not read (not UTF-8)"]
+
+
+@pytest.mark.parametrize("mark", ["\u200b", "\ufe0e", "\u00a0"])
+def test_a_mark_or_space_inside_a_token_is_still_a_finding(tmp_path: Path, mark: str) -> None:
+    marked = "sk-proj-a1b2" + mark + "c3d4e5f6g7h8i9j0"
+    (tmp_path / "app.py").write_text(f'key = "{marked}"\n', encoding="utf-8")
+    server = _server("app.py")
+    assert apply_literal_credential_findings(AIBOM(components=[server]), tmp_path) == 1
+    detail = server.risks[0].detail
+    assert marked not in detail
+    assert mark not in detail
+    assert "app.py:1:" in detail
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'key = "sk-proj-a1b2c3d4" \\\n"e5f6g7h8i9j0"\n',
+        'key = "sk-proj-" +\n"a1b2c3d4e5f6g7h8i9j0"\n',
+        'key = "sk-proj-a1b2c3d4\ne5f6g7h8i9j0"\n',
+    ],
+)
+def test_a_token_split_across_lines_is_one_finding(tmp_path: Path, text: str) -> None:
+    (tmp_path / "app.py").write_text(text, encoding="utf-8")
+    server = _server("app.py")
+    assert apply_literal_credential_findings(AIBOM(components=[server]), tmp_path) == 1
+    detail = server.risks[0].detail
+    assert "sk-proj-" not in detail
+    assert "app.py:1:" in detail
+
+
+def test_a_token_cut_off_by_the_join_cap_fails_closed(tmp_path: Path) -> None:
+    from nexus_symbiote.literal_credentials import _JOIN_LINES
+
+    lines = ['key = "'] + ["pad"] * (_JOIN_LINES - 2) + ["sk-proj-"]
+    lines.append('a1b2c3d4e5f6g7h8i9j0"')
+    (tmp_path / "app.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    server = _server("app.py")
+    failures: list[str] = []
+    added = apply_literal_credential_findings(
+        AIBOM(components=[server]), tmp_path, failures=failures
+    )
+    assert added == 0
+    assert server.risks == []
+    assert any("not collected" in failure for failure in failures)
+    assert "sk-proj-" not in " ".join(failures)
 
 
 def test_scan_reports_a_skill_literal_without_copying_it(tmp_path: Path) -> None:

@@ -6,7 +6,7 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ### Security
 
-- A vendor token shape in source, a Dockerfile, or an instruction or skill file that a collector already opened is a high `credential_exposure` finding. The finding records the path, line, and SHA-256 of the literal, not the literal. Placeholder and low-entropy example values stay quiet, MCP launch positions are unchanged, and `.env` and other credential-shaped names are not read. More than 32 shapes in one file is a collection failure and adds no finding from that file.
+- A vendor token shape in source, a Dockerfile, or an instruction or skill file that a collector already opened is a high `credential_exposure` finding. Matching uses `normalize_credential` (NFKC, then format characters, spaces and variation selectors removed) and joins a bounded string continuation or `"a" + "b"` split. The finding records the path, line, and SHA-256 of that normalized spelling, not the literal. A token the join cap cuts in half is a collection failure. Placeholder values stay quiet, MCP launch positions are unchanged, and `.env` is not read. More than 32 shapes in one file is a collection failure and adds no finding from that file.
 
 ## [0.2.0] - 2026-11-25
 
