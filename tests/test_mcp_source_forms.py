@@ -1440,12 +1440,18 @@ def test_a_gap_makes_the_mcp_collector_partial_and_fails_the_default_gate(tmp_pa
     assert f"excluded: {_gap('server.cjs', 1, LOADED)} (from mcp)" in result.output
     completeness = json.loads(output.read_text())["metadata"]["completeness"]
     assert completeness["scanner_status"]["mcp"] == "partial"
-    assert completeness["surfaces_excluded"] == [
-        "client.mjs:2 (MCP server launched from application code; launcher not inventoried)",
-        f"dynamic.py: {SERVER_LOADED}",
-        f"launch.py: {LAUNCHED}",
-        _gap("server.cjs", 1, LOADED),
-    ]
+    unnamed = "MCP server declared without a name the collector can read; not inventoried"
+    assert sorted(completeness["surfaces_excluded"]) == sorted(
+        [
+            "client.mjs:2 (MCP server launched from application code; launcher not inventoried)",
+            f"dynamic.py: {SERVER_LOADED}",
+            f"launch.py: {LAUNCHED}",
+            _gap("server.cjs", 1, LOADED),
+            # The source collector reads the same two launches and cannot name them.
+            f"client.mjs:2: {unnamed}",
+            f"launch.py:2: {unnamed}",
+        ]
+    )
     tools = [
         c["source_path"]
         for c in json.loads(output.read_text())["components"]

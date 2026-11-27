@@ -1112,11 +1112,12 @@ def _validate(bom, project):
 def test_project_validation_reproduces_the_cited_models(tmp_path):
     project = _project(tmp_path, _report(_evidence("app.py:3", MODEL)))
     bom = _merged(tmp_path, "bom", project)
-    assert [
-        c.name
+    # The report's claim, and the source collector's own reading of the same line.
+    assert sorted(
+        c.properties["collection_mode"]
         for c in AIBOM.model_validate(json.loads(bom.read_text())).components
         if c.name == MODEL
-    ] == [MODEL]
+    ) == ["imported-unverified-report", "static-source-reference"]
     unchanged = _validate(bom, project).output
     assert "discovery report" not in unchanged
 

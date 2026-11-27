@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from nexus_symbiote.core.enums import AssuranceLevel
+from nexus_symbiote.core.enums import AssuranceLevel, ComponentType
 from nexus_symbiote.core.identifiers import neutralize_identifiers
 from nexus_symbiote.core.models import (
     AnyComponent,
@@ -20,6 +20,7 @@ from nexus_symbiote.core.models import (
 )
 
 IMPORTED_MODE = "imported-unverified-report"
+SOURCE_REFERENCE_MODE = "static-source-reference"
 PRESENCE_CLAIM = "repository_presence"
 DISCOVERY_CLAIM = "discovery_report_entry"
 # On an imported model: where a scan read the identifier that a report cites.
@@ -29,6 +30,20 @@ IMPORTING_COLLECTORS = frozenset({"shadowscan"})
 
 def is_imported(component: AnyComponent) -> bool:
     return component.properties.get("collection_mode") == IMPORTED_MODE
+
+
+def is_source_reference(component: AnyComponent) -> bool:
+    """Whether a model is an identifier the source collector read, with no artifact.
+
+    Such a model names no weight file: it has no digest and no path, only the line of
+    source that names it.
+    """
+    return (
+        component.component_type is ComponentType.MODEL
+        and component.properties.get("collection_mode") == SOURCE_REFERENCE_MODE
+        and not component.hashes
+        and component.source_path is None
+    )
 
 
 def measured_assurance(component: AnyComponent) -> AssuranceLevel:

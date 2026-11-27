@@ -4,6 +4,15 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **A ninth collector, `source`, runs by default:** an inventory collected by an earlier release does not record it, so its coverage is partial and the `validate` and `risk` gates fail until it is collected again. Policies and Action inputs that list collectors must add `source` to stay complete. A project whose code names a hosted model, launches an MCP server or constructs an agent gains components, relationships and, where a declaration could not be read, coverage gaps; `diff` reports them as additions against an earlier baseline.
+
+### Added
+
+- **Declarations in application source (`source` collector):** reads, without importing or running anything, the model identifiers, agents, tools, MCP server launches, guardrails, memory and retrieval stores that Python, notebook, TypeScript, JavaScript, Go, Java, Kotlin, C# and Rust source declare, and those that environment templates, container files, Modelfiles, Compose and Kubernetes manifests, CrewAI, LiteLLM and LangGraph configuration, n8n workflows and function-schema files declare. Each record is at `declared` assurance with its file and line; each declared agent holds references to what its constructor names, exported as relationships. Credential environment variables are recorded by name on the repository agent. See the [collector reference](docs/collectors.md#declarations-in-application-source) and the [roadmap decision](ROADMAP.md#decisions-and-non-goals).
+- **Validation of source references:** `validate --project` reports the absent artifact of a model identifier it read again from source as information, as it does for a cited model of an imported report.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

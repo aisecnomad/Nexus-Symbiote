@@ -16,8 +16,40 @@ Every path is relative to the project root. Each collector also bounds what it r
 | `a2a` | `agent.json` and `agent-card.json` in any `.well-known` directory and in the root, and `a2a/agent.json`. At the root, client configuration in `a2a.json`, `a2a.yaml`, `a2a.yml` or `a2a_config.json`. Python files outside directories named `tests`, `test`, `dist`, `build`, `docs`, `benchmarks` or `examples`, for SDK references. A card or client configuration that is a symlink to a file whose name or directory says it holds credentials (including `.aws/`, `.ssh/`, `.gnupg/`, `.kube/`, `.docker/`, `.azure/`, `.gcloud/`, `.vault/`, `vault/`, and `.config/<store>/`), or a regular file inside a dotted or XDG credential store, is a coverage gap and is not read; a regular `.well-known` card under a plain service directory such as `services/credentials/.well-known/agent-card.json` remains inventoried. A card's `url` or `endpoint`, or an interface URL, such as `http:host/x` or `ht\ttp://host/x` is checked and exported as `http://host/x`, as WHATWG parsers read it; client configuration URLs and a security scheme's `tokenUrl` are not normalised |
 | `ide_agents` | Marker files and settings of Claude Code (also `.claude` settings in subdirectories, plugin manifests and the hook files `.claude-plugin/plugin.json` names in `hooks`, and the `hooks` front matter of project subagents in `.claude/agents` and skills in `.claude/skills`), Codex (`.codex/config.toml` and `.codex/config.json`), Cursor (including `.cursor/hooks.json` and `.cursor/cli.json`), Gemini CLI (`.gemini/settings.json`), Windsurf, Cline, Copilot (`.github/copilot-extensions.json`), Antigravity and xAI; `.vscode/extensions.json`, for recommended AI extensions |
 | `shadowscan` | A report at `.shadowscan/report.json`, `shadowscan-report.json` or `shadowscan.json`; reports at more than one of them are a failure |
+| `source` | At any depth, outside directories named `tests`, `test`, `__tests__`, `dist`, `build`, `docs`, `benchmarks` and `examples`: Python files (not `test_*.py`, `*_test.py` or `conftest.py`) and the code cells of `.ipynb` notebooks; TypeScript and JavaScript files (not `.d.ts`, `.test.*` or `.spec.*`); Go, Java, Kotlin, C# and Rust files; environment files, for variable names, and their `.example`, `.sample`, `.template`, `.dist` and `.defaults` templates, for model values too; `Dockerfile`, `Containerfile` and `Modelfile`; and `.json`, `.yaml`, `.yml`, `.toml` and `.properties` files outside dot-directories that no other collector reads. A file [named as one that holds credentials](known-limitations.md#every-collector) is not read |
 
 An optional [`agent.yaml` manifest](agent-manifest.md) at the project root names the agent and declares further instruction files and models.
+
+## Declarations in application source
+
+The `source` collector reads what a project's own code and configuration declare. It
+never imports, runs or contacts anything: Python is parsed to a syntax tree, TypeScript
+and JavaScript with the grammar the `mcp` collector uses, Go, Java, Kotlin, C# and Rust
+as text with comments and strings held apart, and data files with the bounded static
+readers. Every record is at `declared` assurance and carries the file and line it was
+read from, and a model, an agent or a server launch it could not read is a coverage gap.
+
+| Recorded | From |
+| --- | --- |
+| Model identifiers (`model`) | A model argument of an SDK client, constructor or agent; a provider function; a `FROM` line of a `Modelfile`; and, where its value is of a known model family, a constant, a command-line default, a configuration key or an environment variable named for a model. A name is followed through constants, environment defaults, formatted strings, class attributes, parameter defaults, functions and other modules of the project |
+| Agents (`agent`) | Constructors of OpenAI Agents SDK, CrewAI (with its `agents.yaml`), LangGraph, LangChain, LlamaIndex, AutoGen, Pydantic AI, Google ADK, smolagents, Strands, Agno, Semantic Kernel, Claude Agent SDK, Mastra and the AI SDK; n8n agent nodes; `langgraph.json` graphs. Each holds references to its models, tools, MCP servers, sub-agents, guardrails and memory |
+| Tools (`tool`) | Tool decorators, tool base classes, wrappers, function schemas, and what an agent's tool list names |
+| MCP servers (`mcp-server`) | A literal launch or endpoint in code or in an n8n node, read by the same parser as an MCP client file, so no argument, environment or header value is exported |
+| Guardrails (`guardrail-policy`) | Guardrail decorators and classes, moderation and safety-classifier models, Bedrock guardrail identifiers, human-approval settings, and the permission settings of a coding-agent SDK |
+| Stores (`rag-source`, `memory-store`, `data-source`) | Vector stores by collection or index name, conversation and semantic memory classes, document loaders and dataset loaders |
+| Credential names | Environment variables named as credentials are named (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD` and similar), by name only, on the repository agent in `credential_environment_names`; stored credentials an n8n node refers to, by kind, in `credential_references` |
+
+A provider is recorded only where the code names one: the client or constructor, a
+routing prefix such as `anthropic/`, or the host of a base URL. A framework's default
+service is recorded only for an identifier of a family that service serves. A model
+reference has no `source_path`, which on a model names a weight file; its place is in
+its `source_reference` claim. `validate --project` reports the missing artifact of a
+reference it read again from source as information, as it does for a cited model of an
+imported report; without `--project` it stays unknown.
+
+The `mcp` collector still reports a server that application code launches or reaches as
+a coverage gap of its own, because a literal declaration does not show everything code
+may start.
 
 ## MCP servers declared in source
 

@@ -66,7 +66,7 @@ def test_a_symlink_names_its_collectors_and_failure_once(tmp_path):
     failures = [line for line in _lines(result.stderr) if line.startswith("  - collection: ")]
     assert failures == [
         "  - collection: AGENTS.md: symlink target is absolute "
-        "(from a2a, ide_agents, mcp, model, prompt, rag)"
+        "(from a2a, ide_agents, mcp, model, prompt, rag, source)"
     ]
 
 

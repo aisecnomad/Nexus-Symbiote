@@ -209,6 +209,10 @@ class ScanResult:
     source_unmapped_indexes: list[int] = field(default_factory=list)
     discovery_verification: DiscoveryVerification | None = None
     accepted_default_names: set[str] = field(default_factory=set)
+    # Credentials the project's own source names, each with where it was read:
+    # environment variable names, and stored credentials a workflow refers to by kind.
+    credential_names: dict[str, list[str]] = field(default_factory=dict)
+    credential_references: dict[str, list[str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.scan_failures, BoundedRecords):

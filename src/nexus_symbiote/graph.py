@@ -12,7 +12,7 @@ from urllib.parse import quote
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
+from nexus_symbiote.core.aibom import AIBOM, DependencyEdge, Relationship
 from nexus_symbiote.core.enums import AssuranceLevel, AutonomyLevel, ComponentType, RiskSeverity
 from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.identifiers import neutralize_identifiers
@@ -22,12 +22,15 @@ from nexus_symbiote.core.models import (
     AgentComponent,
     AnyComponent,
     ClaimEvidence,
+    GuardrailComponent,
     MCPServerComponent,
     ModelComponent,
     PromptComponent,
+    RAGSourceComponent,
     RegistryEntryComponent,
     RiskAssessment,
     SkillPackageComponent,
+    ToolComponent,
 )
 from nexus_symbiote.utils.secrets import redact_text
 
@@ -400,6 +403,85 @@ def _launcher_key(registry: RegistryEntryComponent) -> str | None:
     return None
 
 
+_SOURCE_DECLARATION = "declared in source; runtime use and authority unobserved"
+_DECLARED_RELATIONS: tuple[tuple[str, Relationship], ...] = (
+    ("model_refs", "uses-model"),
+    ("tool_refs", "configured-with"),
+    ("sub_agent_refs", "delegates-to"),
+    ("guardrail_refs", "uses-guardrail"),
+    ("memory_refs", "uses-memory"),
+    ("data_refs", "retrieves-from"),
+)
+MAX_CREDENTIAL_NAMES = 1_000
+
+
+def _source_declared(component: AnyComponent) -> bool:
+    return (
+        component.properties.get("collection_mode")
+        in {
+            "static-source-declaration",
+            "static-source-reference",
+        }
+        and ":source:" in component.bom_ref
+    )
+
+
+def link_source_declarations(bom: AIBOM) -> None:
+    """Relate what the source collector read, the same way for a scan and a reconciliation.
+
+    A function tool that the MCP collector's decorator reader also recorded from the
+    same file is one tool: the source collector's copy is dropped and each agent that
+    named it refers to the other. Each reference a declared agent, guardrail or
+    retrieval source holds becomes a relationship at declared assurance.
+    """
+    recorded: dict[tuple[str, str], str] = {}
+    for component in bom.components:
+        if (
+            isinstance(component, ToolComponent)
+            and component.bom_ref.startswith("tool:python:")
+            and component.source_path
+        ):
+            key = (component.source_path, component.name)
+            recorded[key] = min(recorded.get(key, component.bom_ref), component.bom_ref)
+    twins = {
+        component.bom_ref: recorded[(component.source_path, component.name)]
+        for component in bom.components
+        if isinstance(component, ToolComponent)
+        and _source_declared(component)
+        and component.properties.get("tool_kind") == "function"
+        and component.source_path
+        and (component.source_path, component.name) in recorded
+    }
+    if twins:
+        bom.components[:] = [c for c in bom.components if c.bom_ref not in twins]
+    present = {component.bom_ref for component in bom.components}
+
+    def relate(source: str, target: str, relationship: Relationship) -> None:
+        if target in present:
+            bom.add_dependency(
+                DependencyEdge(
+                    source_ref=source,
+                    target_ref=target,
+                    relationship=relationship,
+                    assurance_level="declared",
+                    conditions=_SOURCE_DECLARATION,
+                )
+            )
+
+    for component in bom.components:
+        if not _source_declared(component):
+            continue
+        if isinstance(component, AgentComponent):
+            component.tool_refs = sorted({twins.get(ref, ref) for ref in component.tool_refs})
+            for field_name, relationship in _DECLARED_RELATIONS:
+                for target in getattr(component, field_name):
+                    relate(component.bom_ref, target, relationship)
+        elif isinstance(component, GuardrailComponent) and component.model_ref:
+            relate(component.bom_ref, component.model_ref, "uses-model")
+        elif isinstance(component, RAGSourceComponent) and component.embedding_model_ref:
+            relate(component.bom_ref, component.embedding_model_ref, "uses-model")
+
+
 def assemble_repository_agent(
     bom: AIBOM,
     root: Path,
@@ -408,8 +490,15 @@ def assemble_repository_agent(
     failures: list[str] | None = None,
     exclusions: list[str] | None = None,
     surfaces: list[str] | None = None,
+    credential_names: dict[str, list[str]] | None = None,
+    credential_references: dict[str, list[str]] | None = None,
 ) -> AgentComponent:
     """Associate repository-discovered dependencies with a definition, not a running agent.
+
+    ``credential_names`` holds the credential environment variables the project's
+    source names, each with where it was read, and ``credential_references`` the
+    stored credentials a workflow refers to by kind. Both are recorded on the agent
+    by name. No value is read for either.
 
     The optional ``agent.yaml`` manifest is read beneath ``root`` under the caller's
     ``exclude_paths``. Given a ``failures`` list, manifest problems are recorded there,
@@ -527,6 +616,24 @@ def assemble_repository_agent(
             "runtime_use": "unknown",
         },
     )
+    for label, names in (
+        ("credential_environment_names", credential_names),
+        ("credential_references", credential_references),
+    ):
+        if not names:
+            continue
+        listed = sorted(names)[:MAX_CREDENTIAL_NAMES]
+        agent.properties[label] = listed
+        agent.properties[f"{label}_locations"] = {
+            name: names[name][0] for name in listed if names[name]
+        }
+        agent.claims[label] = ClaimEvidence(
+            assurance=AssuranceLevel.DECLARED,
+            method="static-source-reference",
+            scope="repository",
+            collector="source",
+            locator=next((names[name][0] for name in listed if names[name]), None),
+        )
     if binding:
         agent.properties.update(binding)
     elif withheld:
@@ -567,6 +674,7 @@ def assemble_repository_agent(
                     locator=f"{MANIFEST}#/{key}",
                 )
     bom.components.extend(accepted)
+    link_source_declarations(bom)
     relations = {
         ComponentType.MCP_SERVER: ("tool_refs", "configured-with"),
         ComponentType.TOOL: ("tool_refs", "configured-with"),
@@ -587,6 +695,10 @@ def assemble_repository_agent(
         ComponentType.A2A_SERVER: ("configured-with", _REPOSITORY_ASSOCIATION),
         ComponentType.IDE_AGENT: ("configured-with", _REPOSITORY_ASSOCIATION),
         ComponentType.VERIFIED_EXTENSION: ("configured-with", _REPOSITORY_ASSOCIATION),
+        ComponentType.AGENT: (
+            "configured-with",
+            "agent declared in repository source; runtime use and authority unobserved",
+        ),
         ComponentType.REGISTRY_ENTRY: (
             "depends-on",
             "repository manifest dependency; installed artifact, runtime use and authority "

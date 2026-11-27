@@ -16,6 +16,7 @@ from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
 from nexus_symbiote.core.collection import (
     IMPORTED_MODE,
     is_imported,
+    is_source_reference,
     merge_collected,
 )
 from nexus_symbiote.core.coverage import assess_coverage
@@ -160,6 +161,8 @@ class CompletenessReport:
     local_subjects: int | None = None
     supplier_claims: list[SupplierClaim] = field(default_factory=list)
     bound_imports: frozenset[str] = frozenset()
+    bound_references: frozenset[str] = frozenset()
+    """Model references the local collection read again from the project's source."""
     supplier_observed: frozenset[str] = frozenset()
     """Matched components whose observed composition only supplier additions establish."""
     issues_omitted: int = 0
@@ -378,6 +381,8 @@ class CompletenessValidator:
         accepted_default_names: set[str] = set()
         status: dict[str, str] = {}
         report_digest: str | None = None
+        credential_names: dict[str, list[str]] = {}
+        credential_references: dict[str, list[str]] = {}
 
         for scanner_type in ALL_SCANNERS:
             scanner = (
@@ -407,11 +412,19 @@ class CompletenessValidator:
                     incomplete(scanner.name, reason)
                 if not problems:
                     report.bound_imports = frozenset(c.bom_ref for c in local.components)
+            if scanner.name == "source":
+                report.bound_references = frozenset(
+                    c.bom_ref for c in local.components if is_source_reference(c)
+                )
             failed = bool(local.scan_failures)
             for component in local.components:
                 if merge_collected(collected, component, scanner.name, None) == "conflict":
                     incomplete(scanner.name, f"Conflicting local reference: {component.bom_ref}")
                     failed = True
+            for label, where in local.credential_names.items():
+                credential_names.setdefault(label, []).extend(where)
+            for label, where in local.credential_references.items():
+                credential_references.setdefault(label, []).extend(where)
             surfaces.extend(local.surfaces_scanned)
             excluded.extend(local.surfaces_excluded)
             accepted_default_exclusions.update(local.accepted_default_exclusions)
@@ -424,7 +437,12 @@ class CompletenessValidator:
         agent: AgentComponent | None = None
         try:
             agent = assemble_repository_agent(
-                expected, root, exclude_paths=exclude_paths, surfaces=surfaces
+                expected,
+                root,
+                exclude_paths=exclude_paths,
+                surfaces=surfaces,
+                credential_names=credential_names,
+                credential_references=credential_references,
             )
         except (OSError, ValueError, RecursionError):
             incomplete("agent.yaml", "Local agent manifest could not be reconciled.")

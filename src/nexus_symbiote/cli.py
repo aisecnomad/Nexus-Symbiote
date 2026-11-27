@@ -68,7 +68,7 @@ if TYPE_CHECKING:
     from nexus_symbiote.utils.crypto import SigstoreArtifactPolicy
 
 DEBUG_KEY = "nexus_symbiote.debug"
-BUILTIN_SCANNERS = "mcp, model, prompt, rag, registry, a2a, ide_agents, shadowscan"
+BUILTIN_SCANNERS = "mcp, model, prompt, rag, registry, a2a, ide_agents, shadowscan, source"
 # Gate reports name the agent manifest and the graph check like collectors.
 MANIFEST = "agent.yaml"
 
@@ -557,6 +557,7 @@ def _get_scanners() -> dict[str, type]:
         from nexus_symbiote.scanners.rag import RAGScanner
         from nexus_symbiote.scanners.registry import RegistryScanner
         from nexus_symbiote.scanners.shadowscan import ShadowScanImporter
+        from nexus_symbiote.scanners.source import SourceScanner
 
         SCANNER_REGISTRY.update(
             {
@@ -568,6 +569,7 @@ def _get_scanners() -> dict[str, type]:
                 "registry": RegistryScanner,
                 "a2a": A2AScanner,
                 "ide_agents": IDEAgentScanner,
+                "source": SourceScanner,
             }
         )
     return SCANNER_REGISTRY
@@ -1242,6 +1244,8 @@ def scan(
     # AIBOM lookups scan the whole list; a project can declare tens of thousands of
     # tools, so index what this loop adds instead of searching for each component.
     collected: dict[str, Any] = {}
+    credential_names: dict[str, list[str]] = {}
+    credential_references: dict[str, list[str]] = {}
     for name in selected:
         scanner = (
             all_scanners[name](signature_policies=signature_policies)
@@ -1273,6 +1277,10 @@ def scan(
                 source_unmapped_indexes = result.source_unmapped_indexes
                 discovery_verification = result.discovery_verification
             _merge_scan_result(name, result, aibom, collected, scan_failures)
+            for label, where in result.credential_names.items():
+                credential_names.setdefault(label, []).extend(where)
+            for label, where in result.credential_references.items():
+                credential_references.setdefault(label, []).extend(where)
             surfaces_scanned.extend(result.surfaces_scanned)
             surfaces_excluded.extend(result.surfaces_excluded)
             accepted_default_exclusions.update(result.accepted_default_exclusions)
@@ -1314,6 +1322,8 @@ def scan(
             failures=scan_failures,
             exclusions=surfaces_excluded,
             surfaces=surfaces_scanned,
+            credential_names=credential_names,
+            credential_references=credential_references,
         )
     except (PolicyError, ValueError, OSError) as exc:
         raise _failure(exc) from exc
@@ -2217,6 +2227,7 @@ def validate(
     # Only the reconciliation below may claim that the inventory was compared with the project.
     basis = "project-not-reconciled" if root is not None else "supplied-bom"
     bound_imports: frozenset[str] = frozenset()
+    bound_references: frozenset[str] = frozenset()
     supplier_observed: frozenset[str] = frozenset()
     completeness: dict[str, Any] = {"status": "skipped", "skipped_by": "policy"}
     if policy.validation.require_completeness:
@@ -2234,6 +2245,7 @@ def validate(
         )
         completeness = {"status": "pass" if c_report.is_complete else "fail", **c_report.to_dict()}
         bound_imports = c_report.bound_imports
+        bound_references = c_report.bound_references
         supplier_observed = c_report.supplier_observed
         if root is not None:
             # The risk command's vocabulary: reconciled, with supplier claims, or failed.
@@ -2243,7 +2255,11 @@ def validate(
     if not skip_integrity:
         if policy.validation.require_integrity:
             i_report = IntegrityValidator(signature_policies=signature_policies).validate(
-                bom, root, exclude_paths=policy.scan.exclude_paths, bound_imports=bound_imports
+                bom,
+                root,
+                exclude_paths=policy.scan.exclude_paths,
+                bound_imports=bound_imports,
+                bound_references=bound_references,
             )
             integrity = i_report.to_dict()
             passed = passed and i_report.is_valid

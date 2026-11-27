@@ -32,8 +32,11 @@ from packaging.version import InvalidVersion, Version
 from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import AIBOM, NO_CONTENT_SERIAL
 from nexus_symbiote.diff.differ import AIBOMDiffer, _values_unbound
-from nexus_symbiote.scanners.base import sanitized_origin
+from nexus_symbiote.scanners.base import ScanResult, sanitized_origin
 from nexus_symbiote.scanners.registry import RegistryScanner
+from nexus_symbiote.scanners.source import SourceScanner
+from nexus_symbiote.scanners.source_clike import split_source
+from nexus_symbiote.scanners.source_references import model_identifier
 from nexus_symbiote.utils.secrets import redact_descriptor, redact_text, redact_url
 from tests.support import scaling_ratio
 
@@ -767,3 +770,144 @@ def test_every_maintained_reader_has_a_registered_hypothesis_property():
     for reader_name, fn in READER_PROPERTY_MAP.items():
         assert callable(fn), reader_name
         assert hasattr(fn, "hypothesis"), f"{reader_name} must be decorated with @given"
+
+
+# The source collector's readers: a file of any content must leave records, a gap or
+# nothing, never a crash and never a value the collector may not export, and reading
+# must stay linear in the size of a file.
+SOURCE_SUFFIXES = st.sampled_from(
+    [".py", ".ts", ".js", ".go", ".java", ".cs", ".rs", ".json", ".yaml", ".toml", ".ipynb"]
+)
+# Text that makes each reader look closer: SDK names, call shapes and string delimiters.
+SOURCE_FRAGMENTS = st.sampled_from(
+    [
+        "from openai import OpenAI\n",
+        "from agents import Agent\n",
+        'import { Agent } from "@openai/agents";\n',
+        'import "github.com/sashabaranov/go-openai"\n',
+        "using Microsoft.SemanticKernel;\n",
+        'model="gpt-4o"',
+        "Agent(name=",
+        "tools=[",
+        "MCPServerStdio(params={",
+        '{"nodes": [{"type": "n8n-nodes-base.x", "name": ',
+        '"""',
+        "'",
+        '"',
+        "`",
+        "/*",
+        "//",
+        "${",
+        "\\",
+        "\x00",
+        "\n",
+        "(",
+        "{",
+    ]
+)
+SOURCE_TEXT = st.lists(st.one_of(SOURCE_FRAGMENTS, st.text(max_size=12)), max_size=24).map("".join)
+SOURCE_SECRET = st.text(
+    alphabet="ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789", min_size=40, max_size=48
+).map(lambda body: "sk-proj-" + body)
+
+
+def _scan_source(files: dict[str, bytes]) -> tuple[ScanResult, str]:
+    with tempfile.TemporaryDirectory() as directory:
+        for name, content in files.items():
+            path = Path(directory) / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        result = SourceScanner().scan(Path(directory))
+    exported = json.dumps(
+        [component.model_dump(mode="json") for component in result.components]
+        + list(result.surfaces_excluded)
+        + list(result.scan_failures)
+        + [result.credential_names, result.credential_references]
+    )
+    return result, exported
+
+
+@given(SOURCE_SUFFIXES, SOURCE_TEXT)
+def test_no_file_content_crashes_a_reader(suffix, text):
+    result, _ = _scan_source({f"app/unit{suffix}": text.encode("utf-8", "surrogatepass")})
+    assert not result.scan_failures
+
+
+@given(SOURCE_SUFFIXES, st.binary(max_size=96))
+def test_bytes_that_are_not_text_are_read_as_nothing_or_a_gap(suffix, payload):
+    result, _ = _scan_source({f"app/unit{suffix}": b"from openai import OpenAI\n" + payload})
+    assert not result.scan_failures
+
+
+@given(SOURCE_SECRET, st.sampled_from(["model", "name", "api_key", "base_url", "command"]))
+def test_a_token_in_any_argument_is_never_exported(secret, argument):
+    python = f"""\
+from agents import Agent
+from agents.mcp import MCPServerStdio
+from openai import OpenAI
+
+client = OpenAI(api_key="{secret}", base_url="https://{secret}@gateway.example/v1")
+bot = Agent(name="{secret if argument == "name" else "Bot"}", model="{secret if argument == "model" else "gpt-4o"}")
+server = MCPServerStdio(name="s", params={{"command": "{secret if argument == "command" else "npx"}", "args": ["{secret}"], "env": {{"K": "{secret}"}}}})
+"""
+    script = f"""\
+import {{ Agent }} from "@openai/agents";
+import OpenAI from "openai";
+const client = new OpenAI({{ apiKey: "{secret}", baseURL: "https://{secret}@gateway.example/v1" }});
+export const bot = new Agent({{ name: "{secret}", model: "{secret}" }});
+"""
+    _, exported = _scan_source(
+        {
+            "app/bot.py": python.encode(),
+            "app/bot.ts": script.encode(),
+            ".env.example": f"OPENAI_API_KEY={secret}\nCHAT_MODEL={secret}\n".encode(),
+            "svc/main.go": f'package main\nimport "github.com/openai/openai-go"\nconst model = "{secret}"\n'.encode(),
+        }
+    )
+    assert secret not in exported
+    assert secret[8:] not in exported
+
+
+@given(st.text(max_size=160))
+def test_an_accepted_model_identifier_is_exported_as_written(literal):
+    accepted = model_identifier(literal)
+    if accepted is not None:
+        assert accepted == literal.strip()
+        assert " " not in accepted and "://" not in accepted and len(accepted) <= 128
+
+
+@given(st.sampled_from([".go", ".java", ".cs", ".rs", ".kt"]), SOURCE_TEXT)
+def test_splitting_source_keeps_every_line_and_reads_no_comment(suffix, text):
+    source = split_source(text, suffix)
+    assert source.code.count("\n") == text.count("\n")
+    for literal in source.strings:
+        assert literal in text
+
+
+@pytest.mark.no_cover
+def test_reading_a_python_file_is_linear_in_its_size(tmp_path):
+    def read(scale: int) -> None:
+        size = 150 * scale
+        root = tmp_path / f"n{size}"
+        root.mkdir(exist_ok=True)
+        rebinds = "\n".join(f'text = text.replace("{index}", "x")' for index in range(size))
+        calls = "\n".join(
+            f'client.chat.completions.create(model=text + "{index}", messages=[])'
+            for index in range(size)
+        )
+        (root / "app.py").write_text(
+            f'from openai import OpenAI\n\nclient = OpenAI()\ntext = "gpt-4o"\n{rebinds}\n{calls}\n',
+            encoding="utf-8",
+        )
+        SourceScanner().scan(root)
+
+    assert scaling_ratio(read) < 8
+
+
+@pytest.mark.no_cover
+def test_reading_text_source_is_linear_in_its_size():
+    def read(scale: int) -> None:
+        body = 'var model = "gpt-4o" /* x */ // y\n' * (2_000 * scale)
+        split_source('import "github.com/openai/openai-go"\n' + body, ".go")
+
+    assert scaling_ratio(read) < 8
