@@ -2546,6 +2546,12 @@ REMOTE = "a model is loaded with options the collector cannot read; whether it m
             True,
             False,
         ),
+        (
+            'HuggingFaceLocalChatGenerator(model="someorg/custom-7b", generation_kwargs='
+            '{"custom_generate": "someorg/custom-gen", "trust_remote_code": True})',
+            True,
+            False,
+        ),
     ],
     ids=[
         "wrapper-of-a-weights-library",
@@ -2562,6 +2568,7 @@ REMOTE = "a model is loaded with options the collector cannot read; whether it m
         "another-options-dict",
         "options-nested-in-options",
         "tokenizer-options",
+        "generation-options-dict",
     ],
 )
 def test_remote_code_is_read_on_every_sdk_call_and_options_it_cannot_read_are_a_gap(
@@ -3003,6 +3010,7 @@ def test_a_method_of_a_loaded_model_given_a_spread_is_no_load_with_unread_option
         {
             "run.py": """\
 from huggingface_hub import InferenceClient
+from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 
@@ -3012,10 +3020,13 @@ out = model.generate(**tok("hello", return_tensors="pt"), max_new_tokens=32)
 GEN = {"temperature": 0.2}
 LLM(model="Qwen/Qwen2.5-7B-Instruct").generate(["hi"], SamplingParams(**GEN))
 InferenceClient("Qwen/Qwen2.5-7B-Instruct").text_generation("hi", model="Qwen/QwQ-32B", **GEN)
+OPTS = load_options()
+PeftModel.from_pretrained(model, "someorg/adapter").load_adapter(model_id="someorg/a2", **OPTS)
 """
         },
     )
-    # Generating text loads no model, so options it cannot read do not say how one loads.
+    # A loaded model's methods, generating text or adding an adapter, are not where options
+    # let a model's own code run, so options it cannot read there are no gap.
     assert not any("loaded with options" in gap for gap in result.surfaces_excluded)
 
 
