@@ -438,10 +438,16 @@ class CompletenessValidator:
         for reason in text_failures:
             incomplete("text_poisoning", f"Local collection incomplete: {reason}")
         literal_failures: list[str] = []
+        literal_exclusions: list[str] = []
         apply_literal_credential_findings(
-            expected, root, exclude_paths=exclude_paths, failures=literal_failures
+            expected,
+            root,
+            exclude_paths=exclude_paths,
+            failures=literal_failures,
+            exclusions=literal_exclusions,
         )
-        for reason in literal_failures:
+        excluded.extend(literal_exclusions)
+        for reason in (*literal_failures, *literal_exclusions):
             incomplete("literal_credentials", f"Local collection incomplete: {reason}")
         coverage = self._local_coverage(
             report_digest,
