@@ -6,7 +6,7 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ### Security
 
-- Instruction and tool text that tells a shell fetcher (`curl`, `wget`, `nc`) or a command substitution to read a credential path (`~/.ssh`, `id_rsa`, `.netrc`, and the other paths `TP-CRED-002` already names) is now that same finding. A prohibition still suppresses it, and a sentence that only mentions the command and the path does not match. Matched text stays withheld. Text-poisoning pack `1.1.0`.
+- Instruction and tool text that sends a credential path to the network is a `TP-CRED-002` finding whichever stage comes first. A reader (`cat`, `base64`, `xxd`, `gzip`, `openssl`, and the other readers) or a redirect in one stage and `curl`, `wget`, or `nc` in another is enough, including a backslash or pipe continued onto the next line. A command substitution is read in full up to 4,096 characters; a body the cap cuts off is a finding, not a miss. A prohibition and a sentence that only mentions the command stay quiet, and the matched text stays withheld. Text-poisoning pack `1.1.0`.
 
 ## [0.2.0] - 2026-11-25
 

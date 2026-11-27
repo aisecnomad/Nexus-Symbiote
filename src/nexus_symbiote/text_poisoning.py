@@ -277,24 +277,20 @@ _EXFIL_URL_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-# A shell fetcher and a credential path on one line. The path has to be its own
-# token (a URL, a substitution, or a path argument). Prose that merely mentions
-# both ("curl is documented, and ~/.ssh/id_rsa is a key file") has plain words
-# between them and is not a command.
-_SHELL_FETCH_RE = re.compile(r"(?<![\w-])(?:curl|wget|nc)(?![\w-])", re.IGNORECASE)
-_SHELL_READ_RE = re.compile(
-    r"(?<![\w-])(?:cat|base64|xxd|od|dd|head|tail|cut)(?![\w-])", re.IGNORECASE
+# Network sinks and the commands that read a credential path into a pipe.
+# Order does not matter: ``cat file | curl`` and ``base64 file | curl`` are the
+# same finding. A sentence that only mentions both is not a pipeline.
+_SHELL_SINKS = frozenset({"curl", "wget", "nc"})
+_SHELL_READERS = frozenset(
+    {"cat", "base64", "xxd", "gzip", "openssl", "od", "dd", "head", "tail", "cut"}
 )
 _SHELL_TOKEN_RE = re.compile(r"\S+")
 _PLAIN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
-_SHELL_LINE_LIMIT = 400
 _SHELL_PLAIN_WORDS = 1
-# Command substitution that reads a credential path, with or without a fetcher.
-_CRED_SUBSTITUTION_RE = re.compile(
-    r"(?i)(?:\$\(|`)[^`\n()]{0,80}?"
-    r"(?<![\w-])(?:cat|base64|xxd|od|dd|head|tail|cut)(?![\w-])"
-    r"[^`\n()]{0,120}?" + _CRED_PATH_RE.pattern + r"[^`\n()]{0,40}?(?:\)|`)"
-)
+# A continued command or a substitution longer than this is a finding, not a miss.
+_SHELL_WINDOW_CHARS = 4096
+_SHELL_WINDOW_LINES = 32
+_SUBST_CHARS = 4096
 
 _OVERRIDE_RE = re.compile(
     rf"\b{_NOT_NEGATED}(?:"
@@ -532,52 +528,326 @@ def _verb_is_negated(text: str, verb_start: int) -> bool:
     return _has_negated_prefix(text, end)
 
 
-def _plain_words(text: str) -> int:
-    """Tokens that are only letters: the prose between a fetcher and a path."""
-    return sum(1 for token in _SHELL_TOKEN_RE.findall(text) if _PLAIN_WORD_RE.fullmatch(token))
+def _shell_word(token: str) -> str:
+    word = token.lower()
+    if "/" in word:
+        word = word.rsplit("/", 1)[-1]
+    return word
 
 
-def _remember_path(reported: set[int], path: re.Match[str], *, absolute: int) -> None:
-    if path.group().lower().endswith(".pub") or absolute in reported:
-        return
-    reported.add(absolute)
+def _credential_path(token: str) -> re.Match[str] | None:
+    found = _CRED_PATH_RE.search(token)
+    if found is None or found.group().lower().endswith(".pub"):
+        return None
+    return found
+
+
+def _line_ends_continued(text: str, line_start: int, line_end: int) -> bool:
+    end = line_end
+    while end > line_start and text[end - 1] in " \t\r":
+        end -= 1
+    if end > line_start and text[end - 1] == "\\":
+        return True
+    tail = text[line_start:end].rstrip(" \t")
+    return tail.endswith(("|", ";", "&&", "||"))
+
+
+def _next_starts_continued(text: str, index: int) -> bool:
+    if index >= len(text):
+        return False
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    return text.startswith(("|", "&&", "||"), index)
+
+
+def _next_is_lone_path(text: str, index: int) -> bool:
+    if index >= len(text):
+        return False
+    line_end = text.find("\n", index)
+    if line_end < 0:
+        line_end = len(text)
+    tokens = _SHELL_TOKEN_RE.findall(text[index:line_end])
+    return len(tokens) == 1 and _credential_path(tokens[0]) is not None
+
+
+def _window_has_verb(text: str, start: int, end: int) -> bool:
+    for token in _SHELL_TOKEN_RE.findall(text[start:end]):
+        if _shell_word(token) in _SHELL_SINKS or _shell_word(token) in _SHELL_READERS:
+            return True
+    return False
+
+
+def _logical_windows(text: str) -> Iterator[tuple[int, int, bool]]:
+    """Continued shell lines as ``(start, end, truncated)``. One forward pass.
+
+    A backslash, a trailing or leading pipe, ``&&`` / ``||`` / ``;``, or a path
+    that occupies the next line by itself extends the window. Past the character
+    or line cap the window is truncated and the caller fails closed.
+    """
+    length = len(text)
+    index = 0
+    while index < length:
+        start = index
+        end = text.find("\n", index)
+        if end < 0:
+            end = length
+        lines = 1
+        truncated = False
+        while end < length:
+            line_start = text.rfind("\n", start, end) + 1
+            lone_path = _window_has_verb(text, start, end) and _next_is_lone_path(text, end + 1)
+            if not (
+                _line_ends_continued(text, line_start, end)
+                or _next_starts_continued(text, end + 1)
+                or lone_path
+            ):
+                break
+            nxt = text.find("\n", end + 1)
+            if nxt < 0:
+                nxt = length
+            if lines >= _SHELL_WINDOW_LINES or nxt - start > _SHELL_WINDOW_CHARS:
+                truncated = True
+                break
+            end = nxt
+            lines += 1
+        yield start, end, truncated
+        index = end + 1 if end < length else length
+
+
+def _shell_stages(text: str, start: int, end: int) -> list[list[tuple[int, str]]]:
+    """Stages of one command, split on ``|``, ``||``, ``&&`` and ``;`` outside quotes.
+
+    Bytes inside ``$(...)`` or backticks are left to the substitution scan. A
+    backslash-newline is whitespace. The walk is one pass.
+    """
+    stages: list[list[tuple[int, str]]] = [[]]
+    index = start
+    quote = ""
+    subst = 0
+    tick = False
+    while index < end:
+        char = text[index]
+        if char == "\\" and index + 1 < end and text[index + 1] == "\n":
+            index += 2
+            continue
+        if quote:
+            if char == quote and text[index - 1] != "\\":
+                quote = ""
+            index += 1
+            continue
+        if tick:
+            if char == "`":
+                tick = False
+            index += 1
+            continue
+        if text.startswith("$(", index):
+            subst += 1
+            index += 2
+            continue
+        if char == "(" and subst:
+            subst += 1
+            index += 1
+            continue
+        if char == ")" and subst:
+            subst -= 1
+            index += 1
+            continue
+        if char in "\"'":
+            quote = char
+            index += 1
+            continue
+        if char == "`":
+            tick = True
+            index += 1
+            continue
+        if subst == 0 and (text.startswith(("&&", "||"), index) or char in "|;"):
+            stages.append([])
+            index += 2 if text.startswith(("&&", "||"), index) else 1
+            continue
+        if char.isspace():
+            index += 1
+            continue
+        token_end = index + 1
+        while (
+            token_end < end and not text[token_end].isspace() and text[token_end] not in "|;`'\"()"
+        ):
+            if text.startswith(("&&", "||"), token_end):
+                break
+            token_end += 1
+        stages[-1].append((index, text[index:token_end]))
+        index = token_end
+    return stages
+
+
+def _plain_between(tokens: list[tuple[int, str]], left: int, right: int) -> int:
+    lo, hi = sorted((left, right))
+    return sum(1 for index in range(lo + 1, hi) if _PLAIN_WORD_RE.fullmatch(tokens[index][1]))
+
+
+def _stage_reads(tokens: list[tuple[int, str]]) -> int | None:
+    """Offset of a credential path this stage reads, or None.
+
+    The reader and the path have to be near each other, so ``cat the manual and
+    mention ~/.ssh/id_rsa`` is prose. A redirect or an ``@path`` argument is a read
+    on its own.
+    """
+    readers = [i for i, (_, token) in enumerate(tokens) if _shell_word(token) in _SHELL_READERS]
+    paths: list[tuple[int, int, str]] = []
+    for index, (pos, token) in enumerate(tokens):
+        found = _credential_path(token)
+        if found is not None:
+            paths.append((index, pos + found.start(), token))
+    for index, absolute, token in paths:
+        previous = tokens[index - 1][1] if index else ""
+        if token.startswith(("@", "<")) or previous == "<":
+            return absolute
+        if any(_plain_between(tokens, reader, index) <= _SHELL_PLAIN_WORDS for reader in readers):
+            return absolute
+    return None
+
+
+def _stage_sink(tokens: list[tuple[int, str]]) -> bool:
+    return any(_shell_word(token) in _SHELL_SINKS for _, token in tokens)
+
+
+def _sink_near_path(tokens: list[tuple[int, str]]) -> int | None:
+    """A sink and a credential-path token with at most one plain word between them."""
+    sinks = [i for i, (_, token) in enumerate(tokens) if _shell_word(token) in _SHELL_SINKS]
+    paths = [
+        (i, pos + found.start())
+        for i, (pos, token) in enumerate(tokens)
+        if (found := _credential_path(token)) is not None
+    ]
+    for sink in sinks:
+        for path_index, absolute in paths:
+            if _plain_between(tokens, sink, path_index) <= _SHELL_PLAIN_WORDS:
+                return absolute
+    return None
+
+
+def _first_shell_verb(text: str, start: int, end: int) -> int | None:
+    for pos, token in (token for stage in _shell_stages(text, start, end) for token in stage):
+        word = _shell_word(token)
+        if word in _SHELL_SINKS or word in _SHELL_READERS:
+            return pos
+    index = start
+    while index < end:
+        if text[index] == "`":
+            run = index + 1
+            while run < end and text[run] == "`":
+                run += 1
+            if run - index != 1:
+                index = run
+                continue
+        if text.startswith("$(", index) or text[index] == "`":
+            opener = 2 if text.startswith("$(", index) else 1
+            body = index + opener
+            cap = min(end, index + _SUBST_CHARS)
+            while body < cap and text[body] not in " \t\n|;`'\"()":
+                body += 1
+            word = _shell_word(text[index + opener : body])
+            if word in _SHELL_SINKS or word in _SHELL_READERS:
+                return index + opener
+        index += 1
+    return None
+
+
+def _pipeline_offset(text: str, start: int, end: int) -> int | None:
+    """A pipeline or list where one stage reads a credential path and one is a sink."""
+    stages = _shell_stages(text, start, end)
+    reads = [found for stage in stages if (found := _stage_reads(stage)) is not None]
+    sinks = any(_stage_sink(stage) for stage in stages)
+    if reads and sinks:
+        return reads[0]
+    for stage in stages:
+        found = _sink_near_path(stage)
+        if found is not None:
+            return found
+    return None
+
+
+def _substitution_offsets(text: str, start: int, end: int) -> Iterator[int]:
+    """Command substitutions in ``text[start:end]``. An unclosed body past the cap is a hit."""
+    index = start
+    while index < end:
+        if text[index] == "`":
+            run = index + 1
+            while run < end and text[run] == "`":
+                run += 1
+            # A fence or double backtick is Markdown, not a one-backtick substitution.
+            if run - index != 1:
+                index = run
+                continue
+        if not text.startswith("$(", index) and text[index] != "`":
+            index += 1
+            continue
+        dollar = text.startswith("$(", index)
+        opener = 2 if dollar else 1
+        closer = ")" if dollar else "`"
+        body = index + opener
+        cap = min(end, index + _SUBST_CHARS)
+        depth = 1
+        while body < cap and depth:
+            if dollar and text.startswith("$(", body):
+                depth += 1
+                body += 2
+                continue
+            if text[body] == closer:
+                depth -= 1
+                if depth == 0:
+                    break
+            body += 1
+        if depth:
+            # The cap hid the rest of the substitution. Fail closed.
+            yield index
+            index = body
+            continue
+        fragment = text[index + opener : body]
+        verb = None
+        path_at: int | None = None
+        for token in _SHELL_TOKEN_RE.finditer(fragment):
+            if _shell_word(token.group()) in _SHELL_READERS and verb is None:
+                verb = token.start()
+            found = _credential_path(token.group())
+            if found is not None and path_at is None:
+                path_at = token.start() + found.start()
+        if (
+            verb is not None
+            and path_at is not None
+            and not _verb_is_negated(text, index + opener + verb)
+        ):
+            yield index + opener + path_at
+        index = body + 1
+
+
+def _window_interesting(text: str, start: int, end: int) -> bool:
+    if "$(" in text[start:end] or _CRED_PATH_RE.search(text[start:end]) is not None:
+        return True
+    return _window_has_verb(text, start, end)
 
 
 def _shell_exfil_offsets(normalized: str) -> Iterator[int]:
-    """Offsets of a credential path read by command substitution or a shell fetcher.
+    """Offsets of a shell read of a credential path that reaches a network sink.
 
-    ``curl`` / ``wget`` / ``nc`` count only when a credential-path token follows on the
-    same line with at most one plain word between them, so a sentence that mentions
-    the command and the path separately does not. A substitution counts on its own
-    when its body reads the path. A ``.pub`` path stays public. Each path is reported
-    once. The line and the substitution are bounded, so the scan stays linear.
+    A pipeline or command list hits when any stage reads the path (``cat``,
+    ``base64``, ``xxd``, ``gzip``, ``openssl`` and the other readers, or a
+    redirect) and any stage is ``curl``, ``wget`` or ``nc``, in either order.
+    Continuations, including a backslash newline, are one bounded window. A
+    substitution is scanned in full up to its cap; a body the cap cuts off is a
+    hit rather than a miss. A prohibition and a sentence that only mentions the
+    command stay quiet. A ``.pub`` path stays public. The walk is one pass.
     """
     reported: set[int] = set()
-    for match in _CRED_SUBSTITUTION_RE.finditer(normalized):
-        verb = _SHELL_READ_RE.search(normalized, match.start(), match.end())
-        path = _CRED_PATH_RE.search(normalized, match.start(), match.end())
-        if verb is None or path is None or _verb_is_negated(normalized, verb.start()):
+    for start, end, truncated in _logical_windows(normalized):
+        verb = _first_shell_verb(normalized, start, end)
+        if verb is not None and _verb_is_negated(normalized, verb):
             continue
-        line_start = normalized.rfind("\n", 0, match.start()) + 1
-        fetch = _SHELL_FETCH_RE.search(normalized, line_start, match.start())
-        if fetch is not None and _verb_is_negated(normalized, fetch.start()):
-            continue
-        _remember_path(reported, path, absolute=path.start())
-    for fetch in _SHELL_FETCH_RE.finditer(normalized):
-        if _verb_is_negated(normalized, fetch.start()):
-            continue
-        line_end = normalized.find("\n", fetch.end())
-        if line_end == -1:
-            line_end = len(normalized)
-        line_end = min(line_end, fetch.start() + _SHELL_LINE_LIMIT)
-        for token in _SHELL_TOKEN_RE.finditer(normalized, fetch.end(), line_end):
-            path = _CRED_PATH_RE.search(token.group())
-            if path is None:
-                continue
-            if _plain_words(normalized[fetch.end() : token.start()]) > _SHELL_PLAIN_WORDS:
-                continue
-            _remember_path(reported, path, absolute=token.start() + path.start())
-            break
+        found = _pipeline_offset(normalized, start, end)
+        if found is not None:
+            reported.add(found)
+        reported.update(_substitution_offsets(normalized, start, end))
+        if truncated and _window_interesting(normalized, start, end):
+            reported.add(start)
     yield from sorted(reported)
 
 
