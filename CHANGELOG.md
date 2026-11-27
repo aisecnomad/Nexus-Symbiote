@@ -4,6 +4,10 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Security
+
+- **Tamper-evident runtime receipts & gateway descriptor poisoning gate:** Added `runtime_receipts.py` (`ReceiptChainSink`, `compute_merkle_root`, `verify_receipt_chain`, `sanitize_tool_output`) and `nexus-symbiote runtime verify-receipts` for `0600` RFC 8785 JCS hash-chained, optionally Ed25519-signed execution receipts with domain-separated SHA-256 Merkle commitments, and wired `ReferenceGateway` to reject poisoned or hidden-character tool descriptors (`descriptor-poisoned`).
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

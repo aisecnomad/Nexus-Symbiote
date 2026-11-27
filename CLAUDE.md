@@ -15,6 +15,7 @@ src/nexus_symbiote/
   utils/       — Confined `openat` reads (`confined.py`), Sigstore/Ed25519 verification (`crypto.py`), safe output writes (`files.py`), JSONC/model-header parsers, the CommonMark reader for `@path` imports (`markdown.py`), secret redaction, terminal neutralization
   runtime.py   — Signed, operation-bound authorization gateway (`canonical_arguments=True` by default)
   runtime_validation.py, runtime_cli.py — Isolated offline schema validation worker; `runtime` commands
+  runtime_receipts.py — Appends and verifies hash-chained gateway receipts and their Merkle root
   policy.py, operator_policy.py, policy_export.py, signature_policy.py — Caller-selected policy, signed operator policy, policy export, and operator signer policy
   settings_precedence.py               — IDE settings layer precedence and effective-policy resolution
   limits.py                            — Operator-controlled collection bounds (`--limit`, `NEXUS_SYMBIOTE_LIMITS`)

@@ -498,6 +498,7 @@ other code is permanent for the evidence presented.
 | `descriptor-too-large` | Served descriptor exceeds the supported JSON budget |
 | `descriptor-not-json` | Served descriptor is outside the canonical JSON domain |
 | `descriptor-changed` | Served descriptor changed since approval |
+| `descriptor-poisoned` | Served tool descriptor contains prompt-injection or poisoning patterns |
 | `isolation-unavailable` | The pinned launcher's process isolation is unavailable |
 | `isolation-teardown-failed` | The launcher's processes could not be confirmed ended |
 | `approval-required` | Operation requires a signed approval |
@@ -577,6 +578,25 @@ covers a whole tenant, so only keys without deployment, agent or tool
 restrictions count for it. When one gateway serves several tenants, give every
 key a `tenants` scope, or run one gateway configuration per tenant; otherwise any
 ring key can sign for any tenant.
+
+The optional `ReceiptChainSink` writes owner-only JSONL files on POSIX filesystems
+with advisory locking. Writers using the same file serialize appends and verify
+the existing chain on reopen or after another writer has appended. Each record
+retains the outcome, known reason, timestamp, contract digests, serials and
+signer key IDs. The writer replaces freeform request and identity labels with
+`[withheld]`. Store the completed batch root in an independently trusted location
+to detect a missing tail. Rotate to a new log before the next append would exceed
+64 MiB, 250,000 records or the 128 KiB per-line limit.
+
+`runtime verify-receipts` checks every complete v1 wire record against its
+RFC 8785 SHA-256 hash, sequence and previous hash. With `--public-key`, every
+receipt also needs a valid Ed25519 signature from the supplied ring. In the
+JSON result, `signed_count` and `presented_signers` describe signature envelopes.
+`verified_signature_count` and `signers` identify signatures authenticated by the
+supplied keys. Without keys the latter values are zero and an empty list.
+`--expected-merkle-root` checks the RFC 6962 batch commitment against the supplied
+checkpoint. The empty tree uses SHA-256 of the empty byte string. The chain's
+first previous hash is the all-zero genesis value.
 
 A `Decision` holds `admitted`, `reason` (`admitted` or the denial code), `time`,
 the call's `server_id`, `tool_name`, `action` and `resource`, the context fields,

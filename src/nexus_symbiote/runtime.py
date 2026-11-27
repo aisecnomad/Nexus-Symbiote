@@ -157,6 +157,7 @@ REASONS: dict[str, str] = {
     "descriptor-too-large": "served descriptor exceeds the supported JSON budget",
     "descriptor-not-json": "served descriptor is outside the canonical JSON domain",
     "descriptor-changed": "served descriptor changed since approval",
+    "descriptor-poisoned": "served tool descriptor contains prompt-injection or poisoning patterns",
     "approval-required": "operation requires a signed approval",
     "approver-revoked": "an approval signer is revoked",
     "approval-actor-unbound": "approval actor is not bound to its signing keys",
@@ -1611,6 +1612,35 @@ def _validate_rings(
         )
 
 
+def _descriptor_is_poisoned(definition: Mapping[str, Any]) -> bool:
+    """Check a served tool descriptor for hidden characters or text-poisoning directives.
+
+    Only high and critical hidden-text findings count: directional marks and line
+    separators are rated lower because ordinary right-to-left and pasted text holds them.
+    """
+    from nexus_symbiote.core.enums import RiskSeverity
+    from nexus_symbiote.scanners.prompt import definition_text_risks
+    from nexus_symbiote.text_poisoning import scan_text_block
+
+    if any(
+        risk.severity in (RiskSeverity.CRITICAL, RiskSeverity.HIGH)
+        for risk in definition_text_risks(definition, "served-tool", include_name=True)
+    ):
+        return True
+    pending: list[object] = [definition]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, Mapping):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, str) and item:
+            if scan_text_block(item, surface="served-tool", is_tool_surface=True):
+                return True
+    return False
+
+
 class ReferenceGateway(Generic[T]):
     """Authorize and execute one call through authenticated, operator-owned adapters."""
 
@@ -1632,8 +1662,9 @@ class ReferenceGateway(Generic[T]):
         trust_threshold: int = 1,
         signer_scopes: Mapping[str, SignerScope] | None = None,
         allow_shared_keys: bool = False,
-        on_decision: Callable[[Decision], None] | None = None,
+        on_decision: Callable[[Decision], object] | None = None,
         canonical_arguments: bool = True,
+        reject_poisoned_descriptors: bool = True,
     ) -> None:
         for threshold, keys in (
             (snapshot_threshold, snapshot_keys),
@@ -1681,6 +1712,7 @@ class ReferenceGateway(Generic[T]):
         self.allow_shared_keys = allow_shared_keys
         self.on_decision = on_decision
         self.canonical_arguments = canonical_arguments
+        self.reject_poisoned_descriptors = reject_poisoned_descriptors
 
     @staticmethod
     def registrar(
@@ -2034,6 +2066,11 @@ class ReferenceGateway(Generic[T]):
         if tool_definition_digest(definition) != grant.definition_digest:
             raise AuthorizationError(
                 "served descriptor changed since approval", reason="descriptor-changed"
+            )
+        if self.reject_poisoned_descriptors and _descriptor_is_poisoned(definition):
+            raise AuthorizationError(
+                "served tool descriptor contains prompt-injection or poisoning patterns",
+                reason="descriptor-poisoned",
             )
         consent: ActionApproval | None = None
         approval_signers: set[str] = set()
