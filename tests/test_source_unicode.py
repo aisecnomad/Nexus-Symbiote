@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -169,3 +170,36 @@ def test_identifier_analysis_uses_the_operator_syntax_budget(tmp_path: Path) -> 
             == 0
         )
     assert len(failures) == 1 and "syntax-bytes" in failures[0]
+
+
+def test_ordinary_source_alias_is_collected(tmp_path: Path) -> None:
+    (tmp_path / "impl.py").write_text("Δt = 1", encoding="utf-8")
+    (tmp_path / "app.py").symlink_to("impl.py")
+    server = _server("app.py")
+    assert apply_source_unicode_findings(AIBOM(components=[server]), tmp_path) == 1
+    assert server.risks[0].detail.startswith("app.py:1")
+
+
+def test_credential_store_target_is_an_explicit_coverage_exclusion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "sample.txt").write_text("ordinary fixture text", encoding="utf-8")
+    (tmp_path / "app.py").symlink_to("secrets/sample.txt")
+    observed = (tmp_path / "secrets" / "sample.txt").stat()
+    read = os.read
+
+    def check_before_read(fd: int, length: int) -> bytes:
+        opened = os.fstat(fd)
+        assert (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino)
+        return read(fd, length)
+
+    monkeypatch.setattr(os, "read", check_before_read)
+    exclusions: list[str] = []
+    server = _server("app.py")
+    assert (
+        apply_source_unicode_findings(AIBOM(components=[server]), tmp_path, exclusions=exclusions)
+        == 0
+    )
+    assert len(exclusions) == 1 and "not read" in exclusions[0]
+    assert not server.risks

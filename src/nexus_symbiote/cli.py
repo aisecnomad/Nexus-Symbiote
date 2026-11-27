@@ -1336,14 +1336,18 @@ def scan(
     if len(surfaces_excluded) > tp_exclusion_count:
         excluded_by["text_poisoning"] = surfaces_excluded[tp_exclusion_count:]
     unicode_failure_count = len(scan_failures)
+    unicode_exclusion_count = len(surfaces_excluded)
     apply_source_unicode_findings(
         aibom,
         root,
         exclude_paths=policy.scan.exclude_paths,
         failures=scan_failures,
+        exclusions=surfaces_excluded,
     )
     if len(scan_failures) > unicode_failure_count:
         failures_by["source_unicode"] = scan_failures[unicode_failure_count:]
+    if len(surfaces_excluded) > unicode_exclusion_count:
+        excluded_by["source_unicode"] = surfaces_excluded[unicode_exclusion_count:]
     graph_failures = validate_graph(aibom)
     scan_failures.extend(graph_failures)
     if graph_failures:

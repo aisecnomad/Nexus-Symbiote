@@ -16,7 +16,7 @@ import math
 import os
 import stat
 import unicodedata
-from collections.abc import Collection, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, NoReturn, Self, cast
@@ -995,6 +995,7 @@ class ConfinedCollection:
         *,
         missing_ok: bool = False,
         variants_read: Collection[str] = (),
+        target_gap: Callable[[str, str], str | None] | None = None,
         report_coexisting_variants: bool = True,
     ) -> bytes | None:
         """Read a confined regular file, through at most one in-root symlink.
@@ -1008,6 +1009,8 @@ class ConfinedCollection:
         it in ``variants_read`` (or defers coexisting-variant reporting via
         ``report_coexisting_variants=False`` to report every un-inventoried variant
         after walking the tree): case-insensitive file systems collide on both.
+        When supplied, ``target_gap`` checks the requested and opened root-relative
+        paths before reading the descriptor. A refusal records a coverage exclusion.
         """
         relative: Path | str = str(path)
         try:
@@ -1018,6 +1021,11 @@ class ConfinedCollection:
                 raise CollectionError("expected a regular file")
             fd, opened = self._open_file(relative)
             try:
+                if target_gap is not None:
+                    reason = target_gap(relative.as_posix(), opened.as_posix())
+                    if reason is not None:
+                        self._exclusion_log.add(f"{relative}: {reason}; not read or inventoried")
+                        return None
                 before = stat_input_file(fd)
                 if not stat.S_ISREG(before.st_mode):
                     raise CollectionError("not a regular file")

@@ -438,10 +438,16 @@ class CompletenessValidator:
         for reason in text_failures:
             incomplete("text_poisoning", f"Local collection incomplete: {reason}")
         unicode_failures: list[str] = []
+        unicode_exclusions: list[str] = []
         apply_source_unicode_findings(
-            expected, root, exclude_paths=exclude_paths, failures=unicode_failures
+            expected,
+            root,
+            exclude_paths=exclude_paths,
+            failures=unicode_failures,
+            exclusions=unicode_exclusions,
         )
-        for reason in unicode_failures:
+        excluded.extend(unicode_exclusions)
+        for reason in (*unicode_failures, *unicode_exclusions):
             incomplete("source_unicode", f"Local collection incomplete: {reason}")
         coverage = self._local_coverage(
             report_digest,

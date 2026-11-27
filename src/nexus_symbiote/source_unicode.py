@@ -19,7 +19,7 @@ from nexus_symbiote.core.collection import is_imported
 from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.identifiers import mixed_scripts
 from nexus_symbiote.core.models import AnyComponent, RiskAssessment
-from nexus_symbiote.scanners.credential_files import credential_shaped
+from nexus_symbiote.scanners.credential_files import credential_gap, credential_shaped
 from nexus_symbiote.scanners.prompt import detect_invisible_characters
 from nexus_symbiote.scanners.ts_tools import SCRIPT_SUFFIXES, typescript_identifiers
 from nexus_symbiote.utils.confined import ConfinedCollection
@@ -99,7 +99,7 @@ def apply_source_unicode_findings(
         for rel_path in sorted(owners):
             if files.excluded(rel_path) or files.is_directory(rel_path):
                 continue
-            raw = files.read_bytes(rel_path, missing_ok=True)
+            raw = files.read_bytes(rel_path, missing_ok=True, target_gap=credential_gap)
             if raw is None:
                 continue
             try:
