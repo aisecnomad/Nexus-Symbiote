@@ -37,6 +37,7 @@ from nexus_symbiote.scanners.source_python_tables import (
     MODEL_KEYWORDS,
     POSITIONAL_MODELS,
     REPO_ID_CLASSES,
+    ROUTERS,
     WEIGHT_CLASSES,
     WEIGHT_ROOTS,
 )
@@ -1026,6 +1027,7 @@ class PythonReader:
             return
         self._unread.update((value.lineno, value.col_offset) for value in unread)
         weights = origin is not None and _loads_weights(origin)
+        routes = origin is not None and any(_under(base, router) for router in ROUTERS)
         flags = [keywords.get("trust_remote_code")]
         for options in (keywords.get("model_kwargs"), keywords.get("config_kwargs")):
             if isinstance(options, ast.Dict):
@@ -1040,11 +1042,11 @@ class PythonReader:
         )
         for expression, embeds in found:
             self._model_references(
-                module, expression, embedding=embeds, weights=weights, remote=remote
+                module, expression, embedding=embeds, routes=routes, remote=remote
             )
 
     def _model_references(
-        self, module: Module, expression: ast.expr, *, embedding: bool, weights: bool, remote: bool
+        self, module: Module, expression: ast.expr, *, embedding: bool, routes: bool, remote: bool
     ) -> None:
         """Record each identifier a model argument can hold, and account for what else
         it can hold."""
@@ -1068,7 +1070,7 @@ class PythonReader:
                     point[0],
                     method=METHOD,
                     embedding=embedding,
-                    weights=weights,
+                    routes=routes,
                     remote_code=remote,
                     environment=variables,
                 )

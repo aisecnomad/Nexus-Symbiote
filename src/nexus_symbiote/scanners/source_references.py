@@ -81,7 +81,7 @@ _HUB_OWNED: dict[str, re.Pattern[str]] = {
     ),
 }
 # Providers that serve a model from weights on the machine, so no hosted service is named.
-LOCAL_PROVIDERS = frozenset({"huggingface", "ollama"})
+LOCAL_PROVIDERS = frozenset({"ollama"})
 
 
 def unchanged_by_redaction(text: str) -> bool:
@@ -114,15 +114,10 @@ def placeholder(text: str) -> bool:
     return not text or text.lower() in _NOT_A_MODEL or local and not _ABSOLUTE.match(text)
 
 
-def split_route(literal: str, *, weights: bool = False) -> tuple[str, str | None]:
-    """The model identifier and the provider a routing prefix on ``literal`` names.
-
+def split_route(literal: str) -> tuple[str, str | None]:
+    """The model identifier and the provider a routing prefix on ``literal`` names:
     ``openai/gpt-4o`` and ``anthropic:claude-sonnet-4-5`` are a route and an
-    identifier. An identifier read by a library that loads weights, which
-    ``weights`` says, is never split: there the part before the slash is the owner.
-    """
-    if weights:
-        return literal, None
+    identifier. Only a call that routes by prefix reads it so."""
     for separator in ("/", ":"):
         prefix, found, rest = literal.partition(separator)
         if not found or not rest:
@@ -154,15 +149,16 @@ def environment_name(name: object) -> str | None:
     return None
 
 
-def model_ref(name: str) -> str:
-    return f"model:source:{quote(name, safe='._:@+-')}"
+def model_ref(name: str, provider: str | None = None) -> str:
+    # One name routed to two providers may be two models, as an opaque deployment is.
+    qualifier = f"?provider={quote(provider, safe='-')}" if provider else ""
+    return f"model:source:{quote(name, safe='._:@+-')}{qualifier}"
 
 
 @dataclass
 class _Model:
     name: str
     locations: set[tuple[str, int]] = field(default_factory=set)
-    providers: set[str] = field(default_factory=set)
     kinds: set[str] = field(default_factory=set)
     aliases: set[str] = field(default_factory=set)
     environment: set[str] = field(default_factory=set)
@@ -185,12 +181,12 @@ class Declarations:
 
     def __init__(self, result: ScanResult) -> None:
         self.result = result
-        self._models: dict[str, _Model] = {}
+        self._models: dict[tuple[str, str | None], _Model] = {}
         self._written: dict[str, str | None] = {}
         self._gaps: set[str] = set()
         self._full = False
         self._path = ""
-        self._lines: set[tuple[str, int]] = set()
+        self._lines: set[tuple[tuple[str, str | None], int]] = set()
         # Where each file first reads a variable that alone sets a model, with no value.
         self.unresolved_environment: dict[tuple[str, str], int] = {}
 
@@ -208,14 +204,14 @@ class Declarations:
         *,
         method: str,
         embedding: bool = False,
-        weights: bool = False,
+        routes: bool = False,
         remote_code: bool = False,
         environment: Iterable[str] = (),
     ) -> str | None:
         """Record one reference to a model and return its component reference.
 
-        A provider is recorded when a routing prefix on the identifier names it; an
-        identifier a library that loads weights reads is never split.
+        ``routes`` says the call routes by a prefix on the identifier, which then names
+        the provider; the model is one component for each provider it is routed to.
         ``remote_code`` says the call that loads it lets the model run its own code, and
         ``environment`` names the variables that, when set, give a model in its place."""
         if not isinstance(literal, str):
@@ -228,8 +224,9 @@ class Declarations:
         written = self._written[literal]
         if written is None:
             return None
-        name, routed = split_route(written, weights=weights)
-        record = self._models.get(name)
+        name, routed = split_route(written) if routes else (written, None)
+        key = (name, routed)
+        record = self._models.get(key)
         if record is None:
             if len(self._models) >= MAX_RECORDS:
                 if not self._full:
@@ -239,19 +236,17 @@ class Declarations:
                         "recorded"
                     )
                 return None
-            record = self._models[name] = _Model(name)
+            record = self._models[key] = _Model(name)
         if path != self._path:
             self._path, self._lines = path, set()
-        if (name, line) not in self._lines:
+        if (key, line) not in self._lines:
             # A place repeats only within its file, which is read whole before the next.
-            self._lines.add((name, line))
+            self._lines.add((key, line))
             record.count += 1
             record.locations.add((path, line))
             if len(record.locations) > MAX_EVIDENCE_LOCATIONS:
                 record.locations.discard(max(record.locations))
         record.methods.add(method)
-        if routed:
-            record.providers.add(routed)
         kind = model_kind(name, embedding=embedding)
         if kind:
             record.kinds.add(kind)
@@ -259,7 +254,7 @@ class Declarations:
             record.aliases.add(written)
         record.remote_code = record.remote_code or remote_code
         record.environment.update(filter(environment_name, environment))
-        return model_ref(name)
+        return model_ref(name, routed)
 
     def close(self) -> None:
         """Name each model that only an environment variable sets, once for each file that
@@ -269,8 +264,8 @@ class Declarations:
 
     def components(self) -> list[AnyComponent]:
         built: list[AnyComponent] = []
-        for name in sorted(self._models):
-            model = self._models[name]
+        for name, provider in sorted(self._models, key=lambda key: (key[0], key[1] or "")):
+            model = self._models[(name, provider)]
             listed = _evidence(model.locations)
             first = min(model.locations)
             method = sorted(model.methods)[0]
@@ -284,17 +279,14 @@ class Declarations:
                 properties["references_unlisted"] = model.count - MAX_EVIDENCE_LOCATIONS
             if model.environment:
                 properties["environment_variables"] = sorted(model.environment)
-            if len(model.providers) > 1:
-                properties["providers"] = sorted(model.providers)
             if len(model.aliases) > 1:
                 properties["requested_aliases"] = sorted(model.aliases)
-            provider = next(iter(model.providers)) if len(model.providers) == 1 else None
             kind = "fine-tuned" if "fine-tuned" in model.kinds else min(model.kinds, default=None)
             if kind is None and provider is not None and provider not in LOCAL_PROVIDERS:
                 kind = "hosted"
             built.append(
                 ModelComponent(
-                    bom_ref=model_ref(name),
+                    bom_ref=model_ref(name, provider),
                     name=name,
                     model_type=kind,
                     provider=provider,

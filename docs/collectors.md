@@ -58,11 +58,14 @@ Each model identifier becomes one `model` component for the project at `declared
 assurance. Its `source_reference` claim names the file and the line of the argument,
 up to 16 places, and `references_unlisted` counts the rest. The environment variables
 that may give a model in place of a value read are listed in `environment_variables`.
-A routing prefix is read off the identifier: `anthropic/claude-sonnet-4-5` is the model
-`claude-sonnet-4-5` with provider `anthropic`, and the text as written is kept in
-`requested_alias`. An identifier a library that loads weights reads, such as
-`openai/whisper-large-v3`, is a hub owner and a name, never a route. No other provider
-is recorded.
+Where the call routes by a prefix on the identifier (LiteLLM, PydanticAI, LangChain's
+`init_chat_model`, CrewAI, DSPy, smolagents), the prefix names the provider:
+`anthropic/claude-sonnet-4-5` is the model `claude-sonnet-4-5` with provider
+`anthropic`, and the text as written is kept in `requested_alias`. Elsewhere an
+identifier is kept as written, as Replicate's `owner/name` or a gateway's name through
+the OpenAI SDK is. A name routed to two providers is two components, since an opaque
+name such as an Azure deployment may name different models at each. A provider other
+than one that serves local weights (`ollama`) makes the model `hosted`.
 A call that may let the model run its own code, through any `trust_remote_code` but a
 false literal, records it. A relative path or a weight file names a file in the
 project, which the model collector reads.

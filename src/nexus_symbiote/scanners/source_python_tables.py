@@ -65,6 +65,13 @@ MODEL_CALLS = frozenset(
         "transcriptions", "with_options", "with_structured_output",
     }
 )  # fmt: skip
+# Callables that route by a prefix on the identifier, as LiteLLM reads ``anthropic/``. A
+# native owner/name, as Replicate and model hubs read it, and an OpenAI-compatible
+# gateway's names are no routes.
+ROUTERS = (
+    "crewai", "dspy", "langchain.chat_models", "langchain.embeddings", "litellm", "pydantic_ai",
+    "smolagents",
+)  # fmt: skip
 # Libraries that load weights by an owner/name identifier, which is never a route.
 WEIGHT_ROOTS = ("huggingface_hub", "langchain_huggingface", "sentence_transformers", "transformers")
 WEIGHT_CLASSES = frozenset(

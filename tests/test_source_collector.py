@@ -1388,7 +1388,7 @@ def test_each_file_is_read_as_it_is_given_and_only_the_first_places_are_kept(tmp
     (model,) = found.components()
     assert model.properties["references_unlisted"] == 80 - 16
     assert len(model.claims["source_reference"].evidence_refs) == 16
-    assert len(found._models["gpt-4o"].locations) == 16
+    assert len(found._models[("gpt-4o", None)].locations) == 16
 
 
 def test_a_reference_another_collector_contradicts_is_not_vouched_for(
@@ -1403,7 +1403,7 @@ def test_a_reference_another_collector_contradicts_is_not_vouched_for(
     )
     (root / "weights.pkl").write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
     # The two collectors name different subjects by one reference.
-    monkeypatch.setattr(source_references, "model_ref", lambda name: "model:weights.pkl")
+    monkeypatch.setattr(source_references, "model_ref", lambda *_: "model:weights.pkl")
     report = CompletenessValidator().validate_against_project(AIBOM(components=[]), root)
     assert any(
         "Conflicting local reference: model:weights.pkl" in i.description for i in report.issues
@@ -2430,27 +2430,56 @@ def test_a_routed_identifier_keeps_the_text_as_written(tmp_path: Path):
     result = scan(
         tmp_path,
         {
-            "a.py": 'import litellm\nlitellm.completion(model="anthropic/claude-sonnet-4-5")\n',
+            "a.py": "import litellm\n"
+            + 'litellm.completion(model="anthropic/claude-sonnet-4-5")\n'
+            + 'litellm.completion(model="anthropic:claude-sonnet-4-5")\n',
             "b.py": 'import litellm\nlitellm.completion(model="bedrock/claude-sonnet-4-5")\n'
-            'litellm.completion(model="ollama/llama3.2")\n',
+            + 'litellm.completion(model="ollama/llama3.2")\n'
+            + 'litellm.completion(model="huggingface/meta-llama/Llama-3.3-70B-Instruct")\n',
         },
     )
-    found = models(result)
-    sonnet = found["claude-sonnet-4-5"]
-    assert sonnet.provider is None and sonnet.model_type is None
-    assert sonnet.properties["providers"] == ["anthropic", "aws-bedrock"]
-    assert sonnet.properties["requested_aliases"] == [
+    found = {(c.name, c.provider): c for c in result.components}
+    # Routed to two providers, one name is two models until something says they are one.
+    anthropic = found[("claude-sonnet-4-5", "anthropic")]
+    bedrock = found[("claude-sonnet-4-5", "aws-bedrock")]
+    assert anthropic.bom_ref == "model:source:claude-sonnet-4-5?provider=anthropic"
+    assert anthropic.model_type == bedrock.model_type == "hosted"
+    assert anthropic.properties["requested_aliases"] == [
         "anthropic/claude-sonnet-4-5",
-        "bedrock/claude-sonnet-4-5",
+        "anthropic:claude-sonnet-4-5",
     ]
-    assert sonnet.claims["source_reference"].evidence_refs == ["a.py:2", "b.py:2"]
-    local = found["llama3.2"]
-    # A runtime that serves weights on the machine is no hosted service.
-    assert (local.provider, local.model_type, local.requested_alias) == (
-        "ollama",
-        None,
-        "ollama/llama3.2",
+    assert bedrock.requested_alias == "bedrock/claude-sonnet-4-5"
+    # A runtime that serves weights on the machine is no hosted service; Hugging Face's
+    # route through LiteLLM is its hosted inference service.
+    local = found[("llama3.2", "ollama")]
+    assert (local.model_type, local.requested_alias) == (None, "ollama/llama3.2")
+    assert found[("meta-llama/Llama-3.3-70B-Instruct", "huggingface")].model_type == "hosted"
+
+
+def test_a_prefix_is_a_route_only_where_the_call_routes_by_it(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import litellm\nimport replicate\nfrom openai import OpenAI\n\n"
+            + 'replicate.run("openai/gpt-4o-mini", input={})\n'
+            + 'litellm.completion(model="openai/gpt-4o-mini")\n'
+            + 'OpenAI(base_url="https://gateway.example/v1").chat.completions.create(\n'
+            + '    model="anthropic/claude-3.5-sonnet", messages=[]\n)\n'
+            + 'litellm.completion(model="azure/prod-chat")\n'
+            + 'litellm.completion(model="ollama/prod-chat")\n'
+        },
     )
+    found = {(c.name, c.provider): c.bom_ref for c in result.components}
+    # Replicate's own owner/name and a gateway's name through the OpenAI SDK are kept as
+    # written; LiteLLM's prefix names the provider. An opaque deployment name at two
+    # providers is two models.
+    assert found == {
+        ("openai/gpt-4o-mini", None): "model:source:openai%2Fgpt-4o-mini",
+        ("gpt-4o-mini", "openai"): "model:source:gpt-4o-mini?provider=openai",
+        ("anthropic/claude-3.5-sonnet", None): "model:source:anthropic%2Fclaude-3.5-sonnet",
+        ("prod-chat", "azure-openai"): "model:source:prod-chat?provider=azure-openai",
+        ("prod-chat", "ollama"): "model:source:prod-chat?provider=ollama",
+    }
 
 
 def test_positional_models_of_common_entry_points_are_read(tmp_path: Path):
@@ -2468,26 +2497,24 @@ def test_positional_models_of_common_entry_points_are_read(tmp_path: Path):
 
 
 @pytest.mark.parametrize(
-    ("literal", "weights", "expected"),
+    ("literal", "expected"),
     [
-        ("openai/gpt-4o", False, ("gpt-4o", "openai")),
-        ("anthropic:claude-sonnet-4-5", False, ("claude-sonnet-4-5", "anthropic")),
+        ("openai/gpt-4o", ("gpt-4o", "openai")),
+        ("anthropic:claude-sonnet-4-5", ("claude-sonnet-4-5", "anthropic")),
         (
             "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
-            False,
             ("anthropic.claude-3-haiku-20240307-v1:0", "aws-bedrock"),
         ),
-        ("llama3.1:8b", False, ("llama3.1:8b", None)),
-        ("openai/", False, ("openai/", None)),
-        ("openai/x", False, ("openai/x", None)),
-        ("openai/whisper-large-v3", False, ("openai/whisper-large-v3", None)),
-        ("openai/gpt-4o", True, ("openai/gpt-4o", None)),
-        ("mistralai/Mistral-7B-Instruct-v0.3", False, ("mistralai/Mistral-7B-Instruct-v0.3", None)),
-        ("mistralai:mistral-large-latest", False, ("mistral-large-latest", "mistral")),
-        ("meta-llama/Llama-3.3-70B-Instruct", False, ("meta-llama/Llama-3.3-70B-Instruct", None)),
+        ("llama3.1:8b", ("llama3.1:8b", None)),
+        ("openai/", ("openai/", None)),
+        ("openai/x", ("openai/x", None)),
+        ("openai/whisper-large-v3", ("openai/whisper-large-v3", None)),
+        ("mistralai/Mistral-7B-Instruct-v0.3", ("mistralai/Mistral-7B-Instruct-v0.3", None)),
+        ("mistralai:mistral-large-latest", ("mistral-large-latest", "mistral")),
+        ("meta-llama/Llama-3.3-70B-Instruct", ("meta-llama/Llama-3.3-70B-Instruct", None)),
     ],
 )
 def test_a_routing_prefix_is_split_from_the_identifier(
-    literal: str, weights: bool, expected: tuple[str, str | None]
+    literal: str, expected: tuple[str, str | None]
 ):
-    assert split_route(literal, weights=weights) == expected
+    assert split_route(literal) == expected
