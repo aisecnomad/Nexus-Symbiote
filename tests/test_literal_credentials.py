@@ -362,3 +362,30 @@ def test_credential_store_target_is_an_explicit_coverage_exclusion(
     )
     assert len(exclusions) == 1 and "not read" in exclusions[0]
     assert not server.risks
+
+
+def test_prefix_documentation_does_not_join_words_into_a_token(tmp_path: Path) -> None:
+    (tmp_path / "SKILL.md").write_text(
+        "The ghp_ prefix identifies personal access tokens used by developers.\n"
+        "The sk-proj- prefix identifies project keys in this documentation.\n"
+        "The sk-ant-api03- prefix identifies Anthropic credentials in this documentation.\n"
+    )
+    skill = PromptComponent(bom_ref="skill:guide", name="guide", source_path="SKILL.md")
+    assert apply_literal_credential_findings(AIBOM(components=[skill]), tmp_path) == 0
+
+
+def test_only_the_final_word_can_cross_the_continuation_boundary() -> None:
+    from nexus_symbiote.literal_credentials import _cut_off_token
+
+    assert not _cut_off_token("Prefix glossary: ghp_ and sk-proj- are examples.")
+    assert _cut_off_token("Prefix glossary: ghp_ and sk-proj-")
+
+
+def test_a_long_next_line_is_inspected_as_a_separate_window() -> None:
+    from nexus_symbiote.literal_credentials import _JOIN_CHARS, _literal_windows
+
+    long_line = "a" * _JOIN_CHARS
+    windows = list(_literal_windows('description = "first\n' + long_line))
+    assert [window[0] for window in windows] == [1, 2]
+    assert windows[0][3]
+    assert windows[1][1] == long_line
