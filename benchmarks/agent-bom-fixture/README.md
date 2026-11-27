@@ -31,8 +31,10 @@ python benchmarks/agent-bom-fixture/build_fixture.py --out /tmp/agent-bom-fixtur
 nexus-symbiote scan /tmp/agent-bom-fixture --no-project-policy --accept-default-excludes --report-only -o bom.json
 ```
 
-The output directory must not exist or must be empty; a path that would leave it, a
-digest mismatch, an unknown encoding or an oversized file stops the build.
+The output directory must not exist. The builder creates it with mode 0700 and writes every
+directory and file relative to descriptors it opened, without following symbolic links or
+replacing an existing entry. A path that would leave it, a digest mismatch, an unknown
+encoding or an oversized file stops the build before anything is written.
 
 ## What the test checks
 
@@ -40,5 +42,6 @@ digest mismatch, an unknown encoding or an oversized file stops the build.
 format (native, CycloneDX, SARIF) and applies the benchmark's rule: an item or decoy is
 found when one of its identifiers appears in any string of the exports. It asserts that no
 decoy is reported, that MCP servers (17 of 17), prompts (12 of 13), skills (3 of 3) and
-frameworks (10 of 10) stay at the level `main` collects today, and that no sentinel reaches
-an export. Raise a floor when a collector improves; lowering one is a regression to explain.
+frameworks (10 of 10) stay at the level `main` collects today, that the scan records no
+hard collection failure and no coverage gap beyond the one known limitation (an MCP server
+launched from application code), and that no sentinel reaches an export. Raise a floor when a collector improves; lowering one is a regression to explain.

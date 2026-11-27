@@ -26,6 +26,10 @@ BENCH = ROOT / "benchmarks" / "agent-bom-fixture"
 SENTINELS = tuple(f"SYMBIOTE_PUBLIC_SYNTHETIC_SECRET_SENTINEL_0{n}" for n in (1, 2, 3))
 # Categories main collects completely or nearly so; a regression in any of them fails.
 FLOORS = {"mcp_server": 17, "prompt": 12, "skill": 3, "framework": 10}
+# The one coverage gap main records today, a known limitation; any other gap is new.
+KNOWN_GAPS = {
+    "acme_agents/billing.py: MCP server launched from application code; launcher not inventoried"
+}
 
 
 def _builder() -> Any:
@@ -58,9 +62,18 @@ def fixture_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="module")
-def exports(fixture_root: Path, tmp_path_factory: pytest.TempPathFactory) -> str:
+def native(fixture_root: Path, exports: str) -> dict[str, Any]:
+    document: dict[str, Any] = json.loads(
+        (fixture_root.parent / "exports" / "bom.json").read_text(encoding="utf-8")
+    )
+    return document
+
+
+@pytest.fixture(scope="module")
+def exports(fixture_root: Path) -> str:
     """Every string of the native, CycloneDX and SARIF exports, lowercased and joined."""
-    out = tmp_path_factory.mktemp("agent-bom-exports")
+    out = fixture_root.parent / "exports"
+    out.mkdir()
     texts: list[str] = []
     for fmt in ("json", "cyclonedx", "sarif"):
         target = out / f"bom.{fmt}"
@@ -78,6 +91,8 @@ def exports(fixture_root: Path, tmp_path_factory: pytest.TempPathFactory) -> str
                 str(target),
             ],
         )
+        # --report-only keeps the exit at 0 so every export is written; the hard-failure
+        # check is test_collection_has_no_hard_failure_and_only_the_known_gap.
         assert result.exit_code == 0, result.output
         texts.extend(_strings(json.loads(target.read_text(encoding="utf-8"))))
     return "\n".join(texts).lower()
@@ -132,11 +147,18 @@ def test_the_builder_refuses_a_digest_mismatch_and_a_non_empty_output(tmp_path: 
     )
     with pytest.raises(builder.CorpusError, match="SHA-256"):
         builder.build(tmp_path / "out", corpus)
-    occupied = tmp_path / "occupied"
-    occupied.mkdir()
-    (occupied / "keep.txt").write_text("keep")
-    with pytest.raises(builder.CorpusError, match="not an empty directory"):
-        builder.build(occupied)
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    with pytest.raises(builder.CorpusError, match="already exists"):
+        builder.build(existing)
+
+
+def test_the_builder_writes_only_into_the_directory_it_creates(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    _builder().build(out)
+    assert out.stat().st_mode & 0o777 == 0o700
+    assert all(not path.is_symlink() for path in out.rglob("*"))
+    assert (out / ".claude/skills/deploy-helper/scripts/deploy.sh").stat().st_mode & 0o777 == 0o755
 
 
 def test_no_decoy_is_reported(exports: str, ground_truth: dict[str, Any]) -> None:
@@ -151,6 +173,12 @@ def test_discovery_holds_its_floor(
     items = [item for item in ground_truth["items"] if item["category"] == category]
     missing = [item["id"] for item in items if not _found(item, exports)]
     assert len(items) - len(missing) >= floor, missing
+
+
+def test_collection_has_no_hard_failure_and_only_the_known_gap(native: dict[str, Any]) -> None:
+    claim = native["metadata"]["completeness"]
+    assert claim["scan_failures"] == []
+    assert set(claim["surfaces_excluded"]) == KNOWN_GAPS
 
 
 def test_no_planted_secret_value_reaches_an_export(exports: str) -> None:

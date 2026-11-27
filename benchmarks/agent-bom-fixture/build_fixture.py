@@ -9,8 +9,11 @@ an editor would treat as live configuration.
 
     python benchmarks/agent-bom-fixture/build_fixture.py --out /tmp/agent-bom-fixture
 
-The output directory must not exist or must be empty. Every file is checked against the
-SHA-256 the corpus records before the command succeeds, so the same corpus always produces
+The output directory must not exist: the builder creates it with mode 0700 and writes
+every directory and file relative to descriptors it opened itself, without following
+symbolic links and without replacing an existing entry, so a path cannot leave it even if
+another process changes the tree while it runs. Every file is checked against the SHA-256
+the corpus records before anything is written, so the same corpus always produces
 byte-identical files. Nothing is executed: the pickle is an inert dictionary and every
 credential is a public synthetic sentinel.
 """
@@ -21,6 +24,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path, PurePosixPath
 
@@ -80,26 +84,60 @@ def load(corpus: Path = CORPUS) -> list[tuple[PurePosixPath, bytes, int]]:
     return entries
 
 
+_DIRECTORY = (
+    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+)
+_FILE = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _subdirectory(parent: int, name: str, opened: dict[tuple[int, str], int]) -> int:
+    """The descriptor of ``name`` under ``parent``, created if absent, never a symlink."""
+    key = (parent, name)
+    if key not in opened:
+        try:
+            os.mkdir(name, 0o755, dir_fd=parent)
+        except FileExistsError:
+            pass
+        opened[key] = os.open(name, _DIRECTORY, dir_fd=parent)
+    return opened[key]
+
+
 def build(out: Path, corpus: Path = CORPUS) -> list[PurePosixPath]:
-    """Write the corpus under ``out`` and return the relative paths written."""
+    """Write the corpus under a new directory ``out`` and return the relative paths written."""
     entries = load(corpus)
-    if out.exists() and (not out.is_dir() or any(out.iterdir())):
-        raise CorpusError(f"{out} exists and is not an empty directory")
-    out.mkdir(parents=True, exist_ok=True)
-    root = out.resolve()
-    for relative, data, mode in entries:
-        target = root.joinpath(*relative.parts)
-        if not target.resolve().is_relative_to(root):
-            raise CorpusError(f"{relative}: resolves outside the output directory")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        target.chmod(mode)
+    if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
+        raise CorpusError("this platform cannot write without following symbolic links")
+    try:
+        out.mkdir(mode=0o700)
+    except FileExistsError:
+        raise CorpusError(f"{out} already exists; give a new output directory") from None
+    root = os.open(out, _DIRECTORY)
+    opened: dict[tuple[int, str], int] = {}
+    try:
+        for relative, data, mode in entries:
+            parent = root
+            for name in relative.parts[:-1]:
+                parent = _subdirectory(parent, name, opened)
+            handle = os.open(relative.parts[-1], _FILE, mode, dir_fd=parent)
+            with os.fdopen(handle, "wb") as stream:
+                stream.write(data)
+            os.chmod(relative.parts[-1], mode, dir_fd=parent, follow_symlinks=False)
+    finally:
+        for descriptor in opened.values():
+            os.close(descriptor)
+        os.close(root)
     return [relative for relative, _, _ in entries]
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", type=Path, required=True, help="empty or new output directory")
+    parser.add_argument("--out", type=Path, required=True, help="new output directory")
     args = parser.parse_args(argv)
     try:
         written = build(args.out)
