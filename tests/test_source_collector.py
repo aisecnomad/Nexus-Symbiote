@@ -1415,6 +1415,7 @@ def test_a_relative_import_past_the_top_package_binds_nothing(tmp_path: Path):
             False,
         ),
         ("hf.co/mradermacher/deepseekcoderinstructgguf:Q8_0", True, False),
+        ("openai:q2w3e4r5t6y7u8i9o0p1a2s3d4f5g6h7j8k9l0zx", False, True),
     ],
     ids=[
         "drive",
@@ -1444,6 +1445,7 @@ def test_a_relative_import_past_the_top_package_binds_nothing(tmp_path: Path):
         "base64-starting-a-name",
         "lowercase-resource-path",
         "lowercase-run-before-a-capital-tag",
+        "lowercase-base64-after-a-route",
     ],
 )
 def test_a_path_or_a_key_is_never_a_model_and_a_project_file_is_no_gap(
