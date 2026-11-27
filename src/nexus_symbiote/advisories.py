@@ -49,8 +49,9 @@ PUBLIC_REGISTRY_ORIGINS = {
 }
 SCOPE = (
     "exact pkg:pypi and pkg:npm package URLs on registry entries and MCP servers; the "
-    "registry collector records only AI-related packages, so ordinary dependencies are "
-    "not in a scanned inventory; other ecosystems are skipped; operator exclusions are "
+    "registry collector reads supported root declarations, filtered by the AI catalog "
+    "unless --all-packages was selected. Lockfile-only dependencies are outside registry "
+    "collection. Other ecosystems are skipped; operator exclusions are "
     "not queried; installed artifacts are unverified and OSV knowledge is incomplete"
 )
 

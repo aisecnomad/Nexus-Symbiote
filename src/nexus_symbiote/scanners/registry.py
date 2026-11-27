@@ -1393,7 +1393,8 @@ class RegistryScanner(Scanner):
             result.components.extend(pypi)
             result.components.extend(self._scan_docker(result))
         if not result.components and not result.scan_failures and not result.surfaces_excluded:
-            result.surfaces_scanned.append("registry (no AI-related dependencies found)")
+            scope = "supported" if self.inventory_all_packages else "AI-related"
+            result.surfaces_scanned.append(f"registry (no {scope} dependencies found)")
         return result
 
     def _confined(self) -> ConfinedCollection:
@@ -4808,7 +4809,7 @@ class RegistryScanner(Scanner):
         components: list[RegistryEntryComponent] = []
         noted: set[str] = set()
         for raw, files in found.items():
-            if not (is_ai_image(raw) or raw in models):
+            if not (self.inventory_all_packages or is_ai_image(raw) or raw in models):
                 continue
             component = self._image_component(raw, files, raw in unresolved, raw in models)
             if component is None:
@@ -5031,7 +5032,8 @@ class RegistryScanner(Scanner):
                 gaps.append("FROM instruction not parsed")
                 continue
             image, rest = words[start], words[start + 1 :]
-            if image.lower() not in stages:
+            # BuildKit's bare scratch base is an empty filesystem and has no registry image.
+            if image != "scratch" and image.lower() not in stages:
                 if "$" in image:
                     gaps.append("FROM image substitution not resolved")
                 if any(c in image for c in "\"'\\"):
@@ -5459,13 +5461,10 @@ class _ComposeWalk:
 
 
 class AllPackagesRegistryScanner(RegistryScanner):
-    """The registry collector with every declared or locked package in scope.
+    """Inventory supported root PyPI, npm and image declarations without the AI catalog filter.
 
-    ``scan --all-packages`` inventories every PyPI and npm package and every base image,
-    not only the AI catalog, so that an offline advisory match covers the whole dependency
-    set an agent process loads. The catalog predicate is unchanged: each PyPI or npm entry
-    records whether it is in the AI catalog under ``properties.ai_catalog``, which also
-    tells project reconciliation to recollect with this scope.
+    Lockfiles resolve declared packages. Transitive lockfile-only entries stay outside
+    registry collection. Each PyPI and npm entry records its AI catalog membership.
     """
 
     inventory_all_packages = True

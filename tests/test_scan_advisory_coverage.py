@@ -57,6 +57,50 @@ def _receipt(document: dict, field: str) -> dict:
     return json.loads(receipt.removeprefix(ADVISORY_SURFACE_PREFIX))
 
 
+def test_receipt_scopes_complete_coverage_to_inventoried_packages(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    manifest = {"name": "project", "dependencies": {"direct-package": "1.0.0"}}
+    (project / "package.json").write_text(json.dumps(manifest))
+    lock = {
+        "lockfileVersion": 3,
+        "packages": {
+            "": manifest,
+            "node_modules/direct-package": {
+                "version": "1.0.0",
+                "dependencies": {"transitive-package": "2.0.0"},
+            },
+            "node_modules/transitive-package": {"version": "2.0.0"},
+        },
+    }
+    (project / "package-lock.json").write_text(json.dumps(lock))
+    feed = tmp_path / "advisory.json"
+    feed.write_text(
+        json.dumps(
+            {
+                "id": "SYNTHETIC-NPM-1",
+                "modified": datetime.now(UTC).isoformat(),
+                "affected": [
+                    {"package": {"ecosystem": "npm", "name": name}, "versions": [version]}
+                    for name, version in (
+                        ("direct-package", "1.0.0"),
+                        ("transitive-package", "2.0.0"),
+                    )
+                ],
+            }
+        )
+    )
+    native = _scan(project, feed, tmp_path / "inventory.json")
+    packages = [entry for entry in native["components"] if entry.get("registry_type") == "npm"]
+    assert [package["name"] for package in packages] == ["direct-package"]
+    assert packages[0]["properties"]["advisories"][0]["id"] == "SYNTHETIC-NPM-1"
+    receipt = _receipt(native, "surfaces_scanned")
+    assert receipt["coverage"] == "complete"
+    assert receipt["components_checked"] == receipt["advisories_recorded"] == 1
+    assert receipt["scope"] == "inventoried-pypi-and-npm"
+    assert receipt["registry_lockfile_only_dependencies"] == "not-collected"
+
+
 def test_clean_reports_bind_feed_bytes_without_its_path(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()

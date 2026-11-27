@@ -1159,8 +1159,8 @@ def _render_aibom(
     "--all-packages",
     is_flag=True,
     help=(
-        "Inventory every declared or locked package and base image, not only the AI catalog, "
-        "so that advisory matching covers the whole dependency set the agent process loads."
+        "Include PyPI, npm and image declarations outside the AI catalog in supported root "
+        "manifests. Lockfiles resolve declared packages. Lockfile-only dependencies are out of scope."
     ),
 )
 @click.option(
@@ -2299,6 +2299,7 @@ def validate(
                 accept_default_excludes=accept_default_excludes or accept_default_exclude,
                 all_packages=all_packages,
                 advisory_db=advisory_db,
+                inventory_path=Path(aibom_path),
             )
             if root is not None
             else cv.validate(bom)
@@ -2626,6 +2627,7 @@ def risk(
             accept_default_excludes=accept_default_excludes or accept_default_exclude,
             all_packages=all_packages,
             advisory_db=advisory_db,
+            inventory_path=Path(aibom_path),
         )
         discovery: list[str] = []
         if discovery_signature_required(

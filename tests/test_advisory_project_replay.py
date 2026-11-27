@@ -83,6 +83,27 @@ def project(tmp_path: Path) -> Path:
     return root
 
 
+def test_all_packages_recollects_non_catalog_images(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "Dockerfile").write_text(
+        "FROM debian:bookworm AS builder\nFROM builder AS intermediate\nFROM scratch\n"
+    )
+    (project / "compose.yaml").write_text("services:\n  db:\n    image: postgres:16\n")
+
+    def images(path: Path) -> set[str]:
+        components = json.loads(path.read_bytes())["components"]
+        return {entry["name"] for entry in components if entry.get("registry_type") == "docker-hub"}
+
+    assert not images(_scan(project))
+    inventory = _scan(project, "--all-packages")
+    assert images(inventory) == {"debian:bookworm", "postgres:16"}
+    for command in ("validate", "risk"):
+        assert _replay(command, project, inventory, "--all-packages")["assessment_basis"] == (
+            "project-reconciled"
+        )
+
+
 @pytest.mark.parametrize("command", ["validate", "risk"])
 def test_package_scope_is_explicit_and_detects_pin_drift(command: str, project: Path) -> None:
     catalog = _scan(project)
@@ -191,6 +212,44 @@ def test_bundle_inside_project_is_refused(project: Path) -> None:
     report = _replay("validate", project, inventory, "--advisory-db", str(inside))
     assert report["assessment_basis"] == "project-reconciliation-failed"
     assert any("must lie outside the scanned project" in issue for issue in _diagnostics(report))
+
+
+@pytest.mark.parametrize("command", ["scan", "validate", "risk"])
+def test_feed_in_checkout_enclosing_the_nested_project_is_refused(
+    command: str, tmp_path: Path
+) -> None:
+    checkout = tmp_path / "checkout"
+    project = checkout / "services" / "app"
+    project.mkdir(parents=True)
+    (checkout / ".git").mkdir()
+    (project / ".git").write_text("gitdir: submodule-metadata\n")
+    (project / "requirements.txt").write_text("langchain==0.3.27\n")
+    feed = _bundle(checkout)
+    inventory = _scan(project)
+    if command == "scan":
+        result = CliRunner().invoke(
+            main, ["scan", str(project), "--advisory-db", str(feed), "-o", str(inventory)]
+        )
+        assert result.exit_code == 1, result.output
+        claim = json.loads(inventory.read_bytes())["metadata"]["completeness"]
+        reasons = claim["scan_failures"]
+    else:
+        report = _replay(command, project, inventory, "--advisory-db", str(feed))
+        assert report["assessment_basis"] == "project-reconciliation-failed"
+        reasons = _diagnostics(report)
+    assert any("outside every git repository" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize("command", ["validate", "risk"])
+def test_feed_in_inventory_repository_is_refused(command: str, project: Path) -> None:
+    artifacts = project.parent / "artifacts"
+    artifacts.mkdir()
+    (artifacts / ".git").mkdir()
+    inventory = _scan(project).rename(artifacts / "inventory.json")
+    feed = _bundle(artifacts)
+    report = _replay(command, project, inventory, "--advisory-db", str(feed))
+    assert report["assessment_basis"] == "project-reconciliation-failed"
+    assert any("outside every git repository" in issue for issue in _diagnostics(report))
 
 
 @pytest.mark.parametrize("command", ["validate", "risk"])

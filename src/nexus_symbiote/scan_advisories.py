@@ -100,10 +100,13 @@ def _entry(advisory: dict[str, Any]) -> dict[str, Any]:
     return kept
 
 
-def attach_offline_advisories(aibom: AIBOM, db_path: Path, root: Path) -> AdvisoryAttachment:
+def attach_offline_advisories(
+    aibom: AIBOM, db_path: Path, root: Path, *, inventory_path: Path | None = None
+) -> AdvisoryAttachment:
     """Match the inventory against ``db_path``; record hits, failures and the surface line."""
     from nexus_symbiote.offline_advisories import (
         DEFAULT_MAX_FEED_AGE_DAYS,
+        feed_in_input_repository,
         match_offline_advisories,
     )
 
@@ -114,6 +117,14 @@ def attach_offline_advisories(aibom: AIBOM, db_path: Path, root: Path) -> Adviso
         if resolved.is_relative_to(root.resolve()):
             return AdvisoryAttachment(
                 ["advisories: --advisory-db must lie outside the scanned project"]
+            )
+        inputs = (root,) if inventory_path is None else (root, inventory_path.resolve().parent)
+        if feed_in_input_repository(resolved, *inputs):
+            return AdvisoryAttachment(
+                [
+                    "advisories: --advisory-db must lie outside every git repository enclosing "
+                    "the project, inventory or current directory"
+                ]
             )
         report, provenance = match_offline_advisories(
             aibom,
@@ -177,6 +188,8 @@ def attach_offline_advisories(aibom: AIBOM, db_path: Path, root: Path) -> Adviso
             "components_excluded": report.components_excluded,
             "components_skipped": report.components_skipped,
             "coverage": coverage,
+            "scope": "inventoried-pypi-and-npm",
+            "registry_lockfile_only_dependencies": "not-collected",
             "db_sha256": provenance["db_sha256"],
             "db_newest_record": provenance["db_newest_record"],
             "records_loaded": provenance["records_loaded"],

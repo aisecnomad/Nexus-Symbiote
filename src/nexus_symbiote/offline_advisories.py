@@ -67,6 +67,17 @@ _CHEAP_STEPS = 32
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
 
 
+def feed_in_input_repository(feed: Path, *input_directories: Path) -> bool:
+    """Check every Git working tree enclosing an input directory or the working directory."""
+    resolved = feed.resolve()
+    for directory in (*input_directories, Path.cwd()):
+        start = directory.resolve()
+        for tree in (start, *start.parents):
+            if os.path.lexists(tree / ".git") and resolved.is_relative_to(tree):
+                return True
+    return False
+
+
 @dataclass(frozen=True)
 class _ParsedAdvisory:
     record_id: str

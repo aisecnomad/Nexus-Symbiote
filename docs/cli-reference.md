@@ -1018,14 +1018,20 @@ directory otherwise, so two SARIF files are identical too when the scanned direc
 lies at the same path below the working directory in both scans, or below it in
 neither. See [reproducible inventories](reproducible-inventories.md).
 
-`--all-packages` inventories package and base image declarations from the supported manifests
-and lockfiles, including packages outside the [AI package catalog](registry-collector.md#ai-package-catalog).
+`--all-packages` inventories PyPI, npm and image declarations from supported root manifests,
+including declarations outside the [AI package catalog](registry-collector.md#ai-package-catalog).
+Lockfiles supply resolution evidence for declared packages. Transitive dependencies present only
+in a lockfile are outside registry collection.
 `--advisory-db` `PATH` matches every
 exact PyPI/npm pin against an offline OSV bundle (a JSON file or a flat directory of OSV
-records, outside the scanned project) during the scan: each match is a `known_vulnerability`
+records, outside the scanned project) during the scan. Keep the bundle outside every Git
+working tree enclosing the project, the working directory, and, for replay, the supplied
+inventory. Each match is a `known_vulnerability`
 finding on the package, with the advisory's identifiers and severity, and the CycloneDX export
 lists it under `vulnerabilities`. The native completeness claim records the bundle SHA-256,
-newest record, coverage, and counts as a JSON receipt. CycloneDX exposes the same receipt as
+newest record, coverage, and counts as a JSON receipt. Its `scope` is
+`inventoried-pypi-and-npm`. The receipt records `registry_lockfile_only_dependencies` as
+`not-collected` even when every eligible inventory entry was checked. CycloneDX exposes the same receipt as
 `nexus-symbiote:advisories:collection`. A scan with zero exact targets records `coverage: none`
 under `unobserved_surfaces`. A severity
 the bundle does not state is recorded as a medium finding that says so and exported with an

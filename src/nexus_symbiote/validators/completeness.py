@@ -353,6 +353,7 @@ class CompletenessValidator:
         accept_default_excludes: bool | tuple[str, ...] = False,
         all_packages: bool = False,
         advisory_db: Path | None = None,
+        inventory_path: Path | None = None,
     ) -> CompletenessReport:
         """Recollect the supported static inventory under caller-selected scope.
 
@@ -445,7 +446,9 @@ class CompletenessValidator:
         if advisory_db is not None:
             from nexus_symbiote.scan_advisories import attach_offline_advisories
 
-            attachment = attach_offline_advisories(expected, advisory_db, root)
+            attachment = attach_offline_advisories(
+                expected, advisory_db, root, inventory_path=inventory_path
+            )
             for reason in attachment.failures:
                 incomplete("advisories", reason)
             if attachment.surface is not None:
