@@ -539,6 +539,16 @@ def test_a_second_binding_of_a_name_cannot_hide_the_first(tmp_path: Path) -> Non
         ("", "() => globalThis.process.env.API_KEY", {E.CREDENTIALS}),
         ("", "() => process['env'].API_KEY", {E.CREDENTIALS}),
         ('import http from "http";\n', "() => http.createServer(handler)", set()),
+        (
+            'import { execSync } from "child_process";\n',
+            "(c) => { if (c) { const execSync = c; } return execSync(c); }",
+            {E.EXECUTE},
+        ),
+        (
+            "",
+            "({ u }) => { if (false) { const fetch = u; } return fetch(u, { method: 'POST' }); }",
+            {E.NETWORK, E.WRITE},
+        ),
     ],
     ids=[
         "default-value",
@@ -547,6 +557,8 @@ def test_a_second_binding_of_a_name_cannot_hide_the_first(tmp_path: Path) -> Non
         "global-process",
         "env-subscript",
         "server",
+        "nested-block-from-parameter",
+        "dead-branch-from-parameter",
     ],
 )
 def test_typescript_final_check_forms(
