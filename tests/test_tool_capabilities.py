@@ -9,10 +9,12 @@ recorded as read-only, because the classifier cannot show that it writes nothing
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from nexus_symbiote import limits
 from nexus_symbiote.core.enums import CapabilityClass, SideEffectProfile
 from nexus_symbiote.core.models import ToolComponent
 from nexus_symbiote.scanners.mcp import MCPScanner
@@ -394,3 +396,84 @@ def test_long_chains_and_nested_templates_stay_linear(tmp_path: Path, kind: str)
 
     small, large = cost(500), cost(2000)
     assert large < max(small, 0.05) * 12, (small, large)
+
+
+# ---- Remaining forms ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("body", "expected", "profile"),
+    [
+        ("    path.write_text(data)\n", {E.FILESYSTEM, E.WRITE}, "state-modifying"),
+        ("    path.unlink()\n", {E.FILESYSTEM, E.WRITE, E.DESTRUCTIVE}, "destructive"),
+        ("    open(path, 'w').write(data)\n", {E.FILESYSTEM, E.WRITE}, "state-modifying"),
+        ("    Path(path).write_text(data)\n", {E.FILESYSTEM, E.WRITE}, "state-modifying"),
+        ("    os.rename(path, data)\n", {E.FILESYSTEM, E.WRITE}, "state-modifying"),
+        ("    os.remove(path)\n", {E.FILESYSTEM, E.WRITE, E.DESTRUCTIVE}, "destructive"),
+        ("    conn.execute('INSERT INTO t VALUES (1)')\n", {E.WRITE}, "state-modifying"),
+        (
+            "    stmt: str = 'DROP TABLE t'\n    conn.execute(stmt)\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            "destructive",
+        ),
+        (
+            "    conn.execute(*args)\n    smtplib.SMTP('h').sendmail(a, b, data)\n",
+            {E.NETWORK, E.WRITE},
+            "state-modifying",
+        ),
+    ],
+)
+def test_python_forms(body: str, expected: set[CapabilityClass], profile: str) -> None:
+    found = _classify(
+        "import os\nimport smtplib\nfrom pathlib import Path\n\n"
+        f"def tool(path, data, conn, a, b, *args, **kwargs):\n{body}"
+    )
+    assert set(found.capabilities) == expected, body
+    assert found.profile.value == profile, body
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected"),
+    [
+        ('import * as cp from "child_process";\n', "(c) => cp.spawn(c)", {E.EXECUTE}),
+        ('import { execFile as run } from "child_process";\n', "(c) => run(c)", {E.EXECUTE}),
+        ('const cp = require("child_process");\n', "(c) => cp.exec(c)", {E.EXECUTE}),
+        (
+            'const { writeFileSync } = require("fs");\n',
+            "(p) => writeFileSync(p, 'x')",
+            {E.FILESYSTEM, E.WRITE},
+        ),
+        ('import fs from "node:fs";\n', "(p) => fs.writeFileSync(p, 'x')", {E.FILESYSTEM, E.WRITE}),
+        ('import axios from "axios";\n', "(u) => axios.post(u, {})", {E.NETWORK, E.WRITE}),
+        ('import axios from "axios";\n', "(u) => axios.get(u)", {E.NETWORK}),
+        ("", "(u) => fetch(u, { headers: {} })", {E.NETWORK}),
+        ("", "(u) => fetch(u, opts)", {E.NETWORK}),
+        ("", "(to) => mailer.sendMail({ to })", {E.NETWORK, E.WRITE}),
+        ("", "() => process.env['GITHUB_TOKEN']", {E.CREDENTIALS}),
+        ("", "() => process.env.STRIPE_SECRET_KEY", {E.CREDENTIALS}),
+        ("", "() => { function fetch(u) { return u; } return fetch('x'); }", set()),
+    ],
+)
+def test_typescript_forms(
+    tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass]
+) -> None:
+    assert _caps(_ts(tmp_path, handler, header)) == expected, handler
+
+
+def test_typescript_parameter_use_past_its_bound_is_assumed(tmp_path: Path) -> None:
+    template = "(id) => db.query(`DELETE FROM t WHERE x = ${ARGUMENT}`)"
+    tool = _ts(tmp_path, template.replace("ARGUMENT", " + ".join(["k"] * 400)))
+    assert any("caller-supplied" in r.detail for r in tool.risks)
+
+
+def test_a_typescript_body_past_the_bound_records_a_gap(tmp_path: Path) -> None:
+    path = tmp_path / "src" / "server.ts"
+    path.parent.mkdir(parents=True)
+    body = "; ".join(f"x{i}()" for i in range(7000))
+    path.write_text(IMPORT + SERVER + f'server.tool("t", {{}}, async () => {{ {body}; }});\n')
+    # The test default refuses a file this size; production allows far larger files.
+    with limits.applied(replace(limits.DEFAULTS, ts_nodes=400_000)):
+        result = MCPScanner().scan(tmp_path)
+    (tool,) = [c for c in result.components if isinstance(c, ToolComponent)]
+    assert tool.capabilities is None
+    assert any("too large to classify" in gap for gap in result.surfaces_excluded)
