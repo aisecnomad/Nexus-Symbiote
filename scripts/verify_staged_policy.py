@@ -93,16 +93,22 @@ def validation_failures(
     failures: list[str] = []
     excluded = policy.scan.exclude_paths
     bound_imports: frozenset[str] = frozenset()
+    bound_references: frozenset[str] = frozenset()
     if validation.require_completeness:
         c_rep = CompletenessValidator().validate_against_project(
             bom, root, exclude_paths=excluded, accept_default_excludes=accept_default_excludes
         )
         bound_imports = c_rep.bound_imports
+        bound_references = c_rep.bound_references
         if not c_rep.is_complete:
             failures.append("completeness validation failed under operator policy")
     if validation.require_integrity:
         i_rep = IntegrityValidator().validate(
-            bom, root, exclude_paths=excluded, bound_imports=bound_imports
+            bom,
+            root,
+            exclude_paths=excluded,
+            bound_imports=bound_imports,
+            bound_references=bound_references,
         )
         if not i_rep.is_valid:
             failures.append(

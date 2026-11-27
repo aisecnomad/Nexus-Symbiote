@@ -849,7 +849,8 @@ def test_python_source_that_is_not_text_is_nothing_or_a_gap(payload):
     except UnicodeDecodeError:
         assert result.components == []
         assert list(result.surfaces_excluded) == [
-            "app/unit.py: source file is not UTF-8; declarations in it were not read"
+            "app/unit.py: source file cannot be decoded as its encoding declares; "
+            "declarations in it were not read"
         ]
 
 
@@ -926,56 +927,6 @@ def test_reading_python_source_is_linear_in_its_size(tmp_path, shape):
         root.mkdir()
         (root / "app.py").write_text(
             f"import openai\nfrom openai import OpenAI\n{shape(500 * scale)}", encoding="utf-8"
-        )
-
-    assert scaling_ratio(lambda scale: SourceScanner().scan(roots[scale])) < 8
-
-
-def _attributes(size: int) -> str:
-    methods = "\n".join(
-        f"    def ask{index}(self):\n        self.client.responses.create(model=self.model)"
-        for index in range(size)
-    )
-    return f'class Bot:\n    def __init__(self):\n        self.client = OpenAI()\n        self.model = "o3"\n{methods}\n'
-
-
-def _returns(size: int) -> str:
-    return 'def pick():\n    return "o3"\n' + "OpenAI().responses.create(model=pick())\n" * size
-
-
-def _items(size: int) -> str:
-    table = ", ".join(f'"k{index}": "m-{index}"' for index in range(size))
-    reads = "\n".join(f'OpenAI().responses.create(model=T["k{index}"])' for index in range(size))
-    return f"T = {{{table}}}\n{reads}\n"
-
-
-@pytest.mark.no_cover
-@pytest.mark.parametrize("shape", [_attributes, _returns, _items], ids=["self", "returns", "items"])
-def test_following_attributes_items_and_returns_is_linear(tmp_path, shape):
-    roots = {}
-    for scale in (1, 4):
-        root = roots[scale] = tmp_path / f"n{scale}"
-        root.mkdir()
-        (root / "app.py").write_text(
-            f"from openai import OpenAI\n{shape(300 * scale)}", encoding="utf-8"
-        )
-
-    assert scaling_ratio(lambda scale: SourceScanner().scan(roots[scale])) < 8
-
-
-@pytest.mark.no_cover
-def test_following_into_many_modules_is_linear(tmp_path):
-    roots = {}
-    for scale in (1, 4):
-        root = roots[scale] = tmp_path / f"n{scale}"
-        (root / "app").mkdir(parents=True)
-        count = 60 * scale
-        for index in range(count):
-            (root / "app" / f"m{index}.py").write_text(f'MODEL = "m-{index}"\n', encoding="utf-8")
-        imports = "\n".join(f"from app.m{index} import MODEL as M{index}" for index in range(count))
-        reads = "\n".join(f"OpenAI().responses.create(model=M{index})" for index in range(count))
-        (root / "app" / "run.py").write_text(
-            f"from openai import OpenAI\n{imports}\n{reads}\n", encoding="utf-8"
         )
 
     assert scaling_ratio(lambda scale: SourceScanner().scan(roots[scale])) < 8

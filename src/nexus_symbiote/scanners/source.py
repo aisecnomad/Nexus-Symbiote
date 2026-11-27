@@ -9,14 +9,15 @@ syntax tree. What the reader could not resolve is a coverage gap, never silence,
 file it does not understand declares nothing it can record.
 
 Tests, documentation, examples, benchmarks and build output are not read, as the MCP
-source search does not read them. A file named as one that holds credentials is not
-read either, and a link is read only when the file it reaches is one this collector
-reads.
+source search does not read them, and a link is read only when the file it reaches is
+not one of these. A file named as one that holds credentials is read like any other:
+the collector exports no value but a model identifier that passes the export checks.
 """
 
 from __future__ import annotations
 
-from functools import partial
+import io
+import tokenize
 from pathlib import Path, PurePosixPath
 
 from nexus_symbiote import limits
@@ -26,9 +27,8 @@ from nexus_symbiote.scanners.base import (
     SourceBudget,
     source_collection_bytes,
 )
-from nexus_symbiote.scanners.credential_files import credential_shaped
 from nexus_symbiote.scanners.source_python import PythonReader
-from nexus_symbiote.scanners.source_python_tables import AI_MARKERS
+from nexus_symbiote.scanners.source_python_tables import SDK_IMPORT
 from nexus_symbiote.scanners.source_references import Declarations
 from nexus_symbiote.utils.confined import ConfinedCollection
 
@@ -40,25 +40,24 @@ SKIPPED_SURFACE = "source: tests, documentation, examples, benchmarks and build 
 _PYTHON_TESTS = ("test_", "conftest.py")
 
 
+def _skipped(path: PurePosixPath) -> bool:
+    """Whether a path is a test, documentation, an example, a benchmark or build output."""
+    if SKIPPED_DIRECTORIES.intersection(path.parts[:-1]):
+        return True
+    return path.name.startswith(_PYTHON_TESTS) or path.name.endswith("_test.py")
+
+
 def eligible(path: PurePosixPath) -> bool:
     """Whether the collector reads a file at this path, by its name and directories."""
-    if SKIPPED_DIRECTORIES.intersection(path.parts[:-1]) or path.suffix.lower() != ".py":
-        return False
-    return not (path.name.startswith(_PYTHON_TESTS) or path.name.endswith("_test.py"))
+    return path.suffix.lower() == ".py" and not _skipped(path)
 
 
-def _module_text(files: ConfinedCollection, admitted: set[str], path: str) -> str | None:
-    """A module of the project that analysed code imports, read again when it is followed.
-
-    Only a file the collector read within its budget is read again, and only when it is
-    UTF-8 and small enough to parse; otherwise what it binds is not followed.
-    """
-    raw = files.read_bytes(path) if path in admitted else None
-    if raw is None or len(raw) > limits.current().syntax_bytes:
-        return None
+def _decoded(raw: bytes) -> str | None:
+    """Source text as Python reads it: the encoding its first lines declare, else UTF-8."""
     try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+        return raw.decode(encoding)
+    except (SyntaxError, LookupError, UnicodeDecodeError):
         return None
 
 
@@ -78,71 +77,66 @@ class SourceScanner(Scanner):
                     modules.add(path.as_posix())
                 if eligible(PurePosixPath(path.as_posix())):
                     selected.append(path)
-            with ConfinedCollection(
-                files.root,
-                [],
-                exclude_paths=self._exclude_paths,
-                max_total_bytes=source_collection_bytes(),
-            ) as heuristic:
-                admitted: set[str] = set()
-                load = partial(_module_text, heuristic, admitted)
-                python = PythonReader(found, frozenset(modules), load)
-                self._read(heuristic, sorted(selected), result, python, admitted)
-                python.read()
-        found.close()
+            python = PythonReader(found, frozenset(modules))
+            self._read(files.root, sorted(selected), result, python)
+        python.read()
         result.components.extend(found.components())
         result.surfaces_scanned.append(SURFACE)
         result.surfaces_scanned.append(SKIPPED_SURFACE)
         return result
 
     def _read(
-        self,
-        heuristic: ConfinedCollection,
-        selected: list[Path],
-        result: ScanResult,
-        python: PythonReader,
-        admitted: set[str],
+        self, root: Path, selected: list[Path], result: ScanResult, python: PythonReader
     ) -> None:
-        """Hand each selected file that names an SDK to the reader, within the source budget.
+        """Hand each selected file that imports an SDK to the reader, within the source budget.
 
         Files are read apart from the collection, whose failures are not kept. A file
-        that cannot be read, or that names an SDK and is too large to parse or is not
-        UTF-8, is a named gap.
+        that cannot be opened or read, or one that imports an SDK and is too large to
+        parse or cannot be decoded, is a named gap.
         """
         budget = SourceBudget("source declarations", result)
         syntax = limits.current().syntax_bytes
-        for path in selected:
-            if budget.exhausted:
-                break
-            location = path.as_posix()
-            found = None if credential_shaped(location) else heuristic.regular_file(path)
-            if found is None:
-                continue
-            target = found[0].as_posix()
-            if credential_shaped(target) or not eligible(PurePosixPath(target)):
-                # A link reaches a file named for credentials, a test or another kind.
-                continue
-            large = found[1] > heuristic.max_file_bytes
-            raw = None if large else heuristic.read_bytes(path)
-            if raw is None:
-                # Whether it names an SDK is unknown, so it is a gap, not silence.
-                reason = "is larger than the file-bytes limit" if large else "could not be read"
-                result.surfaces_excluded.append(f"{location}: source file {reason}; not read")
-                continue
-            if not budget.admit(len(raw), path):
-                continue
-            admitted.add(location)
-            if not any(marker in raw for marker in AI_MARKERS):
-                continue
-            if len(raw) > syntax:
-                result.surfaces_excluded.append(
-                    f"{location}: source file is larger than the syntax-bytes limit; "
-                    "declarations in it were not read"
-                )
-                continue
-            try:
-                python.add(location, raw.decode("utf-8"))
-            except UnicodeDecodeError:
-                result.surfaces_excluded.append(
-                    f"{location}: source file is not UTF-8; declarations in it were not read"
-                )
+        with ConfinedCollection(
+            root, [], exclude_paths=self._exclude_paths, max_total_bytes=source_collection_bytes()
+        ) as heuristic:
+            for path in selected:
+                if budget.exhausted:
+                    break
+                location = path.as_posix()
+                found = heuristic.regular_file(path)
+                if found is None:
+                    if heuristic.entry_exists(path):
+                        result.surfaces_excluded.append(
+                            f"{location}: source file could not be read; not read"
+                        )
+                    continue
+                if _skipped(PurePosixPath(found[0].as_posix())):
+                    # A link reaches a test, documentation or build output.
+                    continue
+                large = found[1] > heuristic.max_file_bytes
+                raw = None if large else heuristic.read_bytes(path)
+                followed = heuristic.link_target(path)
+                if followed is not None and _skipped(PurePosixPath(followed)):
+                    # The link changed after it was checked.
+                    continue
+                if raw is None:
+                    # Whether it imports an SDK is unknown, so it is a gap, not silence.
+                    reason = "is larger than the file-bytes limit" if large else "could not be read"
+                    result.surfaces_excluded.append(f"{location}: source file {reason}; not read")
+                    continue
+                if not budget.admit(len(raw), path) or not SDK_IMPORT.search(raw):
+                    continue
+                if len(raw) > syntax:
+                    result.surfaces_excluded.append(
+                        f"{location}: source file is larger than the syntax-bytes limit; "
+                        "declarations in it were not read"
+                    )
+                    continue
+                text = _decoded(raw)
+                if text is None:
+                    result.surfaces_excluded.append(
+                        f"{location}: source file cannot be decoded as its encoding declares; "
+                        "declarations in it were not read"
+                    )
+                    continue
+                python.add(location, text)
