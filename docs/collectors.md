@@ -89,8 +89,9 @@ What the reader knows is there and cannot read is a coverage gap:
   variable that cannot be named may override;
 - a model that only an environment variable sets, once for each file that reads it so,
   as when its default names no model, such as `None`, `""` or `"default"`;
-- options a weights library loads a model with that the reader cannot read, such as
-  `model_kwargs=options` or `**options`, which may let the model run its own code;
+- options that a library loading a model here is given and the reader cannot read, such
+  as `model_kwargs=options` or `**options`, which may let the model run its own code (a
+  hosted endpoint, a hub client and a GGUF or ONNX runtime run none);
 - a model argument given to a function or class the project defines, or to a method of
   one of its classes, which the reader does not follow;
 - a bound the reader reached: a callee depth of 32, a following depth of 12, 16 values

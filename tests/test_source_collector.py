@@ -2581,6 +2581,76 @@ def test_remote_code_is_read_on_every_sdk_call_and_options_it_cannot_read_are_a_
     assert list(result.surfaces_excluded) == ([f"run.py:8: {REMOTE}"] if gap else [])
 
 
+@pytest.mark.parametrize(
+    ("call", "gap"),
+    [
+        ('HuggingFaceEndpoint(repo_id="someorg/custom-7b", **OPTIONS)', False),
+        ('HuggingFaceEndpoint(repo_id="someorg/custom-7b", model_kwargs=OPTIONS)', False),
+        ('HuggingFaceEndpointEmbeddings(model="someorg/custom-7b", **OPTIONS)', False),
+        ('InferenceClient("someorg/custom-7b", **OPTIONS)', False),
+        ('InferenceClientModel(model_id="someorg/custom-7b", **OPTIONS)', False),
+        ('HfApiModel(model_id="someorg/custom-7b", **OPTIONS)', False),
+        ('Llama.from_pretrained(repo_id="someorg/custom-7b", filename="*.gguf", **OPTIONS)', False),
+        ('FastEmbedEmbeddings(model_name="someorg/custom-7b", **OPTIONS)', False),
+        ('HuggingFaceEmbeddings(model_name="someorg/custom-7b", **OPTIONS)', True),
+        ('VLLM(model="someorg/custom-7b", **OPTIONS)', True),
+        ('MLXModel(model_id="someorg/custom-7b", **OPTIONS)', True),
+        ('VLLMModel(model_id="someorg/custom-7b", model_kwargs=OPTIONS)', True),
+        ('HuggingFaceLocalChatGenerator(model="someorg/custom-7b", **OPTIONS)', True),
+        (
+            'HuggingFaceLocalGenerator(model="someorg/custom-7b", '
+            "huggingface_pipeline_kwargs=OPTIONS)",
+            True,
+        ),
+        (
+            'HuggingFacePipeline.from_model_id(model_id="someorg/custom-7b", '
+            'task="text-generation", pipeline_kwargs=OPTIONS)',
+            True,
+        ),
+        ('SentenceTransformer("someorg/custom-7b", tokenizer_kwargs=OPTIONS)', True),
+    ],
+    ids=[
+        "hosted-endpoint",
+        "hosted-endpoint-model-options",
+        "hosted-embeddings",
+        "hub-client",
+        "hosted-agent-model",
+        "hosted-agent-model-old-name",
+        "gguf-runtime",
+        "onnx-runtime",
+        "local-embeddings",
+        "local-vllm-wrapper",
+        "local-mlx",
+        "local-vllm-model-options",
+        "local-chat-generator",
+        "local-generator-pipeline-options",
+        "local-pipeline-options",
+        "tokenizer-options",
+    ],
+)
+def test_options_are_a_gap_only_where_a_model_loads_here_and_may_run_its_own_code(
+    tmp_path: Path, call: str, gap: bool
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "from huggingface_hub import InferenceClient\nfrom llama_cpp import Llama\n"
+            "from langchain_community.embeddings import FastEmbedEmbeddings\n"
+            "from langchain_community.llms import VLLM\n"
+            "from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint\n"
+            "from langchain_huggingface import HuggingFaceEndpointEmbeddings, HuggingFacePipeline\n"
+            "from smolagents import HfApiModel, InferenceClientModel, MLXModel, VLLMModel\n"
+            "from sentence_transformers import SentenceTransformer\n"
+            "from haystack.components.generators import HuggingFaceLocalGenerator\n"
+            "from haystack.components.generators.chat import HuggingFaceLocalChatGenerator\n"
+            f"OPTIONS = load_options()\n{call}\n"
+        },
+    )
+    # A hosted endpoint runs the model elsewhere, and GGUF and ONNX weights hold no code.
+    assert models(result)["someorg/custom-7b"].trust_remote_code is None
+    assert list(result.surfaces_excluded) == ([f"run.py:12: {REMOTE}"] if gap else [])
+
+
 def test_a_wrapper_that_hands_on_what_it_was_given_is_no_model_call(tmp_path: Path):
     result = scan(
         tmp_path,
