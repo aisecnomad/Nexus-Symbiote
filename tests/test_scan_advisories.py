@@ -12,6 +12,8 @@ from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
 from nexus_symbiote.generators.validation import validate_cyclonedx
+from nexus_symbiote.offline_advisories import load_offline_advisory_db
+from nexus_symbiote.scan_advisories import ADVISORY_SURFACE_PREFIX
 from nexus_symbiote.scanners.registry import AllPackagesRegistryScanner, RegistryScanner
 
 
@@ -230,20 +232,25 @@ def test_an_unstated_severity_is_recorded_as_medium_and_exported_as_unknown(
 
 def test_every_run_records_the_bundle_digest_and_the_targets_checked(tmp_path: Path) -> None:
     bundle = _write_bundle(tmp_path, [_record("PYSEC-OTHER", [("pillow", "9.0.1")])])
+    _, feed_digest = load_offline_advisory_db(bundle)
     floating = tmp_path / "floating"
     floating.mkdir()
     (floating / "requirements.txt").write_text("requests>=2.0\n")
     claim = _claim(_scan(floating, bundle, tmp_path / "floating.json"))
-    (surface,) = [s for s in claim.surfaces_scanned if s.startswith("advisories:")]
-    assert "sha256:" in surface and "no exact PyPI/npm pins to check" in surface
+    (surface,) = [s for s in claim.unobserved_surfaces if s.startswith(ADVISORY_SURFACE_PREFIX)]
+    receipt = json.loads(surface.removeprefix(ADVISORY_SURFACE_PREFIX))
+    assert receipt["db_sha256"] == feed_digest
+    assert receipt["coverage"] == "none" and receipt["components_checked"] == 0
     assert any(f.startswith("advisories:") for f in claim.scan_failures)
     clean = tmp_path / "clean"
     clean.mkdir()
     (clean / "requirements.txt").write_text("requests==2.31.0\n")
     claim = _claim(_scan(clean, bundle, tmp_path / "clean.json"))
-    (surface,) = [s for s in claim.surfaces_scanned if s.startswith("advisories:")]
-    assert "1 exact PyPI/npm pins checked, 0 advisories recorded" in surface
-    assert "sha256:" in surface and not claim.scan_failures
+    (surface,) = [s for s in claim.surfaces_scanned if s.startswith(ADVISORY_SURFACE_PREFIX)]
+    receipt = json.loads(surface.removeprefix(ADVISORY_SURFACE_PREFIX))
+    assert receipt["db_sha256"] == feed_digest
+    assert receipt["coverage"] == "complete" and receipt["components_checked"] == 1
+    assert receipt["advisories_recorded"] == 0 and not claim.scan_failures
     other = _write_bundle(tmp_path, [_record("PYSEC-ELSE", [("pillow", "9.0.2")])], "other")
     again = _claim(_scan(clean, other, tmp_path / "clean-2.json"))
     assert again.surfaces_scanned != claim.surfaces_scanned

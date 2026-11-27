@@ -1016,15 +1016,16 @@ directory otherwise, so two SARIF files are identical too when the scanned direc
 lies at the same path below the working directory in both scans, or below it in
 neither. See [reproducible inventories](reproducible-inventories.md).
 
-`--all-packages` inventories every declared or locked package and base image, not only the
-[AI package catalog](registry-collector.md#ai-package-catalog), so that an advisory match
-covers the whole dependency set the agent process loads. `--advisory-db` `PATH` matches every
+`--all-packages` inventories package and base image declarations from the supported manifests
+and lockfiles, including packages outside the [AI package catalog](registry-collector.md#ai-package-catalog).
+`--advisory-db` `PATH` matches every
 exact PyPI/npm pin against an offline OSV bundle (a JSON file or a flat directory of OSV
 records, outside the scanned project) during the scan: each match is a `known_vulnerability`
 finding on the package, with the advisory's identifiers and severity, and the CycloneDX export
-lists it under `vulnerabilities`. Every run records a surface line with the bundle's file
-name and SHA-256 and how many exact pins it checked and advisories it recorded, so a clean
-inventory states what it was checked against and one with no exact pins says so. A severity
+lists it under `vulnerabilities`. The native completeness claim records the bundle SHA-256,
+newest record, coverage, and counts as a JSON receipt. CycloneDX exposes the same receipt as
+`nexus-symbiote:advisories:collection`. A scan with zero exact targets records `coverage: none`
+under `unobserved_surfaces`. A severity
 the bundle does not state is recorded as a medium finding that says so and exported with an
 `unknown` rating. The feed-age check uses the current clock, so a bundle older than the
 matcher's default feed age turns the match into a collection failure even under

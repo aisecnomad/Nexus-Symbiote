@@ -1365,6 +1365,7 @@ def scan(
     scan_failures.extend(graph_failures)
     if graph_failures:
         failures_by["graph"] = graph_failures
+    advisory_unobserved: list[str] = []
     if advisory_db is not None:
         from nexus_symbiote.scan_advisories import attach_offline_advisories
 
@@ -1374,6 +1375,8 @@ def scan(
             failures_by["advisories"] = attachment.failures
         if attachment.surface is not None:
             surfaces_scanned.append(attachment.surface)
+        if attachment.unobserved_surface is not None:
+            advisory_unobserved.append(attachment.unobserved_surface)
     aibom.metadata.completeness = CompletenessClaim(
         scope="repository+shadowscan" if source_report_digest else "repository",
         source_report_digest=source_report_digest,
@@ -1406,6 +1409,7 @@ def scan(
             }
         ),
         unobserved_surfaces=[
+            *advisory_unobserved,
             *(f"accepted default exclusion: {name}" for name in sorted(accepted_default_names)),
             *(
                 f"accepted default exclusion path: {path}"
