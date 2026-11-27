@@ -1147,6 +1147,7 @@ SentenceTransformer("all-MiniLM-L6-v2")
         "\fimport openai\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
         "import os, \\\n    openai\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
         "import \uff4f\uff50\uff45\uff4e\uff41\uff49\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
+        "import x\u0301y, openai\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
     ],
     ids=[
         "try",
@@ -1157,6 +1158,7 @@ SentenceTransformer("all-MiniLM-L6-v2")
         "form-feed",
         "continued-list",
         "compatibility-spelling",
+        "combining-mark-in-an-earlier-name",
     ],
 )
 def test_every_import_statement_python_runs_is_found(tmp_path: Path, source: str):

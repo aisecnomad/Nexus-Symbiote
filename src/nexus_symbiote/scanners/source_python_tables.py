@@ -42,9 +42,12 @@ AI_SUBMODULES = {
 # after ``try:`` or ``if ...:``, and joins lines a backslash ends; a word that is not in an
 # import statement, such as ``graphics`` or one in a string, names none.
 _GAP = r"(?:[ \t\f]|\\(?:\r\n?|\n))"
+# A name earlier in an import list may hold any character an identifier may, such as a
+# combining mark, so it runs to the next separator.
+_NAME = r"[^\s,;:\\#()]+"
 _ROOT_NAMES = "|".join(sorted(map(re.escape, AI_ROOTS - {"google"})))
 SDK_IMPORT = re.compile(
-    rf"(?:\A|[\r\n;:\f])[ \t\f]*(?:from|import)(?!\w){_GAP}*(?:[\w.]+(?:{_GAP}+as{_GAP}+\w+)?"
+    rf"(?:\A|[\r\n;:\f])[ \t\f]*(?:from|import)(?!\w){_GAP}*(?:{_NAME}(?:{_GAP}+as{_GAP}+{_NAME})?"
     rf"{_GAP}*,{_GAP}*)*(?:(?:{_ROOT_NAMES})(?!\w)|google(?:\.cloud)?"
     rf"(?:\.(?:adk|genai|generativeai|aiplatform)(?!\w)|{_GAP}+import(?!\w)))"
 )
