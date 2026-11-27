@@ -22,7 +22,7 @@ from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.canonical import json_text
 from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.hashing import parse_json_strict
-from nexus_symbiote.core.models import RiskAssessment
+from nexus_symbiote.core.models import MCPServerComponent, RiskAssessment
 
 ADVISORY_CATEGORY = "known_vulnerability"
 ADVISORY_PROPERTY = "advisories"
@@ -191,7 +191,14 @@ def attach_offline_advisories(
         )
     # Encode the receipt in the existing completeness claim without a native schema change.
     # Keep the receipt stable across checkouts and bind the contents rather than the path.
-    narrowed = bool(failures) or registry_packages != REGISTRY_PACKAGES[0]
+    # An MCP launcher package with no exact package URL is a package whose version is unknown.
+    unidentified = sum(
+        isinstance(component, MCPServerComponent)
+        and component.package_url is None
+        and (component.launcher_package or "").partition(":")[0] in {"npm", "pypi"}
+        for component in aibom.components
+    )
+    narrowed = bool(failures or unidentified) or registry_packages != REGISTRY_PACKAGES[0]
     coverage = "partial" if report.coverage == "complete" and narrowed else report.coverage
     surface = ADVISORY_SURFACE_PREFIX + json_text(
         {
@@ -199,6 +206,7 @@ def attach_offline_advisories(
             "components_checked": report.components_checked,
             "components_excluded": report.components_excluded,
             "components_skipped": report.components_skipped,
+            "components_unidentified": unidentified,
             "coverage": coverage,
             "scope": "inventoried-pypi-and-npm",
             "registry_packages": registry_packages,

@@ -289,3 +289,51 @@ def test_catalog_mode_receipt_is_partial_and_names_its_package_scope(tmp_path: P
         ],
     )
     assert json.loads(replay.stdout)["assessment_basis"] == "project-reconciled", replay.output
+
+
+def test_an_mcp_launcher_package_without_an_exact_version_keeps_coverage_partial(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "requirements.txt").write_text("requests==2.31.0\n", encoding="utf-8")
+    servers = {
+        "floating": {"command": "npx", "args": ["-y", "@acme/mcp-floating"]},
+        "pinned": {"command": "npx", "args": ["-y", "@acme/mcp-pinned@1.0.0"]},
+    }
+    (project / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+    feed = tmp_path / "operator" / "osv.json"
+    feed.parent.mkdir()
+    every_version = {"type": "SEMVER", "events": [{"introduced": "0"}]}
+    record = {
+        "id": "SYNTHETIC-MCP-1",
+        "modified": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+        "affected": [
+            {
+                "package": {"ecosystem": "npm", "name": "@acme/mcp-floating"},
+                "ranges": [every_version],
+            },
+            {"package": {"ecosystem": "PyPI", "name": "requests"}, "versions": ["0.1"]},
+        ],
+    }
+    feed.write_text(json.dumps(record), encoding="utf-8")
+    receipt = _receipt(_scan(project, feed, tmp_path / "inventory.json"), "surfaces_scanned")
+    assert receipt["components_checked"] == 2
+    assert receipt["components_unidentified"] == 1
+    assert receipt["coverage"] == "partial"
+    replay = CliRunner().invoke(
+        main,
+        [
+            "validate",
+            str(tmp_path / "inventory.json"),
+            "--project",
+            str(project),
+            "--no-project-policy",
+            "--skip-integrity",
+            "--json-output",
+            "--all-packages",
+            "--advisory-db",
+            str(feed),
+        ],
+    )
+    assert json.loads(replay.stdout)["assessment_basis"] == "project-reconciled", replay.output
