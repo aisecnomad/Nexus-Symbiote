@@ -700,7 +700,9 @@ class PythonReader:
     def _built(self, module: Module, node: ast.AST) -> bool:
         """Whether a value is an object an SDK or another library builds, not a name."""
         origin = self.origin(module, node)
-        return _sdk(origin) or _library(origin)
+        # A name or an attribute another library holds is a value, not an object it built.
+        built = origin is not None and origin.endswith("()")
+        return built and (_sdk(origin) or _library(origin))
 
     def _imported_leaf(self, module: Module, node: ast.AST) -> bool:
         """Whether a value is a name, or an attribute of one, imported from a project module."""

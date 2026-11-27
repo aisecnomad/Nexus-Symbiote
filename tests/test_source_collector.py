@@ -1122,6 +1122,24 @@ def test_what_can_be_recorded_as_a_model_identifier(literal: object, accepted: b
     assert (model_identifier(literal) is not None) is accepted
 
 
+def test_a_value_another_library_holds_is_unread_and_an_object_it_builds_is_not(
+    tmp_path: Path,
+):
+    text = (
+        "from django.conf import settings\n"
+        "from company_settings import MODEL\n"
+        "from openai import OpenAI\n"
+        "from peft import get_peft_model\n\n"
+        "client = OpenAI()\n"
+        "client.chat.completions.create(model=settings.OPENAI_MODEL, messages=[])\n"
+        "client.chat.completions.create(model=MODEL, messages=[])\n"
+        "client.chat.completions.create(model=get_peft_model(None), messages=[])\n"
+    )
+    result = scan(tmp_path, {"app/views.py": text})
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [unread("app/views.py", 7, 2)]
+
+
 def test_a_windows_directory_is_a_gap_and_never_a_model_name(tmp_path: Path):
     text = (
         "from sentence_transformers import SentenceTransformer\n\n"
