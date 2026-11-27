@@ -120,18 +120,100 @@ def test_keras_v3_dangerous_module_deserialization_flagged(
     assert explanation == ZIP_KERAS_CODE_EXECUTION
 
 
-def test_keras_v3_tf_op_lambda_with_function_flagged(tmp_path: Path) -> None:
-    config = {
-        "module": "keras.layers.core.tf_op_layer",
-        "class_name": "TFOpLambda",
-        "config": {"name": "op", "function": "os.system"},
-    }
-    model_path = _write_keras_zip(
-        tmp_path / "tf_op.keras", config, member_name="nested/config.json"
+@pytest.mark.parametrize(
+    "layer",
+    [
+        {"module": "builtins", "class_name": "function", "config": "relu"},
+        {
+            "module": "keras.layers.core.tf_op_layer",
+            "class_name": "TFOpLambda",
+            "config": {"name": "op", "function": "math.add"},
+        },
+    ],
+)
+def test_standard_keras_functions_are_not_arbitrary_code(tmp_path: Path, layer: dict) -> None:
+    config = {"module": "keras", "class_name": "Functional", "config": {"layers": [layer]}}
+    archive = _write_keras_zip(tmp_path / "standard.keras", config)
+    assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE)
+
+
+@pytest.mark.parametrize("suffix", [".keras", ".npz"])
+def test_nested_application_assets_are_not_model_descriptors(tmp_path: Path, suffix: str) -> None:
+    archive = tmp_path / f"model{suffix}"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        if suffix == ".keras":
+            bundle.writestr(
+                "config.json", '{"module":"keras","class_name":"Sequential","config":{"layers":[]}}'
+            )
+        bundle.writestr(
+            "assets/config.json", '{"module":"builtins","class_name":"str","config":{}}'
+        )
+    assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {"module": "keras", "class_name": "Sequential"},
+        [],
+        {
+            "module": "keras",
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": None, "config": {}}]},
+        },
+        {"module": "example_definitions", "class_name": "function", "config": "an_ordinary_name"},
+    ],
+)
+def test_incomplete_model_descriptor_is_unread(tmp_path: Path, config: object) -> None:
+    archive = _write_keras_zip(tmp_path / "incomplete.keras", json.dumps(config))
+    assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
+
+
+def test_keras_descriptor_must_be_present_in_named_model(tmp_path: Path) -> None:
+    archive = tmp_path / "missing.keras"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("assets/readme.txt", "example asset")
+    assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
+
+
+def test_generic_zip_may_contain_root_application_settings(tmp_path: Path) -> None:
+    archive = tmp_path / "numeric.npz"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("config.json", '{"display_units":"meters","description":"sample"}')
+    assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE)
+
+
+@pytest.mark.parametrize("capacity", [0, 4, None, 128])
+def test_descriptor_read_reserves_its_output_budget_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capacity: int | None
+) -> None:
+    from nexus_symbiote.scanners import model
+
+    payload = b'{"class_name":"Sequential","config":{"layers":[]}}'
+    units = len(payload) if capacity is None else capacity
+    archive = _write_keras_zip(tmp_path / "budgeted.keras", payload)
+    with zipfile.ZipFile(archive) as bundle:
+        info = bundle.getinfo("config.json")
+        boundary = bundle.getinfo("metadata.json").header_offset
+    member = model._ZipMember(
+        b"config.json", info.compress_type, info.compress_size, info.header_offset
     )
-    safety, explanation = inspect_model_format(model_path)
-    assert safety is SerializationSafety.UNSAFE_CODE_EXECUTION
-    assert explanation == ZIP_KERAS_CODE_EXECUTION
+    budget = InspectionBudget(units)
+    original = model._MemberData.read
+    requests = []
+
+    def checked_read(reader: model._MemberData, size: int) -> bytes:
+        requests.append(size)
+        assert budget.remaining == units - size
+        return original(reader, size)
+
+    monkeypatch.setattr(model._MemberData, "read", checked_read)
+    with archive.open("rb") as stream:
+        verdict = model._member_holds_keras_code(stream, member, boundary, budget, required=True)
+    assert requests == ([units] if units else [])
+    assert verdict is (False if units >= len(payload) else None)
+    assert budget.remaining == max(0, units - len(payload))
 
 
 def test_renamed_keras_lambda_archive_under_models_dir_caught_by_content(tmp_path: Path) -> None:
@@ -175,13 +257,13 @@ def test_keras_budget_exhaustion_fails_closed_as_unread(tmp_path: Path) -> None:
 
 def test_keras_non_json_or_empty_config_does_not_crash(tmp_path: Path) -> None:
     empty_path = _write_keras_zip(tmp_path / "empty.keras", b"")
-    assert inspect_model_format(empty_path) == (SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE)
+    assert inspect_model_format(empty_path) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
 
     non_utf8 = _write_keras_zip(tmp_path / "bin_cfg.keras", b"\xff\xfe\xfd")
-    assert inspect_model_format(non_utf8) == (SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE)
+    assert inspect_model_format(non_utf8) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
 
     bad_json = _write_keras_zip(tmp_path / "bad_json.keras", "{not-json")
-    assert inspect_model_format(bad_json) == (SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE)
+    assert inspect_model_format(bad_json) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
 
 
 @pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16-le", "utf-16-be", "utf-32-le"])

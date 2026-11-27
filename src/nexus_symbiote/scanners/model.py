@@ -177,6 +177,46 @@ MAX_KERAS_CONFIG_DEPTH = 64
 MAX_KERAS_CONFIG_NODES = 100_000
 _KERAS_CODE_CLASSES = frozenset({"Lambda", "__lambda__"})
 _KERAS_OP_LAMBDA_CLASSES = frozenset({"TFOpLambda", "SlicingOpLambda"})
+# Keras serializes named activation functions with module="builtins" and looks
+# them up in its API registry. No model or third-party module is imported here.
+_KERAS_ACTIVATIONS = frozenset(
+    [
+        "relu",
+        "leaky_relu",
+        "relu6",
+        "softmax",
+        "celu",
+        "elu",
+        "selu",
+        "softplus",
+        "softsign",
+        "squareplus",
+        "soft_shrink",
+        "sparse_plus",
+        "silu",
+        "gelu",
+        "glu",
+        "tanh",
+        "tanh_shrink",
+        "threshold",
+        "sigmoid",
+        "exponential",
+        "hard_sigmoid",
+        "hard_silu",
+        "hard_tanh",
+        "hard_shrink",
+        "linear",
+        "mish",
+        "log_softmax",
+        "log_sigmoid",
+        "sparsemax",
+        "swish",
+        "hard_swish",
+    ]
+)
+_KERAS_ARITHMETIC_OPS = frozenset(
+    {"math.add", "math.subtract", "math.multiply", "math.divide", "math.maximum", "math.minimum"}
+)
 _KERAS_DANGEROUS_MODULES = frozenset(
     {
         "asyncio",
@@ -903,6 +943,10 @@ class _MemberData:
         self._remaining -= len(data)
         return data
 
+    @property
+    def complete(self) -> bool:
+        return self._remaining == 0 if self._inflater is None else self._inflater.eof
+
     def read(self, size: int) -> bytes:
         if self._inflater is None:
             return self._input(size)
@@ -913,6 +957,8 @@ class _MemberData:
                     break
                 self._pending = self._input(self._chunk)
                 self._chunk = min(2 * self._chunk, 65536)
+                if not self._pending:
+                    break
             out += self._inflater.decompress(self._pending, size - len(out))
             self._pending = self._inflater.unconsumed_tail
         return bytes(out)
@@ -1086,22 +1132,33 @@ def _object_dtype_string(text: str) -> bool:
 
 
 def _keras_config_member(name: bytes) -> bool:
-    """Whether a ZIP member's name is a Keras v3 ``config.json`` descriptor."""
-    for raw in {name, name.split(b"\0", 1)[0]}:
-        normalized = raw.decode("latin-1").replace("\\", "/").rstrip("/").lower()
-        if normalized == "config.json" or normalized.endswith("/config.json"):
-            return True
-    return False
+    """Keras opens the case-sensitive root member; ZipInfo truncates names at NUL."""
+    return name.partition(b"\0")[0] == b"config.json"
 
 
-def _keras_config_has_code(document: object) -> bool | None:
+def _keras_config_has_code(document: object, *, required: bool) -> bool | None:
     """Whether a parsed Keras v3 config declares Lambda or dangerous custom-module execution.
 
-    Traverses iteratively under ``MAX_KERAS_CONFIG_NODES`` so deeply nested or huge JSON
-    graphs never recurse or exhaust memory. Returns ``None`` when the node bound is exceeded.
+    Return ``None`` for incomplete descriptors, unresolved functions or a traversal
+    that exceeds the node bound. A hazardous declaration elsewhere still takes precedence.
     """
+    if not required and (
+        not isinstance(document, dict)
+        or (
+            "class_name" not in document
+            and not (
+                isinstance(document.get("module"), str)
+                and document["module"].split(".", 1)[0] == "keras"
+            )
+        )
+    ):
+        # Other archive formats may carry ordinary application settings under this name.
+        return False
+    if not isinstance(document, dict) or not isinstance(document.get("class_name"), str):
+        return None
     pending: list[object] = [document]
     visited = 0
+    incomplete = False
     while pending:
         visited += 1
         if visited > MAX_KERAS_CONFIG_NODES:
@@ -1110,14 +1167,53 @@ def _keras_config_has_code(document: object) -> bool | None:
         if isinstance(node, dict):
             class_name = node.get("class_name")
             module = node.get("module")
+            if "class_name" in node and not isinstance(class_name, str):
+                incomplete = True
             if isinstance(class_name, str):
+                cfg = node.get("config")
+                config_type = str if class_name == "function" else (dict, list)
+                if not class_name or not isinstance(cfg, config_type):
+                    incomplete = True
+                if class_name in ("Sequential", "Functional", "Model"):
+                    layers = cfg.get("layers") if isinstance(cfg, dict) else cfg
+                    if not isinstance(layers, list) or any(
+                        not isinstance(layer, dict) or not isinstance(layer.get("class_name"), str)
+                        for layer in layers
+                    ):
+                        incomplete = True
                 if class_name in _KERAS_CODE_CLASSES:
                     return True
                 if class_name in _KERAS_OP_LAMBDA_CLASSES:
-                    cfg = node.get("config")
-                    if isinstance(cfg, dict) and isinstance(cfg.get("function"), (str, dict)):
+                    function = cfg.get("function") if isinstance(cfg, dict) else None
+                    if (
+                        isinstance(function, str)
+                        and function.split(".", 1)[0] in _KERAS_DANGEROUS_MODULES
+                    ):
                         return True
-            if isinstance(module, str):
+                    if (
+                        not isinstance(module, str)
+                        or not (
+                            module == "keras.layers"
+                            or module.startswith(
+                                (
+                                    "keras.layers.",
+                                    "keras.src.layers.",
+                                    "tensorflow.python.keras.layers.",
+                                )
+                            )
+                        )
+                        or not isinstance(function, str)
+                        or function not in _KERAS_ARITHMETIC_OPS
+                    ):
+                        incomplete = True
+                if class_name == "function":
+                    if (
+                        module not in ("builtins", "keras.activations")
+                        or not isinstance(cfg, str)
+                        or cfg not in _KERAS_ACTIVATIONS
+                    ):
+                        incomplete = True
+            if isinstance(module, str) and not (module == "builtins" and class_name == "function"):
                 root_module = module.split(".", 1)[0].strip().lower()
                 if root_module in _KERAS_DANGEROUS_MODULES and (
                     isinstance(class_name, str)
@@ -1125,25 +1221,29 @@ def _keras_config_has_code(document: object) -> bool | None:
                     or isinstance(node.get("function"), (str, dict, list))
                 ):
                     return True
+            if len(node) > MAX_KERAS_CONFIG_NODES - visited - len(pending):
+                return None
             pending.extend(node.values())
         elif isinstance(node, list):
+            if len(node) > MAX_KERAS_CONFIG_NODES - visited - len(pending):
+                return None
             pending.extend(node)
-    return False
+    return None if incomplete else False
 
 
 def _member_holds_keras_code(
-    stream: BinaryIO, member: _ZipMember, end: int, budget: InspectionBudget
+    stream: BinaryIO, member: _ZipMember, end: int, budget: InspectionBudget, *, required: bool
 ) -> bool | None:
     """Inspect a single ``config.json`` ZIP member for Keras v3 code-execution constructs."""
     if not _keras_config_member(member.name):
         return False
     if member.size == 0:
-        return False
+        return None
     if member.offset < 0 or member.offset + 30 > end:
         return None
     header = _reread(stream, member.offset, 30)
     if header[:4] != b"PK\x03\x04":
-        return False
+        return None
     start = member.offset + 30 + _little(header, 26, 2) + _little(header, 28, 2)
     if start + member.size > end:
         return None
@@ -1152,42 +1252,49 @@ def _member_holds_keras_code(
     data = _MemberData(stream, start, member.size, deflated=member.method == 8)
     raw = bytearray()
     try:
-        while len(raw) <= MAX_KERAS_CONFIG_BYTES:
-            chunk = data.read(min(8192, MAX_KERAS_CONFIG_BYTES + 1 - len(raw)))
-            if not chunk:
-                break
-            budget.charge(len(chunk), ZIP_MEMBER_UNREAD)
+        while not data.complete:
+            reserved = min(8192, MAX_KERAS_CONFIG_BYTES - len(raw), budget.remaining)
+            if reserved <= 0:
+                return None
+            budget.charge(reserved, ZIP_MEMBER_UNREAD)
+            chunk = data.read(reserved)
+            budget.remaining += reserved - len(chunk)
+            if not chunk and not data.complete:
+                return None
             raw += chunk
-    except FormatError:
-        return None
-    except zlib.error:
-        return False
-    if len(raw) > MAX_KERAS_CONFIG_BYTES:
+    except (FormatError, zlib.error):
         return None
     raw_bytes = bytes(raw)
     try:
         encoding = json.detect_encoding(raw_bytes)
         text = raw_bytes.decode(encoding)
     except (UnicodeDecodeError, LookupError):
-        return False
+        return None
     if json_nesting_exceeds(text, MAX_KERAS_CONFIG_DEPTH):
         return None
     try:
         document = json.loads(text)
     except (ValueError, RecursionError):
-        return False
-    return _keras_config_has_code(document)
+        return None
+    return _keras_config_has_code(document, required=required)
 
 
 def _members_hold_keras_code(
-    stream: BinaryIO, members: list[_ZipMember], directory: int, budget: InspectionBudget
+    stream: BinaryIO,
+    members: list[_ZipMember],
+    directory: int,
+    budget: InspectionBudget,
+    *,
+    required: bool,
 ) -> bool | None:
-    """Whether any ``config.json`` ZIP member declares executable Keras v3 layers/callables."""
+    """Inspect the root descriptor, including when the extension changed."""
+    if not any(_keras_config_member(member.name) for member in members):
+        return None if required else False
     ordered = sorted(members, key=lambda member: member.offset)
     unread = False
     for index, member in enumerate(ordered):
         end = min(ordered[index + 1].offset, directory) if index + 1 < len(ordered) else directory
-        found = _member_holds_keras_code(stream, member, end, budget)
+        found = _member_holds_keras_code(stream, member, end, budget, required=required)
         if found:
             return True
         unread = unread or found is None
@@ -1195,7 +1302,13 @@ def _members_hold_keras_code(
 
 
 def _recognized_code_container(
-    stream: BinaryIO, prefix: bytes, size: int, budget: InspectionBudget, *, by_content: bool
+    stream: BinaryIO,
+    prefix: bytes,
+    size: int,
+    budget: InspectionBudget,
+    *,
+    by_content: bool,
+    expect_keras: bool = False,
 ) -> tuple[SerializationSafety, str] | None:
     """A verdict on content a loader can run code from, or ``None`` for content not recognized.
 
@@ -1242,7 +1355,9 @@ def _recognized_code_container(
             return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_OBJECT_ARRAY
         if found is None:
             arrays = None
-        keras_code = _members_hold_keras_code(stream, members, offset, budget)
+        keras_code = _members_hold_keras_code(
+            stream, members, offset, budget, required=expect_keras
+        )
         if keras_code:
             return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_KERAS_CODE_EXECUTION
         if keras_code is None:
@@ -1349,6 +1464,7 @@ def inspect_model_format(
                     size,
                     budget or InspectionBudget(),
                     by_content=model_format(path) is None,
+                    expect_keras=path.suffix.lower() == ".keras",
                 )
                 # 'G' is an opcode byte, so GGUF content can parse as a pickle stream; the
                 # name rating says what the file is.
