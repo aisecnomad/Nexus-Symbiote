@@ -140,6 +140,10 @@ def _is_ai_package_name(name: str) -> bool:
     ) or any(kw in lowered for kw in _reg.AI_IMAGE_KEYWORDS)
 
 
+def _is_sha256_alg(alg: str) -> bool:
+    return alg.strip().upper().replace("-", "") == "SHA256"
+
+
 def _find_sha256(items: Any, alg_key: str, val_key: str) -> str | None:
     if isinstance(items, list):
         for item in items:
@@ -149,9 +153,7 @@ def _find_sha256(items: Any, alg_key: str, val_key: str) -> str | None:
                 and isinstance(item.get(val_key), str)
             ):
                 val = item[val_key].strip().removeprefix("sha256:").lower()
-                if item[alg_key].strip().upper().replace(
-                    "-", ""
-                ) == "SHA256" and _SHA256_HEX_RE.fullmatch(val):
+                if _is_sha256_alg(item[alg_key]) and _SHA256_HEX_RE.fullmatch(val):
                     return f"sha256:{val}"
     return None
 
@@ -469,7 +471,7 @@ def _require_cdx_entry(node: dict[str, Any], kind: str) -> None:
                 isinstance(item.get(k), str) for k in ("alg", "content")
             ):
                 raise ValueError("CycloneDX hashes must contain an algorithm and digest")
-            if item["alg"].upper().replace("-", "") == "SHA256":
+            if _is_sha256_alg(item["alg"]):
                 digest = _find_sha256([item], "alg", "content")
                 if not digest:
                     raise ValueError("CycloneDX SHA-256 digest has an invalid value")

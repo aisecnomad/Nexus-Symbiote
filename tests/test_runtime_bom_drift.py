@@ -242,7 +242,7 @@ def test_drift_mutable_tags_undeclared_sanitization_and_sarif(tmp_path):
                     {
                         "type": "container",
                         "name": "unpinned-worker",
-                        "purl": "pkg:docker/worker",
+                        "purl": "pkg:docker/unpinned-worker",
                     },
                 ],
             )
@@ -900,3 +900,195 @@ def test_context_key_redaction_recognizes_nested_names(tmp_path):
     (observed,) = report["observed"]
     assert set(observed["cluster_context"]) == {*sensitive, "k8s.workload.label"}
     assert observed["cluster_context"]["k8s.workload.label"] == "training"
+
+
+def test_trailing_slash_route_identity_preserved(tmp_path):
+    from nexus_symbiote.runtime_bom_drift import _normalize_endpoint
+
+    assert _normalize_endpoint("https://a.example/") != _normalize_endpoint("https://a.example")
+    assert _normalize_endpoint("https://tools.cluster.local:8443/mcp/") != _normalize_endpoint(
+        "https://tools.cluster.local:8443/mcp"
+    )
+
+    static_bom = AIBOM(
+        components=[
+            MCPServerComponent(
+                bom_ref="mcp:tools",
+                name="tools-gateway",
+                endpoint_url="https://tools.cluster.local:8443/mcp",
+            ),
+            A2AServerComponent(
+                bom_ref="a2a:planner",
+                name="planner-agent",
+                endpoint_url="https://planner.cluster.local/a2a",
+            ),
+        ]
+    )
+    inv = tmp_path / "static.json"
+    inv.write_text(static_bom.to_native_json(), encoding="utf-8")
+
+    snapshot = tmp_path / "cluster.cdx.json"
+    snapshot.write_text(
+        json.dumps(
+            _cdx(
+                services=[
+                    {
+                        "name": "tools-gateway",
+                        "endpoints": ["https://tools.cluster.local:8443/mcp/"],
+                    },
+                    {
+                        "name": "planner-agent",
+                        "endpoints": ["https://planner.cluster.local/a2a/"],
+                    },
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    report = collect(inv, [snapshot], fail_on="drift")
+    assert report["gate"]["passed"] is False
+    drifted = report["reconciliation"]["drifted"]
+    assert {item["name"]: item["drift_reasons"] for item in drifted} == {
+        "tools-gateway": ["endpoint_mismatch"],
+        "planner-agent": ["endpoint_mismatch"],
+    }
+
+
+def test_sha256_whitespace_normalization_and_static_digest_conflicts(tmp_path):
+    inv = _write_static_bom(tmp_path)
+    runtime_conflict = tmp_path / "runtime-conflict.cdx.json"
+    runtime_conflict.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "machine-learning-model",
+                        "name": "meta-llama/Llama-3.1-8B",
+                        "version": "1.0.0",
+                        "hashes": [
+                            {"alg": " SHA-256 ", "content": _SHA_A},
+                            {"alg": "SHA-256", "content": _SHA_B},
+                        ],
+                    }
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError):
+        collect(inv, [runtime_conflict])
+
+    clean_runtime = tmp_path / "clean.cdx.json"
+    clean_runtime.write_text(json.dumps(_cdx()), encoding="utf-8")
+
+    inv_dup = tmp_path / "static-conflict.json"
+    inv_dup.write_text(
+        AIBOM(
+            components=[
+                ModelComponent(
+                    bom_ref="model:dup",
+                    name="meta-llama/Llama-3.1-8B",
+                    version="1.0.0",
+                    hashes={"sha256": _SHA_A, "SHA-256": _SHA_B},
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError):
+        collect(inv_dup, [clean_runtime])
+
+    inv_bad = tmp_path / "static-invalid.json"
+    inv_bad.write_text(
+        AIBOM(
+            components=[
+                ModelComponent(
+                    bom_ref="model:bad",
+                    name="meta-llama/Llama-3.1-8B",
+                    version="1.0.0",
+                    hashes={" SHA-256 ": "invalid-hex"},
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError):
+        collect(inv_bad, [clean_runtime])
+
+    inv_pin_conflict = tmp_path / "static-pin-conflict.json"
+    inv_pin_conflict.write_text(
+        AIBOM(
+            components=[
+                RegistryEntryComponent(
+                    bom_ref="reg:conflict",
+                    name=f"ghcr.io/org/agent-runner@sha256:{_SHA_B}",
+                    package_url=f"pkg:oci/agent-runner@sha256:{_SHA_B}",
+                    hashes={"SHA-256": _SHA_A},
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError):
+        collect(inv_pin_conflict, [clean_runtime])
+
+
+@pytest.mark.parametrize(
+    ("image_name", "bad_purl"),
+    [
+        (
+            f"ghcr.io/org/agent-runner@sha256:{_SHA_A}",
+            f"pkg:oci/other@sha256:{_SHA_A}",
+        ),
+        (
+            f"ghcr.io/org/agent-runner@sha256:{_SHA_A}",
+            f"pkg:oci/agent-runner@sha256:{_SHA_A}?repository_url=quay.io/evil/agent-runner",
+        ),
+        (
+            f"ghcr.io/org/agent-runner@sha256:{_SHA_A}",
+            f"pkg:docker/otherorg/agent-runner@sha256:{_SHA_A}",
+        ),
+        (
+            "ghcr.io/org/agent-runner:v1",
+            f"pkg:oci/agent-runner@sha256:{_SHA_A}?tag=v2",
+        ),
+    ],
+)
+def test_oci_purl_repository_reconciliation_rejects_mismatches(tmp_path, image_name, bad_purl):
+    inv = _write_static_bom(tmp_path)
+    runtime_bad = tmp_path / "runtime-bad-oci.cdx.json"
+    runtime_bad.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "container",
+                        "name": image_name,
+                        "purl": bad_purl,
+                    }
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError):
+        collect(inv, [runtime_bad])
+
+    clean_runtime = tmp_path / "clean-oci.cdx.json"
+    clean_runtime.write_text(json.dumps(_cdx()), encoding="utf-8")
+    bad_static = tmp_path / "static-bad-oci.json"
+    bad_static.write_text(
+        AIBOM(
+            components=[
+                RegistryEntryComponent(
+                    bom_ref="reg:bad",
+                    name=image_name,
+                    package_url=bad_purl,
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError):
+        collect(bad_static, [clean_runtime])

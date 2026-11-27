@@ -42,6 +42,7 @@ from nexus_symbiote.sbom_import import (
     _clean_exact_spec,
     _extract_cdx_entries,
     _is_ai_package_name,
+    _is_sha256_alg,
     _norm_pkg,
 )
 from nexus_symbiote.scanners.registry import parse_image_reference
@@ -94,11 +95,11 @@ def _normalize_endpoint(raw_url: str) -> str | None:
         port = 80
     elif port is None and parsed.scheme in {"https", "wss", ""}:
         port = 443
-    path = parsed.path.rstrip("/")
+    path = parsed.path
     if ":" in host:
         host = f"[{host}]"
     base = f"{parsed.scheme}://{host}" + (f":{port}" if port is not None else "")
-    return f"{base}{path}" if path else base
+    return f"{base}{path}"
 
 
 def _open_error(path: Path, exc: OSError) -> str:
@@ -225,8 +226,42 @@ def _check_container_mutability(name: str, version: str | None, purl: str | None
     return "container workload has no immutable digest"
 
 
-def _image_key(name: str) -> str:
+def _image_key(name: str, version: str | None = None, purl: str | None = None) -> str:
     reference = parse_image_reference(name)
+    package = _parse_purl(purl)
+    if package is not None:
+        if package.type not in {"oci", "docker"} or reference is None:
+            raise RuntimeBOMInputError("Container image name and package URL repository disagree.")
+        expected_leaf = reference.path.rsplit("/", 1)[-1]
+        purl_leaf = package.name
+        if ":" in package.name:
+            base, ptag = package.name.split(":", 1)
+            known_tags = {t for t in (reference.tag, version) if isinstance(t, str) and t}
+            if base == expected_leaf and ptag in known_tags:
+                purl_leaf = base
+        if purl_leaf.lower() != expected_leaf.lower():
+            raise RuntimeBOMInputError("Container image name and package URL repository disagree.")
+        repo_url = package.qualifiers.get("repository_url")
+        if repo_url is not None:
+            repo_ref = parse_image_reference(repo_url)
+            if (
+                repo_ref is None
+                or repo_ref.digest is not None
+                or repo_ref.tag is not None
+                or repo_ref.repository.lower() != reference.repository.lower()
+            ):
+                raise RuntimeBOMInputError(
+                    "Container image name and package URL repository disagree."
+                )
+        if package.namespace:
+            ns_repo = f"{package.namespace}/{purl_leaf}".lower()
+            if ns_repo not in {reference.path.lower(), reference.repository.lower()}:
+                raise RuntimeBOMInputError(
+                    "Container image name and package URL repository disagree."
+                )
+        tag_q = package.qualifiers.get("tag")
+        if tag_q is not None and reference.tag is not None and tag_q != reference.tag:
+            raise RuntimeBOMInputError("Container image tag and package URL tag disagree.")
     return reference.repository if reference else name
 
 
@@ -377,7 +412,7 @@ def _collect_observations(
                 norm_key = name.lower()
             elif is_container:
                 kind = "container"
-                norm_key = _image_key(name)
+                norm_key = _image_key(name, version, purl)
                 reference = parse_image_reference(name)
                 if not version and reference:
                     version = reference.tag
@@ -462,6 +497,7 @@ class _StaticCatalog:
     packages: dict[str, list[RegistryEntryComponent]]
     package_keys: set[str]
     images: dict[str, list[RegistryEntryComponent]]
+    digests: dict[int, str]
 
 
 def _index_static_bom(bom: AIBOM) -> _StaticCatalog:
@@ -472,7 +508,11 @@ def _index_static_bom(bom: AIBOM) -> _StaticCatalog:
 
     images: dict[str, list[RegistryEntryComponent]] = {}
     package_names: set[str] = set()
+    digests: dict[int, str] = {}
     for comp in bom.components:
+        digest = _static_sha256(comp)
+        if digest is not None:
+            digests[id(comp)] = digest
         if isinstance(comp, ModelComponent):
             keys = set()
             for name in (comp.name, comp.requested_alias):
@@ -496,7 +536,18 @@ def _index_static_bom(bom: AIBOM) -> _StaticCatalog:
             if comp.registry_type in {"docker-hub", "oci"} or (
                 package and package.type in {"oci", "docker"}
             ):
-                images.setdefault(_image_key(comp.name), []).append(comp)
+                images.setdefault(_image_key(comp.name, comp.version, comp.package_url), []).append(
+                    comp
+                )
+                norm_static_pin = _normalize_sha256(
+                    _image_pin(comp.name, comp.version, comp.package_url)
+                )
+                if digest and norm_static_pin and digest != norm_static_pin:
+                    raise RuntimeBOMInputError(
+                        "Static container hash and reference digest disagree."
+                    )
+                if norm_static_pin and digest is None:
+                    digests[id(comp)] = norm_static_pin
             else:
                 eco, name = _package_identity(comp.name, comp.package_url, comp.registry_type)
                 packages.setdefault(f"{eco}:{name}", []).append(comp)
@@ -508,6 +559,7 @@ def _index_static_bom(bom: AIBOM) -> _StaticCatalog:
         packages=packages,
         package_keys=package_names,
         images=images,
+        digests=digests,
     )
 
 
@@ -515,12 +567,16 @@ def _static_sha256(comp: Any) -> str | None:
     hashes = getattr(comp, "hashes", None)
     if not isinstance(hashes, Mapping):
         return None
+    digests: set[str] = set()
     for alg, digest in hashes.items():
-        if str(alg).strip().lower().replace("-", "") == "sha256":
+        if _is_sha256_alg(str(alg)):
             normalized = _normalize_sha256(digest)
-            if normalized:
-                return normalized
-    return None
+            if not normalized:
+                raise RuntimeBOMInputError("Static component has an invalid SHA-256 digest.")
+            digests.add(normalized)
+    if len(digests) > 1:
+        raise RuntimeBOMInputError("Static component has conflicting SHA-256 digests.")
+    return next(iter(digests), None)
 
 
 def collect(
@@ -595,14 +651,13 @@ def collect(
             if isinstance(comp, RegistryEntryComponent):
                 package = _parse_purl(comp.package_url)
                 version = (package.version if package else None) or _clean_exact_spec(version)
-            digest = _static_sha256(comp)
+            digest = catalog.digests.get(id(comp))
             different_pin = False
             observed_version = obs.version
             if obs.kind == "container":
                 static_pin = _image_pin(comp.name, comp.version, comp.package_url)
                 runtime_pin = _image_pin(obs.name, obs.version, obs.purl)
                 different_pin = bool(static_pin and runtime_pin and static_pin != runtime_pin)
-                digest = digest or _normalize_sha256(static_pin)
                 if not version or version == static_pin:
                     reference = parse_image_reference(comp.name)
                     version = reference.tag if reference else None
