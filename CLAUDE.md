@@ -35,7 +35,7 @@ src/nexus_symbiote/
   reporting.py                         — Neutralized text and JSON gate reporting
   scanner_catalog.py                   — Built-in collector universe for coverage checks
   text_poisoning.py                    — Deterministic O(N) text-poisoning and injection rules
-  literal_credentials.py               — Vendor token shapes in collected sources, recorded by line and SHA-256 fingerprint
+  literal_credentials.py               — Vendor token shapes in collected sources, recorded by location with an optional keyed HMAC
   credential_allowlist.py              — Explicit fingerprint or path-glob allowlist for vendor-shaped credential findings
   cli.py, live_cli.py, runtime_cli.py, supply_chain_cli.py — Click CLI entrypoints
 ```

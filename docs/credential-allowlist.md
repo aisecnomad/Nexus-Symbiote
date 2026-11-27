@@ -11,6 +11,8 @@ Suppression is a file at the scan root, not a key in `.nexus-symbiote.yaml` (tha
 - `.nexus-symbiote-credential-allowlist.yaml`, or
 - `.nexus-symbiote-credential-allowlist.yml`
 
+A checkout can request credential suppressions. Pass `--accept-project-policy` to apply a reviewed allowlist to `scan`, `validate --project`, and `risk --project`. Each command records the accepted relaxation in `policy_weakened`. An operator policy withholds checkout credential suppressions. The MCP collector still redacts recognized literals from output, including reviewed samples.
+
 A missing file suppresses nothing. Both names at once, a file over 64 KiB, undecodable bytes, or a document that is not the mapping below suppresses nothing and is a collection failure. `--no-project-policy` does not load the file.
 
 ```yaml

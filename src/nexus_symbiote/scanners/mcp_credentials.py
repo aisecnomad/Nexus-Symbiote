@@ -24,9 +24,13 @@ from nexus_symbiote.utils.secrets import (
     SecretScrubber,
     authorization_header,
     credential_shaped,
+    ignored_credential_char,
     private_key_block,
     scheme_credential_like,
     scheme_parts,
+)
+from nexus_symbiote.utils.secrets import (
+    normalize_credential as normalize_credential,
 )
 
 
@@ -332,14 +336,6 @@ def name_words(name: str) -> list[str]:
     return [word.lower() for word in _NAME_PARTS.split(name) if word and not word.isdigit()]
 
 
-def _ignored_credential_char(char: str) -> bool:
-    """Format characters, variation selectors, and Unicode or ASCII whitespace."""
-    if char.isspace() or unicodedata.category(char) in {"Cf", "Zs"}:
-        return True
-    code = ord(char)
-    return 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF
-
-
 def _normalize_credential_map(value: str) -> tuple[str, list[tuple[int, int]]]:
     """Normalized text and the original ``(start, end)`` slice of each kept character."""
     chars: list[str] = []
@@ -347,7 +343,7 @@ def _normalize_credential_map(value: str) -> tuple[str, list[tuple[int, int]]]:
     length = len(value)
     index = 0
     while index < length:
-        if _ignored_credential_char(value[index]):
+        if ignored_credential_char(value[index]):
             index += 1
             continue
         cluster_start = index
@@ -360,7 +356,7 @@ def _normalize_credential_map(value: str) -> tuple[str, list[tuple[int, int]]]:
             index += 1
         cluster_end = index
         for piece in unicodedata.normalize("NFKC", value[cluster_start:cluster_end]):
-            if _ignored_credential_char(piece):
+            if ignored_credential_char(piece):
                 continue
             chars.append(piece)
             mapping.append((cluster_start, cluster_end))
@@ -381,16 +377,6 @@ def _merged_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
-def normalize_credential(value: str) -> str:
-    """NFKC, then drop Cf, variation selectors and whitespace.
-
-    Applied to a stored credential and to the text it is matched against, so a clean
-    password scrubs a marked sibling and a marked password scrubs the clean spelling.
-    """
-    text = unicodedata.normalize("NFKC", value)
-    return "".join(char for char in text if not _ignored_credential_char(char))
-
-
 def credential_spellings(value: str) -> tuple[str, ...]:
     """``value`` and its normalized spelling, when that spelling still reads as a secret."""
     plain = normalize_credential(value)
@@ -409,7 +395,7 @@ def _text_needs_credential_normalize(text: str) -> bool:
             if char.isspace() and char != " ":
                 return True
             continue
-        if _ignored_credential_char(char):
+        if ignored_credential_char(char):
             return True
     return False
 
@@ -805,19 +791,8 @@ def public_scheme_operand(value: str) -> bool:
 
 
 def _token_hits(value: str) -> list[Hit]:
-    """Vendor shapes in ``value``. A body that looks like an example is still a hit.
-
-    ``placeholder()`` does not drop a match. The shape table already requires the
-    vendor prefix and its minimum length, so ``sk-...``, ``xxxx`` and
-    ``<YOUR_API_KEY>`` do not match. An explicit allowlist entry can suppress one.
-    """
-    from nexus_symbiote.credential_allowlist import credential_suppressed
-
-    return [
-        (SHAPE_CLASS, match.group())
-        for match in TOKEN_SHAPE.finditer(value)
-        if not credential_suppressed(match.group())
-    ]
+    """Keep every vendor-shaped literal for redaction, including reviewed samples."""
+    return [(SHAPE_CLASS, match.group()) for match in TOKEN_SHAPE.finditer(value)]
 
 
 def _private_key(value: str) -> str | None:

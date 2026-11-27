@@ -60,6 +60,7 @@ from nexus_symbiote.core.models import (
     RiskAssessment,
     ToolComponent,
 )
+from nexus_symbiote.credential_allowlist import credential_suppressed
 from nexus_symbiote.scanners.base import (
     KnownValues,
     Scanner,
@@ -2200,7 +2201,9 @@ def _literals(positions: PositionHits) -> list[str]:
     return [literal for _, _, hits in positions for _, literal in hits if literal]
 
 
-def _credential_positions(hits: PositionHits, names: _Names | None = None) -> list[tuple[str, str]]:
+def _credential_positions(
+    hits: PositionHits, names: _Names | None = None, *, source_path: str = ""
+) -> list[tuple[str, str]]:
     """Each launch position holding a literal credential, with its pattern class.
 
     Positions are named as the inventory exports them: a name it withholds, such as one holding
@@ -2212,7 +2215,13 @@ def _credential_positions(hits: PositionHits, names: _Names | None = None) -> li
     names = names or _Names(_literals(hits)).scoped()
     positions: dict[tuple[str, str], None] = {}
     for kind, name, found_hits in hits:
-        found = strongest(found_hits)
+        # Suppress reviewed vendor findings only after every raw hit has fed redaction.
+        suppressed = {
+            literal
+            for pattern_class, literal in found_hits
+            if pattern_class == SHAPE_CLASS and credential_suppressed(literal, rel_path=source_path)
+        }
+        found = strongest(hit for hit in found_hits if hit[1] not in suppressed)
         if found is None:
             continue
         if kind == "env":
@@ -3921,15 +3930,12 @@ class MCPScanner(Scanner):
             entries = read.servers
             server_hits: dict[int, PositionHits] = {}
             overflow_values: list[str] = []
-            from nexus_symbiote.credential_allowlist import bind_credential_path
-
-            with bind_credential_path(dialect.path):
-                values = self._file_secrets(
-                    [*entries, *(("", config) for config in read.dropped)],
-                    dialect.shape,
-                    server_hits,
-                    overflow_values=overflow_values,
-                )
+            values = self._file_secrets(
+                [*entries, *(("", config) for config in read.dropped)],
+                dialect.shape,
+                server_hits,
+                overflow_values=overflow_values,
+            )
             # Retain values from refused files when withholding names declared in source.
             if known is not None:
                 known.add(values)
@@ -4560,7 +4566,7 @@ class MCPScanner(Scanner):
         risks = self._server_risks(
             name,
             launch=launch,
-            credentials=_credential_positions(credential_hits, names),
+            credentials=_credential_positions(credential_hits, names, source_path=dialect.path),
             transport=transport,
             command=command,
             endpoint_url=endpoint_url,
