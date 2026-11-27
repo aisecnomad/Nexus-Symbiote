@@ -1653,7 +1653,7 @@ def test_remote_code_is_read_on_every_sdk_call_and_options_it_cannot_read_are_a_
         {
             "run.py": "import litellm\nfrom langchain_community.llms import VLLM\n"
             "from sentence_transformers import SentenceTransformer\n"
-            "from transformers import AutoModel\nfrom vllm import LLM\n\nOPTIONS = {}\n"
+            "from transformers import AutoModel\nfrom vllm import LLM\n\nOPTIONS = load_options()\n"
             f"{call}\n"
         },
     )
