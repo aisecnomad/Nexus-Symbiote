@@ -23,12 +23,12 @@ allow:
     reason: "Checked-in documentation samples."
 ```
 
-Each entry has a `reason` (one line, at most 200 characters) and exactly one of:
+Each entry has a `reason` (one line, at most 200 characters, not blank) and exactly one of:
 
 | Field | Matches |
 | --- | --- |
 | `fingerprint` | 64 lowercase hex digits. SHA-256 of the token after NFKC and after format characters, spaces and variation selectors are removed. The finding does not print this digest. |
-| `path` | A relative glob. `*` is one path segment, `**` is any number of segments. No absolute path, backslash, or `..`. |
+| `path` | A relative glob. `*` is one path segment, `**` is any number of segments. No absolute path, backslash, or `..`, and not only wildcards: `**`, `*` and `**/*` are refused. |
 
 A path entry suppresses every vendor-shaped token in each matching file. A fingerprint entry suppresses that spelling wherever the active file path is set. At most 256 entries.
 

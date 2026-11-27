@@ -6,6 +6,8 @@ import hashlib
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.models import PromptComponent
 from nexus_symbiote.credential_allowlist import (
@@ -225,3 +227,30 @@ def test_allowlist_read_and_close_failures_discard_valid_policy(tmp_path: Path) 
             rejected, error = load_credential_allowlist(tmp_path)
         assert not rejected.allow
         assert error == "credential allowlist: file could not be read; nothing is suppressed"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        'path: "**"\n    reason: "Every file."',
+        'path: "**/*"\n    reason: "Every file."',
+        'path: "*/**"\n    reason: "Every file."',
+        'path: "*"\n    reason: "Every root file."',
+        'path: "docs/**"\n    reason: "   "',
+        'fingerprint: "' + "0" * 64 + '"\n    reason: "\t"',
+    ],
+)
+def test_a_match_everything_glob_or_a_blank_reason_suppresses_nothing(
+    tmp_path: Path, entry: str
+) -> None:
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "sample.md").write_text(f'key = "{_FAKE}"\n', encoding="utf-8")
+    (tmp_path / ".nexus-symbiote-credential-allowlist.yaml").write_text(
+        f"allow:\n  - {entry}\n", encoding="utf-8"
+    )
+    allowlist, error = load_credential_allowlist(tmp_path)
+    assert error == "credential allowlist: file is not a valid allowlist; nothing is suppressed"
+    assert allowlist.allow == []
+    docs = PromptComponent(bom_ref="prompt:docs", name="docs", source_path="docs/sample.md")
+    with bind_credential_allowlist(allowlist):
+        assert apply_literal_credential_findings(AIBOM(components=[docs]), tmp_path) == 1
