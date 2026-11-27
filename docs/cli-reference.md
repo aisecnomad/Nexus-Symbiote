@@ -1023,14 +1023,17 @@ including declarations outside the [AI package catalog](registry-collector.md#ai
 Lockfiles supply resolution evidence for declared packages. Transitive dependencies present only
 in a lockfile are outside registry collection.
 `--advisory-db` `PATH` matches every
-exact PyPI/npm pin against an offline OSV bundle (a JSON file or a flat directory of OSV
+exact PyPI/npm pin in the inventory against an offline OSV bundle (a JSON file or a flat directory of OSV
 records, outside the scanned project) during the scan. Keep the bundle outside every Git
 working tree enclosing the project, the working directory, and, for replay, the supplied
 inventory. Each match is a `known_vulnerability`
 finding on the package, with the advisory's identifiers and severity, and the CycloneDX export
 lists it under `vulnerabilities`. The native completeness claim records the bundle SHA-256,
 newest record, coverage, and counts as a JSON receipt. Its `scope` is
-`inventoried-pypi-and-npm`. The receipt records `registry_lockfile_only_dependencies` as
+`inventoried-pypi-and-npm`. Its `registry_packages` is `all-supported` with `--all-packages`,
+`ai-catalog` without it, and `not-collected` when the registry collector is not selected. In the
+last two cases registry packages outside the AI catalog are never checked, so `scan` prints a
+warning and the receipt's coverage is at most `partial`. The receipt records `registry_lockfile_only_dependencies` as
 `not-collected` even when every eligible inventory entry was checked. CycloneDX exposes the same receipt as
 `nexus-symbiote:advisories:collection`. A scan with zero exact targets records `coverage: none`
 under `unobserved_surfaces`. A severity

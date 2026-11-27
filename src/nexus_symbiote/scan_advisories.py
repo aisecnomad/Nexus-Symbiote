@@ -50,6 +50,8 @@ _MAX_ALIASES = 16
 _MAX_ERRORS = 16
 _ADVISORY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _FEED_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+# Which registry declarations the inventory holds, widest first.
+REGISTRY_PACKAGES = ("all-supported", "ai-catalog", "not-collected")
 
 
 @dataclass
@@ -101,9 +103,18 @@ def _entry(advisory: dict[str, Any]) -> dict[str, Any]:
 
 
 def attach_offline_advisories(
-    aibom: AIBOM, db_path: Path, root: Path, *, inventory_path: Path | None = None
+    aibom: AIBOM,
+    db_path: Path,
+    root: Path,
+    *,
+    registry_packages: str,
+    inventory_path: Path | None = None,
 ) -> AdvisoryAttachment:
-    """Match the inventory against ``db_path``; record hits, failures and the surface line."""
+    """Match the inventory against ``db_path``; record hits, failures and the surface line.
+
+    ``registry_packages`` names the registry scope: coverage of a narrower one than every
+    supported declaration is at most partial.
+    """
     from nexus_symbiote.offline_advisories import (
         DEFAULT_MAX_FEED_AGE_DAYS,
         feed_in_input_repository,
@@ -180,7 +191,8 @@ def attach_offline_advisories(
         )
     # Encode the receipt in the existing completeness claim without a native schema change.
     # Keep the receipt stable across checkouts and bind the contents rather than the path.
-    coverage = "partial" if report.coverage == "complete" and failures else report.coverage
+    narrowed = bool(failures) or registry_packages != REGISTRY_PACKAGES[0]
+    coverage = "partial" if report.coverage == "complete" and narrowed else report.coverage
     surface = ADVISORY_SURFACE_PREFIX + json_text(
         {
             "advisories_recorded": recorded_count,
@@ -189,6 +201,7 @@ def attach_offline_advisories(
             "components_skipped": report.components_skipped,
             "coverage": coverage,
             "scope": "inventoried-pypi-and-npm",
+            "registry_packages": registry_packages,
             "registry_lockfile_only_dependencies": "not-collected",
             "db_sha256": provenance["db_sha256"],
             "db_newest_record": provenance["db_newest_record"],

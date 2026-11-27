@@ -447,7 +447,11 @@ class CompletenessValidator:
             from nexus_symbiote.scan_advisories import attach_offline_advisories
 
             attachment = attach_offline_advisories(
-                expected, advisory_db, root, inventory_path=inventory_path
+                expected,
+                advisory_db,
+                root,
+                registry_packages="all-supported" if all_packages else "ai-catalog",
+                inventory_path=inventory_path,
             )
             for reason in attachment.failures:
                 incomplete("advisories", reason)

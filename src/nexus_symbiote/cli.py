@@ -1170,7 +1170,8 @@ def _render_aibom(
         "Offline OSV bundle (a JSON file or a flat directory of OSV records) matched against "
         "every exact PyPI/npm pin in the inventory during the scan; matches are recorded as "
         "known_vulnerability findings on the package and exported as CycloneDX vulnerabilities. "
-        "No network I/O."
+        "Without --all-packages, registry packages outside the AI catalog are not checked and "
+        "coverage is recorded as partial. No network I/O."
     ),
 )
 @_exit_code_options
@@ -1394,7 +1395,26 @@ def scan(
     if advisory_db is not None:
         from nexus_symbiote.scan_advisories import attach_offline_advisories
 
-        attachment = attach_offline_advisories(aibom, advisory_db, root)
+        registry_packages = (
+            ("all-supported" if all_packages else "ai-catalog")
+            if "registry" in selected
+            else "not-collected"
+        )
+        if registry_packages == "ai-catalog":
+            echo_line(
+                "  --advisory-db checks only AI-catalog registry packages without "
+                "--all-packages; advisory coverage is recorded as partial",
+                err=True,
+            )
+        elif registry_packages == "not-collected":
+            echo_line(
+                "  --advisory-db checks no registry packages: the registry collector is not "
+                "selected; advisory coverage is recorded as partial",
+                err=True,
+            )
+        attachment = attach_offline_advisories(
+            aibom, advisory_db, root, registry_packages=registry_packages
+        )
         if attachment.failures:
             scan_failures.extend(attachment.failures)
             failures_by["advisories"] = attachment.failures

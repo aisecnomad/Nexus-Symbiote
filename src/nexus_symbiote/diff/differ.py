@@ -26,7 +26,7 @@ from nexus_symbiote.core.models import (
     MCPServerComponent,
     check_spec_version,
 )
-from nexus_symbiote.scan_advisories import parse_receipt
+from nexus_symbiote.scan_advisories import REGISTRY_PACKAGES, parse_receipt
 from nexus_symbiote.utils.crypto import (
     VERIFIED_SIGNING_STATUSES,
     SigningStatus,
@@ -276,6 +276,10 @@ def _advisory_receipts(claim: CompletenessClaim) -> list[tuple[str, dict[str, An
 
 def _receipt_count(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else -1
+
+
+def _scope_rank(value: object) -> int:
+    return REGISTRY_PACKAGES.index(value) if value in REGISTRY_PACKAGES else len(REGISTRY_PACKAGES)
 
 
 def _semantic_value(value: Any, path: tuple[str, ...]) -> Any:
@@ -1183,6 +1187,8 @@ class AIBOMDiffer:
                 )
             elif key == "advisories_recorded":
                 worse = False
+            elif key == "registry_packages":
+                worse = _scope_rank(after) > _scope_rank(before)
             elif key == "components_checked":
                 worse = _receipt_count(after) < _receipt_count(before)
             elif key.startswith("components_"):

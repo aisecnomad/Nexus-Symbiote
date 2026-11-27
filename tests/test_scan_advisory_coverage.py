@@ -229,3 +229,63 @@ def test_advisory_bundle_parent_symlink_is_refused(tmp_path: Path) -> None:
     assert not any(
         surface.startswith(ADVISORY_SURFACE_PREFIX) for surface in claim["surfaces_scanned"]
     )
+
+
+def _pillow_feed(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "id": "SYNTHETIC-PILLOW-1",
+        "modified": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+        "affected": [{"package": {"ecosystem": "PyPI", "name": "pillow"}, "versions": ["9.0.0"]}],
+        "database_specific": {"severity": "CRITICAL"},
+    }
+    path.write_text(json.dumps(record), encoding="utf-8")
+    return path
+
+
+def test_catalog_mode_receipt_is_partial_and_names_its_package_scope(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "requirements.txt").write_text("langchain==0.3.27\npillow==9.0.0\n")
+    feed = _pillow_feed(tmp_path / "operator" / "osv.json")
+    receipts = {}
+    for mode in ((), ("--all-packages",)):
+        output = tmp_path / f"inventory{len(mode)}.json"
+        response = CliRunner().invoke(
+            main,
+            [
+                "scan",
+                str(project),
+                "--no-project-policy",
+                "--report-only",
+                *mode,
+                "--advisory-db",
+                str(feed),
+                "-o",
+                str(output),
+            ],
+        )
+        assert response.exit_code == 0, response.output
+        assert ("AI-catalog" in response.stderr) is (not mode)
+        receipts[mode] = _receipt(json.loads(output.read_text()), "surfaces_scanned")
+    catalog, everything = receipts[()], receipts[("--all-packages",)]
+    assert (catalog["registry_packages"], catalog["coverage"]) == ("ai-catalog", "partial")
+    assert (everything["registry_packages"], everything["coverage"]) == (
+        "all-supported",
+        "complete",
+    )
+    replay = CliRunner().invoke(
+        main,
+        [
+            "validate",
+            str(tmp_path / "inventory0.json"),
+            "--project",
+            str(project),
+            "--no-project-policy",
+            "--skip-integrity",
+            "--json-output",
+            "--advisory-db",
+            str(feed),
+        ],
+    )
+    assert json.loads(replay.stdout)["assessment_basis"] == "project-reconciled", replay.output

@@ -109,3 +109,18 @@ def test_narrowed_advisory_coverage_alerts(tmp_path: Path) -> None:
         "offline advisory matching is no longer recorded" in alert["alert"].lower()
         for alert in report["security_alerts"]
     ), report["security_alerts"]
+
+
+def test_a_wider_package_scope_is_not_narrowed_coverage(tmp_path: Path) -> None:
+    feed = _feed(tmp_path / "operator" / "osv.json", "PYSEC-1")
+    project = _project(tmp_path, "langchain==0.3.27\nrequests==2.31.0\n")
+    catalog = _scan(project, tmp_path / "catalog.json", "--advisory-db", str(feed))
+    everything = _scan(project, tmp_path / "all.json", "--all-packages", "--advisory-db", str(feed))
+    _, wider = _diff(catalog, everything)
+    assert not any("advisory coverage" in alert["alert"] for alert in wider["security_alerts"])
+    _, narrower = _diff(everything, catalog)
+    assert any(
+        "registry_packages all-supported → ai-catalog" in alert["alert"]
+        for alert in narrower["security_alerts"]
+        if alert["severity"] == "high"
+    ), narrower["security_alerts"]
