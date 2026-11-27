@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
 
 from nexus_symbiote.core.aibom import AIBOM
+from nexus_symbiote.core.collection import IMPORTED_MODE
 from nexus_symbiote.core.models import MCPServerComponent, PromptComponent
 from nexus_symbiote.literal_credentials import MAX_LITERALS, apply_literal_credential_findings
 from nexus_symbiote.scanners.mcp_credentials import normalize_credential
@@ -339,3 +341,45 @@ def test_scan_and_sarif_locate_a_match_on_the_continuation_line(tmp_path: Path) 
             ]
         assert len(messages) == 1
         assert messages[0].startswith(".claude/skills/demo/SKILL.md:4:")
+
+
+def test_an_imported_citation_is_not_a_local_source(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(f"demo = '{_TOKEN}'", encoding="utf-8")
+    server = _server("app.py")
+    server.properties["collection_mode"] = IMPORTED_MODE
+    assert apply_literal_credential_findings(AIBOM(components=[server]), tmp_path) == 0
+
+
+def test_ordinary_source_alias_is_collected(tmp_path: Path) -> None:
+    (tmp_path / "impl.py").write_text(f"demo = '{_TOKEN}'", encoding="utf-8")
+    (tmp_path / "app.py").symlink_to("impl.py")
+    server = _server("app.py")
+    assert apply_literal_credential_findings(AIBOM(components=[server]), tmp_path) == 1
+    assert server.risks[0].detail.startswith("app.py:1")
+
+
+def test_credential_store_target_is_an_explicit_coverage_exclusion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "sample.txt").write_text("ordinary fixture text", encoding="utf-8")
+    (tmp_path / "app.py").symlink_to("secrets/sample.txt")
+    observed = (tmp_path / "secrets" / "sample.txt").stat()
+    read = os.read
+
+    def check_before_read(fd: int, length: int) -> bytes:
+        opened = os.fstat(fd)
+        assert (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino)
+        return read(fd, length)
+
+    monkeypatch.setattr(os, "read", check_before_read)
+    exclusions: list[str] = []
+    server = _server("app.py")
+    assert (
+        apply_literal_credential_findings(
+            AIBOM(components=[server]), tmp_path, exclusions=exclusions
+        )
+        == 0
+    )
+    assert len(exclusions) == 1 and "not read" in exclusions[0]
+    assert not server.risks

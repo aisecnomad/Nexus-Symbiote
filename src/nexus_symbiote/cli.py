@@ -1396,12 +1396,18 @@ def scan(
     if len(surfaces_excluded) > tp_exclusion_count:
         excluded_by["text_poisoning"] = surfaces_excluded[tp_exclusion_count:]
     literal_failure_count = len(scan_failures)
+    literal_exclusion_count = len(surfaces_excluded)
     apply_literal_credential_findings(
         aibom,
         root,
         exclude_paths=policy.scan.exclude_paths,
         failures=scan_failures,
+        exclusions=surfaces_excluded,
     )
+    if len(scan_failures) > literal_failure_count:
+        failures_by["literal_credentials"] = scan_failures[literal_failure_count:]
+    if len(surfaces_excluded) > literal_exclusion_count:
+        excluded_by["literal_credentials"] = surfaces_excluded[literal_exclusion_count:]
     env_failure_count = len(scan_failures)
     apply_env_credential_findings(
         aibom,
@@ -1409,8 +1415,6 @@ def scan(
         exclude_paths=policy.scan.exclude_paths,
         failures=scan_failures,
     )
-    if env_failure_count > literal_failure_count:
-        failures_by["literal_credentials"] = scan_failures[literal_failure_count:env_failure_count]
     if len(scan_failures) > env_failure_count:
         failures_by["env_credentials"] = scan_failures[env_failure_count:]
     graph_failures = validate_graph(aibom)

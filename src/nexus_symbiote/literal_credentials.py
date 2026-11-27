@@ -20,10 +20,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from nexus_symbiote.core.aibom import AIBOM
+from nexus_symbiote.core.collection import is_imported
 from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.models import RiskAssessment
 from nexus_symbiote.credential_allowlist import credential_suppressed
-from nexus_symbiote.scanners.credential_files import credential_shaped
+from nexus_symbiote.scanners.credential_files import credential_gap, credential_shaped
 from nexus_symbiote.scanners.mcp_credentials import normalize_credential
 from nexus_symbiote.scanners.source_binding import BindingError, value_binding
 from nexus_symbiote.utils.confined import ConfinedCollection
@@ -260,8 +261,8 @@ def apply_literal_credential_findings(
         return 0
     owners: dict[str, list[Any]] = {}
     for component in aibom.components:
-        path = getattr(component, "source_path", None)
-        if isinstance(path, str) and _eligible(path):
+        path = component.source_path
+        if path and not is_imported(component) and _eligible(path):
             owners.setdefault(path, []).append(component)
     if not owners:
         return 0
@@ -274,7 +275,7 @@ def apply_literal_credential_findings(
         for rel_path in sorted(owners):
             if files.excluded(rel_path) or files.is_directory(rel_path):
                 continue
-            raw = files.read_bytes(rel_path, missing_ok=True)
+            raw = files.read_bytes(rel_path, missing_ok=True, target_gap=credential_gap)
             if raw is None:
                 continue
             try:
