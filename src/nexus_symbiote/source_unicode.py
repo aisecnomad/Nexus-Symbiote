@@ -142,8 +142,13 @@ def apply_source_unicode_findings(
                 continue
             risks.extend(found)
             added += len(found)
-    if failures is not None:
-        failures.extend(own_failures)
-    if exclusions is not None:
-        exclusions.extend(own_exclusions)
+    # A file a collector already read can carry the same case-variant failure. List it once.
+    for target_list, own in ((failures, own_failures), (exclusions, own_exclusions)):
+        if target_list is None:
+            continue
+        known = set(target_list)
+        for msg in own:
+            if msg not in known:
+                target_list.append(msg)
+                known.add(msg)
     return added
