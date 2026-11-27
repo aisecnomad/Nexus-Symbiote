@@ -195,6 +195,56 @@ def test_sse_path_transport_depends_on_client_dialect(tmp_path):
     }
 
 
+def test_codex_stdio_omits_non_inheritable_names_from_local_and_remote_environments(tmp_path):
+    from nexus_symbiote.core.aibom import AIBOM
+    from nexus_symbiote.graph import blast_radius
+
+    blocked = [
+        "CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN",
+        "NODE_REPL_AUTH_TOKEN",
+        "CODEX_GUARDIAN_DECISIONS_API_KEY",
+        "OPENAI_FEDERATION_RULE_ID",
+        "OPENAI_IDENTITY_TOKEN_FILE",
+        "OPENAI_IDENTITY_TOKEN_SOURCE",
+        "OPENAI_SPIFFE_AUDIENCE",
+        "OPENAI_SPIFFE_ID",
+        "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+    ]
+    local_names = json.dumps([*blocked, "node_repl_auth_token", "SPIFFE_ENDPOINT_SOCKET"])
+    toml = f"""
+[mcp_servers.local]
+command = "catalog"
+env_vars = {local_names}
+env = {{ NODE_REPL_AUTH_TOKEN = "synthetic-local", DIRECT_KEY = "neutral-local" }}
+[mcp_servers.remote]
+command = "catalog"
+environment_id = "remote-catalog"
+env_vars = ["Node_Repl_Auth_Token", "ALLOWED_TOKEN",
+            {{ name = "openai_identity_token_file", source = "remote" }},
+            {{ name = "OTHER_TOKEN", source = "remote" }}]
+env = {{ Node_Repl_Auth_Token = "synthetic-remote" }}
+[mcp_servers.http]
+url = "https://catalog.example.test/mcp"
+bearer_token_env_var = "NODE_REPL_AUTH_TOKEN"
+env_http_headers = {{ X-Auth = "openai_identity_token_file" }}
+"""
+    result = scan(tmp_path, {".codex/config.toml": toml})
+    assert not result.scan_failures
+    records = servers(result)
+    local, remote, http = records["local"], records["remote"], records["http"]
+    assert local.properties["env_vars_referenced"] == ["SPIFFE_ENDPOINT_SOCKET"]
+    assert local.env == {"DIRECT_KEY": "***"}
+    assert remote.properties["env_vars_referenced"] == ["ALLOWED_TOKEN"]
+    assert remote.properties["remote_env_vars_referenced"] == ["OTHER_TOKEN"]
+    assert remote.env == {}
+    assert http.properties["env_vars_referenced"] == [
+        "NODE_REPL_AUTH_TOKEN",
+        "openai_identity_token_file",
+    ]
+    bom = AIBOM(components=result.components)
+    assert not blast_radius(bom, http.bom_ref)["shared_credential_surfaces"]
+
+
 def test_codex_environment_references_reach_blast_radius_without_reading_values(
     tmp_path, monkeypatch
 ):
@@ -285,18 +335,24 @@ env_vars = ["LOCAL_TOKEN", { name = "FOREIGN_TOKEN", source = "remote" }]
     assert not servers(result)
 
 
-def test_codex_local_override_does_not_mask_invalid_remote_source(tmp_path):
-    toml = """
+@pytest.mark.parametrize("remote_name", ["FOREIGN_TOKEN", "NODE_REPL_AUTH_TOKEN"])
+def test_codex_local_override_does_not_mask_invalid_remote_source(tmp_path, remote_name):
+    toml = f"""
 [mcp_servers.s]
 command = "catalog"
-env_vars = ["LOCAL_TOKEN", { name = "FOREIGN_TOKEN", source = "remote" }]
-env = { FOREIGN_TOKEN = "synthetic-override-value" }
+env_vars = ["LOCAL_TOKEN", {{ name = "{remote_name}", source = "remote" }}]
+env = {{ {remote_name} = "synthetic-override-value" }}
 """
     result = scan(tmp_path, {".codex/config.toml": toml})
     record = servers(result)["s"]
     assert "env_vars_referenced" not in record.properties
     assert "remote_env_vars_referenced" not in record.properties
     assert "synthetic-override-value" not in record.model_dump_json()
+
+
+def test_non_codex_stdio_keeps_env_names_restricted_only_by_codex(tmp_path):
+    other, _ = single(tmp_path, {"command": "catalog", "env": {"NODE_REPL_AUTH_TOKEN": "sample"}})
+    assert other.env == {"NODE_REPL_AUTH_TOKEN": "***"}
 
 
 def test_codex_withholds_foreign_config_values_and_unresolved_environment_sources(tmp_path):

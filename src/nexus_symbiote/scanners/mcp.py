@@ -2479,6 +2479,12 @@ _LIST_FIELDS = _names(
 )
 _MAP_FIELDS = frozenset({"env", "headers", "http_headers", "env_http_headers"})
 _CODEX_FORWARDING_FIELDS = frozenset({"env_vars", "env_http_headers", "bearer_token_env_var"})
+# Codex's NON_INHERITABLE_ENV_VARS, pinned in docs/collectors.md.
+_CODEX_STDIO_BLOCKED_ENV = _names(
+    "CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN NODE_REPL_AUTH_TOKEN CODEX_GUARDIAN_DECISIONS_API_KEY "
+    "OPENAI_FEDERATION_RULE_ID OPENAI_IDENTITY_TOKEN_FILE OPENAI_IDENTITY_TOKEN_SOURCE "
+    "OPENAI_SPIFFE_AUDIENCE OPENAI_SPIFFE_ID OPENAI_WORKLOAD_IDENTITY_CONTEXT"
+)
 _BOOL_FIELDS = frozenset({"disabled", "trust", "enabled", _OAUTH_DISABLED})
 _NUMBER_FIELDS = _names("timeout startup_timeout_sec startup_timeout_ms tool_timeout_sec")
 _OBJECT_FIELDS = frozenset({"oauth", "auth", "dev", _EXTENSION_SETTINGS})
@@ -2833,6 +2839,10 @@ def _codex_env_entry(entry: Any) -> bool:
     )
 
 
+def _codex_stdio_blocks(name: str) -> bool:
+    return name.isascii() and name.upper() in _CODEX_STDIO_BLOCKED_ENV
+
+
 def _codex_env_references(
     config: dict[str, Any], transport: str, names: _Names, protected: KnownValues
 ) -> dict[str, Any]:
@@ -2863,7 +2873,7 @@ def _codex_env_references(
             if remote_source and not remote_host:
                 # Codex checks source declarations before applying literal overrides.
                 return {}
-            if name not in overrides:
+            if name not in overrides and not _codex_stdio_blocks(name):
                 (remote if remote_source else local).add(name)
     elif transport == "streamable-http" and config.get("url"):
         if any(k in config for k in ("command", "args", "env", "env_vars", "cwd", "bearer_token")):
@@ -4782,6 +4792,10 @@ class MCPScanner(Scanner):
         )
         binding = _keyed_binding(key, config, resolver) if key is not None else {}
 
+        # Codex strips restricted keys after applying explicit stdio environment overrides.
+        effective_env = env
+        if dialect.shape == "codex" and transport == "stdio":
+            effective_env = {k: v for k, v in env.items() if not _codex_stdio_blocks(k)}
         server_comp = MCPServerComponent(
             bom_ref=server_ref,
             name=name,
@@ -4791,7 +4805,7 @@ class MCPScanner(Scanner):
             package_url=package_url,
             command=identity.command,
             args=[REDACTED for _ in args],
-            env=_exported_environment(env, names),
+            env=_exported_environment(effective_env, names),
             endpoint_url=identity.endpoint,
             version_pinned=version_pinned,
             source_path=config_scope,
