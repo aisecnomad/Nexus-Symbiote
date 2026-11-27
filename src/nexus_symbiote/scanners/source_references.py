@@ -39,8 +39,9 @@ _SECRET_SHAPED = re.compile(
 )
 # A model pinned by its version's digest, which is a hash, not a key.
 _PINNED = re.compile(r"[\w.-]+/[\w.-]+:[0-9a-f]{64}")
-# A path on this or another host: a drive, a share, the root or a home directory.
-_ABSOLUTE = re.compile(r"[A-Za-z]:[\\/]|\\\\|/|~")
+# A path on this or another host, after a routing prefix or none: a drive, a share, the
+# root or a home directory.
+_ABSOLUTE = re.compile(r"(?:^|:)(?:[A-Za-z]:|\\\\|/|~)")
 # Words a model argument holds that name no model on purpose.
 _NOT_A_MODEL = frozenset(
     {
@@ -99,7 +100,7 @@ def model_identifier(literal: object) -> str | None:
     lowered = text.lower()
     if lowered in _NOT_A_MODEL or lowered.endswith(_FILE_SUFFIXES) or "://" in text:
         return None
-    if text.startswith(("./", "../")) or _ABSOLUTE.match(text):
+    if text.startswith(("./", "../")) or _ABSOLUTE.search(text):
         return None
     if _SECRET_SHAPED.search(text) and not _PINNED.fullmatch(text):
         return None
@@ -110,8 +111,8 @@ def placeholder(text: str) -> bool:
     """Whether a model argument's text names no hosted model and is no gap: a word such as
     ``default``, or a path or weight file in the project, which the model collector reads."""
     text = text.strip()
-    local = text.startswith(("./", "../")) or text.lower().endswith(_FILE_SUFFIXES)
-    return not text or text.lower() in _NOT_A_MODEL or local and not _ABSOLUTE.match(text)
+    local = text.startswith(("./", "../", ".\\", "..\\")) or text.lower().endswith(_FILE_SUFFIXES)
+    return not text or text.lower() in _NOT_A_MODEL or local and not _ABSOLUTE.search(text)
 
 
 def split_route(literal: str) -> tuple[str, str | None]:
@@ -172,12 +173,8 @@ def _evidence(locations: Iterable[tuple[str, int]]) -> list[str]:
 
 
 class Declarations:
-    """What the readers found, keyed so that a second sighting adds evidence, not a twin.
-
-    A model is one component for the project, whatever the number of files that name
-    it. ``components`` returns the records in an order that depends only on what was
-    read.
-    """
+    """What the readers found: a model is one component for the project, however many files
+    name it, and ``components`` lists them in an order that depends only on what was read."""
 
     def __init__(self, result: ScanResult) -> None:
         self.result = result
@@ -208,20 +205,19 @@ class Declarations:
         remote_code: bool = False,
         environment: Iterable[str] = (),
     ) -> str | None:
-        """Record one reference to a model and return its component reference.
-
-        ``routes`` says the call routes by a prefix on the identifier, which then names
-        the provider; the model is one component for each provider it is routed to.
-        ``remote_code`` says the call that loads it lets the model run its own code, and
-        ``environment`` names the variables that, when set, give a model in its place."""
+        """Record one reference to a model. ``routes`` says the call routes by a prefix on the
+        identifier, which then names the provider, so the model is one component for each
+        provider it is routed to; ``remote_code`` says its call lets it run its code, and
+        ``environment`` names the variables that, when set, give another model."""
         if not isinstance(literal, str):
             return None
         if literal not in self._written:
-            # Each text is judged once: a file may give the same text at every call.
+            # Each text is judged once: a file may give the same text at every call. One
+            # longer than any identifier is not kept, so the memory does not grow with it.
             if len(self._written) >= MAX_RECORDS:
                 self._written.clear()
             self._written[literal] = model_identifier(literal)
-        written = self._written[literal]
+        written = self._written[literal] if len(literal) <= 256 else self._written.pop(literal)
         if written is None:
             return None
         name, routed = split_route(written) if routes else (written, None)
@@ -253,7 +249,10 @@ class Declarations:
         if written != name:
             record.aliases.add(written)
         record.remote_code = record.remote_code or remote_code
-        record.environment.update(filter(environment_name, environment))
+        # Each name was checked where it was read; one is checked again once for a model.
+        record.environment.update(
+            filter(environment_name, frozenset(environment) - record.environment)
+        )
         return model_ref(name, routed)
 
     def close(self) -> None:

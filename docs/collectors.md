@@ -40,14 +40,17 @@ of another library or of Python, such as a logger, and a method of what one retu
 not. Of an object the reader cannot tell, such as an untyped or `Any` parameter or a
 framework's state, a call is read when it is named as SDK calls are (`create`, `chat`,
 `completions`, `invoke`, `generate_content` and the like), so a metrics label or an
-ORM query is not.
+ORM query is not. A call of a name the reader cannot tell, such as a class chosen at run
+time, is read, though not a `**` spread a wrapper hands on that way. A method reached
+through a class, as an ORM's manager is, is the class's: a library's is not read, and a
+project's is a gap.
 
 A model argument is followed within its file, to each text it can hold: through names
 and `:=`, conditionals (`if`/`else`, `or`, `and`), an environment variable's default
 (`os.getenv`, `os.environ.get`, `decouple.config`), joined text (`+`, `+=` and
 f-strings), `str()`, `.lower()`, `.upper()` and `.strip()`, and a dict spread with `**`
 that is written out there or bound once to a name the file reads only to spread it. A
-name is looked up as Python looks it up: in its function, honouring `global` and
+dict of `model_kwargs` or `config_kwargs` is read the same way. A name is looked up as Python looks it up: in its function, honouring `global` and
 `nonlocal`, then in the scopes around it, skipping a class body from its methods. A
 parameter's default and a decorator, annotation or base class are read in the scope
 around their function or class. In `or`, a variable read with no default falls
@@ -66,9 +69,9 @@ identifier is kept as written, as Replicate's `owner/name` or a gateway's name t
 the OpenAI SDK is. A name routed to two providers is two components, since an opaque
 name such as an Azure deployment may name different models at each. A provider other
 than one that serves local weights (`ollama`) makes the model `hosted`.
-A call that may let the model run its own code, through any `trust_remote_code` but a
-false literal, records it. A relative path or a weight file names a file in the
-project, which the model collector reads.
+Any `trust_remote_code` but a false literal, given to a call or in its `model_kwargs` or
+`config_kwargs`, records that the model may run its own code. A relative path or a
+weight file names a file in the project, which the model collector reads.
 
 What the reader knows is there and cannot read is a coverage gap:
 
@@ -79,18 +82,24 @@ What the reader knows is there and cannot read is a coverage gap:
 - a file that imports an SDK by a name a module of the project also has;
 - a model argument bound in another module of the project;
 - what a model argument can hold besides the text read, unless it is an object an SDK
-  makes: a parameter, whatever its default; an attribute, an item or a call other than
-  those above; text joined to something unread, or built from itself, which may grow
-  when run again; a loop, `with`, `except` or pattern variable; a dict that is changed,
-  handed on, spread from another or bound more than once; `**options` without a model
-  keyword; a starred positional argument; an absolute path; and text that is no
-  identifier, or a default a variable that cannot be named may override;
-- a model that only an environment variable sets, once for each file that reads it so;
+  makes rather than text or a path one returns: a parameter, whatever its default; an
+  attribute, an item or a call other than those above; text joined to something unread,
+  or built from itself, which may grow when run again; a loop, `with`, `except` or
+  pattern variable; a dict that is changed, handed on, spread from another or bound more
+  than once; `**options` without a model; a starred positional argument; a path on a
+  host, behind a routing prefix or not; a name of the module that the file also imports,
+  or that an import with `*` may bind; and text that is no identifier, or a default a
+  variable that cannot be named may override;
+- a model that only an environment variable sets, once for each file that reads it so,
+  as when its default names no model, such as `None`, `""` or `"default"`;
+- options a weights library is given that the reader cannot read, such as
+  `model_kwargs=options` or `**options`, which may let the model run its own code;
 - a model argument given to a function or class the project defines, or to a method of
   one of its classes, which the reader does not follow;
 - a bound the reader reached: a callee depth of 32, a following depth of 12, 16 values
-  for one argument, 16 joined texts of up to 256 characters, the directories it looks in
-  for a module, a dotted name of 256 characters, or the steps one file allows.
+  for one argument, 16 joined texts of up to 256 characters, 16 environment variables
+  for one text, the directories it looks in for a module, a dotted name of 256
+  characters, or the steps one file allows.
 
 Unread arguments, and those given to the project's callees, are each counted in one gap
 for the file, at the first of them; an argument bound in another module is a gap of its own.
