@@ -192,7 +192,7 @@ env_vars = ["SHARED_API_TOKEN", {name = "SHARED_API_TOKEN", source = "local"},
             {name = "ROOT_SERVICE_KEY", source = "remote"}, {name = "OVERRIDDEN_TOKEN"}]
 env = { OVERRIDDEN_TOKEN = "fixed-value" }
 [mcp_servers.search]
-url = "https://catalog.example.test"
+url = "https://catalog.example.test/namespace/sse"
 bearer_token_env_var = "SHARED_API_TOKEN"
 env_http_headers = { X-Auth = "SECONDARY_TOKEN", X-Backup = "SHARED_API_TOKEN" }
 """
@@ -200,6 +200,7 @@ env_http_headers = { X-Auth = "SECONDARY_TOKEN", X-Backup = "SHARED_API_TOKEN" }
     assert not result.scan_failures
     found = servers(result)
     reader, search = found["reader"], found["search"]
+    assert search.transport == "streamable-http"
     assert reader.properties["env_vars_referenced"] == ["SHARED_API_TOKEN"]
     assert reader.properties["remote_env_vars_referenced"] == ["ROOT_SERVICE_KEY"]
     assert search.properties["env_vars_referenced"] == ["SECONDARY_TOKEN", "SHARED_API_TOKEN"]
@@ -252,6 +253,32 @@ def test_codex_rejects_uninterpretable_environment_entries(tmp_path, entry):
     )
     assert result.scan_failures == [".codex/config.toml: invalid server configuration"]
     assert not servers(result)
+
+
+def test_codex_rejects_numeric_environment_id(tmp_path):
+    toml = """
+[mcp_servers.s]
+command = "catalog"
+environment_id = 17
+env_vars = ["LOCAL_TOKEN", { name = "FOREIGN_TOKEN", source = "remote" }]
+"""
+    result = scan(tmp_path, {".codex/config.toml": toml})
+    assert result.scan_failures == [".codex/config.toml: invalid server configuration"]
+    assert not servers(result)
+
+
+def test_codex_local_override_does_not_mask_invalid_remote_source(tmp_path):
+    toml = """
+[mcp_servers.s]
+command = "catalog"
+env_vars = ["LOCAL_TOKEN", { name = "FOREIGN_TOKEN", source = "remote" }]
+env = { FOREIGN_TOKEN = "synthetic-override-value" }
+"""
+    result = scan(tmp_path, {".codex/config.toml": toml})
+    record = servers(result)["s"]
+    assert "env_vars_referenced" not in record.properties
+    assert "remote_env_vars_referenced" not in record.properties
+    assert "synthetic-override-value" not in record.model_dump_json()
 
 
 def test_codex_withholds_foreign_config_values_and_unresolved_environment_sources(tmp_path):

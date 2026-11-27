@@ -588,7 +588,11 @@ _EXTENSION_SETTINGS = "settings (zed extension)"
 # opencode's ``"oauth": false``, which turns off OAuth detection for a remote server.
 _OAUTH_DISABLED = "oauth (disabled)"
 # Fields a client's own shape is read into, uninterpreted in any other client's file.
-_SHAPE_FIELDS = {_EXTENSION_SETTINGS: "zed", _OAUTH_DISABLED: "opencode"}
+_SHAPE_FIELDS = {
+    _EXTENSION_SETTINGS: "zed",
+    _OAUTH_DISABLED: "opencode",
+    "environment_id": "codex",
+}
 _DECLARED_FIELDS = {_EXTENSION_SETTINGS: "settings", _OAUTH_DISABLED: "oauth"}
 
 
@@ -2467,7 +2471,7 @@ def _has_path_or_query(url: object) -> bool:
 
 _STRING_FIELDS = _names(
     "command url endpoint serverUrl httpUrl type transport transportType cwd envFile "
-    "description name version bearer_token_env_var"
+    "description name version bearer_token_env_var environment_id"
 )
 _LIST_FIELDS = _names(
     "args alwaysAllow autoApprove includeTools excludeTools enabled_tools disabled_tools "
@@ -2855,14 +2859,12 @@ def _codex_env_references(
         overrides = config.get("env", {})
         for entry in config.get("env_vars", ()):
             name = entry if isinstance(entry, str) else entry["name"]
+            remote_source = isinstance(entry, dict) and entry.get("source") == "remote"
+            if remote_source and not remote_host:
+                # Codex checks source declarations before applying literal overrides.
+                return {}
             if name not in overrides:
-                if isinstance(entry, dict) and entry.get("source") == "remote":
-                    if not remote_host:
-                        # Codex rejects remote-source entries on a local stdio server.
-                        return {}
-                    remote.add(name)
-                else:
-                    local.add(name)
+                (remote if remote_source else local).add(name)
     elif transport == "streamable-http" and config.get("url"):
         if any(k in config for k in ("command", "args", "env", "env_vars", "cwd", "bearer_token")):
             return {}
@@ -2893,7 +2895,7 @@ def _field_names(config: dict[str, Any], shape: str, names: _Names | None = None
     """The fields a server declares, each read from the client's shape by the name the
     client file gives it."""
     fields = [
-        _DECLARED_FIELDS[field] if field in _SHAPE_FIELDS and _interpreted(field, shape) else field
+        _DECLARED_FIELDS.get(field, field) if _interpreted(field, shape) else field
         for field in config
     ]
     return _exported_names(fields, names)
@@ -5099,6 +5101,9 @@ class MCPScanner(Scanner):
             if declared is None and isinstance(_declared_type(config), str)
             else None
         )
+        # Codex URL servers always use Streamable HTTP, regardless of the URL path.
+        if dialect.shape == "codex" and config.get("url") and not has_command:
+            return "streamable-http", gap
         # Gemini CLI chooses the transport from command, url and httpUrl, not a type.
         if declared is not None and not (has_command and dialect.url_transport):
             return declared, None
