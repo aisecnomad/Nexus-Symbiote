@@ -146,9 +146,9 @@ $ nexus-symbiote scan ci/work/second -o second.json 2>/dev/null
 $ cmp first.json second.json && echo identical
 identical
 $ nexus-symbiote digest first.json
-file_sha256: sha256:25eb2cf27e0dde9c3b0220759350c70689d8ee5f9cde8c71c8668fae1845c6cd
-canonical_digest: sha256:1364e3d61ae6519d9d9e1157032d4be37a5bd79684440346352b458c1f58c0d6
-content_digest: sha256:1725d2155f449c1e8750a3121233e7d54b66903c563d5dd5beec3aa75ca7ebb8
+file_sha256: sha256:e8f93b6a16e2e5f81b76c6d7ade0b59d5bb8562c3202266b8fa61729653090a2
+canonical_digest: sha256:0b0e7717ef4a93113a6b5e6f121bf71bb855a012b39210b3bdf3df299d693443
+content_digest: sha256:bc26815126bdb9db4b6fe47326d0c6b0b555e22a7a75c59d880bf0345364dcea
 content_profile: nexus-symbiote/inventory-content/v1
 spec_version: 1.1.0
 components: 11
@@ -164,10 +164,10 @@ $ nexus-symbiote scan "$demo" -o now.json 2>/dev/null
 $ cmp -s first.json now.json || echo different
 different
 $ nexus-symbiote digest now.json --json-output | grep content_digest
-  "content_digest": "sha256:1725d2155f449c1e8750a3121233e7d54b66903c563d5dd5beec3aa75ca7ebb8",
+  "content_digest": "sha256:bc26815126bdb9db4b6fe47326d0c6b0b555e22a7a75c59d880bf0345364dcea",
 $ grep serial_number first.json now.json
-first.json:    "serial_number": "urn:uuid:0083aa95-145c-58a1-8f96-548f2006b8ad",
-now.json:    "serial_number": "urn:uuid:0083aa95-145c-58a1-8f96-548f2006b8ad",
+first.json:    "serial_number": "urn:uuid:1d14059c-655f-56cc-8ede-30d30f691821",
+now.json:    "serial_number": "urn:uuid:1d14059c-655f-56cc-8ede-30d30f691821",
 $ nexus-symbiote scan "$demo" -o again.json 2>/dev/null
 $ cmp now.json again.json && echo identical
 identical

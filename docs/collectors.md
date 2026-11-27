@@ -16,8 +16,63 @@ Every path is relative to the project root. Each collector also bounds what it r
 | `a2a` | `agent.json` and `agent-card.json` in any `.well-known` directory and in the root, and `a2a/agent.json`. At the root, client configuration in `a2a.json`, `a2a.yaml`, `a2a.yml` or `a2a_config.json`. Python files outside directories named `tests`, `test`, `dist`, `build`, `docs`, `benchmarks` or `examples`, for SDK references. A card or client configuration that is a symlink to a file whose name or directory says it holds credentials (including `.aws/`, `.ssh/`, `.gnupg/`, `.kube/`, `.docker/`, `.azure/`, `.gcloud/`, `.vault/`, `vault/`, and `.config/<store>/`), or a regular file inside a dotted or XDG credential store, is a coverage gap and is not read; a regular `.well-known` card under a plain service directory such as `services/credentials/.well-known/agent-card.json` remains inventoried. A card's `url` or `endpoint`, or an interface URL, such as `http:host/x` or `ht\ttp://host/x` is checked and exported as `http://host/x`, as WHATWG parsers read it; client configuration URLs and a security scheme's `tokenUrl` are not normalised |
 | `ide_agents` | Marker files and settings of Claude Code (also `.claude` settings in subdirectories, plugin manifests and the hook files `.claude-plugin/plugin.json` names in `hooks`, and the `hooks` front matter of project subagents in `.claude/agents` and skills in `.claude/skills`), Codex (`.codex/config.toml` and `.codex/config.json`), Cursor (including `.cursor/hooks.json` and `.cursor/cli.json`), Gemini CLI (`.gemini/settings.json`), Windsurf, Cline, Copilot (`.github/copilot-extensions.json`), Antigravity and xAI; `.vscode/extensions.json`, for recommended AI extensions |
 | `shadowscan` | A report at `.shadowscan/report.json`, `shadowscan-report.json` or `shadowscan.json`; reports at more than one of them are a failure |
+| `source` | At any depth, outside directories named `tests`, `test`, `__tests__`, `dist`, `build`, `docs`, `benchmarks` and `examples`: Python files other than `test_*.py`, `*_test.py` and `conftest.py`. A file [named as one that holds credentials](known-limitations.md#every-collector) is not read |
 
 An optional [`agent.yaml` manifest](agent-manifest.md) at the project root names the agent and declares further instruction files and models.
+
+## Declarations in application source
+
+The `source` collector reads the model identifiers that a project's Python code gives
+an SDK. It never imports, runs or contacts anything: a file is parsed to a syntax tree.
+Only a file that imports a known SDK is analysed, and a module of the project named
+like one, such as its own `agents` package, is not taken for the SDK.
+
+It reads the model arguments of a call into a known SDK, and of a call whose callee it
+cannot name, such as a method of a client passed in as a parameter: `model=`,
+`model_name=`, `model_id=`, `modelId=`, `ai_model_id=`, a deployment name,
+`embedding_model=`, `embed_model=`, `llm_model=`, `chat_model=` and `llm=`, `repo_id=`
+of a Hugging Face endpoint, `id=` of an Agno model, and the first argument of an entry
+point such as `init_chat_model`, `SentenceTransformer`, `litellm.completion`,
+`ollama.chat` or a PydanticAI `Agent`. A call into another library or a builtin, such
+as a logger or a metrics label, is not read. Each argument is followed inside its file
+to a constant, an environment default such as `os.getenv("CHAT_MODEL", "gpt-4o")`, a
+formatted string, a concatenation, text extended with `+=`, either side of a
+conditional or of `or`, `str()`, the default of a Pydantic `Field` or a dataclass
+`field`, or `.lower()`, `.upper()` or `.strip()` of one of these. Each identifier
+becomes one `model` component for the project at `declared` assurance. Its
+`source_reference` claim names the file and the line of the argument that gives it, up
+to 16 places, and `environment_variables` names a variable that overrides it.
+
+A routing prefix is read off the identifier: `anthropic/claude-sonnet-4-5` is the model
+`claude-sonnet-4-5` with provider `anthropic`, and the text as written is kept in
+`requested_alias`. No other provider is recorded. A reference has no `source_path`,
+which on a model names a weight file.
+
+What the reader knows is there and cannot read is a coverage gap:
+
+- a file it cannot read, or one larger than `file-bytes`, whatever it holds;
+- a file that names an SDK and cannot be parsed, is not UTF-8, is larger than
+  `syntax-bytes` or holds more syntax nodes than `python-nodes`;
+- a file that imports an SDK by a name a module of the project also has, since which
+  of the two the import loads depends on how the project is run;
+- a model that only an environment variable sets, when no file of the project gives
+  that variable a value;
+- a model argument bound in another module of the project;
+- a model argument bound to a value the reader cannot give: a parameter, which a caller
+  may override whatever its default, an attribute, a subscript, a call it cannot read,
+  a name the file does not bind, a loop, comprehension or pattern variable, a name
+  unpacked from what is not a literal, or text that is no identifier;
+- a model argument given to a function or class the project defines, which the reader
+  does not follow;
+- a bound the reader reached: the 16 values it keeps for one argument or one name, a
+  depth of 12 for text and 32 for a callee, 256 characters of joined text, or the steps
+  one file allows.
+
+The arguments of each kind are counted in one gap for the file, at the first of them.
+
+`validate --project` reports the missing artifact of a reference it read again from
+source as information, as it does for a cited model of an imported report. Without
+`--project` it stays unknown.
 
 ## MCP servers declared in source
 

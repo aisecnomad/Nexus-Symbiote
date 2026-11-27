@@ -62,8 +62,8 @@ SPECS: dict[str, LimitSpec] = {
             "total-bytes",
             "bytes",
             64 * GIB,
-            "Bytes one collector reads in total, except model weights; the mcp, a2a and "
-            "rag collectors, which also search source, may read source-scan-bytes more, "
+            "Bytes one collector reads in total, except model weights; the mcp, a2a, rag "
+            "and source collectors, which also search source, may read source-scan-bytes more, "
             "which alone bounds the files a ShadowScan report cites.",
         ),
         LimitSpec(
@@ -97,15 +97,16 @@ SPECS: dict[str, LimitSpec] = {
             64 * GIB,
             "Bytes of Python, TypeScript and JavaScript source one collector reads while "
             "it looks for references: the mcp collector's SDK and tool references, the "
-            "a2a collector's SDK references and the rag collector's vector-store imports; "
+            "a2a collector's SDK references, the rag collector's vector-store imports and "
+            "the source collector's model identifiers; "
             "also the files of any type that a ShadowScan report cites.",
         ),
         LimitSpec(
             "syntax-bytes",
             "bytes",
             64 * MIB,
-            "Size of one source file the mcp collector parses: a file with an MCP SDK "
-            "or agent framework reference.",
+            "Size of one source file the mcp or source collector parses: a file with an "
+            "MCP SDK, agent framework or other SDK reference.",
         ),
         LimitSpec(
             "ts-nodes",
@@ -117,7 +118,7 @@ SPECS: dict[str, LimitSpec] = {
             "python-nodes",
             "count",
             10_000_000,
-            "Syntax nodes in one Python file the mcp collector parses.",
+            "Syntax nodes in one Python file the mcp or source collector parses.",
         ),
         LimitSpec(
             "import-lookups",

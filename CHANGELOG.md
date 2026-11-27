@@ -4,6 +4,15 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **A ninth collector, `source`, runs by default:** an inventory collected by an earlier release does not record it, so its coverage is partial and the `validate` and `risk` gates fail until it is collected again. Policies and Action inputs that list collectors must add `source` to stay complete. A project whose Python code names a hosted model gains `model` components and, where the collector sees a model argument it cannot resolve, such as one passed in as a parameter or set only by an environment variable, coverage gaps that close the `validate` and `risk` gates; `diff` reports them as additions against an earlier baseline.
+
+### Added
+
+- **Model identifiers in application source (`source` collector):** reads, without importing or running anything, the model identifiers that Python code gives a known SDK, following a name inside its file through constants, environment defaults, formatted strings and conditionals. Each is a `model` component at `declared` assurance whose `source_reference` claim names the file and line; a routing prefix such as `anthropic/` sets the provider. See the [collector reference](docs/collectors.md#declarations-in-application-source) and the [roadmap decision](ROADMAP.md#decisions-and-non-goals).
+- **Validation of source references:** `validate --project` reports the absent artifact of a model identifier it read again from source as information, as it does for a cited model of an imported report.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

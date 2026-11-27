@@ -17,7 +17,7 @@ inputs:
     default: nexus-symbiote-aibom.json
   scanners:
     description: >-
-      Comma-separated scanner names including shadowscan, a2a, ide_agents; empty means all.
+      Comma-separated scanner names including shadowscan, a2a, ide_agents, source; empty means all.
       A list that leaves any collector out makes coverage partial, so the validate and
       risk-check gates fail whenever they are on, and the Action refuses such a list unless
       both are 'false'. Leave it empty in a workflow that gates

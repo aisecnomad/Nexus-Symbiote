@@ -17,6 +17,8 @@ import json
 import os
 import re
 import string
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import quote
@@ -32,8 +34,10 @@ from packaging.version import InvalidVersion, Version
 from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import AIBOM, NO_CONTENT_SERIAL
 from nexus_symbiote.diff.differ import AIBOMDiffer, _values_unbound
-from nexus_symbiote.scanners.base import sanitized_origin
+from nexus_symbiote.scanners.base import ScanResult, sanitized_origin
 from nexus_symbiote.scanners.registry import RegistryScanner
+from nexus_symbiote.scanners.source import SourceScanner
+from nexus_symbiote.scanners.source_references import model_identifier
 from nexus_symbiote.utils.secrets import redact_descriptor, redact_text, redact_url
 from tests.support import scaling_ratio
 
@@ -767,3 +771,196 @@ def test_every_maintained_reader_has_a_registered_hypothesis_property():
     for reader_name, fn in READER_PROPERTY_MAP.items():
         assert callable(fn), reader_name
         assert hasattr(fn, "hypothesis"), f"{reader_name} must be decorated with @given"
+
+
+# The source collector's Python reader: a file of any content must leave records, a gap
+# or nothing, never a crash and never a value the collector may not export, and reading
+# must stay linear in the size of a file.
+SOURCE_FRAGMENTS = st.sampled_from(
+    [
+        "from openai import OpenAI\n",
+        "import litellm\n",
+        "from . import settings\n",
+        'model="gpt-4o"',
+        "model=os.getenv(",
+        'f"{NAME}-',
+        "client.chat.completions.create(",
+        "NAME = NAME\n",
+        '"""',
+        "'",
+        '"',
+        "\\",
+        "\x00",
+        "\n",
+        "(",
+        "[",
+        "lambda: ",
+        "async def f():\n    ",
+        "\t",
+    ]
+)
+SOURCE_TEXT = st.lists(st.one_of(SOURCE_FRAGMENTS, st.text(max_size=12)), max_size=24).map("".join)
+SOURCE_SECRET = st.text(
+    alphabet="ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789", min_size=40, max_size=48
+).map(lambda body: "sk-proj-" + body)
+
+
+def _scan_source(files: dict[str, bytes]) -> tuple[ScanResult, str]:
+    with tempfile.TemporaryDirectory() as directory:
+        for name, content in files.items():
+            path = Path(directory) / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        result = SourceScanner().scan(Path(directory))
+    exported = json.dumps(
+        [component.model_dump(mode="json") for component in result.components]
+        + list(result.surfaces_excluded)
+        + list(result.scan_failures)
+    )
+    return result, exported
+
+
+def _well_formed(result: ScanResult, path: str) -> None:
+    """Whatever the reader made of a file is a declared record of that file, or a gap."""
+    assert not result.scan_failures
+    for component in result.components:
+        claim = component.claims["source_reference"]
+        assert component.assurance_level.value == "declared"
+        assert claim.locator.startswith(f"{path}:") and model_identifier(component.name)
+    assert all(gap.startswith(f"{path}") for gap in result.surfaces_excluded)
+
+
+@given(SOURCE_TEXT)
+def test_no_python_source_crashes_the_source_reader(text):
+    files = {"app/unit.py": ("from openai import OpenAI\n" + text).encode("utf-8", "surrogatepass")}
+    result, exported = _scan_source(files)
+    _well_formed(result, "app/unit.py")
+    # The same file reads the same way again.
+    assert _scan_source(files)[1] == exported
+
+
+@given(st.binary(max_size=96))
+def test_python_source_that_is_not_text_is_nothing_or_a_gap(payload):
+    content = b"from openai import OpenAI\n" + payload
+    result, _ = _scan_source({"app/unit.py": content})
+    _well_formed(result, "app/unit.py")
+    try:
+        content.decode("utf-8")
+    except UnicodeDecodeError:
+        assert result.components == []
+        assert list(result.surfaces_excluded) == [
+            "app/unit.py: source file is not UTF-8; declarations in it were not read"
+        ]
+
+
+@given(SOURCE_SECRET, st.sampled_from(["model", "api_key", "base_url", "variable", "default"]))
+def test_a_token_in_any_argument_of_source_is_never_exported(secret, argument):
+    model = secret if argument == "model" else "gpt-4o"
+    variable = secret if argument == "variable" else "CHAT_MODEL"
+    default = secret if argument == "default" else "gpt-4.1"
+    source = f"""\
+import os
+from openai import OpenAI
+
+client = OpenAI(api_key="{secret}", base_url="https://{secret}@gateway.example/v1")
+client.chat.completions.create(model="{model}", messages=[])
+client.chat.completions.create(model="openai/{model}", messages=[])
+client.chat.completions.create(model=os.getenv("{variable}", "{default}"), messages=[])
+client.chat.completions.create(model=os.environ["{variable}"], messages=[])
+"""
+    _, exported = _scan_source({"app/bot.py": source.encode()})
+    assert secret not in exported
+    assert secret[8:] not in exported
+
+
+@given(
+    st.one_of(
+        st.text(max_size=160),
+        st.from_regex(r"[ \t]?[A-Za-z0-9][A-Za-z0-9._:/@+ -]{0,140}[ \t]?", fullmatch=True),
+    )
+)
+def test_an_accepted_model_identifier_is_exported_as_written(literal):
+    accepted = model_identifier(literal)
+    if accepted is not None:
+        assert accepted == literal.strip()
+        assert " " not in accepted and "://" not in accepted and len(accepted) <= 128
+        assert redact_text(accepted) == accepted
+
+
+def _rebinds(size: int) -> str:
+    rebinds = "\n".join(f'text = text.replace("{index}", "x")' for index in range(size))
+    calls = "\n".join(
+        f'client.chat.completions.create(model=text + "{index}", messages=[])'
+        for index in range(size)
+    )
+    return f'client = OpenAI()\ntext = "gpt-4o"\n{rebinds}\n{calls}\n'
+
+
+def _wide_or(size: int) -> str:
+    wide = " or ".join(["1"] * size)
+    return f"y = ({wide})\n" + "f(model=y)\n" * size
+
+
+def _deep_plus(size: int) -> str:
+    return "z = (" + " + ".join(["f(model=x)"] * size) + ")\n"
+
+
+def _joined_bindings(size: int) -> str:
+    names = "\n".join(f'L{index} = "a{index}"\nR{index} = "b{index}"' for index in range(4))
+    choose = "L = " + " or ".join(f"L{index}" for index in range(4)) + "\n"
+    choose += "R = " + " or ".join(f"R{index}" for index in range(4)) + "\n"
+    bound = "\n".join('N = f"{L}{R}"' for _ in range(16))
+    return f"{names}\n{choose}{bound}\n" + "f(model=N)\n" * size
+
+
+@pytest.mark.no_cover
+@pytest.mark.parametrize(
+    "shape",
+    [_rebinds, _wide_or, _deep_plus, _joined_bindings],
+    ids=["rebinds", "wide-or", "deep-plus", "joined-bindings"],
+)
+def test_reading_python_source_is_linear_in_its_size(tmp_path, shape):
+    roots = {}
+    for scale in (1, 4):
+        root = roots[scale] = tmp_path / f"n{scale}"
+        root.mkdir()
+        (root / "app.py").write_text(
+            f"import openai\nfrom openai import OpenAI\n{shape(500 * scale)}", encoding="utf-8"
+        )
+
+    assert scaling_ratio(lambda scale: SourceScanner().scan(roots[scale])) < 8
+
+
+@pytest.mark.no_cover
+def test_the_records_of_a_tree_do_not_depend_on_the_hash_seed(tmp_path):
+    files = {
+        "app/a.py": "import os\nfrom openai import OpenAI\nfrom litellm import completion\n"
+        'M = os.getenv("CHAT_MODEL", "gpt-4o") or "o3"\nOpenAI().responses.create(model=M)\n'
+        'completion(model="anthropic/claude-sonnet-4-5")\ncompletion(model=unknown)\n',
+        "app/b.py": "from openai import OpenAI\nfor m in pick():\n"
+        '    OpenAI().responses.create(model=m)\nOpenAI().responses.create(model="gpt-4o")\n',
+    }
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    program = (
+        "import json, sys\nfrom pathlib import Path\n"
+        "from nexus_symbiote.scanners.source import SourceScanner\n"
+        "r = SourceScanner().scan(Path(sys.argv[1]))\n"
+        "print(json.dumps([c.model_dump(mode='json') for c in r.components]"
+        " + list(r.surfaces_excluded)))\n"
+    )
+    outputs = set()
+    for seed in ("0", "1", "4242"):
+        environment = {**os.environ, "PYTHONHASHSEED": seed}
+        completed = subprocess.run(  # noqa: S603 -- this interpreter and a fixed program
+            [sys.executable, "-c", program, str(tmp_path)],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=120,
+            check=True,
+        )
+        outputs.add(completed.stdout)
+    assert len(outputs) == 1
+    assert "claude-sonnet-4-5" in outputs.pop()

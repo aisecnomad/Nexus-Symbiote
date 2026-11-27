@@ -187,7 +187,17 @@ def _severities(component: ModelComponent) -> set[tuple[str, str]]:
 
 def _gate(components: list[ModelComponent]) -> tuple[bool, set[tuple[str, str]]]:
     bom = AIBOM(components=list(components))
-    collectors = ["mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents"]
+    collectors = [
+        "mcp",
+        "model",
+        "prompt",
+        "rag",
+        "registry",
+        "shadowscan",
+        "a2a",
+        "ide_agents",
+        "source",
+    ]
     bom.metadata.completeness = CompletenessClaim(
         scope="repository",
         surfaces_scanned=["all"],
