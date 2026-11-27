@@ -245,6 +245,30 @@ env_http_headers = {{ X-Auth = "openai_identity_token_file" }}
     assert not blast_radius(bom, http.bom_ref)["shared_credential_surfaces"]
 
 
+def test_codex_local_ca_overrides_fold_case_only_for_custom_ca_variables(tmp_path):
+    declaration = """
+command = "catalog"
+env_vars = ["SSL_CERT_FILE", "NpM_CoNfIg_CaFiLe", "SSL_CERT_DIR", "DENO_CERT", "OTHER_TOKEN"]
+env = { ssl_cert_file = "ca.pem", npm_config_cafile = "npm.pem", ssl_cert_dir = "certs", deno_cert = "deno.pem", OTHER_TOKEN = "example" }
+"""
+    toml = (
+        "[mcp_servers.local]\n"
+        + declaration
+        + '\n[mcp_servers.managed]\nenvironment_id = "managed"\n'
+        + declaration
+    )
+    result = scan(tmp_path, {".codex/config.toml": toml})
+    assert not result.scan_failures
+    found = servers(result)
+    assert found["local"].properties["env_vars_referenced"] == ["DENO_CERT", "SSL_CERT_DIR"]
+    assert found["managed"].properties["env_vars_referenced"] == [
+        "DENO_CERT",
+        "NpM_CoNfIg_CaFiLe",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+    ]
+
+
 def test_codex_environment_references_reach_blast_radius_without_reading_values(
     tmp_path, monkeypatch
 ):

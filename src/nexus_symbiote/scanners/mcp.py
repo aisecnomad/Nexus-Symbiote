@@ -2487,6 +2487,12 @@ _CODEX_STDIO_BLOCKED_ENV = _names(
     "OPENAI_FEDERATION_RULE_ID OPENAI_IDENTITY_TOKEN_FILE OPENAI_IDENTITY_TOKEN_SOURCE "
     "OPENAI_SPIFFE_AUDIENCE OPENAI_SPIFFE_ID OPENAI_WORKLOAD_IDENTITY_CONTEXT"
 )
+# CUSTOM_CA_ENV_KEYS with case variants collapsed, for local stdio override matching.
+_CODEX_LOCAL_CA_ENV = _names(
+    "CODEX_CA_CERTIFICATE SSL_CERT_FILE REQUESTS_CA_BUNDLE CURL_CA_BUNDLE "
+    "NODE_EXTRA_CA_CERTS GIT_SSL_CAINFO CARGO_HTTP_CAINFO PIP_CERT "
+    "BUNDLE_SSL_CA_CERT NPM_CONFIG_CAFILE"
+)
 _BOOL_FIELDS = frozenset({"disabled", "trust", "enabled", _OAUTH_DISABLED})
 _NUMBER_FIELDS = _names("timeout startup_timeout_sec startup_timeout_ms tool_timeout_sec")
 _OBJECT_FIELDS = frozenset({"oauth", "auth", "dev", _EXTENSION_SETTINGS})
@@ -2845,6 +2851,12 @@ def _codex_stdio_blocks(name: str) -> bool:
     return name.isascii() and name.upper() in _CODEX_STDIO_BLOCKED_ENV
 
 
+def _codex_stdio_override_key(name: str, remote_host: bool) -> str:
+    if not remote_host and name.isascii() and name.upper() in _CODEX_LOCAL_CA_ENV:
+        return name.upper()
+    return name
+
+
 def _codex_env_references(
     config: dict[str, Any], transport: str, names: _Names, protected: KnownValues
 ) -> dict[str, Any]:
@@ -2868,14 +2880,15 @@ def _codex_env_references(
             )
         ):
             return {}
-        overrides = config.get("env", {})
+        overrides = {_codex_stdio_override_key(k, remote_host) for k in config.get("env", {})}
         for entry in config.get("env_vars", ()):
             name = entry if isinstance(entry, str) else entry["name"]
             remote_source = isinstance(entry, dict) and entry.get("source") == "remote"
             if remote_source and not remote_host:
                 # Codex checks source declarations before applying literal overrides.
                 return {}
-            if name not in overrides and not _codex_stdio_blocks(name):
+            override_key = _codex_stdio_override_key(name, remote_host)
+            if override_key not in overrides and not _codex_stdio_blocks(name):
                 (remote if remote_source else local).add(name)
     elif transport == "streamable-http" and config.get("url"):
         if any(k in config for k in ("command", "args", "env", "env_vars", "cwd", "bearer_token")):

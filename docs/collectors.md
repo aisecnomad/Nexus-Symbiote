@@ -23,6 +23,9 @@ In a Codex `.codex/config.toml`, MCP servers can declare host environment-variab
 names through stdio `env_vars`, or through HTTP `bearer_token_env_var` and
 `env_http_headers`. The native server's `properties.env_vars_referenced` lists
 safe local names. A literal stdio environment override takes precedence.
+On Linux and macOS, local Codex stdio compares its custom CA variable names
+without regard to ASCII case when applying overrides. Managed stdio uses exact
+names. [Codex custom CA variables](https://github.com/openai/codex/blob/57b493a648aa44547f5debf6e3344fcd2b2af529/codex-rs/network-proxy/src/certs.rs#L274-L286)
 Explicit remote stdio names appear in `properties.remote_env_vars_referenced`.
 For local and remote stdio servers, the collector omits names that Codex removes
 from the child environment, including explicit `env` assignments. Codex matches
