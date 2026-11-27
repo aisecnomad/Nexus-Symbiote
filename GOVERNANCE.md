@@ -102,6 +102,7 @@ Every gate prints each of its failure reasons. How many findings the console lis
 | `runtime keygen` | Supported | offline | Generates Ed25519 key pair for runtime authorization contracts |
 | `runtime sign` | Supported | offline | Signs runtime authorization, approval and revocation contracts |
 | `runtime verify` | Supported | offline | Verifies signed runtime contract purpose, signers and validity window |
+| `runtime verify-receipts` | Experimental | offline | Verifies a gateway receipt chain and its Merkle root, and authenticates signatures when trusted keys are supplied |
 | `runtime digest` | Supported | offline | Prints canonical digest of runtime contract, approval or revocation document |
 | `runtime key-id` | Supported | offline | Prints canonical Ed25519 public key identifier |
 | `runtime register` | Experimental | offline | Registers newly issued runtime snapshot in local gateway state store |
