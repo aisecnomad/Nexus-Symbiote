@@ -555,6 +555,8 @@ def _unescape_shell(fragment: str) -> str:
     A backslash-newline is whitespace and is removed by the stage walk before this
     runs. Single-quoted text must not be passed here: a backslash stays literal there.
     """
+    if "\\" not in fragment:
+        return fragment
     pieces: list[str] = []
     index = 0
     length = len(fragment)
@@ -595,7 +597,10 @@ def _shell_word(token: str) -> str:
 
 
 def _is_network_sink(token: str) -> bool:
-    spelled = _shell_spell(token)
+    return _names_network_sink(_shell_spell(token))
+
+
+def _names_network_sink(spelled: str) -> bool:
     if _command_word(spelled) in _SHELL_SINKS:
         return True
     lowered = spelled.lower()
@@ -659,7 +664,8 @@ def _next_is_lone_path(text: str, index: int) -> bool:
 
 def _window_has_verb(text: str, start: int, end: int) -> bool:
     for token in _SHELL_TOKEN_RE.findall(text[start:end]):
-        if _is_network_sink(token) or _shell_word(token) in _SHELL_READERS:
+        spelled = _shell_spell(token)
+        if _names_network_sink(spelled) or _command_word(spelled) in _SHELL_READERS:
             return True
     return False
 
@@ -684,9 +690,17 @@ def _logical_windows(text: str) -> Iterator[tuple[int, int, bool]]:
                 continue
         lines = 1
         truncated = False
+        # A lone path continues the window only after a verb. The verb check runs only
+        # then, over the lines not yet read: no word spans the newline before a line.
+        has_verb = False
+        seen = start
         while end < length:
             line_start = max(start, text.rfind("\n", start, end) + 1)
-            lone_path = _window_has_verb(text, start, end) and _next_is_lone_path(text, end + 1)
+            lone_path = _next_is_lone_path(text, end + 1)
+            if lone_path and not has_verb:
+                has_verb = _window_has_verb(text, seen, end)
+                seen = end
+            lone_path = lone_path and has_verb
             if not (
                 _line_ends_continued(text, line_start, end)
                 or _next_starts_continued(text, end + 1)
@@ -719,6 +733,10 @@ def _shell_stages(text: str, start: int, end: int) -> list[tuple[str, list[tuple
     index = start
     word_at: int | None = None
     parts: list[str] = []
+    # A quote with no closer before ``end`` means no later quote of its kind has one:
+    # the failed scan passed each of them as escaped and resumed in the same state.
+    # Skipping those rescans keeps the walk linear in the window.
+    unclosed: set[str] = set()
 
     def flush() -> None:
         nonlocal word_at
@@ -742,9 +760,10 @@ def _shell_stages(text: str, start: int, end: int) -> list[tuple[str, list[tuple
             index = run
             continue
         if char in "\"'":
-            close = _matching_quote(text, index, end)
+            close = None if char in unclosed else _matching_quote(text, index, end)
             if close is None:
                 # The quote never closes. Keep the following bytes in the raw scan.
+                unclosed.add(char)
                 index += 1
                 continue
             if word_at is None:

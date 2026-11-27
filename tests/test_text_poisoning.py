@@ -1804,6 +1804,28 @@ def test_shell_parser_bounds_every_physical_line() -> None:
     assert scan_text_block(text, surface="CLAUDE.md") == []
 
 
+def test_unclosed_quotes_in_a_shell_window_are_scanned_once() -> None:
+    from nexus_symbiote.text_poisoning import _shell_stages
+
+    def run(scale: int) -> None:
+        text = '"' + '\\"' * (1024 * scale)
+        _shell_stages(text, 0, len(text))
+
+    ratio = scaling_ratio(run, factor=4, repeats=2)
+    assert ratio < 9.0, f"expected linear scaling for factor=4, got {ratio:.2f}"
+
+
+def test_a_continued_shell_window_is_tokenized_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nexus_symbiote.text_poisoning import _logical_windows
+
+    monkeypatch.setattr("nexus_symbiote.text_poisoning._SHELL_WINDOW_LINES", 1 << 20)
+    monkeypatch.setattr("nexus_symbiote.text_poisoning._SHELL_WINDOW_CHARS", 1 << 24)
+    ratio = scaling_ratio(
+        lambda scale: list(_logical_windows("x |\n" * (128 * scale))), factor=4, repeats=2
+    )
+    assert ratio < 9.0, f"expected linear scaling for factor=4, got {ratio:.2f}"
+
+
 def test_overlapping_shell_and_text_recognizers_share_one_file_location(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
