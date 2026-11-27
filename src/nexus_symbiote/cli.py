@@ -33,6 +33,7 @@ from nexus_symbiote.graph import validate_graph
 from nexus_symbiote.graph_cli import register_graph_commands
 from nexus_symbiote.instruction_diff import register_instruction_diff_commands
 from nexus_symbiote.inventory_export_cli import register_inventory_export_commands
+from nexus_symbiote.literal_credentials import apply_literal_credential_findings
 from nexus_symbiote.live_cli import register_live_commands
 from nexus_symbiote.minimum_elements_cli import register_minimum_elements_commands
 from nexus_symbiote.policy import Policy
@@ -1334,6 +1335,15 @@ def scan(
         failures_by["text_poisoning"] = scan_failures[tp_failure_count:]
     if len(surfaces_excluded) > tp_exclusion_count:
         excluded_by["text_poisoning"] = surfaces_excluded[tp_exclusion_count:]
+    literal_failure_count = len(scan_failures)
+    apply_literal_credential_findings(
+        aibom,
+        root,
+        exclude_paths=policy.scan.exclude_paths,
+        failures=scan_failures,
+    )
+    if len(scan_failures) > literal_failure_count:
+        failures_by["literal_credentials"] = scan_failures[literal_failure_count:]
     graph_failures = validate_graph(aibom)
     scan_failures.extend(graph_failures)
     if graph_failures:

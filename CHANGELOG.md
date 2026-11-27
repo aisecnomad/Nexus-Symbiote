@@ -4,6 +4,10 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Security
+
+- A vendor token shape in source, a Dockerfile, or an instruction or skill file that a collector already opened is a high `credential_exposure` finding. The finding records the path, line, and SHA-256 of the literal, not the literal. Placeholder and low-entropy example values stay quiet, MCP launch positions are unchanged, and `.env` and other credential-shaped names are not read. More than 32 shapes in one file is a collection failure and adds no finding from that file.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).
