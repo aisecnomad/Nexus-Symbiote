@@ -8,6 +8,7 @@ registry trust, and authorization records.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -19,6 +20,7 @@ from pydantic import (
     StrictInt,
     field_validator,
     model_serializer,
+    model_validator,
 )
 
 from nexus_symbiote.core.enums import (
@@ -34,11 +36,13 @@ from nexus_symbiote.core.enums import (
     TrustTier,
 )
 from nexus_symbiote.core.evidence import DeploymentProfile, Timestamp
+from nexus_symbiote.utils.secrets import holds_token_shape
 
-NATIVE_SPEC_VERSION = "1.1.0"
-"""Version written by this build. 1.1.0 records scan-root-relative POSIX paths."""
+NATIVE_SPEC_VERSION = "1.2.0"
+"""Version written by this build. 1.1.0 records scan-root-relative POSIX paths; 1.2.0 adds
+credential components, which record a credential by name and never by value."""
 
-SUPPORTED_SPEC_MINORS = {1: (0, 1)}
+SUPPORTED_SPEC_MINORS = {1: (0, 1, 2)}
 """Native format versions this build reads, as major -> supported minor versions."""
 
 MAX_REFERENCE_CHARS = 16_384
@@ -580,6 +584,60 @@ class VerifiedExtensionComponent(ComponentBase):
     risks: list[RiskAssessment] = Field(default_factory=list)
 
 
+CredentialKind = Literal["environment-variable", "workflow-credential", "source-literal"]
+
+
+class CredentialComponent(ComponentBase):
+    """A credential that a component authenticates with, recorded by name, never by value.
+
+    The name is what holds the credential: an environment variable, the label under
+    which a workflow tool stores it, or the parameter a literal is passed as. A name or
+    reference shaped like a credential value is refused, as is any other text of the record
+    shaped like one and any digest, so neither a token nor an unkeyed digest of one can
+    reach the inventory or any export of it.
+    """
+
+    component_type: Literal[ComponentType.CREDENTIAL] = ComponentType.CREDENTIAL
+    credential_kind: CredentialKind | None = Field(
+        default=None,
+        description=(
+            "What the name is: environment-variable (a variable that source reads, a .env "
+            "template lists or a ${NAME} placeholder names), workflow-credential (the label "
+            "under which a workflow tool stores the credential) or source-literal (the "
+            "parameter a literal value is passed as in source)"
+        ),
+    )
+    value_in_checkout: StrictBool | None = Field(
+        default=None,
+        description=(
+            "Whether a literal value sits beside the reference in the scanned checkout; "
+            "the value itself is never recorded"
+        ),
+    )
+    risks: list[RiskAssessment] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _holds_no_value(self) -> CredentialComponent:
+        # An unkeyed digest of a secret can be checked against a guessed or leaked value.
+        if self.hashes:
+            raise ValueError("a credential records no digest of its value")
+        if any(holds_token_shape(text) for text in _texts(self.model_dump(mode="json"))):
+            raise ValueError("a credential record holds text shaped like a credential value")
+        return self
+
+
+def _texts(value: Any) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield str(key)
+            yield from _texts(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _texts(item)
+
+
 class DiscoveryVerification(InventoryModel):
     """How imported ShadowScan discovery evidence was authenticated at import.
 
@@ -756,6 +814,7 @@ AnyComponent = Annotated[
         | A2AServerComponent
         | IDEAgentComponent
         | VerifiedExtensionComponent
+        | CredentialComponent
     ),
     Field(discriminator="component_type"),
 ]

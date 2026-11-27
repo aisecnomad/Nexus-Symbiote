@@ -20,6 +20,7 @@ class ComponentType(str, Enum):
     A2A_SERVER = "a2a-server"
     IDE_AGENT = "ide-agent"
     VERIFIED_EXTENSION = "verified-extension"
+    CREDENTIAL = "credential"
 
 
 class AssuranceLevel(str, Enum):

@@ -7,6 +7,7 @@ namespaces. docs/standard-exports.md describes the mapping and the property name
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -91,6 +92,13 @@ COMPONENT_TYPE_MAP: dict[ComponentType, str] = {
     ComponentType.DATA_SOURCE: "data",
     ComponentType.REGISTRY_ENTRY: "library",
     ComponentType.SKILL_PACKAGE: "library",
+    ComponentType.CREDENTIAL: "cryptographic-asset",
+}
+# A credential is crypto material that the inventory names and never holds: the CycloneDX
+# record states its kind and nothing else, so no ``value`` is ever written.
+CREDENTIAL_CRYPTO_PROPERTIES: dict[str, Any] = {
+    "assetType": "related-crypto-material",
+    "relatedCryptoMaterialProperties": {"type": "credential"},
 }
 # Package registries hold libraries; image registries hold containers. Any other
 # registry keeps the neutral "library" type.
@@ -115,6 +123,8 @@ def standard_component(comp: AnyComponent) -> dict[str, Any]:
         "bom-ref": comp.bom_ref,
         "name": comp.name,
     }
+    if comp.component_type is ComponentType.CREDENTIAL:
+        result["cryptoProperties"] = copy.deepcopy(CREDENTIAL_CRYPTO_PROPERTIES)
     version = standard_version(comp)
     if version:
         result["version"] = version

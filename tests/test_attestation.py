@@ -211,7 +211,7 @@ def test_native_inventory_round_trip_records_its_format_and_content_digest():
     built = statement(source_revision=REVISION)
     predicate = built["predicate"]
     assert predicate["subject_format"] == "nexus-symbiote-aibom"
-    assert predicate["spec_version"] == "1.1.0"
+    assert predicate["spec_version"] == "1.2.0"
     assert re.fullmatch(r"sha256:[0-9a-f]{64}", predicate["content_digest"])
     verified = verify(sign_statement(built, [A]))
     assert verified.predicate.source_revision == REVISION
@@ -753,7 +753,7 @@ def test_subject_format_is_decided_from_the_bytes(subject, native):
     ]
     assert (predicate["subject_format"] == "nexus-symbiote-aibom") is native
     if native:
-        assert predicate["spec_version"] in {"1.0.0", "1.1.0"}
+        assert predicate["spec_version"] in {"1.0.0", "1.1.0", "1.2.0"}
 
 
 def depth(value: object) -> int:

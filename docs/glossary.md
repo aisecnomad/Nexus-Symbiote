@@ -9,7 +9,7 @@ another format uses a different word for the same thing, the entry says so.
 
 The agent bill of materials that Nexus SymBiote writes: an agent's components, the
 relationships between them, findings and coverage. The native form is JSON, format
-1.1.0 ([schemas](../schemas/README.md)); CycloneDX, SPDX, SARIF and VEX output are
+1.2.0 ([schemas](../schemas/README.md)); CycloneDX, SPDX, SARIF and VEX output are
 exports of it.
 
 ### AIBOM
@@ -41,9 +41,17 @@ inventory's serial number is the version 5 UUID of it
 
 One record in an inventory: an agent, MCP server or client, tool, model, prompt,
 guardrail, memory store, RAG or data source, registry entry, skill, A2A client or
-server, IDE agent or extension (`ComponentType` in `core/enums.py`). The type
+server, IDE agent, extension or credential (`ComponentType` in `core/enums.py`). The type
 `verified-extension` names the kind of record, an agent extension; it does not mean
 that anything about the extension was verified.
+
+### Credential
+
+A `credential` component names a secret that another component authenticates with: an
+environment variable, the label a workflow tool stores it under, or the parameter a
+literal is passed as. It records the name and whether a value sits in the checkout,
+never the value or a digest of it; a record with text shaped like a credential value is
+refused. An `acts-as-identity` edge leads from the component that uses it.
 
 ## Collection and coverage
 

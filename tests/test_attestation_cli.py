@@ -172,7 +172,7 @@ def test_native_inventory_round_trip(runner, setup):
         f"Signer key ID: {key_id(key.public_key())}",
         f"Subject SHA-256: {signed['subject_sha256']}",
         "Match: bytes",
-        "Subject format: nexus-symbiote-aibom 1.1.0",
+        "Subject format: nexus-symbiote-aibom 1.2.0",
         f"Content digest: {signed['content_digest']} (nexus-symbiote/inventory-content/v1)",
     ]
     assert re.fullmatch(r"Signed at \(signer's clock\): \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", lines[6])
@@ -188,7 +188,7 @@ def test_native_inventory_round_trip(runner, setup):
         "subject_sha256": signed["subject_sha256"],
         "attested_sha256": signed["subject_sha256"],
         "subject_format": "nexus-symbiote-aibom",
-        "spec_version": "1.1.0",
+        "spec_version": "1.2.0",
         "content_digest": signed["content_digest"],
         "content_profile": "nexus-symbiote/inventory-content/v1",
         "signed_at": document["signed_at"],

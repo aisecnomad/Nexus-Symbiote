@@ -804,7 +804,7 @@ def test_inventory_loaders_name_an_unsupported_native_version(tmp_path, command)
     extra = ["--dry-run"] if command == "advisories" else []
     result = CliRunner().invoke(main, [command, str(path), *extra])
     assert result.exit_code == 1
-    assert "supported: 1.0.x, 1.1.x" in result.output
+    assert "supported: 1.0.x, 1.1.x, 1.2.x" in result.output
 
 
 def test_gate_reasons_list_the_first_tripped_findings_and_count_the_rest():

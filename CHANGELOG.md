@@ -4,6 +4,10 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Native format `1.2.0`:** Adds the `credential` component type, which names a secret another component authenticates with (`credential_kind` `environment-variable`, `workflow-credential` or `source-literal`) and records whether a value sits in the checkout (`value_in_checkout`), never the value. A credential record with any text shaped like a credential value, or with any digest, is refused. `diff` rates a credential whose value becomes committed in the checkout high. CycloneDX exports a credential as a `cryptographic-asset` of `related-crypto-material` type `credential`, with no `value`; SPDX 3.0.1 has no class for it, so it stays in the embedded native document and the loss report names it. 1.1.0 inventories still load and reconcile, but a 1.1.0 drift baseline compared with a 1.2.0 snapshot raises a high `spec_version` alert: re-create baselines after upgrading. Builds before this one refuse a 1.2.0 inventory with the supported-versions message.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

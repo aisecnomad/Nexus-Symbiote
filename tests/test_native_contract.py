@@ -21,9 +21,11 @@ from nexus_symbiote.core.models import NATIVE_SPEC_VERSION, AgentComponent, Capa
 # tagged; from then on it is frozen (docs/releasing.md, step 1, re-verifies the pin).
 PINNED_NATIVE_SCHEMA_BYTES_SHA256: dict[str, str] = {
     "1.1.0": "876a82dcd9737a21d391201be3762ebbbff562badeb44646ce570c71445ce64f",
+    "1.2.0": "70abb95d441fb57bbf230c1abfb8bb6ecba56f4dd8d8f88a661598cdc52fef98",
 }
 PINNED_NATIVE_SCHEMA_CANONICAL_SHA256: dict[str, str] = {
     "1.1.0": "59cbd2c45069fd66039d034fd692c2944f28bf3b83d1cf457d879fd164fff309",
+    "1.2.0": "5d4877f1584f8cb480a1c2683b72f3e6e48196754e9e22b53cf691b3560b1672",
 }
 
 
@@ -60,7 +62,7 @@ def test_native_schema_digest_pinned_per_spec_version():
     assert mutated_sha != PINNED_NATIVE_SCHEMA_CANONICAL_SHA256[NATIVE_SPEC_VERSION]
 
 
-@pytest.mark.parametrize("future_version", ["1.2.0", "1.99.0", "2.0.0"])
+@pytest.mark.parametrize("future_version", ["1.3.0", "1.99.0", "2.0.0"])
 def test_unsupported_future_minor_or_major_spec_version_fails_closed(tmp_path, future_version):
     doc = AIBOM().to_dict()
     doc["metadata"]["spec_version"] = future_version
@@ -213,7 +215,7 @@ def test_scalars_are_as_strict_as_the_published_schema(field, value):
 
 @pytest.mark.parametrize(
     ("version", "shown"),
-    [("2.0.0", "version 2.0.0"), ("1.2.0", "version 1.2.0"), ("\x1b[2Jx", "an unrecognised")],
+    [("2.0.0", "version 2.0.0"), ("1.3.0", "version 1.3.0"), ("\x1b[2Jx", "an unrecognised")],
 )
 def test_unsupported_native_versions_fail_with_the_supported_versions(tmp_path, version, shown):
     from nexus_symbiote.core.aibom import NativeFormatError
@@ -223,17 +225,17 @@ def test_unsupported_native_versions_fail_with_the_supported_versions(tmp_path, 
     document["metadata"]["future_field"] = True
     path = tmp_path / "bom.json"
     path.write_text(json.dumps(document))
-    with pytest.raises(NativeFormatError, match="supported: 1.0.x, 1.1.x") as raised:
+    with pytest.raises(NativeFormatError, match="supported: 1.0.x, 1.1.x, 1.2.x") as raised:
         AIBOM.load(path)
     assert shown in str(raised.value) and "\x1b" not in str(raised.value)
     result = CliRunner().invoke(main, ["summary", str(path)])
-    assert result.exit_code == 1 and "supported: 1.0.x, 1.1.x" in result.output
+    assert result.exit_code == 1 and "supported: 1.0.x, 1.1.x, 1.2.x" in result.output
 
 
-def test_format_1_0_documents_still_load_and_new_documents_are_1_1(tmp_path):
+def test_format_1_0_documents_still_load_and_new_documents_are_1_2(tmp_path):
     example = Path(__file__).parents[1] / "schemas/examples/minimal-aibom.json"
     assert AIBOM.load(example).metadata.spec_version == "1.0.0"
-    assert AIBOM().to_dict()["metadata"]["spec_version"] == "1.1.0"
+    assert AIBOM().to_dict()["metadata"]["spec_version"] == "1.2.0"
 
 
 def test_loader_refuses_links_and_special_files_without_blocking(tmp_path):
@@ -384,7 +386,7 @@ def test_a_document_that_declares_no_format_version_is_read_as_format_1_0(tmp_pa
 def test_objects_built_in_process_keep_the_format_this_build_writes(tmp_path):
     from nexus_symbiote.core.models import NATIVE_SPEC_VERSION, AIBOMMetadata
 
-    assert NATIVE_SPEC_VERSION == "1.1.0"
+    assert NATIVE_SPEC_VERSION == "1.2.0"
     assert AIBOM().metadata.spec_version == NATIVE_SPEC_VERSION
     assert AIBOM(components=[]).metadata.spec_version == NATIVE_SPEC_VERSION
     built = AIBOM(metadata=AIBOMMetadata(authors=["a"]))

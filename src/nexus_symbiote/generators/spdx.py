@@ -65,6 +65,8 @@ SPDX_TYPE_MAP = {
     ComponentType.RAG_SOURCE: "dataset_DatasetPackage",
     ComponentType.DATA_SOURCE: "dataset_DatasetPackage",
 }
+SPDX_UNPROJECTED_TYPES = frozenset({ComponentType.CREDENTIAL})
+"""Component types with no SPDX 3.0.1 class, carried only in the embedded native document."""
 _MAPPING_V3 = {
     "invokes": "usesTool",
     "trained-on": "trainedOn",
@@ -311,7 +313,14 @@ class SPDXGenerator(Generator):
             "createdBy": created_by,
             "createdUsing": [tool_id],
         }
-        suppliers = {comp.supplier for comp in aibom.components if comp.supplier}
+        unprojected = {
+            c.bom_ref for c in aibom.components if c.component_type in SPDX_UNPROJECTED_TYPES
+        }
+        suppliers = {
+            comp.supplier
+            for comp in aibom.components
+            if comp.supplier and comp.bom_ref not in unprojected
+        }
         parties = [
             {
                 "type": "Organization",
@@ -322,7 +331,10 @@ class SPDXGenerator(Generator):
             for name in sorted(suppliers)
         ]
         native_by_ref = native_components(native)
-        ordered = sorted(aibom.components, key=lambda c: c.bom_ref)
+        ordered = sorted(
+            (c for c in aibom.components if c.bom_ref not in unprojected),
+            key=lambda c: c.bom_ref,
+        )
         components = [
             self._element(
                 comp, ids, native_by_ref[comp.bom_ref], v4=v4, legacy_locations=legacy_locations
@@ -333,6 +345,7 @@ class SPDXGenerator(Generator):
         edge_values = {
             json_text(edge.model_dump(mode="json", exclude_none=True)): edge
             for edge in aibom.dependencies
+            if edge.source_ref not in unprojected and edge.target_ref not in unprojected
         }
         coverage = coverage_aggregate(aibom.metadata.completeness)
         relationships = [

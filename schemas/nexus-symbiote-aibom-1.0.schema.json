@@ -1346,6 +1346,150 @@
       "title": "CompletenessClaim",
       "type": "object"
     },
+    "CredentialComponent": {
+      "additionalProperties": false,
+      "description": "A credential that a component authenticates with, recorded by name, never by value.\n\nThe name is what holds the credential: an environment variable, the label under\nwhich a workflow tool stores it, or the parameter a literal is passed as. A name or\nreference shaped like a credential value is refused, as is any other text of the record\nshaped like one and any digest, so neither a token nor an unkeyed digest of one can\nreach the inventory or any export of it.",
+      "properties": {
+        "bom_ref": {
+          "description": "Unique reference within this BOM",
+          "maxLength": 16384,
+          "title": "Bom Ref",
+          "type": "string"
+        },
+        "component_type": {
+          "const": "credential",
+          "title": "Component Type",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        },
+        "supplier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Supplier"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "hashes": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Hashes",
+          "type": "object"
+        },
+        "trust_tier": {
+          "$ref": "#/$defs/TrustTier",
+          "default": "unknown"
+        },
+        "assurance_level": {
+          "$ref": "#/$defs/AssuranceLevel",
+          "default": "declared",
+          "description": "declared: stated by configuration, a manifest or a supplier; observed: a named collector measured the component's identity from bytes (a file, weight or descriptor digest); verified: established by cryptographic verification, which offline collection never assigns"
+        },
+        "source_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Where this was discovered: a POSIX path relative to the scan root (native format 1.1.0 and later), or a URL. Format 1.0.0 recorded absolute scan-host paths",
+          "title": "Source Path"
+        },
+        "properties": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Extension properties",
+          "title": "Properties"
+        },
+        "claims": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ClaimEvidence"
+          },
+          "title": "Claims",
+          "type": "object"
+        },
+        "credential_kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "environment-variable",
+                "workflow-credential",
+                "source-literal"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "What the name is: environment-variable (a variable that source reads, a .env template lists or a ${NAME} placeholder names), workflow-credential (the label under which a workflow tool stores the credential) or source-literal (the parameter a literal value is passed as in source)",
+          "title": "Credential Kind"
+        },
+        "value_in_checkout": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whether a literal value sits beside the reference in the scanned checkout; the value itself is never recorded",
+          "title": "Value In Checkout"
+        },
+        "risks": {
+          "items": {
+            "$ref": "#/$defs/RiskAssessment"
+          },
+          "title": "Risks",
+          "type": "array"
+        }
+      },
+      "required": [
+        "bom_ref",
+        "component_type",
+        "name"
+      ],
+      "title": "CredentialComponent",
+      "type": "object"
+    },
     "DataSourceComponent": {
       "additionalProperties": false,
       "description": "A training or fine-tuning dataset.\n\nReserved: no built-in collector emits this type; it appears only in supplied inventories.",
@@ -4358,6 +4502,7 @@
             "a2a-client": "#/$defs/A2AClientComponent",
             "a2a-server": "#/$defs/A2AServerComponent",
             "agent": "#/$defs/AgentComponent",
+            "credential": "#/$defs/CredentialComponent",
             "data-source": "#/$defs/DataSourceComponent",
             "guardrail-policy": "#/$defs/GuardrailComponent",
             "ide-agent": "#/$defs/IDEAgentComponent",
@@ -4422,6 +4567,9 @@
           },
           {
             "$ref": "#/$defs/VerifiedExtensionComponent"
+          },
+          {
+            "$ref": "#/$defs/CredentialComponent"
           }
         ]
       },

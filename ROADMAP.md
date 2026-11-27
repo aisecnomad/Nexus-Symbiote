@@ -46,7 +46,7 @@ The first hardened release from the canonical `aisecnomad` owner, published with
 
 - **Regression corpus & precision depth:** Expand per-category positive and negative fixtures (`model_drift`, `a2a_scope_drift`) and tighten per-class recall floors in `make precision` over `benchmarks/aibom-bench`.
 - **Settings & determinism finish:** Replace remaining TypeScript wall-clock parse deadlines with proportional node budgets, bound export work on adversarial graphs, and add `diff --expect-upgrade` attribution.
-- **Native format 1.2.0:** Add `serialization_evidence` re-derivation, `same-definition` tool relations, server deduplication across multi-config declarations, and root `.env` key-name exposure findings.
+- **Native format 1.2.0:** Add the `credential` component type (a credential by name, never by value), `serialization_evidence` re-derivation, `same-definition` tool relations, server deduplication across multi-config declarations, and root `.env` key-name exposure findings.
 
 ### 1.0.0-rc.1 & 1.0.0 — Frozen AgentBOM v1 contract
 
