@@ -157,10 +157,27 @@ def test_the_builder_refuses_a_parent_another_user_could_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     builder = _builder()
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    with pytest.raises(builder.CorpusError, match="writable only by you"):
+        builder.build(shared / "out")
+    group = tmp_path / "group"
+    group.mkdir()
+    group.chmod(0o770)
+    with pytest.raises(builder.CorpusError, match="writable only by you"):
+        builder.build(group / "out")
     monkeypatch.setattr(builder.os, "geteuid", lambda: 4242)
-    with pytest.raises(builder.CorpusError, match="neither yours nor a sticky directory"):
+    with pytest.raises(builder.CorpusError, match="writable only by you"):
         builder.build(tmp_path / "out")
-    assert not (tmp_path / "out").exists()
+    assert not any((d / "out").exists() for d in (shared, group, tmp_path))
+
+
+def test_the_builder_accepts_a_sticky_parent(tmp_path: Path) -> None:
+    sticky = tmp_path / "sticky"
+    sticky.mkdir()
+    sticky.chmod(0o1777)
+    assert len(_builder().build(sticky / "out")) == 81
 
 
 def test_the_builder_writes_only_into_the_directory_it_creates(tmp_path: Path) -> None:

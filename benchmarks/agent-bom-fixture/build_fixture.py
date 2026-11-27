@@ -9,8 +9,9 @@ an editor would treat as live configuration.
 
     python benchmarks/agent-bom-fixture/build_fixture.py --out /tmp/agent-bom-fixture
 
-The output directory must not exist, and its parent must be one the operator controls: a
-directory the operator owns, or a sticky directory owned by root such as ``/tmp``. The
+The output directory must not exist, and its parent must be one no one else can change: a
+directory the operator owns that only the operator can write to, or a sticky directory
+owned by root or the operator, such as ``/tmp``. The
 builder opens that parent without following a symbolic link, creates the output under it
 with mode 0700, and creates every directory and file relative to descriptors it opened,
 without following symbolic links, without replacing an existing entry, and setting each
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -100,24 +102,35 @@ _FILE = (
 )
 
 
-def _subdirectory(parent: int, name: str, opened: dict[tuple[int, str], int]) -> int:
-    """The descriptor of ``name`` under ``parent``, created if absent, never a symlink."""
-    key = (parent, name)
-    if key not in opened:
-        try:
-            os.mkdir(name, 0o755, dir_fd=parent)
-        except FileExistsError:
-            pass
-        opened[key] = os.open(name, _DIRECTORY, dir_fd=parent)
-    return opened[key]
-
-
 def _trusted_parent(descriptor: int, parent: Path) -> None:
-    """Refuse a parent another user could change: not ours, and not a root sticky directory."""
+    """Refuse a parent another user could change.
+
+    Safe is a sticky directory owned by root or the operator, such as ``/tmp``, where no
+    one else can replace an entry, or a directory the operator owns that no one else can
+    write to.
+    """
     info = os.fstat(descriptor)
-    sticky = bool(info.st_mode & stat.S_ISVTX) and info.st_uid == 0
-    if info.st_uid != os.geteuid() and not sticky:
-        raise CorpusError(f"{parent} is neither yours nor a sticky directory owned by root")
+    sticky = bool(info.st_mode & stat.S_ISVTX) and info.st_uid in {0, os.geteuid()}
+    private = info.st_uid == os.geteuid() and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    if not (sticky or private):
+        raise CorpusError(f"{parent} must be yours and writable only by you, or a sticky directory")
+
+
+def _write(directory: int, parts: tuple[str, ...], data: bytes, mode: int) -> None:
+    """Write ``data`` at ``parts`` under ``directory`` without following symbolic links."""
+    if len(parts) == 1:
+        with os.fdopen(os.open(parts[0], _FILE, 0o600, dir_fd=directory), "wb") as stream:
+            stream.write(data)
+            os.fchmod(stream.fileno(), mode)
+        return
+    # An earlier file may have created the directory; O_NOFOLLOW below still refuses a link.
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(parts[0], 0o755, dir_fd=directory)
+    child = os.open(parts[0], _DIRECTORY, dir_fd=directory)
+    try:
+        _write(child, parts[1:], data, mode)
+    finally:
+        os.close(child)
 
 
 def build(out: Path, corpus: Path = CORPUS) -> list[PurePosixPath]:
@@ -132,8 +145,6 @@ def build(out: Path, corpus: Path = CORPUS) -> list[PurePosixPath]:
         parent = os.open(parent_path, _DIRECTORY)
     except OSError as exc:
         raise CorpusError(f"{parent_path} cannot be opened as a directory: {exc}") from None
-    opened: dict[tuple[int, str], int] = {}
-    root = -1
     try:
         _trusted_parent(parent, parent_path)
         try:
@@ -141,19 +152,12 @@ def build(out: Path, corpus: Path = CORPUS) -> list[PurePosixPath]:
         except FileExistsError:
             raise CorpusError(f"{out} already exists; give a new output directory") from None
         root = os.open(out.name, _DIRECTORY, dir_fd=parent)
-        for relative, data, mode in entries:
-            directory = root
-            for name in relative.parts[:-1]:
-                directory = _subdirectory(directory, name, opened)
-            handle = os.open(relative.parts[-1], _FILE, 0o600, dir_fd=directory)
-            with os.fdopen(handle, "wb") as stream:
-                stream.write(data)
-                os.fchmod(stream.fileno(), mode)
-    finally:
-        for descriptor in opened.values():
-            os.close(descriptor)
-        if root >= 0:
+        try:
+            for relative, data, mode in entries:
+                _write(root, relative.parts, data, mode)
+        finally:
             os.close(root)
+    finally:
         os.close(parent)
     return [relative for relative, _, _ in entries]
 
