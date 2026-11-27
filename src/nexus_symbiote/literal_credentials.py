@@ -24,7 +24,11 @@ from nexus_symbiote.core.collection import is_imported
 from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.models import RiskAssessment
 from nexus_symbiote.scanners.credential_files import credential_gap, credential_shaped
-from nexus_symbiote.scanners.mcp_credentials import normalize_credential, placeholder
+from nexus_symbiote.scanners.mcp_credentials import (
+    credential_name,
+    normalize_credential,
+    placeholder,
+)
 from nexus_symbiote.scanners.source_binding import BindingError, value_binding
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.secrets import TOKEN_SHAPE, holds_token_shape
@@ -33,8 +37,7 @@ from nexus_symbiote.utils.terminal import neutralize
 MAX_LITERALS = 32
 _JOIN_LINES = 8
 _JOIN_CHARS = 2048
-# A vendor prefix left at the end of a window the cap cut is not a completed token.
-_OPEN_PREFIX = re.compile(r"sk-|ghp_|gho_|ghu_|ghs_|ghr_|hf_|github_pat_|glpat-|xox[abeoprs]-")
+_CANDIDATE_CHARS = 256
 _BACKSLASH_JOIN = re.compile(r"\\\n")
 _PLUS_JOIN = re.compile(r"""(?s)(['"])\s*\+\s*\1""")
 _ADJACENT_QUOTES = re.compile(r"""(?s)(['"])\s*\1""")
@@ -58,7 +61,8 @@ _TEXT_SUFFIXES = frozenset(
         ".bash",
     }
 )
-_TOKEN_CHAR = re.compile(r"[\w-]")
+_TOKEN_WORD = re.compile(r"[\w-]++")
+_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)\s*[:=]\s*$")
 # A prefix a space may interrupt. The match itself still has to satisfy the shape table.
 _SPLIT_PREFIX = re.compile(
     r"(?<![\w-])(?:"
@@ -91,6 +95,46 @@ def _direct_matches(visible: str) -> Iterator[re.Match[str]]:
     return (match for match in TOKEN_SHAPE.finditer(visible) if holds_token_shape(match.group()))
 
 
+def _ends_assigned_value(visible: str, start: int, end: int) -> bool:
+    """Whether this final word closes a quoted value assigned to a credential name."""
+    if not start or end >= len(visible) or visible[end] not in ("'", '"'):
+        return False
+    if visible[start - 1] != visible[end]:
+        return False
+    assignment = _ASSIGNMENT.search(visible, max(0, start - _CANDIDATE_CHARS), start - 1)
+    return assignment is not None and credential_name(assignment[1])
+
+
+def _complete_candidate(candidate: str) -> bool:
+    return TOKEN_SHAPE.fullmatch(candidate) is not None and holds_token_shape(candidate)
+
+
+def _split_candidate(visible: str, prefix: re.Match[str]) -> tuple[str, int]:
+    """Read one bounded candidate, keeping ordinary words outside the token."""
+    limit = min(len(visible), prefix.start() + _CANDIDATE_CHARS)
+    word = _TOKEN_WORD.match(visible, prefix.end(), limit)
+    if word is None:
+        return prefix.group(), prefix.end()
+    candidate = prefix.group() + word.group()
+    end = word.end()
+    while end < limit and visible[end].isspace() and not _complete_candidate(candidate):
+        next_start = end + 1
+        while next_start < limit and visible[next_start].isspace():
+            next_start += 1
+        word = _TOKEN_WORD.match(visible, next_start, limit)
+        if word is None:
+            break
+        if word.group().replace("-", "").isalpha() and not _ends_assigned_value(
+            visible, prefix.start(), word.end()
+        ):
+            # An ordinary word is insufficient evidence outside a complete assigned value.
+            # Explicit backslash and string joins were already resolved by the caller.
+            break
+        candidate += word.group()
+        end = word.end()
+    return candidate, end
+
+
 def _literals(visible: str) -> Iterator[tuple[int, str]]:
     """Yield direct matches first, then recover shapes split by whitespace."""
     for match in _direct_matches(visible):
@@ -104,32 +148,9 @@ def _literals(visible: str) -> Iterator[tuple[int, str]]:
             current = next(covered, None)
         if current is not None and current.start() <= prefix.start():
             continue
-        chars: list[str] = []
-        index = prefix.end()
-        limit = min(len(visible), prefix.start() + 256)
-        while index < limit:
-            char = visible[index]
-            if char.isspace():
-                # A standalone prefix is often documentation. Join whitespace only
-                # after a token body has started, or after explicit source joins.
-                if not chars:
-                    break
-                nxt = index + 1
-                while nxt < limit and visible[nxt].isspace():
-                    nxt += 1
-                if holds_token_shape(prefix.group() + "".join(chars)):
-                    break
-                if nxt >= limit or _TOKEN_CHAR.fullmatch(visible[nxt]) is None:
-                    break
-                index = nxt
-                continue
-            if _TOKEN_CHAR.fullmatch(char) is None:
-                break
-            chars.append(char)
-            index += 1
-        candidate = normalize_credential(prefix.group() + "".join(chars))
-        if holds_token_shape(candidate) and TOKEN_SHAPE.fullmatch(candidate):
-            yield prefix.start(), candidate
+        candidate, _ = _split_candidate(visible, prefix)
+        if _complete_candidate(candidate):
+            yield prefix.start(), normalize_credential(candidate)
 
 
 def _commitment(rel_path: str, line_no: int, literal: str) -> str:
@@ -210,13 +231,28 @@ def _normalized_window(parts: list[str]) -> tuple[str, list[int]]:
 def _cut_off_token(visible: str) -> bool:
     """Whether ``visible`` ends in a vendor prefix the window did not finish."""
     text = visible.rstrip()
-    # Only the last contiguous token-shaped word can cross the boundary.
-    # Locate it once so multiple prefixes never rescan the same suffix.
-    start = len(text)
-    while start and _TOKEN_CHAR.fullmatch(text[start - 1]):
-        start -= 1
-    found = _OPEN_PREFIX.search(text, start)
-    return found is not None and not holds_token_shape(text[found.start() :])
+    explicit_join = text.endswith(("+", "\\"))
+    if explicit_join:
+        text = text[:-1].rstrip()
+        if text.endswith(("'", '"')):
+            text = text[:-1]
+        # Direct matches have no 256-character recovery limit. An explicit join
+        # could change an already valid spelling and hence its keyed evidence.
+        start = len(text)
+        while start and (text[start - 1].isalnum() or text[start - 1] in "_.=-"):
+            start -= 1
+        if any(
+            m.end() == len(text) and holds_token_shape(m.group())
+            for m in TOKEN_SHAPE.finditer(text, start)
+        ):
+            return True
+    # Only a candidate within one bounded lookback can reach the cut. Use the
+    # same prefix table and body rules as the whitespace matcher.
+    for prefix in _SPLIT_PREFIX.finditer(text, max(0, len(text) - _CANDIDATE_CHARS)):
+        candidate, end = _split_candidate(text, prefix)
+        if end == len(text) and (explicit_join or not _complete_candidate(candidate)):
+            return True
+    return False
 
 
 def _literal_windows(text: str) -> Iterator[tuple[int, str, list[int], bool]]:
@@ -296,8 +332,8 @@ def apply_literal_credential_findings(
             for first_line, normalized, boundaries, truncated in _literal_windows(text):
                 if truncated and _cut_off_token(normalized):
                     own_failures.append(
-                        f"{neutralize(rel_path)}: a vendor token continues past the "
-                        f"{_JOIN_LINES}-line window; not collected"
+                        f"{neutralize(rel_path)}: a vendor token may continue past the "
+                        "bounded source window; not collected"
                     )
                     refused = True
                     break
