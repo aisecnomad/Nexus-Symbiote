@@ -2206,3 +2206,280 @@ def test_a_parameter_that_selects_an_allow_listed_fragment_is_not_caller_supplie
     tool = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
     found = classify_python(tool, PythonScopes(tree))
     assert any("caller-supplied" in r.detail for r in found.risks) is raw, source
+
+
+# ---- Review of 03c57da0: the names a TypeScript scope binds -------------------------------
+
+_EXEC = 'import { exec } from "child_process";\n'
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected"),
+    [
+        (_EXEC, "(exec) => { const a = exec; const run = a; return run('x'); }", set()),
+        (_EXEC, "(exec) => { if (exec) { const run = exec; return run('x'); } }", set()),
+        (_EXEC, "async (c) => { const exec = (x) => x; const run = exec; return run(c); }", set()),
+        (
+            'import fsp from "fs/promises";\n',
+            "async (fsp) => { const store = fsp; const rm = store.rm; return rm('x'); }",
+            set(),
+        ),
+        (
+            'import Stripe from "stripe";\n',
+            "async (a) => { class Stripe { refunds = { create: () => 0 }; } "
+            "const p = new Stripe(); return p.refunds.create(a); }",
+            set(),
+        ),
+        (_EXEC, "async function exec(c) { return c ? exec(null) : 0; }", set()),
+        (_EXEC, "async (self) => self.exec('x')", set()),
+        ("", "async (self) => self.stripe.refunds.create({ charge: 'c' })", set()),
+        (_EXEC, "(c) => { const run = exec; return run(c); }", {E.EXECUTE}),
+    ],
+    ids=[
+        "two-step-alias-of-a-parameter",
+        "alias-of-a-parameter-in-a-block",
+        "alias-of-a-local-function",
+        "member-of-an-alias-of-a-parameter",
+        "local-class-named-like-an-import",
+        "handler-named-like-an-import",
+        "parameter-named-like-a-global",
+        "stripe-chain-from-a-parameter-named-like-a-global",
+        "alias-of-the-import-control",
+    ],
+)
+def test_a_typescript_name_the_handler_binds_hides_the_import_in_its_aliases(
+    tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass]
+) -> None:
+    assert _caps(_ts(tmp_path, handler, header)) == expected, handler
+
+
+def _ts_file(tmp_path: Path, body: str) -> dict[str, ToolComponent]:
+    path = tmp_path / "src" / "server.ts"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(IMPORT + body.replace("__SERVER__", SERVER))
+    return _tools(tmp_path)
+
+
+def test_one_typescript_handlers_names_never_reach_another(tmp_path: Path) -> None:
+    tools = _ts_file(
+        tmp_path / "leak",
+        _EXEC + "__SERVER__"
+        'server.tool("a", {}, async (exec) => { const run = exec; return run("x"); });\n'
+        'server.tool("b", {}, async ({ cmd }) => { if (cmd) { const run = (c) => c; '
+        "return run(cmd); } });\n",
+    )
+    assert tools["a"].capabilities is None and tools["b"].capabilities is None
+    tools = _ts_file(
+        tmp_path / "union",
+        'import axios from "axios";\nimport { Cache } from "./cache";\n__SERVER__'
+        'server.tool("fetch", {}, async ({ url }) => { const client = axios.create(); '
+        "return (await client.get(url)).data; });\n"
+        'server.tool("evict", {}, async ({ key }) => { const client = new Cache(); '
+        'await client.delete(key); return "ok"; });\n',
+    )
+    assert _caps(tools["fetch"]) == {E.NETWORK} and tools["evict"].capabilities is None
+    many = "".join(f'import {{ C{i} }} from "sdk{i}";\n' for i in range(33))
+    many += "__SERVER__" + "".join(
+        f'server.tool("t{i}", {{}}, async (a) => {{ const client = new C{i}(); '
+        "return client.call(a); });\n"
+        for i in range(33)
+    )
+    root = tmp_path / "reused"
+    path = root / "src" / "server.ts"
+    path.parent.mkdir(parents=True)
+    path.write_text(IMPORT + many.replace("__SERVER__", SERVER))
+    result = MCPScanner().scan(root)
+    assert not [s for s in result.surfaces_excluded if "too large or too ambiguous" in s]
+
+
+def test_a_function_around_a_typescript_handler_lends_it_its_names(tmp_path: Path) -> None:
+    tools = _ts_file(
+        tmp_path / "lends",
+        'import axios from "axios";\n__SERVER__'
+        "function register() { const api = axios.create(); "
+        'server.tool("t", {}, (u) => api.post(u, {})); }\nregister();\n',
+    )
+    assert _caps(tools["t"]) == {E.NETWORK, E.WRITE}
+    tools = _ts_file(
+        tmp_path / "shadows",
+        _EXEC + "__SERVER__"
+        'function register(exec) { server.tool("t", {}, (c) => { const run = exec; '
+        "return run(c); }); }\n",
+    )
+    assert tools["t"].capabilities is None
+    deep = "".join("(() => {" for _ in range(40)) + 'server.tool("t", {}, (c) => c);'
+    deep += "})()" * 40 + ";\n"
+    root = tmp_path / "deep"
+    path = root / "src" / "server.ts"
+    path.parent.mkdir(parents=True)
+    path.write_text(IMPORT + SERVER + deep)
+    assert any("too large or too ambiguous" in s for s in MCPScanner().scan(root).surfaces_excluded)
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected"),
+    [
+        (
+            'import { createServer as createHttpServer } from "node:http";\n'
+            "const httpServer = createHttpServer(() => {});\n",
+            "async () => httpServer.address()",
+            set(),
+        ),
+        (
+            'import { Server as HttpServer } from "http";\nconst srv = new HttpServer();\n',
+            "async () => srv.close()",
+            set(),
+        ),
+        (
+            'const { createServer: mk } = require("https");\nconst srv = mk({}, () => {});\n',
+            "async () => srv.close()",
+            set(),
+        ),
+        (
+            'import http from "http";\n'
+            'const srv = http.createServer(() => {}).on("error", () => {});\n',
+            "async () => srv.close()",
+            set(),
+        ),
+        (
+            'import fetch, { Headers } from "node-fetch";\n',
+            "async ({ url }) => { const h = new Headers(); h.delete('cookie'); "
+            "return fetch(url, { headers: h }); }",
+            {E.NETWORK},
+        ),
+        (
+            'import { FormData } from "undici";\n',
+            "async () => { const f = new FormData(); f.delete('k'); return 0; }",
+            set(),
+        ),
+        (
+            'import axios from "axios";\nconst cfg = await axios.get("https://x/cfg");\n',
+            "async (k) => cfg.data.features.includes(k)",
+            set(),
+        ),
+        (
+            'import https from "https";\nconst agent = new https.Agent({ keepAlive: true });\n',
+            "async () => agent.destroy()",
+            set(),
+        ),
+        (
+            'import { Client } from "undici";\nconst api = new Client("https://x");\n',
+            "async (a) => api.request({ method: 'POST', path: '/', body: a })",
+            {E.NETWORK},
+        ),
+        (
+            'import axios from "axios";\nconst api = axios.create();\n',
+            "async (a) => api.post('/x', a)",
+            {E.NETWORK, E.WRITE},
+        ),
+    ],
+    ids=[
+        "aliased-create-server",
+        "aliased-server-class",
+        "destructured-create-server",
+        "server-with-a-chained-listener",
+        "headers-delete",
+        "form-data-delete",
+        "module-level-response",
+        "https-agent",
+        "undici-client-control",
+        "axios-instance-control",
+    ],
+)
+def test_only_a_client_an_http_module_returns_sends_requests(
+    tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass]
+) -> None:
+    assert _caps(_ts(tmp_path, handler, header)) == expected, handler
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected"),
+    [
+        (
+            _EXEC + 'import { promisify } from "util";\n'
+            "const run = promisify(exec) as (c: string) => Promise<unknown>;\n",
+            "async (c) => run(c)",
+            {E.EXECUTE},
+        ),
+        (
+            'import axios from "axios";\nconst api = axios.create() as any;\n',
+            "async (a) => api.post('/x', a)",
+            {E.NETWORK, E.WRITE},
+        ),
+        (
+            'import axios from "axios";\nconst api = axios.create() satisfies object;\n',
+            "async (a) => api.post('/x', a)",
+            {E.NETWORK, E.WRITE},
+        ),
+        (
+            'import axios from "axios";\nconst api = <any>axios.create();\n',
+            "async (a) => api.post('/x', a)",
+            {E.NETWORK, E.WRITE},
+        ),
+        (
+            'const cp = require("child_process") as typeof import("child_process");\n',
+            "(c) => cp.execSync(c)",
+            {E.EXECUTE},
+        ),
+        (
+            'import * as cp from "child_process";\nconst { execSync } = cp;\n',
+            "(c) => execSync(c)",
+            {E.EXECUTE},
+        ),
+        (
+            'import fs from "fs";\nconst { writeFile, unlink } = fs.promises;\n',
+            "async (p) => { await writeFile(p, 'x'); await unlink(p); }",
+            {E.FILESYSTEM, E.WRITE, E.DESTRUCTIVE},
+        ),
+        (
+            'import axios from "axios";\nconst { post } = axios.create();\n',
+            "async (a) => post('/x', a)",
+            {E.NETWORK, E.WRITE},
+        ),
+        ('import cp = require("child_process");\n', "(c) => cp.execSync(c)", {E.EXECUTE}),
+        (
+            'import * as cp from "child_process";\nlet run: any;\nrun = cp.execSync;\n',
+            "(c) => run(c)",
+            {E.EXECUTE},
+        ),
+        (
+            'import * as cp from "child_process";\nconst run = cp.exec.bind(cp);\n',
+            "(c) => run(c)",
+            {E.EXECUTE},
+        ),
+        (
+            'import * as cp from "child_process";\n'
+            'const run = require("util").promisify(cp.exec);\n',
+            "async (c) => run(c)",
+            {E.EXECUTE},
+        ),
+    ],
+    ids=[
+        "promisify-as-a-type",
+        "client-as-any",
+        "client-satisfies",
+        "client-angle-assertion",
+        "require-as-typeof-import",
+        "destructured-namespace-import",
+        "destructured-module-member",
+        "destructured-client",
+        "import-equals-require",
+        "assigned-alias",
+        "bound-method",
+        "promisify-of-a-required-util",
+    ],
+)
+def test_typescript_names_bound_through_assertions_destructuring_and_assignment(
+    tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass]
+) -> None:
+    assert _caps(_ts(tmp_path, handler, header)) == expected, handler
+
+
+def test_a_typescript_member_of_a_name_bound_in_many_functions_stays_in_each(
+    tmp_path: Path,
+) -> None:
+    many = "".join(
+        f'function f{i}() {{ const x = require("m").e{i}; return x; }}\n' for i in range(34)
+    )
+    many += 'const x = require("child_process");\nconst run = x.execSync;\n'
+    assert _caps(_ts(tmp_path, "(c) => run(c)", many)) == {E.EXECUTE}

@@ -15,7 +15,7 @@ import ast
 import bisect
 import itertools
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -1104,65 +1104,227 @@ Bindings = Mapping[str, tuple[tuple[str, str], ...]]
 
 
 _Names = dict[str, dict[tuple[str, str], None]]  # Each name's bindings, in the order found.
+_TS_FUNCTIONS = frozenset(
+    {"function_declaration", "function_expression", "function", "arrow_function"}
+    | {"method_definition", "generator_function", "generator_function_declaration"}
+)
+# Functions around a handler past this many leave it unclassified, which keeps a lookup's cost
+# constant.
+_MAX_SCOPES = 32
+_TS_DECLARATIONS = frozenset(
+    {"function_declaration", "class_declaration", "generator_function_declaration"}
+)
+_TS_BINDERS = frozenset({"variable_declarator", "assignment_expression"})
 
 
 def _bind(names: _Names, name: str, binding: tuple[str, str]) -> None:
     names.setdefault(name, {})[binding] = None
 
 
-def typescript_imports(nodes: Iterable[Node]) -> dict[str, tuple[tuple[str, str], ...]]:
-    """Every (module, export or '') a name is bound to by ``import`` or ``require``, in any
-    scope, so a second binding adds a candidate and never hides the first."""
+class _View(Mapping[str, tuple[tuple[str, str], ...]]):
+    """What names hold in one function: what it binds them to, over what the functions around
+    it bind and then the module. A name the function binds otherwise, such as a parameter,
+    hides the bindings around it."""
+
+    def __init__(self, outer: _View | None, module: Bindings, depth: int = 0) -> None:
+        self.outer, self.module, self.depth = outer, module, depth
+        self.own: _Names = {}
+        self.hidden: set[str] = set()
+
+    def __getitem__(self, name: str) -> tuple[tuple[str, str], ...]:
+        found: dict[tuple[str, str], None] = {}
+        view: _View | None = self
+        while view is not None:
+            found.update(view.own.get(name, {}))
+            if name in view.hidden:
+                break
+            view = view.outer
+        else:
+            found.update(dict.fromkeys(self.module.get(name, ())))
+        if not found:
+            raise KeyError(name)
+        return tuple(found)
+
+    def __iter__(self) -> Iterator[str]:
+        names: set[str] = set(self.module)
+        view: _View | None = self
+        while view is not None:
+            names.update(view.own)
+            view = view.outer
+        return iter(name for name in names if name in self)
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+
+@dataclass
+class TypeScriptNames:
+    """What a file's names are bound to, by ``import``, ``require`` or a value taken from a
+    bound name. The module's bindings reach every handler, and a function's only the
+    handlers inside it, so one handler's names never reach another's."""
+
+    module: dict[str, tuple[tuple[str, str], ...]]
+    functions: dict[int, Node] = field(default_factory=dict)
+    outer: dict[int, int | None] = field(default_factory=dict)  # Each function's enclosing one.
+    declared: dict[int | None, list[Node]] = field(default_factory=dict)  # In source order.
+    _views: dict[int | None, _View] = field(default_factory=dict)
+
+    def view(self, function: int | None) -> _View:
+        """What names hold in ``function``'s own scope, or the module's for None; past
+        ``_MAX_SCOPES`` functions around it, ``_TooManyTargetsError``."""
+        pending: list[int] = []
+        current = function
+        while current is not None and current not in self._views:
+            pending.append(current)
+            current = self.outer.get(current)
+            if len(pending) > _MAX_SCOPES:
+                raise _TooManyTargetsError
+        if current is None and None not in self._views:
+            self._views[None] = _View(None, self.module)
+        for scope in reversed(pending):
+            outer = self._views[self.outer.get(scope)]
+            if outer.depth >= _MAX_SCOPES:
+                raise _TooManyTargetsError
+            node = self.functions[scope]
+            self._views[scope] = _ts_scope(node, self.declared.get(scope, []), outer)
+        return self._views[function]
+
+    def handler(self, handler: Node, skip: frozenset[int]) -> _View:
+        """What names hold in a handler: what the functions around it bind, and what every
+        declarator in its body binds, nested ones too, except in another tool's handler."""
+        declarators: list[Node] = []
+        stack, visited = [handler], 0
+        while stack:
+            node = stack.pop()
+            visited += 1
+            if visited > MAX_BODY_NODES:
+                raise _TooManyTargetsError
+            if node.type in _TS_BINDERS:
+                declarators.append(node)
+            stack.extend(child for child in node.named_children if child.id not in skip)
+        declarators.sort(key=lambda node: node.start_byte)
+        return _ts_scope(handler, declarators, self.view(self.outer.get(handler.id)))
+
+
+def typescript_imports(nodes: Iterable[Node]) -> TypeScriptNames:
+    """Every (module, export or '') a name is bound to by ``import``, by ``require`` or by
+    a value taken from a bound name, for the scope that binds it. ``nodes`` starts with the
+    root. A second binding adds a candidate and never hides the first."""
     nodes = list(nodes)
+    found = TypeScriptNames({})
     names: _Names = {}
-    for node in nodes:
+    stack: list[tuple[Node, int | None]] = [(nodes[0], None)] if nodes else []
+    while stack:
+        node, function = stack.pop()
         if node.type == "import_statement":
-            source = node.child_by_field_name("source")
-            if source is None:
-                continue
-            module = _ts_module(_ts_text(source).strip("'\"`"))
-            for clause in node.named_children:
-                if clause.type != "import_clause":
-                    continue
-                for part in clause.named_children:
-                    if part.type == "identifier":
-                        _bind(names, _ts_text(part), (module, ""))
-                    elif part.type == "namespace_import":
-                        for ident in part.named_children:
-                            if ident.type == "identifier":
-                                _bind(names, _ts_text(ident), (module, ""))
-                    elif part.type == "named_imports":
-                        for spec in part.named_children:
-                            if spec.type != "import_specifier":
-                                continue
-                            imported = spec.child_by_field_name("name")
-                            alias = spec.child_by_field_name("alias")
-                            local = _ts_text(alias or imported)
-                            _bind(names, local, (module, _ts_text(imported)))
-        elif node.type == "variable_declarator":
-            target = node.child_by_field_name("name")
-            value = _ts_unwrap_await(node.child_by_field_name("value"))
-            if target is None or value is None:
-                continue
-            export = ""
-            if value.type == "member_expression":
-                # const run = require("child_process").execSync
-                export = _ts_text(value.child_by_field_name("property"))
-                value = _ts_unwrap_await(value.child_by_field_name("object"))
-            loaded = (
-                _ts_loaded_module(value)
-                if value is not None and value.type == "call_expression"
-                else None
-            )
-            if loaded is None:
-                continue
-            if target.type == "identifier":
-                _bind(names, _ts_text(target), (loaded, export))
-            elif target.type == "object_pattern":
-                for local, key in _ts_destructured(target, export):
-                    _bind(names, local, (loaded, key))
-    _bind_derived(nodes, names)
-    return {name: tuple(bindings) for name, bindings in names.items()}
+            _bind_import(node, names)
+        elif node.type in _TS_BINDERS:
+            found.declared.setdefault(function, []).append(node)
+        if node.type in _TS_FUNCTIONS:
+            found.functions[node.id] = node
+            found.outer[node.id] = function
+            function = node.id
+        stack.extend((child, function) for child in reversed(node.named_children))
+    for declarator in found.declared.get(None, []):
+        for name, binding in _ts_declared(declarator, names):
+            _bind(names, name, binding)
+    found.module = {name: tuple(bindings) for name, bindings in names.items()}
+    return found
+
+
+def _bind_import(node: Node, names: _Names) -> None:
+    source = node.child_by_field_name("source")
+    for clause in node.named_children:  # import cp = require("child_process")
+        parts = clause.named_children if clause.type == "import_require_clause" else []
+        if source is None and len(parts) == 2 and parts[0].type == "identifier":
+            _bind(names, _ts_text(parts[0]), (_ts_module(_ts_text(parts[1]).strip("'\"`")), ""))
+    if source is None:
+        return
+    module = _ts_module(_ts_text(source).strip("'\"`"))
+    for clause in node.named_children:
+        if clause.type != "import_clause":
+            continue
+        for part in clause.named_children:
+            if part.type == "identifier":
+                _bind(names, _ts_text(part), (module, ""))
+            elif part.type == "namespace_import":
+                for ident in part.named_children:
+                    if ident.type == "identifier":
+                        _bind(names, _ts_text(ident), (module, ""))
+            elif part.type == "named_imports":
+                for spec in part.named_children:
+                    if spec.type != "import_specifier":
+                        continue
+                    imported = spec.child_by_field_name("name")
+                    alias = spec.child_by_field_name("alias")
+                    local = _ts_text(alias or imported)
+                    _bind(names, local, (module, _ts_text(imported)))
+
+
+def _ts_scope(function: Node, declarators: list[Node], outer: _View) -> _View:
+    """What names hold in a function. Its parameters, its own name and what its body declares
+    at the top level otherwise than from a bound name hide the names around it; then each
+    declarator, in source order, binds what its value holds."""
+    view = _View(outer, outer.module, outer.depth + 1)
+    view.hidden.update(_ts_parameters(function))
+    if function.type in {"function_expression", "function", "generator_function"}:
+        own = function.child_by_field_name("name")
+        if own is not None:
+            view.hidden.add(_ts_text(own))
+    body = function.child_by_field_name("body")
+    top: set[int] = set()
+    for statement in (
+        body.named_children if body is not None and body.type == "statement_block" else []
+    ):
+        if statement.type in _TS_DECLARATIONS:
+            declared = statement.child_by_field_name("name")
+            if declared is not None:
+                view.hidden.add(_ts_text(declared))
+        elif statement.type in {"lexical_declaration", "variable_declaration"}:
+            top.update(d.id for d in statement.named_children if d.type == "variable_declarator")
+    for declarator in declarators:  # A top-level declaration that binds nothing is a local.
+        if declarator.id in top:
+            bound = _ts_declared(declarator, view)
+            for name, binding in bound:
+                _bind(view.own, name, binding)
+            if not bound:
+                view.hidden.update(_ts_bound_names(declarator.child_by_field_name("name")))
+    for declarator in declarators:
+        if declarator.id not in top:
+            for name, binding in _ts_declared(declarator, view):
+                _bind(view.own, name, binding)
+    return view
+
+
+def _ts_declared(
+    node: Node, names: Mapping[str, Iterable[tuple[str, str]]]
+) -> list[tuple[str, tuple[str, str]]]:
+    """What a declarator or an assignment binds its names to: a module it loads, as
+    ``const run = require("child_process").execSync``, or what a value taken from a bound
+    name holds. Destructuring binds each key, as ``const { execSync } = cp``."""
+    assigned = node.type == "assignment_expression"
+    target = node.child_by_field_name("left" if assigned else "name")
+    value = _ts_unwrap(node.child_by_field_name("right" if assigned else "value"))
+    if target is None or value is None:
+        return []
+    base: Node | None = value
+    export = ""
+    if value.type == "member_expression":
+        export = _ts_text(value.child_by_field_name("property"))
+        base = _ts_unwrap(value.child_by_field_name("object"))
+    loaded = (
+        _ts_loaded_module(base) if base is not None and base.type == "call_expression" else None
+    )
+    held = [(loaded, export)] if loaded is not None else _ts_derived(value, names)
+    if target.type == "identifier":
+        return [(_ts_text(target), binding) for binding in held]
+    if target.type == "object_pattern":
+        return [
+            (local, (module, key))
+            for module, held_export in held
+            for local, key in _ts_destructured(target, held_export)
+        ]
+    return []
 
 
 def _ts_destructured(pattern: Node, export: str) -> list[tuple[str, str]]:
@@ -1190,48 +1352,69 @@ def _ts_destructured(pattern: Node, export: str) -> list[tuple[str, str]]:
     return found
 
 
-def _ts_unwrap_await(node: Node | None) -> Node | None:
-    while node is not None and node.type == "await_expression":
-        node = node.named_children[0] if node.named_children else None
+_TS_WRAPPED = frozenset(
+    {"await_expression", "as_expression", "satisfies_expression", "non_null_expression"}
+    | {"parenthesized_expression", "type_assertion"}
+)
+
+
+def _ts_unwrap(node: Node | None) -> Node | None:
+    """The value under ``await``, a type assertion (``as``, ``satisfies``, ``<T>``, ``!``) or
+    parentheses."""
+    while node is not None and node.type in _TS_WRAPPED:
+        children = node.named_children
+        node = (
+            (children[-1] if node.type == "type_assertion" else children[0]) if children else None
+        )
     return node
 
 
-def _bind_derived(nodes: Iterable[Node], names: _Names) -> None:
-    """A name bound from an imported name holds what that name holds, in source order."""
-    for node in nodes:
-        target = node.child_by_field_name("name") if node.type == "variable_declarator" else None
-        if target is not None and target.type == "identifier":
-            value = _ts_unwrap_await(node.child_by_field_name("value"))
-            for binding in _ts_derived(value, names):
-                _bind(names, _ts_text(target), binding)
+# What calling an HTTP module returns that sends requests itself: a client or a request. A
+# server, a response, headers, a form or an agent sends nothing.
+_TS_HTTP_CLIENTS = {
+    "axios": frozenset({"create", "Axios"}),
+    "got": frozenset({"extend"}),
+    "ky": frozenset({"create", "extend"}),
+    "undici": frozenset({"Client", "Pool", "BalancedPool", "Agent", "ProxyAgent", "RetryAgent"}),
+    "http": frozenset({"request", "get"}),
+    "https": frozenset({"request", "get"}),
+}
 
 
 def _ts_derived(
     value: Node | None, names: Mapping[str, Iterable[tuple[str, str]]]
 ) -> list[tuple[str, str]]:
-    """What a value taken from an imported name holds: another name for it, a member of it,
-    ``promisify`` of it, or what calling or constructing it returns, as in
-    ``const run = cp.execSync``, ``const api = axios.create()`` or ``new Stripe(key)``. A
-    server an http module creates is not a client. Past ``_MAX_TARGETS``, one more binding
-    is enough for a read of the name to be unclassified."""
+    """What a value taken from a bound name holds: another name for it, a member of it,
+    ``promisify`` or ``.bind()`` of it, or what calling or constructing it returns, as in
+    ``const run = cp.execSync``, ``const api = axios.create()`` or ``new Stripe(key)``. What
+    calling an HTTP module returns holds it only when it is a client. Past ``_MAX_TARGETS``,
+    one more binding is enough for a read of the name to be unclassified."""
+    value = _ts_unwrap(value)
     called = value is not None and value.type in {"call_expression", "new_expression"}
     if called and value is not None:
         callee = value.child_by_field_name("function") or value.child_by_field_name("constructor")
         arguments = value.child_by_field_name("arguments")
-        if _ts_text(callee) in {"promisify", "util.promisify"}:
+        if _ts_chain(callee)[-1:] == ["promisify"]:
             value = arguments.named_children[0] if arguments and arguments.named_children else None
             called = False
         else:
             value = callee
-    chain = _ts_chain(value)
-    if not chain or (called and chain[-1] in _TS_HTTP_SERVER):
+    chain = _ts_chain(_ts_unwrap(value))
+    if called and len(chain) > 1 and chain[-1] == "bind":  # ``f.bind(x)`` is ``f``
+        chain, called = chain[:-1], False
+    if not chain:
         return []
     head = chain[0]
     held = [(head.removeprefix(_MODULE_HEAD), "")] if head.startswith(_MODULE_HEAD) else []
     held = held or list(itertools.islice(names.get(head, ()), _MAX_TARGETS + 1))
-    if called or len(chain) == 1:
-        return held
-    return [(module, chain[-1]) for module, _ in held]
+    if not called:
+        return held if len(chain) == 1 else [(module, chain[-1]) for module, _ in held]
+    return [
+        (module, export)
+        for module, export in held
+        if module not in _TS_HTTP
+        or (chain[-1] if len(chain) > 1 else export) in _TS_HTTP_CLIENTS.get(module, ())
+    ]
 
 
 def _ts_loaded_module(call: Node) -> str | None:
@@ -1385,36 +1568,9 @@ def _ts_env_name(node: Node) -> str | None:
     return _ts_property(node) or None
 
 
-def _ts_import_binding(value: Node | None, imports: Bindings) -> bool:
-    """Whether a declarator binds a module or a value taken from an import, as imports do."""
-    value = _ts_unwrap_await(value)
-    if _ts_derived(value, imports):
-        return True
-    if value is not None and value.type == "member_expression":
-        value = _ts_unwrap_await(value.child_by_field_name("object"))
-    return value is not None and value.type == "call_expression" and bool(_ts_loaded_module(value))
-
-
-def _ts_locals(
-    handler: Node, imports: Bindings, tainted: set[str], skip: frozenset[int]
-) -> set[str] | None:
-    """Names the body binds at its top level, which shadow imports; a name bound from a
-    parameter anywhere is added to ``tainted``. None past the node bound."""
-    names: set[str] = set()
-    body = handler.child_by_field_name("body")
-    if body is not None and body.type == "statement_block":
-        for statement in body.named_children:
-            if statement.type in {"function_declaration", "class_declaration"}:
-                name = statement.child_by_field_name("name")
-                if name is not None:
-                    names.add(_ts_text(name))
-            elif statement.type in {"lexical_declaration", "variable_declaration"}:
-                for declarator in statement.named_children:
-                    value = declarator.child_by_field_name("value")
-                    if declarator.type == "variable_declarator" and not _ts_import_binding(
-                        value, imports
-                    ):
-                        names.update(_ts_bound_names(declarator.child_by_field_name("name")))
+def _ts_tainted(handler: Node, tainted: set[str], skip: frozenset[int]) -> bool:
+    """Add to ``tainted`` each name bound from a parameter anywhere in the body, so that SQL
+    built from it is caller-supplied; False past the node bound."""
     stack = [handler]
     visited = 0
     flows: list[Node] = []
@@ -1423,14 +1579,14 @@ def _ts_locals(
         node = stack.pop()
         visited += 1
         if visited > MAX_BODY_NODES:
-            return None
+            return False
         if node.type in _TS_READS:
             reads.setdefault(_ts_text(node), []).append(node.start_byte)
         elif node.type in _TS_FLOWS or node.type == "call_expression":
             flows.append(node)
         stack.extend(child for child in node.named_children if child.id not in skip)
     _ts_taint(flows, reads, tainted)
-    return names
+    return True
 
 
 _TS_READS = frozenset({"identifier", "shorthand_property_identifier"})
@@ -1514,23 +1670,21 @@ def _ts_bound_names(target: Node | None) -> list[str]:
 
 def classify_typescript(
     handler: Node,
-    imports: Bindings,
+    names: TypeScriptNames,
     label: str,
     skip: frozenset[int] = frozenset(),
 ) -> ToolCapabilities:
     """Classify a handler by the calls in its syntax tree; ``skip`` holds other tools' ids."""
     seen = _Observed()
     parameters = frozenset(_ts_parameters(handler))
-    # _ts_locals adds names bound from a parameter anywhere in the body to ``tainted``, so
-    # that SQL built from them is caller-supplied; only the handler's own parameters and
-    # the names it binds at its top level shadow imports, and a name taken from one of
-    # its parameters is not taken from an import.
-    tainted = set(parameters)
-    unshadowed = {name: b for name, b in imports.items() if name not in parameters}
-    local = _ts_locals(handler, unshadowed, tainted, skip)
-    if local is None:
+    try:
+        imports = names.handler(handler, skip)
+    except _TooManyTargetsError:
         return ToolCapabilities(unclassified=True)
-    imports = {name: bound for name, bound in imports.items() if name not in local}
+    local = frozenset(imports.hidden)
+    tainted = set(parameters)
+    if not _ts_tainted(handler, tainted, skip):
+        return ToolCapabilities(unclassified=True)
     shadowed = parameters | local
     stack = [handler]
     visited = 0
@@ -1583,7 +1737,7 @@ def _ts_call(
     if not chain:
         return
     head, last = chain[0], chain[-1]
-    if head in _TS_GLOBALS and len(chain) > 1:
+    if head in _TS_GLOBALS and head not in shadowed and len(chain) > 1:
         chain, head = chain[1:], chain[1]
     candidates: tuple[tuple[str, str], ...]
     if head.startswith(_MODULE_HEAD):
