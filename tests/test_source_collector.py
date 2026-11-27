@@ -2273,7 +2273,7 @@ def test_a_dict_spread_into_a_call_is_read_where_nothing_else_may_change_it(tmp_
 from openai import OpenAI
 
 client = OpenAI()
-client.responses.create(**{"model": "gpt-4o"})
+client.responses.create(**{"model": "superseded", "model": "gpt-4o"})
 client.responses.create(**dict(model="o3"))
 REQUEST = {"model": "gpt-4.1"}
 client.responses.create(**REQUEST)
@@ -2295,7 +2295,8 @@ def run(**options):
 """
         },
     )
-    # A dict written out, there or bound once to a name the file only spreads, is read.
+    # A dict written out, there or bound once to a name the file only spreads, is read,
+    # and of a key written twice, the value Python keeps.
     # One changed, handed on, spread from another or bound twice may hold anything, and
     # so may a parameter.
     assert set(models(result)) == {"gpt-4o", "o3", "gpt-4.1"}
