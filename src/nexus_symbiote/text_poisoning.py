@@ -2058,6 +2058,14 @@ def _strongest_severity(hits: list[TextPoisoningHit]) -> RiskSeverity:
     return max((hit.severity for hit in hits), key=_SEVERITY_RANK.__getitem__)
 
 
+def _outranks(hit: TextPoisoningHit, other: TextPoisoningHit) -> bool:
+    """Whether ``hit`` represents its rule instead of ``other``: more severe, then earlier."""
+    rank, other_rank = _SEVERITY_RANK[hit.severity], _SEVERITY_RANK[other.severity]
+    if rank != other_rank:
+        return rank > other_rank
+    return (hit.where, hit.byte_offset) < (other.where, other.byte_offset)
+
+
 def _append_consolidated_risks(
     component: ComponentWithRisks,
     hits: list[TextPoisoningHit],
@@ -2463,15 +2471,20 @@ def _scan_text_source(
             by_target.setdefault(chosen_ref, (chosen, []))[1].append(h)
     if decoded_groups:
         # A decoded string is reported at its pointer, as in a JSON source, unless the raw
-        # text already gave its owner the same rule.
-        found = {
-            (ref, h.rule_id, h.unresolved_declaration)
-            for ref, (_, group) in by_target.items()
-            for h in group
-        }
+        # text already gave its owner the same rule at least as severely.
+        found: dict[tuple[str | None, str, int], int] = {}
+        for ref, (_, group) in by_target.items():
+            for h in group:
+                owner_rule = (ref, h.rule_id, h.unresolved_declaration)
+                found[owner_rule] = max(found.get(owner_rule, -1), _SEVERITY_RANK[h.severity])
         for target, decoded in decoded_groups:
             ref = None if target is None else target.bom_ref
-            extra = [h for h in decoded if (ref, h.rule_id, h.unresolved_declaration) not in found]
+            extra = [
+                h
+                for h in decoded
+                if _SEVERITY_RANK[h.severity]
+                > found.get((ref, h.rule_id, h.unresolved_declaration), -1)
+            ]
             if extra:
                 by_target.setdefault(ref, (target, []))[1].extend(extra)
     return list(by_target.values())
@@ -2534,20 +2547,20 @@ def apply_text_poisoning_rules(
     def remember(target: ComponentWithRisks, hits: list[TextPoisoningHit]) -> None:
         if not hits:
             return
-        # Source passes come first. Keep their locations for shared rules while
-        # admitting additional rules derived from component fields afterwards.
+        # A rule is reported once, so its most severe hit stands for it: a lowered hit
+        # must not hide a stronger one. Source passes come first and keep their
+        # locations for shared rules unless a later pass is more severe.
         firsts: dict[tuple[str, str, str, int], TextPoisoningHit] = {}
         for hit in hits:
             key = (hit.category, hit.surface, hit.rule_id, hit.unresolved_declaration)
             previous = firsts.get(key)
-            if previous is None or (hit.where, hit.byte_offset) < (
-                previous.where,
-                previous.byte_offset,
-            ):
+            if previous is None or _outranks(hit, previous):
                 firsts[key] = hit
         saved = located_hits.setdefault(target.bom_ref, {})
         for key, hit in firsts.items():
-            saved.setdefault(key, hit)
+            kept = saved.get(key)
+            if kept is None or _SEVERITY_RANK[hit.severity] > _SEVERITY_RANK[kept.severity]:
+                saved[key] = hit
 
     # Source files first: their findings carry file byte offsets or JSON pointers, which
     # the in-memory fields scanned after them cannot give for the same component.
