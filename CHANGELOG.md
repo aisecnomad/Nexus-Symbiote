@@ -4,6 +4,10 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Added
+
+- **Tool capabilities from source:** a tool the `mcp` collector records from a Python decorator or a TypeScript registration carries a `capabilities` declaration classified from its body (process execution, network, filesystem reads and writes, SQL, payment APIs, credential reads) with the side-effect profile they imply; a shell or evaluation call and a caller-supplied SQL statement are `capability_scope` findings at high, a payment API at medium. Names only, nothing is executed; a body that names none of these keeps no declaration, so existing inventories of such tools are unchanged.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

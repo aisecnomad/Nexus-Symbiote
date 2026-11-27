@@ -6,7 +6,7 @@ import ast
 import re
 import warnings
 from collections import Counter, deque
-from collections.abc import Container, Iterable, Sequence
+from collections.abc import Container, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import quote
@@ -19,6 +19,7 @@ from nexus_symbiote.core.models import (
     ToolComponent,
 )
 from nexus_symbiote.scanners.base import KnownValues, ScanResult, declared_server_name
+from nexus_symbiote.scanners.tool_capabilities import classify_python, import_map
 
 PYTHON_TOOL_HINTS = (
     "mcp",
@@ -500,6 +501,7 @@ def _record_decorator(
     source_digest: str,
     result: ScanResult,
     func_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None,
+    imports: Mapping[str, str] | None = None,
 ) -> None:
     keywords = deco.keywords if isinstance(deco, ast.Call) else []
     options = {kw.arg: kw.value for kw in keywords}
@@ -526,6 +528,11 @@ def _record_decorator(
         )
         return
     risks = _declaration_text_risks(deco, func_node, f"{path.as_posix()}:{deco.lineno} ({name})")
+    capabilities = None
+    if func_node is not None:
+        classified = classify_python(func_node, imports or {}, name)
+        risks = [*risks, *classified.risks]
+        capabilities = classified.declaration
     result.components.append(
         ToolComponent(
             bom_ref=ref,
@@ -533,6 +540,7 @@ def _record_decorator(
             mcp_server_ref=server.bom_ref,
             source_path=path.as_posix(),
             risks=risks,
+            capabilities=capabilities,
             claims={
                 "tool_definition": ClaimEvidence(
                     method="not-collected",
@@ -562,6 +570,7 @@ def _record_sdk_decorator(
     result: ScanResult,
     owner: str | None = None,
     func_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None,
+    imports: Mapping[str, str] | None = None,
 ) -> None:
     """Record one decorated tool; ``owner`` names the agent it is registered on."""
     lineno = getattr(deco, "lineno", 1)
@@ -601,12 +610,18 @@ def _record_sdk_decorator(
         return
     seen_refs.add(ref)
     risks = _declaration_text_risks(deco, func_node, f"{path.as_posix()}:{lineno} ({name})")
+    capabilities = None
+    if func_node is not None:
+        classified = classify_python(func_node, imports or {}, name)
+        risks = [*risks, *classified.risks]
+        capabilities = classified.declaration
     result.components.append(
         ToolComponent(
             bom_ref=ref,
             name=name,
             source_path=path.as_posix(),
             risks=risks,
+            capabilities=capabilities,
             claims={
                 "tool_definition": ClaimEvidence(
                     method="not-collected",
@@ -634,6 +649,7 @@ def _collect_sdk_decorators(
     source_digest: str,
     seen_refs: set[str],
     result: ScanResult,
+    imports: Mapping[str, str] | None = None,
 ) -> None:
     top_level = set(tree.body)
     valid: dict[str, tuple[int, str]] = {}
@@ -674,7 +690,15 @@ def _collect_sdk_decorators(
                 )
                 continue
             _record_sdk_decorator(
-                deco, stmt.name, framework, path, source_digest, seen_refs, result, func_node=stmt
+                deco,
+                stmt.name,
+                framework,
+                path,
+                source_digest,
+                seen_refs,
+                result,
+                func_node=stmt,
+                imports=imports,
             )
     load_uses = {
         node
@@ -699,6 +723,7 @@ def _collect_agent_decorators(
     source_digest: str,
     seen_refs: set[str],
     result: ScanResult,
+    imports: Mapping[str, str] | None = None,
 ) -> set[str]:
     top_level = set(tree.body)
     calls = {
@@ -804,6 +829,7 @@ def _collect_agent_decorators(
                     result,
                     owner,
                     func_node=stmt,
+                    imports=imports,
                 )
     candidates: set[ast.AST] = set(calls)
     candidates.update(
@@ -1200,6 +1226,7 @@ def _record_decorated_tools(
     path: Path,
     source_digest: str,
     result: ScanResult,
+    imports: Mapping[str, str] | None = None,
 ) -> None:
     unwrapped = _unwrapped(
         [
@@ -1221,7 +1248,14 @@ def _record_decorated_tools(
             )
             continue
         _record_decorator(
-            node, stmt.name, servers[receiver], path, source_digest, result, func_node=stmt
+            node,
+            stmt.name,
+            servers[receiver],
+            path,
+            source_digest,
+            result,
+            func_node=stmt,
+            imports=imports,
         )
 
 
@@ -2533,10 +2567,11 @@ def collect_python_tools(
         return
 
     source_digest = hash_bytes(source.encode("utf-8"))
+    import_names = import_map(tree)
     seen_refs: set[str] = set()
     if decorators:
         _collect_sdk_decorators(
-            tree, nodes, decorators, bindings, path, source_digest, seen_refs, result
+            tree, nodes, decorators, bindings, path, source_digest, seen_refs, result, import_names
         )
     agent_receivers: set[str] = set()
     if agent_factories:
@@ -2552,6 +2587,7 @@ def collect_python_tools(
             source_digest,
             seen_refs,
             result,
+            imports=import_names,
         )
     if not factories:
         imported_gap = _report_imported_receivers(tree, path, result)
@@ -2603,7 +2639,9 @@ def collect_python_tools(
             servers[target.id] = server
             result.components.append(server)
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            _record_decorated_tools(stmt, servers, handled, path, source_digest, result)
+            _record_decorated_tools(
+                stmt, servers, handled, path, source_digest, result, import_names
+            )
     if _has_unsupported_registration(
         tree,
         nodes,

@@ -27,6 +27,18 @@ that `logging` is used only for attribute reads. Passing the module as a value,
 including a default such as `def configure(mod=logging)`, produces a coverage gap
 for that call. Other server and tool declarations in the file are still inventoried.
 
+A tool the collector records from a Python decorator or a TypeScript registration
+carries a `capabilities` declaration classified from the body it can see: process
+execution (`subprocess`, `os.system`, `eval`, `execSync`), network egress, filesystem
+reads and writes, SQL statements (a literal statement by its verb, a parameter passed to
+`execute` as a caller-supplied statement), payment APIs and credential reads from the
+environment, with the side-effect profile they imply. Only names in the body count:
+nothing is executed, import aliases are resolved within the file, a helper the body
+calls is not followed, a TypeScript handler bound elsewhere is not read, and a body that
+names none of these keeps no declaration (`unknown`). A shell or evaluation call and a
+caller-supplied statement are `capability_scope` findings at high; a payment API at
+medium.
+
 The `mcp` collector names a server it finds in Python, TypeScript or JavaScript
 source by the name its constructor declares as a string literal, the name clients
 see: the first argument or `name=` of `FastMCP("analytics-mcp")` or `MCPServer`,

@@ -47,6 +47,7 @@ from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolComponent
 from nexus_symbiote.limits import Bound
 from nexus_symbiote.scanners.base import KnownValues, ScanResult, declared_server_name
+from nexus_symbiote.scanners.tool_capabilities import classify_typescript
 
 _SDK = "@modelcontextprotocol/"
 _MODULES = {"@modelcontextprotocol/server", "@modelcontextprotocol/sdk/server/mcp.js"}
@@ -1527,12 +1528,21 @@ def _collect_source(
             f"{location}:{node.start_point.row + 1} ({name})",
             decoded=decoded_source,
         )
+        handler = values[-1] if len(values) > 1 else None
+        capabilities = None
+        if handler is not None and handler.type in _HANDLER_TYPES:
+            # The inline handler is the body the registration binds; a handler bound
+            # elsewhere is not followed and the tool stays unknown.
+            classified = classify_typescript((handler.text or b"").decode("utf-8", "replace"), name)
+            tool_risks = [*tool_risks, *classified.risks]
+            capabilities = classified.declaration
         tool = ToolComponent(
             bom_ref=ref,
             name=name,
             mcp_server_ref=server.bom_ref,
             source_path=location,
             risks=tool_risks,
+            capabilities=capabilities,
             properties={
                 "declaration_line": node.start_point.row + 1,
                 "method": "typescript-ast",
@@ -1552,6 +1562,11 @@ def _collect_source(
         server.tool_count += 1
         components.append(tool)
     result.components.extend(components)
+
+
+_HANDLER_TYPES = frozenset(
+    {"arrow_function", "function_expression", "function", "generator_function"}
+)
 
 
 def _registration_literal_text(arguments: Node | None) -> str:
