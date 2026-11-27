@@ -9,7 +9,6 @@ SHA-256 of a high-entropy token and never the token.
 
 from __future__ import annotations
 
-import hashlib
 import re
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
@@ -19,7 +18,7 @@ from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.models import RiskAssessment
 from nexus_symbiote.credential_allowlist import bind_credential_path, credential_suppressed
-from nexus_symbiote.literal_credentials import MAX_LITERALS
+from nexus_symbiote.literal_credentials import MAX_LITERALS, _commitment
 from nexus_symbiote.scanners.mcp_credentials import normalize_credential
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.secrets import TOKEN_SHAPE, holds_token_shape
@@ -196,8 +195,10 @@ def _line_risks(
             match = TOKEN_SHAPE.search(normalized)
             if match is None or not holds_token_shape(match.group()):
                 continue
-            digest = hashlib.sha256(match.group().encode("utf-8")).hexdigest()
-            detail = f"{where}:{line_no}: a vendor token shape is committed (sha256:{digest})."
+            detail = (
+                f"{where}:{line_no}: a vendor token shape is committed "
+                f"({_commitment(rel_path, line_no, match.group())})."
+            )
         else:
             vendor = _vendor(value)
             article = "an" if vendor[:1] in "aeiou" else "a"

@@ -25,7 +25,7 @@ Each entry has a `reason` (one line, at most 200 characters) and exactly one of:
 
 | Field | Matches |
 | --- | --- |
-| `fingerprint` | 64 lowercase hex digits. SHA-256 of the token after NFKC and after format characters, spaces and variation selectors are removed. The same digest a source finding records after `sha256:`. |
+| `fingerprint` | 64 lowercase hex digits. SHA-256 of the token after NFKC and after format characters, spaces and variation selectors are removed. The finding does not print this digest. |
 | `path` | A relative glob. `*` is one path segment, `**` is any number of segments. No absolute path, backslash, or `..`. |
 
 A path entry suppresses every vendor-shaped token in each matching file. A fingerprint entry suppresses that spelling wherever the active file path is set. At most 256 entries.
@@ -34,8 +34,8 @@ The finding still does not contain the token. An allowlist entry does not either
 
 ## `.env` files
 
-A `.env*` file is reported by path, line, key name and vendor type. Its value is not hashed: many of those values are low-entropy passwords, and a published unsalted SHA-256 can be attacked. The SHA-256 on a source finding is only for a high-entropy vendor token.
+A `.env*` file is reported by path, line, key name and vendor type. Its value is not hashed: many of those values are low-entropy passwords, and a published unsalted SHA-256 can be attacked. A source finding does not publish an unkeyed digest either. With `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` set it records a keyed HMAC; otherwise it says the value is unbound.
 
-`.env.example`, `.env.sample` and `.env.template` are templates. They use the source check, including that digest, and still never include the token.
+`.env.example`, `.env.sample` and `.env.template` are templates. They use that same commitment, and still never include the token.
 
 A path-glob allowlist entry suppresses a `.env` file. A fingerprint entry can match a value, but the finding does not record the digest.

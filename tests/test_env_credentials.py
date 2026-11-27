@@ -39,7 +39,7 @@ def test_a_template_uses_the_vendor_shape_digest(tmp_path: Path) -> None:
     added = apply_env_credential_findings(AIBOM(components=[notes]), tmp_path)
     assert added == 1
     detail = notes.risks[0].detail
-    assert detail.startswith(".env.example:1: a vendor token shape is committed (sha256:")
+    assert detail.startswith(".env.example:1: a vendor token shape is committed (value unbound).")
     assert _SAMPLE not in detail
 
 

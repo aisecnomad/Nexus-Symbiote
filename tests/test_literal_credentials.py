@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.models import MCPServerComponent, PromptComponent
 from nexus_symbiote.literal_credentials import MAX_LITERALS, apply_literal_credential_findings
+from nexus_symbiote.scanners.mcp_credentials import normalize_credential
 
 _TOKEN = "sk-proj-" + "a1b2c3d4e5f6g7h8i9j0"
 _EXAMPLE = "sk-proj-" + ("example" * 4)
@@ -29,7 +31,9 @@ def test_a_vendor_shape_in_source_is_a_fingerprint_finding(tmp_path: Path) -> No
     [risk] = server.risks
     assert risk.category == "credential_exposure"
     assert risk.severity.value == "high"
-    assert risk.detail.startswith("agent/app.py:1: a vendor token shape is committed (sha256:")
+    assert risk.detail.startswith(
+        "agent/app.py:1: a vendor token shape is committed (value unbound)."
+    )
     assert _TOKEN not in risk.detail
     assert _TOKEN not in (risk.recommendation or "")
 
@@ -40,7 +44,7 @@ def test_an_example_looking_vendor_shape_is_still_a_finding(tmp_path: Path) -> N
     added = apply_literal_credential_findings(AIBOM(components=[docs]), tmp_path)
     assert added == 1
     assert _EXAMPLE not in docs.risks[0].detail
-    assert "sha256:" in docs.risks[0].detail
+    assert "value unbound" in docs.risks[0].detail
 
 
 @pytest.mark.parametrize(
@@ -173,3 +177,77 @@ def test_scan_reports_a_skill_literal_without_copying_it(tmp_path: Path) -> None
     assert _TOKEN not in result.output
     assert "credential_exposure" in text
     assert "SKILL.md:3:" in text
+    assert "value unbound" in text
+
+
+def test_a_token_in_prose_is_a_finding(tmp_path: Path) -> None:
+    (tmp_path / "SKILL.md").write_text(
+        f'export KEY="{_TOKEN}"\nOr paste the deploy token {_TOKEN} when asked.\n',
+        encoding="utf-8",
+    )
+    skill = PromptComponent(bom_ref="skill:ship", name="ship", source_path="SKILL.md")
+    added = apply_literal_credential_findings(AIBOM(components=[skill]), tmp_path)
+    assert added == 2
+    rendered = " ".join(risk.detail for risk in skill.risks)
+    assert "SKILL.md:1:" in rendered
+    assert "SKILL.md:2:" in rendered
+    assert _TOKEN not in rendered
+    assert "sha256:" not in rendered
+
+
+def test_a_single_quoted_break_is_not_joined(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("key = 'sk-proj-a1b2c3d4'\n'e5f6g7h8i9j0'\n", encoding="utf-8")
+    server = _server("app.py")
+    assert apply_literal_credential_findings(AIBOM(components=[server]), tmp_path) == 0
+
+
+def test_a_keyed_binding_is_not_an_unkeyed_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NEXUS_SYMBIOTE_SOURCE_BINDING_KEY", "k" * 32)
+    (tmp_path / "app.py").write_text(f'key = "{_TOKEN}"\n', encoding="utf-8")
+    server = _server("app.py")
+    assert apply_literal_credential_findings(AIBOM(components=[server]), tmp_path) == 1
+    detail = server.risks[0].detail
+    assert "hmac-sha256:" in detail
+    assert "key_id=" in detail
+    assert _TOKEN not in detail
+    assert hashlib.sha256(normalize_credential(_TOKEN).encode("utf-8")).hexdigest() not in detail
+
+
+def test_deleting_the_finding_fails_project_reconciliation(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from nexus_symbiote.cli import main
+
+    project = tmp_path / "project"
+    skill = project / ".claude" / "skills" / "ship"
+    skill.mkdir(parents=True)
+    (project / "CLAUDE.md").write_text("Be helpful.\n", encoding="utf-8")
+    (skill / "SKILL.md").write_text(f"# ship\n\nexport KEY={_TOKEN}\n", encoding="utf-8")
+    out = tmp_path / "out.json"
+    runner = CliRunner()
+    scanned = runner.invoke(
+        main, ["scan", str(project), "--no-project-policy", "--report-only", "-o", str(out)]
+    )
+    assert scanned.exit_code == 0, scanned.output
+    assert _TOKEN not in out.read_text(encoding="utf-8")
+    kept = runner.invoke(
+        main, ["validate", "--no-project-policy", str(out), "--project", str(project)]
+    )
+    assert kept.exit_code == 0, kept.output
+    bom = AIBOM.load(out)
+    for component in bom.components:
+        component.risks = [
+            risk for risk in component.risks if risk.category != "credential_exposure"
+        ]
+    bom.save(out)
+    removed = runner.invoke(
+        main, ["validate", "--no-project-policy", str(out), "--project", str(project)]
+    )
+    assert removed.exit_code != 0, removed.output
+    assert "mismatched" in removed.output.lower()
+    gated = runner.invoke(
+        main, ["risk", "--no-project-policy", str(out), "--project", str(project)]
+    )
+    assert gated.exit_code != 0, gated.output
