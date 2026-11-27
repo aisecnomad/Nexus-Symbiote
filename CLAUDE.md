@@ -19,6 +19,7 @@ src/nexus_symbiote/
   settings_precedence.py               — IDE settings layer precedence and effective-policy resolution
   limits.py                            — Operator-controlled collection bounds (`--limit`, `NEXUS_SYMBIOTE_LIMITS`)
   graph.py, lineage.py, trifecta.py    — Repository association graph, blast radius, lineage, and toxic capability flows
+  security_graph.py, security_graph_cli.py — Advisory, inventory and trace correlation for `security-graph`
   instruction_diff.py                  — Instruction-surface normalization and diffing
   risk_classes.py, graph_view.py, graph_cli.py — Risk classes, exposure paths; the `graph` HTML/JSON view
   digest_cli.py                        — `digest`: file, canonical and content digests of an inventory

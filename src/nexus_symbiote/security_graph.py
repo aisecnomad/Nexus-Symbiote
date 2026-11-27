@@ -17,7 +17,8 @@ from __future__ import annotations
 import hashlib
 import html
 import json
-from collections import deque
+from bisect import bisect_left
+from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -25,7 +26,12 @@ from typing import Any
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.enums import AssuranceLevel, ComponentType, RiskSeverity
 from nexus_symbiote.core.models import AnyComponent
-from nexus_symbiote.graph import _is_credential_env_var_name, _references, validate_graph
+from nexus_symbiote.graph import (
+    _declared_workload_values,
+    _is_credential_env_var_name,
+    _references,
+    validate_graph,
+)
 from nexus_symbiote.risk_classes import RiskClass, classify
 from nexus_symbiote.trifecta import analyze_trifecta
 from nexus_symbiote.utils.terminal import neutralize
@@ -34,6 +40,8 @@ from nexus_symbiote.vex_decisions import ExecutionEvidence, LoadedAdvisoryReport
 SECURITY_GRAPH_SCHEMA = "nexus-symbiote/security-graph/v1"
 MAX_CORRELATION_CHAINS = 500
 MAX_CHAIN_HOPS = 8
+MAX_SUBJECT_EDGE_VISITS = 4096
+MAX_REPORT_EDGE_VISITS = 100_000
 
 _SEVERITY_ORDER: dict[str, int] = {
     "critical": 0,
@@ -41,6 +49,7 @@ _SEVERITY_ORDER: dict[str, int] = {
     "medium": 2,
     "low": 3,
     "info": 4,
+    "unknown": 5,
 }
 _TRIGGER_RISK_CATEGORIES = frozenset(
     {
@@ -168,6 +177,7 @@ class SecurityGraphReport:
     chains: tuple[AttackChain, ...]
     trifecta_finding_count: int
     limitations: tuple[str, ...]
+    traversal_complete: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -180,6 +190,7 @@ class SecurityGraphReport:
             "chain_count": self.chain_count,
             "kev_chain_count": self.kev_chain_count,
             "chains_omitted": self.chains_omitted,
+            "traversal_complete": self.traversal_complete,
             "severity_counts": dict(self.severity_counts),
             "trifecta_finding_count": self.trifecta_finding_count,
             "chains": [chain.to_dict() for chain in self.chains],
@@ -244,104 +255,100 @@ def _parse_kev(entry: Mapping[str, Any]) -> bool:
     return False
 
 
-def _collect_advisories(
-    bom: AIBOM, advisory_report: LoadedAdvisoryReport | None
-) -> list[_AdvisoryEntry]:
-    """Merge advisories from an offline/live report and native ``properties.advisories``."""
-    merged: dict[tuple[str, str], _AdvisoryEntry] = {}
-    alias_index: dict[tuple[str, str], tuple[str, str]] = {}
+def _merge_advisory_aliases(entries: list[_AdvisoryEntry]) -> list[_AdvisoryEntry]:
+    """Resolve every alias link for one component before ranking its advisories."""
+    parents: dict[str, str] = {}
 
-    def add(entry: _AdvisoryEntry) -> None:
-        all_ids = (entry.advisory_id, *entry.aliases)
-        key = next(
-            (
-                alias_index[(ident, entry.component_ref)]
-                for ident in all_ids
-                if (ident, entry.component_ref) in alias_index
-            ),
-            (entry.advisory_id, entry.component_ref),
+    def root(ident: str) -> str:
+        while ident in parents:
+            parent = parents[ident]
+            if parent in parents:
+                parents[ident] = parents[parent]
+            ident = parents[ident]
+        return ident
+
+    for entry in entries:
+        primary = root(entry.advisory_id)
+        for alias in entry.aliases:
+            other = root(alias)
+            if other != primary:
+                parents[other] = primary
+
+    groups: dict[str, list[_AdvisoryEntry]] = defaultdict(list)
+    for entry in entries:
+        groups[root(entry.advisory_id)].append(entry)
+
+    merged = []
+    for group in groups.values():
+        # Preserve a sole reported ID. Among multiple primary IDs prefer CVE, then lexical order.
+        primary = min(
+            (e.advisory_id for e in group), key=lambda i: (not i.upper().startswith("CVE-"), i)
         )
-        existing = merged.get(key)
-        if existing is None:
-            merged[key] = entry
-        else:
-            best_sev = (
-                entry.severity
-                if _SEVERITY_ORDER[entry.severity] < _SEVERITY_ORDER[existing.severity]
-                else existing.severity
+        identifiers = {i for e in group for i in (e.advisory_id, *e.aliases)}
+        merged.append(
+            _AdvisoryEntry(
+                advisory_id=primary,
+                component_ref=group[0].component_ref,
+                severity=min((e.severity for e in group), key=_SEVERITY_ORDER.__getitem__),
+                kev=any(e.kev for e in group),
+                epss=max((e.epss for e in group if e.epss is not None), default=None),
+                source="advisory-report"
+                if any(e.source == "advisory-report" for e in group)
+                else "inventory-property",
+                aliases=tuple(sorted(identifiers - {primary})),
             )
-            best_epss = (
-                entry.epss
-                if existing.epss is None or (entry.epss is not None and entry.epss > existing.epss)
-                else existing.epss
+        )
+    return sorted(merged, key=lambda e: e.advisory_id)
+
+
+def _collect_advisories(
+    bom: AIBOM, advisory_report: LoadedAdvisoryReport | None, subject_refs: set[str]
+) -> dict[str, list[_AdvisoryEntry]]:
+    """Merge advisories from an offline/live report and native ``properties.advisories``."""
+    by_subject: dict[str, list[_AdvisoryEntry]] = defaultdict(list)
+
+    def add(raw: Mapping[str, Any], ident: object, ref: str, source: str) -> None:
+        adv_id = str(ident or "").strip()
+        if not adv_id:
+            return
+        raw_aliases = raw.get("aliases")
+        aliases = (
+            tuple(sorted({a.strip() for a in raw_aliases if isinstance(a, str) and a.strip()}))
+            if isinstance(raw_aliases, list)
+            else ()
+        )
+        by_subject[ref].append(
+            _AdvisoryEntry(
+                advisory_id=adv_id,
+                component_ref=ref,
+                severity=_normalize_severity(raw.get("severity")),
+                kev=_parse_kev(raw),
+                epss=_parse_epss(raw.get("epss", raw.get("epss_score"))),
+                source=source,
+                aliases=aliases,
             )
-            merged[key] = _AdvisoryEntry(
-                advisory_id=existing.advisory_id,
-                component_ref=existing.component_ref,
-                severity=best_sev,
-                kev=existing.kev or entry.kev,
-                epss=best_epss,
-                source=existing.source,
-                aliases=tuple(
-                    sorted((set(existing.aliases) | set(all_ids)) - {existing.advisory_id})
-                ),
-            )
-        for ident in all_ids:
-            alias_index[(ident, entry.component_ref)] = key
+        )
 
     if advisory_report is not None:
         for raw in advisory_report.advisories:
-            adv_id = str(raw.get("advisory_id") or raw.get("id") or "").strip()
-            comp_ref = str(raw.get("component_ref") or raw.get("bom_ref") or "").strip()
-            if not adv_id or not comp_ref:
-                continue
-            raw_aliases = raw.get("aliases")
-            aliases = (
-                tuple(sorted({str(a) for a in raw_aliases if isinstance(a, str) and a.strip()}))
-                if isinstance(raw_aliases, list)
-                else ()
-            )
-            add(
-                _AdvisoryEntry(
-                    advisory_id=adv_id,
-                    component_ref=comp_ref,
-                    severity=_normalize_severity(raw.get("severity")),
-                    kev=_parse_kev(raw),
-                    epss=_parse_epss(raw.get("epss") if "epss" in raw else raw.get("epss_score")),
-                    source="advisory-report",
-                    aliases=aliases,
-                )
-            )
+            ref = str(raw.get("component_ref") or raw.get("bom_ref") or "").strip()
+            if ref in subject_refs:
+                add(raw, raw.get("advisory_id") or raw.get("id"), ref, "advisory-report")
 
     for comp in bom.components:
-        prop_advisories = comp.properties.get("advisories")
-        if not isinstance(prop_advisories, list):
+        if comp.bom_ref not in subject_refs:
             continue
-        for raw in prop_advisories:
-            if not isinstance(raw, Mapping):
-                continue
-            adv_id = str(raw.get("id") or raw.get("advisory_id") or "").strip()
-            if not adv_id:
-                continue
-            raw_aliases = raw.get("aliases")
-            aliases = (
-                tuple(sorted({str(a) for a in raw_aliases if isinstance(a, str) and a.strip()}))
-                if isinstance(raw_aliases, list)
-                else ()
-            )
-            add(
-                _AdvisoryEntry(
-                    advisory_id=adv_id,
-                    component_ref=comp.bom_ref,
-                    severity=_normalize_severity(raw.get("severity")),
-                    kev=_parse_kev(raw),
-                    epss=_parse_epss(raw.get("epss") if "epss" in raw else raw.get("epss_score")),
-                    source="inventory-property",
-                    aliases=aliases,
-                )
-            )
-
-    return sorted(merged.values(), key=lambda item: (item.component_ref, item.advisory_id))
+        prop_advisories = comp.properties.get("advisories")
+        if isinstance(prop_advisories, list):
+            for raw in prop_advisories:
+                if isinstance(raw, Mapping):
+                    add(
+                        raw,
+                        raw.get("id") or raw.get("advisory_id"),
+                        comp.bom_ref,
+                        "inventory-property",
+                    )
+    return {ref: _merge_advisory_aliases(entries) for ref, entries in by_subject.items()}
 
 
 def _credential_names_for_component(component: AnyComponent) -> set[str]:
@@ -434,86 +441,74 @@ def _build_evidence_graph(
     return forward, reverse, len(seen)
 
 
-def _shortest_reverse_path(
-    reverse: Mapping[str, list[ChainHop]],
-    start_ref: str,
-    target_refs: set[str],
-    max_hops: int,
-) -> tuple[str | None, list[ChainHop]]:
-    """Find shortest path from ``start_ref`` upstream to any ref in ``target_refs``."""
-    if start_ref in target_refs:
-        return start_ref, []
-    queue: deque[tuple[str, list[ChainHop]]] = deque([(start_ref, [])])
-    visited = {start_ref}
-    while queue:
-        current, path = queue.popleft()
-        if len(path) >= max_hops:
-            continue
-        for hop in reverse.get(current, ()):
-            upstream_ref = hop.source_ref
-            if upstream_ref in visited:
-                continue
-            next_path = [*path, hop]
-            if upstream_ref in target_refs:
-                return upstream_ref, next_path
-            visited.add(upstream_ref)
-            queue.append((upstream_ref, next_path))
-    return None, []
+@dataclass
+class _WalkBudget:
+    remaining: int
+    subject_remaining: int = 0
+    complete: bool = True
+
+    def paths(
+        self,
+        adjacency: Mapping[str, list[ChainHop]],
+        starts: Iterable[str],
+        *,
+        reverse: bool = False,
+    ) -> dict[str, ChainHop | None]:
+        """Record one shortest-path parent per discovered component, charging each examined edge."""
+        parents: dict[str, ChainHop | None] = dict.fromkeys(starts)
+        queue = deque((ref, 0) for ref in parents)
+        while queue:
+            current, depth = queue.popleft()
+            for hop in adjacency.get(current, ()):
+                if not self.remaining or not self.subject_remaining:
+                    self.complete = False
+                    return parents
+                self.remaining -= 1
+                self.subject_remaining -= 1
+                ref = hop.source_ref if reverse else hop.target_ref
+                if ref in parents:
+                    continue
+                if depth == MAX_CHAIN_HOPS:
+                    self.complete = False
+                    continue
+                parents[ref] = hop
+                queue.append((ref, depth + 1))
+        return parents
 
 
-def _shortest_forward_paths(
-    forward: Mapping[str, list[ChainHop]],
-    start_ref: str,
-    max_hops: int,
-) -> dict[str, list[ChainHop]]:
-    """Shortest forward paths anchored strictly at ``start_ref`` so hops stay contiguous."""
-    paths: dict[str, list[ChainHop]] = {start_ref: []}
-    queue: deque[tuple[str, list[ChainHop]]] = deque([(start_ref, [])])
-    while queue:
-        cur, path = queue.popleft()
-        if len(path) >= max_hops:
-            continue
-        for hop in forward.get(cur, ()):
-            nxt = hop.target_ref
-            if nxt in paths:
-                continue
-            next_path = [*path, hop]
-            paths[nxt] = next_path
-            queue.append((nxt, next_path))
-    return paths
+def _path(
+    parents: Mapping[str, ChainHop | None], end: str, *, reverse: bool = False
+) -> list[ChainHop]:
+    path: list[ChainHop] = []
+    while (hop := parents[end]) is not None:
+        if reverse:
+            end = hop.target_ref
+            hop = ChainHop(
+                hop.target_ref,
+                hop.source_ref,
+                f"reaches-via:{hop.relationship}",
+                hop.assurance,
+                hop.evidence_method,
+                hop.target_locator,
+                hop.source_locator,
+                hop.conditions,
+            )
+        else:
+            end = hop.source_ref
+        path.append(hop)
+    return list(reversed(path))
 
 
-def _collect_reachable(
-    forward: Mapping[str, list[ChainHop]],
-    reverse: Mapping[str, list[ChainHop]],
-    starts: Iterable[str],
-    max_hops: int,
-) -> tuple[set[str], set[str]]:
-    """Return upstream refs and all forward-reachable refs from starts and upstream."""
-    upstream: set[str] = set()
-    up_queue: deque[tuple[str, int]] = deque((ref, 0) for ref in starts)
-    while up_queue:
-        cur, depth = up_queue.popleft()
-        if cur in upstream:
-            continue
-        upstream.add(cur)
-        if depth < max_hops:
-            for hop in reverse.get(cur, ()):
-                if hop.source_ref not in upstream:
-                    up_queue.append((hop.source_ref, depth + 1))
-
-    reachable: set[str] = set()
-    fwd_queue: deque[tuple[str, int]] = deque((ref, 0) for ref in sorted(set(starts) | upstream))
-    while fwd_queue:
-        cur, depth = fwd_queue.popleft()
-        if cur in reachable:
-            continue
-        reachable.add(cur)
-        if depth < max_hops:
-            for hop in forward.get(cur, ()):
-                if hop.target_ref not in reachable:
-                    fwd_queue.append((hop.target_ref, depth + 1))
-    return upstream, reachable
+@dataclass(frozen=True)
+class _Exposure:
+    hops: tuple[ChainHop, ...]
+    agents: tuple[str, ...]
+    credentials: tuple[str, ...]
+    sinks: tuple[str, ...]
+    egress: tuple[str, ...]
+    workloads: tuple[str, ...]
+    sensitive: bool
+    runtime_status: str
 
 
 def _chain_severity(
@@ -562,13 +557,17 @@ def build_security_graph(
     execution_evidence: ExecutionEvidence | None = None,
     inventory_sha256: str | None = None,
     max_chains: int = MAX_CORRELATION_CHAINS,
+    subject_refs: set[str] | None = None,
 ) -> SecurityGraphReport:
     """Correlate advisories, risks, components, and agents into traceable exposure chains."""
     issues = validate_graph(bom)
     if issues:
         raise ValueError("invalid graph: " + "; ".join(issues))
 
+    if not 1 <= max_chains <= MAX_CORRELATION_CHAINS:
+        raise ValueError(f"max_chains must be between 1 and {MAX_CORRELATION_CHAINS}")
     nodes = {comp.bom_ref: comp for comp in bom.components}
+    scope = set(nodes) if subject_refs is None else nodes.keys() & subject_refs
     forward, reverse, edge_count = _build_evidence_graph(bom, nodes)
     agent_refs = {ref for ref, comp in nodes.items() if comp.component_type in _AGENT_TYPES}
     trifecta_report = analyze_trifecta(bom)
@@ -580,201 +579,168 @@ def build_security_graph(
         ref: set(classify(comp).classes) for ref, comp in nodes.items()
     }
 
-    chains: list[AttackChain] = []
+    budget = _WalkBudget(MAX_REPORT_EDGE_VISITS)
 
-    def build_chain(
-        *,
-        trigger_kind: str,
-        trigger_id: str,
-        subject_ref: str,
-        base_severity: str,
-        kev: bool,
-        epss: float | None,
-        chain_kind: str,
-        evidence_method: str,
-    ) -> None:
-        if subject_ref not in nodes:
-            return
-        subject = nodes[subject_ref]
-        upstream, reachable = _collect_reachable(forward, reverse, [subject_ref], MAX_CHAIN_HOPS)
-        affected_agents = sorted(ref for ref in upstream if ref in agent_refs)
+    def exposure(subject_ref: str) -> _Exposure:
+        budget.subject_remaining = MAX_SUBJECT_EDGE_VISITS
+        upstream = budget.paths(reverse, [subject_ref], reverse=True)
+        agents = tuple(sorted(agent_refs.intersection(upstream)))
+        anchor = next((ref for ref in upstream if ref in agent_refs), subject_ref)
+        reverse_hops = _path(upstream, anchor, reverse=True)
+        paths = budget.paths(forward, [anchor])
+        reachable = paths if len(upstream) == 1 else budget.paths(forward, upstream)
+        # Each traversal may reach a different boundary when its budget runs out.
+        refs = set(reachable) | paths.keys()
+        creds = tuple(sorted({name for ref in refs for name in component_creds[ref]}))
+        sinks = tuple(sorted(ref for ref in refs if nodes[ref].component_type in _SINK_TYPES))
+        tools = sorted(
+            ref
+            for ref in refs
+            if ref != subject_ref and component_classes[ref] & _SENSITIVE_RISK_CLASSES
+        )
 
-        hops: list[ChainHop] = [
-            ChainHop(
-                source_ref=f"{trigger_kind}:{trigger_id}",
-                target_ref=subject_ref,
-                relationship="affects",
-                assurance="reported"
-                if trigger_kind == "advisory"
-                else subject.assurance_level.value,
-                evidence_method=evidence_method,
-                target_locator=_component_locator(subject),
+        def declared(field: str) -> tuple[str, ...]:
+            return tuple(
+                sorted({v for ref in refs for v in _declared_workload_values(nodes[ref], field)})
             )
-        ]
 
-        reached_agent: str | None = None
-        if affected_agents:
-            reached_agent, rev_hops = _shortest_reverse_path(
-                reverse, subject_ref, set(affected_agents), MAX_CHAIN_HOPS
+        egress = declared("egress_domains")
+        target = next((ref for ref in (*sinks, *tools) if paths.get(ref)), None)
+        hops = reverse_hops + (_path(paths, target) if target is not None else [])
+        if len(hops) > MAX_CHAIN_HOPS + 1:
+            budget.complete = False
+            hops = hops[: MAX_CHAIN_HOPS + 1]
+        runtime = _runtime_status_for_refs(
+            {subject_ref, *agents, *sinks, *(hop.target_ref for hop in hops)}, execution_evidence
+        )
+        return _Exposure(
+            tuple(hops),
+            agents,
+            creds,
+            sinks,
+            egress,
+            declared("spiffe_id"),
+            bool(creds or sinks or egress or tools),
+            runtime,
+        )
+
+    advisories = _collect_advisories(bom, advisory_report, scope)
+    trifectas: dict[str, dict[str, str]] = defaultdict(dict)
+    for finding in trifecta_report.findings:
+        if finding.component_refs and finding.component_refs[0] in scope:
+            kinds = trifectas[finding.component_refs[0]]
+            sev = finding.severity.value
+            if (
+                finding.kind not in kinds
+                or _SEVERITY_ORDER[sev] < _SEVERITY_ORDER[kinds[finding.kind]]
+            ):
+                kinds[finding.kind] = sev
+
+    def triggers(
+        subject: AnyComponent,
+    ) -> Iterable[tuple[str, str, str, bool, float | None, str, str]]:
+        for adv in advisories.get(subject.bom_ref, ()):
+            yield (
+                "advisory",
+                adv.advisory_id,
+                adv.severity,
+                adv.kev,
+                adv.epss,
+                "advisory-exposure",
+                adv.source,
             )
-            if reached_agent is not None:
-                for hop in rev_hops:
-                    hops.append(
-                        ChainHop(
-                            source_ref=hop.target_ref,
-                            target_ref=hop.source_ref,
-                            relationship=f"reaches-via:{hop.relationship}",
-                            assurance=hop.assurance,
-                            evidence_method=hop.evidence_method,
-                            source_locator=hop.target_locator,
-                            target_locator=hop.source_locator,
-                            conditions=hop.conditions,
-                        )
-                    )
-
-        cred_names: set[str] = set()
-        data_sinks: set[str] = set()
-        egress_domains: set[str] = set()
-        workload_ids: set[str] = set()
-        sensitive_tool_sinks: list[str] = []
-
-        for ref in sorted(reachable):
-            comp = nodes[ref]
-            cred_names.update(component_creds[ref])
-            if comp.component_type in _SINK_TYPES:
-                data_sinks.add(ref)
-            if component_classes[ref] & _SENSITIVE_RISK_CLASSES and ref != subject_ref:
-                sensitive_tool_sinks.append(ref)
-            spiffe = comp.properties.get("declared_spiffe_id")
-            if isinstance(spiffe, str) and spiffe:
-                workload_ids.add(spiffe)
-            domains = comp.properties.get("declared_egress_domains")
-            if isinstance(domains, list):
-                egress_domains.update(d for d in domains if isinstance(d, str) and d)
-
-        # Anchor forward sink path strictly at the tail of the current hop chain so every
-        # consecutive edge shares an endpoint (never concatenating disconnected branches).
-        anchor_ref = reached_agent if reached_agent is not None else subject_ref
-        fwd_paths = _shortest_forward_paths(forward, anchor_ref, MAX_CHAIN_HOPS)
-        sink_target = next(
-            (ref for ref in sorted(data_sinks) if fwd_paths.get(ref)),
-            next((ref for ref in sensitive_tool_sinks if fwd_paths.get(ref)), None),
-        )
-        if sink_target is not None:
-            for hop in fwd_paths[sink_target]:
-                if len(hops) < MAX_CHAIN_HOPS + 2:
-                    hops.append(hop)
-
-        has_sensitive = bool(cred_names or data_sinks or egress_domains or sensitive_tool_sinks)
-        severity = _chain_severity(
-            base_severity,
-            kev=kev,
-            epss=epss,
-            has_agent=bool(affected_agents),
-            has_sensitive_sink=has_sensitive,
-        )
-        runtime_status = _runtime_status_for_refs(
-            {subject_ref, *affected_agents, *data_sinks}, execution_evidence
-        )
-        parts = [f"{trigger_id} on {subject.name}"]
-        if affected_agents:
-            parts.append(f"reaches {len(affected_agents)} agent(s)")
-        if cred_names:
-            parts.append(f"{len(cred_names)} credential name(s)")
-        if data_sinks:
-            parts.append(f"{len(data_sinks)} data/memory sink(s)")
-        if kev:
-            parts.append("KEV-listed")
-
-        chains.append(
-            AttackChain(
-                chain_id=_make_chain_id(trigger_kind, trigger_id, subject_ref),
-                severity=severity,
-                kind=chain_kind,
-                trigger_id=trigger_id,
-                trigger_kind=trigger_kind,
-                subject_ref=subject_ref,
-                kev=kev,
-                epss=epss,
-                hops=tuple(hops),
-                affected_agents=tuple(affected_agents),
-                credential_names=tuple(sorted(cred_names)),
-                data_sinks=tuple(sorted(data_sinks)),
-                egress_domains=tuple(sorted(egress_domains)),
-                workload_identities=tuple(sorted(workload_ids)),
-                runtime_status=runtime_status,
-                summary="; ".join(parts),
-            )
-        )
-
-    for adv in _collect_advisories(bom, advisory_report):
-        build_chain(
-            trigger_kind="advisory",
-            trigger_id=adv.advisory_id,
-            subject_ref=adv.component_ref,
-            base_severity=adv.severity,
-            kev=adv.kev,
-            epss=adv.epss,
-            chain_kind="advisory-exposure",
-            evidence_method=adv.source,
-        )
-
-    for comp in sorted(bom.components, key=lambda c: c.bom_ref):
         best_by_cat: dict[str, str] = {}
-        for risk in comp.risks:
+        for risk in subject.risks:
             if (
                 risk.severity in (RiskSeverity.CRITICAL, RiskSeverity.HIGH)
                 and risk.category in _TRIGGER_RISK_CATEGORIES
             ):
                 sev = risk.severity.value
-                prev = best_by_cat.get(risk.category)
-                if prev is None or _SEVERITY_ORDER[sev] < _SEVERITY_ORDER[prev]:
+                if (
+                    risk.category not in best_by_cat
+                    or _SEVERITY_ORDER[sev] < _SEVERITY_ORDER[best_by_cat[risk.category]]
+                ):
                     best_by_cat[risk.category] = sev
-        for category, sev in sorted(best_by_cat.items()):
-            build_chain(
-                trigger_kind="finding",
-                trigger_id=category,
-                subject_ref=comp.bom_ref,
-                base_severity=sev,
-                kev=False,
-                epss=None,
-                chain_kind="risk-exposure",
-                evidence_method="component-risk",
+        for category, sev in best_by_cat.items():
+            yield "finding", category, sev, False, None, "risk-exposure", "component-risk"
+        for kind, sev in trifectas.get(subject.bom_ref, {}).items():
+            yield "trifecta", kind, sev, False, None, kind, "trifecta-analysis"
+
+    priorities: list[tuple[bool, int, float, str]] = []
+    chains: list[AttackChain] = []
+    total = total_kev_chains = 0
+    for ref in sorted(scope):
+        subject = nodes[ref]
+        context = None
+        for trigger_kind, trigger_id, base, kev, epss, kind, method in triggers(subject):
+            if context is None:
+                context = exposure(ref)
+            total += 1
+            total_kev_chains += int(kev)
+            severity = _chain_severity(
+                base,
+                kev=kev,
+                epss=epss,
+                has_agent=bool(context.agents),
+                has_sensitive_sink=context.sensitive,
+            )
+            chain_id = _make_chain_id(trigger_kind, trigger_id, ref)
+            rank = (
+                not kev,
+                _SEVERITY_ORDER[severity],
+                -(epss if epss is not None else -1.0),
+                chain_id,
+            )
+            index = bisect_left(priorities, rank)
+            if index >= max_chains:
+                continue
+            if len(chains) == max_chains:
+                priorities.pop()
+                chains.pop()
+            priorities.insert(index, rank)
+            parts = [f"{trigger_id} on {subject.name}"]
+            if context.agents:
+                parts.append(f"reaches {len(context.agents)} agent(s)")
+            if context.credentials:
+                parts.append(f"{len(context.credentials)} credential name(s)")
+            if context.sinks:
+                parts.append(f"{len(context.sinks)} data/memory sink(s)")
+            if kev:
+                parts.append("KEV-listed")
+            first = ChainHop(
+                source_ref=f"{trigger_kind}:{trigger_id}",
+                target_ref=ref,
+                relationship="affects",
+                assurance="reported"
+                if trigger_kind == "advisory"
+                else subject.assurance_level.value,
+                evidence_method=method,
+                target_locator=_component_locator(subject),
+            )
+            chains.insert(
+                index,
+                AttackChain(
+                    chain_id=chain_id,
+                    severity=severity,
+                    kind=kind,
+                    trigger_id=trigger_id,
+                    trigger_kind=trigger_kind,
+                    subject_ref=ref,
+                    kev=kev,
+                    epss=epss,
+                    hops=(first, *context.hops),
+                    affected_agents=context.agents,
+                    credential_names=context.credentials,
+                    data_sinks=context.sinks,
+                    egress_domains=context.egress,
+                    workload_identities=context.workloads,
+                    runtime_status=context.runtime_status,
+                    summary="; ".join(parts),
+                ),
             )
 
-    best_trifecta: dict[tuple[str, str], str] = {}
-    for finding in trifecta_report.findings:
-        if finding.component_refs:
-            tkey = (finding.kind, finding.component_refs[0])
-            sev = finding.severity.value
-            prev = best_trifecta.get(tkey)
-            if prev is None or _SEVERITY_ORDER[sev] < _SEVERITY_ORDER[prev]:
-                best_trifecta[tkey] = sev
-    for (kind, subject_ref), sev in sorted(best_trifecta.items()):
-        build_chain(
-            trigger_kind="trifecta",
-            trigger_id=kind,
-            subject_ref=subject_ref,
-            base_severity=sev,
-            kev=False,
-            epss=None,
-            chain_kind=kind,
-            evidence_method="trifecta-analysis",
-        )
-
-    # Sort KEV-listed chains first so max_chains truncation can never hide a KEV chain,
-    # and compute total kev_chain_count across all correlated chains before slicing.
-    chains.sort(
-        key=lambda c: (
-            not c.kev,
-            _SEVERITY_ORDER.get(c.severity, 99),
-            -(c.epss if c.epss is not None else -1.0),
-            c.chain_id,
-        )
-    )
-    total_kev_chains = sum(1 for c in chains if c.kev)
-    omitted = max(0, len(chains) - max_chains)
-    kept = tuple(chains[:max_chains])
+    kept = tuple(chains)
+    omitted = total - len(kept)
     sev_counts: dict[str, int] = {}
     for chain in kept:
         sev_counts[chain.severity] = sev_counts.get(chain.severity, 0) + 1
@@ -790,6 +756,12 @@ def build_security_graph(
         )
     if execution_evidence is None:
         limitations.append("No runtime trace evidence was supplied; runtime_status is unobserved.")
+    if not budget.complete:
+        limitations.append(
+            f"Traversal incomplete: paths, affected components, and severity may be incomplete "
+            f"at {MAX_CHAIN_HOPS} hops, {MAX_SUBJECT_EDGE_VISITS} edge visits per subject, "
+            f"or {MAX_REPORT_EDGE_VISITS} edge visits per report."
+        )
     if omitted:
         limitations.append(
             f"{omitted} lower-priority chain(s) omitted beyond max_chains={max_chains}."
@@ -809,6 +781,7 @@ def build_security_graph(
         chains=kept,
         trifecta_finding_count=len(trifecta_report.findings),
         limitations=tuple(limitations),
+        traversal_complete=budget.complete,
     )
 
 
@@ -859,6 +832,8 @@ def render_security_graph_mermaid(report: SecurityGraphReport) -> str:
                 edges.add(edge_key)
     if len(lines) == 1:
         lines.append('  empty["No correlated exposure chains"]')
+    if not report.traversal_complete or report.chains_omitted:
+        lines.append('  partial["Partial view: traversal or output limit reached"]')
     return "\n".join(neutralize(line) for line in lines) + "\n"
 
 

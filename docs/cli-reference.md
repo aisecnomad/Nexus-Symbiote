@@ -466,6 +466,11 @@ nexus-symbiote blast-radius [OPTIONS] AIBOM_PATH COMPONENT_REF
 | `--advisories` `PATH` | Optional advisory report JSON to correlate against the blast radius. |
 | `--allow-partial-advisories` | Accept an advisory report with partial or empty coverage. |
 
+With `--advisories`, the command ranks only advisory and finding subjects in the
+requested component's reachable set. `correlated_chains_omitted` counts additional
+in-scope chains beyond the output limit. `correlation_traversal_complete` reports
+whether the correlation walk reached a depth or work limit.
+
 ### `crosswalk`
 
 Map findings to OWASP, MITRE ATLAS, NIST AI RMF, EU AI Act, ISO/IEC 42001 and CWE.
@@ -980,6 +985,19 @@ nexus-symbiote security-graph [OPTIONS] INVENTORY
 | `--fail-on-chain` | Exit non-zero if any correlated exposure chain is found. |
 | `--fail-on-kev` | Exit non-zero if any KEV-listed advisory reaches an inventory component or agent. |
 | `-o`, `--output` `PATH` | Write the report to this file instead of standard output (required for HTML). |
+
+The report ranks KEV first, followed by severity, EPSS and chain ID. An explicit
+`unknown` severity ranks below `info`. For each component, advisory aliases link
+transitively. When several primary IDs refer to the same advisory, the report prefers
+a primary CVE ID, then lexical order. The chain retains the strongest severity,
+any KEV listing and the highest EPSS score across all linked records.
+`chains_omitted` counts additional known chains beyond the output limit.
+`traversal_complete` is false when the walk or displayed evidence path reaches
+a limit. In that case, reachable agents, sinks, evidence paths and derived severity
+may be incomplete. The KEV count still includes every eligible KEV advisory.
+Correlation examines up to eight hops per direction, 4,096 edges per subject and
+100,000 edges across the report. Reported runtime status includes intermediate
+components on the displayed path.
 
 ### `scan`
 

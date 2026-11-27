@@ -2800,14 +2800,10 @@ def blast_radius_command(
     allow_partial_advisories: bool,
 ) -> None:
     """Show repository dependencies potentially affected by a component compromise."""
-    from nexus_symbiote.core.aibom import AIBOM, NativeFormatError
     from nexus_symbiote.core.hashing import hash_bytes
     from nexus_symbiote.graph import blast_radius
 
-    try:
-        bom, raw_bom = AIBOM.load_with_bytes(Path(aibom_path))
-    except (NativeFormatError, OSError) as exc:
-        raise _failure(exc) from exc
+    bom, raw_bom = _load_bom_with_bytes(aibom_path)
     try:
         result = blast_radius(bom, component_ref)
     except ValueError as exc:
@@ -2825,14 +2821,16 @@ def blast_radius_command(
             )
         except (OSError, VEXDecisionError, ValueError, RecursionError) as exc:
             raise _failure(exc) from exc
-        correlated = build_security_graph(bom, advisory_report=adv_report, inventory_sha256=inv_sha)
-        reachable_set = set(result["reachable_components"]) | {component_ref}
-        result["correlated_chains"] = [
-            chain.to_dict()
-            for chain in correlated.chains
-            if chain.subject_ref in reachable_set
-            or any(agent in reachable_set for agent in chain.affected_agents)
-        ]
+        correlated = build_security_graph(
+            bom,
+            advisory_report=adv_report,
+            inventory_sha256=inv_sha,
+            subject_refs=set(result["reachable_components"]) | {component_ref},
+        )
+        result["correlated_chains"] = [chain.to_dict() for chain in correlated.chains]
+        result["correlation_traversal_complete"] = correlated.traversal_complete
+        result["correlated_chains_omitted"] = correlated.chains_omitted
+        result["limitations"].extend(correlated.limitations)
     if json_output:
         click.echo(json_text(json.dumps(result, indent=2)))
         return

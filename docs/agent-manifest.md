@@ -41,6 +41,11 @@ models:
 | `egress_domains` | no | Up to 256 declared DNS hostnames or wildcard domains (`*.example.com`), recorded as `declared_egress_domains` with `declared` assurance |
 | `delegates_to` | no | Up to 256 declared downstream agent identifiers, recorded as `declared_delegates_to` with `declared` assurance |
 
+Workload identifiers must pass credential redaction checks. Delegation IDs start
+with an ASCII letter or digit and may also contain periods, underscores, colons,
+slashes and hyphens. Invalid declarations produce a manifest collection error.
+The graph and blast-radius reports omit invalid values in imported declarations.
+
 Any other key is an error. The file must be a UTF-8 YAML mapping of at most 1 MiB
 and 20,000 YAML tokens, without anchors, aliases or tags.
 [`schemas/agent-manifest-1.0.schema.json`](../schemas/agent-manifest-1.0.schema.json)

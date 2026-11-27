@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import quote
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
 from nexus_symbiote.core.enums import AssuranceLevel, AutonomyLevel, ComponentType, RiskSeverity
@@ -29,7 +29,7 @@ from nexus_symbiote.core.models import (
     RiskAssessment,
     SkillPackageComponent,
 )
-from nexus_symbiote.utils.secrets import redact_text
+from nexus_symbiote.utils.secrets import holds_token_shape, redact_text
 
 if TYPE_CHECKING:
     from nexus_symbiote.utils.confined import ConfinedCollection
@@ -82,6 +82,37 @@ _EGRESS_DOMAIN_RE = re.compile(
 )
 
 
+def _workload_value(field: str, raw: str) -> str:
+    limit = {"spiffe_id": 2048, "egress_domains": 253, "delegates_to": 256}[field]
+    if len(raw) > limit:
+        raise ValueError(f"{field} identifier too long")
+    value = raw.strip() if field != "spiffe_id" else raw
+    body = value.removeprefix("spiffe://") if field == "spiffe_id" else value
+    if holds_token_shape(body) or redact_text(body) != body:
+        raise ValueError(f"{field} requires a credential-free identifier")
+    if field == "spiffe_id" and (_SPIFFE_ID_RE.fullmatch(value) is None or "/." in value):
+        raise ValueError("invalid SPIFFE identifier")
+    if field == "egress_domains":
+        value = value.lower()
+        if _EGRESS_DOMAIN_RE.fullmatch(value) is None:
+            raise ValueError("invalid egress hostname")
+    if field == "delegates_to" and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}", value):
+        raise ValueError("invalid delegation identifier")
+    return value
+
+
+def _declared_workload_values(component: AnyComponent, field: str) -> Iterable[str]:
+    raw = component.properties.get(f"declared_{field}")
+    values = [raw] if field == "spiffe_id" else raw
+    if isinstance(values, list) and len(values) <= 256:
+        for item in values:
+            if isinstance(item, str):
+                try:
+                    yield _workload_value(field, item)
+                except ValueError:
+                    continue
+
+
 class AgentDeclaration(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str | None = Field(default=None, min_length=1)
@@ -100,38 +131,13 @@ class AgentDeclaration(BaseModel):
     @field_validator("spiffe_id")
     @classmethod
     def _validate_spiffe_id(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if not _SPIFFE_ID_RE.fullmatch(value) or "/.." in value or "/." in value:
-            raise ValueError("spiffe_id must be a valid SPIFFE URI (spiffe://<domain>/<path>)")
-        return value
+        return _workload_value("spiffe_id", value) if value is not None else None
 
-    @field_validator("egress_domains")
+    @field_validator("egress_domains", "delegates_to")
     @classmethod
-    def _validate_egress_domains(cls, values: list[str]) -> list[str]:
-        normalized: list[str] = []
-        for domain in values:
-            candidate = domain.strip().lower()
-            if len(candidate) > 253 or not _EGRESS_DOMAIN_RE.fullmatch(candidate):
-                raise ValueError("egress_domains entries must be valid DNS hostnames or wildcards")
-            normalized.append(candidate)
-        return normalized
-
-    @field_validator("delegates_to")
-    @classmethod
-    def _validate_delegates_to(cls, values: list[str]) -> list[str]:
-        cleaned: list[str] = []
-        for target in values:
-            stripped = target.strip()
-            if (
-                not stripped
-                or len(stripped) > 256
-                or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in stripped)
-                or redact_text(stripped, identifier=True) != stripped
-            ):
-                raise ValueError("delegates_to entries must be clean non-credential agent IDs")
-            cleaned.append(stripped)
-        return cleaned
+    def _validate_workload_list(cls, values: list[str], info: ValidationInfo) -> list[str]:
+        assert info.field_name is not None
+        return [_workload_value(info.field_name, item) for item in values]
 
 
 def _clip(value: object) -> str:
@@ -881,35 +887,12 @@ def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
         if nodes[ref].properties.get("mcp_role") == "gateway"
         or isinstance(nodes[ref].properties.get("upstream_server_refs"), list)
     )
-    workload_identities = sorted(
-        {
-            str(nodes[ref].properties["declared_spiffe_id"])
-            for ref in reach
-            if isinstance(nodes[ref].properties.get("declared_spiffe_id"), str)
-        }
-    )
-    egress_domains = sorted(
-        {
-            domain
-            for ref in reach
-            if isinstance(
-                (raw_domains := nodes[ref].properties.get("declared_egress_domains")), list
-            )
-            for domain in raw_domains
-            if isinstance(domain, str)
-        }
-    )
-    delegations = sorted(
-        {
-            target
-            for ref in reach
-            if isinstance(
-                (raw_delegates := nodes[ref].properties.get("declared_delegates_to")), list
-            )
-            for target in raw_delegates
-            if isinstance(target, str)
-        }
-    )
+
+    def workload_values(field: str) -> list[str]:
+        return sorted(
+            {value for ref in reach for value in _declared_workload_values(nodes[ref], field)}
+        )
+
     limitations = [
         "Reachability describes potential dependencies, not proven exploitability or runtime access."
     ]
@@ -928,9 +911,9 @@ def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
         "dependent_components": sorted(upstream - {component_ref}),
         "reachable_components": sorted(reach),
         "declared_principals": principals,
-        "declared_workload_identities": workload_identities,
-        "declared_egress_domains": egress_domains,
-        "declared_delegations": delegations,
+        "declared_workload_identities": workload_values("spiffe_id"),
+        "declared_egress_domains": workload_values("egress_domains"),
+        "declared_delegations": workload_values("delegates_to"),
         "shared_credential_surfaces": shared_credentials,
         "shared_credential_holders_omitted": omitted_holders,
         "mcp_gateways": gateways,

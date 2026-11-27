@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from itertools import permutations
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -184,6 +185,79 @@ def test_agent_manifest_rejects_invalid_spiffe_egress_and_credential_delegation(
         AgentDeclaration(name="bad", egress_domains=["https://user:pass@evil.example.com"])
     with pytest.raises(ValidationError):
         AgentDeclaration(name="bad", delegates_to=["ghp_1234567890abcdef1234567890abcdef1234"])
+
+
+def test_unknown_advisory_severity_remains_unknown_in_the_report() -> None:
+    component = MCPServerComponent(
+        name="example",
+        bom_ref="server:example",
+        properties={
+            "advisories": [
+                {"id": "example-unscored", "severity": "unknown"},
+                {"id": "example-scored", "severity": "info"},
+            ]
+        },
+    )
+    bom = AIBOM(components=[component])
+    report = build_security_graph(bom)
+    assert [(chain.trigger_id, chain.severity) for chain in report.chains] == [
+        ("example-scored", "info"),
+        ("example-unscored", "unknown"),
+    ]
+    assert report.to_dict()["severity_counts"] == {"info": 1, "unknown": 1}
+    assert build_security_graph(bom, max_chains=1).chains_omitted == 1
+
+
+def test_bridge_aliases_merge_across_sources_and_orders_with_component_isolation() -> None:
+    cve = "CVE-2026-0001"
+    ghsa = "GHSA-example"
+    records = [
+        {"id": cve, "severity": "unknown", "in_kev": True},
+        {"id": ghsa, "severity": "high", "epss": 0.15},
+        {"id": "OSV-example", "aliases": [ghsa, cve], "severity": "low", "epss": 0.85},
+    ]
+    primary = MCPServerComponent(name="example", bom_ref="server:example")
+    other = MCPServerComponent(
+        name="other",
+        bom_ref="server:other",
+        properties={"advisories": [{"id": cve, "severity": "low"}]},
+    )
+    bom = AIBOM(components=[primary, other])
+    chain_ids = set()
+    for order in permutations(records):
+        for native_count in range(len(records) + 1):
+            primary.properties["advisories"] = list(order[:native_count])
+            receipt = LoadedAdvisoryReport(
+                advisories=[
+                    dict(row, component_ref=primary.bom_ref) for row in order[native_count:]
+                ],
+                sha256="sha256:" + "a" * 64,
+                coverage="complete",
+                checked=1,
+                skipped=0,
+                excluded=0,
+                errors=0,
+            )
+            report = build_security_graph(bom, advisory_report=receipt)
+            assert (report.chain_count, report.kev_chain_count, report.chains_omitted) == (2, 1, 0)
+            linked, unrelated = report.chains
+            chain_ids.add(linked.chain_id)
+            assert (
+                linked.subject_ref,
+                linked.trigger_id,
+                linked.severity,
+                linked.kev,
+                linked.epss,
+            ) == (primary.bom_ref, cve, "high", True, 0.85)
+            source = "advisory-report" if receipt.advisories else "inventory-property"
+            assert linked.hops[0].evidence_method == source
+            assert (
+                unrelated.subject_ref,
+                unrelated.trigger_id,
+                unrelated.severity,
+                unrelated.kev,
+            ) == (other.bom_ref, cve, "low", False)
+    assert len(chain_ids) == 1
 
 
 def test_build_security_graph_correlates_cve_package_mcp_agent_credentials_and_sinks() -> None:
@@ -579,3 +653,147 @@ def test_security_graph_audit_regressions_kev_truncation_escaping_and_epss_zero(
     assert "<img" not in mermaid
     md = render_security_graph_markdown(report)
     assert "<img" not in md
+
+
+def test_component_scoping_precedes_global_limit_and_counts_scoped_omissions(
+    tmp_path: Path,
+) -> None:
+    bom = AIBOM()
+    for ref, count, severity in (("local", 501, "low"), ("unrelated", 501, "critical")):
+        bom.components.append(
+            DataSourceComponent(
+                name=ref,
+                bom_ref=ref,
+                properties={
+                    "advisories": [{"id": f"{ref}-{i}", "severity": severity} for i in range(count)]
+                },
+            )
+        )
+    path = tmp_path / "inventory.json"
+    bom.save(path)
+    advisory = tmp_path / "advisories.json"
+    advisory.write_text(
+        json.dumps(
+            {
+                "inventory_sha256": hash_bytes(path.read_bytes()),
+                "coverage": "complete",
+                "complete": True,
+                "dry_run": False,
+                "components_checked": 2,
+                "components_skipped": 0,
+                "components_excluded": 0,
+                "errors": [],
+                "advisories": [],
+            }
+        )
+    )
+    result = CliRunner().invoke(
+        main, ["blast-radius", str(path), "local", "--advisories", str(advisory), "--json-output"]
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert len(data["correlated_chains"]) == 500
+    assert {c["subject_ref"] for c in data["correlated_chains"]} == {"local"}
+    assert data["correlated_chains_omitted"] == 1
+    assert data["correlation_traversal_complete"] is True
+    assert any("1 lower-priority chain(s) omitted" in note for note in data["limitations"])
+
+
+def test_runtime_intermediate_evidence_and_unrelated_negative_control() -> None:
+    from dataclasses import replace
+
+    bom = _sample_bom()
+    trace = ExecutionEvidence(
+        invoked_refs=frozenset({"mcp:server:remote-bridge"}),
+        declared_never_loaded_refs=frozenset(),
+        unobserved_refs=frozenset(),
+        shadowed_refs=frozenset(),
+        sha256="sha256:" + "e" * 64,
+    )
+
+    def advisory_chain(evidence: ExecutionEvidence):
+        return next(
+            chain
+            for chain in build_security_graph(bom, execution_evidence=evidence).chains
+            if chain.kev
+        )
+
+    chain = advisory_chain(trace)
+    assert any(h.target_ref == "mcp:server:remote-bridge" for h in chain.hops[1:-1])
+    assert chain.runtime_status == "reported:invoked"
+    assert (
+        advisory_chain(replace(trace, invoked_refs=frozenset({"other"}))).runtime_status
+        == "reported:unobserved"
+    )
+
+
+def test_workload_declarations_are_safe_at_collection_and_import(tmp_path: Path) -> None:
+    from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
+
+    # Inert marker uses a recognizable provider prefix. No real credential is involved.
+    sample = "ghp_" + "Example123" * 4
+    fields = {
+        "spiffe_id": f"spiffe://corp.example/workload/{sample}",
+        "egress_domains": [f"sk-{'1234567890' * 3}.example.com"],
+        "delegates_to": [f"team:{sample}"],
+    }
+    for field, value in fields.items():
+        (tmp_path / "agent.yaml").write_text(json.dumps({"name": "team", field: value}))
+        bom = AIBOM()
+        failures: list[str] = []
+        assembled = assemble_repository_agent(bom, tmp_path, failures=failures)
+        assert failures
+        assert f"declared_{field}" not in assembled.properties
+        assert str(value) not in str(failures)
+        marker = value if isinstance(value, str) else value[0]
+        assert marker not in bom.to_native_json()
+        assert marker not in json.dumps(CycloneDXGenerator().generate(bom))
+
+    bom = _sample_bom()
+    agent = next(comp for comp in bom.components if comp.bom_ref == "agent:support-bot")
+    agent.properties.update({f"declared_{field}": value for field, value in fields.items()})
+    graph = build_security_graph(bom)
+    radius = blast_radius(bom, agent.bom_ref)
+    assert not radius["declared_workload_identities"]
+    assert not radius["declared_egress_domains"]
+    assert not radius["declared_delegations"]
+    assert not any(chain.workload_identities or chain.egress_domains for chain in graph.chains)
+    assert sample not in render_security_graph_json(graph)
+
+
+def test_subject_work_is_shared_and_traversal_limits_are_reported(monkeypatch) -> None:
+    from nexus_symbiote import security_graph as graph
+
+    bom = _sample_bom()
+    ref = "pkg:npm/mcp-remote@0.1.15"
+    bom.components[0].properties["advisories"].extend(
+        {"id": f"example-{n}", "severity": "high"} for n in range(60)
+    )
+    paths = graph._WalkBudget.paths
+    examined: list[int] = []
+
+    def count(self, *args, **kwargs):
+        before = self.remaining
+        result = paths(self, *args, **kwargs)
+        examined.append(before - self.remaining)
+        return result
+
+    monkeypatch.setattr(graph._WalkBudget, "paths", count)
+    report = build_security_graph(bom, subject_refs={ref}, max_chains=1)
+    assert len(examined) == 3
+    assert report.traversal_complete
+    assert report.chains_omitted == 60
+    assert report.kev_chain_count == 1
+    assert report.chains[0].kev
+    for subject_limit, report_limit in ((2, 100), (100, 2)):
+        examined.clear()
+        monkeypatch.setattr(graph, "MAX_SUBJECT_EDGE_VISITS", subject_limit)
+        monkeypatch.setattr(graph, "MAX_REPORT_EDGE_VISITS", report_limit)
+        partial = build_security_graph(bom, subject_refs={ref}, max_chains=1)
+        assert sum(examined) == min(subject_limit, report_limit)
+        assert partial.to_dict()["traversal_complete"] is False
+        assert partial.chains_omitted == 60
+        assert partial.kev_chain_count == 1
+        assert partial.chains[0].kev
+        assert any("Traversal incomplete" in note for note in partial.limitations)
+        assert "Partial view" in render_security_graph_mermaid(partial)
