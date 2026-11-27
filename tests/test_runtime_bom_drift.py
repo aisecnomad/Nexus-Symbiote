@@ -138,7 +138,7 @@ def test_clean_cluster_match_and_reported_assurance(tmp_path):
                     {
                         "name": "tools-gateway",
                         "version": "2.1.0",
-                        "endpoints": ["https://tools.cluster.local:8443/mcp", "http://"],
+                        "endpoints": ["https://tools.cluster.local:8443/mcp"],
                     },
                     {
                         "name": "planner-agent",
@@ -298,6 +298,11 @@ def test_runtime_bom_input_refusals(tmp_path):
     with pytest.raises(RuntimeBOMInputError, match="symbolic link"):
         collect(inv, [link])
 
+    hardlink = tmp_path / "also-real.json"
+    hardlink.hardlink_to(real)
+    with pytest.raises(RuntimeBOMInputError, match="single-link"):
+        collect(inv, [hardlink])
+
     # Missing & non-CycloneDX & unsupported version & duplicate JSON keys & deep nesting & bad UTF-8
     missing = tmp_path / "missing.cdx.json"
     with pytest.raises(RuntimeBOMInputError, match="does not exist"):
@@ -421,7 +426,9 @@ def test_mutability_helpers_endpoint_defaults_and_edge_branches(tmp_path, monkey
     assert mod._clean("x" * 700, limit=16).endswith("...")
     assert mod._normalize_sha256("not-a-hash") is None
     assert mod._normalize_endpoint("") is None
-    assert mod._normalize_endpoint("http://svc.cluster.local/api") == "svc.cluster.local:80/api"
+    assert (
+        mod._normalize_endpoint("http://svc.cluster.local/api") == "http://svc.cluster.local:80/api"
+    )
     assert mod._normalize_endpoint("https://") is None
     assert mod._check_container_mutability("img", "sha256:" + _SHA_A, None) is None
     assert (
@@ -438,7 +445,7 @@ def test_mutability_helpers_endpoint_defaults_and_edge_branches(tmp_path, monkey
         is None
     )
 
-    # Duplicate component split across two BOMs fills missing sha256 & merges endpoints
+    # Distinct snapshots retain their own digests and endpoints.
     inv = _write_static_bom(tmp_path)
     p1 = tmp_path / "p1.cdx.json"
     p2 = tmp_path / "p2.cdx.json"
@@ -530,3 +537,366 @@ def test_mutability_helpers_endpoint_defaults_and_edge_branches(tmp_path, monkey
     perm = PermissionError(13, "denied")
     assert "cannot be read" in mod._open_error(p1, perm)
     assert "exceeds bounds" in mod._open_error(p1, OSError(5, "eio"))
+
+
+def test_cluster_identities_and_endpoints(tmp_path):
+    inv = _write_static_bom(tmp_path)
+    rt = tmp_path / "reported.cdx.json"
+    rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {"type": "library", "name": "openai", "purl": "pkg:npm/openai@1.50.0"},
+                    {"type": "library", "name": "openai", "purl": "pkg:pypi/openai@1.50.0"},
+                    {
+                        "type": "machine-learning-model",
+                        "name": "other/Llama-3.1-8B",
+                        "version": "1.0.0",
+                    },
+                    {
+                        "type": "machine-learning-model",
+                        "name": "Llama-3.1-8B",
+                        "supplier": {"name": "other"},
+                        "version": "1.0.0",
+                    },
+                ],
+                services=[
+                    {"name": "tools-gateway", "endpoints": ["https://planner.cluster.local/a2a"]},
+                    {"name": "tools-gateway", "endpoints": []},
+                    {"name": "tools-gateway", "endpoints": ["http://tools.cluster.local:8443/mcp"]},
+                    {
+                        "name": "tools-gateway",
+                        "endpoints": [
+                            "https://tools.cluster.local:8443/mcp",
+                            "https://aux.cluster.local/mcp",
+                        ],
+                    },
+                ],
+                metadata={
+                    "properties": [
+                        {"name": "cdx:k8s:token", "value": "ordinary-property-sample"},
+                        {"name": "k8s.namespace", "value": "training"},
+                    ]
+                },
+            )
+        )
+    )
+    with enforce(Mode.OFFLINE):
+        result = collect(inv, [rt], fail_on="drift")
+    assert not result["gate"]["passed"]
+    rec = result["reconciliation"]
+    assert [x["purl"] for x in rec["matched"]] == ["pkg:pypi/openai@1.50.0"]
+    assert sorted(x["name"] for x in rec["undeclared"]) == [
+        "Llama-3.1-8B",
+        "openai",
+        "other/Llama-3.1-8B",
+    ]
+    assert len(rec["drifted"]) == 4
+    assert all(x["drift_reasons"] == ["endpoint_mismatch"] for x in rec["drifted"])
+    assert "ordinary-property-sample" not in render(result)
+    assert rec["matched"][0]["cluster_context"]["k8s.namespace"] == "training"
+
+
+def test_each_declaration_binds_one_version_and_digest(tmp_path):
+    inv = tmp_path / "inventory.json"
+    inv.write_text(
+        AIBOM(
+            components=[
+                ModelComponent(
+                    name="org/weights", bom_ref="model:a", version="1", hashes={"SHA-256": _SHA_A}
+                ),
+                ModelComponent(
+                    name="org/weights", bom_ref="model:b", version="2", hashes={"SHA-256": _SHA_B}
+                ),
+                RegistryEntryComponent(
+                    name="openai", bom_ref="pkg:openai", version="==1.9.0", registry_type="pypi"
+                ),
+            ]
+        ).to_native_json()
+    )
+    reports = []
+    for label, digest in (("first", _SHA_A), ("second", _SHA_B)):
+        path = tmp_path / f"{label}.json"
+        path.write_text(
+            json.dumps(
+                _cdx(
+                    components=[
+                        {
+                            "type": "machine-learning-model",
+                            "name": "org/weights",
+                            "version": "1",
+                            "hashes": [{"alg": "SHA-256", "content": digest}],
+                        },
+                        {"type": "library", "name": "openai", "purl": "pkg:pypi/openai@1.9.0"},
+                    ]
+                )
+            )
+        )
+        reports.append(path)
+    with enforce(Mode.OFFLINE):
+        one = collect(inv, [reports[1]], fail_on="drift")
+        combined = collect(inv, reports, fail_on="drift")
+        assert render(combined) == render(collect(inv, reports[::-1], fail_on="drift"))
+    assert not one["gate"]["passed"]
+    assert one["reconciliation"]["drifted"][0]["drift_reasons"] == [
+        "version_mismatch",
+        "digest_mismatch",
+    ]
+    assert combined["reconciliation"]["matched"][0]["inventory_refs"] == ["pkg:openai"]
+    assert not combined["gate"]["passed"]
+    assert {r["sha256"] for r in combined["reconciliation"]["drifted"]} == {
+        f"sha256:{_SHA_A}",
+        f"sha256:{_SHA_B}",
+    }
+    assert all(
+        "conflicting_reported_digests" in r["drift_reasons"]
+        for r in combined["reconciliation"]["drifted"]
+    )
+    assert len(sarif_document(combined, "inventory.json")["runs"][0]["results"]) == 2
+
+
+def test_cluster_image_pin_and_observation_cap(tmp_path, monkeypatch):
+    from nexus_symbiote import runtime_bom_drift as mod
+
+    inv = _write_static_bom(tmp_path)
+    rt = tmp_path / "reported.cdx.json"
+    rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {"type": "container", "name": "ghcr.io/org/agent-runner@sha256:" + _SHA_B},
+                    {"type": "container", "name": "ghcr.io/org/agent-runner@sha256:" + _SHA_A},
+                    {"type": "container", "name": "ghcr.io/org/sidecar:1.2.0", "version": "1.2.0"},
+                ]
+            )
+        )
+    )
+    result = collect(inv, [rt], fail_on="drift")
+    assert not result["gate"]["passed"]
+    assert [r["name"] for r in result["reconciliation"]["mutable_tags"]] == [
+        "ghcr.io/org/sidecar:1.2.0"
+    ]
+    assert any("digest_mismatch" in r["drift_reasons"] for r in result["reconciliation"]["drifted"])
+    assert mod._check_container_mutability("image@sha512:" + "a" * 128, None, None) is None
+    assert mod._check_container_mutability("image", _SHA_A, None)
+    monkeypatch.setattr(mod, "MAX_DRIFT_ITEMS", 2)
+    with pytest.raises(RuntimeBOMInputError, match="observation limit"):
+        collect(inv, [rt], fail_on="none")
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"components": [None]}, "objects"),
+        ({"components": None}, "JSON array"),
+        ({"metadata": {"component": []}}, "objects"),
+        ({"components": [{"name": "model"}]}, "type"),
+        ({"components": [{"type": "library", "name": "torch", "version": 1}]}, "version"),
+        (
+            {"components": [{"type": "library", "name": "torch", "purl": "unstructured"}]},
+            "package URL",
+        ),
+        (
+            {
+                "components": [
+                    {"type": "library", "name": "torch", "purl": "pkg:pypi/torch@1", "version": "2"}
+                ]
+            },
+            "disagree",
+        ),
+        ({"services": [{"name": "chat", "endpoints": 123}]}, "endpoints"),
+        ({"services": [{"name": "chat", "endpoints": ["https://"]}]}, "no host"),
+        ({"services": [{"name": "chat", "endpoints": ["https://host:port"]}]}, "host or port"),
+        ({"services": [{"name": "chat", "services": {}}]}, "nested services"),
+        ({"components": [{"type": "library", "name": "torch", "hashes": {}}]}, "array"),
+        (
+            {"components": [{"type": "library", "name": "torch", "hashes": [{"content": "aaa"}]}]},
+            "algorithm",
+        ),
+        (
+            {
+                "components": [
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "hashes": [{"alg": "SHA-256", "content": "abc"}],
+                    }
+                ]
+            },
+            "invalid value",
+        ),
+        (
+            {
+                "components": [
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "hashes": [
+                            {"alg": "SHA-256", "content": _SHA_A},
+                            {"alg": "SHA-256", "content": _SHA_B},
+                        ],
+                    }
+                ]
+            },
+            "conflicting",
+        ),
+        (
+            {
+                "components": [
+                    {
+                        "type": "container",
+                        "name": "image@sha256:" + _SHA_A,
+                        "purl": "pkg:oci/image@sha256:" + _SHA_B,
+                    }
+                ]
+            },
+            "conflicting",
+        ),
+        (
+            {
+                "components": [
+                    {
+                        "type": "container",
+                        "name": "image@sha256:" + _SHA_A,
+                        "hashes": [{"alg": "SHA-256", "content": _SHA_B}],
+                    }
+                ]
+            },
+            "disagree",
+        ),
+    ],
+)
+def test_invalid_comparison_fields_are_refused(tmp_path, change, message):
+    inv = _write_static_bom(tmp_path)
+    rt = tmp_path / "reported.cdx.json"
+    rt.write_text(json.dumps({**_cdx(), **change}))
+    with enforce(Mode.OFFLINE), pytest.raises(RuntimeBOMInputError, match=message):
+        collect(inv, [rt], fail_on="none")
+
+
+def test_qualified_model_names_retain_snapshot_supplier_and_one_declaration(tmp_path):
+    def write_snapshot(path, supplier, digest):
+        path.write_text(
+            json.dumps(
+                _cdx(
+                    components=[
+                        {
+                            "type": "machine-learning-model",
+                            "name": "fieldlab/forecast",
+                            "version": "1",
+                            "supplier": {"name": supplier},
+                            "hashes": [{"alg": "SHA-256", "content": digest}],
+                        }
+                    ]
+                )
+            )
+        )
+        return path
+
+    def static(provider, digest):
+        return ModelComponent(
+            name="fieldlab/forecast",
+            bom_ref=f"model:{provider}",
+            version="1",
+            provider=provider,
+            hashes={"SHA-256": digest},
+        )
+
+    inv = tmp_path / "inventory.json"
+    AIBOM(components=[static("Provider A", _SHA_A)]).save(inv)
+    a = write_snapshot(tmp_path / "a.json", "Provider A", _SHA_A)
+    b = write_snapshot(tmp_path / "b.json", "Provider B", _SHA_A)
+    for order in ([a, b], [b, a]):
+        report = collect(inv, order, fail_on="undeclared")
+        assert not report["gate"]["passed"]
+        assert report["coverage"]["observed_distinct"] == 2
+        assert [(row["supplier"], row["source_files"]) for row in report["observed"]] == [
+            ("Provider A", ["a.json"]),
+            ("Provider B", ["b.json"]),
+        ]
+        assert [row["supplier"] for row in report["reconciliation"]["undeclared"]] == ["Provider B"]
+        assert report["reconciliation"]["matched"][0]["inventory_refs"] == ["model:Provider A"]
+
+    write_snapshot(b, "Provider B", _SHA_B)
+    AIBOM(components=[static("Provider A", _SHA_A), static("Provider B", _SHA_B)]).save(inv)
+    independent = collect(inv, [a, b], fail_on="drift")
+    assert independent["gate"]["passed"]
+    assert {tuple(row["inventory_refs"]) for row in independent["reconciliation"]["matched"]} == {
+        ("model:Provider A",),
+        ("model:Provider B",),
+    }
+    write_snapshot(b, "Provider A", _SHA_B)
+    conflicts = collect(inv, [a, b], fail_on="drift")
+    assert not conflicts["gate"]["passed"]
+    assert all(
+        "conflicting_reported_digests" in row["drift_reasons"]
+        for row in conflicts["reconciliation"]["drifted"]
+    )
+
+
+def test_producer_model_provider_property_is_independent_of_supplier(tmp_path):
+    from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
+
+    model = ModelComponent(
+        name="fieldlab/forecast",
+        bom_ref="model:forecast",
+        provider="Compute A",
+        supplier="Distribution",
+        version="1",
+    )
+    bom = AIBOM(components=[model])
+    inventory = tmp_path / "static.json"
+    bom.save(inventory)
+    snapshot = tmp_path / "snapshot.json"
+    doc = CycloneDXGenerator(projection_version=3).generate(bom)
+    (row,) = [c for c in doc["components"] if c["type"] == "machine-learning-model"]
+    (prop,) = [v for v in row["properties"] if v["name"] == "nexus-symbiote:provider"]
+    assert prop["value"] == "Compute A" and row["supplier"]["name"] == "Distribution"
+    for provider, supplier, passed in [
+        ("Compute A", "Distribution", True),
+        ("Compute B", "Distribution", False),
+        ("Compute A", "Distribution B", False),
+    ]:
+        prop["value"] = provider
+        row["supplier"]["name"] = supplier
+        snapshot.write_text(json.dumps(_cdx(components=[row])))
+        result = collect(inventory, [snapshot], fail_on="undeclared")
+        assert result["gate"]["passed"] is passed
+        (observed,) = result["observed"]
+        assert (observed["provider"], observed["supplier"]) == (provider, supplier)
+    row["properties"].append({"name": "nexus-symbiote:provider", "value": "Compute B"})
+    snapshot.write_text(json.dumps(_cdx(components=[row])))
+    with pytest.raises(RuntimeBOMInputError, match="conflicting provider"):
+        collect(inventory, [snapshot])
+
+
+def test_context_key_redaction_recognizes_nested_names(tmp_path):
+    inv = _write_static_bom(tmp_path)
+    snapshot = tmp_path / "properties.json"
+    sensitive = [
+        "k8s.secret.value",
+        "container.env.API_TOKEN.value",
+        "k8s.http.authorization",
+        "k8s.http.authorization.value",
+        "cdx:k8s:headers:cookie:value",
+    ]
+    props = [{"name": name, "value": "session=inert-ordinary-sample"} for name in sensitive]
+    props.append({"name": "k8s.workload.label", "value": "training"})
+    snapshot.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "machine-learning-model",
+                        "name": "fieldlab/model",
+                        "properties": props,
+                    }
+                ]
+            )
+        )
+    )
+    report = collect(inv, [snapshot], fail_on="none")
+    assert "inert-ordinary-sample" not in render(report)
+    (observed,) = report["observed"]
+    assert set(observed["cluster_context"]) == {*sensitive, "k8s.workload.label"}
+    assert observed["cluster_context"]["k8s.workload.label"] == "training"

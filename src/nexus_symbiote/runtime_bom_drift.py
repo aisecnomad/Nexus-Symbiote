@@ -10,12 +10,15 @@ reporting pipeline emitted and cannot prove absence.
 from __future__ import annotations
 
 import errno
+import os
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from packageurl import PackageURL
 
 from nexus_symbiote.core.aibom import AIBOM, parse_native_bytes
 from nexus_symbiote.core.content_digest import inventory_content_digest
@@ -36,11 +39,13 @@ from nexus_symbiote.core.models import (
 )
 from nexus_symbiote.sbom_import import (
     MAX_FOREIGN_SBOM_BYTES,
+    _clean_exact_spec,
     _extract_cdx_entries,
     _is_ai_package_name,
     _norm_pkg,
 )
-from nexus_symbiote.utils.secrets import redact_text
+from nexus_symbiote.scanners.registry import parse_image_reference
+from nexus_symbiote.utils.secrets import REDACTED, redact_keyed_text, redact_text
 from nexus_symbiote.utils.terminal import neutralize
 
 FORMAT = "nexus-symbiote-k8s-drift-v1"
@@ -53,7 +58,6 @@ MAX_TEXT_FIELD = 512
 _SUPPORTED_CDX_VERSIONS = frozenset({"1.4", "1.5", "1.6", "1.7"})
 _SHA256_DIGEST_RE = re.compile(r"^(?:sha256:)?([0-9a-fA-F]{64})$", re.ASCII)
 _MUTABLE_IMAGE_TAGS = frozenset({"latest", "main", "master", "dev", "nightly", "edge", "canary"})
-_MUTABLE_PURL_RE = re.compile(r"^pkg:(?:oci|docker)/[^@#?]+(?:@([^?#]+))?(?:\?.*)?$", re.ASCII)
 
 
 class RuntimeBOMInputError(ValueError):
@@ -78,17 +82,22 @@ def _normalize_endpoint(raw_url: str) -> str | None:
     cleaned = raw_url.strip()
     if not cleaned:
         return None
-    parsed = urlsplit(cleaned if "://" in cleaned else f"https://{cleaned}")
-    host = (parsed.hostname or "").strip().lower()
+    try:
+        parsed = urlsplit(cleaned if "://" in cleaned else f"https://{cleaned}")
+        host = (parsed.hostname or "").strip().lower()
+        port = parsed.port
+    except ValueError:
+        raise RuntimeBOMInputError("Service endpoint has an invalid host or port.") from None
     if not host:
         return None
-    port = parsed.port
     if port is None and parsed.scheme in {"http", "ws"}:
         port = 80
     elif port is None and parsed.scheme in {"https", "wss", ""}:
         port = 443
     path = parsed.path.rstrip("/")
-    base = f"{host}:{port}" if port is not None else host
+    if ":" in host:
+        host = f"[{host}]"
+    base = f"{parsed.scheme}://{host}" + (f":{port}" if port is not None else "")
     return f"{base}{path}" if path else base
 
 
@@ -110,6 +119,8 @@ def _open_error(path: Path, exc: OSError) -> str:
 def _read_runtime_document(path: Path) -> tuple[dict[str, Any], str]:
     try:
         with open_regular_file(path) as handle:
+            if os.fstat(handle.fileno()).st_nlink != 1:
+                raise RuntimeBOMInputError("Runtime BOM must be a single-link regular file.")
             raw_bytes = handle.read(MAX_FOREIGN_SBOM_BYTES + 1)
     except OSError as exc:
         raise RuntimeBOMInputError(_open_error(path, exc)) from None
@@ -164,37 +175,67 @@ def _extract_k8s_properties(node: Mapping[str, Any]) -> dict[str, str]:
         if not isinstance(pname, str) or not isinstance(pval, str):
             continue
         if pname.startswith(("k8s.", "cdx:k8s:", "container.")):
-            context[_clean(pname, limit=128)] = _clean(pval, limit=256)
+            safe = redact_keyed_text(pname, pval)
+            for segment in re.finditer(r"[^.:]+", pname):
+                if safe == REDACTED:
+                    break
+                safe = redact_keyed_text(segment.group(), pval, redacted=safe)
+            context[_clean(pname, limit=128)] = _clean(safe, limit=256)
             if len(context) >= 16:
                 break
     return context
 
 
-def _check_container_mutability(name: str, version: str | None, purl: str | None) -> str | None:
-    if purl:
-        if "@sha256:" in purl.lower() and re.search(r"@sha256:[0-9a-f]{64}", purl.lower()):
-            return None
-        match = _MUTABLE_PURL_RE.fullmatch(purl.strip())
-        if match is not None:
-            ref_tag = (match.group(1) or "").strip().lower()
-            if not ref_tag:
-                return "unpinned OCI/Docker PURL without digest or version"
-            if ref_tag in _MUTABLE_IMAGE_TAGS:
-                return f"mutable container tag ':{_clean(ref_tag)}'"
-            return "container PURL omits immutable @sha256 digest"
-    ver = (version or "").strip()
-    if ver:
-        if re.search(r"(?:^|@)sha256:[0-9a-f]{64}$", ver.lower()):
-            return None
-        lowered = ver.lstrip(":").lower()
-        if lowered in _MUTABLE_IMAGE_TAGS:
-            return f"mutable container tag ':{_clean(lowered)}'"
+def _parse_purl(value: str | None) -> PackageURL | None:
+    if not value:
         return None
-    if ":" in name:
-        tag = name.rsplit(":", 1)[1].strip().lower()
-        if tag in _MUTABLE_IMAGE_TAGS:
-            return f"mutable container tag ':{_clean(tag)}'"
-    return "container workload has no immutable digest or version"
+    try:
+        return PackageURL.from_string(value)
+    except ValueError:
+        raise RuntimeBOMInputError("Invalid package URL in comparison input.") from None
+
+
+def _image_pin(name: str, version: str | None, purl: str | None) -> str | None:
+    reference = parse_image_reference(name)
+    package = _parse_purl(purl)
+    pins = set()
+    for value in (
+        reference.digest if reference else None,
+        version,
+        package.version if package else None,
+    ):
+        if value and ":" in value:
+            pinned = parse_image_reference(f"image@{value}")
+            if pinned and pinned.pinned:
+                pins.add(value)
+    if len(pins) > 1:
+        raise RuntimeBOMInputError("Container description has conflicting digest pins.")
+    return next(iter(pins), None)
+
+
+def _check_container_mutability(name: str, version: str | None, purl: str | None) -> str | None:
+    if _image_pin(name, version, purl):
+        return None
+    reference = parse_image_reference(name)
+    tag = (version or (reference.tag if reference else None) or "").lstrip(":").lower()
+    if tag in _MUTABLE_IMAGE_TAGS:
+        return f"mutable container tag ':{_clean(tag)}'"
+    if purl:
+        return "container PURL without digest pin"
+    return "container workload has no immutable digest"
+
+
+def _image_key(name: str) -> str:
+    reference = parse_image_reference(name)
+    return reference.repository if reference else name
+
+
+def _package_identity(name: str, purl: str | None, ecosystem: str | None = None) -> tuple[str, str]:
+    package = _parse_purl(purl)
+    if package:
+        ecosystem = package.type
+        name = "/".join(part for part in (package.namespace, package.name) if part)
+    return ecosystem or "", _norm_pkg(name) if ecosystem == "pypi" else name
 
 
 @dataclass(frozen=True)
@@ -205,9 +246,11 @@ class _RuntimeObservation:
     version: str | None
     purl: str | None
     sha256: str | None
+    provider: str
+    supplier: str
     endpoints: tuple[str, ...]
     mutable_reason: str | None
-    source_files: tuple[str, ...]
+    source_files: set[str]
     cluster_context: dict[str, str]
 
     def to_dict(self) -> dict[str, Any]:
@@ -218,8 +261,12 @@ class _RuntimeObservation:
             "purl": _clean(self.purl) if self.purl else None,
             "sha256": self.sha256,
             "assurance": ASSURANCE,
-            "source_files": list(self.source_files),
+            "source_files": sorted(self.source_files),
         }
+        if self.provider:
+            payload["provider"] = _clean(self.provider)
+        if self.supplier:
+            payload["supplier"] = _clean(self.supplier)
         if self.endpoints:
             payload["endpoints"] = [_clean(ep) for ep in self.endpoints]
         if self.mutable_reason:
@@ -229,27 +276,46 @@ class _RuntimeObservation:
         return payload
 
 
-@dataclass
-class _MutableObsAcc:
-    kind: str
-    name: str
-    version: str | None
-    purl: str | None
-    sha256: str | None
-    endpoints: set[str] = field(default_factory=set)
-    mutable_reason: str | None = None
-    source_files: set[str] = field(default_factory=set)
-    cluster_context: dict[str, str] = field(default_factory=dict)
-
-
 def _model_keys(name: str) -> set[str]:
     clean = name.strip().lower()
-    keys = {clean}
-    if "/" in clean:
-        keys.add(clean.rsplit("/", 1)[-1])
-    if ":" in clean:
-        keys.add(clean.split(":", 1)[0])
-    return {k for k in keys if k}
+    key = clean.rsplit(":", 1)[0] if ":" in clean.rsplit("/", 1)[-1] else clean
+    return {clean, key} - {""}
+
+
+def _model_sources(node: Mapping[str, Any]) -> tuple[str, str]:
+    """CycloneDX supplier.name and the producer's native model-provider extension."""
+    entity = node.get("supplier", {})
+    if not isinstance(entity, dict) or not isinstance(entity.get("name", ""), str):
+        raise RuntimeBOMInputError("Model supplier must be an organization with an optional name.")
+    supplier = entity.get("name", "").strip()
+    providers = set()
+    properties = node.get("properties", [])
+    if not isinstance(properties, list):
+        raise RuntimeBOMInputError("Model properties must be an array.")
+    for prop in properties:
+        if isinstance(prop, dict) and prop.get("name") == "nexus-symbiote:provider":
+            value = prop.get("value")
+            if not isinstance(value, str) or not value.strip():
+                raise RuntimeBOMInputError("Model provider property requires a nonempty name.")
+            providers.add(value.strip())
+    if len(providers) > 1:
+        raise RuntimeBOMInputError("Model has conflicting provider declarations.")
+    return next(iter(providers), ""), supplier
+
+
+def _model_source_matches(obs: _RuntimeObservation, comp: ModelComponent) -> bool:
+    if (
+        obs.supplier
+        and comp.supplier
+        and obs.supplier.casefold() != comp.supplier.strip().casefold()
+    ):
+        return False
+    # Third-party snapshots can supply only the organization. Compare it with the
+    # native provider if the static declaration supplies no separate supplier.
+    provider = obs.provider or (obs.supplier if not comp.supplier else "")
+    return (
+        not provider or not comp.provider or provider.casefold() == comp.provider.strip().casefold()
+    )
 
 
 def _collect_observations(
@@ -257,7 +323,10 @@ def _collect_observations(
     static_pkg_keys: set[str],
 ) -> tuple[list[_RuntimeObservation], list[dict[str, str]], dict[str, int]]:
     inputs_meta: list[dict[str, str]] = []
-    acc_map: dict[tuple[str, str, str], _MutableObsAcc] = {}
+    acc_map: dict[
+        tuple[str, str, str, str, str, str, str, str, tuple[str, ...], tuple[tuple[str, str], ...]],
+        _RuntimeObservation,
+    ] = {}
     stats = {
         "runtime_boms_read": 0,
         "cyclonedx_entries_read": 0,
@@ -275,7 +344,10 @@ def _collect_observations(
                 "spec_version": str(doc["specVersion"]),
             }
         )
-        entries = _extract_cdx_entries(doc)
+        try:
+            entries = _extract_cdx_entries(doc, strict=True)
+        except ValueError as exc:
+            raise RuntimeBOMInputError(f"Invalid runtime CycloneDX structure: {exc}") from exc
         stats["cyclonedx_entries_read"] += len(entries)
         doc_ctx = _extract_k8s_properties(
             doc.get("metadata", {}) if isinstance(doc.get("metadata"), Mapping) else {}
@@ -292,80 +364,91 @@ def _collect_observations(
             is_container = raw_type == "container" or (
                 isinstance(purl, str) and purl.lower().startswith(("pkg:oci/", "pkg:docker/"))
             )
+            provider = supplier = ""
             if raw_type == "machine-learning-model":
                 kind = "model"
-                norm_key = name.lower()
+                provider, supplier = _model_sources(raw_entry)
+                qualifier = provider or supplier
+                norm_key = (
+                    f"{qualifier}/{name}" if qualifier and "/" not in name else name
+                ).lower()
             elif raw_type == "service":
                 kind = "service"
                 norm_key = name.lower()
             elif is_container:
                 kind = "container"
-                base_name = (
-                    name.rsplit(":", 1)[0]
-                    if ":" in name and not name.startswith("sha256:")
-                    else name
-                )
-                norm_key = base_name.lower()
+                norm_key = _image_key(name)
+                reference = parse_image_reference(name)
+                if not version and reference:
+                    version = reference.tag
+                pin = _normalize_sha256(_image_pin(name, version, purl))
+                if sha256 and pin and sha256 != pin:
+                    raise RuntimeBOMInputError("Container hash and reference digest disagree.")
+                sha256 = sha256 or pin
             elif raw_type in {"library", "framework", "application"}:
-                pkg_key = _norm_pkg(name)
-                if not (_is_ai_package_name(name) or pkg_key in static_pkg_keys):
+                ecosystem, package_name = _package_identity(name, purl)
+                if not (
+                    _is_ai_package_name(name)
+                    or _is_ai_package_name(package_name)
+                    or _norm_pkg(package_name) in static_pkg_keys
+                ):
                     stats["non_ai_packages_ignored"] += 1
                     continue
                 kind = "package"
-                norm_key = pkg_key
+                norm_key = f"{ecosystem}:{package_name}"
             else:
                 stats["non_ai_packages_ignored"] += 1
                 continue
 
-            ver_key = (version or "").strip().lower()
-            map_key = (kind, norm_key, ver_key)
+            context = {**doc_ctx, **_extract_k8s_properties(raw_entry)}
+            endpoints = set()
+            for ep in raw_entry.get("endpoints") or []:
+                endpoint = _normalize_endpoint(ep)
+                if not endpoint:
+                    raise RuntimeBOMInputError("Service endpoint has no host.")
+                endpoints.add(endpoint)
+            if kind == "package" and (package := _parse_purl(purl)) is not None and package.version:
+                if version and version != package.version:
+                    raise RuntimeBOMInputError("Runtime package version and package URL disagree.")
+                version = package.version
+            map_key = (
+                kind,
+                norm_key,
+                version or "",
+                name,
+                purl or "",
+                sha256 or "",
+                provider,
+                supplier,
+                tuple(sorted(endpoints)),
+                tuple(sorted(context.items())),
+            )
             if map_key not in acc_map:
-                mutable_reason = (
-                    _check_container_mutability(name, version, purl)
-                    if kind == "container"
-                    else None
-                )
-                ctx = {**doc_ctx, **_extract_k8s_properties(raw_entry)}
-                acc_map[map_key] = _MutableObsAcc(
+                if len(acc_map) >= MAX_DRIFT_ITEMS:
+                    raise RuntimeBOMInputError(
+                        f"Runtime BOMs exceed the distinct observation limit ({MAX_DRIFT_ITEMS}); comparison incomplete."
+                    )
+                acc_map[map_key] = _RuntimeObservation(
                     kind=kind,
+                    key=norm_key,
+                    source_files=set(),
                     name=name,
-                    version=version.strip()
-                    if isinstance(version, str) and version.strip()
-                    else None,
-                    purl=purl.strip() if isinstance(purl, str) and purl.strip() else None,
+                    version=version,
+                    purl=purl,
                     sha256=sha256,
-                    mutable_reason=mutable_reason,
-                    cluster_context=ctx,
+                    provider=provider,
+                    supplier=supplier,
+                    endpoints=tuple(sorted(endpoints)),
+                    mutable_reason=_check_container_mutability(name, version, purl)
+                    if kind == "container"
+                    else None,
+                    cluster_context=context,
                 )
-            acc = acc_map[map_key]
-            acc.source_files.add(file_label)
-            if sha256 and not acc.sha256:
-                acc.sha256 = sha256
-            raw_eps = raw_entry.get("endpoints")
-            if isinstance(raw_eps, list):
-                for ep in raw_eps:
-                    if isinstance(ep, str):
-                        norm_ep = _normalize_endpoint(ep)
-                        if norm_ep:
-                            acc.endpoints.add(norm_ep)
+            acc_map[map_key].source_files.add(file_label)
 
-    observations = [
-        _RuntimeObservation(
-            kind=key[0],
-            key=key[1],
-            name=acc.name,
-            version=acc.version,
-            purl=acc.purl,
-            sha256=acc.sha256,
-            endpoints=tuple(sorted(acc.endpoints)),
-            mutable_reason=acc.mutable_reason,
-            source_files=tuple(sorted(acc.source_files)),
-            cluster_context=acc.cluster_context,
-        )
-        for key, acc in sorted(acc_map.items())
-    ]
+    observations = [acc_map[key] for key in sorted(acc_map)]
     return (
-        observations[:MAX_DRIFT_ITEMS],
+        observations,
         sorted(inputs_meta, key=lambda item: (item["file"], item["sha256"])),
         stats,
     )
@@ -378,6 +461,7 @@ class _StaticCatalog:
     endpoints: dict[str, list[MCPServerComponent | A2AServerComponent]]
     packages: dict[str, list[RegistryEntryComponent]]
     package_keys: set[str]
+    images: dict[str, list[RegistryEntryComponent]]
 
 
 def _index_static_bom(bom: AIBOM) -> _StaticCatalog:
@@ -386,13 +470,21 @@ def _index_static_bom(bom: AIBOM) -> _StaticCatalog:
     endpoints: dict[str, list[MCPServerComponent | A2AServerComponent]] = {}
     packages: dict[str, list[RegistryEntryComponent]] = {}
 
+    images: dict[str, list[RegistryEntryComponent]] = {}
+    package_names: set[str] = set()
     for comp in bom.components:
         if isinstance(comp, ModelComponent):
-            for key in _model_keys(comp.name):
+            keys = set()
+            for name in (comp.name, comp.requested_alias):
+                if not name:
+                    continue
+                keys.update(_model_keys(name))
+                if "/" not in name:
+                    for source in (comp.provider, comp.supplier):
+                        if source:
+                            keys.update(_model_keys(f"{source.strip()}/{name}"))
+            for key in keys:
                 models.setdefault(key, []).append(comp)
-            if comp.requested_alias:
-                for key in _model_keys(comp.requested_alias):
-                    models.setdefault(key, []).append(comp)
         elif isinstance(comp, MCPServerComponent | A2AServerComponent):
             services.setdefault(comp.name.strip().lower(), []).append(comp)
             if comp.endpoint_url:
@@ -400,17 +492,22 @@ def _index_static_bom(bom: AIBOM) -> _StaticCatalog:
                 if ep:
                     endpoints.setdefault(ep, []).append(comp)
         elif isinstance(comp, RegistryEntryComponent):
-            packages.setdefault(_norm_pkg(comp.name), []).append(comp)
-            if comp.package_url and "/" in comp.package_url:
-                tail = comp.package_url.rsplit("/", 1)[-1].split("@", 1)[0].split("?", 1)[0]
-                if tail:
-                    packages.setdefault(_norm_pkg(tail), []).append(comp)
+            package = _parse_purl(comp.package_url)
+            if comp.registry_type in {"docker-hub", "oci"} or (
+                package and package.type in {"oci", "docker"}
+            ):
+                images.setdefault(_image_key(comp.name), []).append(comp)
+            else:
+                eco, name = _package_identity(comp.name, comp.package_url, comp.registry_type)
+                packages.setdefault(f"{eco}:{name}", []).append(comp)
+                package_names.add(_norm_pkg(name))
     return _StaticCatalog(
         models=models,
         services=services,
         endpoints=endpoints,
         packages=packages,
-        package_keys=set(packages),
+        package_keys=package_names,
+        images=images,
     )
 
 
@@ -424,13 +521,6 @@ def _static_sha256(comp: Any) -> str | None:
             if normalized:
                 return normalized
     return None
-
-
-def _static_purl_digest(purl: str | None) -> str | None:
-    if not isinstance(purl, str) or "@sha256:" not in purl.lower():
-        return None
-    tail = purl.lower().split("@", 1)[1].split("?", 1)[0]
-    return _normalize_sha256(tail)
 
 
 def collect(
@@ -461,22 +551,31 @@ def collect(
     undeclared: list[dict[str, Any]] = []
     seen_static_refs: set[str] = set()
 
+    def digest_key(obs: _RuntimeObservation) -> tuple[str, str, str | None, str, str]:
+        return obs.kind, obs.key, obs.version, obs.provider.casefold(), obs.supplier.casefold()
+
+    observed_digests: dict[tuple[str, str, str | None, str, str], set[str]] = {}
+    for obs in observations:
+        if obs.sha256:
+            observed_digests.setdefault(digest_key(obs), set()).add(obs.sha256)
+
     for obs in observations:
         static_matches: list[Any] = []
         if obs.kind == "model":
-            for mk in _model_keys(obs.name):
-                static_matches.extend(catalog.models.get(mk, ()))
+            for mk in _model_keys(obs.key):
+                static_matches.extend(
+                    comp for comp in catalog.models.get(mk, ()) if _model_source_matches(obs, comp)
+                )
         elif obs.kind == "service":
             static_matches.extend(catalog.services.get(obs.key, ()))
-            for ep in obs.endpoints:
-                static_matches.extend(catalog.endpoints.get(ep, ()))
+            if not static_matches:
+                for ep in obs.endpoints:
+                    static_matches.extend(catalog.endpoints.get(ep, ()))
+        elif obs.kind == "container":
+            static_matches.extend(catalog.images.get(obs.key, ()))
         else:
-            static_matches.extend(catalog.packages.get(_norm_pkg(obs.name), ()))
-            if obs.kind == "container":
-                static_matches.extend(catalog.packages.get(_norm_pkg(obs.key), ()))
-                static_matches.extend(catalog.services.get(obs.key, ()))
+            static_matches.extend(catalog.packages.get(obs.key, ()))
 
-        # Deduplicate matched components cleanly preserving declaration order
         deduped_matches = list({c.bom_ref: c for c in static_matches}.values())
         obs_dict = obs.to_dict()
 
@@ -486,40 +585,57 @@ def collect(
             undeclared.append(obs_dict)
             continue
 
-        for comp in deduped_matches:
-            seen_static_refs.add(comp.bom_ref)
-
-        drift_reasons: list[str] = []
-        # Version drift check against matching static component declarations
-        static_versions = {
-            c.version.strip() for c in deduped_matches if getattr(c, "version", None)
-        }
-        if obs.version and static_versions and obs.version not in static_versions:
-            drift_reasons.append("version_mismatch")
-
-        # Digest drift check
-        static_digests = {
-            d
-            for c in deduped_matches
-            for d in (_static_sha256(c), _static_purl_digest(getattr(c, "package_url", None)))
-            if d
-        }
-        if obs.sha256 and static_digests and obs.sha256 not in static_digests:
-            drift_reasons.append("digest_mismatch")
-
-        # Service endpoint drift check
-        if obs.kind == "service" and obs.endpoints:
-            static_eps = {
-                norm
-                for c in deduped_matches
-                if getattr(c, "endpoint_url", None)
-                for norm in (_normalize_endpoint(str(c.endpoint_url)),)
-                if norm
-            }
-            if static_eps and not (set(obs.endpoints) & static_eps):
-                drift_reasons.append("endpoint_mismatch")
-
-        obs_dict["inventory_refs"] = [_clean(c.bom_ref) for c in deduped_matches]
+        # Evaluate version, digest and endpoints against the same declaration.
+        matching = []
+        reasons_by_candidate = []
+        static_versions = set()
+        for comp in sorted(deduped_matches, key=lambda c: c.bom_ref):
+            candidate_reasons = []
+            version = comp.version
+            if isinstance(comp, RegistryEntryComponent):
+                package = _parse_purl(comp.package_url)
+                version = (package.version if package else None) or _clean_exact_spec(version)
+            digest = _static_sha256(comp)
+            different_pin = False
+            observed_version = obs.version
+            if obs.kind == "container":
+                static_pin = _image_pin(comp.name, comp.version, comp.package_url)
+                runtime_pin = _image_pin(obs.name, obs.version, obs.purl)
+                different_pin = bool(static_pin and runtime_pin and static_pin != runtime_pin)
+                digest = digest or _normalize_sha256(static_pin)
+                if not version or version == static_pin:
+                    reference = parse_image_reference(comp.name)
+                    version = reference.tag if reference else None
+                if observed_version == runtime_pin:
+                    reference = parse_image_reference(obs.name)
+                    observed_version = reference.tag if reference else None
+            if version:
+                static_versions.add(version)
+                if observed_version and version != observed_version:
+                    candidate_reasons.append("version_mismatch")
+            if different_pin or (digest and obs.sha256 and obs.sha256 != digest):
+                candidate_reasons.append("digest_mismatch")
+            if obs.kind == "service":
+                declared = _normalize_endpoint(comp.endpoint_url) if comp.endpoint_url else None
+                if set(obs.endpoints) != ({declared} if declared else set()):
+                    candidate_reasons.append("endpoint_mismatch")
+            if not candidate_reasons:
+                matching.append(comp)
+            reasons_by_candidate.append(candidate_reasons)
+        drift_reasons = (
+            []
+            if matching
+            else [
+                reason
+                for reason in ("version_mismatch", "digest_mismatch", "endpoint_mismatch")
+                if any(reason in reasons for reasons in reasons_by_candidate)
+            ]
+        )
+        if len(observed_digests.get(digest_key(obs), ())) > 1:
+            drift_reasons.append("conflicting_reported_digests")
+        refs = sorted({c.bom_ref for c in (matching or deduped_matches)})
+        seen_static_refs.update(refs)
+        obs_dict["inventory_refs"] = [_clean(ref) for ref in refs]
         if static_versions:
             obs_dict["declared_versions"] = [_clean(v) for v in sorted(static_versions)]
 
@@ -657,6 +773,10 @@ def sarif_document(document: Mapping[str, Any], anchor: str) -> dict[str, Any]:
                 "kind": kind,
                 "name": name,
                 "ver": item.get("version"),
+                "purl": item.get("purl"),
+                "sha256": item.get("sha256"),
+                "endpoints": item.get("endpoints"),
+                "context": item.get("cluster_context"),
             }
         )
         props: dict[str, Any] = {

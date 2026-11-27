@@ -1398,6 +1398,4 @@ nexus-symbiote k8s-drift [OPTIONS] INVENTORY RUNTIME_BOM...
 | `--sarif` `SARIF_PATH` | Write schema-valid SARIF 2.1.0 findings for undeclared, drifted and mutable-tag items. |
 | `--fail-on` `undeclared\|drift\|none` | Exit 1 on undeclared cluster items or empty BOMs (`undeclared`, default), also on version/SHA-256/endpoint drift and mutable image tags (`drift`), or report only (`none`). |
 
-Runtime inputs must be regular, single-link UTF-8 CycloneDX `1.4`–`1.7` JSON files inside size and nesting bounds. Outputs neutralize terminal sequences and redact secrets; SARIF messages defang URLs (`https[:]//`).
-
-
+Runtime inputs must be regular, single-link UTF-8 CycloneDX `1.4`–`1.7` JSON files inside size and nesting bounds. The command rejects malformed comparison entries and inputs exceeding 5,000 distinct observations. Separate runtime snapshots retain conflicting digests, endpoints, model suppliers and providers. The command checks CycloneDX `supplier.name` and the `nexus-symbiote:provider` property independently of the model name. If a snapshot gives only a supplier and the inventory gives only a provider, those names must agree. Output neutralizes terminal sequences and redacts sensitive property values. SARIF messages defang URLs (`https[:]//`).
