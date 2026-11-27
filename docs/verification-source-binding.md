@@ -216,7 +216,11 @@ Several security declarations are recorded in clear:
   fragment is reduced to its origin, and so is one whose path holds a credential-shaped
   run, such as the secret of a Slack, Discord or Teams webhook URL: 16 or more letters and
   digits that mix both, or 20 or more that mix upper and lower case. A run is split at
-  `-`, `_` and `.`, so word paths such as `task-scheduler-read-2024` stay in full; a
+  `-`, `_` and `.`, so word paths such as `task-scheduler-read-2024` stay in full. A scope
+  URI on a recognised webhook route is reduced to its origin however its path is spelled:
+  any path on `hooks.slack.com`, `hooks.zapier.com`, `maker.ifttt.com`, `api.telegram.org`
+  or `webhook.site`, a `/webhooks/` path on Discord, any path on `*.webhook.office.com`, and a
+  `/webhook` path on Outlook. The same route written without a scheme is exported as `***`; a
   recognised credential assignment such as
   `token=...` or `api_key=...` is reduced by the standard redaction, and one in a
   known token format (a JWT or a prefix the [security model](security-model.md#known-false-positive-and-false-negative-classes)

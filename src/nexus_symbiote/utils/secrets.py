@@ -1134,9 +1134,14 @@ _SCHEMELESS_USERINFO = re.compile(r"//[^\s/?#@]*+@|[^\s/?#@:]++:[^\s/?#@]++@[^\s
 def redact_oauth_scope(value: str) -> str:
     """Show an OAuth scope (RFC 6749 section 3.3) unless it may contain a secret."""
     shown = _shown_scope(value)
-    # A token glued to a letter or digit, or user information in a URL without a scheme,
-    # passes the rules below, also in what remains of a scope they reduced in part.
-    if holds_token_shape(shown, require_sk_boundary=True) or _SCHEMELESS_USERINFO.search(shown):
+    # A token glued to a letter or digit, user information in a URL without a scheme, or a
+    # webhook route written without one passes the rules below, also in what remains of a
+    # scope they reduced in part.
+    if (
+        holds_token_shape(shown, require_sk_boundary=True)
+        or _SCHEMELESS_USERINFO.search(shown)
+        or ("://" not in shown and _webhook_route(shown))
+    ):
         return REDACTED
     return shown
 
@@ -1158,6 +1163,36 @@ def _secret_path(path: str) -> bool:
     return False
 
 
+# Webhook routes whose path is the credential however it is spelled: on these hosts any path,
+# and on these host suffixes a path holding the marker.
+_WEBHOOK_HOSTS = frozenset(
+    {"hooks.slack.com", "hooks.zapier.com", "maker.ifttt.com", "api.telegram.org", "webhook.site"}
+)
+_WEBHOOK_PATHS = (
+    ("discord.com", "/webhooks/"),
+    ("discordapp.com", "/webhooks/"),
+    ("webhook.office.com", "/"),
+    ("outlook.office.com", "/webhook"),
+    ("outlook.office365.com", "/webhook"),
+)
+
+
+def _webhook_route(text: str) -> bool:
+    """Whether ``text``, with or without a scheme, is a URL on a recognised webhook route."""
+    try:
+        parts = urlsplit(text if "://" in text else "//" + text)
+    except ValueError:
+        return False
+    host, path = (parts.hostname or "").lower(), parts.path.lower()
+    return path not in {"", "/"} and (
+        host in _WEBHOOK_HOSTS
+        or any(
+            (host == suffix or host.endswith("." + suffix)) and marker in path
+            for suffix, marker in _WEBHOOK_PATHS
+        )
+    )
+
+
 def _shown_scope(value: str) -> str:
     if len(value) > _MAX_OAUTH_SCOPE or _A2A_TOKEN_SHAPE.search(value):
         return REDACTED
@@ -1176,6 +1211,7 @@ def _shown_scope(value: str) -> str:
         and not any(char in "@?#" or char.isspace() for char in value)
         and redact_text(locator) == locator
         and not _secret_path(parsed.path)
+        and not _webhook_route(value)
     ):
         return value
     return redacted

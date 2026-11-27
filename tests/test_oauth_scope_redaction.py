@@ -175,3 +175,86 @@ def test_drift_output_withholds_a_webhook_secret_in_a_scope_uri(tmp_path: Path) 
     assert result.exit_code == 1, result.output
     assert '\\"https://hooks.slack.com\\"' in result.output
     assert WEBHOOK_SECRET not in result.output
+
+
+@pytest.mark.parametrize(
+    ("scope", "shown"),
+    [
+        ("https://hooks.slack.com/services/TEAM/BOT/onlywordshere", "https://hooks.slack.com"),
+        ("https://hooks.slack.com/workflows/T/A/123/abc", "https://hooks.slack.com"),
+        ("https://HOOKS.SLACK.COM:443/services/T/B/x", "https://hooks.slack.com:443"),
+        ("https://discord.com/api/webhooks/1/short", "https://discord.com"),
+        ("https://canary.discord.com/api/v10/webhooks/1/abc", "https://canary.discord.com"),
+        (
+            "https://contoso.webhook.office.com/webhookb2/a@b/IncomingWebhook/c/d",
+            "https://contoso.webhook.office.com",
+        ),
+        ("https://outlook.office.com/webhook/a/IncomingWebhook/b/c", "https://outlook.office.com"),
+        ("https://hooks.zapier.com/hooks/catch/123/abc/", "https://hooks.zapier.com"),
+        ("https://maker.ifttt.com/trigger/door/with/key/plainkey", "https://maker.ifttt.com"),
+        ("https://api.telegram.org/bot123:token/sendMessage", "https://api.telegram.org"),
+        ("hooks.slack.com/services/TEAM/BOT/onlywordshere", REDACTED),
+        ("discord.com/api/webhooks/1/short", REDACTED),
+    ],
+    ids=[
+        "slack-words",
+        "slack-workflow",
+        "slack-case-and-port",
+        "discord-short",
+        "discord-subdomain",
+        "teams",
+        "outlook",
+        "zapier",
+        "ifttt",
+        "telegram",
+        "slack-without-scheme",
+        "discord-without-scheme",
+    ],
+)
+def test_a_recognised_webhook_route_is_withheld_however_it_is_spelled(
+    scope: str, shown: str
+) -> None:
+    assert redact_oauth_scope(scope) == shown
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "https://hooks.slack.com",
+        "https://discord.com/api/oauth2/authorize",
+        "https://outlook.office.com/Mail.Read",
+        "https://www.googleapis.com/auth/chat.messages",
+        "hooks:read",
+        "webhooks.write",
+    ],
+)
+def test_ordinary_scopes_on_webhook_hosts_stay_in_full(scope: str) -> None:
+    assert redact_oauth_scope(scope) == scope
+
+
+def test_the_inventory_and_drift_output_withhold_a_webhook_route(tmp_path: Path) -> None:
+    secret = "only" + "words" + "here"
+    card = {
+        "name": "notifier",
+        "url": "https://agents.example.com",
+        "skills": [{"id": "notify", "name": "notify"}],
+        "securitySchemes": {"oauth": {"type": "oauth2"}},
+        "security": [{"oauth": [f"https://hooks.slack.com/services/T/B/{secret}"]}],
+    }
+    (tmp_path / ".well-known").mkdir()
+    (tmp_path / ".well-known" / "agent.json").write_text(json.dumps(card))
+    (server,) = [
+        c for c in A2AScanner().scan(tmp_path).components if isinstance(c, A2AServerComponent)
+    ]
+    assert server.capabilities is not None
+    assert server.capabilities.oauth_scopes == ["https://hooks.slack.com"]
+    assert secret not in server.model_dump_json()
+    old, new = tmp_path / "before.json", tmp_path / "after.json"
+    old.write_text(_inventory(["read:only"]))
+    new.write_text(_inventory(["read:only", f"hooks.slack.com/services/T/B/{secret}"]))
+    for report_format in ("text", "json", "markdown", "junit"):
+        result = CliRunner().invoke(
+            main, ["diff", str(old), str(new), "--report-format", report_format]
+        )
+        assert result.exit_code == 1, result.output
+        assert secret not in html.unescape(result.output.replace("\\", "")), report_format
