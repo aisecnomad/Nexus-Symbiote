@@ -1032,10 +1032,12 @@ class PythonReader:
             for flag in flags
         )
         for expression, embeds in found:
-            self._model_references(module, expression, embedding=embeds, remote=remote)
+            self._model_references(
+                module, expression, embedding=embeds, weights=weights, remote=remote
+            )
 
     def _model_references(
-        self, module: Module, expression: ast.expr, *, embedding: bool, remote: bool
+        self, module: Module, expression: ast.expr, *, embedding: bool, weights: bool, remote: bool
     ) -> None:
         """Record each identifier a model argument can hold, and account for what else
         it can hold."""
@@ -1059,6 +1061,7 @@ class PythonReader:
                     point[0],
                     method=METHOD,
                     embedding=embedding,
+                    weights=weights,
                     remote_code=remote,
                     environment=variables,
                 )

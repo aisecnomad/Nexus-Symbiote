@@ -58,6 +58,30 @@ _FILE_SUFFIXES = (
 _EMBEDDING = re.compile(
     r"(?i)(?:embed|bge-|e5-|gte-|minilm|mpnet|gecko|arctic-embed|voyage-|jina-|rerank)"
 )
+# The routing prefix a model router reads off an identifier, and its provider.
+ROUTES: dict[str, str] = {
+    "anthropic": "anthropic", "azure": "azure-openai", "azure_ai": "azure-ai",
+    "bedrock": "aws-bedrock", "bedrock_converse": "aws-bedrock", "cerebras": "cerebras",
+    "cohere": "cohere", "cohere_chat": "cohere", "deepseek": "deepseek", "fireworks": "fireworks",
+    "fireworks_ai": "fireworks", "gemini": "google", "google-gla": "google",
+    "google-vertex": "google-vertex-ai", "google_genai": "google",
+    "google_vertexai": "google-vertex-ai", "groq": "groq", "huggingface": "huggingface",
+    "mistral": "mistral", "mistralai": "mistral", "nvidia_nim": "nvidia", "ollama": "ollama",
+    "ollama_chat": "ollama", "openai": "openai", "openrouter": "openrouter",
+    "perplexity": "perplexity", "replicate": "replicate", "sagemaker": "aws-sagemaker",
+    "together": "together", "together_ai": "together", "vertex_ai": "google-vertex-ai",
+    "watsonx": "ibm-watsonx", "xai": "xai",
+}  # fmt: skip
+# Routing prefixes that are also the owner of weights on a model hub, with the names
+# that owner publishes there: such an identifier is the owner and the name together.
+_HUB_OWNED: dict[str, re.Pattern[str]] = {
+    "mistralai": re.compile(""),
+    "openai": re.compile(
+        r"(?i)(?:whisper-(?:tiny|base|small|medium|large)|clip|gpt2|gpt-oss|shap-e|jukebox)"
+    ),
+}
+# Providers that serve a model from weights on the machine, so no hosted service is named.
+LOCAL_PROVIDERS = frozenset({"huggingface", "ollama"})
 
 
 def unchanged_by_redaction(text: str) -> bool:
@@ -90,6 +114,31 @@ def placeholder(text: str) -> bool:
     return not text or text.lower() in _NOT_A_MODEL or local and not _ABSOLUTE.match(text)
 
 
+def split_route(literal: str, *, weights: bool = False) -> tuple[str, str | None]:
+    """The model identifier and the provider a routing prefix on ``literal`` names.
+
+    ``openai/gpt-4o`` and ``anthropic:claude-sonnet-4-5`` are a route and an
+    identifier. An identifier read by a library that loads weights, which
+    ``weights`` says, is never split: there the part before the slash is the owner.
+    """
+    if weights:
+        return literal, None
+    for separator in ("/", ":"):
+        prefix, found, rest = literal.partition(separator)
+        if not found or not rest:
+            continue
+        provider = ROUTES.get(prefix.lower())
+        if provider is None:
+            continue
+        owned = _HUB_OWNED.get(prefix.lower()) if separator == "/" else None
+        if owned is not None and owned.match(rest):
+            continue
+        if model_identifier(rest) is None:
+            continue
+        return rest, provider
+    return literal, None
+
+
 def model_kind(name: str, *, embedding: bool = False) -> str | None:
     if name.startswith("ft:"):
         return "fine-tuned"
@@ -113,7 +162,9 @@ def model_ref(name: str) -> str:
 class _Model:
     name: str
     locations: set[tuple[str, int]] = field(default_factory=set)
+    providers: set[str] = field(default_factory=set)
     kinds: set[str] = field(default_factory=set)
+    aliases: set[str] = field(default_factory=set)
     environment: set[str] = field(default_factory=set)
     methods: set[str] = field(default_factory=set)
     remote_code: bool = False
@@ -157,10 +208,14 @@ class Declarations:
         *,
         method: str,
         embedding: bool = False,
+        weights: bool = False,
         remote_code: bool = False,
         environment: Iterable[str] = (),
     ) -> str | None:
         """Record one reference to a model and return its component reference.
+
+        A provider is recorded when a routing prefix on the identifier names it; an
+        identifier a library that loads weights reads is never split.
         ``remote_code`` says the call that loads it lets the model run its own code, and
         ``environment`` names the variables that, when set, give a model in its place."""
         if not isinstance(literal, str):
@@ -170,9 +225,10 @@ class Declarations:
             if len(self._written) >= MAX_RECORDS:
                 self._written.clear()
             self._written[literal] = model_identifier(literal)
-        name = self._written[literal]
-        if name is None:
+        written = self._written[literal]
+        if written is None:
             return None
+        name, routed = split_route(written, weights=weights)
         record = self._models.get(name)
         if record is None:
             if len(self._models) >= MAX_RECORDS:
@@ -194,9 +250,13 @@ class Declarations:
             if len(record.locations) > MAX_EVIDENCE_LOCATIONS:
                 record.locations.discard(max(record.locations))
         record.methods.add(method)
+        if routed:
+            record.providers.add(routed)
         kind = model_kind(name, embedding=embedding)
         if kind:
             record.kinds.add(kind)
+        if written != name:
+            record.aliases.add(written)
         record.remote_code = record.remote_code or remote_code
         record.environment.update(filter(environment_name, environment))
         return model_ref(name)
@@ -224,12 +284,21 @@ class Declarations:
                 properties["references_unlisted"] = model.count - MAX_EVIDENCE_LOCATIONS
             if model.environment:
                 properties["environment_variables"] = sorted(model.environment)
+            if len(model.providers) > 1:
+                properties["providers"] = sorted(model.providers)
+            if len(model.aliases) > 1:
+                properties["requested_aliases"] = sorted(model.aliases)
+            provider = next(iter(model.providers)) if len(model.providers) == 1 else None
             kind = "fine-tuned" if "fine-tuned" in model.kinds else min(model.kinds, default=None)
+            if kind is None and provider is not None and provider not in LOCAL_PROVIDERS:
+                kind = "hosted"
             built.append(
                 ModelComponent(
                     bom_ref=model_ref(name),
                     name=name,
                     model_type=kind,
+                    provider=provider,
+                    requested_alias=next(iter(model.aliases)) if len(model.aliases) == 1 else None,
                     trust_tier=TrustTier.UNKNOWN,
                     assurance_level=AssuranceLevel.DECLARED,
                     # Code that lets a model run its own code says so; it is no bare name.

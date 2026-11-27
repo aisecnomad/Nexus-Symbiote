@@ -26,6 +26,7 @@ from nexus_symbiote.scanners.source_references import (
     Declarations,
     environment_name,
     model_identifier,
+    split_route,
 )
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.validators.completeness import CompletenessValidator
@@ -1494,64 +1495,6 @@ def test_an_unsafe_format_claim_on_a_reference_still_fails(tmp_path: Path):
     assert not report.is_valid
 
 
-@pytest.mark.parametrize(
-    ("source", "expected"),
-    [
-        (
-            'from langchain.chat_models import init_chat_model\ninit_chat_model("openai:gpt-4.1")\n',
-            {"openai:gpt-4.1"},
-        ),
-        (
-            'from sentence_transformers import SentenceTransformer\nSentenceTransformer("BAAI/bge-m3")\n',
-            {"BAAI/bge-m3"},
-        ),
-        (
-            'from transformers import AutoModel\nAutoModel.from_pretrained("openai/whisper-large-v3")\n',
-            {"openai/whisper-large-v3"},
-        ),
-        ('import dspy\ndspy.LM("anthropic/claude-sonnet-4-5")\n', {"anthropic/claude-sonnet-4-5"}),
-        (
-            'from agno.models.openai import OpenAIChat\nOpenAIChat(id="gpt-4.1-mini")\n',
-            {"gpt-4.1-mini"},
-        ),
-        (
-            'from langchain_huggingface import HuggingFaceEndpoint\nHuggingFaceEndpoint(repo_id="mistralai/Mistral-7B-Instruct-v0.3")\n',
-            {"mistralai/Mistral-7B-Instruct-v0.3"},
-        ),
-        (
-            'from huggingface_hub import hf_hub_download\nhf_hub_download(repo_id="acme/rules-dataset")\n',
-            set(),
-        ),
-        (
-            'from langchain.chat_models import init_chat_model\ninit_chat_model("ignored", model="gpt-4o")\n',
-            {"gpt-4o"},
-        ),
-        (
-            'import boto3\nboto3.client("bedrock-runtime").converse(modelId="anthropic.claude-3-5-haiku-20241022-v1:0")\n',
-            {"anthropic.claude-3-5-haiku-20241022-v1:0"},
-        ),
-        ('from crewai import LLM\nLLM(model="ollama/llama3.1:8b")\n', {"ollama/llama3.1:8b"}),
-    ],
-)
-def test_which_arguments_hold_a_model(tmp_path: Path, source: str, expected: set[str]):
-    result = scan(tmp_path, {"run.py": source})
-    # An identifier is recorded as written; no provider is read from it here.
-    assert set(models(result)) == expected
-    assert all(model.provider is None for model in models(result).values())
-
-
-def test_positional_models_of_common_entry_points_are_read(tmp_path: Path):
-    result = scan(
-        tmp_path,
-        {
-            "run.py": "import litellm\nimport ollama\nfrom pydantic_ai import Agent\n\n"
-            'Agent("openai:gpt-4o")\nlitellm.completion("gpt-4o-mini", [])\n'
-            'ollama.chat("llama3.2", messages=[])\n'
-        },
-    )
-    assert set(models(result)) == {"openai:gpt-4o", "gpt-4o-mini", "llama3.2"}
-
-
 def test_more_entry_points_name_their_models(tmp_path: Path):
     result = scan(
         tmp_path,
@@ -2367,3 +2310,120 @@ def test_a_default_in_one_file_does_not_stand_for_a_read_another_file_needs(tmp_
     assert list(result.surfaces_excluded) == [
         "b.py:3: model set only by environment variable CHAT_MODEL; not inventoried"
     ]
+
+
+# -- providers read off a routing prefix ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            'from langchain.chat_models import init_chat_model\ninit_chat_model("openai:gpt-4.1")\n',
+            {"gpt-4.1": "openai"},
+        ),
+        (
+            'from sentence_transformers import SentenceTransformer\nSentenceTransformer("BAAI/bge-m3")\n',
+            {"BAAI/bge-m3": None},
+        ),
+        (
+            'from transformers import AutoModel\nAutoModel.from_pretrained("openai/whisper-large-v3")\n',
+            {"openai/whisper-large-v3": None},
+        ),
+        (
+            'import dspy\ndspy.LM("anthropic/claude-sonnet-4-5")\n',
+            {"claude-sonnet-4-5": "anthropic"},
+        ),
+        (
+            'from agno.models.openai import OpenAIChat\nOpenAIChat(id="gpt-4.1-mini")\n',
+            {"gpt-4.1-mini": None},
+        ),
+        (
+            'from langchain_huggingface import HuggingFaceEndpoint\nHuggingFaceEndpoint(repo_id="mistralai/Mistral-7B-Instruct-v0.3")\n',
+            {"mistralai/Mistral-7B-Instruct-v0.3": None},
+        ),
+        (
+            'from huggingface_hub import hf_hub_download\nhf_hub_download(repo_id="acme/rules-dataset")\n',
+            {},
+        ),
+        (
+            'from langchain.chat_models import init_chat_model\ninit_chat_model("ignored", model="gpt-4o")\n',
+            {"gpt-4o": None},
+        ),
+        (
+            'import boto3\nboto3.client("bedrock-runtime").converse(modelId="anthropic.claude-3-5-haiku-20241022-v1:0")\n',
+            {"anthropic.claude-3-5-haiku-20241022-v1:0": None},
+        ),
+        ('from crewai import LLM\nLLM(model="ollama/llama3.1:8b")\n', {"llama3.1:8b": "ollama"}),
+    ],
+)
+def test_which_arguments_hold_a_model(tmp_path: Path, source: str, expected: dict[str, str | None]):
+    result = scan(tmp_path, {"run.py": source})
+    assert {name: model.provider for name, model in models(result).items()} == expected
+
+
+def test_a_routed_identifier_keeps_the_text_as_written(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "a.py": 'import litellm\nlitellm.completion(model="anthropic/claude-sonnet-4-5")\n',
+            "b.py": 'import litellm\nlitellm.completion(model="bedrock/claude-sonnet-4-5")\n'
+            'litellm.completion(model="ollama/llama3.2")\n',
+        },
+    )
+    found = models(result)
+    sonnet = found["claude-sonnet-4-5"]
+    assert sonnet.provider is None and sonnet.model_type is None
+    assert sonnet.properties["providers"] == ["anthropic", "aws-bedrock"]
+    assert sonnet.properties["requested_aliases"] == [
+        "anthropic/claude-sonnet-4-5",
+        "bedrock/claude-sonnet-4-5",
+    ]
+    assert sonnet.claims["source_reference"].evidence_refs == ["a.py:2", "b.py:2"]
+    local = found["llama3.2"]
+    # A runtime that serves weights on the machine is no hosted service.
+    assert (local.provider, local.model_type, local.requested_alias) == (
+        "ollama",
+        None,
+        "ollama/llama3.2",
+    )
+
+
+def test_positional_models_of_common_entry_points_are_read(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import litellm\nimport ollama\nfrom pydantic_ai import Agent\n\n"
+            'Agent("openai:gpt-4o")\nlitellm.completion("gpt-4o-mini", [])\n'
+            'ollama.chat("llama3.2", messages=[])\n'
+        },
+    )
+    found = models(result)
+    assert set(found) == {"gpt-4o", "gpt-4o-mini", "llama3.2"}
+    assert found["gpt-4o"].provider == "openai"
+
+
+@pytest.mark.parametrize(
+    ("literal", "weights", "expected"),
+    [
+        ("openai/gpt-4o", False, ("gpt-4o", "openai")),
+        ("anthropic:claude-sonnet-4-5", False, ("claude-sonnet-4-5", "anthropic")),
+        (
+            "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+            False,
+            ("anthropic.claude-3-haiku-20240307-v1:0", "aws-bedrock"),
+        ),
+        ("llama3.1:8b", False, ("llama3.1:8b", None)),
+        ("openai/", False, ("openai/", None)),
+        ("openai/x", False, ("openai/x", None)),
+        ("openai/whisper-large-v3", False, ("openai/whisper-large-v3", None)),
+        ("openai/gpt-4o", True, ("openai/gpt-4o", None)),
+        ("mistralai/Mistral-7B-Instruct-v0.3", False, ("mistralai/Mistral-7B-Instruct-v0.3", None)),
+        ("mistralai:mistral-large-latest", False, ("mistral-large-latest", "mistral")),
+        ("meta-llama/Llama-3.3-70B-Instruct", False, ("meta-llama/Llama-3.3-70B-Instruct", None)),
+    ],
+)
+def test_a_routing_prefix_is_split_from_the_identifier(
+    literal: str, weights: bool, expected: tuple[str, str | None]
+):
+    assert split_route(literal, weights=weights) == expected

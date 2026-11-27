@@ -58,7 +58,11 @@ Each model identifier becomes one `model` component for the project at `declared
 assurance. Its `source_reference` claim names the file and the line of the argument,
 up to 16 places, and `references_unlisted` counts the rest. The environment variables
 that may give a model in place of a value read are listed in `environment_variables`.
-The identifier is kept as written, routing prefix and all, and no provider is recorded.
+A routing prefix is read off the identifier: `anthropic/claude-sonnet-4-5` is the model
+`claude-sonnet-4-5` with provider `anthropic`, and the text as written is kept in
+`requested_alias`. An identifier a library that loads weights reads, such as
+`openai/whisper-large-v3`, is a hub owner and a name, never a route. No other provider
+is recorded.
 A call that may let the model run its own code, through any `trust_remote_code` but a
 false literal, records it. A relative path or a weight file names a file in the
 project, which the model collector reads.

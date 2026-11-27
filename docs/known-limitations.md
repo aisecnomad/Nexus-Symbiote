@@ -55,7 +55,7 @@ Bypassing a documented control in a way not described here warrants a [private v
 - **Flow-insensitive names.** Every binding of a name in a scope counts, whichever runs first, and a name set through `globals()`, `setattr` or another module's attribute assignment is not seen. A dict is read only where the file uses its name for nothing but spreading it into a call.
 - **Known SDKs and unknown callees.** A model keyword is read on a call the collector traces to an SDK in its table, and on a call of an object it cannot tell that is named as SDK calls are; there, a keyword of the same name that holds something else is recorded as a model. A wrapper library the table does not list, and a method of an unknown object named otherwise, are not read.
 - **What is skipped.** Directories named `tests`, `test`, `__tests__`, `dist`, `build`, `docs`, `benchmarks` and `examples`, and test modules. Source in other languages, notebooks and configuration files are not read by this collector, nor is an SDK loaded through `importlib` or `__import__`.
-- **Providers.** No provider is recorded. An identifier such as `anthropic/claude-sonnet-4-5` is kept as written, routing prefix and all, and the client class, a base URL and a framework's default service are not read.
+- **Providers.** A provider is recorded only when a routing prefix on the identifier names one. The client class, a base URL and a framework's default service are not read.
 - **Two records for one model.** A model that a ShadowScan report cites and the collector also reads is two components, one imported and one declared.
 
 ## ShadowScan
