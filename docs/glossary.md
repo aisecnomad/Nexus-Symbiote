@@ -52,7 +52,7 @@ that anything about the extension was verified.
 One module that reads one class of declarations from a checkout. The documentation
 says collector; the code and the CLI say scanner (`--scanner`, `scanners/`,
 `scanner_status`, "Running mcp scanner..."). There are eight: `mcp`, `model`,
-`prompt`, `rag`, `registry`, `a2a`, `ide_agents` and `shadowscan`.
+`prompt`, `rag`, `registry`, `a2a`, `ide_agents`, `agents` and `shadowscan`.
 
 ### Coverage gap
 

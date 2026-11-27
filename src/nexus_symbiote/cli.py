@@ -68,7 +68,7 @@ if TYPE_CHECKING:
     from nexus_symbiote.utils.crypto import SigstoreArtifactPolicy
 
 DEBUG_KEY = "nexus_symbiote.debug"
-BUILTIN_SCANNERS = "mcp, model, prompt, rag, registry, a2a, ide_agents, shadowscan"
+BUILTIN_SCANNERS = "mcp, model, prompt, rag, registry, a2a, ide_agents, agents, shadowscan"
 # Gate reports name the agent manifest and the graph check like collectors.
 MANIFEST = "agent.yaml"
 
@@ -550,6 +550,7 @@ def _signer_policies(path: Path | None, project: Path | None) -> list[SigstoreAr
 def _get_scanners() -> dict[str, type]:
     if not SCANNER_REGISTRY:
         from nexus_symbiote.scanners.a2a import A2AScanner
+        from nexus_symbiote.scanners.agents import AgentScanner
         from nexus_symbiote.scanners.ide_agents import IDEAgentScanner
         from nexus_symbiote.scanners.mcp import MCPScanner
         from nexus_symbiote.scanners.model import ModelScanner
@@ -568,6 +569,7 @@ def _get_scanners() -> dict[str, type]:
                 "registry": RegistryScanner,
                 "a2a": A2AScanner,
                 "ide_agents": IDEAgentScanner,
+                "agents": AgentScanner,
             }
         )
     return SCANNER_REGISTRY

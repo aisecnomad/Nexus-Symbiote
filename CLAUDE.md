@@ -7,7 +7,7 @@ Agent Bill of Materials (AgentBOM) generator and validator for AI agent supply c
 ```
 src/nexus_symbiote/
   core/        — Domain models (Pydantic v2), evidence/authority records, enums, AIBOM container, RFC 8785 JCS hashing, inventory content digest
-  scanners/    — Component discovery (MCP, MCP launch/live wire, model weights, prompts, RAG, registry, A2A, IDE agents, ShadowScan reports)
+  scanners/    — Component discovery (MCP, MCP launch/live wire, model weights, prompts, RAG, registry, A2A, IDE agents, framework agents in source, ShadowScan reports)
   generators/  — Exports & PURL projection: native JSON, CycloneDX 1.7, SPDX 3.0.1, SARIF 2.1.0, VEX
   validators/  — Completeness, integrity, and risk scoring
   diff/        — AIBOM version comparison and the snapshot alert gate

@@ -1112,10 +1112,12 @@ def _validate(bom, project):
 def test_project_validation_reproduces_the_cited_models(tmp_path):
     project = _project(tmp_path, _report(_evidence("app.py:3", MODEL)))
     bom = _merged(tmp_path, "bom", project)
+    # The agents collector may also name the model from the same source line; the cited
+    # model itself is projected once.
     assert [
         c.name
         for c in AIBOM.model_validate(json.loads(bom.read_text())).components
-        if c.name == MODEL
+        if c.name == MODEL and c.bom_ref.startswith(MODEL_REF_PREFIX)
     ] == [MODEL]
     unchanged = _validate(bom, project).output
     assert "discovery report" not in unchanged

@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 SCANNERS = frozenset(
-    {"shadowscan", "mcp", "model", "prompt", "rag", "registry", "a2a", "ide_agents"}
+    {"shadowscan", "mcp", "model", "prompt", "rag", "registry", "a2a", "ide_agents", "agents"}
 )
 FORMATS = frozenset({"json", "cyclonedx", "spdx", "sarif"})
 SIGSTORE_MODULES = (

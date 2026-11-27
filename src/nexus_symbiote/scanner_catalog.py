@@ -5,7 +5,7 @@ Keep this set synchronized with the CLI registry and its regression test.
 """
 
 BUILTIN_SCANNER_NAMES = frozenset(
-    {"mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents"}
+    {"mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents", "agents"}
 )
 
 INSTRUCTION_DIRECTORIES: dict[str, str] = {

@@ -19,6 +19,7 @@ import pytest
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.enums import SerializationSafety
 from nexus_symbiote.core.models import CompletenessClaim, ModelComponent
+from nexus_symbiote.scanner_catalog import BUILTIN_SCANNER_NAMES
 from nexus_symbiote.scanners.model import (
     MAX_MODEL_HEADER_BYTES,
     MAX_PICKLE_INSPECTION_BYTES,
@@ -187,7 +188,7 @@ def _severities(component: ModelComponent) -> set[tuple[str, str]]:
 
 def _gate(components: list[ModelComponent]) -> tuple[bool, set[tuple[str, str]]]:
     bom = AIBOM(components=list(components))
-    collectors = ["mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents"]
+    collectors = sorted(BUILTIN_SCANNER_NAMES)
     bom.metadata.completeness = CompletenessClaim(
         scope="repository",
         surfaces_scanned=["all"],

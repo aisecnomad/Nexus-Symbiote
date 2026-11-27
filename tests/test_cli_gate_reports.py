@@ -51,14 +51,14 @@ def test_a_scoped_scan_names_the_collectors_it_left_out(tmp_path):
     assert result.exit_code == 1
     lines = _lines(result.stderr)
     assert "  - collection coverage is unknown or incomplete" in lines
-    assert any(line.startswith("  - not collected: a2a, ide_agents, mcp") for line in lines)
+    assert any(line.startswith("  - not collected: a2a, agents, ide_agents, mcp") for line in lines)
     # Standard output carries only the inventory.
     assert json.loads(result.stdout)["components"]
 
 
 def test_a_symlink_names_its_collectors_and_failure_once(tmp_path):
     # Every walking collector meets the symlink and records the same failure; the gate
-    # lists it once, naming all six, in alphabetical rather than run order.
+    # lists it once, naming all seven, in alphabetical rather than run order.
     project = _agent(tmp_path / "p")
     (project / "AGENTS.md").symlink_to(project / "CLAUDE.md")
     result = CliRunner().invoke(main, ["scan", str(project), "--no-project-policy", "--check"])
@@ -66,7 +66,7 @@ def test_a_symlink_names_its_collectors_and_failure_once(tmp_path):
     failures = [line for line in _lines(result.stderr) if line.startswith("  - collection: ")]
     assert failures == [
         "  - collection: AGENTS.md: symlink target is absolute "
-        "(from a2a, ide_agents, mcp, model, prompt, rag)"
+        "(from a2a, agents, ide_agents, mcp, model, prompt, rag)"
     ]
 
 

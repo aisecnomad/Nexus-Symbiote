@@ -297,6 +297,7 @@ class CompletenessValidator:
 
     def _validate_claims(self, bom: AIBOM) -> CompletenessReport:
         from nexus_symbiote.graph import validate_graph
+        from nexus_symbiote.scanners.agents import REFERENCE_COLLECTION_MODE
         from nexus_symbiote.scanners.prompt import withholds_content_hash
 
         report = CompletenessReport()
@@ -330,9 +331,12 @@ class CompletenessValidator:
                     # A prompt file that is not an instruction file, such as an import
                     # that is not Markdown, is bound only by the operator key; integrity
                     # verifies that binding or counts it as unbound.
-                    if not (hasattr(c, "definition_hash") and c.definition_hash) and not (
-                        isinstance(c, PromptComponent) and withholds_content_hash(c)
+                    if (
+                        not (hasattr(c, "definition_hash") and c.definition_hash)
+                        and not (isinstance(c, PromptComponent) and withholds_content_hash(c))
+                        and c.properties.get("collection_mode") != REFERENCE_COLLECTION_MODE
                     ):
+                        # A model named by an identifier in source has no artifact to hash.
                         report.add_issue(
                             c.bom_ref, f"Component '{c.name}' has no integrity hash.", "warning"
                         )

@@ -43,7 +43,7 @@ A checkout that requests a stricter assurance level and a higher risk threshold 
 ```yaml
 version: "1.0"
 scan:
-  scanners: ["mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents"]
+  scanners: ["mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents", "agents"]
   exclude_paths: ["node_modules", ".git", "__pycache__", ".venv"]
   failure_mode: "error"
 risk:

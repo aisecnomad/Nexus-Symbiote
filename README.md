@@ -140,9 +140,9 @@ Every control has explicit bounds: see [known limitations](https://github.com/ai
 
 ```text
              ┌──────────────────────────────────────────────┐
-  agent      │ 8 static collectors (nothing is executed)    │
+  agent      │ 9 static collectors (nothing is executed)    │
   project ──>│ mcp · model · prompt · rag · registry        │
- (read-only) │ a2a · ide_agents · shadowscan                │
+ (read-only) │ a2a · ide_agents · agents · shadowscan                │
              └──────────────────────┬───────────────────────┘
                                     v
              ┌──────────────────────────────────────────────┐
@@ -172,6 +172,7 @@ Every control has explicit bounds: see [known limitations](https://github.com/ai
 | `registry` | Packages & images | [AI package catalog](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/registry-collector.md#ai-package-catalog) pins, lockfile integrity, container digests, index redirects |
 | `a2a` | A2A agent cards | Endpoints, security schemes, OAuth scopes, card signature status |
 | `ide_agents` | IDE agent settings | Permission modes, blanket grants, hook commands, settings digests |
+| `agents` | Agents built in source | Framework agents (LangGraph, CrewAI, OpenAI Agents, Claude Agent SDK, Google ADK, Pydantic AI, Vercel AI SDK, n8n) with their models, tools and capabilities, credential names, datasets |
 | `shadowscan` | [ShadowScan](https://github.com/Hunzee-VC/Nexus-ShadowScan) reports | Imported discovery claims kept separate from local evidence |
 
 Nothing read is executed, imported, or loaded. Omitting a collector via `--scanner` records it as `unknown`, never clean. Full path coverage: [collector reference](https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/collectors.md).

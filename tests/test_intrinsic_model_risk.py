@@ -7,13 +7,14 @@ import pytest
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.models import CompletenessClaim, ModelComponent, RiskAssessment
+from nexus_symbiote.scanner_catalog import BUILTIN_SCANNER_NAMES
 from nexus_symbiote.validators.risk import RiskScorer
 
 
 def imported_model(**fields) -> AIBOM:
     component = ModelComponent(bom_ref="model:imported", name="imported", **fields)
     bom = AIBOM(components=[component])
-    collectors = ["mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents"]
+    collectors = sorted(BUILTIN_SCANNER_NAMES)
     bom.metadata.completeness = CompletenessClaim(
         scope="repository",
         surfaces_scanned=["all"],

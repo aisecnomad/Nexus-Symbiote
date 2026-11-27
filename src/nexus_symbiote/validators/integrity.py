@@ -242,6 +242,13 @@ class _ArtifactDigests:
         return content
 
 
+def is_model_reference(comp: ModelComponent) -> bool:
+    """Whether a model component names an identifier in source rather than a local artifact."""
+    from nexus_symbiote.scanners.agents import REFERENCE_COLLECTION_MODE
+
+    return comp.properties.get("collection_mode") == REFERENCE_COLLECTION_MODE
+
+
 def _locate_artifact(project_root: Path, source_path: str) -> Path | str:
     """Return the in-root artifact a component names, or the fixed reason it is refused.
 
@@ -461,6 +468,10 @@ class IntegrityValidator:
         component the budget cannot cover is unknown, not skipped silently. A path the
         readers refuse costs nothing here; the checks report why.
         """
+        if is_model_reference(comp):
+            # An identifier passed to an SDK names a hosted or runtime-fetched model; the
+            # inventory holds no artifact of it, so there is nothing to digest or verify.
+            return False
         if project_root is None or not comp.source_path:
             return True
         located = _locate_artifact(project_root, comp.source_path)

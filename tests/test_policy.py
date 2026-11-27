@@ -71,7 +71,7 @@ class TestLoadPolicy:
         (tmp_path / ".nexus-symbiote.yaml").write_text('version: "1.0"\n')
         policy = load_policy(tmp_path)
         assert policy is not None
-        assert len(policy.scan.scanners) == 8
+        assert len(policy.scan.scanners) == 9
         assert policy.risk.fail_threshold == 50.0
 
 
@@ -89,6 +89,7 @@ class TestPolicyModel:
             "shadowscan",
             "a2a",
             "ide_agents",
+            "agents",
         ]
 
     def test_custom_risk_config(self) -> None:

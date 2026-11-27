@@ -72,6 +72,7 @@ Every gate prints each of its failure reasons. How many findings the console lis
 | `registry` | Supported | Root dependency manifests and lockfiles, pinned container digests and index redirects |
 | `a2a` | Supported | Static A2A agent cards, client configurations and SDK references |
 | `ide_agents` | Supported | Coding-agent permissions, settings, hooks and credential helpers read as data |
+| `agents` | Experimental | Framework agents, the models and tools they bind, credential names and datasets declared in Python, TypeScript and n8n sources; literal-only, never executes or imports what it reads |
 | `shadowscan` | Supported | Imports producer-verified Nexus-ShadowScan discovery reports as `declared` claims |
 
 ### CLI commands

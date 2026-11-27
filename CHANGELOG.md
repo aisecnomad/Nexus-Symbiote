@@ -4,6 +4,10 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Added
+
+- **`agents` collector:** framework agents declared in Python (LangGraph, CrewAI, OpenAI Agents SDK, Claude Agent SDK, Google ADK, Pydantic AI, AutoGen, smolagents), TypeScript/JavaScript (Vercel AI SDK, provider SDKs) and n8n workflow exports become `agent` components with `uses-model` and `invokes` edges to the models and tools they bind; tool bodies are classified into capabilities and side-effect profiles, with `capability_scope` findings for shell, caller-supplied SQL and payment tools; model identifiers passed to a known AI SDK, Hugging Face ids, Bedrock ids, LiteLLM routes, Ollama Modelfiles and Codex/Continue settings become `model` components; `load_dataset` calls become `data-source` components; environment variable names an agent reads are recorded (never values). Adding a collector changes the minimum evidence for a complete scan: re-collect baselines.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

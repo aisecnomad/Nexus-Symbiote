@@ -1,4 +1,4 @@
-"""One cause met by six collectors is reported once, while the inventory keeps six records.
+"""One cause met by seven collectors is reported once, while the inventory keeps seven records.
 
 Every walking collector records the same out-of-root symlink or depth failure, and each
 is recorded as not complete. The inventory's records are a contract and stay as they
@@ -37,10 +37,10 @@ from nexus_symbiote.scanner_catalog import BUILTIN_SCANNER_NAMES
 from nexus_symbiote.utils.confined import ConfinedCollection
 
 ROOT = Path(__file__).resolve().parents[1]
-WALKERS = ("a2a", "ide_agents", "mcp", "model", "prompt", "rag")
+WALKERS = ("a2a", "agents", "ide_agents", "mcp", "model", "prompt", "rag")
 ESCAPE = "escape: symlink target is absolute"
 GROUPED_SCAN = f"  - collection: {ESCAPE} (from {', '.join(WALKERS)})"
-GROUPED_RISK = f"  - collection: {ESCAPE} (recorded 6 times)"
+GROUPED_RISK = f"  - collection: {ESCAPE} (recorded 7 times)"
 COVERAGE = f"Scanner coverage is failed for {', '.join(WALKERS)}."
 
 
@@ -66,13 +66,13 @@ def _scan(project: Path, output: Path) -> None:
     assert sum(line.startswith("  - collection: ") for line in _lines(result.stderr)) == 1
 
 
-def test_one_escaping_symlink_is_one_line_in_each_report_and_six_records(tmp_path):
+def test_one_escaping_symlink_is_one_line_in_each_report_and_seven_records(tmp_path):
     project = _agent(tmp_path / "p", escaping=True)
     output = tmp_path / "bom.json"
     _scan(project, output)
     claim = AIBOM.load(output).metadata.completeness
     assert claim is not None
-    assert claim.scan_failures == [ESCAPE] * 6
+    assert claim.scan_failures == [ESCAPE] * 7
     assert {name for name, state in claim.scanner_status.items() if state == "failed"} == set(
         WALKERS
     )
@@ -86,11 +86,11 @@ def test_one_escaping_symlink_is_one_line_in_each_report_and_six_records(tmp_pat
     assert sum("Scanner coverage is" in line for line in lines) == 1
     risk_json = runner.invoke(main, ["risk", str(output), "--json-output"])
     gaps = json.loads(risk_json.stdout)["coverage_gaps"]
-    assert gaps.count(f"{ESCAPE} (recorded 6 times)") == 1
+    assert gaps.count(f"{ESCAPE} (recorded 7 times)") == 1
     assert [gap for gap in gaps if gap.startswith("Scanner coverage is")] == [COVERAGE]
     validated = runner.invoke(main, ["validate", str(output)])
     assert validated.exit_code == 1
-    assert _lines(validated.stdout).count(f"  ERROR [collection] {ESCAPE} (recorded 6 times)") == 1
+    assert _lines(validated.stdout).count(f"  ERROR [collection] {ESCAPE} (recorded 7 times)") == 1
     assert _lines(validated.stdout).count(f"  ERROR [coverage] {COVERAGE}") == 1
     validated_json = runner.invoke(main, ["validate", str(output), "--json-output"])
     issues = json.loads(validated_json.stdout)["completeness"]["issues"]
@@ -99,7 +99,7 @@ def test_one_escaping_symlink_is_one_line_in_each_report_and_six_records(tmp_pat
     assert [issue for issue in issues if ESCAPE in issue["description"]] == [
         {
             "surface": "collection",
-            "description": f"{ESCAPE} (recorded 6 times)",
+            "description": f"{ESCAPE} (recorded 7 times)",
             "severity": "error",
         }
     ]
@@ -159,7 +159,7 @@ def test_the_action_log_relays_the_grouped_scan_line(tmp_path, capsys):
     log = _action_log(tmp_path, workspace, capsys)
     relayed = [line for line in _lines(log) if "collection: " in line and ESCAPE in line]
     assert len(relayed) == 1 and relayed[0].endswith(GROUPED_SCAN)
-    assert "Collection failed: 1 distinct collection failure (6 records) was recorded" in log
+    assert "Collection failed: 1 distinct collection failure (7 records) was recorded" in log
 
 
 def test_the_action_summary_omits_the_record_count_when_each_failure_is_recorded_once(
@@ -222,9 +222,9 @@ def test_risk_report_drops_the_coverage_gap_that_restates_a_grouped_failure():
         "passed": False,
         "overall_score": 0.0,
         "gate_reasons": ["collection coverage is unknown or incomplete"],
-        "coverage_gaps": [f"{ESCAPE} (recorded 6 times)", COVERAGE],
+        "coverage_gaps": [f"{ESCAPE} (recorded 7 times)", COVERAGE],
     }
-    lines = [text for text, _ in risk_report_lines(document, failures=[ESCAPE] * 6)]
+    lines = [text for text, _ in risk_report_lines(document, failures=[ESCAPE] * 7)]
     assert lines.count(GROUPED_RISK) == 1
     assert lines.count(f"  - coverage gap: {COVERAGE}") == 1
     assert sum(ESCAPE in line for line in lines) == 1
