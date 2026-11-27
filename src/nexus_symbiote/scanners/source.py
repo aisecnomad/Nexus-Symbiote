@@ -99,12 +99,9 @@ class SourceScanner(Scanner):
         self, root: Path, selected: list[Path], result: ScanResult, python: PythonReader
     ) -> None:
         """Hand each selected file that names an SDK to the reader, within the source budget.
-
-        Files are read apart from the collection, whose failures are not kept. A file
-        that cannot be opened, read or decoded as Python decodes it, a link to a file
-        the collector does not read, and a file that names an SDK and is too large to
-        parse are each a named gap.
-        """
+        Files are read apart from the collection, whose failures are not kept: a file that
+        cannot be opened, read or decoded as Python decodes it, a link to a file the collector
+        does not read and one that names an SDK and is too large to parse are each a gap."""
         budget = SourceBudget("source declarations", result)
         syntax = limits.current().syntax_bytes
         with ConfinedCollection(
