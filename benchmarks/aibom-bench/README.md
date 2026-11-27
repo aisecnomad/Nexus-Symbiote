@@ -18,3 +18,16 @@ agent components, with the tool's own safety as a scored dimension.
 | `results/` | Raw outputs per tool and mode (traces omitted), plus `scores.json` |
 
 See [SPEC.md](SPEC.md#running-the-benchmark) for how to run it, and [ROADMAP.md](../../ROADMAP.md) for how benchmark gaps feed into the release train.
+
+## Offline advisory acceptance
+
+With `nexus-symbiote` installed, replay the companion advisory check from this directory.
+
+```bash
+result_parent=$(mktemp -d)
+python replay_advisories.py --out "$result_parent/advisories"
+```
+
+The check scans synthetic PyPI and npm manifests and runs the advisory CLI against an operator-side OSV bundle. It expects two matches and a failing gate for the affected pins, zero matches and a passing gate for the fixed pins, and incomplete coverage for a floating PyPI version. Each report must bind both the scanned inventory and the advisory bundle by digest. The output includes the fixture inputs, individual reports, and `summary.json`.
+
+The fixture packages and CVE identifiers are synthetic. This check supplements the leaderboard's existing criteria. Set `--operator-dir` when the host's default temporary directory would put the operator feed inside a repository enclosing the output directory.
