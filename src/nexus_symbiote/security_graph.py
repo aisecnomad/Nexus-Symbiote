@@ -368,6 +368,16 @@ def _credential_names_for_component(component: AnyComponent) -> set[str]:
     return names
 
 
+def _reference_evidence(
+    component: AnyComponent, field_name: str, fallback_locator: str | None
+) -> tuple[str, str | None]:
+    """Derive per-hop assurance from relationship evidence, never component identity."""
+    claim = component.claims.get(field_name)
+    if claim is not None:
+        return claim.assurance.value, claim.locator or fallback_locator
+    return AssuranceLevel.DECLARED.value, fallback_locator
+
+
 def _build_evidence_graph(
     bom: AIBOM, nodes: Mapping[str, AnyComponent]
 ) -> tuple[dict[str, list[ChainHop]], dict[str, list[ChainHop]], int]:
@@ -408,19 +418,21 @@ def _build_evidence_graph(
             dst = nodes.get(target_ref)
             if dst is None:
                 continue
+            ref_assurance, ref_locator = _reference_evidence(comp, field_name, src_loc)
             register(
                 ChainHop(
                     source_ref=comp.bom_ref,
                     target_ref=target_ref,
                     relationship=field_name,
-                    assurance=comp.assurance_level.value,
+                    assurance=ref_assurance,
                     evidence_method="component-reference",
-                    source_locator=src_loc,
+                    source_locator=ref_locator,
                     target_locator=_component_locator(dst),
                 )
             )
         upstreams = comp.properties.get("upstream_server_refs")
         if isinstance(upstreams, list):
+            ref_assurance, ref_locator = _reference_evidence(comp, "upstream_server_refs", src_loc)
             for target_ref in upstreams:
                 if isinstance(target_ref, str) and target_ref in nodes:
                     register(
@@ -428,9 +440,9 @@ def _build_evidence_graph(
                             source_ref=comp.bom_ref,
                             target_ref=target_ref,
                             relationship="proxies-to",
-                            assurance=comp.assurance_level.value,
+                            assurance=ref_assurance,
                             evidence_method="mcp-gateway-upstream",
-                            source_locator=src_loc,
+                            source_locator=ref_locator,
                             target_locator=_component_locator(nodes[target_ref]),
                         )
                     )
@@ -713,7 +725,7 @@ def build_security_graph(
                 relationship="affects",
                 assurance="reported"
                 if trigger_kind == "advisory"
-                else subject.assurance_level.value,
+                else AssuranceLevel.DECLARED.value,
                 evidence_method=method,
                 target_locator=_component_locator(subject),
             )

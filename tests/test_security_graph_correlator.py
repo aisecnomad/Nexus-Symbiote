@@ -797,3 +797,124 @@ def test_subject_work_is_shared_and_traversal_limits_are_reported(monkeypatch) -
         assert partial.chains[0].kev
         assert any("Traversal incomplete" in note for note in partial.limitations)
         assert "Partial view" in render_security_graph_mermaid(partial)
+
+
+def test_component_identity_assurance_does_not_promote_static_reference_hops() -> None:
+    from nexus_symbiote.core.models import ClaimEvidence
+
+    pkg = RegistryEntryComponent(
+        bom_ref="pkg:npm/observed-pkg@1.0.0",
+        name="observed-pkg",
+        version="1.0.0",
+        registry_type="npm",
+        assurance_level=AssuranceLevel.OBSERVED,
+        source_path="package-lock.json",
+        properties={"advisories": [{"id": "CVE-2026-4242", "severity": "high"}]},
+    )
+    server = MCPServerComponent(
+        bom_ref="mcp:server:obs",
+        name="obs-server",
+        command="npx",
+        args=["observed-pkg@1.0.0"],
+        assurance_level=AssuranceLevel.OBSERVED,
+        source_path=".mcp.json",
+        claims={
+            "identity": ClaimEvidence(
+                assurance=AssuranceLevel.OBSERVED,
+                method="file-digest",
+                scope="repository",
+                locator=".mcp.json",
+            )
+        },
+        properties={"upstream_server_refs": ["mcp:server:upstream"]},
+    )
+    upstream = MCPServerComponent(
+        bom_ref="mcp:server:upstream",
+        name="upstream-server",
+        command="npx",
+        args=["upstream@1.0.0"],
+        assurance_level=AssuranceLevel.OBSERVED,
+        source_path=".mcp.json",
+    )
+    tool = ToolComponent(
+        bom_ref="tool:obs:run",
+        name="run",
+        mcp_server_ref="mcp:server:obs",
+        assurance_level=AssuranceLevel.OBSERVED,
+        source_path=".mcp.json",
+        claims={
+            "tool_definition": ClaimEvidence(
+                assurance=AssuranceLevel.OBSERVED,
+                method="descriptor-digest",
+                scope="repository",
+                locator=".mcp.json",
+            )
+        },
+        risks=[
+            RiskAssessment(
+                severity=RiskSeverity.HIGH,
+                category="tool_description_poisoning",
+                detail="Hidden directive.",
+            )
+        ],
+    )
+    sink = DataSourceComponent(
+        bom_ref="data:obs-sink",
+        name="obs-sink",
+        assurance_level=AssuranceLevel.OBSERVED,
+        source_path="rag.yaml",
+    )
+    agent = AgentComponent(
+        bom_ref="agent:obs-agent",
+        name="obs-agent",
+        assurance_level=AssuranceLevel.OBSERVED,
+        tool_refs=["mcp:server:obs", "tool:obs:run"],
+        data_refs=["data:obs-sink"],
+        source_path="agent.yaml",
+        claims={
+            "identity": ClaimEvidence(
+                assurance=AssuranceLevel.OBSERVED,
+                method="file-digest",
+                scope="repository",
+                locator="agent.yaml",
+            ),
+            "data_refs": ClaimEvidence(
+                assurance=AssuranceLevel.OBSERVED,
+                method="relationship-evidence",
+                scope="deployment",
+                locator="trace.json",
+            ),
+        },
+    )
+    bom = AIBOM(components=[pkg, server, upstream, tool, sink, agent])
+    bom.add_dependency(
+        DependencyEdge(
+            source_ref="mcp:server:obs",
+            target_ref="pkg:npm/observed-pkg@1.0.0",
+            relationship="registered-as",
+            assurance_level="observed",
+        )
+    )
+
+    report = build_security_graph(bom)
+    adv_chain = next(c for c in report.chains if c.trigger_id == "CVE-2026-4242")
+    by_method = {(h.evidence_method, h.relationship): h for h in adv_chain.hops}
+    # Explicit DependencyEdge relationship assurance is preserved.
+    assert by_method[("bom-dependency-edge", "reaches-via:registered-as")].assurance == "observed"
+    # Static component-reference hop (tool_refs without a relationship claim) MUST stay declared
+    # even though agent.assurance_level is OBSERVED.
+    assert by_method[("component-reference", "reaches-via:tool_refs")].assurance == "declared"
+    # Field-specific relationship claim on data_refs IS honored with its own locator.
+    data_hop = by_method[("component-reference", "data_refs")]
+    assert data_hop.assurance == "observed"
+    assert data_hop.source_locator == "trace.json"
+
+    # Finding trigger hop on an observed-identity tool stays declared, and static mcp_server_ref
+    # / upstream_server_refs stay declared without relationship-specific claims.
+    finding_chain = next(c for c in report.chains if c.trigger_kind == "finding")
+    assert finding_chain.hops[0].assurance == "declared"
+    for hop in finding_chain.hops:
+        if hop.evidence_method in ("component-reference", "mcp-gateway-upstream") and (
+            hop.relationship != "data_refs"
+        ):
+            assert hop.assurance == "declared"
