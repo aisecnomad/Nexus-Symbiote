@@ -655,6 +655,33 @@ def test_security_graph_audit_regressions_kev_truncation_escaping_and_epss_zero(
     assert "<img" not in md
 
 
+def test_markdown_cells_keep_supplied_link_and_image_syntax_inert() -> None:
+    image = "![x](https://beacon.example.invalid/p.png)"
+    smuggled = "\\![y](https://beacon.example.invalid/q.png)"
+    bom = AIBOM()
+    bom.components.append(
+        DataSourceComponent(
+            name="docs",
+            bom_ref="data:[docs](https://example.invalid/)",
+            properties={
+                "advisories": [
+                    {"id": image, "severity": "high"},
+                    {"id": smuggled, "severity": "high"},
+                ]
+            },
+        )
+    )
+    md = render_security_graph_markdown(build_security_graph(bom))
+    assert "| !\\[x\\](https://beacon.example.invalid/p.png) |" in md
+    assert "| \\\\!\\[y\\](https://beacon.example.invalid/q.png) |" in md
+    assert "| data:\\[docs\\](https://example.invalid/) |" in md
+    for line in md.splitlines():
+        for index, char in enumerate(line):
+            if char in "[]":
+                escapes = len(line[:index]) - len(line[:index].rstrip("\\"))
+                assert escapes % 2 == 1, line
+
+
 def test_component_scoping_precedes_global_limit_and_counts_scoped_omissions(
     tmp_path: Path,
 ) -> None:

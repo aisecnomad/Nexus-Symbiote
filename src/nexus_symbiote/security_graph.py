@@ -820,7 +820,12 @@ def _mermaid_label(raw: str) -> str:
 
 
 def _md_cell(raw: str) -> str:
-    return neutralize(raw).replace("|", "\\|").replace("<", "&lt;").replace(">", "&gt;")
+    # Escaping brackets keeps supplied text from forming a link or a remote image, and
+    # escaping backslashes first keeps it from cancelling those escapes.
+    text = neutralize(raw)
+    for char in "\\[]|":
+        text = text.replace(char, "\\" + char)
+    return text.replace("<", "&lt;").replace(">", "&gt;")
 
 
 def render_security_graph_mermaid(report: SecurityGraphReport) -> str:
