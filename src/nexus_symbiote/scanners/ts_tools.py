@@ -28,6 +28,7 @@ isolated in a separate process.
 
 from __future__ import annotations
 
+import bisect
 import codecs
 import re
 import sys
@@ -1387,6 +1388,8 @@ def _collect_source(
         resolver.bind(scope, receiver, (server, node.end_byte))
         servers[node.id] = (server, node.end_byte)
     components: list[MCPServerComponent | ToolComponent] = [s for s, _ in servers.values()]
+    handlers: list[tuple[ToolComponent, Node]] = []
+    spans: list[tuple[int, int]] = []
     scalar_literals = frozenset(
         {"number", "string", "template_string", "true", "false", "null", "undefined", "regex"}
     )
@@ -1528,21 +1531,12 @@ def _collect_source(
             f"{location}:{node.start_point.row + 1} ({name})",
             decoded=decoded_source,
         )
-        handler = values[-1] if len(values) > 1 else None
-        capabilities = None
-        if handler is not None and handler.type in _HANDLER_TYPES:
-            # The inline handler is the body the registration binds; a handler bound
-            # elsewhere is not followed and the tool stays unknown.
-            classified = classify_typescript((handler.text or b"").decode("utf-8", "replace"), name)
-            tool_risks = [*tool_risks, *classified.risks]
-            capabilities = classified.declaration
         tool = ToolComponent(
             bom_ref=ref,
             name=name,
             mcp_server_ref=server.bom_ref,
             source_path=location,
             risks=tool_risks,
-            capabilities=capabilities,
             properties={
                 "declaration_line": node.start_point.row + 1,
                 "method": "typescript-ast",
@@ -1561,7 +1555,42 @@ def _collect_source(
         server.tool_refs.append(ref)
         server.tool_count += 1
         components.append(tool)
+        spans.append((node.start_byte, node.end_byte))
+        handler = values[-1] if len(values) > 1 else None
+        if handler is not None and handler.type in _HANDLER_TYPES:
+            # The inline handler is the body the registration binds; a handler bound
+            # elsewhere is not followed and the tool stays unknown.
+            handlers.append((tool, handler))
+    _classify_handlers(source, handlers, spans)
     result.components.extend(components)
+
+
+def _classify_handlers(
+    source: bytes, handlers: list[tuple[ToolComponent, Node]], spans: list[tuple[int, int]]
+) -> None:
+    """Classify each inline handler by its own text, without the registrations it nests.
+
+    A registration inside a handler belongs to its own tool, so its whole call is cut out
+    of the enclosing handler's text. Each byte is then read for one tool only, and nested
+    registrations are classified in linear time.
+    """
+    starts = sorted(spans)
+    keys = [start for start, _ in starts]
+    for tool, handler in handlers:
+        begin, end = handler.start_byte, handler.end_byte
+        pieces: list[bytes] = []
+        position = begin
+        index = bisect.bisect_left(keys, begin)
+        while index < len(starts) and starts[index][0] < end:
+            inner_start, inner_end = starts[index]
+            if inner_end <= end and inner_start >= position:
+                pieces.append(source[position:inner_start])
+                position = inner_end
+            index = bisect.bisect_left(keys, max(position, inner_start + 1), lo=index + 1)
+        pieces.append(source[position:end])
+        classified = classify_typescript(b"".join(pieces).decode("utf-8", "replace"), tool.name)
+        tool.capabilities = classified.declaration
+        tool.risks = [*tool.risks, *classified.risks]
 
 
 _HANDLER_TYPES = frozenset(

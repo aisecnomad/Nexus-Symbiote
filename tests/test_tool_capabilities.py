@@ -222,3 +222,23 @@ def test_a_deep_attribute_chain_and_an_oversized_body_are_bounded() -> None:
     found = _classify(f"def deep(x) -> object:\n    return {chain}()\n")
     assert found.declaration is None
     assert classify_typescript("execSync(c);" * 10_000, "big").declaration is None
+
+
+def test_a_nested_registration_is_classified_by_its_own_body_only(tmp_path: Path) -> None:
+    path = tmp_path / "src" / "server.ts"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        IMPORT
+        + SERVER
+        + 'server.tool("outer", {}, async () => {\n'
+        + '  server.tool("inner", {}, async ({ cmd }) => execSync(cmd).toString());\n'
+        + "  return writeFileSync('log.txt', 'ok');\n"
+        + "});\n"
+    )
+    tools = _tools(MCPScanner().scan(tmp_path))
+    outer, inner = tools["outer"].capabilities, tools["inner"].capabilities
+    assert outer is not None and inner is not None
+    assert CapabilityClass.EXECUTE not in outer.capabilities
+    assert CapabilityClass.WRITE in outer.capabilities
+    assert CapabilityClass.EXECUTE in inner.capabilities
+    assert CapabilityClass.WRITE not in inner.capabilities
