@@ -3921,12 +3921,15 @@ class MCPScanner(Scanner):
             entries = read.servers
             server_hits: dict[int, PositionHits] = {}
             overflow_values: list[str] = []
-            values = self._file_secrets(
-                [*entries, *(("", config) for config in read.dropped)],
-                dialect.shape,
-                server_hits,
-                overflow_values=overflow_values,
-            )
+            from nexus_symbiote.credential_allowlist import bind_credential_path
+
+            with bind_credential_path(dialect.path):
+                values = self._file_secrets(
+                    [*entries, *(("", config) for config in read.dropped)],
+                    dialect.shape,
+                    server_hits,
+                    overflow_values=overflow_values,
+                )
             # Retain values from refused files when withholding names declared in source.
             if known is not None:
                 known.add(values)

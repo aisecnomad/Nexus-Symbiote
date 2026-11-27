@@ -18,8 +18,9 @@ from typing import Any
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.models import RiskAssessment
+from nexus_symbiote.credential_allowlist import bind_credential_path, credential_suppressed
 from nexus_symbiote.scanners.credential_files import credential_shaped
-from nexus_symbiote.scanners.mcp_credentials import normalize_credential, placeholder
+from nexus_symbiote.scanners.mcp_credentials import normalize_credential
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.secrets import TOKEN_SHAPE, holds_token_shape
 from nexus_symbiote.utils.terminal import neutralize
@@ -149,7 +150,7 @@ def apply_literal_credential_findings(
     failures: list[str] | None = None,
     exclusions: list[str] | None = None,
 ) -> int:
-    """Append one ``credential_exposure`` per non-placeholder vendor token shape.
+    """Append one ``credential_exposure`` per vendor token shape.
 
     ``root`` is the scan root. Without a directory, nothing is read. Findings are
     added to one component that already names the file, the lowest ``bom_ref``, so
@@ -185,29 +186,33 @@ def apply_literal_credential_findings(
                 continue
             found: list[tuple[int, str]] = []
             refused = False
-            for line_no, normalized, truncated in _literal_windows(text):
-                if truncated and _cut_off_token(normalized):
-                    own_failures.append(
-                        f"{neutralize(rel_path)}: a vendor token continues past the "
-                        f"{_JOIN_LINES}-line window; not collected"
-                    )
-                    refused = True
-                    break
-                for match in TOKEN_SHAPE.finditer(normalized):
-                    literal = match.group()
-                    if not holds_token_shape(literal) or placeholder(literal):
-                        continue
-                    digest = hashlib.sha256(literal.encode("utf-8")).hexdigest()
-                    found.append((line_no, digest))
-                    if len(found) > MAX_LITERALS:
+            with bind_credential_path(rel_path):
+                for line_no, normalized, truncated in _literal_windows(text):
+                    if truncated and _cut_off_token(normalized):
                         own_failures.append(
-                            f"{neutralize(rel_path)}: more than {MAX_LITERALS} vendor token "
-                            "shapes in one file; not collected"
+                            f"{neutralize(rel_path)}: a vendor token continues past the "
+                            f"{_JOIN_LINES}-line window; not collected"
                         )
                         refused = True
                         break
-                if refused:
-                    break
+                    for match in TOKEN_SHAPE.finditer(normalized):
+                        literal = match.group()
+                        # A vendor shape of valid length is a finding even when its body
+                        # looks like an example. The shape table already rejects sk-...,
+                        # xxxx and <YOUR_API_KEY>.
+                        if not holds_token_shape(literal) or credential_suppressed(literal):
+                            continue
+                        digest = hashlib.sha256(literal.encode("utf-8")).hexdigest()
+                        found.append((line_no, digest))
+                        if len(found) > MAX_LITERALS:
+                            own_failures.append(
+                                f"{neutralize(rel_path)}: more than {MAX_LITERALS} vendor "
+                                "token shapes in one file; not collected"
+                            )
+                            refused = True
+                            break
+                    if refused:
+                        break
             if refused or not found:
                 continue
             component = _owner(owners[rel_path])

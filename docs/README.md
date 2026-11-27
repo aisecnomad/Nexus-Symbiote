@@ -36,6 +36,7 @@ Exact behavior, fields and limits.
 | [Finding catalog](finding-catalog.md) | Every finding category: severity, collector, meaning, remediation and gate effects |
 | [Known limitations](known-limitations.md) | What each collector, gate, export and integration does not cover, and what to do about each limit |
 | [Policy reference](policy-reference.md) | Every `.nexus-symbiote.yaml` setting, targeted suppressions and `policy_weakened` reports |
+| [Credential allowlist](credential-allowlist.md) | The only way to suppress a vendor-shaped credential finding: a fingerprint or a path glob, with a reason |
 | [Collection limits](collection-limits.md) | Every bound on what a command reads, its default, what happens at the limit and how to raise it |
 | [AgentBOM schemas](../schemas/README.md) | The native AgentBOM JSON Schema, the agent-manifest and deployment-profile schemas, and a minimal example |
 | [Agent manifest](agent-manifest.md) | The optional `agent.yaml`: its fields, what it adds to the inventory, its failures and its trust limits |

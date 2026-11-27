@@ -805,10 +805,18 @@ def public_scheme_operand(value: str) -> bool:
 
 
 def _token_hits(value: str) -> list[Hit]:
+    """Vendor shapes in ``value``. A body that looks like an example is still a hit.
+
+    ``placeholder()`` does not drop a match. The shape table already requires the
+    vendor prefix and its minimum length, so ``sk-...``, ``xxxx`` and
+    ``<YOUR_API_KEY>`` do not match. An explicit allowlist entry can suppress one.
+    """
+    from nexus_symbiote.credential_allowlist import credential_suppressed
+
     return [
         (SHAPE_CLASS, match.group())
         for match in TOKEN_SHAPE.finditer(value)
-        if not placeholder(match.group())
+        if not credential_suppressed(match.group())
     ]
 
 

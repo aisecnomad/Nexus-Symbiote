@@ -1226,6 +1226,18 @@ def scan(
     accepted_default_exclusions: set[str] = set()
     accepted_default_names: set[str] = set()
     scan_failures: list[str] = []
+    from nexus_symbiote.credential_allowlist import (
+        bind_credential_allowlist,
+        load_credential_allowlist,
+    )
+
+    credential_allowlist = None
+    if not no_project_policy:
+        credential_allowlist, allowlist_error = load_credential_allowlist(
+            root, exclude_paths=policy.scan.exclude_paths
+        )
+        if allowlist_error:
+            scan_failures.append(allowlist_error)
     failures_by: dict[str, list[str]] = {}
     excluded_by: dict[str, list[str]] = {}
     completed: list[str] = []
@@ -1260,7 +1272,8 @@ def scan(
                 )
             elif policy.scan.exclude_paths:
                 raise ValueError("scanner does not support configured exclude_paths")
-            result = scanner.scan(root)
+            with bind_credential_allowlist(credential_allowlist):
+                result = scanner.scan(root)
             result.make_portable(root)
             if name == "shadowscan":
                 source_report_digest = result.source_report_digest
@@ -1336,12 +1349,13 @@ def scan(
     if len(surfaces_excluded) > tp_exclusion_count:
         excluded_by["text_poisoning"] = surfaces_excluded[tp_exclusion_count:]
     literal_failure_count = len(scan_failures)
-    apply_literal_credential_findings(
-        aibom,
-        root,
-        exclude_paths=policy.scan.exclude_paths,
-        failures=scan_failures,
-    )
+    with bind_credential_allowlist(credential_allowlist):
+        apply_literal_credential_findings(
+            aibom,
+            root,
+            exclude_paths=policy.scan.exclude_paths,
+            failures=scan_failures,
+        )
     if len(scan_failures) > literal_failure_count:
         failures_by["literal_credentials"] = scan_failures[literal_failure_count:]
     graph_failures = validate_graph(aibom)
