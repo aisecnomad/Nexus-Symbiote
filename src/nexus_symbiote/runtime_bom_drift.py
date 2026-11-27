@@ -96,6 +96,8 @@ def _normalize_endpoint(raw_url: str) -> str | None:
     elif port is None and parsed.scheme in {"https", "wss", ""}:
         port = 443
     path = parsed.path
+    if not path and parsed.scheme in {"http", "https"}:
+        path = "/"  # HTTP(S) empty paths denote the root (RFC 9110, section 4.2.3).
     if ":" in host:
         host = f"[{host}]"
     base = f"{parsed.scheme}://{host}" + (f":{port}" if port is not None else "")

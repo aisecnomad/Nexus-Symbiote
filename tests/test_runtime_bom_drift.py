@@ -902,14 +902,33 @@ def test_context_key_redaction_recognizes_nested_names(tmp_path):
     assert observed["cluster_context"]["k8s.workload.label"] == "training"
 
 
-def test_trailing_slash_route_identity_preserved(tmp_path):
-    from nexus_symbiote.runtime_bom_drift import _normalize_endpoint
-
-    assert _normalize_endpoint("https://a.example/") != _normalize_endpoint("https://a.example")
-    assert _normalize_endpoint("https://tools.cluster.local:8443/mcp/") != _normalize_endpoint(
-        "https://tools.cluster.local:8443/mcp"
+@pytest.mark.parametrize(
+    ("declared", "observed", "matches"),
+    [
+        ("http://hub.example", "http://hub.example:80/", True),
+        ("https://hub.example/", "https://hub.example", True),
+        ("https://hub.example?view=public", "https://hub.example/?view=overview", True),
+        ("https://hub.example", "https://hub.example:8443/", False),
+    ],
+)
+def test_http_root_endpoint_identity(tmp_path, declared, observed, matches):
+    component = MCPServerComponent(bom_ref="mcp:hub", name="hub", endpoint_url=declared)
+    inventory = tmp_path / "static.json"
+    inventory.write_text(AIBOM(components=[component]).to_native_json(), encoding="utf-8")
+    snapshot = tmp_path / "cluster.cdx.json"
+    snapshot.write_text(
+        json.dumps(_cdx(services=[{"name": "hub", "endpoints": [observed]}])), encoding="utf-8"
     )
+    report = collect(inventory, [snapshot], fail_on="drift")
+    assert report["gate"]["passed"] is matches
+    assert "?" not in report["observed"][0]["endpoints"][0]
+    if matches:
+        assert report["reconciliation"]["matched"][0]["inventory_refs"] == ["mcp:hub"]
+    else:
+        assert report["reconciliation"]["drifted"][0]["drift_reasons"] == ["endpoint_mismatch"]
 
+
+def test_trailing_slash_route_identity_preserved(tmp_path):
     static_bom = AIBOM(
         components=[
             MCPServerComponent(
