@@ -118,15 +118,16 @@ def placeholder(text: str) -> bool:
 def split_route(literal: str) -> tuple[str, str | None]:
     """The model identifier and the provider a routing prefix on ``literal`` names:
     ``openai/gpt-4o`` and ``anthropic:claude-sonnet-4-5`` are a route and an
-    identifier. Only a call that routes by prefix reads it so."""
+    identifier. Only a call that routes by prefix reads it so, and only as written: a
+    router's prefixes are lower case, so ``Groq/`` is an owner on a model hub."""
     for separator in ("/", ":"):
         prefix, found, rest = literal.partition(separator)
         if not found or not rest:
             continue
-        provider = ROUTES.get(prefix.lower())
+        provider = ROUTES.get(prefix)
         if provider is None:
             continue
-        owned = _HUB_OWNED.get(prefix.lower()) if separator == "/" else None
+        owned = _HUB_OWNED.get(prefix) if separator == "/" else None
         if owned is not None and owned.match(rest):
             continue
         if model_identifier(rest) is None:

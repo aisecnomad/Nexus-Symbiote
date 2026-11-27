@@ -2903,3 +2903,31 @@ def test_a_variable_is_checked_once_for_a_model_however_often_it_is_read(
         },
     )
     assert checked == ["CHAT_MODEL"]
+
+
+def test_a_prefix_is_read_as_routers_write_it_and_a_bare_name_keeps_no_provider(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "a.py": "from openai import AzureOpenAI\n\n"
+            + 'AzureOpenAI().chat.completions.create(model="gpt-4o", messages=[])\n',
+            "b.py": "import litellm\nfrom llama_cpp import Llama\nfrom vllm import LLM\n\n"
+            + 'litellm.completion(model="openai/gpt-4o")\n'
+            + 'litellm.completion(model="Groq/Llama-3-Groq-8B-Tool-Use")\n'
+            + 'LLM(model="Groq/Llama-3-Groq-8B-Tool-Use")\n'
+            + 'Llama.from_pretrained(repo_id="Groq/Llama-3-Groq-8B-Tool-Use-GGUF", filename="*")\n',
+        },
+    )
+    found = {(c.name, c.provider): c for c in result.components}
+    # A router's prefixes are lower case: ``Groq/`` names the owner of weights on a hub.
+    assert set(found) == {
+        ("gpt-4o", None),
+        ("gpt-4o", "openai"),
+        ("Groq/Llama-3-Groq-8B-Tool-Use", None),
+        ("Groq/Llama-3-Groq-8B-Tool-Use-GGUF", None),
+    }
+    # A name written without a route takes no provider from one written with it.
+    bare = found[("gpt-4o", None)]
+    assert (bare.requested_alias, bare.model_type) == (None, None)
+    assert bare.claims["source_reference"].locator == "a.py:3"
+    assert found[("gpt-4o", "openai")].requested_alias == "openai/gpt-4o"

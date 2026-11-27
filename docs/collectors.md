@@ -64,11 +64,15 @@ that may give a model in place of a value read are listed in `environment_variab
 Where the call routes by a prefix on the identifier (LiteLLM, PydanticAI, LangChain's
 `init_chat_model`, CrewAI, DSPy, smolagents), the prefix names the provider:
 `anthropic/claude-sonnet-4-5` is the model `claude-sonnet-4-5` with provider
-`anthropic`, and the text as written is kept in `requested_alias`. Elsewhere an
-identifier is kept as written, as Replicate's `owner/name` or a gateway's name through
-the OpenAI SDK is. A name routed to two providers is two components, since an opaque
-name such as an Azure deployment may name different models at each. A provider other
-than one that serves local weights (`ollama`) makes the model `hosted`.
+`anthropic`, and the text as written is kept in `requested_alias`, or in
+`requested_aliases` when it is written more than one way. A prefix is read as written,
+in lower case as routers spell them, so `Groq/` is an owner on a model hub. Elsewhere an
+identifier is kept as written, as Replicate's `owner/name`, a weights library's
+`owner/name` or a gateway's name through the OpenAI SDK is. A name routed to two
+providers is two components, and one written without a route is another, since an
+opaque name such as an Azure deployment may name different models at each. A provider
+other than one that serves local weights (`ollama`) makes the model `hosted`, which
+`trace-diff` lists as `unobserved` when no trace names it.
 Any `trust_remote_code` but a false literal, given to a call or in its `model_kwargs` or
 `config_kwargs`, records that the model may run its own code. A relative path or a
 weight file names a file in the project, which the model collector reads.
