@@ -35,9 +35,7 @@ MAX_LITERALS = 32
 _JOIN_LINES = 8
 _JOIN_CHARS = 2048
 # A vendor prefix left at the end of a window the cap cut is not a completed token.
-_OPEN_PREFIX = re.compile(
-    r"(?:sk-|ghp_|gho_|ghu_|ghs_|ghr_|hf_|github_pat_|glpat-|xox[abeoprs]-)[\w-]*$"
-)
+_OPEN_PREFIX = re.compile(r"sk-|ghp_|gho_|ghu_|ghs_|ghr_|hf_|github_pat_|glpat-|xox[abeoprs]-")
 _BACKSLASH_JOIN = re.compile(r"\\\n")
 _PLUS_JOIN = re.compile(r"""(?s)(['"])\s*\+\s*\1""")
 _ADJACENT_QUOTES = re.compile(r"""(?s)(['"])\s*\1""")
@@ -65,7 +63,7 @@ _TOKEN_CHAR = re.compile(r"[\w-]")
 # A prefix a space may interrupt. The match itself still has to satisfy the shape table.
 _SPLIT_PREFIX = re.compile(
     r"(?<![\w-])(?:"
-    r"sk-(?:proj-|svcacct-|admin-|ant-|or-v1-|lf-)?"
+    r"sk-(?:proj-|svcacct-|admin-|ant-(?:[a-z]+[0-9]{2}-)?|or-v1-|lf-)?"
     r"|github_pat_|gh[oprsu]_|glpat-|xox[abeoprs]-|hf_|npm_|AIza|(?:AKIA|ASIA)"
     r")"
 )
@@ -113,6 +111,10 @@ def _literals(visible: str) -> Iterator[tuple[int, str]]:
         while index < limit:
             char = visible[index]
             if char.isspace():
+                # A standalone prefix is often documentation. Join whitespace only
+                # after a token body has started, or after explicit source joins.
+                if not chars:
+                    break
                 nxt = index + 1
                 while nxt < limit and visible[nxt].isspace():
                     nxt += 1
@@ -208,8 +210,14 @@ def _normalized_window(parts: list[str]) -> tuple[str, list[int]]:
 
 def _cut_off_token(visible: str) -> bool:
     """Whether ``visible`` ends in a vendor prefix the window did not finish."""
-    found = _OPEN_PREFIX.search(visible.rstrip())
-    return found is not None and not holds_token_shape(found.group())
+    text = visible.rstrip()
+    # Only the last contiguous token-shaped word can cross the boundary.
+    # Locate it once so multiple prefixes never rescan the same suffix.
+    start = len(text)
+    while start and _TOKEN_CHAR.fullmatch(text[start - 1]):
+        start -= 1
+    found = _OPEN_PREFIX.search(text, start)
+    return found is not None and not holds_token_shape(text[found.start() :])
 
 
 def _literal_windows(text: str) -> Iterator[tuple[int, str, list[int], bool]]:
@@ -223,16 +231,15 @@ def _literal_windows(text: str) -> Iterator[tuple[int, str, list[int], bool]]:
     while index < len(lines):
         parts = [lines[index]]
         start = index + 1
+        window_chars = len(lines[index])
         truncated = False
-        while _window_continues(parts):
-            if (
-                len(parts) >= _JOIN_LINES
-                or sum(len(part) for part in parts) >= _JOIN_CHARS
-                or index + 1 >= len(lines)
-            ):
-                truncated = index + 1 < len(lines) and _window_continues(parts)
+        while index + 1 < len(lines) and _window_continues(parts):
+            next_chars = 1 + len(lines[index + 1])
+            if len(parts) >= _JOIN_LINES or window_chars + next_chars > _JOIN_CHARS:
+                truncated = True
                 break
             index += 1
+            window_chars += next_chars
             parts.append(lines[index])
         normalized, boundaries = _normalized_window(parts)
         yield start, normalized, boundaries, truncated
