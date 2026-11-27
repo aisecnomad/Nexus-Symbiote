@@ -2,8 +2,8 @@
 
 A tool the ``mcp`` collector records from a Python decorator or a TypeScript registration is
 classified by the calls in its own body: process execution, network egress and whether it
-sends data, filesystem writes and deletions, payment API writes and reads of secret-named
-environment variables. Names resolve only through the file's imports, names
+sends data, filesystem writes and deletions, SQL statements, payment API writes and reads of
+secret-named environment variables. Names resolve only through the file's imports, names
 bound from them and builtins, by the language's scoping rules; nothing is executed or
 imported. The classifier cannot show that a body does nothing else, so it records only what
 raises risk, never ``read`` or ``read-only``, and a body past a bound records a coverage gap.
@@ -12,7 +12,9 @@ raises risk, never ``read`` or ``read-only``, and a body past a bound records a 
 from __future__ import annotations
 
 import ast
+import bisect
 import itertools
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -60,6 +62,12 @@ _PAYMENT_LOCAL = frozenset({"Webhook", "WebhookSignature", "error", "util", "oau
 _PAYMENT_RESOURCES = frozenset(
     {"Charge", "Refund", "PaymentIntent", "Payout", "Transfer", "Transaction", "Payment"}
 )
+_DB_MODULES = frozenset(
+    {"sqlite3", "sqlalchemy", "psycopg", "psycopg2", "pymysql", "mysql", "asyncpg", "duckdb"}
+)
+_DB_RECEIVERS = frozenset({"cursor", "cur", "conn", "connection", "engine", "session", "db"})
+_DB_EXECUTE = frozenset({"execute", "executemany", "executescript", "exec_driver_sql"})
+_SQL_TEXT = frozenset({"sqlalchemy.text", "sqlalchemy.sql.text", "sqlalchemy.sql.expression.text"})
 # Distinctive on any receiver, such as a Path parameter.
 _FS_WRITE = frozenset(
     {"write_text", "write_bytes", "makedirs", "mkdir", "copyfile", "copytree", "touch"}
@@ -71,6 +79,30 @@ _FS_MODULES = frozenset({"os", "shutil", "pathlib", "tempfile"})
 # Ambiguous names, counted only as os.<name> or shutil.<name>.
 _FS_MODULE_WRITE = frozenset({"remove", "rename", "replace", "copy", "copy2", "move"})
 _FS_MODULE_DELETE = frozenset({"remove", "removedirs"})
+# SQL operations count where a statement or subquery starts, and only with the clause they
+# need, so prose that starts with the word, such as "update my profile", names nothing.
+_SQL_WRITES = frozenset(
+    {"INSERT", "REPLACE", "MERGE", "UPDATE", "ALTER", "CREATE", "GRANT", "REVOKE"}
+)
+_SQL_DESTRUCTIVE = frozenset({"DELETE", "DROP", "TRUNCATE"})
+_SQL_OPERATIONS = _SQL_WRITES | _SQL_DESTRUCTIVE
+_SQL_CLAUSE = {"INSERT": "INTO", "REPLACE": "INTO", "MERGE": "INTO", "UPDATE": "SET"}
+_SQL_CLAUSE["DELETE"] = "FROM"
+_SQL_DDL = frozenset({"ALTER", "CREATE", "DROP"})
+_SQL_OBJECTS = frozenset(
+    {"TABLE", "VIEW", "INDEX", "DATABASE", "SCHEMA", "SEQUENCE", "FUNCTION", "PROCEDURE"}
+    | {"TRIGGER", "TYPE", "USER", "ROLE", "EXTENSION", "MATERIALIZED", "UNIQUE", "TEMP"}
+    | {"TEMPORARY", "OR", "IF", "GLOBAL", "LOCAL", "VIRTUAL", "UNLOGGED", "COLUMN"}
+    | {"CONSTRAINT", "POLICY", "DOMAIN", "OWNED"}
+)
+# Words after which the next word still starts the statement.
+_SQL_PREFIXES = frozenset({"EXPLAIN", "ANALYZE", "VERBOSE", "BEGIN", "DO"})
+_SQL_WORD = re.compile(r"\w+")
+# Where a database call takes its statement when it is not the first argument.
+_SQL_ARGUMENTS = frozenset({"statement", "query", "sql", "operation"})
+_SQL_DOLLAR = re.compile(r"\$(?:[^\W\d]\w*)?\$")
+_SQL_RANK = {None: 0, "write": 1, "destructive": 2}
+
 _TS_EXECUTE = frozenset(
     {"exec", "execSync", "execFile", "execFileSync", "spawn", "spawnSync", "fork"}
 )
@@ -80,12 +112,26 @@ _TS_FS_WRITE = frozenset(
 )
 _TS_FS_DELETE = frozenset({"rm", "rmSync", "unlink", "unlinkSync", "rmdir", "rmdirSync"})
 _TS_HTTP = frozenset({"axios", "node-fetch", "got", "undici", "ky", "http", "https"})
+_TS_SQL = frozenset(
+    {"query", "execute", "raw", "unsafe", "$queryRawUnsafe", "$executeRawUnsafe", "queryRaw"}
+)
+# A receiver ``query`` or ``execute`` is SQL on: a client from one of these modules, or by name.
+_TS_DB_MODULES = frozenset(
+    {"pg", "mysql", "mysql2", "sqlite3", "better-sqlite3", "postgres", "@prisma/client", "knex"}
+    | {"sequelize", "drizzle-orm", "mssql", "kysely", "typeorm"}
+)
+_TS_DB_RECEIVERS = frozenset(
+    {"db", "pool", "client", "conn", "connection", "sql", "knex", "prisma", "tx", "trx"}
+    | {"sequelize", "database", "cursor"}
+)
 _TS_PAYMENT_RESOURCES = frozenset({"refunds", "charges", "paymentIntents", "payouts", "transfers"})
 _TS_PAYMENT_WRITE = frozenset({"create", "confirm", "capture"})
 _TS_GLOBALS = frozenset({"globalThis", "window", "global", "self"})
 _TS_HTTP_SERVER = frozenset({"createServer", "Server", "listen", "STATUS_CODES"})
 # A callee chain longer than this is not an API call; it names nothing, in constant time.
 MAX_CHAIN = 16
+# Nodes read to decide whether one SQL argument uses a parameter; past it, assume it does.
+_MAX_USE_NODES = 256
 _MODULE_HEAD = "\x00module:"
 
 
@@ -114,6 +160,7 @@ class _Observed:
     writes: bool = False
     destructive: bool = False
     payment: bool = False
+    raw_sql: bool = False
     execute: bool = False
 
     def add(self, *classes: CapabilityClass) -> None:
@@ -139,6 +186,15 @@ def _finish(label: str, seen: _Observed) -> ToolCapabilities:
                 recommendation="Confine the tool to an allow-list of commands and a sandbox.",
             )
         )
+    if seen.raw_sql:
+        risks.append(
+            RiskAssessment(
+                severity=RiskSeverity.HIGH,
+                category=CATEGORY,
+                detail=f"Tool '{label}' passes a caller-supplied statement to a database.",
+                recommendation="Parameterize queries and restrict the tool to read-only access.",
+            )
+        )
     if seen.payment:
         risks.append(
             RiskAssessment(
@@ -150,7 +206,7 @@ def _finish(label: str, seen: _Observed) -> ToolCapabilities:
         )
     if seen.payment:
         profile = SideEffectProfile.FINANCIAL_TRANSACTION
-    elif seen.destructive:
+    elif seen.destructive or seen.raw_sql:
         profile = SideEffectProfile.DESTRUCTIVE
     elif seen.writes or seen.execute:
         profile = SideEffectProfile.STATE_MODIFYING
@@ -165,9 +221,88 @@ def _secret_name(name: str) -> bool:
     return bool(name) and bool(SECRET_ENV_KEY_RE.search(name))
 
 
+def _sql_tokens(text: str) -> list[str]:
+    """Upper-cased words and ``(``, ``)``, ``;`` outside literals, quoted names and comments."""
+    tokens: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        char = text[i]
+        if char in "'\"`":
+            # A doubled quote stays inside; an unterminated literal runs to the end.
+            end = i + 1
+            while (end := text.find(char, end)) >= 0 and text.startswith(char, end + 1):
+                end += 2
+            i = n if end < 0 else end + 1
+        elif text.startswith("--", i):
+            end = text.find("\n", i)
+            i = n if end < 0 else end + 1
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+        elif char in "();":
+            tokens.append(char)
+            i += 1
+        elif tag := _SQL_DOLLAR.match(text, i):
+            # PostgreSQL dollar quoting; ``$1`` is a parameter, not a quote.
+            end = text.find(tag.group(), tag.end())
+            i = n if end < 0 else end + len(tag.group())
+        elif word := _SQL_WORD.match(text, i):
+            tokens.append(word.group().upper())
+            i = word.end()
+        else:
+            i += 1
+    return tokens
+
+
+def _sql_effect(text: str | None) -> str | None:
+    """``destructive``, ``write`` or None: what the statements in ``text`` do. An operation
+    counts where a statement or subquery starts, with the clause it needs."""
+    if not text:
+        return None
+    operations: set[str] = set()
+    tokens = _sql_tokens(text)
+    begin = 0
+    for end in [*(k for k, part in enumerate(tokens) if part == ";"), len(tokens)]:
+        statement, begin = tokens[begin:end], end + 1
+        words = set(statement)
+        analyze = statement.index("ANALYZE") if "ANALYZE" in words else -1
+        if statement[:1] == ["EXPLAIN"] and (
+            analyze < 0 or statement[analyze + 1 : analyze + 2] in (["FALSE"], ["OFF"], ["0"])
+        ):
+            continue  # A plan: the statement it describes does not run.
+        restart = statement[:1] in (["WITH"], ["EXPLAIN"])
+        start, depth = True, 0
+        for k, word in enumerate(statement):
+            if word == "(":
+                start, depth = True, depth + 1
+                continue
+            if word == ")":
+                depth = max(depth - 1, 0)
+                start = restart and depth == 0
+                continue
+            if start and word in _SQL_PREFIXES:
+                continue
+            if start and word in _SQL_OPERATIONS:
+                clause = _SQL_CLAUSE.get(word)
+                following = statement[k + 1] if k + 1 < len(statement) else ""
+                if clause is not None:
+                    shaped = clause in words
+                else:
+                    shaped = word not in _SQL_DDL or following in _SQL_OBJECTS
+                if shaped:
+                    operations.add(word)
+                    if word == "ALTER" and "DROP" in words:
+                        operations.add("DROP")
+            start = False
+    if operations & _SQL_DESTRUCTIVE:
+        return "destructive"
+    return "write" if operations else None
+
+
 _PY_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 _PY_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 _PY_SCOPES = (*_PY_FUNCTIONS, ast.ClassDef, *_PY_COMPREHENSIONS)
+_PY_LOOPS = (ast.For, ast.AsyncFor, ast.While, *_PY_COMPREHENSIONS)
 _SCOPE_KINDS = {ast.ClassDef: "class", **dict.fromkeys(_PY_COMPREHENSIONS, "comprehension")}
 # Distinct targets one name may have in one scope. Past it, a tool that reads the name is
 # unclassified, so piling up bindings cannot crowd out the one that raises risk.
@@ -201,6 +336,21 @@ class _Scope:
     declared_nonlocal: set[str] = field(default_factory=set)
 
 
+_Key = tuple[_Scope, str]
+# Where a binding takes effect, the statement that always makes it (None for one that may
+# not run, such as a loop target), the value it binds and the scope that value is read in.
+_Binding = tuple[ast.AST, ast.AST | None, ast.AST | None, _Scope]
+# Whether a statement may be caller-supplied, and the rank of what its text does.
+_Value = tuple[bool, int]
+# A name's bindings in its own frame, each with where it starts and ends and where the block
+# that always runs it ends; their starts; and what its bindings elsewhere may give it.
+_Placed = tuple[list[tuple[int, int, int, _Binding]], list[int], _Value]
+
+
+def _join(a: _Value, b: _Value) -> _Value:
+    return a[0] or b[0], max(a[1], b[1])
+
+
 class PythonScopes:
     """Every binding a module's names have, scope by scope, read as Python reads them: a name
     a function binds anywhere in its body is local to it, and a module-level name may hold
@@ -212,6 +362,9 @@ class PythonScopes:
         self._scopes: dict[ast.AST, _Scope] = {}
         # Stacked decorators can register one body under many names; it is read once.
         self.observed: dict[ast.AST, _Observed | None] = {}
+        # Each name's bindings with the values they bind, under the scope that owns the name.
+        self.bindings: dict[_Key, list[_Binding]] = {}
+        self._statements: dict[ast.AST | None, tuple[int, list[_Key]]] = {}
         if tree is not None:
             self._fill(tree, self.module)
 
@@ -241,11 +394,11 @@ class PythonScopes:
         """What ``dotted`` may name where ``scope`` reads it, and whether a binding names
         nothing; ``_TooManyTargetsError`` past the target bound."""
         head, _, rest = dotted.partition(".")
-        entries, builtin = self._lookup(scope, head)
+        owners, builtin = self.lookup(scope, head)
         builtin = builtin and head in _PY_BUILTINS
         targets = [(dotted, False)] if builtin else []
-        unresolved = not entries and not builtin
-        for entry in entries:
+        unresolved = not owners and not builtin
+        for entry in (owner.names[head] for owner in owners):
             if entry.overflow:
                 raise _TooManyTargetsError
             unresolved = unresolved or entry.unresolved
@@ -254,9 +407,10 @@ class PythonScopes:
             )
         return targets, unresolved
 
-    def _lookup(self, scope: _Scope, name: str) -> tuple[list[_Name], bool]:
-        """The bindings a read of ``name`` in ``scope`` may see, and whether a builtin may."""
-        entries: list[_Name] = []
+    def lookup(self, scope: _Scope, name: str) -> tuple[list[_Scope], bool]:
+        """The scopes whose bindings a read of ``name`` in ``scope`` may see, and whether a
+        builtin may."""
+        owners: list[_Scope] = []
         current: _Scope | None = scope
         own = True  # A class body reads its own names; a scope nested in it does not.
         while current is not None:
@@ -266,15 +420,14 @@ class PythonScopes:
             if name in current.declared_nonlocal:
                 current, own = current.parent, False
                 continue
-            entry = current.names.get(name) if own or current.kind != "class" else None
-            if entry is not None:
-                entries.append(entry)
+            if name in current.names and (own or current.kind != "class"):
+                owners.append(current)
                 if current.kind in {"function", "comprehension"}:
-                    return entries, False
+                    return owners, False
                 if current.kind == "module":
-                    return entries, True
+                    return owners, True
             current, own = current.parent, False
-        return entries, True
+        return owners, True
 
     def _fill(self, root: ast.AST, scope: _Scope) -> None:
         pending: list[tuple[ast.AST, _Scope]] = [(root, scope)]
@@ -294,7 +447,7 @@ class PythonScopes:
                 a = node.args
                 for argument in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg):
                     if argument is not None:
-                        self._bind(inner, argument.arg, ())
+                        self._bind(inner, argument.arg, (), (argument, None, None, inner))
         elif isinstance(node, ast.Global):
             scope.declared_global.update(node.names)
         elif isinstance(node, ast.Nonlocal):
@@ -314,51 +467,64 @@ class PythonScopes:
                     )
         elif isinstance(node, ast.Assign):
             for target in node.targets:
-                self._assign(scope, target, node.value)
-        elif isinstance(
-            node, ast.AnnAssign | ast.AugAssign | ast.For | ast.AsyncFor | ast.comprehension
-        ):
-            self._assign(
-                scope, node.target, node.value if isinstance(node, ast.AnnAssign) else None
-            )
+                self._assign(scope, target, node.value, where=node, statement=node)
+        elif isinstance(node, ast.AnnAssign | ast.AugAssign):
+            # ``sql += text`` binds the old statement with ``text`` added.
+            value = node if isinstance(node, ast.AugAssign) else node.value
+            self._assign(scope, node.target, value, where=node, statement=node)
+        elif isinstance(node, ast.For | ast.AsyncFor | ast.comprehension):
+            self._assign(scope, node.target, node)
         elif isinstance(node, ast.NamedExpr):
             # ``:=`` in a comprehension binds in the function or module around it.
             owner = scope
             while owner.kind == "comprehension" and owner.parent is not None:
                 owner = owner.parent
-            self._assign(owner, node.target, node.value, scope)
+            self._assign(owner, node.target, node.value, scope, where=node)
         elif isinstance(node, ast.With | ast.AsyncWith):
             for item in node.items:
                 if item.optional_vars is not None:
-                    self._assign(scope, item.optional_vars, item.context_expr)
+                    self._assign(scope, item.optional_vars, item.context_expr, statement=node)
         elif isinstance(node, ast.Delete):
             for target in node.targets:
                 self._assign(scope, target, None)
-        elif isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar) and node.name:
+        elif isinstance(node, ast.ExceptHandler) and node.name:
             self._bind(scope, node.name, ())
-        elif isinstance(node, ast.MatchMapping) and node.rest:
-            self._bind(scope, node.rest, ())
+        elif isinstance(node, ast.Match):
+            # A capture is part of the subject.
+            for part in (p for case in node.cases for p in ast.walk(case.pattern)):
+                for name in (getattr(part, "name", None), getattr(part, "rest", None)):
+                    if name:
+                        self._bind(scope, name, (), (part, None, node.subject, scope))
 
     def _assign(
         self,
         scope: _Scope,
         target: ast.AST,
-        value: ast.expr | None,
+        value: ast.AST | None,
         reads: _Scope | None = None,
+        where: ast.AST | None = None,
+        statement: ast.AST | None = None,
     ) -> None:
-        """Bind a name target to ``value``; each name an unpacking binds names nothing."""
-        pending = [target]
+        """Bind a name target to ``value``; each name an unpacking binds names nothing, and
+        holds its own item of a literal of the same length, or else any part of the value."""
+        reads = reads or scope
+        pending: list[tuple[ast.AST, ast.AST | None]] = [(target, value)]
         while pending:
-            node = pending.pop()
+            node, source = pending.pop()
             if isinstance(node, ast.Name):
-                bound = self._value(reads or scope, value) if node is target else ()
-                self._bind(scope, node.id, bound)
+                bound = self._value(reads, source) if node is target else ()
+                binding = None if source is None else (where or node, statement, source, reads)
+                self._bind(scope, node.id, bound, binding)
             elif isinstance(node, ast.Tuple | ast.List):
-                pending.extend(node.elts)
+                items: list[ast.AST | None] = [source] * len(node.elts)
+                if isinstance(source, ast.Tuple | ast.List) and len(source.elts) == len(node.elts):
+                    if not any(isinstance(i, ast.Starred) for i in (*source.elts, *node.elts)):
+                        items = [*source.elts]
+                pending.extend(zip(node.elts, items, strict=True))
             elif isinstance(node, ast.Starred):
-                pending.append(node.value)
+                pending.append((node.value, source))
 
-    def _value(self, scope: _Scope, value: ast.expr | None) -> tuple[_Target, ...] | None:
+    def _value(self, scope: _Scope, value: ast.AST | None) -> tuple[_Target, ...] | None:
         """What assigning ``value`` binds: a call's result or another name for a target."""
         found = _chain_through(value) if value is not None else None
         if found is None:
@@ -371,11 +537,19 @@ class PythonScopes:
             return None
         return tuple((path, through or call) for path, call in targets)
 
-    def _bind(self, scope: _Scope, name: str, targets: tuple[_Target, ...] | None) -> None:
+    def _bind(
+        self,
+        scope: _Scope,
+        name: str,
+        targets: tuple[_Target, ...] | None,
+        binding: _Binding | None = None,
+    ) -> None:
         if name in scope.declared_global:
             scope = self.module
         elif name in scope.declared_nonlocal:
             scope = self._enclosing(scope, name)
+        if binding is not None and self.bindings.setdefault((scope, name), [])[-1:] != [binding]:
+            self.bindings[scope, name].append(binding)
         entry = scope.names.setdefault(name, _Name())
         if targets is None:
             entry.overflow = True
@@ -400,6 +574,80 @@ class PythonScopes:
             current = current.parent
         return nearest or self.module
 
+    def statement(self, node: ast.AST | None, scope: _Scope) -> tuple[int, list[_Key]]:
+        """The rank of the SQL text ``node`` may evaluate to, with each alternative read on
+        its own and any other part as ``?``, and the names that text is taken from."""
+        if node in self._statements:
+            return self._statements[node]
+        names: set[str] = set()
+        runs: list[list[str]] = [[]]
+        pending: list[ast.AST | None] = [node]
+        while pending:
+            part = pending.pop()
+            if part is None:
+                runs.append([])
+            elif isinstance(part, ast.Constant):
+                runs[-1].append(part.value if isinstance(part.value, str) else "?")
+            elif isinstance(part, ast.Name | ast.FormattedValue):
+                names.update(_names_in(part))
+                runs[-1].append("?")
+            elif isinstance(part, ast.JoinedStr):
+                pending.extend(reversed(part.values))
+            elif isinstance(part, ast.BinOp) and isinstance(part.op, ast.Add):
+                pending += [part.right, part.left]
+            elif isinstance(part, ast.BinOp) and isinstance(part.op, ast.Mod):
+                names.update(_names_in(part.right))
+                pending.append(part.left)
+            elif isinstance(
+                part, ast.Attribute | ast.Subscript | ast.Starred | ast.Await | ast.NamedExpr
+            ):
+                pending.append(part.value)
+            elif isinstance(part, ast.Call) and (text := self._wrapped(part, scope)) is not None:
+                pending.append(text)
+            elif isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute):
+                # A method of the statement, such as ``.strip()`` or ``.bindparams(...)``;
+                # ``.format()`` and ``.join()`` also take their arguments into the text.
+                if part.func.attr in {"format", "join"}:
+                    names.update(*map(_names_in, (*part.args, *part.keywords)))
+                pending.append(part.func.value)
+            elif isinstance(part, ast.AugAssign):
+                pending += [part.value, part.target]
+            elif isinstance(part, ast.For | ast.AsyncFor | ast.comprehension):
+                pending.append(part.iter)
+            elif (items := _alternatives(part)) is not None:
+                pending.append(None)
+                for item in reversed(items):
+                    pending += [item, None]
+            else:
+                runs[-1].append("?")
+        rank = max(_SQL_RANK[_sql_effect("".join(run))] for run in runs)
+        keys = [(owner, name) for name in names for owner in self.lookup(scope, name)[0]]
+        self._statements[node] = rank, keys
+        return rank, keys
+
+    def _wrapped(self, call: ast.Call, scope: _Scope) -> ast.AST | None:
+        """The statement a SQLAlchemy ``text()`` call wraps; None for any other call."""
+        chain = _chain(call.func)
+        if chain is None or not any(p in _SQL_TEXT for p, _ in self.resolve(scope, chain)[0]):
+            return None
+        return next(iter(call.args), None) or next(
+            (k.value for k in call.keywords if k.arg == "text"), None
+        )
+
+
+def _alternatives(node: ast.AST) -> list[ast.expr] | None:
+    """The values a statement may be one of: either side of a conditional or ``or``, or an
+    item of the literal or comprehension it is taken from; None for anything else."""
+    if isinstance(node, ast.IfExp):
+        return [node.body, node.orelse]
+    if isinstance(node, ast.BoolOp | ast.Dict):
+        return node.values
+    if isinstance(node, ast.List | ast.Tuple | ast.Set):
+        return node.elts
+    if isinstance(node, ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp):
+        return [node.value if isinstance(node, ast.DictComp) else node.elt]
+    return None
+
 
 def _chain(node: ast.AST) -> str | None:
     """``a.b.c`` for a name or attribute chain, reading through calls, without recursion."""
@@ -418,6 +666,8 @@ def _chain_through(node: ast.AST) -> tuple[str, bool] | None:
         elif isinstance(node, ast.Call):
             through_call = True
             node = node.func
+        elif isinstance(node, ast.Await):
+            node = node.value
         elif isinstance(node, ast.Name):
             parts.append(node.id)
             return ".".join(reversed(parts)), through_call
@@ -430,10 +680,145 @@ def _chain_through(node: ast.AST) -> tuple[str, bool] | None:
     return None
 
 
+def _names_in(node: ast.AST) -> set[str]:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
 def _literal(node: ast.AST | None) -> str | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     return None
+
+
+class _PythonBody:
+    """A tool body by program point, so a statement is read from the bindings that can
+    reach the call that runs it."""
+
+    def __init__(
+        self,
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+        nodes: list[tuple[ast.AST, _Scope, int, int, int]],
+        outer: dict[int, int],
+        scopes: PythonScopes,
+    ) -> None:
+        self.scopes, self.outer, self.at = scopes, outer, 0  # ``at``: the node being read.
+        self.frames = [frame for *_, frame, _ in nodes]
+        self.loops = [loop for *_, loop in nodes]
+        self.frame_of = {scope: frame for _, scope, _, frame, _ in nodes}
+        # Nodes are in source order, so each subtree ends where the next one not in it starts.
+        self.ends = list(range(1, len(nodes) + 1))
+        for index in range(len(nodes) - 1, -1, -1):
+            if (parent := nodes[index][2]) >= 0:
+                self.ends[parent] = max(self.ends[parent], self.ends[index])
+        self.position = {node: index for index, (node, *_) in enumerate(nodes)}
+        self.stops: dict[int, int] = {}
+        for loop in outer:  # A loop repeats to the end of its body; an else runs once, after.
+            body = getattr(nodes[loop][0], "body", None)
+            self.stops[loop] = self.ends[self.position[body[-1]] if body else loop]
+        self.last: dict[ast.AST, ast.AST] = dict.fromkeys(function.body, function.body[-1])
+        for node, *_ in nodes:
+            for _, value in ast.iter_fields(node):
+                if isinstance(value, list) and value and isinstance(value[-1], ast.stmt):
+                    self.last.update(dict.fromkeys(value, value[-1]))
+        a = function.args
+        every = (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg)
+        self.arguments = {p for p in every if p is not None and p.arg not in {"self", "cls"}}
+        self.summaries: dict[_Key, _Value] = {}
+        self._placed: dict[_Key, _Placed] = {}
+        self._contributions: dict[_Binding, _Value] = {}
+
+    def evaluate(self, node: ast.AST | None, scope: _Scope) -> _Value:
+        """What the statement ``node`` may be where the current node runs."""
+        rank, keys = self.scopes.statement(node, scope)
+        value: _Value = (False, rank)
+        for key in keys:
+            if self.frame_of.get(key[0]) == self.frames[self.at]:
+                value = _join(value, self.reaching(key))
+            else:
+                value = _join(value, self.summary(key))
+        return value
+
+    def reaching(self, key: _Key) -> _Value:
+        """What ``key`` may hold at the current node, which runs in the frame that binds it.
+        A binding there that always runs before the node hides the earlier ones, and one
+        later in a loop the node is in reaches it on the next pass; a binding made in another
+        frame, such as a ``nonlocal`` write in a closure, may reach it anywhere."""
+        placed, starts, value = self._place(key)
+        if len(placed) > _MAX_TARGETS:  # Past the bound every binding counts, in constant time.
+            return self.summary(key)
+        at, kill = self.at, -1
+        for latest in range(bisect.bisect_right(starts, at) - 1, -1, -1):
+            index, end, block, binding = placed[latest]
+            if end <= at:
+                value = _join(value, self.contribution(binding))
+                if at < block:
+                    kill = index
+                    break
+        start, stop, loop = -1, -1, self.loops[at]
+        while loop > kill:  # The outermost loop around the node that has no kill in it.
+            start, stop, loop = loop, self.stops[loop], self.outer[loop]
+        low, high = bisect.bisect_right(starts, start), bisect.bisect_left(starts, stop)
+        for _, end, _, binding in placed[low:high]:
+            if end > at:
+                value = _join(value, self.contribution(binding))
+        return value
+
+    def _place(self, key: _Key) -> _Placed:
+        if key not in self._placed:
+            frame, other = self.frame_of[key[0]], (False, 0)
+            placed: list[tuple[int, int, int, _Binding]] = []
+            for binding in self.scopes.bindings.get(key, ()):
+                where, statement = binding[0], binding[1]
+                index = -1 if where in self.arguments else self.position.get(where, -2)
+                if index == -1:
+                    placed.append((-1, 0, len(self.ends), binding))
+                elif index >= 0 and self.frames[index] == frame:
+                    block = self.ends[self.position[self.last[statement]]] if statement else -1
+                    placed.append((index, self.ends[index], block, binding))
+                else:
+                    other = _join(other, self.contribution(binding))
+            placed.sort(key=lambda entry: entry[0])
+            self._placed[key] = placed, [entry[0] for entry in placed], other
+        return self._placed[key]
+
+    def contribution(self, binding: _Binding) -> _Value:
+        """What one binding may give its name: its own text and what it is built from."""
+        if binding not in self._contributions:
+            rank, keys = self.scopes.statement(binding[2], binding[3])
+            value = (binding[0] in self.arguments, rank)
+            for key in keys:
+                value = _join(value, self.summary(key))
+            self._contributions[binding] = value
+        return self._contributions[binding]
+
+    def summary(self, key: _Key) -> _Value:
+        """What ``key`` may hold anywhere: every binding of it and of the names it is built
+        from, solved for every name reached at once so that a cycle reads every value."""
+        if key not in self.summaries:
+            found: dict[_Key, _Value] = {}
+            users: dict[_Key, set[_Key]] = {}
+            pending = [key]
+            while pending:
+                current = pending.pop()
+                if current in found or current in self.summaries:
+                    continue
+                found[current] = (False, 0)
+                for where, _, source, reads in self.scopes.bindings.get(current, ()):
+                    rank, keys = self.scopes.statement(source, reads)
+                    found[current] = _join(found[current], (where in self.arguments, rank))
+                    for ref in keys:
+                        users.setdefault(ref, set()).add(current)
+                        pending.append(ref)
+            queue = list(users)
+            while queue:
+                ref = queue.pop()
+                known = self.summaries[ref] if ref in self.summaries else found[ref]
+                for user in users.get(ref, ()):
+                    if (joined := _join(found[user], known)) != found[user]:
+                        found[user] = joined
+                        queue.append(user)
+            self.summaries.update(found)
+        return self.summaries[key]
 
 
 def _open_mode(call: ast.Call) -> str | None:
@@ -462,26 +847,47 @@ def _observe_python(
     function: ast.FunctionDef | ast.AsyncFunctionDef, scopes: PythonScopes
 ) -> _Observed | None:
     """What a body names that raises risk; None past a bound."""
-    nodes: list[tuple[ast.AST, _Scope]] = []
-    pending: list[tuple[ast.AST, _Scope]] = [
-        (s, scopes.scope(function)) for s in reversed(function.body)
-    ]
+    # Each node with its scope and, by index, its parent, the frame it runs in (the function
+    # or generator around it, or -1 for the tool's own) and the innermost loop around it in
+    # that frame; each loop with the next one out in its frame.
+    nodes: list[tuple[ast.AST, _Scope, int, int, int]] = []
+    outer: dict[int, int] = {}
+    own = scopes.scope(function)
+    pending: list[tuple[ast.AST, _Scope, int, int, int]]
+    pending = [(s, own, -1, -1, -1) for s in reversed(function.body)]
     while pending:
-        node, scope = pending.pop()
-        nodes.append((node, scope))
+        node, scope, _, frame, loop = entry = pending.pop()
+        nodes.append(entry)
         if len(nodes) > MAX_BODY_NODES:
             return None
-        pending.extend(reversed(scopes.children(node, scope)))
+        here = len(nodes) - 1
+        later = isinstance(node, (*_PY_FUNCTIONS, ast.GeneratorExp))  # Runs when called.
+        repeats = isinstance(node, _PY_LOOPS)
+        if repeats:
+            outer[here] = -1 if later else loop
+        once: set[ast.AST] = set()  # Parts of a loop that run once: an else, a for's iterable.
+        if isinstance(node, ast.For | ast.AsyncFor | ast.While):
+            once.update(node.orelse, [] if isinstance(node, ast.While) else [node.iter])
+        for child, inner in reversed(scopes.children(node, scope)):
+            if later and inner is not scope:
+                pending.append((child, inner, here, here, here if repeats else -1))
+            else:
+                around = here if repeats and child not in once else loop
+                pending.append((child, inner, here, frame, around))
     seen = _Observed()
     try:
-        for node, scope in nodes:
-            _python_node(node, scope, scopes, seen)
+        body = _PythonBody(function, nodes, outer, scopes)
+        for index, (node, scope, *_) in enumerate(nodes):
+            body.at = index
+            _python_node(node, scope, scopes, body, seen)
     except _TooManyTargetsError:
         return None
     return seen
 
 
-def _python_node(node: ast.AST, scope: _Scope, scopes: PythonScopes, seen: _Observed) -> None:
+def _python_node(
+    node: ast.AST, scope: _Scope, scopes: PythonScopes, body: _PythonBody, seen: _Observed
+) -> None:
     if isinstance(node, ast.Subscript):
         environ = _chain(node.value)
         if environ is not None and any(
@@ -497,6 +903,7 @@ def _python_node(node: ast.AST, scope: _Scope, scopes: PythonScopes, seen: _Obse
         return
     written, through_call = found
     names, unresolved = scopes.resolve(scope, written)
+    receiver = written.split(".")[0] if "." in written else ""
     if unresolved:
         last = written.rsplit(".", 1)[-1]
         if last in _FS_WRITE:
@@ -505,6 +912,12 @@ def _python_node(node: ast.AST, scope: _Scope, scopes: PythonScopes, seen: _Obse
             seen.delete(CapabilityClass.FILESYSTEM)
     for name, via_call in names:
         _python_call(node, name, through_call or via_call, seen)
+    # Once per call, whatever targets the callee has: building a statement, such as with
+    # SQLAlchemy's ``text()``, is not running it.
+    if written.rsplit(".", 1)[-1] in _DB_EXECUTE and (
+        receiver in _DB_RECEIVERS or any(n.split(".")[0] in _DB_MODULES for n, _ in names)
+    ):
+        _python_sql(node, scope, body, seen)
 
 
 def _python_call(node: ast.Call, name: str, through_call: bool, seen: _Observed) -> None:
@@ -550,6 +963,22 @@ def _python_call(node: ast.Call, name: str, through_call: bool, seen: _Observed)
         key = _literal(node.args[0]) if node.args else None
         if key is not None and _secret_name(key):
             seen.add(CapabilityClass.CREDENTIALS)
+
+
+def _python_sql(call: ast.Call, scope: _Scope, body: _PythonBody, seen: _Observed) -> None:
+    named = (k.value for k in call.keywords if k.arg in _SQL_ARGUMENTS)
+    supplied, rank = body.evaluate(next(iter(call.args), None) or next(named, None), scope)
+    if supplied:
+        seen.raw_sql = True
+        rank = 2
+    _sql_record(rank, seen)
+
+
+def _sql_record(rank: int, seen: _Observed) -> None:
+    if rank == 2:
+        seen.delete()
+    elif rank == 1:
+        seen.write()
 
 
 def _ts_text(node: Node | None) -> str:
@@ -776,6 +1205,29 @@ def _ts_parameters(handler: Node) -> set[str]:
     return names
 
 
+def _ts_uses(node: Node, parameters: set[str], *, assume: bool = True) -> bool:
+    """Whether ``node`` reads a parameter; past ``_MAX_USE_NODES`` nodes, ``assume``."""
+    if not parameters:
+        return False
+    stack = [node]
+    budget = _MAX_USE_NODES
+    while stack:
+        budget -= 1
+        if budget < 0:
+            return assume
+        current = stack.pop()
+        if current.type in {"identifier", "shorthand_property_identifier"}:
+            if _ts_text(current) in parameters:
+                return True
+        elif current.type == "member_expression":
+            obj = current.child_by_field_name("object")
+            if obj is not None:
+                stack.append(obj)
+            continue
+        stack.extend(current.named_children)
+    return False
+
+
 def _ts_method(options: Node | None) -> str:
     if options is None or options.type != "object":
         return ""
@@ -833,8 +1285,11 @@ def _ts_import_binding(value: Node | None, imports: Bindings) -> bool:
     return value is not None and value.type == "call_expression" and bool(_ts_loaded_module(value))
 
 
-def _ts_locals(handler: Node, imports: Bindings) -> set[str]:
-    """Names the body binds at its top level, which shadow imports."""
+def _ts_locals(
+    handler: Node, imports: Bindings, tainted: set[str], skip: frozenset[int]
+) -> set[str] | None:
+    """Names the body binds at its top level, which shadow imports; a name bound from a
+    parameter anywhere is added to ``tainted``. None past the node bound."""
     names: set[str] = set()
     body = handler.child_by_field_name("body")
     if body is not None and body.type == "statement_block":
@@ -850,6 +1305,21 @@ def _ts_locals(handler: Node, imports: Bindings) -> set[str]:
                         value, imports
                     ):
                         names.update(_ts_bound_names(declarator.child_by_field_name("name")))
+    stack = [handler]
+    visited = 0
+    declarators: list[Node] = []
+    while stack:
+        node = stack.pop()
+        visited += 1
+        if visited > MAX_BODY_NODES:
+            return None
+        if node.type == "variable_declarator":
+            declarators.append(node)
+        stack.extend(child for child in node.named_children if child.id not in skip)
+    for node in sorted(declarators, key=lambda n: n.start_byte):
+        value = node.child_by_field_name("value")
+        if value is not None and _ts_uses(value, tainted, assume=False):
+            tainted.update(_ts_bound_names(node.child_by_field_name("name")))
     return names
 
 
@@ -883,8 +1353,15 @@ def classify_typescript(
     """Classify a handler by the calls in its syntax tree; ``skip`` holds other tools' ids."""
     seen = _Observed()
     parameters = frozenset(_ts_parameters(handler))
-    # A name taken from one of the handler's parameters is not taken from an import.
-    local = _ts_locals(handler, {name: b for name, b in imports.items() if name not in parameters})
+    # _ts_locals adds names bound from a parameter anywhere in the body to ``tainted``, so
+    # that SQL built from them is caller-supplied; only the handler's own parameters and
+    # the names it binds at its top level shadow imports, and a name taken from one of
+    # its parameters is not taken from an import.
+    tainted = set(parameters)
+    unshadowed = {name: b for name, b in imports.items() if name not in parameters}
+    local = _ts_locals(handler, unshadowed, tainted, skip)
+    if local is None:
+        return ToolCapabilities(unclassified=True)
     imports = {name: bound for name, bound in imports.items() if name not in local}
     shadowed = parameters | local
     stack = [handler]
@@ -896,7 +1373,7 @@ def classify_typescript(
             return ToolCapabilities(unclassified=True)
         if node.type == "call_expression":
             try:
-                _ts_call(node, imports, shadowed, parameters, seen)
+                _ts_call(node, imports, shadowed, parameters, seen, tainted)
             except _TooManyTargetsError:
                 return ToolCapabilities(unclassified=True)
         elif node.type == "new_expression":
@@ -931,6 +1408,7 @@ def _ts_call(
     shadowed: frozenset[str],
     parameters: frozenset[str],
     seen: _Observed,
+    tainted: set[str],
 ) -> None:
     """Classify one call against every binding its head may have."""
     chain = _ts_chain(node.child_by_field_name("function"))
@@ -993,3 +1471,36 @@ def _ts_call(
         seen.add(CapabilityClass.NETWORK)
         seen.write(CapabilityClass.PAYMENT)
         seen.payment = True
+    # A receiver counts by its module, or by its name when nothing in the file binds it;
+    # Prisma's ``$``-prefixed raw methods exist on no other client.
+    client = last.startswith("$") or any(module in _TS_DB_MODULES for module, _ in candidates)
+    named = len(chain) > 1 and chain[-2] in _TS_DB_RECEIVERS
+    named = named and not (len(chain) == 2 and candidates)
+    if last in _TS_SQL and len(chain) > 1 and values and (client or named):
+        statement = values[0]
+        interpolated = statement.type == "template_string" and any(
+            part.type == "template_substitution" and _ts_uses(part, tainted)
+            for part in statement.named_children
+        )
+        passed = statement.type == "identifier" and _ts_text(statement) in tainted
+        if interpolated or passed:
+            seen.raw_sql = True
+            seen.delete()
+        else:
+            _sql_record(_SQL_RANK[_sql_effect(_ts_literal_text(statement))], seen)
+
+
+def _ts_literal_text(node: Node) -> str | None:
+    """The text of a string or template literal, each substitution read as ``?``."""
+    if node.type not in {"string", "template_string"}:
+        return None
+    parts: list[str] = []
+    for child in node.named_children:
+        if child.type == "string_fragment":
+            parts.append(_ts_text(child))
+        elif child.type == "escape_sequence":
+            escaped = _ts_text(child)
+            parts.append("\n" if escaped in {"\\n", "\\r"} else escaped[1:2])
+        elif child.type == "template_substitution":
+            parts.append(" ? ")
+    return "".join(parts)

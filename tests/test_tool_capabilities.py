@@ -93,6 +93,31 @@ def test_an_http_client_bound_in_the_body_sends_data() -> None:
     assert E.WRITE in session.capabilities
 
 
+def test_sql_built_from_a_parameter_is_caller_supplied() -> None:
+    for body in (
+        "    sql = f'DELETE FROM {table}'\n    db.execute(sql)\n",
+        "    db.execute('DELETE FROM t WHERE id = {tid}'.format(tid=table))\n",
+        "    db.execute('DELETE FROM ' + table)\n",
+        "    sqlite3.connect('x.db').execute(table)\n",
+    ):
+        found = _classify(f"import sqlite3\n\ndef purge(db, table: str) -> None:\n{body}")
+        assert found.profile is SideEffectProfile.DESTRUCTIVE, body
+        assert any("caller-supplied" in r.detail for r in found.risks), body
+
+
+def test_a_parameterized_query_names_nothing_and_a_literal_delete_is_destructive() -> None:
+    safe = _classify(
+        "import sqlite3\n\ndef lookup(conn, tid: str) -> list:\n"
+        "    return conn.execute('SELECT * FROM t WHERE id = ?', (tid,)).fetchall()\n"
+    )
+    assert safe.declaration is None and not safe.risks
+    delete = _classify(
+        "from sqlalchemy.sql import text\n\ndef clear(session) -> None:\n"
+        "    session.execute(text('DELETE FROM sessions'))\n"
+    )
+    assert delete.profile is SideEffectProfile.DESTRUCTIVE and not delete.risks
+
+
 def test_payment_writes_filesystem_deletes_and_secret_reads() -> None:
     found = _classify(
         "import os\nimport shutil\nimport stripe\nfrom pathlib import Path\n\n"
@@ -200,6 +225,42 @@ def test_python_mcp_tools_carry_capabilities_and_their_evidence(tmp_path: Path) 
     assert "capability_evidence" not in tools["greet"].properties
 
 
+def test_a_python_tool_that_runs_a_caller_statement_is_destructive_and_high(tmp_path: Path) -> None:
+    (tmp_path / "server.py").write_text(
+        "import sqlite3\nfrom mcp.server.fastmcp import FastMCP\n\n"
+        "mcp = FastMCP('tickets')\nengine = sqlite3.connect('t.db')\n\n"
+        "@mcp.tool()\ndef run_sql(statement: str) -> list:\n"
+        '    """Run SQL."""\n    return list(engine.execute(statement))\n'
+    )
+    run_sql = _tools(tmp_path)["run_sql"]
+    assert run_sql.capabilities is not None
+    assert run_sql.capabilities.side_effect_profile is SideEffectProfile.DESTRUCTIVE
+    assert run_sql.properties["capability_evidence"] == EVIDENCE
+    assert any(
+        r.category == "capability_scope" and r.severity.value == "high" for r in run_sql.risks
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "expected", "profile"),
+    [
+        ("    conn.execute('INSERT INTO t VALUES (1)')\n", {E.WRITE}, "state-modifying"),
+        (
+            "    stmt: str = 'DROP TABLE t'\n    conn.execute(stmt)\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            "destructive",
+        ),
+    ],
+    ids=["literal-insert", "annotated-local-drop"],
+)
+def test_python_sql_statement_forms(
+    body: str, expected: set[CapabilityClass], profile: str
+) -> None:
+    found = _classify(f"def tool(conn):\n{body}")
+    assert set(found.capabilities) == expected, body
+    assert found.profile.value == profile, body
+
+
 # ---- TypeScript ---------------------------------------------------------------------------
 
 
@@ -254,6 +315,15 @@ def test_typescript_negative_controls(tmp_path: Path, handler: str) -> None:
     tool = _ts(tmp_path, handler)
     assert tool.capabilities is None, handler
     assert not [r for r in tool.risks if r.category == "capability_scope"], handler
+
+
+def test_typescript_sql_from_a_parameter_is_caller_supplied(tmp_path: Path) -> None:
+    for name, handler in {
+        "a": "({ id }) => db.query(`DELETE FROM t WHERE id = ${id}`)",
+        "b": "({ statement }) => prisma.$queryRawUnsafe(statement)",
+    }.items():
+        tool = _ts(tmp_path / name, handler)
+        assert any("caller-supplied" in r.detail for r in tool.risks), handler
 
 
 def test_a_nested_registration_is_classified_by_its_own_handler_only(tmp_path: Path) -> None:
@@ -337,6 +407,14 @@ def test_typescript_handler_bindings_shadow_imports(tmp_path: Path) -> None:
     assert shadow.capabilities is None
 
 
+def test_typescript_names_bound_from_a_parameter_carry_taint(tmp_path: Path) -> None:
+    tainted = _ts(
+        tmp_path,
+        "(args) => { const { id } = args; return db.query(`DELETE FROM t WHERE id = ${id}`); }",
+    )
+    assert any("caller-supplied" in r.detail for r in tainted.risks)
+
+
 @pytest.mark.parametrize("kind", ["member", "call", "template"])
 def test_long_chains_and_nested_templates_stay_linear(tmp_path: Path, kind: str) -> None:
     import time
@@ -375,8 +453,8 @@ def test_long_chains_and_nested_templates_stay_linear(tmp_path: Path, kind: str)
         ("    os.remove(path)\n", {E.FILESYSTEM, E.WRITE, E.DESTRUCTIVE}, "destructive"),
         (
             "    conn.execute(*args)\n    smtplib.SMTP('h').sendmail(a, b, data)\n",
-            {E.NETWORK, E.WRITE},
-            "state-modifying",
+            {E.NETWORK, E.WRITE, E.DESTRUCTIVE},
+            "destructive",
         ),
     ],
 )
@@ -415,6 +493,12 @@ def test_typescript_forms(
     tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass]
 ) -> None:
     assert _caps(_ts(tmp_path, handler, header)) == expected, handler
+
+
+def test_typescript_parameter_use_past_its_bound_is_assumed(tmp_path: Path) -> None:
+    template = "(id) => db.query(`DELETE FROM t WHERE x = ${ARGUMENT}`)"
+    tool = _ts(tmp_path, template.replace("ARGUMENT", " + ".join(["k"] * 400)))
+    assert any("caller-supplied" in r.detail for r in tool.risks)
 
 
 def test_a_typescript_body_past_the_bound_records_a_gap(tmp_path: Path) -> None:
@@ -513,6 +597,13 @@ def test_typescript_final_check_forms(
     tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass]
 ) -> None:
     assert _caps(_ts(tmp_path, handler, header)) == expected, handler
+
+
+def test_a_local_too_large_to_read_is_not_tainted(tmp_path: Path) -> None:
+    columns = ", ".join(f"'c{i}'" for i in range(130))
+    template = "(id) => { const cols = [COLUMNS]; return db.query(`SELECT ${cols.join(',')} FROM t`, [id]); }"
+    tool = _ts(tmp_path, template.replace("COLUMNS", columns))
+    assert not [r for r in tool.risks if r.category == "capability_scope"]
 
 
 # ---- Review of 17cd06df: Python scoping and destructured TypeScript bindings ---------------
@@ -729,6 +820,173 @@ def test_typescript_destructured_module_bindings(
 
 
 @pytest.mark.parametrize(
+    ("body", "expected", "raw"),
+    [
+        ("    return text(q)\n", set(), False),
+        ("    stmt = text(q)\n    return stmt\n", set(), False),
+        ("    return session.execute(text(q))\n", {E.WRITE, E.DESTRUCTIVE}, True),
+        (
+            "    stmt = text(f'DELETE FROM t WHERE id = {q}')\n    return conn.execute(stmt)\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            True,
+        ),
+        ("    return conn.execute(text(q).bindparams(a=1))\n", {E.WRITE, E.DESTRUCTIVE}, True),
+        ("    return conn.execute(text('SELECT 1').bindparams(a=q))\n", set(), False),
+        ("    return conn.execute('SELECT * FROM t -- DELETE later', (q,))\n", set(), False),
+        (
+            "    return conn.execute(\"SELECT * FROM t WHERE note = 'please DROP it'\")\n",
+            set(),
+            False,
+        ),
+        ("    return conn.execute('/* UPDATE */ SELECT * FROM t FOR UPDATE')\n", set(), False),
+        ("    return conn.execute('SELECT 1; DROP TABLE t')\n", {E.WRITE, E.DESTRUCTIVE}, False),
+        (
+            "    return conn.execute('ALTER TABLE t DROP COLUMN c')\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    return conn.execute('CREATE TABLE t (id INT REFERENCES u ON DELETE CASCADE)')\n",
+            {E.WRITE},
+            False,
+        ),
+        (
+            "    return conn.execute('WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d')\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+    ],
+    ids=[
+        "text-preview",
+        "text-bound-and-returned",
+        "text-executed",
+        "text-of-an-f-string-executed",
+        "text-bindparams-executed",
+        "literal-text-bindparams",
+        "comment-prose",
+        "literal-prose",
+        "lock-clause",
+        "second-statement",
+        "alter-drop",
+        "referential-action",
+        "data-modifying-cte",
+    ],
+)
+def test_sql_is_read_as_statements_and_only_executed_sql_counts(
+    body: str, expected: set[CapabilityClass], raw: bool
+) -> None:
+    found = _classify(f"from sqlalchemy import text\n\ndef tool(q, session, conn):\n{body}")
+    assert set(found.capabilities) == expected, body
+    assert any("caller-supplied" in r.detail for r in found.risks) is raw, body
+
+
+@pytest.mark.parametrize(
+    ("handler", "expected"),
+    [
+        ('(id) => db.query("UPDATE t SET seen = 1 WHERE id = $1", [id])', {E.WRITE}),
+        ("() => db.query('DELETE FROM sessions')", {E.WRITE, E.DESTRUCTIVE}),
+        ("(id) => db.query(`UPDATE t SET n = ${LIMIT} WHERE id = $1`, [id])", {E.WRITE}),
+        ("() => db.query('SELECT * FROM t -- DELETE later')", set()),
+        ("() => db.query(\"SELECT * FROM t WHERE note = 'please DROP it'\")", set()),
+        ("(q) => index.query('Update my profile')", set()),
+    ],
+    ids=["update", "delete", "constant-substitution", "comment", "literal", "prose"],
+)
+def test_typescript_literal_sql_is_classified_by_its_statement(
+    tmp_path: Path, handler: str, expected: set[CapabilityClass]
+) -> None:
+    tool = _ts(tmp_path, handler)
+    assert _caps(tool) == expected, handler
+    assert not [r for r in tool.risks if r.category == "capability_scope"], handler
+
+
+@pytest.mark.parametrize(
+    ("body", "expected", "raw"),
+    [
+        (
+            "    sql = 'DELETE FROM t'\n    conn.execute(sql)\n    sql = 'SELECT 1'\n"
+            "    return conn.execute(sql)\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    sql = f'DELETE FROM t WHERE n = {q}'\n    conn.execute(sql)\n    sql = 'SELECT 1'\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            True,
+        ),
+        ("    sql = 'SELECT 1'\n    conn.execute(sql)\n    sql = 'DELETE FROM t'\n", set(), False),
+        (
+            "    if q:\n        sql = 'DELETE FROM t'\n    else:\n        sql = 'SELECT 1'\n"
+            "    conn.execute(sql)\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    sql = 'SELECT 1'\n    for row in q:\n        conn.execute(sql)\n"
+            "        sql = 'UPDATE t SET seen = 1'\n",
+            {E.WRITE},
+            False,
+        ),
+        ("    return conn.execute('EXPLAIN DELETE FROM t')\n", set(), False),
+        ("    return conn.execute('EXPLAIN QUERY PLAN DELETE FROM t')\n", set(), False),
+        (
+            "    return conn.execute('EXPLAIN ANALYZE DELETE FROM t')\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    return conn.execute('EXPLAIN (ANALYZE, BUFFERS) UPDATE t SET a = 1')\n",
+            {E.WRITE},
+            False,
+        ),
+        (
+            "    return conn.execute('SELECT $doc$ Use UPDATE t SET a = 1; DROP TABLE t $doc$')\n",
+            set(),
+            False,
+        ),
+        ("    return conn.execute('SELECT $$ (DELETE FROM t) $$')\n", set(), False),
+        (
+            "    return conn.execute('DELETE FROM t WHERE id = $1', (q,))\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+    ],
+    ids=[
+        "later-assignment",
+        "later-assignment-of-caller-text",
+        "assignment-after-the-call",
+        "either-branch",
+        "loop-carried",
+        "explain",
+        "explain-query-plan",
+        "explain-analyze",
+        "explain-options",
+        "dollar-quoted",
+        "empty-dollar-tag",
+        "positional-parameter",
+    ],
+)
+def test_sql_is_classified_at_the_call_as_it_runs(
+    body: str, expected: set[CapabilityClass], raw: bool
+) -> None:
+    found = _classify(f"def tool(q, conn):\n{body}")
+    assert set(found.capabilities) == expected, body
+    assert any("caller-supplied" in r.detail for r in found.risks) is raw, body
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        "() => db.query('EXPLAIN UPDATE t SET a = 1')",
+        "() => db.query('SELECT $$; DROP TABLE t $$')",
+    ],
+    ids=["explain", "dollar-quoted"],
+)
+def test_typescript_plans_and_quoted_sql_write_nothing(tmp_path: Path, handler: str) -> None:
+    assert _caps(_ts(tmp_path, handler)) == set(), handler
+
+
+@pytest.mark.parametrize(
     ("source", "expected"),
     [
         (
@@ -817,6 +1075,13 @@ def test_a_function_classified_without_its_module_scopes_still_reads_its_own() -
     assert set(classify_python(function).capabilities) == {E.EXECUTE}
 
 
+def test_a_doubled_quote_stays_inside_its_literal() -> None:
+    found = _classify(
+        "def tool(conn):\n    conn.execute(\"INSERT INTO t VALUES ('it''s; DROP TABLE x')\")\n"
+    )
+    assert set(found.capabilities) == {E.WRITE}
+
+
 def test_a_body_registered_under_many_names_is_read_once(tmp_path: Path) -> None:
     import time
 
@@ -838,6 +1103,460 @@ def test_a_body_registered_under_many_names_is_read_once(tmp_path: Path) -> None
 
     small, large = cost(1), cost(200)
     assert large < max(small, 0.05) * 6, (small, large)
+
+
+# ---- Reviews of d05e5cdc and 10b2125a: SQL at the call, database receivers ----------------
+
+
+@pytest.mark.parametrize(
+    ("body", "expected", "raw"),
+    [
+        (
+            "    sql = 'DELETE FROM t'\n    sql = 'SELECT 1'\n    return conn.execute(sql)\n",
+            set(),
+            False,
+        ),
+        (
+            "    sql = 'DELETE FROM t'\n    if q:\n        sql = 'SELECT 1'\n    return conn.execute(sql)\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    sql = 'DELETE FROM t'\n    sql = conn.execute(sql)\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    sql = 'SELECT 1'\n    for r in rows:\n        sql = 'SELECT 2'\n"
+            "        conn.execute(sql)\n        sql = 'DELETE FROM t'\n",
+            set(),
+            False,
+        ),
+        (
+            "    sql = 'SELECT 1'\n    def inner():\n        sql = 'DELETE FROM t'\n        return sql\n"
+            "    return conn.execute(sql)\n",
+            set(),
+            False,
+        ),
+        (
+            "    sql = 'DELETE FROM t'\n    def run():\n        conn.execute(sql)\n    run()\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    return session.execute(statement=text(f'DELETE FROM t WHERE id = {q}'))\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            True,
+        ),
+        ("    return conn.execute(query='DROP TABLE t')\n", {E.WRITE, E.DESTRUCTIVE}, False),
+        (
+            "    return session.execute(text(text=f'DELETE FROM t WHERE id = {q}'))\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            True,
+        ),
+        ("    return conn.execute('EXPLAIN (ANALYZE FALSE) DELETE FROM t')\n", set(), False),
+        ("    return conn.execute('EXPLAIN (ANALYZE OFF, BUFFERS) DELETE FROM t')\n", set(), False),
+        ("    return conn.execute('EXPLAIN (ANALYZE 0) DELETE FROM t')\n", set(), False),
+        (
+            "    return conn.execute('EXPLAIN (ANALYZE TRUE) DELETE FROM t')\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+    ],
+    ids=[
+        "definite-overwrite",
+        "overwrite-in-a-branch",
+        "assignment-of-the-call-result",
+        "killed-inside-the-loop",
+        "nested-scope-stays-there",
+        "closure-reads-the-outer-value",
+        "statement-keyword",
+        "query-keyword",
+        "text-keyword",
+        "explain-analyze-false",
+        "explain-analyze-off",
+        "explain-analyze-zero",
+        "explain-analyze-true",
+    ],
+)
+def test_sql_values_follow_the_program_and_explain_options(
+    body: str, expected: set[CapabilityClass], raw: bool
+) -> None:
+    found = _classify(f"from sqlalchemy import text\n\ndef tool(q, conn, session, rows):\n{body}")
+    assert set(found.capabilities) == expected, body
+    assert any("caller-supplied" in r.detail for r in found.risks) is raw, body
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected"),
+    [
+        ("", "async ({ query }) => searchClient.query(query)", set()),
+        ("", "async (args) => handler.execute(args)", set()),
+        ("", "async ({ v }) => index.query(v)", set()),
+        ("", "async ({ q }) => graphql.query(q)", set()),
+        ("", "async ({ sql }) => knex.raw(sql)", {E.WRITE, E.DESTRUCTIVE}),
+        ("", "async ({ q }) => this.db.query(q)", {E.WRITE, E.DESTRUCTIVE}),
+        ("", "async () => pool.query('DELETE FROM t')", {E.WRITE, E.DESTRUCTIVE}),
+        ('import pg from "pg";\n', "async ({ q }) => pg.query(q)", {E.WRITE, E.DESTRUCTIVE}),
+        ("", "async (stripe) => stripe.refunds.create({ charge: 'x' })", set()),
+    ],
+    ids=[
+        "search-client",
+        "handler",
+        "vector-index",
+        "graphql",
+        "knex",
+        "this-db",
+        "pool-literal",
+        "pg-import",
+        "stripe-parameter",
+    ],
+)
+def test_typescript_sql_needs_a_database_client(
+    tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass]
+) -> None:
+    assert _caps(_ts(tmp_path, handler, header)) == expected, handler
+
+
+D, W, N = (
+    SideEffectProfile.DESTRUCTIVE,
+    SideEffectProfile.STATE_MODIFYING,
+    SideEffectProfile.UNKNOWN,
+)
+
+
+@pytest.mark.parametrize(
+    ("source", "profile", "raw"),
+    [
+        (
+            "def tool(cur):\n    sql = 'SELECT 1'\n    def run():\n        cur.execute(sql)\n"
+            "    sql = 'DROP TABLE users'\n    run()\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur):\n    sql = 'SELECT 1'\n    run = lambda: cur.execute(sql)\n"
+            "    sql = 'DROP TABLE users'\n    run()\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur):\n    sql = 'SELECT 1'\n    rows = (cur.execute(sql) for _ in range(1))\n"
+            "    sql = 'DROP TABLE users'\n    return list(rows)\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur, hard):\n    sql = 'SELECT 1'\n    def choose():\n        nonlocal sql\n"
+            "        sql = 'DROP TABLE users'\n    if hard:\n        choose()\n    cur.execute(sql)\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur):\n    def setup():\n        global SQL\n        SQL = 'DROP TABLE users'\n"
+            "    setup()\n    cur.execute(SQL)\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur):\n    sql = 'DROP TABLE users'\n    def inner():\n        nonlocal sql\n"
+            "        cur.execute(sql)\n        sql = 'SELECT 1'\n    inner()\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur, batches):\n    for batch in batches:\n        sql = 'SELECT 1'\n"
+            "        for row in batch:\n            cur.execute(sql, row)\n"
+            "            sql = 'DELETE FROM t WHERE id = ?'\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur, ys, xs):\n    for y in ys:\n        def run():\n            sql = 'SELECT 1'\n"
+            "            for x in xs:\n                cur.execute(sql)\n                sql = 'DROP TABLE t'\n"
+            "        run()\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur, name):\n    sql = 'SELECT * FROM users WHERE 1 = 1'\n    if name:\n"
+            "        sql += f\" AND name = '{name}'\"\n    cur.execute(sql)\n",
+            D,
+            True,
+        ),
+        (
+            "def tool(cur):\n    sql = 'SELECT 1'\n    sql += '; DROP TABLE users'\n    cur.execute(sql)\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur, ident):\n    sql = 'DELETE FROM users'\n    sql = sql + ' WHERE id = ?'\n"
+            "    cur.execute(sql, (ident,))\n",
+            D,
+            False,
+        ),
+        (
+            "from sqlalchemy import text\ndef tool(conn, ident):\n"
+            "    stmt = text('DELETE FROM users WHERE id = :i')\n    stmt = stmt.bindparams(i=ident)\n"
+            "    conn.execute(stmt)\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur, statements):\n    for sql in statements:\n        cur.execute(sql)\n",
+            D,
+            True,
+        ),
+        (
+            "def tool(cur, statements):\n    sql = 'SELECT 1'\n    for sql in statements:\n"
+            "        cur.execute(sql)\n",
+            D,
+            True,
+        ),
+        (
+            "def tool(cur, ident):\n    sql, params = 'DELETE FROM users WHERE id = ?', (ident,)\n"
+            "    cur.execute(sql, params)\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur, ident):\n    sql, params = 'SELECT 1', ident\n    cur.execute(sql, params)\n",
+            N,
+            False,
+        ),
+        (
+            "def tool(cur, table):\n    if (sql := f'DROP TABLE {table}'):\n        cur.execute(sql)\n",
+            D,
+            True,
+        ),
+        ("def tool(cur):\n    cur.execute(sql := 'DROP TABLE t')\n", D, False),
+        (
+            "def tool(cur, payload):\n    sql = 'SELECT 1'\n    match payload:\n"
+            "        case {'sql': sql}:\n            cur.execute(sql)\n",
+            D,
+            True,
+        ),
+        ("def tool(cur):\n    [cur.execute(s) for s in ('DROP TABLE a',)]\n", D, False),
+        (
+            "DELETE_SQL = 'DELETE FROM notes WHERE id = ?'\ndef tool(conn, note_id):\n"
+            "    conn.execute(DELETE_SQL, (note_id,))\n",
+            D,
+            False,
+        ),
+        (
+            "TABLE = 'notes'\ndef tool(cur, note_id):\n"
+            "    cur.execute(f'DELETE FROM {TABLE} WHERE id = ?', (note_id,))\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur, hard):\n    sql = 'DELETE FROM t' if hard else 'UPDATE t SET deleted = 1'\n"
+            "    cur.execute(sql)\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur, hard):\n    sql = 'SELECT 1' if hard else 'UPDATE t SET deleted = 1'\n"
+            "    cur.execute(sql)\n",
+            W,
+            False,
+        ),
+        ("def tool(cur):\n    cur.execute('DELETE FROM t ' + 'WHERE id = 1')\n", D, False),
+        (
+            "def tool(cur):\n    drop = 'DROP TABLE users'\n    sql = drop\n    cur.execute(sql)\n",
+            D,
+            False,
+        ),
+        (
+            "from sqlalchemy import text\ndef tool(session):\n    sql = 'DELETE FROM users'\n"
+            "    stmt = text(sql)\n    session.execute(stmt)\n",
+            D,
+            False,
+        ),
+        ("def tool(cur, req):\n    cur.execute(req.sql)\n", D, True),
+        ("def tool(cur, args):\n    cur.execute(args['sql'])\n", D, True),
+        ("def tool(cur, q):\n    cur.execute(q.strip())\n", D, True),
+        (
+            "def tool(cur, table):\n    t = table.strip()\n    cur.execute(f'SELECT * FROM {t}')\n",
+            D,
+            True,
+        ),
+        ("def tool(cur, q):\n    a = q\n    b = a\n    cur.execute(b)\n", D, True),
+        ("def tool(cur, q):\n    sql = q or 'SELECT 1'\n    cur.execute(sql)\n", D, True),
+        (
+            "def tool(cur, cols):\n    cur.execute('SELECT ' + ', '.join(cols) + ' FROM t')\n",
+            D,
+            True,
+        ),
+        (
+            "QUERIES = {'users': 'SELECT * FROM users'}\ndef tool(cur, name):\n"
+            "    cur.execute(QUERIES[name])\n",
+            N,
+            False,
+        ),
+        (
+            "QUERIES = {'purge': 'DELETE FROM t'}\ndef tool(cur, name):\n"
+            "    cur.execute(QUERIES.get(name, 'SELECT 1'))\n",
+            D,
+            False,
+        ),
+        ("class T:\n    def tool(self, cur):\n        cur.execute(self.SQL)\n", N, False),
+        (
+            "import psycopg\nasync def tool(dsn):\n"
+            "    aconn = await psycopg.AsyncConnection.connect(dsn)\n"
+            "    await aconn.execute('DELETE FROM users')\n",
+            D,
+            False,
+        ),
+        (
+            "def tool(cur):\n    sql = 'SELECT 1'\n    for row in cur.execute(sql):\n"
+            "        sql = 'DROP TABLE users'\n",
+            N,
+            False,
+        ),
+        (
+            "def tool(cur, xs):\n    sql = 'SELECT 1'\n    for x in xs:\n        cur.execute(sql)\n"
+            "    else:\n        sql = 'DROP TABLE users'\n",
+            N,
+            False,
+        ),
+        (
+            "def tool(cur):\n    sql = 'SELECT 1'\n    while cur.execute(sql):\n"
+            "        sql = 'DROP TABLE users'\n",
+            D,
+            False,
+        ),
+        ("def tool(cur, sql):\n    sql = 'SELECT 1'\n    cur.execute(sql)\n", N, False),
+        (
+            "def tool(cur, sql, safe):\n    if safe:\n        sql = 'SELECT 1'\n    cur.execute(sql)\n",
+            D,
+            True,
+        ),
+        (
+            "def tool(cur):\n    sql = 'DROP TABLE users'\n    class Q:\n        sql = 'SELECT 1'\n"
+            "        def run(self):\n            cur.execute(sql)\n    Q().run()\n",
+            D,
+            False,
+        ),
+    ],
+    ids=[
+        "closure-defined-before-a-later-assignment",
+        "lambda",
+        "generator-expression",
+        "nonlocal-write",
+        "global-write",
+        "nonlocal-read-before-its-reassignment",
+        "inner-loop-reassignment",
+        "inner-loop-in-a-function-in-a-loop",
+        "augmented-f-string",
+        "augmented-literal",
+        "self-derived-concatenation",
+        "self-derived-bindparams",
+        "loop-target",
+        "loop-target-after-a-literal",
+        "tuple-unpacking",
+        "tuple-unpacking-pairs-items",
+        "walrus",
+        "walrus-as-the-statement",
+        "match-capture",
+        "comprehension-target",
+        "module-constant",
+        "f-string-over-a-constant",
+        "conditional-expression",
+        "conditional-write",
+        "concatenated-literals",
+        "alias-of-a-literal",
+        "text-of-a-variable",
+        "attribute-of-a-parameter",
+        "subscript-of-a-parameter",
+        "method-of-a-parameter",
+        "local-derived-from-a-parameter",
+        "two-hop-alias",
+        "or-default",
+        "join-of-a-parameter",
+        "allow-listed-query-by-key",
+        "allow-listed-query-by-get",
+        "self-attribute",
+        "awaited-connection",
+        "loop-iterable-runs-once",
+        "loop-else-runs-once",
+        "while-test-runs-each-pass",
+        "parameter-overwritten",
+        "parameter-kept-in-a-branch",
+        "class-scope-is-skipped",
+    ],
+)
+def test_a_statement_reaches_the_call_through_every_binding_and_frame(
+    source: str, profile: SideEffectProfile, raw: bool
+) -> None:
+    found = _classify_named(source, "tool")
+    assert found.profile is profile, source
+    assert any("caller-supplied" in r.detail for r in found.risks) is raw, source
+
+
+@pytest.mark.parametrize(("overwrites", "profile"), [(31, SideEffectProfile.UNKNOWN), (32, D)])
+def test_past_the_bound_every_binding_of_a_statement_counts(
+    overwrites: int, profile: SideEffectProfile
+) -> None:
+    lines = "    sql = 'SELECT 1'\n" * overwrites
+    found = _classify(f"def tool(conn):\n    sql = 'DROP TABLE t'\n{lines}    conn.execute(sql)\n")
+    assert found.profile is profile
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "raw"),
+    [
+        (
+            'import { DataSource } from "typeorm";\nconst AppDataSource = new DataSource({});\n',
+            "async ({ q }) => AppDataSource.query(q)",
+            True,
+        ),
+        (
+            'import { Pool } from "pg";\nconst pgPool = new Pool();\n',
+            "async ({ q }) => pgPool.query(q)",
+            True,
+        ),
+        (
+            'import mysql from "mysql2";\nconst pool = mysql.createPool({});\nconst promised = pool.promise();\n',
+            "async ({ q }) => promised.query(q)",
+            True,
+        ),
+        ('const pg = require("knex")({ client: "pg" });\n', "async ({ q }) => pg.raw(q)", True),
+        (
+            'import sql from "mssql";\nconst pool = new sql.ConnectionPool("x");\n',
+            "async ({ q }) => pool.request().query(q)",
+            True,
+        ),
+        (
+            'import { PrismaClient } from "@prisma/client";\nconst prismaClient = new PrismaClient();\n',
+            "async ({ q }) => prismaClient.$queryRawUnsafe(q)",
+            True,
+        ),
+        ("", "async function ({ q }) { return this.prismaService.$queryRawUnsafe(q); }", True),
+        (
+            'import { Client } from "@urql/core";\nconst client = new Client({});\n',
+            "async ({ q }) => client.query(q)",
+            False,
+        ),
+        ("", "async ({ q }) => client.query(q)", True),
+    ],
+    ids=[
+        "typeorm-data-source",
+        "pg-pool-under-another-name",
+        "mysql2-promise-pool",
+        "called-knex-module",
+        "mssql-request",
+        "prisma-under-another-name",
+        "prisma-raw-method-on-any-receiver",
+        "non-database-client-named-client",
+        "unbound-client-by-name",
+    ],
+)
+def test_typescript_database_clients_resolve_through_derived_names(
+    tmp_path: Path, header: str, handler: str, raw: bool
+) -> None:
+    tool = _ts(tmp_path, handler, header)
+    assert any("caller-supplied" in r.detail for r in tool.risks) is raw
 
 
 # ---- Review of 899c7384: names TypeScript takes from an import ----------------------------
