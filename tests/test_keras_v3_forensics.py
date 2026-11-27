@@ -137,6 +137,39 @@ def test_standard_keras_functions_are_not_arbitrary_code(tmp_path: Path, layer: 
     assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE)
 
 
+@pytest.mark.parametrize(
+    ("module", "function", "expected"),
+    [
+        ("builtins", "mean_squared_error", ZIP_WITHOUT_PICKLE),
+        ("builtins", "categorical_accuracy", ZIP_WITHOUT_PICKLE),
+        ("keras.losses", "mean_absolute_error", ZIP_WITHOUT_PICKLE),
+        ("keras.losses", "cosine_similarity", ZIP_WITHOUT_PICKLE),
+        ("keras.metrics", "binary_accuracy", ZIP_WITHOUT_PICKLE),
+        ("keras.metrics", "pearson_correlation", ZIP_WITHOUT_PICKLE),
+        ("keras.metrics", "mean_squared_error", ZIP_WITHOUT_PICKLE),
+        ("keras.metrics", "relu", ZIP_MEMBER_UNREAD),
+        ("keras.losses", "local_workshop_loss", ZIP_MEMBER_UNREAD),
+    ],
+)
+def test_keras_compile_function_descriptors(
+    tmp_path: Path, module: str, function: str, expected: str
+) -> None:
+    descriptor = {
+        "module": module,
+        "class_name": "function",
+        "config": function,
+        "registered_name": "function" if module == "builtins" else function,
+    }
+    config = {
+        "module": "keras",
+        "class_name": "Sequential",
+        "config": {"layers": []},
+        "compile_config": {"metrics": [descriptor]},
+    }
+    archive = _write_keras_zip(tmp_path / "compiled.keras", config)
+    assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, expected)
+
+
 @pytest.mark.parametrize("suffix", [".keras", ".npz"])
 def test_nested_application_assets_are_not_model_descriptors(tmp_path: Path, suffix: str) -> None:
     archive = tmp_path / f"model{suffix}"
@@ -177,11 +210,39 @@ def test_keras_descriptor_must_be_present_in_named_model(tmp_path: Path) -> None
     assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
 
 
-def test_generic_zip_may_contain_root_application_settings(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"display_units": "meters", "description": "sample"},
+        {"module": "builtins", "class_name": "str", "config": {}},
+        {
+            "class_name": "DisplayScale",
+            "config": {"label_type": {"module": "builtins", "class_name": "str", "config": {}}},
+        },
+    ],
+)
+def test_generic_zip_may_contain_root_application_settings(tmp_path: Path, settings: dict) -> None:
     archive = tmp_path / "numeric.npz"
+    # NumPy format 1.0, one unsigned byte, with a 16-byte-aligned data offset.
+    header = b"{'descr': '|u1', 'fortran_order': False, 'shape': (1,), }".ljust(69) + b"\n"
     with zipfile.ZipFile(archive, "w") as bundle:
-        bundle.writestr("config.json", '{"display_units":"meters","description":"sample"}')
+        bundle.writestr(
+            "levels.npy",
+            b"\x93NUMPY\x01\x00" + len(header).to_bytes(2, "little") + header + b"\x02",
+        )
+        bundle.writestr("config.json", json.dumps(settings))
+        bundle.writestr("metadata.json", '{"units":"meters"}')
     assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE)
+
+
+def test_renamed_custom_model_with_keras_archive_layout_is_inspected(tmp_path: Path) -> None:
+    archive = tmp_path / "snapshot.npz"
+    config = {"module": "workshop.models", "class_name": "Forecast", "config": None}
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("config.json", json.dumps(config))
+        bundle.writestr("metadata.json", '{"keras_version":"3.9.2"}')
+        bundle.writestr("model.weights.npz", b"")
+    assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
 
 
 @pytest.mark.parametrize("capacity", [0, 4, None, 128])

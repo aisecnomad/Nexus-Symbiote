@@ -177,8 +177,8 @@ MAX_KERAS_CONFIG_DEPTH = 64
 MAX_KERAS_CONFIG_NODES = 100_000
 _KERAS_CODE_CLASSES = frozenset({"Lambda", "__lambda__"})
 _KERAS_OP_LAMBDA_CLASSES = frozenset({"TFOpLambda", "SlicingOpLambda"})
-# Keras serializes named activation functions with module="builtins" and looks
-# them up in its API registry. No model or third-party module is imported here.
+# Keras v3 resolves function descriptors against its public API, including
+# an unqualified lookup for module="builtins". Inspect names without imports.
 _KERAS_ACTIVATIONS = frozenset(
     [
         "relu",
@@ -213,6 +213,43 @@ _KERAS_ACTIVATIONS = frozenset(
         "swish",
         "hard_swish",
     ]
+)
+_KERAS_LOSS_METRICS = frozenset(
+    {
+        "binary_crossentropy",
+        "binary_focal_crossentropy",
+        "categorical_crossentropy",
+        "categorical_focal_crossentropy",
+        "categorical_hinge",
+        "hinge",
+        "huber",
+        "kl_divergence",
+        "log_cosh",
+        "mean_absolute_error",
+        "mean_absolute_percentage_error",
+        "mean_squared_error",
+        "mean_squared_logarithmic_error",
+        "poisson",
+        "sparse_categorical_crossentropy",
+        "squared_hinge",
+    }
+)
+_KERAS_FUNCTIONS_BY_MODULE = {
+    "keras.activations": _KERAS_ACTIVATIONS,
+    "keras.losses": _KERAS_LOSS_METRICS | {"circle", "cosine_similarity", "ctc", "dice", "tversky"},
+    "keras.metrics": _KERAS_LOSS_METRICS
+    | {
+        "binary_accuracy",
+        "categorical_accuracy",
+        "concordance_correlation",
+        "pearson_correlation",
+        "sparse_categorical_accuracy",
+        "sparse_top_k_categorical_accuracy",
+        "top_k_categorical_accuracy",
+    },
+}
+_KERAS_FUNCTIONS_BY_MODULE["builtins"] = frozenset(
+    name for functions in _KERAS_FUNCTIONS_BY_MODULE.values() for name in functions
 )
 _KERAS_ARITHMETIC_OPS = frozenset(
     {"math.add", "math.subtract", "math.multiply", "math.divide", "math.maximum", "math.minimum"}
@@ -1142,18 +1179,12 @@ def _keras_config_has_code(document: object, *, required: bool) -> bool | None:
     Return ``None`` for incomplete descriptors, unresolved functions or a traversal
     that exceeds the node bound. A hazardous declaration elsewhere still takes precedence.
     """
-    if not required and (
-        not isinstance(document, dict)
-        or (
-            "class_name" not in document
-            and not (
-                isinstance(document.get("module"), str)
-                and document["module"].split(".", 1)[0] == "keras"
-            )
-        )
-    ):
-        # Other archive formats may carry ordinary application settings under this name.
-        return False
+    if not required:
+        # Other archive formats use both config.json and class_name for their own
+        # settings. A serialized Keras namespace provides independent evidence.
+        module = document.get("module") if isinstance(document, dict) else None
+        if not isinstance(module, str) or module.split(".", 1)[0] != "keras":
+            return False
     if not isinstance(document, dict) or not isinstance(document.get("class_name"), str):
         return None
     pending: list[object] = [document]
@@ -1208,9 +1239,9 @@ def _keras_config_has_code(document: object, *, required: bool) -> bool | None:
                         incomplete = True
                 if class_name == "function":
                     if (
-                        module not in ("builtins", "keras.activations")
+                        not isinstance(module, str)
                         or not isinstance(cfg, str)
-                        or cfg not in _KERAS_ACTIVATIONS
+                        or cfg not in _KERAS_FUNCTIONS_BY_MODULE.get(module, ())
                     ):
                         incomplete = True
             if isinstance(module, str) and not (module == "builtins" and class_name == "function"):
@@ -1290,6 +1321,13 @@ def _members_hold_keras_code(
     """Inspect the root descriptor, including when the extension changed."""
     if not any(_keras_config_member(member.name) for member in members):
         return None if required else False
+    # Keras saves custom models outside its own module namespace too. Its native
+    # root metadata and weights together identify renamed archives in that case.
+    names = {member.name.partition(b"\0")[0] for member in members}
+    required = required or (
+        b"metadata.json" in names
+        and (b"model.weights.h5" in names or b"model.weights.npz" in names)
+    )
     ordered = sorted(members, key=lambda member: member.offset)
     unread = False
     for index, member in enumerate(ordered):

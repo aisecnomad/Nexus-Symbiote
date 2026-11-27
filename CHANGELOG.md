@@ -6,7 +6,7 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ### Security
 
-- Model scans inspect the root `config.json` used by the Keras ZIP loader. They report Lambda declarations and recognized hazardous callable references, and identify incomplete metadata or unresolved operation wrappers as unread. Inspection uses a shared decompression budget and fixed JSON size, nesting and node limits. [Keras archive loader](https://github.com/keras-team/keras/blob/9067d8060992924757e48492ee73dfa5df87c0ee/keras/src/saving/saving_lib.py#L439-L445) · [Keras built-in function resolution](https://github.com/keras-team/keras/blob/9067d8060992924757e48492ee73dfa5df87c0ee/keras/src/saving/serialization_lib.py#L772-L782).
+- Model scans inspect the root `config.json` used by the Keras ZIP loader. They recognize renamed models from Keras module names or the native metadata and weights files, as well as public activation, loss and metric function descriptors. They report Lambda declarations and recognized hazardous callable references, and identify incomplete metadata or unresolved operation wrappers as unread. Inspection uses a shared decompression budget and fixed JSON size, nesting and node limits. [Keras archive loader](https://github.com/keras-team/keras/blob/9067d8060992924757e48492ee73dfa5df87c0ee/keras/src/saving/saving_lib.py#L439-L453) · [Keras built-in function resolution](https://github.com/keras-team/keras/blob/9067d8060992924757e48492ee73dfa5df87c0ee/keras/src/saving/serialization_lib.py#L760-L782).
 
 ## [0.2.0] - 2026-11-25
 
