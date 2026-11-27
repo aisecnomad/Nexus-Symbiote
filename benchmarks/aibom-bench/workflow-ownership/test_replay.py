@@ -244,3 +244,12 @@ def test_report_only_scan_with_a_failed_collector_is_a_scan_failure(
     scanner.chmod(0o755)
     assert main(["--nexus", str(scanner)]) == 2
     assert "collection failures" in capsys.readouterr().err
+
+
+def test_score_itself_refuses_an_inventory_with_collection_failures(positive: dict) -> None:
+    positive["metadata"]["completeness"] = {
+        "scan_failures": [],
+        "scanner_status": {"source": "failed"},
+    }
+    with pytest.raises(ValueError, match="collection failures"):
+        score(positive)

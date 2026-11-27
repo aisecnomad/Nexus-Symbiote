@@ -114,7 +114,12 @@ def _workflow_edge(edge: dict[str, Any]) -> bool:
 
 
 def score(document: dict[str, Any]) -> dict[str, Any]:
-    """Require a unique named owner and three independently attributable edges."""
+    """Require a unique named owner and three independently attributable edges.
+
+    An inventory that records a collection failure has no valid score: ``ValueError``.
+    """
+    if _records_collection_failures(document):
+        raise ValueError("The inventory records collection failures; its score is not valid")
     components = _rows(document, "components")
     edges = _rows(document, "dependencies")
     by_ref: dict[str, dict[str, Any]] = {}
@@ -306,8 +311,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not isinstance(document, dict):
             raise ValueError("Native AgentBOM needs a JSON object")
-        if _records_collection_failures(document):
-            raise ValueError("The inventory records collection failures; its score is not valid")
         receipt = score(document)
         metadata = document.get("metadata")
         if metadata is not None and not isinstance(metadata, dict):
