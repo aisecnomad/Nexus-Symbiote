@@ -418,11 +418,15 @@ class CompletenessValidator:
                 accepted.add(component.bom_ref)
             # scan imports a collector's own edges between the components it accepted;
             # the local assembly must hold the same edges or every one reads as unevidenced.
-            collected_edges.extend(
-                edge
-                for edge in local.dependencies
-                if edge.source_ref in accepted and edge.target_ref in accepted
-            )
+            for edge in local.dependencies:
+                if edge.source_ref in accepted and edge.target_ref in accepted:
+                    collected_edges.append(edge)
+                else:
+                    incomplete(
+                        scanner.name,
+                        "Local collection incomplete: dependency endpoint was not imported",
+                    )
+                    failed = True
             surfaces.extend(local.surfaces_scanned)
             excluded.extend(local.surfaces_excluded)
             accepted_default_exclusions.update(local.accepted_default_exclusions)

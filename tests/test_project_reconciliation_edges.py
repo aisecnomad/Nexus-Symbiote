@@ -111,3 +111,57 @@ def test_an_edge_the_collector_did_not_record_is_still_unevidenced(
         cli.main, ["validate", str(out), "--project", str(project), "--no-project-policy"]
     )
     assert "no local evidence" in validated.output, validated.output
+
+
+@pytest.mark.parametrize("target", ["prompt:absent", "prompt:CLAUDE.md"])
+def test_refused_endpoint_is_a_collection_failure_in_scan_and_both_project_gates(
+    tmp_path: Path, edge_collector: None, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    project = tmp_path / "project"
+    (project / "agent").mkdir(parents=True)
+    (project / "agent" / "app.py").write_text("print('agent')\n")
+    (project / "CLAUDE.md").write_text("Instructions.\n")
+    baseline, current = tmp_path / "baseline.json", tmp_path / "current.json"
+    runner = CliRunner()
+    scan = ["scan", str(project), "--no-project-policy", "--report-only", "-o"]
+    result = runner.invoke(cli.main, [*scan, str(baseline)])
+    assert result.exit_code == 0, result.output
+    prior_refs = {c["bom_ref"] for c in json.loads(baseline.read_text())["components"]}
+    assert "prompt:CLAUDE.md" in prior_refs and "prompt:absent" not in prior_refs
+
+    original_scan = _EdgeCollector.scan
+
+    def collect(self: _EdgeCollector, root: Path) -> ScanResult:
+        result = original_scan(self, root)
+        result.dependencies.append(
+            DependencyEdge(source_ref=_AGENT, target_ref=target, relationship="invokes")
+        )
+        return result
+
+    monkeypatch.setattr(_EdgeCollector, "scan", collect)
+    result = runner.invoke(cli.main, [*scan, str(current)])
+    assert result.exit_code == 0, result.output
+    claim = json.loads(current.read_text())["metadata"]["completeness"]
+    assert "rag: dependency endpoint was not imported" in claim["scan_failures"]
+    assert claim["scanner_status"]["rag"] == "failed"
+
+    for command in ("validate", "risk"):
+        result = runner.invoke(
+            cli.main,
+            [
+                command,
+                str(baseline),
+                "--project",
+                str(project),
+                "--no-project-policy",
+                "--json-output",
+            ],
+        )
+        assert result.exit_code == 1, result.output
+        report = json.loads(result.stdout)
+        assert report["assessment_basis"] == "project-reconciliation-failed"
+        if command == "validate":
+            claims = report["completeness"]["supplier_claims"]
+            coverage = {c["detail"] for c in claims if c["kind"] == "field"}
+            assert {"collectors_completed", "scanner_status"} <= coverage
+        assert "dependency endpoint was not imported" in result.stdout
