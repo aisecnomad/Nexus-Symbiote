@@ -27,3 +27,10 @@ tool, and a graded report of ten tools ([REPORT.md](aibom-bench/REPORT.md)).
 Unlike the corpus above, it does compare tools, and its report says for every
 score whether it was verified by a run, read from source, or taken from
 documentation.
+
+## Agent-to-model ownership
+
+The model-swap replay checks whether two named agents retain the right model
+references when they exchange models. It runs the installed CLI offline on a
+fixed LangGraph and CrewAI fixture and reports missing and extra bindings.
+[Fixtures and replay instructions](agent-model-swap/README.md)

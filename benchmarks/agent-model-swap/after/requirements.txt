@@ -1,0 +1,4 @@
+langgraph==0.6.7
+langgraph-prebuilt==0.6.4
+langchain-core==0.3.76
+crewai==0.186.1
