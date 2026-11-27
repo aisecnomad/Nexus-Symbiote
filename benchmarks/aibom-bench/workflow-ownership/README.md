@@ -20,7 +20,9 @@ resolved source and target references, and the inventory digest. A saved invento
 can be scored independently of how it was collected. Exit 0 means all four
 criteria pass and no decoy is attributed to the workflow. Exit 1 means an acceptance
 check failed. Exit 2 means the scan failed or the input could not be scored because
-it was unreadable or its scored graph was invalid.
+it was unreadable, its scored graph was invalid, or it records a collection failure.
+`scan --report-only` exits 0 when a collector fails, so the replay reads the failure
+from the inventory's `metadata.completeness`.
 
 Check the scorer with the included synthetic known-positive inventory and its negative
 controls.

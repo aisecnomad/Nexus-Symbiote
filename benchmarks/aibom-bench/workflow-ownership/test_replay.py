@@ -206,3 +206,41 @@ def test_malformed_workflow_typed_references_are_refused(
     positive["components"][0][field] = [ref]
     with pytest.raises(ValueError, match=rf"{field} must resolve"):
         score(positive)
+
+
+@pytest.mark.parametrize(
+    ("completeness", "code"),
+    [
+        ({"scan_failures": ["agent.py: limit exceeded"], "scanner_status": {}}, 2),
+        ({"scan_failures": [], "scanner_status": {"source": "failed"}}, 2),
+        ({"scan_failures": [], "scanner_status": {"source": "complete"}}, 0),
+    ],
+)
+def test_recorded_collection_failures_are_not_scored(
+    positive: dict, tmp_path: Path, completeness: dict, code: int
+) -> None:
+    positive["metadata"]["completeness"] = completeness
+    path = tmp_path / "input.json"
+    path.write_text(json.dumps(positive), encoding="utf-8")
+    out = tmp_path / "receipt.json"
+    assert main(["--bom", str(path), "--out", str(out)]) == code
+    assert out.exists() == (code == 0)
+
+
+def test_report_only_scan_with_a_failed_collector_is_a_scan_failure(
+    positive: dict, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    positive["metadata"]["completeness"] = {
+        "scan_failures": ["agent.py: file-bytes limit of 8 bytes exceeded"],
+        "scanner_status": {"source": "failed"},
+    }
+    inventory = tmp_path / "inventory.json"
+    inventory.write_text(json.dumps(positive), encoding="utf-8")
+    scanner = tmp_path / "scanner"
+    scanner.write_text(
+        f'#!/bin/sh\nwhile [ "$1" != "-o" ]; do shift; done\ncp "{inventory}" "$2"\n',
+        encoding="utf-8",
+    )
+    scanner.chmod(0o755)
+    assert main(["--nexus", str(scanner)]) == 2
+    assert "collection failures" in capsys.readouterr().err

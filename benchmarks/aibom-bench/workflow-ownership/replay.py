@@ -211,6 +211,21 @@ def score(document: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _records_collection_failures(document: dict[str, Any]) -> bool:
+    """`scan --report-only` exits 0 when a collector fails; the inventory records it."""
+    metadata = document.get("metadata")
+    completeness = metadata.get("completeness") if isinstance(metadata, dict) else None
+    if completeness is None:
+        return False
+    if not isinstance(completeness, dict):
+        raise ValueError("Native AgentBOM completeness must be an object")
+    failures = completeness.get("scan_failures", [])
+    status = completeness.get("scanner_status", {})
+    if not isinstance(failures, list) or not isinstance(status, dict):
+        raise ValueError("Native AgentBOM completeness needs scan_failures and scanner_status")
+    return bool(failures) or "failed" in status.values()
+
+
 def _read_bom(path: Path) -> bytes:
     with path.open("rb") as stream:
         contents = stream.read(MAX_BOM_BYTES + 1)
@@ -291,6 +306,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not isinstance(document, dict):
             raise ValueError("Native AgentBOM needs a JSON object")
+        if _records_collection_failures(document):
+            raise ValueError("The inventory records collection failures; its score is not valid")
         receipt = score(document)
         metadata = document.get("metadata")
         if metadata is not None and not isinstance(metadata, dict):
