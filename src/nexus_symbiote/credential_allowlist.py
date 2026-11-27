@@ -57,6 +57,8 @@ class AllowEntry(BaseModel):
             raise ValueError("an entry needs a fingerprint or a path, and not both")
         if "\n" in self.reason or "\r" in self.reason:
             raise ValueError("reason must be one line")
+        if not self.reason.strip():
+            raise ValueError("reason must say why the entry is allowed")
         if self.fingerprint is not None and _FINGERPRINT.fullmatch(self.fingerprint) is None:
             raise ValueError("fingerprint must be 64 lowercase hex digits")
         if self.path is not None:
@@ -89,6 +91,9 @@ def _check_glob(pattern: str) -> None:
     parts = pattern.split("/")
     if len(parts) > _MAX_PATTERN_PARTS or any(part == ".." or part == "" for part in parts):
         raise ValueError("path glob must be a relative pattern")
+    if set(pattern) <= set("*?/"):
+        # Only wildcards: the entry would silence the detector for every file it reaches.
+        raise ValueError("path glob must name a file or directory")
 
 
 def path_glob_matches(pattern: str, path: str) -> bool:
