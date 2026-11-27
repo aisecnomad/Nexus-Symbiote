@@ -920,11 +920,21 @@ def _joined_bindings(size: int) -> str:
     return f"{names}\n{choose}{bound}\n" + "f(model=N)\n" * size
 
 
+def _cut_names(size: int) -> str:
+    # A name past the depth bound is worked out again at each read, unless each is charged.
+    return "x = a" + ".a" * 40 + "\n" + "x = 0\n" * size + "x()\n" * size
+
+
+def _nested_owners(size: int) -> str:
+    # Each ``super()`` looks for its class through every scope around it.
+    return "f = " + "lambda: " * size + "(" + "super().f(), " * size + ")\n"
+
+
 @pytest.mark.no_cover
 @pytest.mark.parametrize(
     "shape",
-    [_rebinds, _wide_or, _deep_plus, _joined_bindings],
-    ids=["rebinds", "wide-or", "deep-plus", "joined-bindings"],
+    [_rebinds, _wide_or, _deep_plus, _joined_bindings, _cut_names, _nested_owners],
+    ids=["rebinds", "wide-or", "deep-plus", "joined-bindings", "cut-names", "nested-owners"],
 )
 def test_reading_python_source_is_linear_in_its_size(tmp_path, shape):
     roots = {}

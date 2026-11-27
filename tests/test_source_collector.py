@@ -26,7 +26,6 @@ from nexus_symbiote.scanners.source_references import (
     Declarations,
     environment_name,
     model_identifier,
-    split_route,
 )
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.validators.completeness import CompletenessValidator
@@ -139,6 +138,8 @@ def test_a_literal_model_argument_is_recorded_with_where_it_was_read(client: Sca
         ("[NAME]", [], 1),
         ("DEFAULT_MODEL", [], 1),
         ("pydantic_ai.DEFAULT", [], 1),
+        # What another library makes, such as configuration it reads, may be any text.
+        ("yaml.safe_load(TEXT)", [], 1),
     ],
 )
 def test_text_a_value_spells_is_read_and_any_other_value_is_unread_unless_a_library_builds_it(
@@ -150,6 +151,7 @@ def test_text_a_value_spells_is_read_and_any_other_value_is_unread_unless_a_libr
             "run.py": f"""\
 import os
 import pydantic_ai
+import yaml
 from openai import OpenAI
 from peft import get_peft_model
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -160,9 +162,9 @@ OpenAI().chat.completions.create(model={argument}, messages=[])
 """
         },
     )
-    # An object a library makes is no text; a library's name or attribute may be.
+    # An object an SDK makes is no text; a library's name, attribute or value may be.
     assert sorted(models(result)) == sorted(expected)
-    assert list(result.surfaces_excluded) == ([unread_gap("run.py", 9)] if unread else [])
+    assert list(result.surfaces_excluded) == ([unread_gap("run.py", 10)] if unread else [])
 
 
 def test_a_docstring_and_a_comment_declare_nothing(client: ScanResult):
@@ -174,80 +176,6 @@ def test_the_surfaces_say_what_was_and_was_not_read(client: ScanResult):
         "source: declarations in application source (static)",
         "source: tests, documentation, examples, benchmarks and build output are not read",
     ]
-
-
-@pytest.mark.parametrize(
-    ("source", "expected"),
-    [
-        (
-            'from langchain.chat_models import init_chat_model\ninit_chat_model("openai:gpt-4.1")\n',
-            {"gpt-4.1": "openai"},
-        ),
-        (
-            'from sentence_transformers import SentenceTransformer\nSentenceTransformer("BAAI/bge-m3")\n',
-            {"BAAI/bge-m3": None},
-        ),
-        (
-            'from transformers import AutoModel\nAutoModel.from_pretrained("openai/whisper-large-v3")\n',
-            {"openai/whisper-large-v3": None},
-        ),
-        (
-            'import dspy\ndspy.LM("anthropic/claude-sonnet-4-5")\n',
-            {"claude-sonnet-4-5": "anthropic"},
-        ),
-        (
-            'from agno.models.openai import OpenAIChat\nOpenAIChat(id="gpt-4.1-mini")\n',
-            {"gpt-4.1-mini": None},
-        ),
-        (
-            'from langchain_huggingface import HuggingFaceEndpoint\nHuggingFaceEndpoint(repo_id="mistralai/Mistral-7B-Instruct-v0.3")\n',
-            {"mistralai/Mistral-7B-Instruct-v0.3": None},
-        ),
-        (
-            'from huggingface_hub import hf_hub_download\nhf_hub_download(repo_id="acme/rules-dataset")\n',
-            {},
-        ),
-        (
-            'from langchain.chat_models import init_chat_model\ninit_chat_model("ignored", model="gpt-4o")\n',
-            {"gpt-4o": None},
-        ),
-        (
-            'import boto3\nboto3.client("bedrock-runtime").converse(modelId="anthropic.claude-3-5-haiku-20241022-v1:0")\n',
-            {"anthropic.claude-3-5-haiku-20241022-v1:0": None},
-        ),
-        ('from crewai import LLM\nLLM(model="ollama/llama3.1:8b")\n', {"llama3.1:8b": "ollama"}),
-    ],
-)
-def test_which_arguments_hold_a_model(tmp_path: Path, source: str, expected: dict[str, str | None]):
-    result = scan(tmp_path, {"run.py": source})
-    assert {name: model.provider for name, model in models(result).items()} == expected
-
-
-def test_a_routed_identifier_keeps_the_text_as_written(tmp_path: Path):
-    result = scan(
-        tmp_path,
-        {
-            "a.py": 'import litellm\nlitellm.completion(model="anthropic/claude-sonnet-4-5")\n',
-            "b.py": 'import litellm\nlitellm.completion(model="bedrock/claude-sonnet-4-5")\n'
-            'litellm.completion(model="ollama/llama3.2")\n',
-        },
-    )
-    found = models(result)
-    sonnet = found["claude-sonnet-4-5"]
-    assert sonnet.provider is None and sonnet.model_type is None
-    assert sonnet.properties["providers"] == ["anthropic", "aws-bedrock"]
-    assert sonnet.properties["requested_aliases"] == [
-        "anthropic/claude-sonnet-4-5",
-        "bedrock/claude-sonnet-4-5",
-    ]
-    assert sonnet.claims["source_reference"].evidence_refs == ["a.py:2", "b.py:2"]
-    local = found["llama3.2"]
-    # A runtime that serves weights on the machine is no hosted service.
-    assert (local.provider, local.model_type, local.requested_alias) == (
-        "ollama",
-        None,
-        "ollama/llama3.2",
-    )
 
 
 def test_one_component_names_every_place_up_to_the_listing_bound(tmp_path: Path):
@@ -724,11 +652,14 @@ def test_a_link_is_read_only_when_it_reaches_a_file_the_collector_reads(tmp_path
     (tmp_path / "app" / "text.py").symlink_to("real.txt")
     (tmp_path / "app" / "real.txt").write_text(body.format("through-a-text-file"))
     result = SourceScanner().scan(tmp_path)
-    # A file named for credentials is read like any other; a test is not, nor through a link.
+    # A file named for credentials is read like any other. A test is not, and a link from
+    # the application to one may hide what it runs, so it is a gap.
     assert set(models(result)) == {"through-a-link", "from-secrets", "through-a-text-file"}
     reference = models(result)["through-a-link"].claims["source_reference"]
     assert reference.evidence_refs == ["app/alias.py:3", "app/real.py:3"]
-    assert not result.surfaces_excluded
+    assert list(result.surfaces_excluded) == [
+        "app/prod.py: source file links to a file the collector does not read; not read"
+    ]
 
 
 def test_a_link_that_changes_after_it_was_checked_is_not_read(
@@ -789,40 +720,6 @@ def test_a_call_into_another_library_or_a_builtin_is_not_read(tmp_path: Path):
     assert set(models(result)) == {"gpt-4o"}
     # A function of the project may hand its argument to an SDK, which is not followed.
     assert list(result.surfaces_excluded) == [f"app.py:14: a model argument is {GIVEN}"]
-
-
-def test_positional_models_of_common_entry_points_are_read(tmp_path: Path):
-    result = scan(
-        tmp_path,
-        {
-            "run.py": "import litellm\nimport ollama\nfrom pydantic_ai import Agent\n\n"
-            'Agent("openai:gpt-4o")\nlitellm.completion("gpt-4o-mini", [])\n'
-            'ollama.chat("llama3.2", messages=[])\n'
-        },
-    )
-    found = models(result)
-    assert set(found) == {"gpt-4o", "gpt-4o-mini", "llama3.2"}
-    assert found["gpt-4o"].provider == "openai"
-
-
-def test_a_reference_another_collector_contradicts_is_not_vouched_for(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    root = write(
-        tmp_path,
-        {
-            "app/client.py": 'from openai import OpenAI\n\nOpenAI().responses.create(model="gpt-4o")\n',
-            "CLAUDE.md": "Be brief.\n",
-        },
-    )
-    (root / "weights.pkl").write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
-    # The two collectors name different subjects by one reference.
-    monkeypatch.setattr(source_references, "model_ref", lambda name: "model:weights.pkl")
-    report = CompletenessValidator().validate_against_project(AIBOM(components=[]), root)
-    assert any(
-        "Conflicting local reference: model:weights.pkl" in i.description for i in report.issues
-    )
-    assert report.bound_references == frozenset()
 
 
 def test_only_text_is_recorded_as_a_model():
@@ -1145,32 +1042,6 @@ def test_what_can_be_recorded_as_a_model_identifier(literal: object, accepted: b
     assert (model_identifier(literal) is not None) is accepted
 
 
-@pytest.mark.parametrize(
-    ("literal", "weights", "expected"),
-    [
-        ("openai/gpt-4o", False, ("gpt-4o", "openai")),
-        ("anthropic:claude-sonnet-4-5", False, ("claude-sonnet-4-5", "anthropic")),
-        (
-            "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
-            False,
-            ("anthropic.claude-3-haiku-20240307-v1:0", "aws-bedrock"),
-        ),
-        ("llama3.1:8b", False, ("llama3.1:8b", None)),
-        ("openai/", False, ("openai/", None)),
-        ("openai/x", False, ("openai/x", None)),
-        ("openai/whisper-large-v3", False, ("openai/whisper-large-v3", None)),
-        ("openai/gpt-4o", True, ("openai/gpt-4o", None)),
-        ("mistralai/Mistral-7B-Instruct-v0.3", False, ("mistralai/Mistral-7B-Instruct-v0.3", None)),
-        ("mistralai:mistral-large-latest", False, ("mistral-large-latest", "mistral")),
-        ("meta-llama/Llama-3.3-70B-Instruct", False, ("meta-llama/Llama-3.3-70B-Instruct", None)),
-    ],
-)
-def test_a_routing_prefix_is_split_from_the_identifier(
-    literal: str, weights: bool, expected: tuple[str, str | None]
-):
-    assert split_route(literal, weights=weights) == expected
-
-
 def test_the_number_of_model_identifiers_is_bounded(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(source_references, "MAX_RECORDS", 3)
     result = ScanResult(scanner_name="source")
@@ -1222,6 +1093,319 @@ def test_only_the_source_collector_can_be_selected(runner, tmp_path: Path):
         "gpt-4o-mini",
         "text-embedding-3-small",
     }
+
+
+def test_a_project_without_ai_source_gains_no_component(runner, tmp_path: Path):
+    bom, _ = run_scan(
+        runner, write(tmp_path / "project", {"app.py": "print('hello')\n", "README.md": "# x\n"})
+    )
+    assert [c for c in bom.components if ":source:" in c.bom_ref] == []
+    assert bom.metadata.completeness.scanner_status["source"] == "complete"
+
+
+# -- the third review -------------------------------------------------------------------
+
+
+def test_an_import_in_a_function_binds_there_and_nowhere_else(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from sentence_transformers import SentenceTransformer
+
+
+def helper():
+    from mylib import SentenceTransformer
+
+    return SentenceTransformer("not-a-model-here")
+
+
+def loader():
+    from ollama import Client
+
+    return Client().chat(model="llama3")
+
+
+SentenceTransformer("all-MiniLM-L6-v2")
+"""
+        },
+    )
+    # The module's name is still the SDK's, and the function's own import is its own.
+    assert set(models(result)) == {"all-MiniLM-L6-v2", "llama3"}
+    assert not result.surfaces_excluded
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "try: import openai\nexcept ImportError: pass\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
+        "from typing import TYPE_CHECKING\nif TYPE_CHECKING: from openai import OpenAI\n\n\n"
+        "def ask(client: OpenAI):\n    client.responses.create(model='gpt-4o')\n",
+        "import os; import openai\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
+        "from \\\n    openai import OpenAI\nOpenAI().responses.create(model='gpt-4o')\n",
+        "import os\r# one\rimport openai\ropenai.OpenAI().responses.create(model='gpt-4o')\r",
+        "\fimport openai\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
+        "import os, \\\n    openai\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
+        "import \uff4f\uff50\uff45\uff4e\uff41\uff49\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
+    ],
+    ids=[
+        "try",
+        "type-checking",
+        "semicolon",
+        "continued",
+        "carriage-return",
+        "form-feed",
+        "continued-list",
+        "compatibility-spelling",
+    ],
+)
+def test_every_import_statement_python_runs_is_found(tmp_path: Path, source: str):
+    (tmp_path / "run.py").write_bytes(source.encode())
+    assert set(models(SourceScanner().scan(tmp_path))) == {"gpt-4o"}
+
+
+def test_a_codec_the_reader_does_not_follow_is_a_gap(tmp_path: Path):
+    # In UTF-7, ``+AGk-`` is ``i``: the import is there only once the text is decoded.
+    (tmp_path / "seven.py").write_bytes(
+        b"# coding: utf-7\n+AGk-mport openai\nopenai.OpenAI().responses.create(model='gpt-4o')\n"
+    )
+    result = SourceScanner().scan(tmp_path)
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [
+        "seven.py: source file cannot be decoded as its encoding declares; declarations in it "
+        "were not read"
+    ]
+
+
+def test_a_google_cloud_import_of_vertex_is_found(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "from google.cloud import aiplatform\n"
+            'aiplatform.Endpoint("projects/p").predict(model="text-bison")\n'
+        },
+    )
+    assert set(models(result)) == {"text-bison"}
+
+
+def test_a_method_of_an_object_the_reader_cannot_tell_is_read_where_named_as_sdk_calls_are(
+    tmp_path: Path,
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+import mlflow
+from django.contrib.contenttypes.models import ContentType
+from openai import OpenAI
+
+
+class Agent:
+    @classmethod
+    def create(cls, model):
+        return OpenAI().responses.create(model=model)
+
+
+def handle(metric, client, store, settings):
+    metric.labels(model="thermostat-v2").inc()
+    store.put(model="customer")
+    settings.usage.objects.filter(model="invoice")
+    ContentType.objects.get(app_label="blog", model="post")
+    mlflow.pyfunc.log_model("x", model="summariser")
+    client.chat.completions.create(model="gpt-4o")
+    settings.llm.invoke("hi", model="o3")
+    Agent.create(model="planner")
+"""
+        },
+    )
+    # A label, a store, a query and a logging call take no model; an SDK call does. What
+    # a method of a project class is given is the project's to give.
+    assert set(models(result)) == {"gpt-4o", "o3"}
+    assert list(result.surfaces_excluded) == [
+        unread("run.py", 9),
+        f"run.py:20: a model argument is {GIVEN}",
+    ]
+
+
+@pytest.mark.parametrize(
+    "client",
+    [
+        "from typing import Any\n\ndef ask(client: Any):\n    client.converse(modelId='nova')\n",
+        "def ask(client: object):\n    client.chat(model='nova')\n",
+        "from typing import cast, Any\nimport ollama\n\ncast(Any, ollama.Client()).chat(model='nova')\n",
+        "CLIENTS = {}\nCLIENTS.get('x').chat(model='nova')\n",
+        "from contextvars import ContextVar\nCURRENT = ContextVar('c')\nCURRENT.get().chat(model='nova')\n",
+        "from mypy_boto3_bedrock_runtime import BedrockRuntimeClient\n\n"
+        "def ask(client: BedrockRuntimeClient):\n    client.converse(modelId='nova')\n",
+    ],
+    ids=["any", "object", "cast", "container", "context-variable", "type-stub"],
+)
+def test_an_object_typed_as_anything_is_read_as_one_the_reader_cannot_tell(
+    tmp_path: Path, client: str
+):
+    result = scan(tmp_path, {"run.py": "import openai\n" + client})
+    assert set(models(result)) == {"nova"}
+
+
+def test_an_executor_and_a_mixin_lead_to_the_sdk(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from concurrent.futures import Executor
+from langchain_openai import ChatOpenAI
+from openai import OpenAI
+
+
+class Logged:
+    pass
+
+
+class Tuned(Logged, ChatOpenAI):
+    def __init__(self):
+        super().__init__(model="gpt-4.1-mini")
+
+
+def ask(pool: Executor):
+    pool.submit(OpenAI().responses.create, model="o4-mini")
+"""
+        },
+    )
+    assert set(models(result)) == {"gpt-4.1-mini", "o4-mini"}
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "trust_remote_code=TRUST",
+        "trust_remote_code=args.trust",
+        "model_kwargs={'trust_remote_code': True}",
+    ],
+    ids=["name", "attribute", "model-kwargs"],
+)
+def test_remote_code_that_is_not_a_false_literal_is_recorded(tmp_path: Path, flag: str):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "from transformers import AutoModel\nTRUST = True\n"
+            f'AutoModel.from_pretrained("someorg/custom-7b", {flag})\n'
+        },
+    )
+    model = models(result)["someorg/custom-7b"]
+    assert model.trust_remote_code is True and not is_source_reference(model)
+
+
+@pytest.mark.parametrize(
+    ("directory", "imported"),
+    [
+        ("pkg", "a1.a2.a3.a4.a5.a6.a7.a8.a9"),
+        ("/".join(f"d{index}" for index in range(34)), "helpers"),
+    ],
+    ids=["dotted-name", "directories"],
+)
+def test_a_bound_reached_through_a_kept_answer_is_a_gap_in_every_file(
+    tmp_path: Path, directory: str, imported: str
+):
+    body = f'import openai\nfrom {imported} import run\nrun(model="gpt-4o")\n'
+    result = scan(tmp_path, {f"{directory}/one.py": body, f"{directory}/two.py": body})
+    assert sorted(result.surfaces_excluded) == [
+        f"{directory}/one.py:1: {CUT}",
+        f"{directory}/two.py:1: {CUT}",
+    ]
+
+
+def test_a_submodule_imported_from_a_project_package_is_the_projects(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "agents/__init__.py": "",
+            "agents/researcher.py": "class Researcher: ...\n",
+            "main.py": "from agents import researcher\n\nresearcher.Researcher()\n",
+        },
+    )
+    assert result.components == [] and not result.surfaces_excluded
+
+
+def test_a_relative_import_past_the_top_package_binds_nothing(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {"app/run.py": "from .... import OpenAI\nimport openai\nOpenAI().create(model='gpt-4o')\n"},
+    )
+    assert set(models(result)) == {"gpt-4o"}
+
+
+@pytest.mark.parametrize(
+    ("literal", "recorded", "gap"),
+    [
+        ("C:/Users/alice/models/minilm", False, True),
+        ("\\\\\\\\share\\\\models\\\\minilm", False, True),
+        ("/opt/models/minilm", False, True),
+        ("./checkpoints/final", False, False),
+        ("model.safetensors", False, False),
+        ("key-" + "0123456789abcdef" * 2, False, True),
+        ("0123456789abcdef0123456789abcd-" + "0123456789abcdef0123456789abcd", False, True),
+        ("anthropic:claude-3-5-sonnet@20240620", True, False),
+        ("stability-ai/sdxl:" + "39ed52f2a78e934b" * 4, True, False),
+    ],
+    ids=[
+        "drive",
+        "share",
+        "absolute",
+        "relative",
+        "weight-file",
+        "hex-key",
+        "split-hex",
+        "versioned",
+        "pinned",
+    ],
+)
+def test_a_path_or_a_key_is_never_a_model_and_a_project_file_is_no_gap(
+    tmp_path: Path, literal: str, recorded: bool, gap: bool
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "from sentence_transformers import SentenceTransformer\n"
+            f"SentenceTransformer({literal!r})\n"
+        },
+    )
+    assert bool(result.components) is recorded
+    assert (literal in exported(result)) is recorded
+    assert bool(result.surfaces_excluded) is gap
+
+
+def test_each_file_is_read_as_it_is_given_and_only_the_first_places_are_kept(tmp_path: Path):
+    found = Declarations(ScanResult(scanner_name="source"))
+    reader = source_python.PythonReader(found, frozenset({"a.py", "b.py"}))
+    calls = "\n".join('OpenAI().responses.create(model="gpt-4o")' for _ in range(40))
+    reader.add("a.py", f"from openai import OpenAI\n{calls}\n")
+    # Read as it was given, before any other file.
+    assert [component.name for component in found.components()] == ["gpt-4o"]
+    reader.add("b.py", "from openai import OpenAI\n" + calls.replace("\n", "\n\n") + "\n")
+    (model,) = found.components()
+    assert model.properties["references_unlisted"] == 80 - 16
+    assert len(model.claims["source_reference"].evidence_refs) == 16
+    assert len(found._models["gpt-4o"].locations) == 16
+
+
+def test_a_reference_another_collector_contradicts_is_not_vouched_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = write(
+        tmp_path,
+        {
+            "app/client.py": 'from openai import OpenAI\n\nOpenAI().responses.create(model="gpt-4o")\n',
+            "CLAUDE.md": "Be brief.\n",
+        },
+    )
+    (root / "weights.pkl").write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+    # The two collectors name different subjects by one reference.
+    monkeypatch.setattr(source_references, "model_ref", lambda name: "model:weights.pkl")
+    report = CompletenessValidator().validate_against_project(AIBOM(components=[]), root)
+    assert any(
+        "Conflicting local reference: model:weights.pkl" in i.description for i in report.issues
+    )
+    assert report.bound_references == frozenset()
 
 
 def test_the_staged_policy_gate_validates_a_reference_as_validate_does(tmp_path: Path):
@@ -1310,12 +1494,74 @@ def test_an_unsafe_format_claim_on_a_reference_still_fails(tmp_path: Path):
     assert not report.is_valid
 
 
-def test_a_project_without_ai_source_gains_no_component(runner, tmp_path: Path):
-    bom, _ = run_scan(
-        runner, write(tmp_path / "project", {"app.py": "print('hello')\n", "README.md": "# x\n"})
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            'from langchain.chat_models import init_chat_model\ninit_chat_model("openai:gpt-4.1")\n',
+            {"openai:gpt-4.1"},
+        ),
+        (
+            'from sentence_transformers import SentenceTransformer\nSentenceTransformer("BAAI/bge-m3")\n',
+            {"BAAI/bge-m3"},
+        ),
+        (
+            'from transformers import AutoModel\nAutoModel.from_pretrained("openai/whisper-large-v3")\n',
+            {"openai/whisper-large-v3"},
+        ),
+        ('import dspy\ndspy.LM("anthropic/claude-sonnet-4-5")\n', {"anthropic/claude-sonnet-4-5"}),
+        (
+            'from agno.models.openai import OpenAIChat\nOpenAIChat(id="gpt-4.1-mini")\n',
+            {"gpt-4.1-mini"},
+        ),
+        (
+            'from langchain_huggingface import HuggingFaceEndpoint\nHuggingFaceEndpoint(repo_id="mistralai/Mistral-7B-Instruct-v0.3")\n',
+            {"mistralai/Mistral-7B-Instruct-v0.3"},
+        ),
+        (
+            'from huggingface_hub import hf_hub_download\nhf_hub_download(repo_id="acme/rules-dataset")\n',
+            set(),
+        ),
+        (
+            'from langchain.chat_models import init_chat_model\ninit_chat_model("ignored", model="gpt-4o")\n',
+            {"gpt-4o"},
+        ),
+        (
+            'import boto3\nboto3.client("bedrock-runtime").converse(modelId="anthropic.claude-3-5-haiku-20241022-v1:0")\n',
+            {"anthropic.claude-3-5-haiku-20241022-v1:0"},
+        ),
+        ('from crewai import LLM\nLLM(model="ollama/llama3.1:8b")\n', {"ollama/llama3.1:8b"}),
+    ],
+)
+def test_which_arguments_hold_a_model(tmp_path: Path, source: str, expected: set[str]):
+    result = scan(tmp_path, {"run.py": source})
+    # An identifier is recorded as written; no provider is read from it here.
+    assert set(models(result)) == expected
+    assert all(model.provider is None for model in models(result).values())
+
+
+def test_positional_models_of_common_entry_points_are_read(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import litellm\nimport ollama\nfrom pydantic_ai import Agent\n\n"
+            'Agent("openai:gpt-4o")\nlitellm.completion("gpt-4o-mini", [])\n'
+            'ollama.chat("llama3.2", messages=[])\n'
+        },
     )
-    assert [c for c in bom.components if ":source:" in c.bom_ref] == []
-    assert bom.metadata.completeness.scanner_status["source"] == "complete"
+    assert set(models(result)) == {"openai:gpt-4o", "gpt-4o-mini", "llama3.2"}
+
+
+def test_more_entry_points_name_their_models(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import replicate\nfrom llama_cpp import Llama\n\n"
+            'replicate.run("meta/meta-llama-3-8b-instruct", input={})\n'
+            'Llama.from_pretrained(repo_id="Qwen/Qwen2-0.5B-Instruct-GGUF", filename="*q8_0.gguf")\n'
+        },
+    )
+    assert set(models(result)) == {"meta/meta-llama-3-8b-instruct", "Qwen/Qwen2-0.5B-Instruct-GGUF"}
 
 
 # -- following a model argument within its file ---------------------------------------
@@ -1581,10 +1827,11 @@ client.chat.completions.create(model=environ["TUNED_MODEL"], messages=[])
     )
     assert set(models(result)) == {"gpt-4.1"}
     assert models(result)["gpt-4.1"].properties["environment_variables"] == ["TUNED_MODEL"]
-    # One gap for the variable, at its first use; a variable with a value elsewhere is none.
+    # One gap for each variable a read needs, at its first such read in the file: a
+    # default another read gives does not stand for this one.
     assert list(result.surfaces_excluded) == [
-        "run.py:6: model set by environment variable CHAT_MODEL, which no file of the project "
-        "gives a value; not inventoried"
+        "run.py:6: model set only by environment variable CHAT_MODEL; not inventoried",
+        "run.py:9: model set only by environment variable TUNED_MODEL; not inventoried",
     ]
 
 
@@ -1611,8 +1858,7 @@ OpenAI().responses.create(model=os.environ["STRICT_MODEL"] or "o4-mini")
     # Indexing ``os.environ`` raises when the variable is unset, so nothing falls through.
     assert "environment_variables" not in found["o4-mini"].properties
     assert list(result.surfaces_excluded) == [
-        "run.py:8: model set by environment variable STRICT_MODEL, which no file of the "
-        "project gives a value; not inventoried"
+        "run.py:8: model set only by environment variable STRICT_MODEL; not inventoried"
     ]
 
 
@@ -1951,9 +2197,9 @@ client.responses.create(model="default")
 def test_text_a_call_gives_back_is_read_only_where_its_callee_is_known(tmp_path: Path):
     result = scan(tmp_path, {"text.py": TEXT_CALLS})
     assert set(models(result)) == {"o3", "gpt-4o", "gpt-4.1"}
-    # A call of anything else, a format, a variable named so it is not exported, text
-    # that is no identifier and a weight file are unread; ``default`` names none.
-    assert list(result.surfaces_excluded) == [unread("text.py", 8, 5)]
+    # A call of anything else, a format, a variable named so it is not exported and text
+    # that is no identifier are unread; ``default`` and a weight file name no hosted model.
+    assert list(result.surfaces_excluded) == [unread("text.py", 8, 4)]
 
 
 def test_a_token_is_not_exported_through_a_change_of_case(tmp_path: Path):
@@ -2104,3 +2350,19 @@ def test_joining_text_is_charged_to_the_allowance(tmp_path: Path, monkeypatch: p
     # No joined text is short enough to keep, yet each of the 256 was made and is a
     # step, which this allowance does not cover.
     assert list(result.surfaces_excluded) == [unread("run.py", 4), f"run.py:1: {CUT}"]
+
+
+def test_a_default_in_one_file_does_not_stand_for_a_read_another_file_needs(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "a.py": "import os\nfrom openai import OpenAI\n"
+            'OpenAI().responses.create(model=os.getenv("CHAT_MODEL", "gpt-4o"))\n',
+            "b.py": "import os\nfrom openai import OpenAI\n"
+            'OpenAI().responses.create(model=os.environ["CHAT_MODEL"])\n',
+        },
+    )
+    assert set(models(result)) == {"gpt-4o"}
+    assert list(result.surfaces_excluded) == [
+        "b.py:3: model set only by environment variable CHAT_MODEL; not inventoried"
+    ]

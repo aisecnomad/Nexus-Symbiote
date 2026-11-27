@@ -34,7 +34,13 @@ _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{1,127}")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,63}")
 # A long run of hex or of base64 with no separator, or user information before an
 # ``@``: what a key, a token or a connection string looks like, and no model's name.
-_SECRET_SHAPED = re.compile(r"[0-9A-Fa-f]{32,}|[A-Za-z0-9+/]{40,}={0,2}|[^@:/]+:[^@/]*@.+")
+_SECRET_SHAPED = re.compile(
+    r"[0-9A-Fa-f]{32}|[0-9A-Fa-f-]{48}|^[A-Za-z0-9+/]{40,}={0,2}$|^[^@:/]+:[^@/]+@(?![0-9]+$)"
+)
+# A model pinned by its version's digest, which is a hash, not a key.
+_PINNED = re.compile(r"[\w.-]+/[\w.-]+:[0-9a-f]{64}")
+# A path on this or another host: a drive, a share, the root or a home directory.
+_ABSOLUTE = re.compile(r"[A-Za-z]:[\\/]|\\\\|/|~")
 # Words a model argument holds that name no model on purpose.
 _NOT_A_MODEL = frozenset(
     {
@@ -52,31 +58,6 @@ _FILE_SUFFIXES = (
 _EMBEDDING = re.compile(
     r"(?i)(?:embed|bge-|e5-|gte-|minilm|mpnet|gecko|arctic-embed|voyage-|jina-|rerank)"
 )
-# The routing prefix a model router reads off the front of an identifier, and the
-# provider it routes to.
-ROUTES: dict[str, str] = {
-    "anthropic": "anthropic", "azure": "azure-openai", "azure_ai": "azure-ai",
-    "bedrock": "aws-bedrock", "bedrock_converse": "aws-bedrock", "cerebras": "cerebras",
-    "cohere": "cohere", "cohere_chat": "cohere", "deepseek": "deepseek", "fireworks": "fireworks",
-    "fireworks_ai": "fireworks", "gemini": "google", "google-gla": "google",
-    "google-vertex": "google-vertex-ai", "google_genai": "google",
-    "google_vertexai": "google-vertex-ai", "groq": "groq", "huggingface": "huggingface",
-    "mistral": "mistral", "mistralai": "mistral", "nvidia_nim": "nvidia", "ollama": "ollama",
-    "ollama_chat": "ollama", "openai": "openai", "openrouter": "openrouter",
-    "perplexity": "perplexity", "replicate": "replicate", "sagemaker": "aws-sagemaker",
-    "together": "together", "together_ai": "together", "vertex_ai": "google-vertex-ai",
-    "watsonx": "ibm-watsonx", "xai": "xai",
-}  # fmt: skip
-# Routing prefixes that are also the owner of weights on a model hub, with the names
-# that owner publishes there: such an identifier is the owner and the name together.
-_HUB_OWNED: dict[str, re.Pattern[str]] = {
-    "mistralai": re.compile(""),
-    "openai": re.compile(
-        r"(?i)(?:whisper-(?:tiny|base|small|medium|large)|clip|gpt2|gpt-oss|shap-e|jukebox)"
-    ),
-}
-# Providers that serve a model from weights on the machine, so no hosted service is named.
-LOCAL_PROVIDERS = frozenset({"huggingface", "ollama"})
 
 
 def unchanged_by_redaction(text: str) -> bool:
@@ -94,41 +75,19 @@ def model_identifier(literal: object) -> str | None:
     lowered = text.lower()
     if lowered in _NOT_A_MODEL or lowered.endswith(_FILE_SUFFIXES) or "://" in text:
         return None
-    if text.startswith(("./", "../", "/", "~")) or not unchanged_by_redaction(text):
+    if text.startswith(("./", "../")) or _ABSOLUTE.match(text):
         return None
-    if _SECRET_SHAPED.fullmatch(text):
+    if _SECRET_SHAPED.search(text) and not _PINNED.fullmatch(text):
         return None
-    return text
+    return text if unchanged_by_redaction(text) else None
 
 
 def placeholder(text: str) -> bool:
-    """Whether a model argument's text names no model on purpose, such as ``default``."""
-    return not text.strip() or text.strip().lower() in _NOT_A_MODEL
-
-
-def split_route(literal: str, *, weights: bool = False) -> tuple[str, str | None]:
-    """The model identifier and the provider a routing prefix on ``literal`` names.
-
-    ``openai/gpt-4o`` and ``anthropic:claude-sonnet-4-5`` are a route and an
-    identifier. An identifier read by a library that loads weights, which
-    ``weights`` says, is never split: there the part before the slash is the owner.
-    """
-    if weights:
-        return literal, None
-    for separator in ("/", ":"):
-        prefix, found, rest = literal.partition(separator)
-        if not found or not rest:
-            continue
-        provider = ROUTES.get(prefix.lower())
-        if provider is None:
-            continue
-        owned = _HUB_OWNED.get(prefix.lower()) if separator == "/" else None
-        if owned is not None and owned.match(rest):
-            continue
-        if model_identifier(rest) is None:
-            continue
-        return rest, provider
-    return literal, None
+    """Whether a model argument's text names no hosted model and is no gap: a word such as
+    ``default``, or a path or weight file in the project, which the model collector reads."""
+    text = text.strip()
+    local = text.startswith(("./", "../")) or text.lower().endswith(_FILE_SUFFIXES)
+    return not text or text.lower() in _NOT_A_MODEL or local and not _ABSOLUTE.match(text)
 
 
 def model_kind(name: str, *, embedding: bool = False) -> str | None:
@@ -154,12 +113,11 @@ def model_ref(name: str) -> str:
 class _Model:
     name: str
     locations: set[tuple[str, int]] = field(default_factory=set)
-    providers: set[str] = field(default_factory=set)
     kinds: set[str] = field(default_factory=set)
-    aliases: set[str] = field(default_factory=set)
     environment: set[str] = field(default_factory=set)
     methods: set[str] = field(default_factory=set)
     remote_code: bool = False
+    count: int = 0
 
 
 def _evidence(locations: Iterable[tuple[str, int]]) -> list[str]:
@@ -180,10 +138,10 @@ class Declarations:
         self._written: dict[str, str | None] = {}
         self._gaps: set[str] = set()
         self._full = False
-        # Variables that alone set a model, with where each is read; those that also
-        # override a value the project gives are not gaps.
-        self.unresolved_environment: dict[str, set[tuple[str, int]]] = {}
-        self._environment: set[str] = set()
+        self._path = ""
+        self._lines: set[tuple[str, int]] = set()
+        # Where each file first reads a variable that alone sets a model, with no value.
+        self.unresolved_environment: dict[tuple[str, str], int] = {}
 
     def gap(self, path: str, line: int, reason: str) -> None:
         text = f"{path}:{line}: {reason}"
@@ -199,16 +157,12 @@ class Declarations:
         *,
         method: str,
         embedding: bool = False,
-        weights: bool = False,
         remote_code: bool = False,
         environment: Iterable[str] = (),
     ) -> str | None:
         """Record one reference to a model and return its component reference.
-
-        A provider is recorded only when a routing prefix on the identifier names it.
         ``remote_code`` says the call that loads it lets the model run its own code, and
-        ``environment`` names the variables that, when set, give a model in its place.
-        """
+        ``environment`` names the variables that, when set, give a model in its place."""
         if not isinstance(literal, str):
             return None
         if literal not in self._written:
@@ -216,10 +170,9 @@ class Declarations:
             if len(self._written) >= MAX_RECORDS:
                 self._written.clear()
             self._written[literal] = model_identifier(literal)
-        written = self._written[literal]
-        if written is None:
+        name = self._written[literal]
+        if name is None:
             return None
-        name, routed = split_route(written, weights=weights)
         record = self._models.get(name)
         if record is None:
             if len(self._models) >= MAX_RECORDS:
@@ -231,35 +184,28 @@ class Declarations:
                     )
                 return None
             record = self._models[name] = _Model(name)
-        record.locations.add((path, line))
+        if path != self._path:
+            self._path, self._lines = path, set()
+        if (name, line) not in self._lines:
+            # A place repeats only within its file, which is read whole before the next.
+            self._lines.add((name, line))
+            record.count += 1
+            record.locations.add((path, line))
+            if len(record.locations) > MAX_EVIDENCE_LOCATIONS:
+                record.locations.discard(max(record.locations))
         record.methods.add(method)
-        if routed:
-            record.providers.add(routed)
         kind = model_kind(name, embedding=embedding)
         if kind:
             record.kinds.add(kind)
-        if written != name:
-            record.aliases.add(written)
         record.remote_code = record.remote_code or remote_code
-        for variable in environment:
-            if environment_name(variable):
-                record.environment.add(variable)
-                self._environment.add(variable)
+        record.environment.update(filter(environment_name, environment))
         return model_ref(name)
 
     def close(self) -> None:
-        """Name each model that only an environment variable sets, with no value in the
-        project: a variable that also overrides a value read is recorded with that one."""
-        for name in sorted(self.unresolved_environment):
-            if name in self._environment:
-                continue
-            path, line = min(self.unresolved_environment[name])
-            self.gap(
-                path,
-                line,
-                f"model set by environment variable {name}, which no file of the project "
-                "gives a value; not inventoried",
-            )
+        """Name each model that only an environment variable sets, once for each file that
+        reads it so: a value another read gives does not stand for this one."""
+        for (path, name), line in sorted(self.unresolved_environment.items()):
+            self.gap(path, line, f"model set only by environment variable {name}; not inventoried")
 
     def components(self) -> list[AnyComponent]:
         built: list[AnyComponent] = []
@@ -274,33 +220,16 @@ class Declarations:
                 "declaration_line": first[1],
                 "reference_path": first[0],
             }
-            if len(model.locations) > MAX_EVIDENCE_LOCATIONS:
-                properties["references_unlisted"] = len(model.locations) - MAX_EVIDENCE_LOCATIONS
-            if len(model.providers) > 1:
-                properties["providers"] = sorted(model.providers)
-            if len(model.aliases) > 1:
-                properties["requested_aliases"] = sorted(model.aliases)
+            if model.count > MAX_EVIDENCE_LOCATIONS:
+                properties["references_unlisted"] = model.count - MAX_EVIDENCE_LOCATIONS
             if model.environment:
                 properties["environment_variables"] = sorted(model.environment)
-            provider = next(iter(model.providers)) if len(model.providers) == 1 else None
-            kind = (
-                "fine-tuned"
-                if "fine-tuned" in model.kinds
-                else "embedding"
-                if "embedding" in model.kinds
-                else "hosted"
-                if provider is not None and provider not in LOCAL_PROVIDERS
-                else None
-            )
+            kind = "fine-tuned" if "fine-tuned" in model.kinds else min(model.kinds, default=None)
             built.append(
                 ModelComponent(
                     bom_ref=model_ref(name),
                     name=name,
                     model_type=kind,
-                    provider=provider,
-                    requested_alias=(
-                        next(iter(model.aliases)) if len(model.aliases) == 1 else None
-                    ),
                     trust_tier=TrustTier.UNKNOWN,
                     assurance_level=AssuranceLevel.DECLARED,
                     # Code that lets a model run its own code says so; it is no bare name.
