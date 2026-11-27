@@ -7,6 +7,8 @@ shadows one of these module names is never read as the SDK.
 
 from __future__ import annotations
 
+import re
+
 # Top-level modules whose import makes a file one the reader analyses.
 AI_ROOTS = frozenset(
     {
@@ -33,8 +35,14 @@ AI_ROOTS = frozenset(
 AI_SUBMODULES = {
     "google": ("google.adk", "google.genai", "google.generativeai", "google.cloud.aiplatform"),
 }
-# Bytes that say a file may import one of the roots, tested before it is parsed.
-AI_MARKERS = tuple(sorted(name.encode() for name in AI_ROOTS))
+# An import statement that may name one of the roots, tested before a file is parsed: a
+# word that only appears in text, such as ``graphics`` or ``camelCase``, is no import.
+_ROOT_WORDS = b"|".join(sorted(re.escape(name).encode() for name in AI_ROOTS - {"google"}))
+SDK_IMPORT = re.compile(
+    rb"(?m)^(?:\xef\xbb\xbf)?[ \t]*(?:from[ \t]+|import[ \t]+(?:[\w.]+(?:[ \t]+as[ \t]+\w+)?"
+    rb"[ \t]*,[ \t]*)*)(?:(?:" + _ROOT_WORDS + rb")\b(?![\w])"
+    rb"|google(?:\.(?:adk|genai|generativeai|cloud\.aiplatform)\b|[ \t]+import\b))"
+)
 # Libraries that load weights by an owner/name identifier, which is never a route.
 WEIGHT_ROOTS = ("huggingface_hub", "langchain_huggingface", "sentence_transformers", "transformers")
 WEIGHT_CLASSES = frozenset(
@@ -70,13 +78,16 @@ POSITIONAL_MODELS: dict[tuple[str, str], int] = {
     ("sentence_transformers", "SentenceTransformer"): 0, ("transformers", "from_pretrained"): 0,
     ("vertexai", "GenerativeModel"): 0, ("vertexai", "TextEmbeddingModel.from_pretrained"): 0,
 }  # fmt: skip
-ENVIRONMENT_READS = frozenset({"os.getenv", "os.environ.get", "decouple.config"})
-# Calls whose text is their default: whether the first positional argument is it too.
-TEXT_DEFAULTS = {
-    "builtins.str": True,
-    "dataclasses.field": False,
-    "pydantic.Field": True,
-    "pydantic.fields.Field": True,
-}
+# Calls that call their first argument with the rest, so its keywords are that callee's.
+FORWARDERS = frozenset(
+    {
+        "asyncio.to_thread",
+        "concurrent.futures.ProcessPoolExecutor().submit",
+        "concurrent.futures.ThreadPoolExecutor().submit",
+        "fastapi.concurrency.run_in_threadpool",
+        "functools.partial",
+        "starlette.concurrency.run_in_threadpool",
+    }
+)
 # Class methods that construct what the class names, so ``X.from_pretrained`` is ``X``.
 CLASS_METHODS = frozenset({"from_defaults", "from_model_id", "from_pretrained"})
