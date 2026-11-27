@@ -37,6 +37,9 @@ models:
 | `autonomy_level` | no | `L0-chatbot`, `L1-copilot`, `L2-agent`, `L3-autonomous` or `L4-fully-autonomous`; recorded as the property `declared_autonomy_level`, never as the agent's observed `autonomy_level` |
 | `instructions` | no | Up to 1,024 paths of instruction files, relative to the project root |
 | `models` | no | Up to 1,024 named models, each either `path` (a model file or the directory that holds it, relative to the project root) or both `provider` and `requested_ref` (a hosted model) |
+| `spiffe_id` | no | Declared workload SPIFFE URI (`spiffe://<trust-domain>/<path>`), recorded as `declared_spiffe_id` with `declared` assurance |
+| `egress_domains` | no | Up to 256 declared DNS hostnames or wildcard domains (`*.example.com`), recorded as `declared_egress_domains` with `declared` assurance |
+| `delegates_to` | no | Up to 256 declared downstream agent identifiers, recorded as `declared_delegates_to` with `declared` assurance |
 
 Any other key is an error. The file must be a UTF-8 YAML mapping of at most 1 MiB
 and 20,000 YAML tokens, without anchors, aliases or tags.

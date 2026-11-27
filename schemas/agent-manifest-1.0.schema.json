@@ -60,16 +60,47 @@
   },
   "additionalProperties": false,
   "properties": {
-    "autonomy_level": {
+    "id": {
       "anyOf": [
         {
-          "$ref": "#/$defs/AutonomyLevel"
+          "minLength": 1,
+          "type": "string"
         },
         {
           "type": "null"
         }
       ],
-      "default": null
+      "default": null,
+      "title": "Id"
+    },
+    "name": {
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+    },
+    "version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Version"
+    },
+    "purpose": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Purpose"
     },
     "framework": {
       "anyOf": [
@@ -83,10 +114,9 @@
       "default": null,
       "title": "Framework"
     },
-    "id": {
+    "owner": {
       "anyOf": [
         {
-          "minLength": 1,
           "type": "string"
         },
         {
@@ -94,7 +124,7 @@
         }
       ],
       "default": null,
-      "title": "Id"
+      "title": "Owner"
     },
     "instructions": {
       "items": {
@@ -116,14 +146,22 @@
       "title": "Models",
       "type": "object"
     },
-    "name": {
-      "minLength": 1,
-      "title": "Name",
-      "type": "string"
-    },
-    "owner": {
+    "autonomy_level": {
       "anyOf": [
         {
+          "$ref": "#/$defs/AutonomyLevel"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "spiffe_id": {
+      "anyOf": [
+        {
+          "maxLength": 2048,
+          "minLength": 1,
           "type": "string"
         },
         {
@@ -131,31 +169,25 @@
         }
       ],
       "default": null,
-      "title": "Owner"
+      "title": "Spiffe Id"
     },
-    "purpose": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Purpose"
+    "egress_domains": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 256,
+      "title": "Egress Domains",
+      "type": "array"
     },
-    "version": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Version"
+    "delegates_to": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 256,
+      "title": "Delegates To",
+      "type": "array"
     }
   },
   "required": [

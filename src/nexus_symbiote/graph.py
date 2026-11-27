@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import quote
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
 from nexus_symbiote.core.enums import AssuranceLevel, AutonomyLevel, ComponentType, RiskSeverity
@@ -74,6 +74,14 @@ class ModelDeclaration(BaseModel):
         return self
 
 
+_SPIFFE_ID_RE = re.compile(
+    r"^spiffe://[a-z0-9](?:[a-z0-9._-]{0,253}[a-z0-9])?(?:/[A-Za-z0-9._-]+)+$"
+)
+_EGRESS_DOMAIN_RE = re.compile(
+    r"^(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
+
+
 class AgentDeclaration(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str | None = Field(default=None, min_length=1)
@@ -85,6 +93,45 @@ class AgentDeclaration(BaseModel):
     instructions: list[NonemptyString] = Field(default_factory=list, max_length=1024)
     models: dict[NonemptyString, ModelDeclaration] = Field(default_factory=dict, max_length=1024)
     autonomy_level: AutonomyLevel | None = None
+    spiffe_id: str | None = Field(default=None, min_length=1, max_length=2048)
+    egress_domains: list[NonemptyString] = Field(default_factory=list, max_length=256)
+    delegates_to: list[NonemptyString] = Field(default_factory=list, max_length=256)
+
+    @field_validator("spiffe_id")
+    @classmethod
+    def _validate_spiffe_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not _SPIFFE_ID_RE.fullmatch(value) or "/.." in value or "/." in value:
+            raise ValueError("spiffe_id must be a valid SPIFFE URI (spiffe://<domain>/<path>)")
+        return value
+
+    @field_validator("egress_domains")
+    @classmethod
+    def _validate_egress_domains(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for domain in values:
+            candidate = domain.strip().lower()
+            if len(candidate) > 253 or not _EGRESS_DOMAIN_RE.fullmatch(candidate):
+                raise ValueError("egress_domains entries must be valid DNS hostnames or wildcards")
+            normalized.append(candidate)
+        return normalized
+
+    @field_validator("delegates_to")
+    @classmethod
+    def _validate_delegates_to(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for target in values:
+            stripped = target.strip()
+            if (
+                not stripped
+                or len(stripped) > 256
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in stripped)
+                or redact_text(stripped, identifier=True) != stripped
+            ):
+                raise ValueError("delegates_to entries must be clean non-credential agent IDs")
+            cleaned.append(stripped)
+        return cleaned
 
 
 def _clip(value: object) -> str:
@@ -548,6 +595,12 @@ def assemble_repository_agent(
     if declared:
         if declared.autonomy_level is not None:
             agent.properties["declared_autonomy_level"] = declared.autonomy_level.value
+        if declared.spiffe_id is not None:
+            agent.properties["declared_spiffe_id"] = declared.spiffe_id
+        if declared.egress_domains:
+            agent.properties["declared_egress_domains"] = sorted(set(declared.egress_domains))
+        if declared.delegates_to:
+            agent.properties["declared_delegates_to"] = sorted(set(declared.delegates_to))
         for key in (
             "name",
             "version",
@@ -557,6 +610,9 @@ def assemble_repository_agent(
             "autonomy_level",
             "instructions",
             "models",
+            "spiffe_id",
+            "egress_domains",
+            "delegates_to",
         ):
             if key in declared.model_fields_set and getattr(declared, key) is not None:
                 agent.claims[key] = ClaimEvidence(
@@ -825,6 +881,35 @@ def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
         if nodes[ref].properties.get("mcp_role") == "gateway"
         or isinstance(nodes[ref].properties.get("upstream_server_refs"), list)
     )
+    workload_identities = sorted(
+        {
+            str(nodes[ref].properties["declared_spiffe_id"])
+            for ref in reach
+            if isinstance(nodes[ref].properties.get("declared_spiffe_id"), str)
+        }
+    )
+    egress_domains = sorted(
+        {
+            domain
+            for ref in reach
+            if isinstance(
+                (raw_domains := nodes[ref].properties.get("declared_egress_domains")), list
+            )
+            for domain in raw_domains
+            if isinstance(domain, str)
+        }
+    )
+    delegations = sorted(
+        {
+            target
+            for ref in reach
+            if isinstance(
+                (raw_delegates := nodes[ref].properties.get("declared_delegates_to")), list
+            )
+            for target in raw_delegates
+            if isinstance(target, str)
+        }
+    )
     limitations = [
         "Reachability describes potential dependencies, not proven exploitability or runtime access."
     ]
@@ -843,6 +928,9 @@ def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
         "dependent_components": sorted(upstream - {component_ref}),
         "reachable_components": sorted(reach),
         "declared_principals": principals,
+        "declared_workload_identities": workload_identities,
+        "declared_egress_domains": egress_domains,
+        "declared_delegations": delegations,
         "shared_credential_surfaces": shared_credentials,
         "shared_credential_holders_omitted": omitted_holders,
         "mcp_gateways": gateways,
