@@ -227,7 +227,11 @@ def _extract_severity(record: dict[str, Any]) -> str:
             if norm in _SEVERITY_ORDER:
                 return norm
     # Without a label, the highest CVSS v3 base score in OSV's severity array decides.
-    entries = record.get("severity")
+    return _cvss_severity(record.get("severity"))
+
+
+def _cvss_severity(entries: object) -> str:
+    """The rating of the highest CVSS v3 base score in an OSV ``severity`` array."""
     scores = [
         score
         for entry in (entries if isinstance(entries, list) else [])
@@ -579,7 +583,13 @@ class _PackageMatcher:
         budget: _MatchBudget,
     ) -> None:
         self._ecosystem = ecosystem
-        self._advisories = [adv for adv, _ in blocks]
+        # A record that states no severity takes the one OSV states for this package.
+        self._advisories = [
+            replace(adv, severity=_cvss_severity(affected.get("severity")))
+            if adv.severity == "unknown"
+            else adv
+            for adv, affected in blocks
+        ]
         self._listed: dict[Any, list[int]] = {}
         self._listed_text: dict[str, list[int]] = {}
         self._nodes: dict[int, list[_Hit]] = {}

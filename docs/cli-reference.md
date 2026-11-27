@@ -1045,7 +1045,8 @@ exact pin, such as a range, a wildcard, a pin with an environment marker, a URL 
 is never reported as unaffected: it is recorded as the collection failure `exact package
 identity unavailable`, the receipt's coverage becomes `partial` (`none` when no entry is
 pinned), and the scan gate fails because collection is incomplete. A record without a severity label takes its
-severity from the highest CVSS v3.0 or v3.1 base score in OSV's `severity` array, using the
+severity from the highest CVSS v3.0 or v3.1 base score in OSV's `severity` array, or else in the
+matched package's `affected[].severity`, using the
 CVSS 3.1 equations and rating ranges (a 0.0 score is low); CVSS v2 and v4 vectors are not
 scored. A severity the bundle states neither way is recorded as a medium finding that says so
 and exported with an `unknown` rating. The feed-age check uses the current clock, so a bundle older than the

@@ -396,3 +396,77 @@ def test_vex_lists_a_recorded_advisory_once_under_its_bom_id(tmp_path: Path) -> 
             if entry["affects"] == [{"ref": "registry:pypi/pillow"}]
         ]
         assert listed == [(bom_vulnerability["id"], "not_affected")], linked
+
+
+def test_a_package_level_cvss_vector_sets_the_matched_package_severity(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    record = _record("CVE-2099-7777", [("pillow", "9.0.1")], severity=None)
+    affected = record["affected"]
+    assert isinstance(affected, list)
+    affected[0]["severity"] = [
+        {"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}
+    ]
+    bom = _scan(project, _write_bundle(tmp_path, [record]), tmp_path / "inventory.json")
+    (pillow,) = [c for c in bom.components if c.name == "pillow"]
+    (finding,) = [r for r in pillow.risks if r.category == "known_vulnerability"]
+    assert finding.severity.value == "critical"
+    (vulnerability,) = CycloneDXGenerator().generate(bom)["vulnerabilities"]
+    assert vulnerability["ratings"] == [{"severity": "critical"}]
+
+
+def test_a_partial_receipt_does_not_let_a_decision_suppress_its_advisory(tmp_path: Path) -> None:
+    from nexus_symbiote.core.hashing import hash_bytes
+
+    project, operator, out = (tmp_path / name for name in ("project", "operator", "out"))
+    for directory in (project, operator, out):
+        directory.mkdir()
+    # The floating pin cannot be checked, so the receipt and the linked report are partial.
+    (project / "requirements.txt").write_text("pillow==9.0.0\nrequests>=2\n")
+    feed = operator / "osv.json"
+    feed.write_text(json.dumps([_record("PYSEC-F5-2", [("pillow", "9.0.1")])]))
+    inventory, report = out / "inventory.json", operator / "advisories.json"
+    bom = _scan(project, feed, inventory)
+    (receipt,) = [s for s in _claim(bom).surfaces_scanned if s.startswith(ADVISORY_SURFACE_PREFIX)]
+    assert '"coverage":"partial"' in receipt
+    runner = CliRunner()
+    runner.invoke(
+        main, ["advisories", str(inventory), "--offline-db", str(feed), "-o", str(report)]
+    )
+    decision = {
+        "id": "PYSEC-F5-2",
+        "component_ref": "registry:pypi/pillow",
+        "state": "not_affected",
+        "justification": "code_not_reachable",
+        "detail": "The decoder is never imported.",
+        "owner": "security@example.invalid",
+        "expires_at": "2030-01-01T00:00:00Z",
+        "inventory_sha256": hash_bytes(inventory.read_bytes()),
+        "deployment_id": "prod",
+    }
+    decisions = operator / "decisions.json"
+    decisions.write_text(json.dumps({"version": 1, "decisions": [decision]}))
+    for linked in (["--advisories", str(report), "--allow-partial-advisories"], []):
+        vex = out / "vex.json"
+        result = runner.invoke(
+            main,
+            [
+                "vex",
+                str(inventory),
+                *linked,
+                "--decisions",
+                str(decisions),
+                "--project-root",
+                str(project),
+                "--deployment-id",
+                "prod",
+                "-o",
+                str(vex),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        listed = [
+            (entry["id"], entry["analysis"]["state"])
+            for entry in json.loads(vex.read_text())["vulnerabilities"]
+            if entry["affects"] == [{"ref": "registry:pypi/pillow"}]
+        ]
+        assert listed == [("PYSEC-F5-2", "in_triage")], linked

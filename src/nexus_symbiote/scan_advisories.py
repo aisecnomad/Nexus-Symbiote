@@ -287,7 +287,14 @@ def finding_advisory_id(risk: RiskAssessment) -> str | None:
 
 
 def vex_advisories(aibom: AIBOM) -> list[dict[str, Any]]:
-    """Recorded advisories in the shape of an advisory report entry, for the VEX export."""
+    """Recorded advisories in the shape of an advisory report entry, for the VEX export, each
+    with the coverage of the receipt that recorded it."""
+    claim = aibom.metadata.completeness
+    coverage = {
+        receipt["db_sha256"]: receipt.get("coverage")
+        for surface in ((*claim.surfaces_scanned, *claim.unobserved_surfaces) if claim else ())
+        if (receipt := parse_receipt(surface)) is not None
+    }
     return [
         {
             "id": identifier,
@@ -297,6 +304,7 @@ def vex_advisories(aibom: AIBOM) -> list[dict[str, Any]]:
             "summary": entry["summary"] if isinstance(entry.get("summary"), str) else "",
             "range_undecidable": entry.get("range_undecidable") is True,
             "offline": True,
+            "coverage": coverage.get(entry.get("db_sha256")),
         }
         for (ref, identifier), entry in recorded_advisories(aibom).items()
     ]

@@ -134,3 +134,44 @@ def test_a_wider_package_scope_is_not_narrowed_coverage(tmp_path: Path) -> None:
         for alert in narrower["security_alerts"]
         if alert["severity"] == "high"
     ), narrower["security_alerts"]
+
+
+def _edit_receipt(inventory: Path, edit) -> None:  # noqa: ANN001
+    from nexus_symbiote.scan_advisories import ADVISORY_SURFACE_PREFIX
+
+    document = json.loads(inventory.read_text(encoding="utf-8"))
+    surfaces = document["metadata"]["completeness"]["surfaces_scanned"]
+    for index, surface in enumerate(surfaces):
+        if surface.startswith(ADVISORY_SURFACE_PREFIX):
+            receipt = json.loads(surface.removeprefix(ADVISORY_SURFACE_PREFIX))
+            edit(receipt)
+            surfaces[index] = ADVISORY_SURFACE_PREFIX + json.dumps(receipt, separators=(",", ":"))
+    inventory.write_text(json.dumps(document), encoding="utf-8")
+
+
+def test_a_receipt_from_before_a_count_existed_does_not_narrow(tmp_path: Path) -> None:
+    project = _project(tmp_path, "langchain==0.3.27\npillow==9.0.0\n")
+    feed = _feed(tmp_path / "feed" / "osv.json", "PYSEC-1")
+    options = ("--all-packages", "--advisory-db", str(feed))
+    old = _scan(project, tmp_path / "old.json", *options)
+    new = _scan(project, tmp_path / "new.json", *options)
+    _edit_receipt(old, lambda r: (r.pop("components_unidentified"), r.pop("registry_packages")))
+    code, report = _diff(old, new)
+    assert code == 0, report
+    assert report["security_alerts"] == []
+
+
+def test_a_receipt_that_drops_or_garbles_a_count_narrows(tmp_path: Path) -> None:
+    project = _project(tmp_path, "langchain==0.3.27\npillow==9.0.0\n")
+    feed = _feed(tmp_path / "feed" / "osv.json", "PYSEC-1")
+    options = ("--all-packages", "--advisory-db", str(feed))
+    old = _scan(project, tmp_path / "old.json", *options)
+    for name, edit in (
+        ("dropped", lambda r: r.pop("components_excluded")),
+        ("garbled", lambda r: r.update(components_skipped="none")),
+    ):
+        new = _scan(project, tmp_path / f"{name}.json", *options)
+        _edit_receipt(new, edit)
+        code, report = _diff(old, new)
+        assert code == 1, (name, report)
+        assert any("coverage narrowed" in str(a) for a in report["security_alerts"]), name

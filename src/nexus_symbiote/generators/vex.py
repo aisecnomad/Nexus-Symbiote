@@ -343,9 +343,10 @@ class VEXGenerator(Generator):
                 expired_warnings=expired_warnings,
                 inventory_sha256=decision_subject,
                 deployment_id=self._deployment_id,
-                advisory_complete=not reported
-                or self._advisory_report is None
-                or self._advisory_report.coverage == "complete",
+                # Embedded and linked evidence alike must be complete to suppress.
+                advisory_complete=adv.get("coverage") == "complete"
+                if not reported
+                else self._advisory_report is None or self._advisory_report.coverage == "complete",
             )
             vulnerabilities.append(
                 {

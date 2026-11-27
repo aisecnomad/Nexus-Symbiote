@@ -274,8 +274,13 @@ def _advisory_receipts(claim: CompletenessClaim) -> list[tuple[str, dict[str, An
     ]
 
 
-def _receipt_count(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) else -1
+# A count a new receipt states in a form no count takes is as many as can be left out.
+_UNREADABLE_COUNT = 1 << 62
+
+
+def _receipt_count(value: object, default: int) -> int:
+    """A receipt's count, or ``default`` when it records none or not a count."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
 
 
 def _scope_rank(value: object) -> int:
@@ -1171,7 +1176,7 @@ class AIBOMDiffer:
         less_covered = _RECEIPT_COVERAGE_RANK.get(
             str(new.get("coverage")), 3
         ) > _RECEIPT_COVERAGE_RANK.get(str(old.get("coverage")), 3) or any(
-            _receipt_count(new.get(key)) > _receipt_count(old.get(key))
+            _receipt_count(new.get(key), _UNREADABLE_COUNT) > _receipt_count(old.get(key), 0)
             for key in old.keys() | new.keys()
             if key.startswith("components_") and key != "components_checked"
         )
@@ -1190,7 +1195,11 @@ class AIBOMDiffer:
             if before == after:
                 continue
             change = f"{key} {_clip(before)} → {_clip(after)}"
-            if key == "coverage":
+            # A count a baseline from before it existed does not record is compared as zero;
+            # a field the baseline records and the new receipt drops is narrowing.
+            if key in old and key not in new:
+                worse = True
+            elif key == "coverage":
                 worse = _RECEIPT_COVERAGE_RANK.get(str(after), 3) > _RECEIPT_COVERAGE_RANK.get(
                     str(before), 3
                 )
@@ -1199,9 +1208,9 @@ class AIBOMDiffer:
             elif key == "registry_packages":
                 worse = _scope_rank(after) > _scope_rank(before)
             elif key == "components_checked":
-                worse = _receipt_count(after) < _receipt_count(before) and less_covered
+                worse = _receipt_count(after, -1) < _receipt_count(before, 0) and less_covered
             elif key.startswith("components_"):
-                worse = _receipt_count(after) > _receipt_count(before)
+                worse = _receipt_count(after, _UNREADABLE_COUNT) > _receipt_count(before, 0)
             else:
                 # Any other field states the scope the counts are over.
                 worse = True
