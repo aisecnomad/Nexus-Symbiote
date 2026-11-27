@@ -49,9 +49,8 @@ def eligible(path: PurePosixPath) -> bool:
 
 
 def _names_sdk(text: str) -> bool:
-    """Whether an import statement may name an SDK once Python folds identifiers to NFKC.
-    Text that needs folding is folded a slice at a time, so that a character's expansion
-    stays within its slice; a statement may span slices there, so the name alone counts."""
+    """Whether an import statement may name an SDK once Python folds identifiers to NFKC,
+    a slice at a time to bound each character's expansion, where its name alone counts."""
     if SDK_IMPORT.search(text):
         return True
     if text.isascii() or unicodedata.is_normalized("NFKC", text):
