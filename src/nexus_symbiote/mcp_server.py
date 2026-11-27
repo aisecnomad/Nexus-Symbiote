@@ -500,7 +500,7 @@ class OfflineMCPServer:
             negotiated = (
                 requested
                 if isinstance(requested, str) and requested in SUPPORTED_PROTOCOL_VERSIONS
-                else SUPPORTED_PROTOCOL_VERSIONS[1]
+                else SUPPORTED_PROTOCOL_VERSIONS[0]
             )
             return self._result(
                 req_id,

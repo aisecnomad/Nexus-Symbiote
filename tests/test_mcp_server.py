@@ -37,6 +37,7 @@ from nexus_symbiote.mcp_server import (
     MAX_FRAME_BYTES,
     MAX_FRAME_DEPTH,
     MAX_HEADER_BYTES,
+    SUPPORTED_PROTOCOL_VERSIONS,
     OfflineMCPServer,
     _collect_advisories,
     _normalize_advisory_row,
@@ -272,7 +273,7 @@ def test_initialize_ping_notifications_and_tool_list():
         }
     )
     assert init_fallback is not None
-    assert init_fallback["result"]["protocolVersion"] == "2025-03-26"
+    assert init_fallback["result"]["protocolVersion"] == "2025-06-18"
 
     assert server.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
     assert server.handle_message({"jsonrpc": "2.0", "id": 3, "method": "ping"}) == {
@@ -303,6 +304,19 @@ def test_initialize_ping_notifications_and_tool_list():
             "idempotentHint": True,
             "openWorldHint": False,
         }
+
+
+@pytest.mark.parametrize("requested", ["2025-11-25", "1999-01-01", 7, None])
+def test_unsupported_protocol_version_negotiates_the_latest_supported(requested):
+    # MCP lifecycle: answer an unsupported request with another supported version,
+    # the latest one. 2025-03-26 also obliges servers to accept JSON-RPC batches.
+    server = OfflineMCPServer(_build_rich_bom())
+    params = {} if requested is None else {"protocolVersion": requested}
+    reply = server.handle_message(
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params}
+    )
+    assert reply is not None
+    assert reply["result"]["protocolVersion"] == SUPPORTED_PROTOCOL_VERSIONS[0] == "2025-06-18"
 
 
 def test_all_eight_tools_filters_sorting_and_sanitization(tmp_path):
