@@ -6,7 +6,7 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ### Security
 
-- Code and Dockerfiles a collector already opened are checked for a mixed-script word and for hidden characters (bidi overrides, zero-width characters, and the other format characters the prompt collector rates). The finding names the file, the line, and the SHA-256 of that line, not the line. An emoji joiner stays ordinary. More than 32 hits in one file is a collection failure and adds no finding from that file. Instruction files stay on the prompt collector's existing check.
+- Collected code and Dockerfiles are checked for hidden characters, including inside comments and strings. Python, JavaScript and TypeScript identifiers are also checked for mixed scripts. Findings identify the file and line and withhold the source text and its digest. Both project gates re-derive these findings. More than 32 hits in one file is a collection failure and adds no findings from that file. Instruction files retain their existing prompt checks.
 
 ## [0.2.0] - 2026-11-25
 

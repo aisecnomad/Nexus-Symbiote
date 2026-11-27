@@ -1,44 +1,33 @@
 """Homoglyphs and hidden characters in source a collector already opened.
 
 Instruction files are already rated by the prompt collector. This pass reads
-code and Dockerfiles those collectors named, and records a mixed-script word or
-a hidden character with the file, the line, and a SHA-256 of that line. The
-line itself is not copied into the finding. More than ``MAX_FINDINGS`` hits in
-one file is a collection failure and produces no finding from that file.
+code and Dockerfiles those collectors named. Findings locate hidden characters
+and mixed-script Python, JavaScript and TypeScript identifiers by file and line.
+More than ``MAX_FINDINGS`` hits in a file cause an explicit collection failure.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import io
+import tokenize
+from collections.abc import Iterable, Iterator
 from pathlib import Path, PurePosixPath
-from typing import Any
 
+from nexus_symbiote import limits
 from nexus_symbiote.core.aibom import AIBOM
+from nexus_symbiote.core.collection import is_imported
 from nexus_symbiote.core.enums import RiskSeverity
-from nexus_symbiote.core.identifiers import mixed_scripts, raw_digest
-from nexus_symbiote.core.models import RiskAssessment
+from nexus_symbiote.core.identifiers import mixed_scripts
+from nexus_symbiote.core.models import AnyComponent, RiskAssessment
 from nexus_symbiote.scanners.credential_files import credential_shaped
 from nexus_symbiote.scanners.prompt import detect_invisible_characters
+from nexus_symbiote.scanners.ts_tools import SCRIPT_SUFFIXES, typescript_identifiers
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.terminal import neutralize
 
 MAX_FINDINGS = 32
-_CODE_SUFFIXES = frozenset(
-    {
-        ".py",
-        ".pyi",
-        ".js",
-        ".jsx",
-        ".mjs",
-        ".cjs",
-        ".ts",
-        ".tsx",
-        ".mts",
-        ".cts",
-        ".sh",
-        ".bash",
-    }
-)
+_PYTHON_SUFFIXES = frozenset({".py", ".pyi"})
+_CODE_SUFFIXES = SCRIPT_SUFFIXES | _PYTHON_SUFFIXES | {".sh", ".bash"}
 _DOCKER_NAMES = frozenset({"dockerfile", "containerfile"})
 
 
@@ -51,16 +40,36 @@ def _eligible(path: str) -> bool:
     return PurePosixPath(path).suffix.lower() in _CODE_SUFFIXES
 
 
-def _already_named(components: list[Any], line: str) -> bool:
-    """A component name neutralized on its own is not reported again as this line."""
-    stripped = line.strip()
-    for component in components:
-        if getattr(component, "name", None) != stripped:
-            continue
-        risks = getattr(component, "risks", ())
-        if any(getattr(risk, "category", "") == "identifier_characters" for risk in risks):
-            return True
-    return False
+def _identifiers(text: str, suffix: str) -> Iterator[tuple[int, str]]:
+    if suffix in _PYTHON_SUFFIXES:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type == tokenize.NAME:
+                yield token.start[0], token.string
+    elif suffix in SCRIPT_SUFFIXES:
+        yield from typescript_identifiers(text.encode("utf-8"), suffix)
+
+
+def _mixed_identifier_lines(
+    text: str, path: str, byte_size: int, failures: list[str]
+) -> dict[int, set[str]]:
+    suffix = PurePosixPath(path).suffix.lower()
+    if suffix not in _PYTHON_SUFFIXES and suffix not in SCRIPT_SUFFIXES:
+        return {}
+    syntax = limits.bound("syntax-bytes")
+    if byte_size > syntax.value:
+        failures.append(f"{neutralize(path)}: {syntax.exceeded()}")
+        return {}
+    by_line: dict[int, set[str]] = {}
+    try:
+        for line, name in _identifiers(text, suffix):
+            if not name.isascii() and (scripts := mixed_scripts(name)):
+                by_line.setdefault(line, set()).update(scripts)
+    except (ImportError, SyntaxError, tokenize.TokenError, ValueError, RecursionError):
+        # Parser diagnostics can contain source text. Keep the independent format-
+        # character check active and report the incomplete identifier check.
+        failures.append(f"{neutralize(path)}: source identifiers could not be read")
+        return {}
+    return by_line
 
 
 def apply_source_unicode_findings(
@@ -74,10 +83,10 @@ def apply_source_unicode_findings(
     """Append hidden-character and mixed-script findings for collected source files."""
     if root is None or not root.is_dir():
         return 0
-    owners: dict[str, list[Any]] = {}
+    owners: dict[str, list[AnyComponent]] = {}
     for component in aibom.components:
-        path = getattr(component, "source_path", None)
-        if isinstance(path, str) and _eligible(path):
+        path = component.source_path
+        if path and not is_imported(component) and _eligible(path):
             owners.setdefault(path, []).append(component)
     if not owners:
         return 0
@@ -100,47 +109,47 @@ def apply_source_unicode_findings(
                     f"{neutralize(rel_path)}: source characters were not read (not UTF-8)"
                 )
                 continue
+            if text.isascii():
+                continue
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            identifier_lines = _mixed_identifier_lines(text, rel_path, len(raw), own_failures)
             group = owners[rel_path]
+            named = {
+                component.name
+                for component in group
+                if any(risk.category == "identifier_characters" for risk in component.risks)
+            }
             found: list[RiskAssessment] = []
             refused = False
-            for line_no, line in enumerate(text.splitlines(), start=1):
-                if line.isascii() or _already_named(group, line):
+            for line_no, line in enumerate(io.StringIO(text), start=1):
+                if line.isascii():
                     continue
                 where = f"{neutralize(rel_path)}:{line_no}"
-                scripts = mixed_scripts(line)
-                if scripts:
+                scripts = identifier_lines.get(line_no)
+                if scripts and line.strip() not in named:
                     found.append(
                         RiskAssessment(
                             severity=RiskSeverity.HIGH,
                             category="identifier_characters",
-                            detail=(
-                                f"{where} mixes the {', '.join(scripts)} scripts "
-                                f"(sha256:{raw_digest(line)})."
-                            ),
+                            detail=f"{where} mixes the {', '.join(sorted(scripts))} scripts.",
                             recommendation=(
                                 "Rewrite the identifier in one script so it cannot be "
                                 "mistaken for another name."
                             ),
                         )
                     )
-                found.extend(detect_invisible_characters(line, where))
+                found.extend(detect_invisible_characters(line, where, at_start=line_no == 1))
                 if len(found) > MAX_FINDINGS:
                     own_failures.append(
-                        f"{neutralize(rel_path)}: more than {MAX_FINDINGS} disguised source "
-                        "lines; not collected"
+                        f"{neutralize(rel_path)}: more than {MAX_FINDINGS} source Unicode "
+                        "findings; not collected"
                     )
                     refused = True
                     break
             if refused or not found:
                 continue
-            component = min(group, key=lambda item: str(getattr(item, "bom_ref", "")))
-            risks = getattr(component, "risks", None)
-            if not isinstance(risks, list):
-                own_failures.append(
-                    f"{neutralize(rel_path)}: disguised source text has no component to record it"
-                )
-                continue
-            risks.extend(found)
+            owner = min(group, key=lambda item: item.bom_ref)
+            owner.risks.extend(found)
             added += len(found)
     # A file a collector already read can carry the same case-variant failure. List it once.
     for target_list, own in ((failures, own_failures), (exclusions, own_exclusions)):

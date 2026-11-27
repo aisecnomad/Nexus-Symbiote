@@ -207,7 +207,7 @@ def _line_separator_risks(counts: dict[str, int], source_name: str) -> list[Risk
 
 
 def detect_invisible_characters(
-    content: str, source_name: str, *, decoded: str | None = None
+    content: str, source_name: str, *, decoded: str | None = None, at_start: bool = True
 ) -> list[RiskAssessment]:
     """Detect invisible Unicode characters that could be used for prompt trojans.
 
@@ -224,7 +224,7 @@ def detect_invisible_characters(
     its raw text does not hold; each character counts as often as the text that holds it
     more often, so one written raw counts once.
     """
-    counts, tags = _hidden_counts(content, at_start=True)
+    counts, tags = _hidden_counts(content, at_start=at_start)
     separators = _line_separator_counts(content)
     if decoded is not None:
         escaped, escaped_tags = _hidden_counts(decoded, at_start=False)

@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import pytest
+from click.testing import CliRunner
+
+from nexus_symbiote import limits
+from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import AIBOM
+from nexus_symbiote.core.collection import IMPORTED_MODE
 from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.models import MCPServerComponent, RiskAssessment
 from nexus_symbiote.source_unicode import MAX_FINDINGS, apply_source_unicode_findings
@@ -24,8 +31,8 @@ def _categories(server: MCPServerComponent) -> set[str]:
 
 
 def test_a_homoglyph_a_bidi_override_and_a_zero_width_are_flagged(tmp_path: Path) -> None:
-    (tmp_path / "agent.ts").write_text(_HOMOGLYPH + _BIDI + _ZERO_WIDTH, encoding="utf-8")
-    server = _server("agent.ts")
+    (tmp_path / "agent.py").write_text(_HOMOGLYPH + _BIDI + _ZERO_WIDTH, encoding="utf-8")
+    server = _server("agent.py")
     added = apply_source_unicode_findings(AIBOM(components=[server]), tmp_path)
     assert added == 3
     assert _categories(server) == {"identifier_characters", "bidi_override", "invisible_characters"}
@@ -33,10 +40,10 @@ def test_a_homoglyph_a_bidi_override_and_a_zero_width_are_flagged(tmp_path: Path
     assert "\u0435" not in rendered
     assert "\u202e" not in rendered
     assert "\u200b" not in rendered
-    assert "agent.ts:1 mixes the Cyrillic, Latin scripts" in rendered
+    assert "agent.py:1 mixes the Cyrillic, Latin scripts" in rendered
     assert "U+202E" in rendered
     assert "U+200B" in rendered
-    assert "sha256:" in rendered
+    assert "sha256:" not in rendered
 
 
 def test_an_emoji_joiner_and_ascii_raise_nothing(tmp_path: Path) -> None:
@@ -75,7 +82,7 @@ def test_too_many_disguised_lines_fail_closed(tmp_path: Path) -> None:
     added = apply_source_unicode_findings(AIBOM(components=[server]), tmp_path, failures=failures)
     assert added == 0
     assert server.risks == []
-    assert failures == [f"app.py: more than {MAX_FINDINGS} disguised source lines; not collected"]
+    assert failures == [f"app.py: more than {MAX_FINDINGS} source Unicode findings; not collected"]
     assert "\u202e" not in " ".join(failures)
 
 
@@ -83,3 +90,82 @@ def test_an_instruction_file_is_not_read_here(tmp_path: Path) -> None:
     (tmp_path / "CLAUDE.md").write_text(_BIDI, encoding="utf-8")
     prompt_like = _server("CLAUDE.md")
     assert apply_source_unicode_findings(AIBOM(components=[prompt_like]), tmp_path) == 0
+
+
+@pytest.mark.parametrize(
+    ("filename", "source"),
+    [
+        ("agent.py", '# Measure Δt in μs.\n"""Scientific notes: σ_max and μs."""\nΔt = 5\n'),
+        ("agent.ts", "// Measure Δt in μs.\nconst unit = `μs`;\nconst Δt = 5;\n"),
+        ("agent.jsx", "/* Δt in μs */\nconst label = <div>μs</div>;\nconst Δt = 5;\n"),
+    ],
+)
+def test_only_identifier_tokens_contribute_mixed_scripts(
+    tmp_path: Path, filename: str, source: str
+) -> None:
+    (tmp_path / filename).write_text(source, encoding="utf-8")
+    server = _server(filename)
+    assert apply_source_unicode_findings(AIBOM(components=[server]), tmp_path) == 1
+    assert server.risks[0].detail == f"{filename}:3 mixes the Greek, Latin scripts."
+
+
+def test_source_parser_refusal_stays_visible_without_disclosing_source(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text('"""unfinished Δt', encoding="utf-8")
+    failures: list[str] = []
+    apply_source_unicode_findings(
+        AIBOM(components=[_server("app.py")]), tmp_path, failures=failures
+    )
+    assert failures == ["app.py: source identifiers could not be read"]
+
+
+def test_both_project_gates_corroborate_an_observed_identifier(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "server.py").write_text(
+        'from mcp.server.fastmcp import FastMCP\nserver = FastMCP("science")\nΔt = 1\n',
+        encoding="utf-8",
+    )
+    target = tmp_path / "bom.json"
+    runner = CliRunner()
+    scan = runner.invoke(
+        main, ["scan", "--report-only", "--no-project-policy", str(project), "-o", str(target)]
+    )
+    assert scan.exit_code == 0, scan.output
+    assert any(
+        risk.detail == "server.py:3 mixes the Greek, Latin scripts."
+        for component in AIBOM.load(target).components
+        for risk in component.risks
+    )
+    common = [str(target), "--project", str(project), "--no-project-policy", "--json-output"]
+    for command in ("validate", "risk"):
+        result = runner.invoke(main, [command, *common])
+        assert json.loads(result.stdout)["assessment_basis"] == "project-reconciled", result.output
+
+    # A new scientific variable on a different line makes the saved observation stale.
+    with (project / "server.py").open("a", encoding="utf-8") as source:
+        source.write("Δt_other = 2\n")
+    for command in ("validate", "risk"):
+        result = runner.invoke(main, [command, *common])
+        report = json.loads(result.stdout)
+        assert result.exit_code == 1, result.output
+        assert report["assessment_basis"] == "project-reconciliation-failed", result.output
+
+
+def test_an_imported_source_citation_does_not_select_files(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("Δt = 1", encoding="utf-8")
+    server = _server("app.py")
+    server.properties["collection_mode"] = IMPORTED_MODE
+    assert apply_source_unicode_findings(AIBOM(components=[server]), tmp_path) == 0
+
+
+def test_identifier_analysis_uses_the_operator_syntax_budget(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("Δt = 1", encoding="utf-8")
+    failures: list[str] = []
+    with limits.applied(limits.resolve(["syntax-bytes=4"], {})):
+        assert (
+            apply_source_unicode_findings(
+                AIBOM(components=[_server("app.py")]), tmp_path, failures=failures
+            )
+            == 0
+        )
+    assert len(failures) == 1 and "syntax-bytes" in failures[0]
