@@ -10,7 +10,7 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ### Added
 
-- **`diff`:** names OAuth scopes added to or removed from an A2A card instead of reporting an opaque capabilities change.
+- **`diff`:** names the OAuth scopes added to or removed from every component that declares `capabilities.oauth_scopes`, not only A2A cards (an imported inventory can carry them on agent, tool, skill, A2A client or extension records), instead of reporting an opaque `capabilities changed.` alert. Scope values from the compared inventories now appear in drift output (text, JSON, Markdown, JUnit and step summaries): each is redacted by the A2A scope rule and quoted as a JSON string, and up to five are named in each direction. The alert stays high.
 
 ## [0.2.0] - 2026-11-25
 

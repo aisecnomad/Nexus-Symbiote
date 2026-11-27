@@ -1,8 +1,9 @@
-"""`diff` names the OAuth scopes an A2A card gained or lost."""
+"""`diff` names the OAuth scopes a component gained or lost."""
 
 from __future__ import annotations
 
 import html
+import json
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,11 @@ from click.testing import CliRunner
 
 from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import AIBOM
-from nexus_symbiote.core.models import A2AServerComponent, CapabilityDeclaration
+from nexus_symbiote.core.models import (
+    A2AServerComponent,
+    AgentComponent,
+    CapabilityDeclaration,
+)
 from nexus_symbiote.diff.differ import AIBOMDiffer
 
 
@@ -140,3 +145,32 @@ def test_a_quoted_scope_stays_bounded_and_shows_characters_scopes_never_use() ->
     assert listed[:2] == ['"cafe\\u0301"', '"caf\\u00e9"']
     assert listed[2].startswith('"\\u202e') and listed[2].endswith('\u2026"')
     assert len(listed[2]) <= 200
+
+
+def test_every_component_with_oauth_scopes_is_named_as_the_release_notes_say(
+    tmp_path: Path,
+) -> None:
+    def inventory(scopes: list[str]) -> str:
+        bom = AIBOM()
+        bom.add_component(
+            AgentComponent(
+                bom_ref="agent:support",
+                name="support",
+                capabilities=CapabilityDeclaration(oauth_scopes=scopes),
+            )
+        )
+        return bom.to_native_json()
+
+    old, new = tmp_path / "before.json", tmp_path / "after.json"
+    old.write_text(inventory(["support:read"]))
+    new.write_text(inventory(["support:read", "support:admin"]))
+    result = CliRunner().invoke(main, ["diff", str(old), str(new), "--json-output"])
+    assert result.exit_code == 1, result.output
+    (change,) = json.loads(result.output)["components_modified"]
+    assert change["type"] == "agent" and change["severity"] == "high"
+    assert change["details"] == ['capabilities changed: OAuth scopes added: "support:admin"']
+    changelog = (Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text(encoding="utf-8")
+    notes = " ".join(changelog.split("\n## [", 2)[1].split())
+    assert "from an A2A card instead" not in notes
+    assert "every component that declares `capabilities.oauth_scopes`" in notes
+    assert "Scope values from the compared inventories now appear in drift output" in notes
