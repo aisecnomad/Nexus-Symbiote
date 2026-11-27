@@ -240,6 +240,31 @@ def _oauth_scopes(capabilities: object) -> set[str]:
     return {s for s in capabilities.get("oauth_scopes") or () if isinstance(s, str)}
 
 
+def _ascii_literal(text: str) -> str:
+    return json.dumps(text).replace("\x7f", "\\u007f")
+
+
+def _quoted_scope(scope: str) -> str:
+    """A redacted scope as a JSON string literal of at most ``_SHOWN`` characters.
+
+    Quotes keep a value from imitating the listing's separators and show an empty one;
+    escapes show every character outside printable ASCII, which RFC 6749 scopes never use.
+    """
+    text = redact_oauth_scope(scope)
+    literal = _ascii_literal(text)
+    if len(literal) <= _SHOWN:
+        return literal
+    kept: list[str] = []
+    used = len('"…"')
+    for char in text:
+        escaped = _ascii_literal(char)[1:-1]
+        used += len(escaped)
+        if used > _SHOWN:
+            break
+        kept.append(escaped)
+    return '"' + "".join(kept) + '…"'
+
+
 def _without_scopes(capabilities: object) -> dict[str, Any] | None:
     """The declaration with its scopes blanked, or None when it is not a declaration."""
     if capabilities is not None and not isinstance(capabilities, dict):
@@ -865,7 +890,7 @@ class AIBOMDiffer:
             added_scopes = after_scopes - before_scopes
             removed_scopes = before_scopes - after_scopes
             scope_changes = [
-                f"{word}: {_listing(scopes, display=redact_oauth_scope)}"
+                f"{word}: {_listing(scopes, display=_quoted_scope)}"
                 for word, scopes in (("added", added_scopes), ("removed", removed_scopes))
                 if scopes
             ]

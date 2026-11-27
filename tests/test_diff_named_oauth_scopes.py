@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 from pathlib import Path
 
 import pytest
@@ -28,7 +29,7 @@ def test_diff_names_added_oauth_scopes() -> None:
 
     report = AIBOMDiffer().diff(card(["support:read"]), card(["support:read", "support:admin"]))
     (change,) = report.components_modified
-    assert any("OAuth scopes added: support:admin" in detail for detail in change.details)
+    assert any('OAuth scopes added: "support:admin"' in detail for detail in change.details)
     assert "capabilities changed." not in change.details
     assert change.severity == "high"
 
@@ -51,13 +52,13 @@ def test_a_first_grant_and_a_last_removal_are_named() -> None:
         _server(None), _server(CapabilityDeclaration(oauth_scopes=["support:admin"]))
     )
     (change,) = granted.components_modified
-    assert change.details == ["capabilities changed: OAuth scopes added: support:admin"]
+    assert change.details == ['capabilities changed: OAuth scopes added: "support:admin"']
     assert change.severity == "high"
     revoked = AIBOMDiffer().diff(
         _server(CapabilityDeclaration(oauth_scopes=["support:admin"])), _server(None)
     )
     (change,) = revoked.components_modified
-    assert change.details == ["capabilities changed: OAuth scopes removed: support:admin"]
+    assert change.details == ['capabilities changed: OAuth scopes removed: "support:admin"']
     assert change.severity == "high"
 
 
@@ -72,7 +73,7 @@ def test_a_simultaneous_non_scope_capability_change_stays_visible() -> None:
         ),
     )
     (change,) = report.components_modified
-    assert "capabilities changed: OAuth scopes added: support:admin" in change.details
+    assert 'capabilities changed: OAuth scopes added: "support:admin"' in change.details
     assert "capabilities changed." in change.details
 
 
@@ -84,7 +85,7 @@ def test_reordered_capability_sets_do_not_add_a_generic_alert() -> None:
         _server(CapabilityDeclaration(oauth_scopes=scopes[:1], egress_domains=egress[::-1])),
     )
     (change,) = report.components_modified
-    assert change.details == ["capabilities changed: OAuth scopes removed: support:admin"]
+    assert change.details == ['capabilities changed: OAuth scopes removed: "support:admin"']
     assert change.severity == "high"
 
 
@@ -106,7 +107,36 @@ def test_imported_oauth_scope_values_are_redacted_only_for_display(
     )
 
     assert result.exit_code == 1, result.output
-    # Markdown protects punctuation with backslashes. Check the visible content.
-    shown = result.output.replace("\\", "")
+    # Markdown protects punctuation with backslashes and JUnit with entities.
+    shown = html.unescape(result.output.replace("\\", ""))
     assert added not in shown and removed not in shown
-    assert f"OAuth scopes added: ***; {public_uri} and removed: ***" in shown
+    assert f'OAuth scopes added: "***"; "{public_uri}" and removed: "***"' in shown
+
+
+def test_listed_scopes_are_quoted_so_a_value_cannot_imitate_the_listing() -> None:
+    report = AIBOMDiffer().diff(
+        _server(CapabilityDeclaration(oauth_scopes=["support:admin"])),
+        _server(
+            CapabilityDeclaration(
+                oauth_scopes=["support:admin", "", 'q"; "r', "x and removed: support:admin"]
+            )
+        ),
+    )
+    (change,) = report.components_modified
+    assert change.details == [
+        'capabilities changed: OAuth scopes added: ""; "q\\"; \\"r"; "x and removed: support:admin"'
+    ]
+
+
+def test_a_quoted_scope_stays_bounded_and_shows_characters_scopes_never_use() -> None:
+    hidden = "\u202e" * 300
+    report = AIBOMDiffer().diff(
+        _server(CapabilityDeclaration(oauth_scopes=["read"])),
+        _server(CapabilityDeclaration(oauth_scopes=["read", "caf\u00e9", "cafe\u0301", hidden])),
+    )
+    (change,) = report.components_modified
+    (detail,) = change.details
+    listed = detail.removeprefix("capabilities changed: OAuth scopes added: ").split("; ")
+    assert listed[:2] == ['"cafe\\u0301"', '"caf\\u00e9"']
+    assert listed[2].startswith('"\\u202e') and listed[2].endswith('\u2026"')
+    assert len(listed[2]) <= 200
