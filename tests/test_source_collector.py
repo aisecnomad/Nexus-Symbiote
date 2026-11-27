@@ -2431,3 +2431,15 @@ def test_two_variables_that_share_a_fallback_are_both_kept(tmp_path: Path):
     )
     variables = models(result)["gpt-4o"].properties["environment_variables"]
     assert variables == ["BACKUP_MODEL", "PRIMARY_MODEL"]
+
+
+def test_a_folded_import_statement_longer_than_a_slice_is_found(tmp_path: Path):
+    names = ", ".join(f"m{index}" for index in range(1500))
+    (tmp_path / "run.py").write_text(
+        f"import {names}, \uff4f\uff50\uff45\uff4e\uff41\uff49\n"
+        + "openai.OpenAI().responses.create(model='gpt-4o')\n",
+        encoding="utf-8",
+    )
+    # Folded a slice at a time, the statement's start and the SDK's name are in different
+    # slices; the name alone admits the file, and the syntax tree decides.
+    assert set(models(SourceScanner().scan(tmp_path))) == {"gpt-4o"}
