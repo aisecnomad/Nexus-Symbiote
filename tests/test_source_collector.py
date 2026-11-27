@@ -1395,6 +1395,19 @@ def test_a_relative_import_past_the_top_package_binds_nothing(tmp_path: Path):
         ("ollama/svc:Tr0ub4dor3@gpu-box", False, True),
         ("openai:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", False, True),
         ("openai//models/llama-3-8b-instruct.Q4_K_M.gguf", False, True),
+        ("openai-wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", False, True),
+        ("openai_wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", False, True),
+        ("openai.wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", False, True),
+        ("openai@wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", False, True),
+        ("openai:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY-v1", False, True),
+        ("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY-v1", False, True),
+        (
+            "projects/acmeproductionml2024/locations/us-central1/publishers/google/models/"
+            "multimodalembedding",
+            True,
+            False,
+        ),
+        ("hf.co/mradermacher/deepseekcoderinstructgguf:Q8_0", True, False),
     ],
     ids=[
         "drive",
@@ -1416,6 +1429,14 @@ def test_a_relative_import_past_the_top_package_binds_nothing(tmp_path: Path):
         "user-information-after-a-route",
         "base64-after-a-route",
         "host-weight-file-after-a-route",
+        "base64-after-a-dash",
+        "base64-after-an-underscore",
+        "base64-after-a-dot",
+        "base64-after-an-at",
+        "base64-within-a-name",
+        "base64-starting-a-name",
+        "lowercase-resource-path",
+        "lowercase-run-before-a-capital-tag",
     ],
 )
 def test_a_path_or_a_key_is_never_a_model_and_a_project_file_is_no_gap(

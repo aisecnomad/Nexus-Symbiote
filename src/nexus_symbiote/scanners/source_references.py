@@ -25,9 +25,10 @@ MAX_RECORDS = 5_000
 
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{1,127}")
 # A long run of hex or base64, or user information before an ``@``: a key's shape, no name's.
+# Elsewhere in a name, a base64 run counts when it holds a capital, as keys do and paths do not.
 _SECRET_SHAPED = re.compile(
     r"[0-9A-Fa-f]{32}|[0-9A-Fa-f-]{48}|(?:^|:)[A-Za-z0-9+/]{40,}={0,2}$"
-    r"|(?:^|/)[^@:/]+:[^@/]+@(?![0-9]+$)"
+    r"|(?:^|/)[^@:/]+:[^@/]+@(?![0-9]+$)|(?<![^-._:@])(?=[^-._:@]*[A-Z])[A-Za-z0-9+/]{40,}"
 )
 # A model pinned by its version's digest, which is a hash, not a key.
 _PINNED = re.compile(r"[\w.-]+/[\w.-]+:[0-9a-f]{64}")
