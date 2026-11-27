@@ -87,10 +87,8 @@ class SourceScanner(Scanner):
     def _read(
         self, root: Path, selected: list[Path], result: ScanResult, python: PythonReader
     ) -> None:
-        """Hand each selected file that names an SDK to the reader, within the source budget.
-        Files are read apart from the collection, whose failures are not kept: a file that
-        cannot be opened, read or decoded as Python decodes it, a link to a file the collector
-        does not read and one that names an SDK and is too large to parse are each a gap."""
+        """Hand each selected file that names an SDK to the reader, within the source budget,
+        read apart from the collection, whose failures are not kept; ``docs`` name the gaps."""
         budget = SourceBudget("source declarations", result)
         syntax = limits.current().syntax_bytes
         with ConfinedCollection(
@@ -128,8 +126,7 @@ class SourceScanner(Scanner):
                 try:
                     text = _python_text(raw)
                 except _UnreadableError as error:
-                    # Text Python cannot decode does not run, unless its codec is one
-                    # this reader does not follow; then what it names is unknown.
+                    # Undecodable text does not run, unless its codec is one this reader skips.
                     invalid = error.args[0] in (_INVALID_UTF8, _INVALID_DECLARED)
                     if not invalid or _names_sdk(raw.decode("latin-1")):
                         result.surfaces_excluded.append(

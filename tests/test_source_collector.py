@@ -1393,6 +1393,7 @@ def test_a_relative_import_past_the_top_package_binds_nothing(tmp_path: Path):
         ("hosted_vllm//home/alice/models/Meta-Llama-3-8B-Instruct", False, True),
         ("openai//models/Meta-Llama-3-8B-Instruct", False, True),
         ("ollama/svc:Tr0ub4dor3@gpu-box", False, True),
+        ("openai:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", False, True),
         ("openai//models/llama-3-8b-instruct.Q4_K_M.gguf", False, True),
     ],
     ids=[
@@ -1413,6 +1414,7 @@ def test_a_relative_import_past_the_top_package_binds_nothing(tmp_path: Path):
         "root-behind-a-slash-route",
         "root-after-a-slash-route",
         "user-information-after-a-route",
+        "base64-after-a-route",
         "host-weight-file-after-a-route",
     ],
 )
@@ -1980,3 +1982,49 @@ def test_a_router_and_a_crews_other_models_are_read_or_a_gap(tmp_path: Path):
     # A router's deployments and fallbacks are read by a later slice; until then, a gap.
     assert set(models(result)) == {"groq/llama-3.1-8b", "o3", "gpt-4o", "gpt-4o-mini"}
     assert list(result.surfaces_excluded) == [unread("proxy.py", 4, 2)]
+
+
+def test_an_import_of_a_dotted_name_of_many_parts_is_a_gap_and_never_parsed(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "app/many.py": "import openai.b0" + ".a" * 20_000 + "\n",
+            "app/few.py": "import openai.b0.a.a.a\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
+        },
+    )
+    # Python 3.12 and later keep every prefix of such a name for good, so it is not parsed.
+    assert set(models(result)) == {"gpt-4o"}
+    assert list(result.surfaces_excluded) == [
+        "app/many.py:1: Python source imports dotted names of more parts than the collector "
+        + "reads; not read"
+    ]
+
+
+def test_names_imported_from_a_long_module_are_not_joined_to_it(tmp_path: Path):
+    names = ", ".join(f"a{index}" for index in range(2_000))
+    found = Declarations(ScanResult(scanner_name="source"))
+    reader = source_python.PythonReader(found, frozenset({"app/client.py", "app/plain.py"}))
+    reader.add("app/client.py", f"from openai.m{'x' * 4_000} import ({names})\n")
+    reader.add("app/plain.py", f"import openai.m{'x' * 4_000}\nimport openai.n{'x' * 4_000} as n\n")
+    # Each name would otherwise copy the module's name; only what the reader keeps is short.
+    assert all(len(dotted) <= source_python.MAX_ORIGIN for dotted, _ in reader._local)
+    assert all(len(dotted) <= source_python.MAX_ORIGIN for dotted, _ in reader._resolved)
+    assert list(found.result.surfaces_excluded) == [
+        f"app/client.py:1: {CUT}",
+        f"app/plain.py:1: {CUT}",
+    ]
+
+
+def test_a_model_given_when_a_partial_is_called_is_read(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import functools\nfrom functools import partial\nfrom openai import OpenAI\n\n"
+            "client = OpenAI()\n"
+            "create = functools.partial(client.chat.completions.create, temperature=0)\n"
+            "create(model='gpt-4o', messages=[])\n"
+            "ask = partial(client.responses.create, instructions='be brief')\n"
+            "ask(model='o3', input='hi')\n"
+        },
+    )
+    assert set(models(result)) == {"gpt-4o", "o3"}

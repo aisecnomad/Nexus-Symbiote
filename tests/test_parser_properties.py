@@ -973,9 +973,18 @@ def test_reading_python_source_is_linear_in_its_size(tmp_path, shape):
 
 
 @pytest.mark.no_cover
-def test_searching_for_an_import_is_linear_in_a_run_of_form_feeds():
-    # A form feed starts no statement, so each is scanned once, not once per form feed.
-    texts = {scale: "x = 1\n" + "\f" * (20_000 * scale) for scale in (1, 4)}
+@pytest.mark.parametrize(
+    "shape",
+    [
+        lambda size: "x = 1\n" + "\f" * (20 * size),
+        lambda size: 'N = """\nimport a,' + " \\\nimport.b," * size + ' c\n"""\n',
+    ],
+    ids=["form-feeds", "continued-list-of-keywords"],
+)
+def test_searching_for_an_import_is_linear_in_its_text(shape):
+    # A form feed starts no statement, and no import lists its keyword as a name, so each
+    # character is scanned once, not once for each place a statement may start.
+    texts = {scale: shape(1000 * scale) for scale in (1, 4)}
     assert scaling_ratio(lambda scale: SDK_IMPORT.search(texts[scale])) < 8
 
 
