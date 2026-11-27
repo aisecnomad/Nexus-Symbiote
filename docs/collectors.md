@@ -23,56 +23,57 @@ An optional [`agent.yaml` manifest](agent-manifest.md) at the project root names
 ## Declarations in application source
 
 The `source` collector reads the model identifiers that a project's Python code gives
-an SDK. It never imports, runs or contacts anything: a file is parsed to a syntax tree.
-Only a file with an import statement that names a known SDK is analysed. A module of
-the project at an import root named like an SDK, such as its own `agents` package, is
-not taken for the SDK; a path only the project has, such as `agents.researcher`, is the
-project's.
+an SDK. It never imports, runs or contacts anything. A file is decoded as CPython
+decodes it and parsed to a syntax tree only when an import statement in it, however it
+is spelled, may name a known SDK; the tree then decides. A module of the project at an
+import root named like an SDK, such as its own `agents` package, is not taken for the
+SDK, and a path only the project has, such as `agents.researcher`, is the project's.
 
-It reads the model arguments of a call into a known SDK, and of a call whose callee it
-cannot name: `model=`, `model_name=`, `model_id=`, `modelId=`, `ai_model_id=`, a
-deployment name, `embedding_model=`, `embed_model=`, `llm_model=`, `chat_model=` and
-`llm=`, `repo_id=` of a Hugging Face endpoint, `id=` of an Agno model, and the first
-argument of an entry point such as `init_chat_model`, `SentenceTransformer`,
-`litellm.completion`, `ollama.chat` or a PydanticAI `Agent`. What a callee is comes
-from the names, attributes and calls it is reached through: a client made in the file,
-a parameter annotated with an SDK class, a method handed to `functools.partial`,
-`asyncio.to_thread` or an executor, and `super()` in a subclass of an SDK class are all
-read, and so is a client reached through a framework's state or an untyped parameter.
-A function of another library or of Python, such as a logger or a metrics label, and a
-method of what one returns are not read.
+It reads the model arguments of a call (`model=` and its variants, a deployment name,
+`llm=`, and `repo_id=` or `id=` where they name a model) and the first argument of an
+entry point such as `init_chat_model`, `SentenceTransformer` or `litellm.completion`. What
+a callee is comes from the names, attributes and calls it is reached through, each
+import in the scope it binds: a client made in the file, a parameter annotated with an
+SDK class, a method handed to `functools.partial`, `asyncio.to_thread` or an executor,
+and `super()` in a subclass of an SDK class. A call into a known SDK is read. A function
+of another library or of Python, such as a logger, and a method of what one returns are
+not. Of an object the reader cannot tell, such as an untyped or `Any` parameter or a
+framework's state, a call is read when it is named as SDK calls are (`create`, `chat`,
+`completions`, `invoke`, `generate_content` and the like), so a metrics label or an
+ORM query is not.
 
 A model identifier written as a literal argument becomes one `model` component for the
 project at `declared` assurance. Its `source_reference` claim names the file and the
-line of the argument, up to 16 places. A routing prefix is read off the identifier:
-`anthropic/claude-sonnet-4-5` is the model `claude-sonnet-4-5` with provider
-`anthropic`, and the text as written is kept in `requested_alias`. No other provider is
-recorded. A reference has no `source_path`, which on a model names a weight file, unless
-the call lets the model run its own code (`trust_remote_code=True`), which is recorded
-and makes validation judge it as any model with an artifact.
+line of the argument, up to 16 places, and `references_unlisted` counts the rest. The
+identifier is kept as written, routing prefix and all, and no provider is recorded. A
+call that may let the model run its own code, through any `trust_remote_code` but a
+false literal, records it. A relative path or a weight file names a file in the
+project, which the model collector reads.
 
 What the reader knows is there and cannot read is a coverage gap:
 
-- a file it cannot open or read, or one larger than `file-bytes`, whatever it holds;
-- a file that imports an SDK and cannot be parsed, cannot be decoded as its coding line
-  declares, is larger than `syntax-bytes` or holds more syntax nodes than `python-nodes`;
-- a file that imports an SDK by a name a module of the project also has, since which of
-  the two the import loads depends on how the project is run;
+- a file it cannot open, read or decode, one larger than `file-bytes`, and a link to a
+  test, documentation or build output, whatever they hold;
+- a file that may import an SDK and cannot be parsed, is larger than `syntax-bytes` or
+  holds more syntax nodes than `python-nodes`;
+- a file that imports an SDK by a name a module of the project also has;
 - a model argument bound in another module of the project;
-- a model argument that is not a literal, unless it is an object an SDK or another
-  library builds: a name, an attribute, a parameter, a call, joined text, `**options`
-  without a model keyword, a starred positional argument, or text that is no identifier;
+- a model argument that is not a literal, unless it is an object an SDK makes: a name,
+  an attribute, a parameter, a call of another library, joined text, `**options`
+  without a model keyword, a starred positional argument, an absolute path, or text
+  that is no identifier;
 - a model argument given to a function or class the project defines, or to a method of
-  an object of a project class, which the reader does not follow;
+  one of its classes, which the reader does not follow;
 - a bound the reader reached: a callee depth of 32, the directories it looks in for a
   module, a dotted name of 256 characters, or the steps one file allows.
 
-The arguments of each kind are counted in one gap for the file, at the first of them.
+Unread arguments, and those given to the project's callees, are each counted in one gap
+for the file, at the first of them; an argument bound in another module is a gap of its own.
 
 `validate --project` reports the missing artifact of a reference it read again from
 source as information, as it does for a cited model of an imported report. Without
-`--project`, or when another collector's component contradicts the reference, it stays
-unknown.
+`--project`, when another collector's component contradicts the reference, or when the
+model may run its own code, it stays unknown.
 
 ## MCP servers declared in source
 

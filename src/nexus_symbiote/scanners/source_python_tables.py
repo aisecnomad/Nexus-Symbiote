@@ -14,7 +14,8 @@ AI_ROOTS = frozenset(
     {
         "ag2", "agents", "agno", "anthropic", "autogen", "autogen_agentchat", "autogen_core",
         "autogen_ext", "boto3", "camel", "chromadb", "claude_agent_sdk", "claude_code_sdk",
-        "cohere", "crewai", "crewai_tools", "datasets", "deepagents", "dspy", "faiss", "fireworks",
+        "cohere", "crewai", "crewai_tools", "datasets", "deepagents", "diffusers", "dspy", "faiss",
+        "fireworks",
         "google", "groq", "guardrails", "haystack", "haystack_integrations", "huggingface_hub",
         "instructor", "lancedb", "langchain", "langchain_anthropic", "langchain_aws",
         "langchain_chroma", "langchain_cohere", "langchain_community", "langchain_core",
@@ -26,23 +27,41 @@ AI_ROOTS = frozenset(
         "langchain_qdrant", "langchain_tavily", "langchain_together", "langchain_weaviate",
         "langchain_xai", "langgraph", "litellm", "livekit", "llama_cpp", "llama_index", "llm_guard",
         "mcp", "mcp_use", "mem0", "mistralai", "nemoguardrails", "ollama", "openai", "phi",
-        "pinecone", "presidio_analyzer", "pydantic_ai", "pymilvus", "qdrant_client", "replicate",
+        "peft", "pinecone", "presidio_analyzer", "pydantic_ai", "pymilvus", "qdrant_client",
+        "replicate",
         "semantic_kernel", "sentence_transformers", "smolagents", "strands", "strands_tools",
-        "swarm", "together", "transformers", "vertexai", "voyageai", "weaviate", "zep_cloud",
+        "swarm", "together", "transformers", "vertexai", "vllm", "voyageai", "weaviate", "zep_cloud",
     }
 )  # fmt: skip
 # ``google`` holds much besides AI clients: only these parts of it count.
 AI_SUBMODULES = {
     "google": ("google.adk", "google.genai", "google.generativeai", "google.cloud.aiplatform"),
 }
-# An import statement that may name one of the roots, tested before a file is parsed: a
-# word that only appears in text, such as ``graphics`` or ``camelCase``, is no import.
-_ROOT_WORDS = b"|".join(sorted(re.escape(name).encode() for name in AI_ROOTS - {"google"}))
+# An import statement that may name one of the roots, searched for in the text Python
+# compiles, before a file is parsed. Python ends a statement at any newline, at ``;`` and
+# after ``try:`` or ``if ...:``, and joins lines a backslash ends; a word that is not in an
+# import statement, such as ``graphics`` or one in a string, names none.
+_GAP = r"(?:[ \t\f]|\\(?:\r\n?|\n))"
+_ROOT_NAMES = "|".join(sorted(map(re.escape, AI_ROOTS - {"google"})))
 SDK_IMPORT = re.compile(
-    rb"(?m)^(?:\xef\xbb\xbf)?[ \t]*(?:from[ \t]+|import[ \t]+(?:[\w.]+(?:[ \t]+as[ \t]+\w+)?"
-    rb"[ \t]*,[ \t]*)*)(?:(?:" + _ROOT_WORDS + rb")\b(?![\w])"
-    rb"|google(?:\.(?:adk|genai|generativeai|cloud\.aiplatform)\b|[ \t]+import\b))"
+    rf"(?:\A|[\r\n;:\f])[ \t\f]*(?:from|import)(?!\w){_GAP}*(?:[\w.]+(?:{_GAP}+as{_GAP}+\w+)?"
+    rf"{_GAP}*,{_GAP}*)*(?:(?:{_ROOT_NAMES})(?!\w)|google(?:\.cloud)?"
+    rf"(?:\.(?:adk|genai|generativeai|aiplatform)(?!\w)|{_GAP}+import(?!\w)))"
 )
+# Names along a callee that SDK calls use: of an object the reader cannot tell, a call
+# reached through one of them is read.
+MODEL_CALLS = frozenset(
+    {
+        "__init__", "abatch", "achat", "acomplete", "acompletion", "acreate", "aembed",
+        "aembedding", "agenerate", "ainvoke", "apredict", "arun", "astream", "batch", "chat",
+        "chat_completion", "complete", "completion", "completions", "converse",
+        "converse_stream", "create", "embed", "embed_content", "embed_documents", "embed_query",
+        "embedding", "embeddings", "generate", "generate_content", "generate_images", "images",
+        "invoke", "invoke_model", "messages", "models", "predict", "rerank", "responses", "run",
+        "run_stream", "run_sync", "stream", "stream_chat", "stream_complete", "text_generation",
+        "transcriptions", "with_options", "with_structured_output",
+    }
+)  # fmt: skip
 # Libraries that load weights by an owner/name identifier, which is never a route.
 WEIGHT_ROOTS = ("huggingface_hub", "langchain_huggingface", "sentence_transformers", "transformers")
 WEIGHT_CLASSES = frozenset(
@@ -61,7 +80,7 @@ MODEL_KEYWORDS = (
 )  # fmt: skip
 EMBEDDING_KEYWORDS = frozenset({"embedding_model", "embed_model"})
 # ``repo_id`` names many things; it is a model only for these loaders.
-REPO_ID_CLASSES = frozenset({"HuggingFaceEndpoint", "HuggingFaceHub", "InferenceClient"})
+REPO_ID_CLASSES = frozenset({"HuggingFaceEndpoint", "HuggingFaceHub", "InferenceClient", "Llama"})
 # Calls whose model identifier is positional: (module prefix, symbol) to its index.
 POSITIONAL_MODELS: dict[tuple[str, str], int] = {
     ("dspy", "LM"): 0, ("google.generativeai", "GenerativeModel"): 0,
@@ -77,11 +96,13 @@ POSITIONAL_MODELS: dict[tuple[str, str], int] = {
     ("sentence_transformers", "CrossEncoder"): 0,
     ("sentence_transformers", "SentenceTransformer"): 0, ("transformers", "from_pretrained"): 0,
     ("vertexai", "GenerativeModel"): 0, ("vertexai", "TextEmbeddingModel.from_pretrained"): 0,
+    ("replicate", "run"): 0,
 }  # fmt: skip
 # Calls that call their first argument with the rest, so its keywords are that callee's.
 FORWARDERS = frozenset(
     {
         "asyncio.to_thread",
+        "concurrent.futures.Executor().submit",
         "concurrent.futures.ProcessPoolExecutor().submit",
         "concurrent.futures.ThreadPoolExecutor().submit",
         "fastapi.concurrency.run_in_threadpool",
