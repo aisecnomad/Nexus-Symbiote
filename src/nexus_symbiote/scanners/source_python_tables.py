@@ -34,26 +34,28 @@ AI_ROOTS = frozenset(
 AI_SUBMODULES = {
     "google": ("google.adk", "google.genai", "google.generativeai", "google.cloud.aiplatform"),
 }
-# An import statement that may name one of the roots, searched for in the text Python
-# compiles, before a file is parsed. Python ends a statement at any newline, at ``;`` and
-# after ``try:`` or ``if ...:``, never at a form feed, and joins lines a backslash ends; a
-# word not in an import statement, such as ``graphics`` or one in a string, names none.
+# An import statement that may name one of the roots, searched for before a file is parsed.
+# Python ends a statement at a newline, ``;`` or ``if ...:``, never a form feed, and joins
+# lines a backslash ends; a word in no import statement, such as ``graphics``, names none.
 _GAP = r"(?:[ \t\f]|\\(?:\r\n?|\n))"
-# A name earlier in an import list may hold any character an identifier may, such as a
-# combining mark, so it runs to the next separator, and its dots may have gaps around them.
+# An earlier name of an import list runs to a separator, with gaps around its dots.
 _DOT = rf"{_GAP}*\.{_GAP}*"
-_NAME = rf"[^\s,;:\\#().]+(?:{_DOT}[^\s,;:\\#().]+)*"
+_NAME = rf"(?!(?:from|import)(?!\w))[^\s,;:\\#().]+(?:{_DOT}[^\s,;:\\#().]+)*"
 _ROOT_NAMES = "|".join(sorted(map(re.escape, AI_ROOTS - {"google"})))
 SDK_IMPORT = re.compile(
     rf"(?:\A|[\r\n;:])[ \t\f]*(?:from|import)(?!\w){_GAP}*(?:{_NAME}(?:{_GAP}+as{_GAP}+{_NAME})?"
     rf"{_GAP}*,{_GAP}*)*(?:(?:{_ROOT_NAMES})(?!\w)|google(?:{_DOT}cloud)?"
     rf"(?:{_DOT}(?:adk|genai|generativeai|aiplatform)(?!\w)|{_GAP}+import(?!\w)))"
 )
-# A root's name alone, searched for in text Python folds a slice at a time, where a
-# statement may span slices: any such word admits the file, and the tree decides.
+# The module names of import statements, whose every prefix CPython 3.12+ keeps for good.
+_GAPS = rf"{_GAP}*+"
+_DOTTED = rf"\.*+\w++(?:{_GAPS}\.{_GAPS}\w++)*+"
+_LIST = rf"(?:{_DOTTED}(?:{_GAPS}as{_GAPS}\w++)?{_GAPS},{_GAPS})*+{_DOTTED}"
+IMPORTED = re.compile(rf"(?<![\w.])(?:import|from)(?!\w){_GAPS}\(?{_GAPS}({_LIST})")
+DOTTED = re.compile(_DOTTED)
+# A root's name alone, searched for in text folded a slice at a time; the tree then decides.
 SDK_WORD = re.compile(r"(?<![\w.])(?:" + "|".join(sorted(map(re.escape, AI_ROOTS))) + r")(?!\w)")
-# Names along a callee that SDK calls use: of an object the reader cannot tell, a call
-# reached through one of them is read.
+# Names along a callee that SDK calls use, by which a call of an unknown object is read.
 MODEL_CALLS = frozenset(
     {
         "__init__", "abatch", "achat", "acomplete", "acompletion", "acreate", "aembed",
@@ -118,8 +120,7 @@ POSITIONAL_MODELS: dict[tuple[str, str], int] = {
     ("replicate", "run"): 0, ("diffusers", "from_pretrained"): 0, ("vllm", "LLM"): 0,
     ("peft", "PeftModel.from_pretrained"): 1, ("peft", "from_pretrained"): 0,
 }  # fmt: skip
-# Calls that give text or a path rather than an object an SDK makes: SDK helpers, str's
-# methods and a type of model names. Neither does an SDK's ``types``, which hold its data.
+# What gives text or a path, not an SDK's object: SDK helpers, str's methods, model names.
 TEXT_CALLS = frozenset({
     *dir(str), "KnownModelName", "cached_file", "get", "get_from_dict_or_env", "get_from_env",
     "get_secret", "hf_hub_download", "hf_hub_url", "snapshot_download", "try_to_load_from_cache",

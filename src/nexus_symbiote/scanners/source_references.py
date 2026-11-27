@@ -27,15 +27,14 @@ MAX_RECORDS = 5_000
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{1,127}")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,63}")
 _RUN = re.compile(r"[A-Za-z0-9]{24,}")
-# A long run of hex or of base64 with no separator, or user information before an
-# ``@``: what a key, a token or a connection string looks like, and no model's name.
+# A long run of hex or base64, or user information before an ``@``: a key's shape, no name's.
 _SECRET_SHAPED = re.compile(
-    r"[0-9A-Fa-f]{32}|[0-9A-Fa-f-]{48}|^[A-Za-z0-9+/]{40,}={0,2}$|(?:^|/)[^@:/]+:[^@/]+@(?![0-9]+$)"
+    r"[0-9A-Fa-f]{32}|[0-9A-Fa-f-]{48}|(?:^|:)[A-Za-z0-9+/]{40,}={0,2}$"
+    r"|(?:^|/)[^@:/]+:[^@/]+@(?![0-9]+$)"
 )
 # A model pinned by its version's digest, which is a hash, not a key.
 _PINNED = re.compile(r"[\w.-]+/[\w.-]+:[0-9a-f]{64}")
-# A path on this or another host, after a routing prefix or none: a drive with a path, a
-# share, the root or a home directory. No identifier holds ``//``.
+# A host path, after a route or none: a drive with a path, a share, the root, a home or ``//``.
 _ABSOLUTE = re.compile(r"(?:^|[:/@])(?:[A-Za-z]:(?=[^:]*[\\/])|\\\\|/|~)")
 # Words a model argument holds that name no model on purpose.
 _NOT_A_MODEL = frozenset(
@@ -106,8 +105,7 @@ def model_identifier(literal: object) -> str | None:
 
 
 def placeholder(text: str) -> bool:
-    """Whether a model argument's text names no hosted model and is no gap: a word such as
-    ``default``, or a path or weight file in the project, which the model collector reads."""
+    """Whether a model argument's text is no model and no gap: a placeholder or a project file."""
     text = text.strip()
     local = text.startswith(("./", "../", ".\\", "..\\")) or text.lower().endswith(_FILE_SUFFIXES)
     return not text or text.lower() in _NOT_A_MODEL or local and not _ABSOLUTE.search(text)
@@ -166,6 +164,7 @@ class _Model:
     kinds: set[str] = field(default_factory=set)
     aliases: set[str] = field(default_factory=set)
     environment: set[str] = field(default_factory=set)
+    environment_unlisted: bool = False
     methods: set[str] = field(default_factory=set)
     remote_code: bool = False
     count: int = 0
@@ -176,8 +175,7 @@ def _evidence(locations: Iterable[tuple[str, int]]) -> list[str]:
 
 
 class Declarations:
-    """What the readers found: a model is one component for the project, however many files
-    name it, and ``components`` lists them in an order that depends only on what was read."""
+    """What the readers found: one component for each model, in an order fixed by what was read."""
 
     def __init__(self, result: ScanResult) -> None:
         self.result = result
@@ -217,8 +215,7 @@ class Declarations:
         if not isinstance(literal, str):
             return None
         if literal not in self._written:
-            # Each text is judged once: a file may give the same text at every call. One
-            # longer than any identifier is not kept, so the memory does not grow with it.
+            # Each text is judged once, and one longer than any identifier is not kept.
             if len(self._written) >= MAX_RECORDS:
                 self._written.clear()
             self._written[literal] = model_identifier(literal)
@@ -266,6 +263,10 @@ class Declarations:
         record.environment.update(
             filter(environment_name, frozenset(environment) - record.environment)
         )
+        if len(record.environment) > MAX_EVIDENCE_LOCATIONS:
+            # The first names in order are kept, as the first places are.
+            record.environment = set(sorted(record.environment)[:MAX_EVIDENCE_LOCATIONS])
+            record.environment_unlisted = True
         return model_ref(name, routed)
 
     def close(self) -> None:
@@ -293,6 +294,8 @@ class Declarations:
                 properties["environment_variables"] = sorted(model.environment)
             if len(model.aliases) > 1:
                 properties["requested_aliases"] = sorted(model.aliases)
+            if model.environment_unlisted:
+                properties["environment_variables_unlisted"] = True
             kind = "fine-tuned" if "fine-tuned" in model.kinds else min(model.kinds, default=None)
             if kind is None and provider is not None and provider not in LOCAL_PROVIDERS:
                 kind = "hosted"

@@ -62,7 +62,8 @@ Each model identifier becomes one `model` component for the project at `declared
 assurance. Its `source_reference` claim names the file and the line of the argument,
 up to 16 places, and `references_unlisted` counts the rest. The environment variables
 that may give a model in place of a value read are listed in `environment_variables`,
-unless a name is shaped like a key, which is never exported.
+the first 16 in order, with `environment_variables_unlisted` when there are more, unless
+a name is shaped like a key, which is never exported.
 Where the call routes by a prefix on the identifier, the prefix names the provider.
 LiteLLM's functions, CrewAI's `LLM`, `Agent` and `Crew`, DSPy's `LM` and `Embedder` and
 smolagents' `LiteLLMModel` read `anthropic/claude-sonnet-4-5`, and PydanticAI's `Agent`
