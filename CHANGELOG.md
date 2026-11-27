@@ -6,7 +6,7 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ### Added
 
-- **Tool capabilities from source:** a tool the `mcp` collector records from a Python decorator or a TypeScript registration carries a `capabilities` declaration classified from its body (process execution, network, filesystem reads and writes, SQL, payment APIs, credential reads) with the side-effect profile they imply; a shell or evaluation call and a caller-supplied SQL statement are `capability_scope` findings at high, a payment API at medium. Names only, nothing is executed; a body that names none of these keeps no declaration, so existing inventories of such tools are unchanged.
+- **Tool capabilities from source:** a tool the `mcp` collector records from a Python decorator or a TypeScript registration carries a `capabilities` declaration when its body names an operation that raises risk: process execution, network egress and whether it sends data, filesystem writes and deletions, SQL that writes or is built from a parameter, payment API writes and secret-named environment reads, with `capability_evidence: source-body-call-names`. A shell or evaluation call and a caller-supplied SQL statement are `capability_scope` findings at high, a payment write at medium. Names resolve only through imports, so ordinary and unimported names count for nothing; a body is never recorded as read-only, and a body past the size bound records a coverage gap. **Re-collect baselines:** a tool whose body names one of these operations gains a declaration, which `diff` reports as a capabilities change against an older baseline.
 
 ## [0.2.0] - 2026-11-25
 

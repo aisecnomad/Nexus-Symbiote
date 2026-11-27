@@ -28,16 +28,25 @@ including a default such as `def configure(mod=logging)`, produces a coverage ga
 for that call. Other server and tool declarations in the file are still inventoried.
 
 A tool the collector records from a Python decorator or a TypeScript registration
-carries a `capabilities` declaration classified from the body it can see: process
-execution (`subprocess`, `os.system`, `eval`, `execSync`), network egress, filesystem
-reads and writes, SQL statements (a literal statement by its verb, a parameter passed to
-`execute` as a caller-supplied statement), payment APIs and credential reads from the
-environment, with the side-effect profile they imply. Only names in the body count:
-nothing is executed, import aliases are resolved within the file, a helper the body
-calls is not followed, a TypeScript handler bound elsewhere is not read, and a body that
-names none of these keeps no declaration (`unknown`). A shell or evaluation call and a
-caller-supplied statement are `capability_scope` findings at high; a payment API at
-medium.
+carries a `capabilities` declaration when its own body names an operation that raises risk:
+process execution (`subprocess.run`, `os.system`, `eval`; `child_process.execSync`,
+`new Function`), network egress and whether it sends data (an HTTP client's `post`, `put`,
+`patch` or `delete`, `fetch` with such a `method`, mail), filesystem writes and deletions,
+SQL that writes or that is built from a parameter, payment API writes (`stripe.Refund.create`,
+`stripe.refunds.create`) and reads of secret-named environment variables. The profile is
+`financial-transaction`, `destructive` or `state-modifying` by the strongest of these, and
+the record says `capability_evidence: source-body-call-names`.
+
+Names are resolved only through the file's imports, a client or connection the body binds
+from an imported call, and builtins, so a parameter, a local function or an unimported name
+spelled like a module names nothing; TypeScript is read from its syntax tree, so comments
+and strings name nothing either. The classifier cannot show that a body does nothing else:
+it does not follow helpers, dynamic dispatch, a handler bound elsewhere or another file. It
+therefore never records `read` or `read-only`; a body that names only reads, or nothing it
+knows, keeps no declaration and stays `unknown`, which the graph and trifecta rules treat as
+not safe. A body of more than 20,000 syntax nodes is not classified and records a coverage
+gap. A shell or evaluation call and a caller-supplied SQL statement are `capability_scope`
+findings at high, a payment write at medium.
 
 The `mcp` collector names a server it finds in Python, TypeScript or JavaScript
 source by the name its constructor declares as a string literal, the name clients

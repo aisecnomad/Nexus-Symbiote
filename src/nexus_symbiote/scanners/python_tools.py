@@ -19,7 +19,12 @@ from nexus_symbiote.core.models import (
     ToolComponent,
 )
 from nexus_symbiote.scanners.base import KnownValues, ScanResult, declared_server_name
-from nexus_symbiote.scanners.tool_capabilities import classify_python, import_map
+from nexus_symbiote.scanners.tool_capabilities import (
+    EVIDENCE,
+    UNCLASSIFIED,
+    classify_python,
+    import_map,
+)
 
 PYTHON_TOOL_HINTS = (
     "mcp",
@@ -531,6 +536,10 @@ def _record_decorator(
     capabilities = None
     if func_node is not None:
         classified = classify_python(func_node, imports or {}, name)
+        if classified.unclassified:
+            result.surfaces_excluded.append(
+                f"{path.as_posix()}:{deco.lineno} ({name}: {UNCLASSIFIED})"
+            )
         risks = [*risks, *classified.risks]
         capabilities = classified.declaration
     result.components.append(
@@ -553,6 +562,7 @@ def _record_decorator(
                 "collection_mode": "static-source-declaration",
                 "declaration_line": deco.lineno,
                 "source_sha256": source_digest,
+                **({"capability_evidence": EVIDENCE} if capabilities is not None else {}),
             },
         )
     )
@@ -613,6 +623,8 @@ def _record_sdk_decorator(
     capabilities = None
     if func_node is not None:
         classified = classify_python(func_node, imports or {}, name)
+        if classified.unclassified:
+            result.surfaces_excluded.append(f"{path.as_posix()}:{lineno} ({name}: {UNCLASSIFIED})")
         risks = [*risks, *classified.risks]
         capabilities = classified.declaration
     result.components.append(
@@ -635,6 +647,7 @@ def _record_sdk_decorator(
                 "collection_mode": "static-source-declaration",
                 "declaration_line": lineno,
                 "source_sha256": source_digest,
+                **({"capability_evidence": EVIDENCE} if capabilities is not None else {}),
             },
         )
     )

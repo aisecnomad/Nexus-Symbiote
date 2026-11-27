@@ -28,7 +28,6 @@ isolated in a separate process.
 
 from __future__ import annotations
 
-import bisect
 import codecs
 import re
 import sys
@@ -48,7 +47,12 @@ from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolComponent
 from nexus_symbiote.limits import Bound
 from nexus_symbiote.scanners.base import KnownValues, ScanResult, declared_server_name
-from nexus_symbiote.scanners.tool_capabilities import classify_typescript
+from nexus_symbiote.scanners.tool_capabilities import (
+    EVIDENCE,
+    UNCLASSIFIED,
+    classify_typescript,
+    typescript_imports,
+)
 
 _SDK = "@modelcontextprotocol/"
 _MODULES = {"@modelcontextprotocol/server", "@modelcontextprotocol/sdk/server/mcp.js"}
@@ -1388,8 +1392,7 @@ def _collect_source(
         resolver.bind(scope, receiver, (server, node.end_byte))
         servers[node.id] = (server, node.end_byte)
     components: list[MCPServerComponent | ToolComponent] = [s for s, _ in servers.values()]
-    handlers: list[tuple[ToolComponent, Node]] = []
-    spans: list[tuple[int, int]] = []
+    handlers: list[tuple[ToolComponent, Node, int]] = []
     scalar_literals = frozenset(
         {"number", "string", "template_string", "true", "false", "null", "undefined", "regex"}
     )
@@ -1555,42 +1558,41 @@ def _collect_source(
         server.tool_refs.append(ref)
         server.tool_count += 1
         components.append(tool)
-        spans.append((node.start_byte, node.end_byte))
         handler = values[-1] if len(values) > 1 else None
         if handler is not None and handler.type in _HANDLER_TYPES:
             # The inline handler is the body the registration binds; a handler bound
             # elsewhere is not followed and the tool stays unknown.
-            handlers.append((tool, handler))
-    _classify_handlers(source, handlers, spans)
+            handlers.append((tool, handler, node.start_point.row + 1))
+    _classify_handlers(index, handlers, location, result)
     result.components.extend(components)
 
 
 def _classify_handlers(
-    source: bytes, handlers: list[tuple[ToolComponent, Node]], spans: list[tuple[int, int]]
+    index: _Index,
+    handlers: list[tuple[ToolComponent, Node, int]],
+    location: str,
+    result: ScanResult,
 ) -> None:
-    """Classify each inline handler by its own text, without the registrations it nests.
+    """Classify each inline handler by its own syntax tree.
 
-    A registration inside a handler belongs to its own tool, so its whole call is cut out
-    of the enclosing handler's text. Each byte is then read for one tool only, and nested
-    registrations are classified in linear time.
+    A handler nested in another belongs to its own tool, so the enclosing tool's walk skips
+    that handler's subtree, and only that subtree: the rest of the nested registration
+    call, such as an argument it computes, runs in the enclosing body. Every node is then
+    read for one tool, so nested registrations are classified in linear time.
     """
-    starts = sorted(spans)
-    keys = [start for start, _ in starts]
-    for tool, handler in handlers:
-        begin, end = handler.start_byte, handler.end_byte
-        pieces: list[bytes] = []
-        position = begin
-        index = bisect.bisect_left(keys, begin)
-        while index < len(starts) and starts[index][0] < end:
-            inner_start, inner_end = starts[index]
-            if inner_end <= end and inner_start >= position:
-                pieces.append(source[position:inner_start])
-                position = inner_end
-            index = bisect.bisect_left(keys, max(position, inner_start + 1), lo=index + 1)
-        pieces.append(source[position:end])
-        classified = classify_typescript(b"".join(pieces).decode("utf-8", "replace"), tool.name)
+    if not handlers:
+        return
+    imports = typescript_imports(index.nodes)
+    nested = frozenset(handler.id for _, handler, _ in handlers)
+    for tool, handler, line in handlers:
+        classified = classify_typescript(handler, imports, tool.name, nested - {handler.id})
+        if classified.unclassified:
+            result.surfaces_excluded.append(f"{location}:{line} ({tool.name}: {UNCLASSIFIED})")
+            continue
         tool.capabilities = classified.declaration
         tool.risks = [*tool.risks, *classified.risks]
+        if classified.declaration is not None:
+            tool.properties["capability_evidence"] = EVIDENCE
 
 
 _HANDLER_TYPES = frozenset(

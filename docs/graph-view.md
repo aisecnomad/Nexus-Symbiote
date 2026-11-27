@@ -50,9 +50,10 @@ category and detail, a fact, and a coverage gap are cut at 2,000 characters.
 ## Risk classes
 
 A risk class restates recorded evidence about what one component may do. The evidence
-is mostly declared, or inferred from tool names and descriptions by the `mcp` collector,
-whose tool records say so in `capability_evidence`
-(`unverified-declaration-and-name-heuristic`). A class does not establish what a
+is mostly declared, or inferred by the `mcp` collector from tool names and descriptions
+or from the calls a source-declared tool body names, and its tool records say which in
+`capability_evidence` (`unverified-declaration-and-name-heuristic` or
+`source-body-call-names`). A class does not establish what a
 component can do at run time, and the absence of a class does not establish that it
 cannot. Classes are computed when the view is made and never written to the inventory.
 
