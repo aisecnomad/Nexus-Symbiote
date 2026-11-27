@@ -1,8 +1,5 @@
-"""What the Python source reader recognises: SDK modules, constructors and keywords.
-
-These are tables, not behaviour. A row says which modules make a file one the reader
-analyses and which arguments of a call hold a model identifier. A project module that
-shadows one of these module names is never read as the SDK.
+"""What the Python source reader recognises: SDK modules, calls and keywords. These are
+tables, not behaviour; a project module that shadows one of these names is never the SDK.
 """
 
 from __future__ import annotations
@@ -39,17 +36,18 @@ AI_SUBMODULES = {
 }
 # An import statement that may name one of the roots, searched for in the text Python
 # compiles, before a file is parsed. Python ends a statement at any newline, at ``;`` and
-# after ``try:`` or ``if ...:``, and joins lines a backslash ends; a word that is not in an
-# import statement, such as ``graphics`` or one in a string, names none.
+# after ``try:`` or ``if ...:``, never at a form feed, and joins lines a backslash ends; a
+# word not in an import statement, such as ``graphics`` or one in a string, names none.
 _GAP = r"(?:[ \t\f]|\\(?:\r\n?|\n))"
 # A name earlier in an import list may hold any character an identifier may, such as a
 # combining mark, so it runs to the next separator.
 _NAME = r"[^\s,;:\\#()]+"
+_DOT = rf"{_GAP}*\.{_GAP}*"
 _ROOT_NAMES = "|".join(sorted(map(re.escape, AI_ROOTS - {"google"})))
 SDK_IMPORT = re.compile(
-    rf"(?:\A|[\r\n;:\f])[ \t\f]*(?:from|import)(?!\w){_GAP}*(?:{_NAME}(?:{_GAP}+as{_GAP}+{_NAME})?"
-    rf"{_GAP}*,{_GAP}*)*(?:(?:{_ROOT_NAMES})(?!\w)|google(?:\.cloud)?"
-    rf"(?:\.(?:adk|genai|generativeai|aiplatform)(?!\w)|{_GAP}+import(?!\w)))"
+    rf"(?:\A|[\r\n;:])[ \t\f]*(?:from|import)(?!\w){_GAP}*(?:{_NAME}(?:{_GAP}+as{_GAP}+{_NAME})?"
+    rf"{_GAP}*,{_GAP}*)*(?:(?:{_ROOT_NAMES})(?!\w)|google(?:{_DOT}cloud)?"
+    rf"(?:{_DOT}(?:adk|genai|generativeai|aiplatform)(?!\w)|{_GAP}+import(?!\w)))"
 )
 # A root's name alone, searched for in text Python folds a slice at a time, where a
 # statement may span slices: any such word admits the file, and the tree decides.
@@ -69,7 +67,10 @@ MODEL_CALLS = frozenset(
     }
 )  # fmt: skip
 # Libraries that load weights by an owner/name identifier, which is never a route.
-WEIGHT_ROOTS = ("huggingface_hub", "langchain_huggingface", "sentence_transformers", "transformers")
+WEIGHT_ROOTS = (
+    "diffusers", "huggingface_hub", "langchain_huggingface", "llama_cpp", "peft",
+    "sentence_transformers", "transformers", "vllm",
+)  # fmt: skip
 WEIGHT_CLASSES = frozenset(
     {
         "CrossEncoder", "FastEmbedEmbeddings", "HfApiModel", "HuggingFaceBgeEmbeddings",
@@ -82,7 +83,7 @@ WEIGHT_CLASSES = frozenset(
 MODEL_KEYWORDS = (
     "model", "model_name", "model_id", "modelId", "ai_model_id", "deployment_name",
     "azure_deployment", "embedding_model", "embed_model", "llm_model", "chat_model", "llm",
-    "repo_id",
+    "repo_id", "model_name_or_path", "pretrained_model_name_or_path",
 )  # fmt: skip
 EMBEDDING_KEYWORDS = frozenset({"embedding_model", "embed_model"})
 # ``repo_id`` names many things; it is a model only for these loaders.
@@ -102,8 +103,13 @@ POSITIONAL_MODELS: dict[tuple[str, str], int] = {
     ("sentence_transformers", "CrossEncoder"): 0,
     ("sentence_transformers", "SentenceTransformer"): 0, ("transformers", "from_pretrained"): 0,
     ("vertexai", "GenerativeModel"): 0, ("vertexai", "TextEmbeddingModel.from_pretrained"): 0,
-    ("replicate", "run"): 0,
+    ("replicate", "run"): 0, ("diffusers", "from_pretrained"): 0, ("vllm", "LLM"): 0,
+    ("peft", "PeftModel.from_pretrained"): 1, ("peft", "from_pretrained"): 0,
 }  # fmt: skip
+# SDK functions that return text or a path, not an object the SDK makes.
+TEXT_CALLS = frozenset(
+    {"get", "get_from_dict_or_env", "get_from_env", "hf_hub_download", "snapshot_download"}
+)
 # Calls that call their first argument with the rest, so its keywords are that callee's.
 FORWARDERS = frozenset(
     {

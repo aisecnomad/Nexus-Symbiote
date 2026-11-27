@@ -1024,6 +1024,8 @@ def test_an_excluded_path_is_not_read(tmp_path: Path):
         ("two words", False),
         ("./models/llama", False),
         ("~/models/llama", False),
+        ("local:/home/alice/models/minilm", False),
+        ("C:Users/alice/models/minilm", False),
         ("weights.safetensors", False),
         ("https://api.example.com/v1", False),
         ("a" * 129, False),
@@ -1173,13 +1175,21 @@ def test_a_codec_the_reader_does_not_follow_is_a_gap(tmp_path: Path):
     ]
 
 
-def test_a_google_cloud_import_of_vertex_is_found(tmp_path: Path):
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "from google.cloud import aiplatform",
+        "from google . cloud import aiplatform",
+        "from google \\\n    .cloud import aiplatform",
+        "import google . cloud . aiplatform as aiplatform",
+        "import google.\\\ncloud.aiplatform as aiplatform",
+    ],
+    ids=["dotted", "spaced", "continued", "spaced-import", "continued-import"],
+)
+def test_a_google_cloud_import_of_vertex_is_found(tmp_path: Path, statement: str):
     result = scan(
         tmp_path,
-        {
-            "run.py": "from google.cloud import aiplatform\n"
-            'aiplatform.Endpoint("projects/p").predict(model="text-bison")\n'
-        },
+        {"run.py": f'{statement}\naiplatform.Endpoint("projects/p").predict(model="text-bison")\n'},
     )
     assert set(models(result)) == {"text-bison"}
 
@@ -1233,8 +1243,25 @@ def handle(metric, client, store, settings):
         "from contextvars import ContextVar\nCURRENT = ContextVar('c')\nCURRENT.get().chat(model='nova')\n",
         "from mypy_boto3_bedrock_runtime import BedrockRuntimeClient\n\n"
         + "def ask(client: BedrockRuntimeClient):\n    client.converse(modelId='nova')\n",
+        "from types_boto3_bedrock_runtime import BedrockRuntimeClient\n\n"
+        + "def ask(client: BedrockRuntimeClient):\n    client.converse(modelId='nova')\n",
+        "from typing_extensions import cast, Any\nimport ollama\n\n"
+        + "cast(Any, ollama.Client()).chat(model='nova')\n",
+        "import ollama\nCLIENTS = {}\nCLIENTS.setdefault('h', ollama.Client()).chat(model='nova')\n",
+        "import random\nPOOL = []\nrandom.choice(POOL).chat(model='nova')\n",
     ],
-    ids=["any", "object", "cast", "container", "context-variable", "type-stub"],
+    ids=[
+        "any",
+        "object",
+        "cast",
+        "container",
+        "context-variable",
+        "type-stub",
+        "other-type-stub",
+        "backported-cast",
+        "set-default",
+        "random-choice",
+    ],
 )
 def test_an_object_typed_as_anything_is_read_as_one_the_reader_cannot_tell(
     tmp_path: Path, client: str
@@ -1342,6 +1369,11 @@ def test_a_relative_import_past_the_top_package_binds_nothing(tmp_path: Path):
         ("0123456789abcdef0123456789abcd-" + "0123456789abcdef0123456789abcd", False, True),
         ("anthropic:claude-3-5-sonnet@20240620", True, False),
         ("stability-ai/sdxl:" + "39ed52f2a78e934b" * 4, True, False),
+        ("local:/home/alice/models/minilm", False, True),
+        ("huggingface:C:/Users/alice/models/minilm", False, True),
+        ("C:Users/alice/models/minilm", False, True),
+        ("file:/home/alice/models/minilm", False, True),
+        (".\\checkpoints\\final", False, False),
     ],
     ids=[
         "drive",
@@ -1353,6 +1385,11 @@ def test_a_relative_import_past_the_top_package_binds_nothing(tmp_path: Path):
         "split-hex",
         "versioned",
         "pinned",
+        "prefixed-root",
+        "prefixed-drive",
+        "drive-relative",
+        "one-slash-file-scheme",
+        "windows-relative",
     ],
 )
 def test_a_path_or_a_key_is_never_a_model_and_a_project_file_is_no_gap(
@@ -1570,3 +1607,186 @@ def test_a_folded_import_statement_longer_than_a_slice_is_found(tmp_path: Path):
     # Folded a slice at a time, the statement's start and the SDK's name are in different
     # slices; the name alone admits the file, and the syntax tree decides.
     assert set(models(SourceScanner().scan(tmp_path))) == {"gpt-4o"}
+
+
+REMOTE = "a model is loaded with options the collector cannot read; whether it may run its own code is not known"
+
+
+@pytest.mark.parametrize(
+    ("call", "remote", "gap"),
+    [
+        ('VLLM(model="someorg/custom-7b", trust_remote_code=True)', True, False),
+        ('LLM(model="someorg/custom-7b", trust_remote_code=True)', True, False),
+        (
+            'SentenceTransformer("someorg/custom-7b", model_kwargs=dict(trust_remote_code=True))',
+            True,
+            False,
+        ),
+        ('SentenceTransformer("someorg/custom-7b", model_kwargs=OPTIONS)', None, True),
+        ('SentenceTransformer("someorg/custom-7b", model_kwargs={**OPTIONS})', None, True),
+        ('SentenceTransformer("someorg/custom-7b", model_kwargs=dict(OPTIONS))', None, True),
+        ('AutoModel.from_pretrained("someorg/custom-7b", **OPTIONS)', None, True),
+        ('LLM("someorg/custom-7b", **OPTIONS)', None, True),
+        ('SentenceTransformer("someorg/custom-7b", model_kwargs={"device": "cpu"})', None, False),
+        ('SentenceTransformer("someorg/custom-7b", model_kwargs=None)', None, False),
+        ('litellm.completion("someorg/custom-7b", messages=[], **OPTIONS)', None, False),
+    ],
+    ids=[
+        "wrapper-of-a-weights-library",
+        "weights-library-of-its-own",
+        "dict-call",
+        "name",
+        "spread-in-a-dict",
+        "dict-of-a-name",
+        "spread",
+        "spread-to-a-weights-library-of-its-own",
+        "readable-options",
+        "no-options",
+        "hosted-call",
+    ],
+)
+def test_remote_code_is_read_on_every_sdk_call_and_options_it_cannot_read_are_a_gap(
+    tmp_path: Path, call: str, remote: bool | None, gap: bool
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import litellm\nfrom langchain_community.llms import VLLM\n"
+            "from sentence_transformers import SentenceTransformer\n"
+            "from transformers import AutoModel\nfrom vllm import LLM\n\nOPTIONS = {}\n"
+            f"{call}\n"
+        },
+    )
+    assert models(result)["someorg/custom-7b"].trust_remote_code is remote
+    assert list(result.surfaces_excluded) == ([f"run.py:8: {REMOTE}"] if gap else [])
+
+
+def test_a_wrapper_that_hands_on_what_it_was_given_is_no_model_call(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+import functools
+
+import openai
+
+
+def retry(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def run(hook, context):
+    hook(**context)
+
+
+openai.OpenAI().responses.create(**PARAMS)
+"""
+        },
+    )
+    # A spread given to an SDK call may hold the model; one a wrapper hands on, to a
+    # callee it was given, is not known to be a model call.
+    assert list(result.surfaces_excluded) == [unread("run.py", 18)]
+
+
+@pytest.mark.parametrize("sdk_first", [True, False], ids=["sdk-first", "sdk-last"])
+def test_of_two_imports_of_one_name_in_a_module_the_sdks_is_read(tmp_path: Path, sdk_first: bool):
+    imports = ["from langchain_openai import ChatOpenAI as Chat", "from my_company_llm import Chat"]
+    first, second = imports if sdk_first else imports[::-1]
+    source = f"import os\n\nif os.environ.get('P'):\n    {first}\nelse:\n    {second}\n"
+    result = scan(tmp_path, {"run.py": source + "Chat(model='gpt-4o')\n"})
+    assert set(models(result)) == {"gpt-4o"}
+
+
+def test_weights_libraries_name_their_models_by_position_and_by_keyword(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from diffusers import DiffusionPipeline
+from peft import AutoPeftModelForCausalLM, PeftModel
+from sentence_transformers import SentenceTransformer
+from transformers import AutoModel
+from vllm import LLM
+
+base = AutoModel.from_pretrained(pretrained_model_name_or_path="someorg/base-7b")
+PeftModel.from_pretrained(base, "someorg/adapter")
+AutoPeftModelForCausalLM.from_pretrained("someorg/peft-7b")
+DiffusionPipeline.from_pretrained("stabilityai/sdxl-base")
+LLM("facebook/opt-125m")
+SentenceTransformer(model_name_or_path="someorg/embedder")
+"""
+        },
+    )
+    assert set(models(result)) == {
+        "someorg/base-7b",
+        "someorg/adapter",
+        "someorg/peft-7b",
+        "stabilityai/sdxl-base",
+        "facebook/opt-125m",
+        "someorg/embedder",
+    }
+    assert list(result.surfaces_excluded) == []
+
+
+def test_text_an_sdk_function_returns_is_unread_not_an_object_it_made(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+import boto3
+from huggingface_hub import snapshot_download
+from langchain_core.utils import get_from_env
+from langchain_openai import ChatOpenAI
+from transformers import AutoModel
+
+AutoModel.from_pretrained(snapshot_download(repo_id="meta-llama/Llama-3.1-8B"))
+ChatOpenAI(model=get_from_env("model", "OPENAI_MODEL"))
+secrets = boto3.client("secretsmanager")
+ChatOpenAI(model=secrets.get_secret_value(SecretId="m").get("SecretString"))
+ChatOpenAI(model=ChatOpenAI().model_name)
+"""
+        },
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [unread("run.py", 7, 4)]
+
+
+def test_a_method_reached_through_a_class_is_the_classs_and_no_sdk_call(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
+from django.db import models
+from openai import OpenAI
+
+
+class Car(models.Model):
+    make = models.CharField(max_length=40)
+
+
+def record(client):
+    ContentType.objects.create(app_label="blog", model="post")
+    Car.objects.create(make="Toyota", model="Corolla")
+    settings.LLM_CLIENT.chat.completions.create(model="o3")
+    client.chat.completions.create(model="gpt-4o")
+"""
+        },
+    )
+    # A row of an ORM's class names no model: a library's is not read, and what a
+    # project class is given is the project's to give. A constant of a library may still
+    # hold an SDK's client.
+    assert set(models(result)) == {"gpt-4o", "o3"}
+    assert list(result.surfaces_excluded) == [f"run.py:13: a model argument is {GIVEN}"]
+
+
+def test_a_text_longer_than_any_identifier_is_judged_and_not_kept():
+    found = Declarations(ScanResult(scanner_name="source"))
+    assert found.model("x" * 300, "run.py", 1, method="python-ast") is None
+    assert found.model("gpt-4o", "run.py", 2, method="python-ast") == "model:source:gpt-4o"
+    assert list(found._written) == ["gpt-4o"]

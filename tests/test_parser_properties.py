@@ -37,6 +37,7 @@ from nexus_symbiote.diff.differ import AIBOMDiffer, _values_unbound
 from nexus_symbiote.scanners.base import ScanResult, sanitized_origin
 from nexus_symbiote.scanners.registry import RegistryScanner
 from nexus_symbiote.scanners.source import SourceScanner
+from nexus_symbiote.scanners.source_python_tables import SDK_IMPORT
 from nexus_symbiote.scanners.source_references import model_identifier
 from nexus_symbiote.utils.secrets import redact_descriptor, redact_text, redact_url
 from tests.support import scaling_ratio
@@ -924,11 +925,24 @@ def _nested_owners(size: int) -> str:
     return "f = " + "lambda: " * size + "(" + "super().f(), " * size + ")\n"
 
 
+def _cut_augmented(size: int) -> str:
+    # A binding by ``+=`` names no callee, and is still one of the values each read walks.
+    return "x = a" + ".a" * 40 + "\n" + "x += 0\n" * size + "x()\n" * size
+
+
 @pytest.mark.no_cover
 @pytest.mark.parametrize(
     "shape",
-    [_rebinds, _wide_or, _deep_plus, _joined_bindings, _cut_names, _nested_owners],
-    ids=["rebinds", "wide-or", "deep-plus", "joined-bindings", "cut-names", "nested-owners"],
+    [_rebinds, _wide_or, _deep_plus, _joined_bindings, _cut_names, _nested_owners, _cut_augmented],
+    ids=[
+        "rebinds",
+        "wide-or",
+        "deep-plus",
+        "joined-bindings",
+        "cut-names",
+        "nested-owners",
+        "cut-augmented",
+    ],
 )
 def test_reading_python_source_is_linear_in_its_size(tmp_path, shape):
     roots = {}
@@ -940,6 +954,13 @@ def test_reading_python_source_is_linear_in_its_size(tmp_path, shape):
         )
 
     assert scaling_ratio(lambda scale: SourceScanner().scan(roots[scale])) < 8
+
+
+@pytest.mark.no_cover
+def test_searching_for_an_import_is_linear_in_a_run_of_form_feeds():
+    # A form feed starts no statement, so each is scanned once, not once per form feed.
+    texts = {scale: "x = 1\n" + "\f" * (20_000 * scale) for scale in (1, 4)}
+    assert scaling_ratio(lambda scale: SDK_IMPORT.search(texts[scale])) < 8
 
 
 @pytest.mark.no_cover

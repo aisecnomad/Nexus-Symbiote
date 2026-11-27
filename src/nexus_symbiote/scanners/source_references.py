@@ -38,8 +38,9 @@ _SECRET_SHAPED = re.compile(
 )
 # A model pinned by its version's digest, which is a hash, not a key.
 _PINNED = re.compile(r"[\w.-]+/[\w.-]+:[0-9a-f]{64}")
-# A path on this or another host: a drive, a share, the root or a home directory.
-_ABSOLUTE = re.compile(r"[A-Za-z]:[\\/]|\\\\|/|~")
+# A path on this or another host, after a routing prefix or none: a drive, a share, the
+# root or a home directory.
+_ABSOLUTE = re.compile(r"(?:^|:)(?:[A-Za-z]:|\\\\|/|~)")
 # Words a model argument holds that name no model on purpose.
 _NOT_A_MODEL = frozenset(
     {
@@ -74,7 +75,7 @@ def model_identifier(literal: object) -> str | None:
     lowered = text.lower()
     if lowered in _NOT_A_MODEL or lowered.endswith(_FILE_SUFFIXES) or "://" in text:
         return None
-    if text.startswith(("./", "../")) or _ABSOLUTE.match(text):
+    if text.startswith(("./", "../")) or _ABSOLUTE.search(text):
         return None
     if _SECRET_SHAPED.search(text) and not _PINNED.fullmatch(text):
         return None
@@ -85,8 +86,8 @@ def placeholder(text: str) -> bool:
     """Whether a model argument's text names no hosted model and is no gap: a word such as
     ``default``, or a path or weight file in the project, which the model collector reads."""
     text = text.strip()
-    local = text.startswith(("./", "../")) or text.lower().endswith(_FILE_SUFFIXES)
-    return not text or text.lower() in _NOT_A_MODEL or local and not _ABSOLUTE.match(text)
+    local = text.startswith(("./", "../", ".\\", "..\\")) or text.lower().endswith(_FILE_SUFFIXES)
+    return not text or text.lower() in _NOT_A_MODEL or local and not _ABSOLUTE.search(text)
 
 
 def model_kind(name: str, *, embedding: bool = False) -> str | None:
@@ -116,12 +117,8 @@ def _evidence(locations: Iterable[tuple[str, int]]) -> list[str]:
 
 
 class Declarations:
-    """What the readers found, keyed so that a second sighting adds evidence, not a twin.
-
-    A model is one component for the project, whatever the number of files that name
-    it. ``components`` returns the records in an order that depends only on what was
-    read.
-    """
+    """What the readers found: a model is one component for the project, however many files
+    name it, and ``components`` lists them in an order that depends only on what was read."""
 
     def __init__(self, result: ScanResult) -> None:
         self.result = result
@@ -148,16 +145,16 @@ class Declarations:
         embedding: bool = False,
         remote_code: bool = False,
     ) -> str | None:
-        """Record one reference to a model and return its component reference.
-        ``remote_code`` says the call that loads it lets the model run its own code."""
+        """Record one reference to a model; ``remote_code`` says its call lets it run its code."""
         if not isinstance(literal, str):
             return None
         if literal not in self._written:
-            # Each text is judged once: a file may give the same text at every call.
+            # Each text is judged once: a file may give the same text at every call. One
+            # longer than any identifier is not kept, so the memory does not grow with it.
             if len(self._written) >= MAX_RECORDS:
                 self._written.clear()
             self._written[literal] = model_identifier(literal)
-        name = self._written[literal]
+        name = self._written[literal] if len(literal) <= 256 else self._written.pop(literal)
         if name is None:
             return None
         record = self._models.get(name)

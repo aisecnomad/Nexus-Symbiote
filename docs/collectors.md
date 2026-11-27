@@ -40,15 +40,18 @@ of another library or of Python, such as a logger, and a method of what one retu
 not. Of an object the reader cannot tell, such as an untyped or `Any` parameter or a
 framework's state, a call is read when it is named as SDK calls are (`create`, `chat`,
 `completions`, `invoke`, `generate_content` and the like), so a metrics label or an
-ORM query is not.
+ORM query is not. A call of a name the reader cannot tell, such as a class chosen at run
+time, is read, though not a `**` spread a wrapper hands on that way. A method reached
+through a class, as an ORM's manager is, is the class's: a library's is not read, and a
+project's is a gap.
 
 A model identifier written as a literal argument becomes one `model` component for the
 project at `declared` assurance. Its `source_reference` claim names the file and the
 line of the argument, up to 16 places, and `references_unlisted` counts the rest. The
-identifier is kept as written, routing prefix and all, and no provider is recorded. A
-call that may let the model run its own code, through any `trust_remote_code` but a
-false literal, records it. A relative path or a weight file names a file in the
-project, which the model collector reads.
+identifier is kept as written, routing prefix and all, and no provider is recorded. Any
+`trust_remote_code` but a false literal, given to a call or in its `model_kwargs` or
+`config_kwargs`, records that the model may run its own code. A relative path or a
+weight file names a file in the project, which the model collector reads.
 
 What the reader knows is there and cannot read is a coverage gap:
 
@@ -58,10 +61,12 @@ What the reader knows is there and cannot read is a coverage gap:
   holds more syntax nodes than `python-nodes`;
 - a file that imports an SDK by a name a module of the project also has;
 - a model argument bound in another module of the project;
-- a model argument that is not a literal, unless it is an object an SDK makes: a name,
-  an attribute, a parameter, a call of another library, joined text, `**options`
-  without a model keyword, a starred positional argument, an absolute path, or text
-  that is no identifier;
+- a model argument that is not a literal, unless it is an object an SDK makes rather
+  than text or a path one returns: a name, an attribute, a parameter, a call of another
+  library, joined text, `**options` without a model, a starred positional argument, a
+  path on a host, behind a routing prefix or not, or text that is no identifier;
+- options a weights library is given that the reader cannot read, such as
+  `model_kwargs=options` or `**options`, which may let the model run its own code;
 - a model argument given to a function or class the project defines, or to a method of
   one of its classes, which the reader does not follow;
 - a bound the reader reached: a callee depth of 32, the directories it looks in for a
