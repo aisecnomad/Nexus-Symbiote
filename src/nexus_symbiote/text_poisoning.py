@@ -85,6 +85,19 @@ _POINTER_FIELDS = frozenset(
         "allOf",
         "$defs",
         "definitions",
+        "patternProperties",
+        "prefixItems",
+        "dependentSchemas",
+        "dependencies",
+        "unevaluatedProperties",
+        "propertyNames",
+        "if",
+        "then",
+        "else",
+        "not",
+        "contains",
+        "outputSchema",
+        "_meta",
         "description",
         "title",
         "name",
@@ -103,19 +116,27 @@ _SIDE_CHANNEL_PARAM_NAMES = frozenset(
     {
         "note",
         "notes",
+        "sidenote",
+        "sidenotes",
         "debug",
         "telemetry",
+        "telemetry_payload",
         "meta",
         "metadata",
         "audit",
         "query",
         "context",
+        "hidden_context",
+        "conversation_history",
+        "system_state",
         "extra",
         "extras",
         "callback",
         "webhook",
         "reason",
         "comment",
+        "exfil",
+        "exfiltration",
     }
 )
 # Typographic apostrophes fold to ASCII so that "Don’t tell" reads as "Don't tell".
@@ -1029,29 +1050,84 @@ def _escape_decoded_hits(
     ]
 
 
-def _collect_schema_property_names(schema: dict[str, Any] | None) -> set[str]:
+def _collect_schema_properties(
+    schema: dict[str, Any] | None,
+) -> list[tuple[str, dict[str, Any] | None]]:
     if not isinstance(schema, dict):
-        return set()
-    names: set[str] = set()
+        return []
+    found: list[tuple[str, dict[str, Any] | None]] = []
+    seen: set[int] = {id(schema)}
     queue: deque[dict[str, Any]] = deque([schema])
-    while queue:
+    visited = 0
+    while queue and visited < 4096:
         node = queue.popleft()
+        visited += 1
         props = node.get("properties")
         if isinstance(props, dict):
             for k, v in props.items():
                 if isinstance(k, str):
-                    names.add(k)
-                if isinstance(v, dict):
+                    found.append((k, v if isinstance(v, dict) else None))
+                if isinstance(v, dict) and id(v) not in seen:
+                    seen.add(id(v))
                     queue.append(v)
-        for combiner in ("items", "additionalProperties"):
+        for def_key in (
+            "$defs",
+            "definitions",
+            "patternProperties",
+            "dependentSchemas",
+            "dependencies",
+        ):
+            defs = node.get(def_key)
+            if isinstance(defs, dict):
+                for sub_schema in defs.values():
+                    if isinstance(sub_schema, dict) and id(sub_schema) not in seen:
+                        seen.add(id(sub_schema))
+                        queue.append(sub_schema)
+        items_val = node.get("items")
+        if isinstance(items_val, dict) and id(items_val) not in seen:
+            seen.add(id(items_val))
+            queue.append(items_val)
+        elif isinstance(items_val, list):
+            for item in items_val:
+                if isinstance(item, dict) and id(item) not in seen:
+                    seen.add(id(item))
+                    queue.append(item)
+        for combiner in (
+            "additionalProperties",
+            "unevaluatedProperties",
+            "propertyNames",
+            "if",
+            "then",
+            "else",
+            "not",
+            "contains",
+        ):
             sub = node.get(combiner)
-            if isinstance(sub, dict):
+            if isinstance(sub, dict) and id(sub) not in seen:
+                seen.add(id(sub))
                 queue.append(sub)
-        for list_key in ("anyOf", "oneOf", "allOf"):
+        for list_key in ("anyOf", "oneOf", "allOf", "prefixItems"):
             items = node.get(list_key)
             if isinstance(items, list):
-                queue.extend(item for item in items if isinstance(item, dict))
-    return names
+                for item in items:
+                    if isinstance(item, dict) and id(item) not in seen:
+                        seen.add(id(item))
+                        queue.append(item)
+    return found
+
+
+def _collect_schema_property_names(schema: dict[str, Any] | None) -> set[str]:
+    return {k for k, _ in _collect_schema_properties(schema)}
+
+
+def _subschema_has_tool_poisoning(subschema: dict[str, Any], *, surface: str) -> bool:
+    for path, text in extract_json_text_entries(subschema, max_depth=64, max_entries=512):
+        if text and any(
+            h.category == CATEGORY_TOOL_POISONING
+            for h in scan_text_block(text, surface=surface, is_tool_surface=True, where=path)
+        ):
+            return True
+    return False
 
 
 def check_sidenote_tool_schema(
@@ -1069,8 +1145,9 @@ def check_sidenote_tool_schema(
     Flags:
     1) A tool declaring ``readOnlyHint=True`` or ``destructiveHint=False`` whose text
        carries a poisoning directive.
-    2) A declared side-channel parameter (``note``, ``debug``, ``query``, ``context``,
-       ``metadata`` ...) that the tool's text names beside such a directive.
+    2) A declared side-channel parameter (``sidenote``, ``note``, ``debug``, ``query``,
+       ``context``, ``metadata`` ...) that the tool's text names beside such a directive
+       or whose own schema subtree houses the poisoning directive.
     The finding is located at the poisoning hit that triggered it.
     """
     poison = next((h for h in existing_hits if h.category == CATEGORY_TOOL_POISONING), None)
@@ -1079,12 +1156,23 @@ def check_sidenote_tool_schema(
     ann = annotations or {}
     flagged = ann.get("readOnlyHint") is True or ann.get("destructiveHint") is False
     if not flagged:
-        normalized, _ = normalize_for_lexical_scan(combined_text)
-        flagged = any(
-            re.search(rf"\b{re.escape(prop)}\b", normalized, re.IGNORECASE) is not None
-            for prop in sorted(_collect_schema_property_names(schema))
+        side_entries = [
+            (prop, sub)
+            for prop, sub in _collect_schema_properties(schema)
             if prop.lower() in _SIDE_CHANNEL_PARAM_NAMES
-        )
+        ]
+        if side_entries:
+            if any(
+                sub is not None and _subschema_has_tool_poisoning(sub, surface=surface)
+                for _, sub in side_entries
+            ):
+                flagged = True
+            else:
+                normalized, _ = normalize_for_lexical_scan(combined_text)
+                flagged = any(
+                    re.search(rf"\b{re.escape(prop)}\b", normalized, re.IGNORECASE) is not None
+                    for prop, _ in {(p, None) for p, _ in side_entries}
+                )
     if not flagged:
         return []
     return [

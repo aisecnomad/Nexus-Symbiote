@@ -4,6 +4,10 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Security
+
+- **MCP launch confinement & tool-schema poisoning depth:** Flagged unrestricted Deno/Node sandboxes (`-A`, `--allow-all`, `--allow-run`, `--allow-ffi`, `--allow-child-process`, `--allow-addons`, `--allow-worker`, root/wildcard `--allow-*`), disabled TLS verification (`--unsafely-ignore-certificate-errors`), exposed debuggers (`--inspect*`), and unscoped Deno `-R`/`-W`/`-N`/`-E`/`-P`/`--allow-*` permissions under `launch_context` while supporting scoped `-N=host`/`-R=/path` short flags; extended `TP-SIDENOTE-004` across `$defs`, `definitions`, `patternProperties`, `prefixItems`, `dependentSchemas`, and `if`/`then`/`else` subtrees; applied `text_poisoning` rules across `discover-mcp --record` live server instructions, `serverInfo`, prompts, resource templates, and full tool descriptors (`title`, `outputSchema`, `annotations`, `_meta`).
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

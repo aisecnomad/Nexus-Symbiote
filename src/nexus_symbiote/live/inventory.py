@@ -183,6 +183,78 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
                 conditions="served descriptor observed; backend behavior and authorization unverified",
             )
         )
+    from nexus_symbiote.text_poisoning import (
+        _append_consolidated_risks,
+        apply_text_poisoning_rules,
+        extract_json_text_entries,
+        scan_text_block,
+    )
+
+    server_hits = []
+    if isinstance(result.instructions, str) and result.instructions:
+        server_hits.extend(
+            scan_text_block(
+                result.instructions,
+                surface=origin,
+                is_tool_surface=True,
+                where="instructions",
+            )
+        )
+    if isinstance(result.server_info, dict):
+        for path, text in extract_json_text_entries(
+            result.server_info, max_depth=16, max_entries=256
+        ):
+            if text:
+                server_hits.extend(
+                    scan_text_block(
+                        text,
+                        surface=origin,
+                        is_tool_surface=True,
+                        where=f"serverInfo.{path}",
+                    )
+                )
+    for surface_label, items in (
+        ("prompts", result.prompts),
+        ("resourceTemplates", result.resource_templates),
+    ):
+        if items:
+            for item in items:
+                for path, text in extract_json_text_entries(
+                    item.descriptor, max_depth=32, max_entries=512
+                ):
+                    if text:
+                        server_hits.extend(
+                            scan_text_block(
+                                text,
+                                surface=origin,
+                                is_tool_surface=True,
+                                where=f"{surface_label}.{path}",
+                            )
+                        )
+    if server_hits:
+        _append_consolidated_risks(server, server_hits)
+
+    for observed, tool_comp in zip(result.tools, tools, strict=True):
+        extra_fields = {
+            k: v
+            for k, v in observed.descriptor.items()
+            if k not in {"name", "description", "inputSchema"}
+        }
+        extra_hits = []
+        for path, text in extract_json_text_entries(extra_fields, max_depth=64, max_entries=1024):
+            if text:
+                extra_hits.extend(
+                    scan_text_block(
+                        text,
+                        surface=tool_comp.name,
+                        is_tool_surface=True,
+                        where=path,
+                    )
+                )
+        if extra_hits:
+            _append_consolidated_risks(tool_comp, extra_hits)
+
+    apply_text_poisoning_rules(bom)
     surfaces = ["initialize", "tools/list"]
     if result.prompts is not None:
         surfaces.append("prompts/list")

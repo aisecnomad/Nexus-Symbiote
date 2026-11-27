@@ -2644,6 +2644,9 @@ _CONTEXT_HIGH = {
     "host_root_mount": "a host root mount",
     "security_options_disabled": "disabled confinement",
     "dangerous_capabilities": "a host-level capability",
+    "unrestricted_sandbox": "unrestricted sandbox or host-execution permissions",
+    "tls_verification_disabled": "disabled TLS certificate verification",
+    "inspector_exposed": "an exposed debugger or inspector",
 }
 _CONTEXT_MEDIUM = {
     "host_namespaces": "a host namespace",
@@ -2658,6 +2661,7 @@ _CONTEXT_MEDIUM = {
     "container_environment_file": "container environment from a file the inventory does not read",
     "container_command": "a health-check command the engine runs in the container",
     "custom_security_profile": "a seccomp profile from a file",
+    "widened_sandbox": "unscoped sandbox permissions",
 }
 
 
