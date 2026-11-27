@@ -2369,3 +2369,65 @@ def test_a_default_in_one_file_does_not_stand_for_a_read_another_file_needs(tmp_
     assert list(result.surfaces_excluded) == [
         "b.py:3: model set only by environment variable CHAT_MODEL; not inventoried"
     ]
+
+
+def test_a_call_given_one_keyword_twice_gives_no_model(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "from openai import OpenAI\nclient = OpenAI()\n"
+            + 'client.responses.create(model="gpt-4o", **{"model": "o3"})\n'
+            + 'client.responses.create(**{"model": "gpt-4.1"}, **dict(model="o4-mini"))\n'
+            + 'client.responses.create(model="gpt-4o-mini", **{"temperature": 0})\n'
+        },
+    )
+    # Python refuses a call given one keyword twice; a key given once is no conflict.
+    assert set(models(result)) == {"gpt-4o-mini"}
+    assert not result.surfaces_excluded
+
+
+def test_a_spread_is_charged_for_every_entry_it_walks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(source_python.PythonReader, "_allowance", staticmethod(lambda module: 300))
+    entries = ", ".join('"model": "gpt-4o"' for _ in range(200))
+    result = scan(
+        tmp_path,
+        {
+            "run.py": f"from openai import OpenAI\nREQUEST = {{{entries}}}\n"
+            + "OpenAI().responses.create(**REQUEST)\n" * 2
+        },
+    )
+    # Two walks of 200 entries are more steps than this allowance holds.
+    assert f"run.py:1: {CUT}" in result.surfaces_excluded
+
+
+def test_a_default_that_names_no_model_leaves_it_to_the_environment(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom openai import OpenAI\n"
+            + 'OpenAI().responses.create(model=os.getenv("CHAT_MODEL", None))\n'
+            + 'OpenAI().responses.create(model=os.environ.get("FAST_MODEL", ""))\n'
+        },
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [
+        "run.py:3: model set only by environment variable CHAT_MODEL; not inventoried",
+        "run.py:4: model set only by environment variable FAST_MODEL; not inventoried",
+    ]
+
+
+def test_two_variables_that_share_a_fallback_are_both_kept(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom openai import OpenAI\n"
+            + 'FALLBACK = "gpt-4o"\n'
+            + 'M = (os.getenv("PRIMARY_MODEL") or FALLBACK) if fast else '
+            + '(os.getenv("BACKUP_MODEL") or FALLBACK)\n'
+            + "OpenAI().responses.create(model=M)\n"
+        },
+    )
+    variables = models(result)["gpt-4o"].properties["environment_variables"]
+    assert variables == ["BACKUP_MODEL", "PRIMARY_MODEL"]
