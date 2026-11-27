@@ -172,7 +172,7 @@ MCP_DIALECTS = (
     McpDialect(".amazonq/mcp.json", "json", _SERVER_MAPS),
     McpDialect(".windsurf/mcp.json", "json", _SERVER_MAPS),
     McpDialect(".cline/mcp.json", "json", _SERVER_MAPS),
-    McpDialect(".codex/config.toml", "toml", ("mcp_servers",)),
+    McpDialect(".codex/config.toml", "toml", ("mcp_servers",), shape="codex"),
     McpDialect(".zed/settings.json", "jsonc", ("context_servers",), shape="zed", host="zed"),
     # opencode reads comments and trailing commas in both names.
     McpDialect("opencode.json", "jsonc", ("mcp",), shape="opencode"),
@@ -2474,6 +2474,7 @@ _LIST_FIELDS = _names(
     "disabledTools env_vars watchPaths"
 )
 _MAP_FIELDS = frozenset({"env", "headers", "http_headers", "env_http_headers"})
+_CODEX_FORWARDING_FIELDS = frozenset({"env_vars", "env_http_headers", "bearer_token_env_var"})
 _BOOL_FIELDS = frozenset({"disabled", "trust", "enabled", _OAUTH_DISABLED})
 _NUMBER_FIELDS = _names("timeout startup_timeout_sec startup_timeout_ms tool_timeout_sec")
 _OBJECT_FIELDS = frozenset({"oauth", "auth", "dev", _EXTENSION_SETTINGS})
@@ -2816,6 +2817,76 @@ def _exported_environment(env: dict[str, Any], names: _Names | None = None) -> d
             withheld += 1
             shown[f"[redacted-{withheld}]"] = "***"
     return shown
+
+
+def _codex_env_entry(entry: Any) -> bool:
+    """The two forms of Codex's stdio env_vars declaration."""
+    return isinstance(entry, str) or (
+        isinstance(entry, dict)
+        and entry.keys() <= {"name", "source"}
+        and isinstance(entry.get("name"), str)
+        and entry.get("source", "local") in ("local", "remote")
+    )
+
+
+def _codex_env_references(
+    config: dict[str, Any], transport: str, names: _Names, protected: KnownValues
+) -> dict[str, Any]:
+    """Declared variable names by source. No lookup or interpolation takes place."""
+    local: set[str] = set()
+    remote: set[str] = set()
+    remote_host = config.get("environment_id", "local") != "local"
+    if transport == "stdio" and config.get("command"):
+        if any(
+            k in config
+            for k in (
+                "url",
+                "http_headers",
+                "env_http_headers",
+                "bearer_token_env_var",
+                "bearer_token",
+                "http_headers_helper",
+                "oauth",
+                "oauth_resource",
+                "auth",
+            )
+        ):
+            return {}
+        overrides = config.get("env", {})
+        for entry in config.get("env_vars", ()):
+            name = entry if isinstance(entry, str) else entry["name"]
+            if name not in overrides:
+                if isinstance(entry, dict) and entry.get("source") == "remote":
+                    if not remote_host:
+                        # Codex rejects remote-source entries on a local stdio server.
+                        return {}
+                    remote.add(name)
+                else:
+                    local.add(name)
+    elif transport == "streamable-http" and config.get("url"):
+        if any(k in config for k in ("command", "args", "env", "env_vars", "cwd", "bearer_token")):
+            return {}
+        if remote_host:
+            # The Codex config does not establish where a remote HTTP connector reads
+            # these variables. Avoid associating it with a local host credential.
+            return {}
+        if "bearer_token_env_var" in config:
+            local.add(config["bearer_token_env_var"])
+        local.update(config.get("env_http_headers", {}).values())
+    # These fields take arbitrary strings. Export identifier-shaped names only, using
+    # the same scan-wide literal and token checks that protect names in findings.
+    properties = {}
+    for key, candidates in (("env_vars_referenced", local), ("remote_env_vars_referenced", remote)):
+        shown = sorted(
+            name
+            for name in candidates
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name)
+            and names.shown(name, finding=True)
+            and not protected.held_by(name)
+        )
+        if shown:
+            properties[key] = shown
+    return properties
 
 
 def _field_names(config: dict[str, Any], shape: str, names: _Names | None = None) -> list[str]:
@@ -3729,7 +3800,7 @@ _HOST_SETTINGS = frozenset(
 )
 
 
-def _configured_values(document: Any) -> list[str] | None:
+def _configured_values(document: Any, *, codex_references: bool = False) -> list[str] | None:
     """Values of a configuration document that a server name declared in source must not hold.
 
     Beyond what a server's parsing collects: a credential-named value in any field, as
@@ -3739,6 +3810,16 @@ def _configured_values(document: Any) -> list[str] | None:
     of which the inventory shows. The whole document is read, a server map that is not
     collected too. ``None`` past ``_KNOWN_VALUE_NODES`` nodes.
     """
+    # When checking forwarded names, a declaration of the name itself is public.
+    # Keep every other occurrence eligible as a value, including in sibling servers.
+    servers = (
+        document.get("mcp_servers") if codex_references and isinstance(document, dict) else None
+    )
+    declarations = (
+        {id(server) for server in servers.values() if isinstance(server, dict)}
+        if isinstance(servers, dict)
+        else set()
+    )
     values: list[str] = []
     pending: list[tuple[object, Any]] = [(None, document)]
     visited = 0
@@ -3748,6 +3829,10 @@ def _configured_values(document: Any) -> list[str] | None:
             return None
         key, node = pending.pop()
         if isinstance(node, dict):
+            if id(node) in declarations:
+                node = {
+                    key: value for key, value in node.items() if key not in _CODEX_FORWARDING_FIELDS
+                }
             values.extend(secret_values(node))
             if key in _VALUE_MAPS:
                 values.extend(
@@ -3972,6 +4057,24 @@ class MCPScanner(Scanner):
             collected.append((dialect, data, read, file_secrets, server_hits))
         # A name may repeat a literal or credential of any client file, so every file is read first.
         names = _Names(literals)
+        protected = KnownValues()
+        if any(
+            dialect.shape == "codex"
+            and any(
+                isinstance(entry, dict) and not _CODEX_FORWARDING_FIELDS.isdisjoint(entry)
+                for _, entry in read.servers
+            )
+            for dialect, _, read, _, _ in collected
+        ):
+            for dialect, data, _, scrubber, _hits in collected:
+                protected.add(scrubber.values)
+                configured = _configured_values(data, codex_references=dialect.shape == "codex")
+                if configured is None:
+                    protected.refuse()
+                    break
+                protected.add(configured)
+            if result.scan_failures or files.failures_recorded:
+                protected.refuse()
         for dialect, data, read, file_secrets, server_hits in collected:
             file_names = names.scoped(file_secrets.values)
             server_refs: list[str] = []
@@ -4001,6 +4104,7 @@ class MCPScanner(Scanner):
                         file_secrets,
                         server_hits.get(id(server_config)),
                         file_names,
+                        protected_references=protected,
                         launcher_unknown=read.unknown.get(server_name),
                         root=files.root,
                     )
@@ -4344,6 +4448,8 @@ class MCPScanner(Scanner):
                 continue
             if field in _STRING_FIELDS:
                 valid = isinstance(value, str)
+            elif field == "env_vars" and shape == "codex":
+                valid = isinstance(value, list) and all(_codex_env_entry(entry) for entry in value)
             elif field in _LIST_FIELDS:
                 valid = isinstance(value, list) and all(isinstance(item, str) for item in value)
             elif field in _MAP_FIELDS:
@@ -4370,6 +4476,8 @@ class MCPScanner(Scanner):
         """A type or size problem in a server entry; unknown fields are gaps, not failures."""
         if any(True for _ in cls._invalid_field_values(config, shape)):
             return "invalid server configuration"
+        if shape == "codex" and len(config.get("env_http_headers", ())) > MAX_HEADERS:
+            return f"MCP server header limit ({MAX_HEADERS}) exceeded"
         limits = (
             ("args", MAX_ARGUMENTS, "argument"),
             ("env", MAX_ENVIRONMENT, "environment variable"),
@@ -4416,6 +4524,7 @@ class MCPScanner(Scanner):
         credential_hits: PositionHits | None = None,
         names: _Names | None = None,
         *,
+        protected_references: KnownValues | None = None,
         launcher_unknown: str | None = None,
         root: Path | None = None,
     ) -> tuple[MCPServerComponent, list[ToolComponent]]:
@@ -4692,6 +4801,11 @@ class MCPScanner(Scanner):
                 "endpoint_credentials_omitted": bool(endpoint_url),
                 "declared_fields": fields,
                 **launcher_properties,
+                **(
+                    _codex_env_references(config, transport, names, protected_references)
+                    if dialect.shape == "codex" and protected_references is not None
+                    else {}
+                ),
                 "source_values_bound": key is not None,
                 "static_config_hash": source_config_hash,
                 "static_config_hash_profile": STATIC_CONFIG_HASH_PROFILE,

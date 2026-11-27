@@ -19,6 +19,15 @@ Every path is relative to the project root. Each collector also bounds what it r
 
 An optional [`agent.yaml` manifest](agent-manifest.md) at the project root names the agent and declares further instruction files and models.
 
+In a Codex `.codex/config.toml`, MCP servers can declare host environment-variable
+names through stdio `env_vars`, or through HTTP `bearer_token_env_var` and
+`env_http_headers`. The native server's `properties.env_vars_referenced` lists
+safe local names. Explicit remote stdio names for a remote MCP environment appear separately in
+`remote_env_vars_referenced`. A literal stdio environment override takes
+precedence. Remote HTTP configurations do not establish a local host credential. The collector reads the declarations without looking up the
+variables. `blast-radius` uses the local names to identify shared credential
+references. Runtime access and the equality of credential values remain unknown.
+
 ## MCP servers declared in source
 
 The collector treats a standard-library logger name such as

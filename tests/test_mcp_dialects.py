@@ -177,6 +177,133 @@ def test_codex_project_config_toml_is_inventoried(tmp_path):
     )
 
 
+def test_codex_environment_references_reach_blast_radius_without_reading_values(
+    tmp_path, monkeypatch
+):
+    from nexus_symbiote.core.aibom import AIBOM
+    from nexus_symbiote.graph import blast_radius
+
+    monkeypatch.setenv("SHARED_API_TOKEN", "unrelated-value-in-test-environment")
+    toml = """
+[mcp_servers.reader]
+command = "catalog"
+environment_id = "remote-catalog"
+env_vars = ["SHARED_API_TOKEN", {name = "SHARED_API_TOKEN", source = "local"},
+            {name = "ROOT_SERVICE_KEY", source = "remote"}, {name = "OVERRIDDEN_TOKEN"}]
+env = { OVERRIDDEN_TOKEN = "fixed-value" }
+[mcp_servers.search]
+url = "https://catalog.example.test"
+bearer_token_env_var = "SHARED_API_TOKEN"
+env_http_headers = { X-Auth = "SECONDARY_TOKEN", X-Backup = "SHARED_API_TOKEN" }
+"""
+    result = scan(tmp_path, {".codex/config.toml": toml})
+    assert not result.scan_failures
+    found = servers(result)
+    reader, search = found["reader"], found["search"]
+    assert reader.properties["env_vars_referenced"] == ["SHARED_API_TOKEN"]
+    assert reader.properties["remote_env_vars_referenced"] == ["ROOT_SERVICE_KEY"]
+    assert search.properties["env_vars_referenced"] == ["SECONDARY_TOKEN", "SHARED_API_TOKEN"]
+    bom = AIBOM(components=result.components)
+    shared = blast_radius(bom, search.bom_ref)["shared_credential_surfaces"]
+    assert shared == {"SHARED_API_TOKEN": sorted([reader.bom_ref, search.bom_ref])}
+    assert "unrelated-value-in-test-environment" not in bom.model_dump_json()
+
+
+def test_codex_only_emits_safe_names_in_interpreted_locations(tmp_path):
+    toml = """
+[mcp_servers.remote]
+url = "https://service.example.test"
+env_http_headers = { X-One = "NAME/IS/PATH", X-Two = "HIDDEN_SHARED_TOKEN", X-Three = "SAFE_API_KEY" }
+[mcp_servers.sibling]
+command = "catalog"
+env = { PRIVATE_TOKEN = "HIDDEN_SHARED_TOKEN" }
+[mcp_servers.invalid_stdio]
+command = "catalog"
+bearer_token_env_var = "WRONG_MODE_TOKEN"
+[mcp_servers.invalid_http]
+url = "https://service.example.test"
+env_vars = ["WRONG_MODE_TOKEN"]
+"""
+    other = {
+        "mcpServers": {
+            "foreign": {
+                "url": "https://other.example.test",
+                "bearer_token_env_var": "FOREIGN_TOKEN",
+            }
+        }
+    }
+    result = scan(tmp_path, {"nested/.codex/config.toml": toml, ".mcp.json": json.dumps(other)})
+    found = servers(result)
+    assert found["remote"].properties["env_vars_referenced"] == ["SAFE_API_KEY"]
+    for name in ("sibling", "foreign", "invalid_stdio", "invalid_http"):
+        assert "env_vars_referenced" not in found[name].properties
+    serialized = json.dumps([component.model_dump(mode="json") for component in result.components])
+    assert "HIDDEN_SHARED_TOKEN" not in serialized
+    assert "NAME/IS/PATH" not in serialized
+
+
+@pytest.mark.parametrize(
+    "entry", ["{name = 17}", '{name = "A", source = "other"}', '{name = "A", extra = true}']
+)
+def test_codex_rejects_uninterpretable_environment_entries(tmp_path, entry):
+    result = scan(
+        tmp_path,
+        {".codex/config.toml": f'[mcp_servers.s]\ncommand="catalog"\nenv_vars=[{entry}]\n'},
+    )
+    assert result.scan_failures == [".codex/config.toml: invalid server configuration"]
+    assert not servers(result)
+
+
+def test_codex_withholds_foreign_config_values_and_unresolved_environment_sources(tmp_path):
+    codex = """
+[mcp_servers.first]
+url = "https://service.example.test"
+env_http_headers = { X-Test = "SHARED_HIDDEN_NAME", X-Public = "PUBLIC_API_TOKEN" }
+[mcp_servers.remote_http]
+environment_id = "remote-catalog"
+url = "https://service.example.test"
+bearer_token_env_var = "REMOTE_TOKEN"
+[mcp_servers.local_stdio]
+command = "catalog"
+env_vars = ["LOCAL_TOKEN", { name = "FOREIGN_TOKEN", source = "remote" }]
+"""
+    other = {"servers": {"s": {"command": "catalog", "env": {"LABEL": "SHARED_HIDDEN_NAME"}}}}
+    result = scan(tmp_path, {"nested/.codex/config.toml": codex, ".mcp.json": json.dumps(other)})
+    found = servers(result)
+    assert found["first"].properties["env_vars_referenced"] == ["PUBLIC_API_TOKEN"]
+    for name in ["local_stdio", "remote_http"]:
+        assert "env_vars_referenced" not in found[name].properties
+        assert "remote_env_vars_referenced" not in found[name].properties
+    assert "SHARED_HIDDEN_NAME" not in json.dumps(
+        [c.model_dump(mode="json") for c in result.components]
+    )
+
+
+def test_codex_respects_forwarded_header_bounds_and_withholds_names_when_context_is_unreadable(
+    tmp_path,
+):
+    from nexus_symbiote.scanners.mcp import MAX_HEADERS
+
+    headers = ", ".join(f'H{i} = "TOKEN_{i}"' for i in range(MAX_HEADERS + 1))
+    result = scan(
+        tmp_path,
+        {
+            ".codex/config.toml": f'[mcp_servers.s]\nurl="https://a.example.test"\nenv_http_headers = {{ {headers} }}'
+        },
+    )
+    assert not servers(result)
+    assert any("header limit" in problem for problem in result.scan_failures)
+    result = scan(
+        tmp_path,
+        {
+            ".codex/config.toml": '[mcp_servers.s]\nurl="https://a.example.test"\nbearer_token_env_var="SERVICE_TOKEN"\n',
+            ".mcp.json": "{",
+        },
+    )
+    assert result.scan_failures
+    assert "env_vars_referenced" not in servers(result)["s"].properties
+
+
 def test_invalid_codex_toml_is_a_failure(tmp_path):
     result = scan(tmp_path, {".codex/config.toml": "[mcp_servers.docs\ncommand = 1"})
     assert result.scan_failures == [".codex/config.toml: invalid TOML"]
