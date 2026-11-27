@@ -4,6 +4,10 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Security
+
+- Instruction and tool text that tells a shell fetcher (`curl`, `wget`, `nc`) or a command substitution to read a credential path (`~/.ssh`, `id_rsa`, `.netrc`, and the other paths `TP-CRED-002` already names) is now that same finding. A prohibition still suppresses it, and a sentence that only mentions the command and the path does not match. Matched text stays withheld. Text-poisoning pack `1.1.0`.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

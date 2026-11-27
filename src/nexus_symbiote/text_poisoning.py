@@ -46,7 +46,7 @@ from nexus_symbiote.utils.markdown import front_matter_candidates
 from nexus_symbiote.utils.terminal import neutralize
 from nexus_symbiote.utils.toml import loads as toml_loads
 
-RULE_PACK_VERSION = "1.0.0"
+RULE_PACK_VERSION = "1.1.0"
 
 CATEGORY_TOOL_POISONING = "tool_description_poisoning"
 CATEGORY_INSTRUCTION_INJECTION = "instruction_injection"
@@ -277,6 +277,24 @@ _EXFIL_URL_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+# A shell fetcher and a credential path on one line. The path has to be its own
+# token (a URL, a substitution, or a path argument). Prose that merely mentions
+# both ("curl is documented, and ~/.ssh/id_rsa is a key file") has plain words
+# between them and is not a command.
+_SHELL_FETCH_RE = re.compile(r"(?<![\w-])(?:curl|wget|nc)(?![\w-])", re.IGNORECASE)
+_SHELL_READ_RE = re.compile(
+    r"(?<![\w-])(?:cat|base64|xxd|od|dd|head|tail|cut)(?![\w-])", re.IGNORECASE
+)
+_SHELL_TOKEN_RE = re.compile(r"\S+")
+_PLAIN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+_SHELL_LINE_LIMIT = 400
+_SHELL_PLAIN_WORDS = 1
+# Command substitution that reads a credential path, with or without a fetcher.
+_CRED_SUBSTITUTION_RE = re.compile(
+    r"(?i)(?:\$\(|`)[^`\n()]{0,80}?"
+    r"(?<![\w-])(?:cat|base64|xxd|od|dd|head|tail|cut)(?![\w-])"
+    r"[^`\n()]{0,120}?" + _CRED_PATH_RE.pattern + r"[^`\n()]{0,40}?(?:\)|`)"
+)
 
 _OVERRIDE_RE = re.compile(
     rf"\b{_NOT_NEGATED}(?:"
@@ -497,6 +515,72 @@ def _directive_tag_hits(normalized: str) -> Iterator[int]:
             chain, chain_end = (opened.start(), start), end
 
 
+def _verb_is_negated(text: str, verb_start: int) -> bool:
+    """Whether a prohibition ends at ``verb_start``, as the credential-path rule reads it.
+
+    A substitution opener (``$(`` or a backtick) sitting on the verb is not a word, so
+    the prohibition is read at the opener: ``must not $(cat`` is still a prohibition.
+    """
+    end = verb_start
+    if text[max(0, verb_start - 2) : verb_start] == "$(":
+        end = verb_start - 2
+    elif verb_start > 0 and text[verb_start - 1] == "`":
+        end = verb_start - 1
+    start = max(0, end - 80)
+    if _VERB_NEGATED_RE.search(text, start, end) is not None:
+        return True
+    return _has_negated_prefix(text, end)
+
+
+def _plain_words(text: str) -> int:
+    """Tokens that are only letters: the prose between a fetcher and a path."""
+    return sum(1 for token in _SHELL_TOKEN_RE.findall(text) if _PLAIN_WORD_RE.fullmatch(token))
+
+
+def _remember_path(reported: set[int], path: re.Match[str], *, absolute: int) -> None:
+    if path.group().lower().endswith(".pub") or absolute in reported:
+        return
+    reported.add(absolute)
+
+
+def _shell_exfil_offsets(normalized: str) -> Iterator[int]:
+    """Offsets of a credential path read by command substitution or a shell fetcher.
+
+    ``curl`` / ``wget`` / ``nc`` count only when a credential-path token follows on the
+    same line with at most one plain word between them, so a sentence that mentions
+    the command and the path separately does not. A substitution counts on its own
+    when its body reads the path. A ``.pub`` path stays public. Each path is reported
+    once. The line and the substitution are bounded, so the scan stays linear.
+    """
+    reported: set[int] = set()
+    for match in _CRED_SUBSTITUTION_RE.finditer(normalized):
+        verb = _SHELL_READ_RE.search(normalized, match.start(), match.end())
+        path = _CRED_PATH_RE.search(normalized, match.start(), match.end())
+        if verb is None or path is None or _verb_is_negated(normalized, verb.start()):
+            continue
+        line_start = normalized.rfind("\n", 0, match.start()) + 1
+        fetch = _SHELL_FETCH_RE.search(normalized, line_start, match.start())
+        if fetch is not None and _verb_is_negated(normalized, fetch.start()):
+            continue
+        _remember_path(reported, path, absolute=path.start())
+    for fetch in _SHELL_FETCH_RE.finditer(normalized):
+        if _verb_is_negated(normalized, fetch.start()):
+            continue
+        line_end = normalized.find("\n", fetch.end())
+        if line_end == -1:
+            line_end = len(normalized)
+        line_end = min(line_end, fetch.start() + _SHELL_LINE_LIMIT)
+        for token in _SHELL_TOKEN_RE.finditer(normalized, fetch.end(), line_end):
+            path = _CRED_PATH_RE.search(token.group())
+            if path is None:
+                continue
+            if _plain_words(normalized[fetch.end() : token.start()]) > _SHELL_PLAIN_WORDS:
+                continue
+            _remember_path(reported, path, absolute=token.start() + path.start())
+            break
+    yield from sorted(reported)
+
+
 def scan_text_block(
     text: str,
     *,
@@ -577,6 +661,9 @@ def scan_text_block(
     for exfil_match in _EXFIL_URL_RE.finditer(normalized):
         if not _has_negated_prefix(normalized, exfil_match.start()):
             record("TP-CRED-002", base_category, exfil_match.start())
+
+    for at in _shell_exfil_offsets(normalized):
+        record("TP-CRED-002", base_category, at)
 
     # 4. TP-CONCEAL-003: Concealment instructions ("never tell the user", "do not mention this to the user")
     for conceal_match in _CONCEAL_RE.finditer(normalized):
