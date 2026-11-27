@@ -303,8 +303,8 @@ _SHELL_READERS = frozenset(
     {"cat", "base64", "xxd", "gzip", "openssl", "od", "dd", "head", "tail", "cut"}
 )
 _SHELL_TOKEN_RE = re.compile(r"\S+")
-_PLAIN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
-_SHELL_PLAIN_WORDS = 1
+_SHELL_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)=(.+)", re.DOTALL)
+_SHELL_VARIABLE = re.compile(r"\$([A-Za-z_][A-Za-z_0-9]*)|\$\{([A-Za-z_][A-Za-z_0-9]*)\}")
 # A prohibition lowers a shell finding only when it is the words immediately before
 # the command. One of these verbs may sit between them: "never run cat".
 _PROHIBITION_FILLERS = frozenset({"run", "execute", "type", "use", "call", "invoke", "pipe"})
@@ -653,8 +653,10 @@ def _next_starts_continued(text: str, index: int) -> bool:
 def _next_is_lone_path(text: str, index: int) -> bool:
     if index >= len(text):
         return False
-    line_end = text.find("\n", index)
+    line_end = text.find("\n", index, index + _SHELL_WINDOW_CHARS + 1)
     if line_end < 0:
+        if len(text) - index > _SHELL_WINDOW_CHARS:
+            return False
         line_end = len(text)
     tokens = _SHELL_TOKEN_RE.findall(text[index:line_end])
     return len(tokens) == 1 and _credential_path(tokens[0]) is not None
@@ -678,13 +680,17 @@ def _logical_windows(text: str) -> Iterator[tuple[int, int, bool]]:
     index = 0
     while index < length:
         start = index
-        end = text.find("\n", index)
+        end = text.find("\n", index, start + _SHELL_WINDOW_CHARS + 1)
         if end < 0:
-            end = length
+            end = min(length, start + _SHELL_WINDOW_CHARS)
+            if end < length:
+                yield start, end, True
+                index = end
+                continue
         lines = 1
         truncated = False
         while end < length:
-            line_start = text.rfind("\n", start, end) + 1
+            line_start = max(start, text.rfind("\n", start, end) + 1)
             lone_path = _window_has_verb(text, start, end) and _next_is_lone_path(text, end + 1)
             if not (
                 _line_ends_continued(text, line_start, end)
@@ -692,7 +698,7 @@ def _logical_windows(text: str) -> Iterator[tuple[int, int, bool]]:
                 or lone_path
             ):
                 break
-            nxt = text.find("\n", end + 1)
+            nxt = text.find("\n", end + 1, start + _SHELL_WINDOW_CHARS + 1)
             if nxt < 0:
                 nxt = length
             if lines >= _SHELL_WINDOW_LINES or nxt - start > _SHELL_WINDOW_CHARS:
@@ -704,7 +710,7 @@ def _logical_windows(text: str) -> Iterator[tuple[int, int, bool]]:
         index = end + 1 if end < length else length
 
 
-def _shell_stages(text: str, start: int, end: int) -> list[list[tuple[int, str]]]:
+def _shell_stages(text: str, start: int, end: int) -> list[tuple[str, list[tuple[int, str]]]]:
     """Stages of one command, split on ``|``, ``||``, ``&&`` and ``;``.
 
     Single and double quotes are removed, backslashes outside single quotes are
@@ -714,7 +720,7 @@ def _shell_stages(text: str, start: int, end: int) -> list[list[tuple[int, str]]
     list. An unbalanced quote does not swallow the rest. A backslash-newline
     is whitespace. The walk is one pass.
     """
-    stages: list[list[tuple[int, str]]] = [[]]
+    stages: list[tuple[str, list[tuple[int, str]]]] = [("", [])]
     index = start
     word_at: int | None = None
     parts: list[str] = []
@@ -722,7 +728,7 @@ def _shell_stages(text: str, start: int, end: int) -> list[list[tuple[int, str]]
     def flush() -> None:
         nonlocal word_at
         if parts:
-            stages[-1].append((word_at if word_at is not None else index, "".join(parts)))
+            stages[-1][1].append((word_at if word_at is not None else index, "".join(parts)))
             parts.clear()
             word_at = None
 
@@ -758,8 +764,9 @@ def _shell_stages(text: str, start: int, end: int) -> list[list[tuple[int, str]]
             continue
         if text.startswith(("&&", "||"), index) or char in "|;":
             flush()
-            stages.append([])
-            index += 2 if text.startswith(("&&", "||"), index) else 1
+            separator = text[index : index + 2] if text.startswith(("&&", "||"), index) else char
+            stages.append((separator, []))
+            index += len(separator)
             continue
         if char.isspace():
             flush()
@@ -780,87 +787,88 @@ def _shell_stages(text: str, start: int, end: int) -> list[list[tuple[int, str]]
     return stages
 
 
-def _plain_between(tokens: list[tuple[int, str]], left: int, right: int) -> int:
-    lo, hi = sorted((left, right))
-    return sum(1 for index in range(lo + 1, hi) if _PLAIN_WORD_RE.fullmatch(tokens[index][1]))
-
-
-def _stage_reads(tokens: list[tuple[int, str]]) -> int | None:
-    """Offset of a credential path this stage reads, or None.
-
-    The reader and the path have to be near each other, so ``cat the manual and
-    mention ~/.ssh/id_rsa`` is prose. A redirect or an ``@path`` argument is a read
-    on its own.
-    """
-    readers = [i for i, (_, token) in enumerate(tokens) if _shell_word(token) in _SHELL_READERS]
-    paths: list[tuple[int, int, str]] = []
-    for index, (pos, token) in enumerate(tokens):
-        found = _credential_path(token)
-        if found is not None:
-            paths.append((index, pos + found.start(), token))
-    for index, absolute, token in paths:
-        previous = tokens[index - 1][1] if index else ""
-        if token.startswith(("@", "<")) or previous == "<":
-            return absolute
-        if any(_plain_between(tokens, reader, index) <= _SHELL_PLAIN_WORDS for reader in readers):
-            return absolute
-    return None
-
-
-def _stage_sink(tokens: list[tuple[int, str]]) -> bool:
-    return any(_is_network_sink(token) for _, token in tokens)
-
-
-def _sink_near_path(tokens: list[tuple[int, str]]) -> int | None:
-    """A sink and a credential-path token with at most one plain word between them."""
-    sinks = [i for i, (_, token) in enumerate(tokens) if _is_network_sink(token)]
-    paths = [
-        (i, pos + found.start())
-        for i, (pos, token) in enumerate(tokens)
-        if (found := _credential_path(token)) is not None
-    ]
-    for sink in sinks:
-        for path_index, absolute in paths:
-            if _plain_between(tokens, sink, path_index) <= _SHELL_PLAIN_WORDS:
-                return absolute
-    return None
-
-
-def _stage_path(tokens: list[tuple[int, str]]) -> int | None:
-    """Offset of a credential path named in this stage, whatever command names it."""
-    for pos, token in tokens:
-        if _credential_path(token) is not None:
-            return pos
-    return None
-
-
 def _pipeline_offset(text: str, start: int, end: int) -> int | None:
-    """A pipeline or list where one stage names a credential path and one is a sink.
-
-    A path and a sink in the same stage still have to sit near each other, so a
-    sentence that mentions both is not a command. A path in one stage and a sink
-    in another is a reader no matter which program names the path.
-    """
-    stages = _shell_stages(text, start, end)
-    paths = [_stage_path(stage) for stage in stages]
-    sinks = [_stage_sink(stage) for stage in stages]
-    for index, path_at in enumerate(paths):
-        if path_at is None:
-            continue
-        for other, is_sink in enumerate(sinks):
-            if not is_sink:
+    """A path connected to a network command by a pipe, input argument or redirect."""
+    assignments: dict[str, int] = {}
+    pipe_path: int | None = None
+    pipe_sink = False
+    for separator, stage in _shell_stages(text, start, end):
+        if separator != "|":
+            pipe_path, pipe_sink = None, False
+        stage_path: int | None = None
+        sink = ""
+        sink_index = -1
+        copy_command = False
+        copy_source: int | None = None
+        for index, (pos, token) in enumerate(stage):
+            value = _shell_spell(token)
+            word = _command_word(value)
+            binding = _SHELL_ASSIGNMENT.fullmatch(value) if index == 0 else None
+            if binding:
+                if _credential_path(binding[2]):
+                    assignments[binding[1]] = pos
+                else:
+                    assignments.pop(binding[1], None)
                 continue
-            if index != other:
-                return path_at
-            near = _sink_near_path(stages[index])
-            if near is not None:
-                return near
+            previous = _shell_spell(stage[index - 1][1]) if index else ""
+            if word in _SHELL_SINKS:
+                sink, sink_index = word, index
+                copy_command = word in {"scp", "rsync", "sftp"} and (
+                    index == 0
+                    or text[pos - 1 : pos] == "`"
+                    or previous.lower()
+                    in _PROHIBITION_FILLERS | {"$", "never", "not", "avoid", "don't"}
+                )
+                continue
+            if value.startswith(("/dev/tcp/", "/dev/udp/", ">/dev/tcp/", ">/dev/udp/")):
+                if stage_path is not None and (previous == ">" or value.startswith(">")):
+                    return stage_path
+            at = pos if _credential_path(token) is not None else None
+            if at is None and assignments:
+                at = next(
+                    (
+                        assignments[name]
+                        for ref in _SHELL_VARIABLE.finditer(value)
+                        if (name := ref[1] or ref[2]) in assignments
+                    ),
+                    None,
+                )
+            if at is None:
+                if copy_source is not None and ":" in value:
+                    return copy_source
+                continue
+            if stage_path is None:
+                stage_path = at
+            if not sink:
+                continue
+            if (
+                value.startswith(("@", "<", "--post-file=", "--upload-file="))
+                or "=@" in value
+                or previous in {"<", "-T", "--upload-file", "--post-file"}
+            ):
+                return at
+            if index == sink_index + 1 and sink in {"curl", "wget"}:
+                return at
+            if (
+                copy_command
+                and not value.startswith("-")
+                and previous not in {"-i", "-F", "-e", "-o"}
+            ):
+                copy_source = at
+        if (pipe_sink and stage_path is not None) or (sink and pipe_path is not None):
+            return stage_path if stage_path is not None else pipe_path
+        if stage_path is not None:
+            pipe_path = stage_path
+        pipe_sink = pipe_sink or bool(sink)
     return None
 
 
 def _substitution_offsets(text: str, start: int, end: int) -> Iterator[int]:
     """Command substitutions in ``text[start:end]``. An unclosed body past the cap is a hit."""
+    if text.find("$(", start, end) == -1 and text.find("`", start, end) == -1:
+        return
     index = start
+    has_verb = _window_has_verb(text, start, end)
     while index < end:
         if text[index] == "`":
             run = index + 1
@@ -905,7 +913,7 @@ def _substitution_offsets(text: str, start: int, end: int) -> Iterator[int]:
         # a known reader verb still counts when the substitution is the whole command.
         # A prohibition does not drop the hit; the caller may only lower it.
         if path_at is not None and (
-            _window_has_verb(text, start, end)
+            has_verb
             or any(
                 _shell_word(token.group()) in _SHELL_READERS
                 for token in _SHELL_TOKEN_RE.finditer(fragment)
@@ -916,9 +924,24 @@ def _substitution_offsets(text: str, start: int, end: int) -> Iterator[int]:
 
 
 def _window_interesting(text: str, start: int, end: int) -> bool:
-    if "$(" in text[start:end] or _CRED_PATH_RE.search(text[start:end]) is not None:
+    """Only an unfinished shell expression can turn a parser limit into a finding."""
+    window = text[start:end]
+    if "$(" in window:
         return True
-    return _window_has_verb(text, start, end)
+    if end < len(text) and text[end] != "\n":
+        # The first physical line also has a size cap. A long paragraph can name
+        # SSH and its manuals many times without starting a command.
+        if "|" in window or "<" in window or ">" in window or "\\\n" in window:
+            return _window_has_verb(text, start, end) or _CRED_PATH_RE.search(window) is not None
+        if start and text[start - 1] != "\n":
+            return False
+        lead = window.split(maxsplit=2)
+        return (
+            len(lead) > 1
+            and (_is_network_sink(lead[0]) or _shell_word(lead[0]) in _SHELL_READERS)
+            and (lead[1].startswith(("-", "@", "/", "$", "~")) or "://" in lead[1])
+        )
+    return _CRED_PATH_RE.search(window) is not None or _window_has_verb(text, start, end)
 
 
 _MAX_SUBST_DEPTH = 32
@@ -978,7 +1001,7 @@ def _exfil_command_start(text: str, start: int, end: int) -> int | None:
     front of it, so a negation is judged only on that prefix.
     """
     anchors: list[int] = []
-    for stage in _shell_stages(text, start, end):
+    for _, stage in _shell_stages(text, start, end):
         for index, (pos, token) in enumerate(stage):
             if _is_network_sink(token) or _shell_word(token) in _SHELL_READERS:
                 anchors.append(pos)
@@ -1039,7 +1062,6 @@ def _shell_exfil_offsets(normalized: str) -> Iterator[tuple[int, bool]]:
     command, and a ``Never curl`` with no credential path, stay quiet because they
     are not commands. A ``.pub`` path stays public. The walk is one pass.
     """
-    reported: dict[int, bool] = {}
     for start, end, truncated in _logical_windows(normalized):
         found = _pipeline_offset(normalized, start, end)
         subs = list(_substitution_offsets(normalized, start, end))
@@ -1048,13 +1070,17 @@ def _shell_exfil_offsets(normalized: str) -> Iterator[tuple[int, bool]]:
             continue
         # Only a window that already hit pays for the prohibition check.
         prohibited = _command_is_prohibited(normalized, start, end)
+        offsets = set(subs)
         if found is not None:
-            reported[found] = prohibited
-        for sub in subs:
-            reported[sub] = prohibited
+            offsets.add(found)
         if truncated_hit:
-            reported[start] = prohibited
-    yield from ((offset, reported[offset]) for offset in sorted(reported))
+            offsets.add(start)
+        for offset in sorted(offsets):
+            # The prose relay reports the raw path. Use that same offset when
+            # this shell token contains it, even if home and quotes were expanded.
+            token = _SHELL_TOKEN_RE.match(normalized, offset, end)
+            path = _CRED_PATH_RE.search(normalized, offset, token.end()) if token else None
+            yield path.start() if path else offset, prohibited
 
 
 def scan_text_block(
@@ -1148,7 +1174,14 @@ def scan_text_block(
         if not _has_negated_prefix(normalized, exfil_match.start()):
             record("TP-CRED-002", base_category, exfil_match.start())
 
+    credential_locations = {hit.byte_offset for hit in hits if hit.rule_id == "TP-CRED-002"}
     for at, prohibited in _shell_exfil_offsets(normalized):
+        if len(hits) >= max_hits:
+            break
+        location = _byte_offset_at(byte_offsets, at)
+        if location in credential_locations:
+            continue
+        credential_locations.add(location)
         # A governing prohibition lowers the finding. It never removes it.
         record(
             "TP-CRED-002",
