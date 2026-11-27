@@ -106,6 +106,7 @@ _SQL_WORD = re.compile(r"[\w$]+")
 _SQL_ARGUMENTS = frozenset({"statement", "query", "sql", "operation"})
 _SQL_DOLLAR = re.compile(r"\$(?:[^\W\d]\w*)?\$")
 _SQL_RANK = {None: 0, "write": 1, "destructive": 2}
+_QUOTES = re.compile("['\"]")
 # A literal or quoted name, by its opening character and whether a backslash escapes: a
 # doubled closing character stays inside, and an unterminated one runs to the end.
 _SQL_QUOTED = {
@@ -419,13 +420,14 @@ class PythonScopes:
         self.observed: dict[ast.AST, _Observed | None] = {}
         # Each name's bindings with the values they bind, under the scope that owns the name.
         self.bindings: dict[_Key, list[_Binding]] = {}
-        self._statements: dict[ast.AST | None, tuple[int, list[_Key]]] = {}
+        self._statements: dict[ast.AST | None, tuple[int, list[tuple[_Key, bool]]]] = {}
         # A function, and each parameter of it that may be caller input, to the function's bit;
         # what each name and binding may hold, solved once for every tool in the file.
         self.function_bits: dict[ast.AST, int] = {}
         self._parameter_bits: dict[ast.AST, int] = {}
         self._summaries: dict[_Key, _Held] = {}
         self._contributions: dict[_Binding, _Held] = {}
+        self._first: set[ast.AST] = set()  # Generators whose iterable the enclosing scope reads.
         if tree is not None:
             self._fill(tree, self.module)
 
@@ -504,6 +506,8 @@ class PythonScopes:
                 self._bind(scope, node.name, ())
             kind = _SCOPE_KINDS.get(type(node), "function")
             inner = self._scopes[node] = _Scope(kind, scope)
+            if isinstance(node, _PY_COMPREHENSIONS):
+                self._first.add(node.generators[0])
             if isinstance(node, _PY_FUNCTIONS):
                 a = node.args
                 bit = self.function_bits[node] = 1 << len(self.function_bits)
@@ -537,7 +541,9 @@ class PythonScopes:
             value = node if isinstance(node, ast.AugAssign) else node.value
             self._assign(scope, node.target, value, where=node, statement=node)
         elif isinstance(node, ast.For | ast.AsyncFor | ast.comprehension):
-            self._assign(scope, node.target, node)
+            # A comprehension's first iterable is evaluated in the scope around it.
+            outside = node in self._first and scope.parent is not None
+            self._assign(scope, node.target, node, scope.parent if outside else None)
         elif isinstance(node, ast.NamedExpr):
             # ``:=`` in a comprehension binds in the function or module around it.
             owner = scope
@@ -643,8 +649,9 @@ class PythonScopes:
         if binding not in self._contributions:
             rank, keys = self.statement(binding[2], binding[3])
             held = self._parameter_bits.get(binding[0], 0), rank
-            for key in keys:
-                held = _hold(held, self.summary(key))
+            for key, ranked in keys:
+                value = self.summary(key)
+                held = _hold(held, value if ranked else (value[0], 0))
             self._contributions[binding] = held
         return self._contributions[binding]
 
@@ -658,7 +665,7 @@ class PythonScopes:
         low: dict[_Key, int] = {}
         place: dict[_Key, int] = {}  # Where a name sits on ``group``.
         held: dict[_Key, _Held] = {}
-        refs: dict[_Key, list[_Key]] = {}
+        refs: dict[_Key, list[tuple[_Key, bool]]] = {}
         group: list[_Key] = []
         frames = [(key, 0)]
         while frames:
@@ -675,9 +682,10 @@ class PythonScopes:
                 held[current], refs[current] = value, found
             if at < len(refs[current]):
                 frames[-1] = (current, at + 1)
-                ref = refs[current][at]
+                ref, ranked = refs[current][at]
                 if ref in self._summaries:
-                    held[current] = _hold(held[current], self._summaries[ref])
+                    value = self._summaries[ref]
+                    held[current] = _hold(held[current], value if ranked else (value[0], 0))
                 elif ref not in order:
                     frames.append((ref, 0))
                 else:  # Visited and not solved: part of the group being solved.
@@ -692,61 +700,84 @@ class PythonScopes:
                 self._summaries.update(dict.fromkeys(group[start:], value))
                 del group[start:]
             if frames:
-                parent = frames[-1][0]
+                parent, reached = frames[-1]
                 if current in self._summaries:
-                    held[parent] = _hold(held[parent], self._summaries[current])
+                    value = self._summaries[current]
+                    ranked = refs[parent][reached - 1][1]
+                    held[parent] = _hold(held[parent], value if ranked else (value[0], 0))
                 else:
                     low[parent] = min(low[parent], low[current])
         return self._summaries[key]
 
-    def statement(self, node: ast.AST | None, scope: _Scope) -> tuple[int, list[_Key]]:
+    def statement(self, node: ast.AST | None, scope: _Scope) -> tuple[int, list[tuple[_Key, bool]]]:
         """The rank of the SQL text ``node`` may evaluate to, with each alternative read on
-        its own and any other part as ``?``, and the names that text is taken from."""
+        its own and any other part as ``?``, and the names that text is taken from, each with
+        whether its own text counts: a name inside a quoted literal of the text is data. A
+        comprehension's item is read in the comprehension."""
         if node in self._statements:
             return self._statements[node]
-        names: set[str] = set()
+        names: dict[tuple[str, _Scope], bool] = {}
         runs: list[list[str]] = [[]]
-        pending: list[ast.AST | None] = [node]
+        quote = ""  # The quote the text so far leaves open.
+        pending: list[tuple[ast.AST | None, _Scope] | None] = [(node, scope)]
         while pending:
-            part = pending.pop()
-            if part is None:
+            entry = pending.pop()
+            if entry is None:
                 runs.append([])
-            elif isinstance(part, ast.Constant):
-                runs[-1].append(part.value if isinstance(part.value, str) else "?")
+                quote = ""
+                continue
+            part, where = entry
+            if isinstance(part, ast.Constant):
+                text = part.value if isinstance(part.value, str) else "?"
+                runs[-1].append(text)
+                for found in _QUOTES.finditer(text):
+                    quote = "" if quote == found.group() else quote or found.group()
             elif isinstance(part, ast.Name | ast.FormattedValue):
-                names.update(_names_in(part))
+                for name in _names_in(part):
+                    names[name, where] = names.get((name, where), False) or not quote
                 runs[-1].append("?")
             elif isinstance(part, ast.JoinedStr):
-                pending.extend(reversed(part.values))
+                pending.extend((value, where) for value in reversed(part.values))
             elif isinstance(part, ast.BinOp) and isinstance(part.op, ast.Add):
-                pending += [part.right, part.left]
+                pending += [(part.right, where), (part.left, where)]
             elif isinstance(part, ast.BinOp) and isinstance(part.op, ast.Mod):
-                names.update(_names_in(part.right))
-                pending.append(part.left)
+                for name in _names_in(part.right):
+                    names[name, where] = True
+                pending.append((part.left, where))
             elif isinstance(
                 part, ast.Attribute | ast.Subscript | ast.Starred | ast.Await | ast.NamedExpr
             ):
-                pending.append(part.value)
-            elif isinstance(part, ast.Call) and (text := self._wrapped(part, scope)) is not None:
-                pending.append(text)
+                pending.append((part.value, where))
+            elif isinstance(part, ast.Call) and (wrapped := self._wrapped(part, where)):
+                pending.append((wrapped, where))
             elif isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute):
                 # A method of the statement, such as ``.strip()`` or ``.bindparams(...)``;
                 # ``.format()`` and ``.join()`` also take their arguments into the text.
                 if part.func.attr in {"format", "join"}:
-                    names.update(*map(_names_in, (*part.args, *part.keywords)))
-                pending.append(part.func.value)
+                    for argument in (*part.args, *part.keywords):
+                        for name in _names_in(argument):
+                            names[name, where] = True
+                pending.append((part.func.value, where))
             elif isinstance(part, ast.AugAssign):
-                pending += [part.value, part.target]
+                pending += [(part.value, where), (part.target, where)]
             elif isinstance(part, ast.For | ast.AsyncFor | ast.comprehension):
-                pending.append(part.iter)
-            elif (items := _alternatives(part)) is not None:
+                pending.append((part.iter, where))
+            elif isinstance(part, _PY_COMPREHENSIONS):
+                inner = self._scopes.get(part, where)
+                item = part.value if isinstance(part, ast.DictComp) else part.elt
+                pending += [None, (item, inner), None]
+            elif part is not None and (items := _alternatives(part)) is not None:
                 pending.append(None)
                 for item in reversed(items):
-                    pending += [item, None]
+                    pending += [(item, where), None]
             else:
                 runs[-1].append("?")
         rank = max(_SQL_RANK[_sql_effect("".join(run))] for run in runs)
-        keys = [(owner, name) for name in names for owner in self.lookup(scope, name)[0]]
+        keys = [
+            ((owner, name), ranked)
+            for (name, where), ranked in names.items()
+            for owner in self.lookup(where, name)[0]
+        ]
         self._statements[node] = rank, keys
         return rank, keys
 
@@ -762,15 +793,13 @@ class PythonScopes:
 
 def _alternatives(node: ast.AST) -> list[ast.expr] | None:
     """The values a statement may be one of: either side of a conditional or ``or``, or an
-    item of the literal or comprehension it is taken from; None for anything else."""
+    item of the literal it is taken from; None for anything else."""
     if isinstance(node, ast.IfExp):
         return [node.body, node.orelse]
     if isinstance(node, ast.BoolOp | ast.Dict):
         return node.values
     if isinstance(node, ast.List | ast.Tuple | ast.Set):
         return node.elts
-    if isinstance(node, ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp):
-        return [node.value if isinstance(node, ast.DictComp) else node.elt]
     return None
 
 
@@ -865,16 +894,21 @@ class _PythonBody:
         self.arguments = {p for p in every if p is not None and p.arg not in {"self", "cls"}}
         self.bit = scopes.function_bits.get(function, 0)
         self._placed: dict[_Key, _Placed] = {}
+        self._made: dict[_Binding, _Value] = {}
+        self._making: set[_Binding] = set()
 
     def evaluate(self, node: ast.AST | None, scope: _Scope) -> _Value:
         """What the statement ``node`` may be where the current node runs."""
+        return self._read(node, scope, self.at)
+
+    def _read(self, node: ast.AST | None, scope: _Scope, at: int) -> _Value:
         rank, keys = self.scopes.statement(node, scope)
         value: _Value = (False, rank)
-        for key in keys:
-            if self.frame_of.get(key[0]) == self.frames[self.at]:
-                value = _join(value, self.reaching(key))
-            else:
-                value = _join(value, self.summary(key))
+        for key, ranked in keys:
+            # A comprehension binds its targets before each item it makes, so they are read whole.
+            same = key[0].kind != "comprehension" and self.frame_of.get(key[0]) == self.frames[at]
+            found = self.reaching(key) if same else self.summary(key)
+            value = _join(value, found if ranked else (found[0], 0))
         return value
 
     def reaching(self, key: _Key) -> _Value:
@@ -921,9 +955,24 @@ class _PythonBody:
         return self._placed[key]
 
     def contribution(self, binding: _Binding) -> _Value:
-        """What one binding may give its name, for this tool's parameters."""
-        held, rank = self.scopes.contribution(binding)
-        return bool(held & self.bit), rank
+        """What one binding may give its name, for this tool's parameters. One made in this
+        body reads the names it is built from where it is made, as a call reads its
+        statement; one made elsewhere, or past ``_MAX_TARGETS`` bindings being read inside
+        each other, reads every binding of them."""
+        made = self.position.get(binding[0], -1)
+        if made < 0 or binding in self._making or len(self._making) >= _MAX_TARGETS:
+            held, rank = self.scopes.contribution(binding)
+            return bool(held & self.bit), rank
+        if binding not in self._made:
+            self._making.add(binding)
+            at, self.at = self.at, made
+            try:
+                supplied, rank = self._read(binding[2], binding[3], made)
+                self._made[binding] = supplied or binding[0] in self.arguments, rank
+            finally:
+                self.at = at
+                self._making.discard(binding)
+        return self._made[binding]
 
     def summary(self, key: _Key) -> _Value:
         """What ``key`` may hold anywhere, for this tool's parameters."""

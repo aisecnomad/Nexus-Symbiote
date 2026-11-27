@@ -2547,3 +2547,113 @@ def test_typescript_prepared_statements_and_package_entries(
     tool = _ts(tmp_path, handler, header)
     assert _caps(tool) == expected, handler
     assert any("caller-supplied" in r.detail for r in tool.risks) is raw, handler
+
+
+@pytest.mark.parametrize(
+    ("source", "profile", "raw"),
+    [
+        (
+            "def tool(conn, statements):\n    cleaned = [s.strip() for s in statements]\n"
+            "    for sql in cleaned:\n        conn.execute(sql)\n",
+            "destructive",
+            True,
+        ),
+        (
+            "def tool(conn, columns):\n    cols = [c.strip() for c in columns.split(',')]\n"
+            "    return conn.execute(f\"SELECT {', '.join(cols)} FROM items\")\n",
+            "destructive",
+            True,
+        ),
+        (
+            "SAFE = ('SELECT 1', 'SELECT 2')\ndef tool(conn, name):\n"
+            "    for sql in [name for name in SAFE]:\n        conn.execute(sql)\n",
+            "unknown",
+            False,
+        ),
+        (
+            "def tool(cur):\n    sql = 'DROP TABLE t'\n"
+            "    stmts = [sql for sql in ('SELECT 1', 'SELECT 2')]\n"
+            "    for s in stmts:\n        cur.execute(s)\n",
+            "unknown",
+            False,
+        ),
+        ("def tool(conn, q):\n    [conn.execute(q) for q in q.split(';')]\n", "destructive", True),
+        (
+            "def tool(conn, q):\n    list(conn.execute(q) for q in q.split(';'))\n",
+            "destructive",
+            True,
+        ),
+        (
+            "def tool(cur):\n    class Q:\n        stmts = ['DROP TABLE a']\n"
+            "        done = [cur.execute(s) for s in stmts]\n",
+            "destructive",
+            False,
+        ),
+        (
+            "def tool(conn):\n    rounding = 'truncate'\n"
+            "    return conn.execute(f\"SELECT * FROM t WHERE rounding = '{rounding}'\")\n",
+            "unknown",
+            False,
+        ),
+        (
+            "ACTION = 'grant'\ndef tool(conn, who):\n"
+            "    return conn.execute(f\"SELECT * FROM audit WHERE action = '{ACTION}'\")\n",
+            "unknown",
+            False,
+        ),
+        (
+            "ACTION = 'DELETE FROM t'\ndef tool(conn):\n"
+            "    return conn.execute(f'{ACTION} WHERE id = 1')\n",
+            "destructive",
+            False,
+        ),
+        (
+            "def tool(conn, name):\n    return conn.execute(f\"SELECT * FROM t WHERE n = '{name}'\")\n",
+            "destructive",
+            True,
+        ),
+        (
+            "ORDER = {'name': 'name', 'age': 'age'}\ndef tool(conn, order_by):\n"
+            "    order_by = ORDER.get(order_by, 'name')\n"
+            "    sql = f'SELECT * FROM people ORDER BY {order_by}'\n    return conn.execute(sql)\n",
+            "unknown",
+            False,
+        ),
+        (
+            "def tool(cur):\n    sql = 'SELECT 1'\n    alias = sql\n    sql = 'DROP TABLE t'\n"
+            "    cur.execute(alias)\n",
+            "unknown",
+            False,
+        ),
+        (
+            "def tool(cur):\n    sql = 'SELECT 1'\n    sql = 'DROP TABLE t'\n    alias = sql\n"
+            "    cur.execute(alias)\n",
+            "destructive",
+            False,
+        ),
+    ],
+    ids=[
+        "comprehension-of-parameters",
+        "column-list-comprehension",
+        "comprehension-target-named-like-a-parameter",
+        "comprehension-target-named-like-a-local",
+        "first-iterable-of-a-list-comprehension",
+        "first-iterable-of-a-generator",
+        "first-iterable-in-a-class-body",
+        "constant-inside-a-quoted-literal",
+        "module-constant-inside-a-quoted-literal",
+        "constant-as-a-clause-control",
+        "parameter-inside-a-quoted-literal-control",
+        "overwritten-before-the-statement-is-built",
+        "alias-of-an-earlier-binding",
+        "alias-of-the-later-binding-control",
+    ],
+)
+def test_python_statements_read_comprehensions_quotes_and_bindings_where_they_are_made(
+    source: str, profile: str, raw: bool
+) -> None:
+    tree = ast.parse(source)
+    tool = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
+    found = classify_python(tool, PythonScopes(tree))
+    assert found.profile.value == profile, source
+    assert any("caller-supplied" in r.detail for r in found.risks) is raw, source
