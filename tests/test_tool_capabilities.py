@@ -1032,3 +1032,26 @@ def test_a_doubled_quote_stays_inside_its_literal() -> None:
         "def tool(conn):\n    conn.execute(\"INSERT INTO t VALUES ('it''s; DROP TABLE x')\")\n"
     )
     assert set(found.capabilities) == {E.WRITE}
+
+
+def test_a_body_registered_under_many_names_is_read_once(tmp_path: Path) -> None:
+    import time
+
+    def cost(names: int) -> float:
+        root = tmp_path / str(names)
+        root.mkdir()
+        (root / "server.py").write_text(
+            "import subprocess\nfrom mcp.server.fastmcp import FastMCP\n\nmcp = FastMCP('t')\n\n"
+            + "".join(f"@mcp.tool(name='t{i}')\n" for i in range(names))
+            + "def run(cmd: str) -> str:\n    _ = ["
+            + "0, " * 7000
+            + "]\n    return subprocess.check_output(cmd)\n"
+        )
+        start = time.process_time()
+        tools = _tools(root)
+        elapsed = time.process_time() - start
+        assert len(tools) == names and all(E.EXECUTE in _caps(t) for t in tools.values())
+        return elapsed
+
+    small, large = cost(1), cost(200)
+    assert large < max(small, 0.05) * 6, (small, large)

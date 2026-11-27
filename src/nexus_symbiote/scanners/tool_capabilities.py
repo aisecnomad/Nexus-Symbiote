@@ -355,6 +355,8 @@ class PythonScopes:
     def __init__(self, tree: ast.AST | None = None) -> None:
         self.module = _Scope("module")
         self._scopes: dict[ast.AST, _Scope] = {}
+        # Stacked decorators can register one body under many names; it is read once.
+        self.observed: dict[ast.AST, _Observed | None] = {}
         if tree is not None:
             self._fill(tree, self.module)
 
@@ -682,6 +684,18 @@ def classify_python(
 ) -> ToolCapabilities:
     """Classify a Python tool body by the calls it names, never by its decorators."""
     scopes = scopes if scopes is not None else PythonScopes()
+    if function not in scopes.observed:
+        scopes.observed[function] = _observe_python(function, scopes)
+    seen = scopes.observed[function]
+    if seen is None:
+        return ToolCapabilities(unclassified=True)
+    return _finish(label or function.name, seen)
+
+
+def _observe_python(
+    function: ast.FunctionDef | ast.AsyncFunctionDef, scopes: PythonScopes
+) -> _Observed | None:
+    """What a body names that raises risk; None past a bound."""
     # Each node with its scope and the index of its outermost enclosing loop, or -1.
     nodes: list[tuple[ast.AST, _Scope, int]] = []
     own = scopes.scope(function)
@@ -690,7 +704,7 @@ def classify_python(
         node, scope, loop = pending.pop()
         nodes.append((node, scope, loop))
         if len(nodes) > MAX_BODY_NODES:
-            return ToolCapabilities(unclassified=True)
+            return None
         if loop < 0 and isinstance(node, ast.For | ast.AsyncFor | ast.While):
             loop = len(nodes) - 1
         pending.extend((c, s, loop) for c, s in reversed(scopes.children(node, scope)))
@@ -701,8 +715,8 @@ def classify_python(
             body.at = index
             _python_node(node, scope, scopes, body, seen)
     except _TooManyTargetsError:
-        return ToolCapabilities(unclassified=True)
-    return _finish(label or function.name, seen)
+        return None
+    return seen
 
 
 def _python_node(
