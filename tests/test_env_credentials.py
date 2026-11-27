@@ -242,3 +242,69 @@ def test_shared_walk_failures_remain_private_and_do_not_hide_new_gaps(tmp_path: 
     (root / "north").symlink_to(tmp_path / "another")
     assert apply_env_credential_findings(bom, root, failures=local, prior_failures={published}) == 1
     assert local == [generic]
+
+
+def test_a_quoted_value_that_spans_lines_is_value_text_not_assignments(tmp_path: Path) -> None:
+    # dotenv reads a quoted value to its closing quote. A key body line that ends in
+    # base64 padding, or any continuation line with "=", is value text, not a key.
+    body = ["MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", "Zm9vYmFyQmF6UXV4Q29yZ2VHcmF1bHQ=="]
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                'PRIVATE_KEY="-----BEGIN PRIVATE KEY-----',
+                *body,
+                '-----END PRIVATE KEY-----"',
+                "export NOTE='first line",
+                "second=part' # trailing comment",
+                "PORT=3000",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    notes = _bom(tmp_path)
+    failures: list[str] = []
+    assert (
+        apply_env_credential_findings(AIBOM(components=[notes]), tmp_path, failures=failures) == 3
+    )
+    assert [risk.detail for risk in notes.risks] == [
+        ".env:1: PRIVATE_KEY holds an unspecified credential.",
+        ".env:5: NOTE holds an unspecified credential.",
+        ".env:7: PORT holds an unspecified credential.",
+    ]
+    assert not failures
+    rendered = " ".join(risk.detail for risk in notes.risks)
+    assert body[1].rstrip("=") not in rendered and "second" not in rendered
+
+
+def test_a_value_that_starts_with_the_other_quote_stays_on_its_line(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("MSG='\"hi'\nQUOTE=\"'x\"\nPORT=1\n", encoding="utf-8")
+    notes = _bom(tmp_path)
+    assert apply_env_credential_findings(AIBOM(components=[notes]), tmp_path) == 3
+    assert [risk.detail.split(" holds")[0] for risk in notes.risks] == [
+        ".env:1: MSG",
+        ".env:2: QUOTE",
+        ".env:3: PORT",
+    ]
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\x85", "\x0c", "\x1e"])
+def test_only_newlines_end_an_env_line(tmp_path: Path, separator: str) -> None:
+    (tmp_path / ".env").write_text(f"PASSWORD=abc{separator}tailWord=x\r\nPORT=1\r\n")
+    notes = _bom(tmp_path)
+    assert apply_env_credential_findings(AIBOM(components=[notes]), tmp_path) == 2
+    assert [risk.detail for risk in notes.risks] == [
+        ".env:1: PASSWORD holds an unspecified credential.",
+        ".env:2: PORT holds an unspecified credential.",
+    ]
+
+
+def test_an_unterminated_quoted_value_fails_closed(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text('TOKEN="opened\nbodyLine=value\nPORT=1\n', encoding="utf-8")
+    notes = _bom(tmp_path)
+    failures: list[str] = []
+    assert (
+        apply_env_credential_findings(AIBOM(components=[notes]), tmp_path, failures=failures) == 0
+    )
+    assert notes.risks == []
+    assert failures == ["an env file: env file has an unterminated quoted value; not collected"]

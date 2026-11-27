@@ -7,6 +7,7 @@ vendor type. Templates use the same keyed or unbound commitment as source findin
 
 from __future__ import annotations
 
+import io
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -77,7 +78,8 @@ def _vendor(value: str) -> str:
     return "vendor-token"
 
 
-def _assignment(line: str) -> tuple[str, str] | None:
+def _assignment(line: str) -> tuple[str, str, str | None] | None:
+    """Key, value, and the quote a value opens without closing on this line."""
     body = line.strip()
     if not body or body.startswith("#"):
         return None
@@ -88,13 +90,30 @@ def _assignment(line: str) -> tuple[str, str] | None:
     key, _, value = body.partition("=")
     key = key.strip()
     value = value.strip()
+    opened = None
     if quoted := _QUOTED_VALUE.fullmatch(value):
         value = quoted[1] if quoted[1] is not None else quoted[2]
     elif not value.startswith(('"', "'")):
         value = re.split(r"(?<=\s)#", value, maxsplit=1)[0].rstrip()
+    elif _quote_end(value, value[0], 1) is None:
+        opened = value[0]
     if not _KEY.fullmatch(key) or TOKEN_SHAPE.search(key):
         key = "a key name"
-    return key, value
+    return key, value, opened
+
+
+def _quote_end(text: str, quote: str, start: int = 0) -> int | None:
+    """The index of the first ``quote`` at or after ``start`` that no backslash escapes."""
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == quote:
+            return index
+    return None
 
 
 def _owner(components: list[Any], path: str) -> Any | None:
@@ -203,7 +222,9 @@ def apply_env_credential_findings(
             except UnicodeDecodeError:
                 read_failures.append("env credentials were not read (not UTF-8)")
                 continue
-            lines = text.splitlines()
+            # dotenv ends a line only at a newline. str.splitlines also splits at U+2028,
+            # NEL and form feed, which moved value text after "=" into the key position.
+            lines = [line.removesuffix("\n") for line in io.StringIO(text, newline=None)]
             if len(lines) > MAX_ENV_LINES or any(len(line) > MAX_ENV_LINE_CHARS for line in lines):
                 read_failures.append("env file exceeds the line bound; not collected")
                 continue
@@ -273,11 +294,27 @@ def _line_findings(
     known: _EnvValues,
 ) -> list[_EnvFinding] | None:
     found: list[_EnvFinding] = []
-    for line_no, line in enumerate(lines, start=1):
-        parsed = _assignment(line)
+    index = 0
+    while index < len(lines):
+        line_no = index + 1
+        parsed = _assignment(lines[index])
+        index += 1
         if parsed is None:
             continue
-        key, value = parsed
+        key, value, quote = parsed
+        if quote is not None:
+            # dotenv reads a quoted value to its closing quote. The lines it spans are
+            # value text: read as assignments, their text before "=" became the key.
+            parts = [value[1:]]
+            while index < len(lines) and (end := _quote_end(lines[index], quote)) is None:
+                parts.append(lines[index])
+                index += 1
+            if index == len(lines):
+                failures.append("env file has an unterminated quoted value; not collected")
+                return None
+            parts.append(lines[index][:end])
+            index += 1
+            value = "\n".join(parts)
         known.add(value)
         if credential_suppressed(value):
             continue
