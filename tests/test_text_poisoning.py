@@ -1700,6 +1700,69 @@ def test_a_shell_mention_without_a_command_raises_nothing(text: str) -> None:
     assert scan_text_block(text, surface="CLAUDE.md") == []
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Run `git status\n--short` before committing.",
+        "The spelling is `git status",
+        "Use ssh to connect. The default user key is documented at `~/.ssh/id_ed25519`.",
+        "The ssh guide describes the command `ls ~/.ssh/id_ed25519` for checking file presence.",
+        "Use curl for the manual. For the key filename see `~/.ssh/id_ed25519`.",
+        "The documentation uses the notation $(value.",
+    ],
+)
+def test_markdown_code_spans_and_unfinished_markup_do_not_imply_a_credential_read(
+    text: str,
+) -> None:
+    assert _shell_cred_hits(text) == []
+
+
+@pytest.mark.parametrize("outer", [True, False])
+@pytest.mark.parametrize("formatted", [True, False])
+def test_table_columns_are_independent_instruction_surfaces(outer: bool, formatted: bool) -> None:
+    rows = ["Tool | Configuration filename", ":--- | ---:", "ssh | ~/.ssh/id_ed25519"]
+    if formatted:
+        rows[-1] = "`ssh` | `~/.ssh/id_ed25519`"
+    if outer:
+        rows = [f"| {row} |" for row in rows]
+    assert _shell_cred_hits("\n".join(rows)) == []
+
+
+@pytest.mark.parametrize("line", [0, 1, 2])
+def test_markdown_table_parsing_obeys_the_shell_row_limit(
+    line: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import nexus_symbiote.text_poisoning as rules
+
+    cells = rules._table_cells
+
+    def bounded_cells(text: str, start: int, end: int):
+        assert end - start <= rules._SHELL_WINDOW_CHARS
+        return cells(text, start, end)
+
+    monkeypatch.setattr(rules, "_table_cells", bounded_cells)
+    rows = ["Tool | Filename", "--- | ---", "Manual | Documentation"]
+    rows[line] = rows[line] * rules._SHELL_WINDOW_CHARS
+    assert _shell_cred_hits("\n".join(rows)) == []
+
+
+def test_markdown_table_retains_shell_pipes_in_code_cells_and_outside_tables() -> None:
+    from nexus_symbiote.text_poisoning import _shell_regions
+
+    body = (
+        "Before table.\n\n"
+        "Command | Purpose\n--- | ---\n"
+        "`printf sample \\| wc -c` | Count characters\n"
+        "`printf sample | wc -l` | Count lines\n\n"
+        "After table.\n```sh\nTool | Path\n--- | ---\nssh | example\n```"
+    )
+    regions = [body[a:b].strip() for a, b in _shell_regions(body)]
+    assert "`printf sample \\| wc -c`" in regions
+    assert "`printf sample | wc -l`" in regions
+    assert regions[0] == "Before table."
+    assert regions[-1].startswith("After table.\n```sh\nTool | Path")
+
+
 def test_shell_parser_bounds_every_physical_line() -> None:
     from nexus_symbiote.text_poisoning import _SHELL_WINDOW_CHARS, _logical_windows
 

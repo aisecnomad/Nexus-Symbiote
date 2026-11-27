@@ -869,6 +869,8 @@ def _substitution_offsets(text: str, start: int, end: int) -> Iterator[int]:
         return
     index = start
     has_verb = _window_has_verb(text, start, end)
+    preceding = start
+    sink_arguments = False
     while index < end:
         if text[index] == "`":
             run = index + 1
@@ -881,6 +883,14 @@ def _substitution_offsets(text: str, start: int, end: int) -> Iterator[int]:
         if not text.startswith("$(", index) and text[index] != "`":
             index += 1
             continue
+        # A single backtick also delimits Markdown code spans. Only a shell
+        # argument can connect a substitution to a preceding network command.
+        for outer in _SHELL_TOKEN_RE.finditer(text, preceding, index):
+            word = outer.group()
+            if _is_network_sink(word):
+                sink_arguments = True
+            elif word.isalpha() or word.endswith((".", "!", "?", ";", "|", "&&")):
+                sink_arguments = False
         dollar = text.startswith("$(", index)
         opener = 2 if dollar else 1
         closer = ")" if dollar else "`"
@@ -897,29 +907,32 @@ def _substitution_offsets(text: str, start: int, end: int) -> Iterator[int]:
                 if depth == 0:
                     break
             body += 1
+        preceding = body + 1
+        # Markdown can wrap a real command. Inspect explicit substitutions in
+        # the span, independently of whether the surrounding prose is a command.
+        # The body ends at the next backtick, so this can recurse only once.
+        if not dollar and text.find("$(", index + opener, body) != -1:
+            yield from _substitution_offsets(text, index + opener, body)
         if depth:
-            # The cap hid the rest of the substitution. Fail closed.
-            yield index
+            # A line ending inside a Markdown span says nothing about shell
+            # behavior. A bounded, unfinished explicit shell substitution is
+            # still reported when the scan reached the actual size limit.
+            if dollar and cap - index >= _SUBST_CHARS:
+                yield index
             index = body
             continue
-        fragment = text[index + opener : body]
-        path_at: int | None = None
-        for token in _SHELL_TOKEN_RE.finditer(fragment):
-            if _credential_path(token.group()) is None:
-                continue
-            path_at = token.start()
-            break
-        # Naming the path is the read. A sink in the same window supplies the exfil;
-        # a known reader verb still counts when the substitution is the whole command.
-        # A prohibition does not drop the hit; the caller may only lower it.
-        if path_at is not None and (
-            has_verb
-            or any(
-                _shell_word(token.group()) in _SHELL_READERS
-                for token in _SHELL_TOKEN_RE.finditer(fragment)
-            )
-        ):
-            yield index + opener + path_at
+        words = _SHELL_TOKEN_RE.finditer(text, index + opener, body)
+        command = next(words, None)
+        if command is not None and _credential_path(command.group()) is None:
+            reader = _shell_word(command.group()) in _SHELL_READERS
+            for token in words:
+                if dollar and _shell_word(token.group()) in _SHELL_READERS:
+                    reader = True
+                if _credential_path(token.group()) is not None and (
+                    reader or sink_arguments or (dollar and has_verb)
+                ):
+                    yield token.start()
+                    break
         index = body + 1
 
 
@@ -1053,7 +1066,97 @@ def _command_is_prohibited(text: str, start: int, end: int) -> bool:
     return _GOVERNING_PROHIBITION_RE.search(window) is not None
 
 
+def _table_cells(text: str, start: int, end: int) -> Iterator[tuple[int, int]]:
+    """Table cells, retaining shell pipes inside code spans or escaped as Markdown."""
+    spans = _code_spans(text, start, end)
+    span = next(spans, None)
+    cell = cursor = start
+    while (pipe := text.find("|", cursor, end)) != -1:
+        cursor = pipe + 1
+        while span is not None and span[1] <= pipe:
+            span = next(spans, None)
+        if span is not None and span[0] <= pipe < span[1]:
+            cursor = span[1]
+            continue
+        slash = pipe
+        while slash > cell and text[slash - 1] == "\\":
+            slash -= 1
+        if (pipe - slash) % 2:
+            continue
+        if cell != start or text[cell:pipe].strip():
+            yield cell, pipe
+        cell = cursor
+    if text[cell:end].strip():
+        yield cell, end
+
+
+_TABLE_DELIMITER = re.compile(r"[ \t]*:?-+:?[ \t]*")
+_TABLE_DELIMITER_LINE = re.compile(r"[|:\- \t]+")
+_TABLE_BLOCK_START = re.compile(r" {0,3}(?:#{1,6}(?:[ \t]|$)|>|(?:[-*+]|[0-9]{1,9}[.)])[ \t])")
+
+
+def _shell_regions(text: str) -> Iterator[tuple[int, int]]:
+    """Scan genuine Markdown table cells independently. Preserve other shell text intact."""
+    if "|" not in text or "-" not in text:
+        yield 0, len(text)
+        return
+    previous = previous_end = regular = start = 0
+    header_candidate = in_table = False
+    fence = ""
+    while start < len(text):
+        newline = text.find("\n", start)
+        end = len(text) if newline == -1 else newline
+        stop = end - 1 if end > start and text[end - 1] == "\r" else end
+        if stop - start > _SHELL_WINDOW_CHARS:
+            # Keep all content on the bounded shell path. Table recognition must
+            # never materialize an unrestricted number of cells or backticks.
+            if in_table:
+                yield start, stop
+                regular = end + 1
+            header_candidate = False
+            start = end + 1
+            continue
+        has_pipe = text.find("|", start, stop) != -1
+        eligible = not text.startswith(("    ", "\t"), start) and not _TABLE_BLOCK_START.match(
+            text, start, stop
+        )
+        if fence:
+            closer = _FENCE_CLOSE_RE.match(text, start, end)
+            if closer and closer.group(1).startswith(fence):
+                fence = ""
+            header_candidate = in_table = False
+        elif opener := _FENCE_OPEN_RE.match(text, start, end):
+            fence = opener.group(1)
+            header_candidate = in_table = False
+        elif in_table and eligible and text[start:stop].strip():
+            yield from _table_cells(text, start, stop)
+            regular = end + 1
+        else:
+            in_table = False
+            if header_candidate and eligible and _TABLE_DELIMITER_LINE.fullmatch(text, start, stop):
+                columns = text[start:stop].strip().removeprefix("|").removesuffix("|").split("|")
+                if all(_TABLE_DELIMITER.fullmatch(col) for col in columns):
+                    header = list(_table_cells(text, previous, previous_end))
+                    if len(header) == len(columns):
+                        if regular < previous:
+                            yield regular, previous
+                        yield from header
+                        in_table = True
+                        regular = end + 1
+            header_candidate = has_pipe and eligible
+        previous, previous_end = start, stop
+        start = end + 1
+    if regular < len(text):
+        yield regular, len(text)
+
+
 def _shell_exfil_offsets(normalized: str) -> Iterator[tuple[int, bool]]:
+    for start, end in _shell_regions(normalized):
+        for at, prohibited in _shell_region_offsets(normalized[start:end]):
+            yield start + at, prohibited
+
+
+def _shell_region_offsets(normalized: str) -> Iterator[tuple[int, bool]]:
     """Offsets of a shell read of a credential path that reaches a network sink.
 
     Each offset is paired with whether a prohibition immediately governs that command.
