@@ -39,6 +39,7 @@ from nexus_symbiote.core.hashing import (
     descriptor_binding,
     hash_bytes,
     hash_canonical,
+    json_nesting_exceeds,
     open_regular_file,
 )
 from nexus_symbiote.core.models import (
@@ -166,6 +167,61 @@ _ZIP_TAIL_BYTES = MAX_ZIP_DIRECTORY_BYTES + _ZIP_END_RECORD_BYTES
 ZIP_PICKLE_MEMBER = "ZIP archive with a pickle member; torch.load unpickles it"
 ZIP_OBJECT_ARRAY = (
     "ZIP archive with a NumPy object-dtype array member; np.load(allow_pickle=True) unpickles it"
+)
+ZIP_KERAS_CODE_EXECUTION = (
+    "ZIP archive with a Keras config declaring a Lambda layer or executable custom callable; "
+    "keras.models.load_model can execute arbitrary code"
+)
+MAX_KERAS_CONFIG_BYTES = 1024 * 1024
+MAX_KERAS_CONFIG_DEPTH = 64
+MAX_KERAS_CONFIG_NODES = 100_000
+_KERAS_CODE_CLASSES = frozenset({"Lambda", "__lambda__"})
+_KERAS_OP_LAMBDA_CLASSES = frozenset({"TFOpLambda", "SlicingOpLambda"})
+_KERAS_DANGEROUS_MODULES = frozenset(
+    {
+        "asyncio",
+        "bdb",
+        "builtins",
+        "code",
+        "codecs",
+        "ctypes",
+        "doctest",
+        "ensurepip",
+        "ftplib",
+        "http",
+        "importlib",
+        "logging",
+        "marshal",
+        "multiprocessing",
+        "nt",
+        "operator",
+        "os",
+        "pathlib",
+        "pdb",
+        "pickle",
+        "_pickle",
+        "pip",
+        "pipes",
+        "pkgutil",
+        "posix",
+        "pty",
+        "pydoc",
+        "runpy",
+        "shutil",
+        "smtplib",
+        "socket",
+        "subprocess",
+        "sys",
+        "tarfile",
+        "tempfile",
+        "timeit",
+        "urllib",
+        "venv",
+        "webbrowser",
+        "xmlrpc",
+        "zipfile",
+        "zipimport",
+    }
 )
 ZIP_WITHOUT_PICKLE = (
     "ZIP archive whose directory lists no pickle member; no bounded structural validator "
@@ -383,7 +439,10 @@ def _content_format(explanation: str) -> tuple[str, str]:
     """The (format key, format name) of a file inventoried by what its content is."""
     if explanation in (NUMPY_OBJECT_ARRAY, NUMPY_HEADER_UNREAD):
         return "npy", "numpy"
-    if explanation in (ZIP_PICKLE_MEMBER, ZIP_OBJECT_ARRAY) or explanation in _ZIP_UNRATED:
+    if (
+        explanation in (ZIP_PICKLE_MEMBER, ZIP_OBJECT_ARRAY, ZIP_KERAS_CODE_EXECUTION)
+        or explanation in _ZIP_UNRATED
+    ):
         return "zip", "zip-archive"
     return "pickle", "pickle"
 
@@ -752,6 +811,7 @@ def _listed_name(name: bytes, extra: bytes) -> bytes:
     so a pickle name either way rates the member.
     """
     position = 0
+    keras_candidate: bytes | None = None
     while position + 4 <= len(extra):
         length = _little(extra, position + 2, 2)
         field = extra[position + 4 : position + 4 + length]
@@ -760,11 +820,14 @@ def _listed_name(name: bytes, extra: bytes) -> bytes:
             and len(field) >= 5
             and field[0] == 1
             and _little(field, 1, 4) == zlib.crc32(name)
-            and _pickle_member(field[5:])
         ):
-            return field[5:]
+            unicode_name = field[5:]
+            if _pickle_member(unicode_name):
+                return unicode_name
+            if not _pickle_member(name) and _keras_config_member(unicode_name):
+                keras_candidate = unicode_name
         position += 4 + length
-    return name
+    return keras_candidate if keras_candidate is not None else name
 
 
 def _listed(members: list[_ZipMember], *, complete: bool) -> list[_ZipMember] | None:
@@ -1022,6 +1085,115 @@ def _object_dtype_string(text: str) -> bool:
     )
 
 
+def _keras_config_member(name: bytes) -> bool:
+    """Whether a ZIP member's name is a Keras v3 ``config.json`` descriptor."""
+    for raw in {name, name.split(b"\0", 1)[0]}:
+        normalized = raw.decode("latin-1").replace("\\", "/").rstrip("/").lower()
+        if normalized == "config.json" or normalized.endswith("/config.json"):
+            return True
+    return False
+
+
+def _keras_config_has_code(document: object) -> bool | None:
+    """Whether a parsed Keras v3 config declares Lambda or dangerous custom-module execution.
+
+    Traverses iteratively under ``MAX_KERAS_CONFIG_NODES`` so deeply nested or huge JSON
+    graphs never recurse or exhaust memory. Returns ``None`` when the node bound is exceeded.
+    """
+    pending: list[object] = [document]
+    visited = 0
+    while pending:
+        visited += 1
+        if visited > MAX_KERAS_CONFIG_NODES:
+            return None
+        node = pending.pop()
+        if isinstance(node, dict):
+            class_name = node.get("class_name")
+            module = node.get("module")
+            if isinstance(class_name, str):
+                if class_name in _KERAS_CODE_CLASSES:
+                    return True
+                if class_name in _KERAS_OP_LAMBDA_CLASSES:
+                    cfg = node.get("config")
+                    if isinstance(cfg, dict) and isinstance(cfg.get("function"), (str, dict)):
+                        return True
+            if isinstance(module, str):
+                root_module = module.split(".", 1)[0].strip().lower()
+                if root_module in _KERAS_DANGEROUS_MODULES and (
+                    isinstance(class_name, str)
+                    or isinstance(node.get("registered_name"), str)
+                    or isinstance(node.get("function"), (str, dict, list))
+                ):
+                    return True
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
+    return False
+
+
+def _member_holds_keras_code(
+    stream: BinaryIO, member: _ZipMember, end: int, budget: InspectionBudget
+) -> bool | None:
+    """Inspect a single ``config.json`` ZIP member for Keras v3 code-execution constructs."""
+    if not _keras_config_member(member.name):
+        return False
+    if member.size == 0:
+        return False
+    if member.offset < 0 or member.offset + 30 > end:
+        return None
+    header = _reread(stream, member.offset, 30)
+    if header[:4] != b"PK\x03\x04":
+        return False
+    start = member.offset + 30 + _little(header, 26, 2) + _little(header, 28, 2)
+    if start + member.size > end:
+        return None
+    if member.method not in (0, 8):
+        return None
+    data = _MemberData(stream, start, member.size, deflated=member.method == 8)
+    raw = bytearray()
+    try:
+        while len(raw) <= MAX_KERAS_CONFIG_BYTES:
+            chunk = data.read(min(8192, MAX_KERAS_CONFIG_BYTES + 1 - len(raw)))
+            if not chunk:
+                break
+            budget.charge(len(chunk), ZIP_MEMBER_UNREAD)
+            raw += chunk
+    except FormatError:
+        return None
+    except zlib.error:
+        return False
+    if len(raw) > MAX_KERAS_CONFIG_BYTES:
+        return None
+    raw_bytes = bytes(raw)
+    try:
+        encoding = json.detect_encoding(raw_bytes)
+        text = raw_bytes.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        return False
+    if json_nesting_exceeds(text, MAX_KERAS_CONFIG_DEPTH):
+        return None
+    try:
+        document = json.loads(text)
+    except (ValueError, RecursionError):
+        return False
+    return _keras_config_has_code(document)
+
+
+def _members_hold_keras_code(
+    stream: BinaryIO, members: list[_ZipMember], directory: int, budget: InspectionBudget
+) -> bool | None:
+    """Whether any ``config.json`` ZIP member declares executable Keras v3 layers/callables."""
+    ordered = sorted(members, key=lambda member: member.offset)
+    unread = False
+    for index, member in enumerate(ordered):
+        end = min(ordered[index + 1].offset, directory) if index + 1 < len(ordered) else directory
+        found = _member_holds_keras_code(stream, member, end, budget)
+        if found:
+            return True
+        unread = unread or found is None
+    return None if unread else False
+
+
 def _recognized_code_container(
     stream: BinaryIO, prefix: bytes, size: int, budget: InspectionBudget, *, by_content: bool
 ) -> tuple[SerializationSafety, str] | None:
@@ -1069,6 +1241,11 @@ def _recognized_code_container(
         if found:
             return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_OBJECT_ARRAY
         if found is None:
+            arrays = None
+        keras_code = _members_hold_keras_code(stream, members, offset, budget)
+        if keras_code:
+            return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_KERAS_CODE_EXECUTION
+        if keras_code is None:
             arrays = None
     if undecided:
         return SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD
