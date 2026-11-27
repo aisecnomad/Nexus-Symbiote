@@ -83,7 +83,8 @@ WEIGHT_CLASSES = frozenset(
 MODEL_KEYWORDS = (
     "model", "model_name", "model_id", "modelId", "ai_model_id", "deployment_name",
     "azure_deployment", "embedding_model", "embed_model", "llm_model", "chat_model", "llm",
-    "repo_id", "model_name_or_path", "pretrained_model_name_or_path",
+    "repo_id", "model_name_or_path", "pretrained_model_name_or_path", "manager_llm",
+    "function_calling_llm", "planning_llm", "model_list", "fallbacks",
 )  # fmt: skip
 EMBEDDING_KEYWORDS = frozenset({"embedding_model", "embed_model"})
 # ``repo_id`` names many things; it is a model only for these loaders.

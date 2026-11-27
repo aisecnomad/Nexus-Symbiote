@@ -27,7 +27,7 @@ _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{1,127}")
 # A long run of hex or of base64 with no separator, or user information before an
 # ``@``: what a key, a token or a connection string looks like, and no model's name.
 _SECRET_SHAPED = re.compile(
-    r"[0-9A-Fa-f]{32}|[0-9A-Fa-f-]{48}|^[A-Za-z0-9+/]{40,}={0,2}$|^[^@:/]+:[^@/]+@(?![0-9]+$)"
+    r"[0-9A-Fa-f]{32}|[0-9A-Fa-f-]{48}|^[A-Za-z0-9+/]{40,}={0,2}$|(?:^|/)[^@:/]+:[^@/]+@(?![0-9]+$)"
 )
 # A model pinned by its version's digest, which is a hash, not a key.
 _PINNED = re.compile(r"[\w.-]+/[\w.-]+:[0-9a-f]{64}")
