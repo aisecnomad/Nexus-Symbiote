@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -85,11 +85,22 @@ def _visible(text: str) -> str:
     return "".join(kept)
 
 
-def _split_bodies(visible: str, covered: list[tuple[int, int]]) -> list[str]:
-    """Tokens whose body is split by whitespace, not tokens separated from prose."""
-    found: list[str] = []
+def _direct_matches(visible: str) -> Iterator[re.Match[str]]:
+    return (match for match in TOKEN_SHAPE.finditer(visible) if holds_token_shape(match.group()))
+
+
+def _literals(visible: str) -> Iterable[str]:
+    """Yield direct matches first, then recover shapes split by whitespace."""
+    for match in _direct_matches(visible):
+        yield normalize_credential(match.group())
+
+    # Both iterators advance in source order. Keep just the next covered span.
+    covered = _direct_matches(visible)
+    current = next(covered, None)
     for prefix in _SPLIT_PREFIX.finditer(visible):
-        if any(start <= prefix.start() < end for start, end in covered):
+        while current is not None and current.end() <= prefix.start():
+            current = next(covered, None)
+        if current is not None and current.start() <= prefix.start():
             continue
         chars: list[str] = []
         index = prefix.end()
@@ -112,21 +123,7 @@ def _split_bodies(visible: str, covered: list[tuple[int, int]]) -> list[str]:
             index += 1
         candidate = normalize_credential(prefix.group() + "".join(chars))
         if holds_token_shape(candidate) and TOKEN_SHAPE.fullmatch(candidate):
-            found.append(candidate)
-    return found
-
-
-def _literals(visible: str) -> list[str]:
-    found: list[str] = []
-    covered: list[tuple[int, int]] = []
-    for match in TOKEN_SHAPE.finditer(visible):
-        literal = match.group()
-        if not holds_token_shape(literal):
-            continue
-        found.append(normalize_credential(literal))
-        covered.append(match.span())
-    found.extend(_split_bodies(visible, covered))
-    return list(dict.fromkeys(found))
+            yield candidate
 
 
 def _commitment(rel_path: str, line_no: int, literal: str) -> str:
@@ -283,9 +280,11 @@ def apply_literal_credential_findings(
                     )
                     refused = True
                     break
+                seen: set[str] = set()
                 for literal in _literals(normalized):
-                    if placeholder(literal):
+                    if literal in seen or placeholder(literal):
                         continue
+                    seen.add(literal)
                     found.append((line_no, literal))
                     if len(found) > MAX_LITERALS:
                         own_failures.append(

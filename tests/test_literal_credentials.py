@@ -91,6 +91,34 @@ def test_a_non_utf8_file_is_a_failure_and_not_a_guess(tmp_path: Path) -> None:
     assert failures == ["app.py: literal credentials were not read (not UTF-8)"]
 
 
+def test_one_window_stops_matching_at_the_findings_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nexus_symbiote import literal_credentials
+
+    monkeypatch.setattr(literal_credentials, "MAX_LITERALS", 1)
+    normalizations = 0
+
+    def counted(value: str) -> str:
+        nonlocal normalizations
+        normalizations += 1
+        return normalize_credential(value)
+
+    monkeypatch.setattr(literal_credentials, "normalize_credential", counted)
+    tokens = [_TOKEN, _TOKEN, _TOKEN + "1", _TOKEN + "2"]
+    (tmp_path / "app.py").write_text(" ".join(tokens), encoding="utf-8")
+    server = _server("app.py")
+    failures: list[str] = []
+    assert (
+        apply_literal_credential_findings(AIBOM(components=[server]), tmp_path, failures=failures)
+        == 0
+    )
+    assert len(failures) == 1 and server.risks == []
+    # Two occurrences of the first spelling consume one slot. The third
+    # occurrence exceeds the budget, so the fourth is never normalized.
+    assert normalizations == 3
+
+
 @pytest.mark.parametrize("mark", ["\u200b", "\ufe0e", "\u00a0"])
 def test_a_mark_or_space_inside_a_token_is_still_a_finding(tmp_path: Path, mark: str) -> None:
     marked = "sk-proj-a1b2" + mark + "c3d4e5f6g7h8i9j0"
