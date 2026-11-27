@@ -19,9 +19,9 @@ from nexus_symbiote.core.models import RiskAssessment
 from nexus_symbiote.credential_allowlist import bind_credential_path, credential_suppressed
 from nexus_symbiote.literal_credentials import MAX_LITERALS, _commitment
 from nexus_symbiote.scanners.base import KnownValues, declared_server_name
-from nexus_symbiote.scanners.mcp_credentials import normalize_credential
+from nexus_symbiote.scanners.mcp_credentials import CredentialScrubber, normalize_credential
 from nexus_symbiote.utils.confined import ConfinedCollection, LimitExceededError
-from nexus_symbiote.utils.secrets import TOKEN_SHAPE, holds_token_shape
+from nexus_symbiote.utils.secrets import TOKEN_SHAPE, holds_token_shape, redact_text
 from nexus_symbiote.utils.terminal import neutralize
 
 MAX_ENV_BYTES = 1_048_576
@@ -112,19 +112,51 @@ def _owner(components: list[Any], path: str) -> Any | None:
     return min(pool, key=lambda component: str(getattr(component, "bom_ref", "")))
 
 
+class _EnvValues:
+    """Bound the comparison index and withhold labels if it cannot hold every value."""
+
+    def __init__(self) -> None:
+        self.names = KnownValues()
+        self.values: set[str] = set()
+        self.byte_count = 0
+        self.incomplete = False
+
+    def add(self, value: str) -> None:
+        if self.incomplete or not value or value in self.values:
+            return
+        size = len(value.encode("utf-8"))
+        if len(self.values) >= MAX_ENV_LINES or self.byte_count + size > MAX_ENV_BYTES:
+            self.refuse()
+            return
+        self.values.add(value)
+        self.byte_count += size
+        self.names.add((value, normalize_credential(value)))
+
+    def refuse(self) -> None:
+        self.incomplete = True
+        self.values.clear()
+        self.names.refuse()
+
+
+def _display_text(text: str, scrubber: CredentialScrubber | None, fallback: str) -> str:
+    if scrubber is not None and redact_text(text, scrubber) == text:
+        display = neutralize(text)
+        if not scrubber.contains(display):
+            return display
+    return fallback
+
+
 def _read_env(files: ConfinedCollection, path: str, failures: list[str]) -> bytes | None:
     entry = files.regular_file(path)
     if entry is None:
-        failures.append(f"{neutralize(path)}: env file unavailable during collection")
+        failures.append("env file unavailable during collection")
         return None
     target, size = entry
     if _kind(target.name) != _kind(PurePosixPath(path).name):
-        failures.append(f"{neutralize(path)}: env symlink crosses the file's credential policy")
+        failures.append("env symlink crosses the file's credential policy")
         return None
     if size > MAX_ENV_BYTES:
-        failures.append(
-            f"{neutralize(path)}: env file exceeds {MAX_ENV_BYTES} bytes; not collected"
-        )
+        failures.append(f"env file exceeds {MAX_ENV_BYTES} bytes; not collected")
         return None
     try:
         with files.open_regular(
@@ -149,8 +181,9 @@ def apply_env_credential_findings(
     """Record ``.env`` assignments and vendor shapes in ``.env`` templates."""
     if root is None or not root.is_dir():
         return 0
-    known = KnownValues()
+    known = _EnvValues()
     pending: list[tuple[Any, str, list[_EnvFinding]]] = []
+    read_failures: list[str] = []
     own_failures: list[str] = []
     own_exclusions: list[str] = []
     with ConfinedCollection(
@@ -161,39 +194,45 @@ def apply_env_credential_findings(
         )
         for rel_path in paths:
             kind = _kind(PurePosixPath(rel_path).name)
-            raw = _read_env(files, rel_path, own_failures)
+            raw = _read_env(files, rel_path, read_failures)
             if raw is None:
                 continue
             try:
                 text = raw.decode("utf-8")
             except UnicodeDecodeError:
-                own_failures.append(
-                    f"{neutralize(rel_path)}: env credentials were not read (not UTF-8)"
-                )
+                read_failures.append("env credentials were not read (not UTF-8)")
                 continue
             lines = text.splitlines()
             if len(lines) > MAX_ENV_LINES or any(len(line) > MAX_ENV_LINE_CHARS for line in lines):
-                own_failures.append(
-                    f"{neutralize(rel_path)}: env file exceeds the line bound; not collected"
-                )
+                read_failures.append("env file exceeds the line bound; not collected")
                 continue
             component = _owner(list(aibom.components), rel_path)
             if component is None:
-                own_failures.append(
-                    f"{neutralize(rel_path)}: env credential has no component to record it"
-                )
+                read_failures.append("env credential has no component to record it")
                 continue
             with bind_credential_path(rel_path):
-                findings = _line_findings(rel_path, lines, kind == "template", own_failures, known)
+                findings = _line_findings(rel_path, lines, kind == "template", read_failures, known)
             if findings:
                 pending.append((component, rel_path, findings))
-    # A key can repeat a value declared later, even in another file or an allowed entry.
-    # If collection was incomplete we cannot establish which keys are safe to export.
-    if own_failures:
+    # A location or key can contain an assignment from a later file, including an
+    # allowlisted assignment. Only project-controlled fields use the scrubber.
+    if own_failures or read_failures:
         known.refuse()
+    scrubber = None if known.incomplete else CredentialScrubber(known.values)
     for component, rel_path, findings in pending:
-        component.risks.extend(finding.assessment(rel_path, known) for finding in findings)
-    for target_list, own in ((failures, own_failures), (exclusions, own_exclusions)):
+        display = _display_text(rel_path, scrubber, "an env file")
+        component.risks.extend(finding.assessment(display, known.names) for finding in findings)
+
+    # Confined collection summaries may include several paths, even in the reason.
+    # Their contents cannot be displayed when the set of values is incomplete.
+    diagnostics = [f"an env file: {reason}" for reason in read_failures]
+    if own_failures:
+        diagnostics.append("env collection could not safely read every path")
+    gaps = [
+        _display_text(message, scrubber, "env path excluded during collection")
+        for message in own_exclusions
+    ]
+    for target_list, own in ((failures, diagnostics), (exclusions, gaps)):
         if target_list is None:
             continue
         recorded = set(target_list)
@@ -217,7 +256,7 @@ class _EnvFinding:
         return RiskAssessment(
             severity=RiskSeverity.HIGH,
             category="credential_exposure",
-            detail=f"{neutralize(path)}:{self.line}: {subject} {self.description}",
+            detail=f"{path}:{self.line}: {subject} {self.description}",
             recommendation="Remove the value from the repository and pass it by an environment reference.",
         )
 
@@ -227,16 +266,15 @@ def _line_findings(
     lines: list[str],
     template: bool,
     failures: list[str],
-    known: KnownValues,
+    known: _EnvValues,
 ) -> list[_EnvFinding] | None:
     found: list[_EnvFinding] = []
-    where = neutralize(rel_path)
     for line_no, line in enumerate(lines, start=1):
         parsed = _assignment(line)
         if parsed is None:
             continue
         key, value = parsed
-        known.add((value,))
+        known.add(value)
         if credential_suppressed(value):
             continue
         if template:
@@ -251,11 +289,8 @@ def _line_findings(
             vendor = _vendor(value)
             article = "an" if vendor[:1] in "aeiou" else "a"
             finding = _EnvFinding(line_no, key, f"holds {article} {vendor} credential.")
-        if len(value) >= 16 and value in where:
-            failures.append("env finding path would have copied a value; not collected")
-            return None
         found.append(finding)
         if len(found) > MAX_LITERALS:
-            failures.append(f"{where}: more than {MAX_LITERALS} env credentials; not collected")
+            failures.append(f"more than {MAX_LITERALS} env credentials; not collected")
             return None
     return found

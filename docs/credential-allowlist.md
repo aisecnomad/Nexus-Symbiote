@@ -42,10 +42,13 @@ A `.env*` file is reported by path, line, key name and vendor type. Its value is
 
 A path-glob allowlist entry suppresses a `.env` file. A fingerprint entry can match a value, but the finding does not record the digest.
 
-If a key name contains an assignment value found in a scanned `.env` file, the
-finding displays `a key name`. The collector also withholds key names when a file
-could not be collected. `validate --project` and `risk --project` repeat this
-collection when checking an inventory against its checkout.
+If a path or key contains an assignment value from any scanned `.env` file,
+the finding displays `an env file` or `a key name`. Allowlisted assignments
+also protect these labels. Collection diagnostics and exclusions withhold
+sensitive locations. When an input is incomplete or the comparison budget is
+exhausted, the collector withholds all file and key names in its findings.
+`validate --project` and `risk --project` repeat this collection when checking
+an inventory against its checkout.
 
 A symlink must point to the same kind of file. Store-to-store and
 template-to-template links inside the checkout are supported. A link that

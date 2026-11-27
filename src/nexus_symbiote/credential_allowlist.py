@@ -145,7 +145,8 @@ def load_credential_allowlist(
             elif not failures:
                 return CredentialAllowlist(), None
     except (OSError, ValueError):
-        pass
+        # A failed close also invalidates bytes returned by a successful read.
+        raw = None
     if failures:
         return CredentialAllowlist(), f"credential allowlist: {failures[0]}"
     if raw is None:

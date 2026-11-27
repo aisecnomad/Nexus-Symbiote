@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
+from nexus_symbiote import env_credentials
 from nexus_symbiote.cli import main
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.models import PromptComponent
 from nexus_symbiote.credential_allowlist import bind_credential_allowlist, load_credential_allowlist
 from nexus_symbiote.env_credentials import MAX_ENV_LINES, apply_env_credential_findings
+from nexus_symbiote.generators.sarif import SARIFGenerator
 
 _SAMPLE = "sk-proj-thisisfake0123456789ab"
 
@@ -67,7 +70,7 @@ def test_a_non_utf8_env_and_a_huge_env_fail_closed(tmp_path: Path) -> None:
         apply_env_credential_findings(AIBOM(components=[notes]), tmp_path, failures=failures) == 0
     )
     assert notes.risks == []
-    assert failures == [".env: env credentials were not read (not UTF-8)"]
+    assert failures == ["an env file: env credentials were not read (not UTF-8)"]
     assert _SAMPLE not in failures[0]
 
     (tmp_path / "nested").mkdir()
@@ -106,10 +109,10 @@ def test_env_aliases_preserve_store_and_template_policies(tmp_path: Path) -> Non
     assert (
         apply_env_credential_findings(AIBOM(components=[notes]), tmp_path, failures=failures) == 2
     )
-    assert failures == [".env.sample: env symlink crosses the file's credential policy"]
+    assert failures == ["an env file: env symlink crosses the file's credential policy"]
     assert [r.detail for r in notes.risks] == [
-        ".env:1: a key name holds an unspecified credential.",
-        ".env.local:1: a key name holds an unspecified credential.",
+        "an env file:1: a key name holds an unspecified credential.",
+        "an env file:1: a key name holds an unspecified credential.",
     ]
 
 
@@ -154,3 +157,62 @@ def test_a_path_allowlist_suppresses_the_env_file(tmp_path: Path) -> None:
         added = apply_env_credential_findings(AIBOM(components=[notes]), tmp_path)
     assert added == 0
     assert notes.risks == []
+
+
+def test_env_locations_use_all_values_even_from_later_allowed_files(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "field study").mkdir()
+    (project / "field study" / ".env").write_text("ALPHA=blue\nZONE=north\n")
+    (project / "z").mkdir()
+    (project / "z" / ".env").write_text('LABEL="field study"\n')
+    (project / "z" / ".env.example").write_text("EMPTY=\n")
+    (project / ".nexus-symbiote-credential-allowlist.yaml").write_text(
+        'allow:\n  - path: "z/.env"\n    reason: "Reference configuration."\n'
+    )
+    allowlist, error = load_credential_allowlist(project)
+    assert error is None
+    notes = _bom(project)
+    inventory = AIBOM(components=[notes])
+    with bind_credential_allowlist(allowlist):
+        assert apply_env_credential_findings(inventory, project) == 2
+    assert all(r.detail.startswith("an env file:") for r in notes.risks)
+    assert "ALPHA holds" in notes.risks[0].detail
+    assert "field study" not in inventory.to_native_json()
+    assert "field study" not in json.dumps(SARIFGenerator().generate(inventory))
+
+
+def test_env_gaps_and_failures_keep_locations_private(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("REGION=map-west\n")
+    skipped = tmp_path / "map-west"
+    skipped.mkdir()
+    (skipped / "notes").write_text("notes")
+    inventory = AIBOM(components=[_bom(tmp_path)])
+    failures: list[str] = []
+    gaps: list[str] = []
+    assert (
+        apply_env_credential_findings(
+            inventory, tmp_path, failures=failures, exclusions=gaps, exclude_paths=[skipped]
+        )
+        == 1
+    )
+    assert not failures
+    assert gaps == ["env path excluded during collection"]
+    assert ".env:1: REGION holds" in inventory.components[0].risks[0].detail
+
+    (skipped / ".env").write_bytes(b"\xff")
+    failures.clear()
+    assert apply_env_credential_findings(inventory, tmp_path, failures=failures) == 1
+    assert failures == ["an env file: env credentials were not read (not UTF-8)"]
+    assert inventory.components[0].risks[-1].detail.startswith("an env file:1: a key name holds")
+
+
+def test_env_display_budget_withholds_labels_but_preserves_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(env_credentials, "MAX_ENV_LINES", 1)
+    (tmp_path / ".env").write_text("ONE=first\n")
+    (tmp_path / ".env.local").write_text("TWO=second\n")
+    notes = _bom(tmp_path)
+    assert apply_env_credential_findings(AIBOM(components=[notes]), tmp_path) == 2
+    assert all(r.detail.startswith("an env file:1: a key name holds") for r in notes.risks)

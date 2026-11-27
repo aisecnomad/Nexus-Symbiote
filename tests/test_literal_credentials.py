@@ -410,3 +410,65 @@ def test_a_long_next_line_is_inspected_as_a_separate_window() -> None:
     assert [window[0] for window in windows] == [1, 2]
     assert windows[0][3]
     assert windows[1][1] == long_line
+
+
+@pytest.mark.parametrize("prefix", ["npm_", "AIza", "AKIA", "ASIA", "hf_", "ghp_", "sk-proj-"])
+def test_a_documented_prefix_at_a_window_limit_marks_collection_incomplete(
+    tmp_path: Path, prefix: str
+) -> None:
+    from nexus_symbiote.literal_credentials import _JOIN_LINES
+
+    lines = ['description = "Guide'] + ["Notes."] * (_JOIN_LINES - 2) + [prefix, 'End of guide."']
+    (tmp_path / "guide.py").write_text("\n".join(lines))
+    server = _server("guide.py")
+    failures: list[str] = []
+    assert (
+        apply_literal_credential_findings(AIBOM(components=[server]), tmp_path, failures=failures)
+        == 0
+    )
+    assert len(failures) == 1
+    assert "bounded source window" in failures[0]
+    assert prefix not in failures[0]
+
+
+def test_explanatory_words_after_a_short_label_are_not_credentials(tmp_path: Path) -> None:
+    (tmp_path / "guide.md").write_text(
+        "The label ghp_a identifies a short example in the glossary for developers.\n"
+        'description = "The label xoxb-a describes an integration setting."\n'
+        "The label sk-proj-a describes project-specific documentation for new developers.\n"
+    )
+    server = _server("guide.md")
+    failures: list[str] = []
+    assert (
+        apply_literal_credential_findings(AIBOM(components=[server]), tmp_path, failures=failures)
+        == 0
+    )
+    assert not server.risks and not failures
+
+
+def test_alphabetic_word_needs_a_complete_credential_assignment() -> None:
+    from nexus_symbiote.literal_credentials import _ends_assigned_value
+
+    for name, expected in (("API_KEY", True), ("description", False)):
+        value = f'{name} = "example word"'
+        assert _ends_assigned_value(value, value.index("example"), value.rindex('"')) is expected
+
+
+@pytest.mark.parametrize("join_tail", ["", '" +', '" \\', "\\"])
+def test_cutoff_includes_explicit_continuation_syntax(join_tail: str) -> None:
+    from nexus_symbiote.literal_credentials import _cut_off_token
+
+    assert _cut_off_token('note = "npm_' + join_tail)
+
+
+def test_an_explicit_join_cannot_bind_a_known_shape_early(monkeypatch: pytest.MonkeyPatch) -> None:
+    import re
+
+    from nexus_symbiote import literal_credentials as literals
+
+    # A symbolic format exercises the binding boundary without credential material.
+    monkeypatch.setattr(literals, "TOKEN_SHAPE", re.compile(r"label_[a-z]+"))
+    monkeypatch.setattr(literals, "holds_token_shape", lambda value: value.startswith("label_"))
+    for value in ["label_example", "label_" + "a" * 300]:
+        assert not literals._cut_off_token('description = "' + value)
+        assert literals._cut_off_token('description = "' + value + '" +')
