@@ -6,7 +6,7 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ### Security
 
-- **A2A OAuth scopes:** a scope holding a known token format glued to a preceding letter or digit, or a URL written without a scheme that carries user information (`//user@host/…`, or `user:pass@host` followed by a dot, port or path), is now exported as `***`, and `diff` shows it as `***`. Scopes the collector already reduced keep their form. A card with such a scope records a new `static_card_hash` and, collected without `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`, lists `redacted OAuth scopes` among its unbound values if it did not already; re-collect its baseline.
+- **A2A OAuth scopes:** a scope holding a known token format glued to a preceding letter or digit, or a URL written without a scheme that carries user information (`//user@host/…`, or `user:pass@host` followed by a dot, port or path), is now exported as `***`, and `diff` shows it as `***`. A scope URI whose path holds a credential-shaped run, such as the secret of a Slack, Discord or Teams webhook URL, is reduced to its origin. Scopes the collector already reduced keep their form. A card with such a scope records a new `static_card_hash` and, collected without `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`, lists `redacted OAuth scopes` among its unbound values if it did not already; re-collect its baseline.
 
 ### Added
 

@@ -121,3 +121,57 @@ def test_drift_output_withholds_imported_glued_tokens_and_user_information(
     shown = html.unescape(result.output.replace("\\", ""))
     assert "OAuth scopes added:" in shown
     assert PAT not in shown and KEY_ID not in shown and PASSWORD not in shown
+
+
+WEBHOOK_SECRET = "Zq8vR2mN5kL1" + "pX7wT4yH9cJ3"
+
+
+@pytest.mark.parametrize(
+    ("scope", "origin"),
+    [
+        (
+            f"https://hooks.slack.com/services/T0AAAAAAA/B0BBBBBBB/{WEBHOOK_SECRET}",
+            "https://hooks.slack.com",
+        ),
+        (
+            "https://discord.com/api/webhooks/123456789012345678/" + "Ab1Cd2Ef3Gh4" * 5,
+            "https://discord.com",
+        ),
+        ("https://example.com/hooks/9f8e7d6c5b4a39281706f5e4d3c2b1a0", "https://example.com"),
+        ("https://example.com/hook/" + "AbCdEfGhIjKlMnOpQrStUv", "https://example.com"),
+        ("https://example.com/hook/a-" + "1a2b3c4d" * 2 + "_b", "https://example.com"),
+    ],
+    ids=["slack", "discord", "hex", "mixed-case", "between-separators"],
+)
+def test_a_scope_uri_whose_path_holds_a_secret_is_reduced_to_its_origin(
+    scope: str, origin: str
+) -> None:
+    assert redact_oauth_scope(scope) == origin
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "https://www.googleapis.com/auth/cloudplatformprojects.readonly",
+        "https://graph.microsoft.com/Files.ReadWrite.All",
+        "https://management.azure.com/user_impersonation",
+        "https://api.example.com/task-scheduler-read-2024-v2",
+        "https://api.example.com/projects/12345678901234567890/read",
+        "api://11111111-2222-3333-4444-555555555555/Files.Read",
+    ],
+)
+def test_scope_uris_that_name_permissions_stay_in_full(scope: str) -> None:
+    assert redact_oauth_scope(scope) == scope
+
+
+def test_drift_output_withholds_a_webhook_secret_in_a_scope_uri(tmp_path: Path) -> None:
+    old, new = tmp_path / "before.json", tmp_path / "after.json"
+    old.write_text(_inventory(["read:only"]))
+    webhook = f"https://hooks.slack.com/services/T0AAAAAAA/B0BBBBBBB/{WEBHOOK_SECRET}"
+    new.write_text(_inventory(["read:only", webhook]))
+
+    result = CliRunner().invoke(main, ["diff", str(old), str(new), "--json-output"])
+
+    assert result.exit_code == 1, result.output
+    assert '\\"https://hooks.slack.com\\"' in result.output
+    assert WEBHOOK_SECRET not in result.output

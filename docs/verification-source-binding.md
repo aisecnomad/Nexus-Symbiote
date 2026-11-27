@@ -213,7 +213,11 @@ Several security declarations are recorded in clear:
   identifiers (RFC 6749 section 3.3), so scope URIs such as
   `https://www.googleapis.com/auth/drive.readonly` or `api://<app>/access_as_user`
   are kept in full. A scope in `scheme://` URL form with user information, a query or a
-  fragment is reduced to its origin, a recognised credential assignment such as
+  fragment is reduced to its origin, and so is one whose path holds a credential-shaped
+  run, such as the secret of a Slack, Discord or Teams webhook URL: 16 or more letters and
+  digits that mix both, or 20 or more that mix upper and lower case. A run is split at
+  `-`, `_` and `.`, so word paths such as `task-scheduler-read-2024` stay in full; a
+  recognised credential assignment such as
   `token=...` or `api_key=...` is reduced by the standard redaction, and one in a
   known token format (a JWT or a prefix the [security model](security-model.md#known-false-positive-and-false-negative-classes)
   lists, such as `ghp_`, `AKIA`, `sk-`, `xox`, `glpat-`, `AIza` or `gsk_`), even

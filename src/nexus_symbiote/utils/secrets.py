@@ -1141,6 +1141,23 @@ def redact_oauth_scope(value: str) -> str:
     return shown
 
 
+# A run of letters and digits in a scope URI's path that names a credential rather than a
+# permission: one that mixes letters with digits, or upper with lower case, as the secret
+# of a Slack, Discord or Teams webhook URL does. Permission paths are words, such as
+# ``auth/drive.readonly``, ``User.Read`` or ``task-scheduler-read-2024``.
+_SECRET_PATH_RUN = re.compile(r"[A-Za-z0-9]{16,}")
+
+
+def _secret_path(path: str) -> bool:
+    for match in _SECRET_PATH_RUN.finditer(path):
+        run = match.group()
+        mixes_kinds = not run.isdigit() and not run.isalpha()
+        mixes_case = len(run) >= 20 and run != run.lower() and run != run.upper()
+        if mixes_kinds or mixes_case:
+            return True
+    return False
+
+
 def _shown_scope(value: str) -> str:
     if len(value) > _MAX_OAUTH_SCOPE or _A2A_TOKEN_SHAPE.search(value):
         return REDACTED
@@ -1158,6 +1175,7 @@ def _shown_scope(value: str) -> str:
         and parsed.netloc
         and not any(char in "@?#" or char.isspace() for char in value)
         and redact_text(locator) == locator
+        and not _secret_path(parsed.path)
     ):
         return value
     return redacted
