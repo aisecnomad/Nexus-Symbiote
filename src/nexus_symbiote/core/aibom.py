@@ -16,11 +16,16 @@ from nexus_symbiote.core.canonical import NAMESPACE, json_text
 from nexus_symbiote.core.content_digest import inventory_content_digest
 from nexus_symbiote.core.enums import ComponentType
 from nexus_symbiote.core.models import (
+    CREDENTIAL_FORMAT_REFUSAL,
+    CREDENTIAL_SPEC_VERSION_PATTERN,
     MAX_REFERENCE_CHARS,
     AIBOMMetadata,
     AnyComponent,
+    CredentialComponent,
     UnsupportedSpecVersionError,
+    admits_credentials,
     check_spec_version,
+    credential_value_problem,
 )
 
 MAX_NATIVE_BYTES = 16 * 1024 * 1024
@@ -184,6 +189,30 @@ class AIBOM(BaseModel):
         json_schema_extra={
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "$id": SCHEMA_ID,
+            # A credential component needs a format that defines it.
+            "if": {
+                "required": ["components"],
+                "properties": {
+                    "components": {
+                        "contains": {
+                            "type": "object",
+                            "required": ["component_type"],
+                            "properties": {"component_type": {"const": "credential"}},
+                        }
+                    }
+                },
+            },
+            "then": {
+                "required": ["metadata"],
+                "properties": {
+                    "metadata": {
+                        "required": ["spec_version"],
+                        "properties": {
+                            "spec_version": {"pattern": CREDENTIAL_SPEC_VERSION_PATTERN}
+                        },
+                    }
+                },
+            },
         },
     )
 
@@ -205,6 +234,14 @@ class AIBOM(BaseModel):
             if isinstance(metadata, dict) and "spec_version" not in metadata:
                 return {**data, "metadata": {**metadata, "spec_version": UNDECLARED_SPEC_VERSION}}
         return data
+
+    @model_validator(mode="after")
+    def credentials_need_their_format(self) -> AIBOM:
+        if not admits_credentials(self.metadata.spec_version) and any(
+            c.component_type is ComponentType.CREDENTIAL for c in self.components
+        ):
+            raise ValueError(CREDENTIAL_FORMAT_REFUSAL)
+        return self
 
     @classmethod
     def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -411,10 +448,19 @@ def prepare(bom: AIBOM) -> AIBOM:
 
     Raises ``ContentSerialError`` when the content digest is undefined for the inventory,
     and ``ExportCheckError`` for a timestamp without a timezone, a duplicate component
-    reference or a dependency on an unknown component.
+    reference, a dependency on an unknown component, or a credential that holds a value
+    or a digest of one or that the declared format does not define. Validation alone
+    cannot keep a value out: a record can be changed after it was built.
     """
     if bom.metadata.timestamp is not None and bom.metadata.timestamp.tzinfo is None:
         raise ExportCheckError("export timestamps must include a timezone")
+    for component in bom.components:
+        if isinstance(component, CredentialComponent):
+            if not admits_credentials(bom.metadata.spec_version):
+                raise ExportCheckError(CREDENTIAL_FORMAT_REFUSAL)
+            problem = credential_value_problem(component)
+            if problem is not None:
+                raise ExportCheckError(problem)
     if bom.metadata.tool_version is None:
         bom.metadata.tool_version = __version__
     if bom.metadata.serial_number is None:

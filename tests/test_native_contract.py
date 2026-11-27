@@ -21,11 +21,11 @@ from nexus_symbiote.core.models import NATIVE_SPEC_VERSION, AgentComponent, Capa
 # tagged; from then on it is frozen (docs/releasing.md, step 1, re-verifies the pin).
 PINNED_NATIVE_SCHEMA_BYTES_SHA256: dict[str, str] = {
     "1.1.0": "876a82dcd9737a21d391201be3762ebbbff562badeb44646ce570c71445ce64f",
-    "1.2.0": "70abb95d441fb57bbf230c1abfb8bb6ecba56f4dd8d8f88a661598cdc52fef98",
+    "1.2.0": "bfab95e64b8c78efee69b5c5c2d006cb573cbad5ec0da7c4aca53c6c4a65144f",
 }
 PINNED_NATIVE_SCHEMA_CANONICAL_SHA256: dict[str, str] = {
     "1.1.0": "59cbd2c45069fd66039d034fd692c2944f28bf3b83d1cf457d879fd164fff309",
-    "1.2.0": "5d4877f1584f8cb480a1c2683b72f3e6e48196754e9e22b53cf691b3560b1672",
+    "1.2.0": "a9f26a0ab3f35f3f945f57ec58af2443071600c5c1688e08737182a4fbed6457",
 }
 
 
@@ -182,7 +182,9 @@ def test_the_schema_requires_the_component_type_the_reader_selects_a_model_by():
         component = AIBOM.model_validate(
             {"components": [{"bom_ref": "c", "component_type": kind, "name": "c"}]}
         ).to_dict()["components"][0]
-        assert not list(validator.iter_errors({"components": [component]})), kind
+        # A document that declares no version is read as 1.0.0, which has no credentials.
+        current = {"metadata": {"spec_version": NATIVE_SPEC_VERSION}, "components": [component]}
+        assert not list(validator.iter_errors(current)), kind
         del component["component_type"]
         document = {"components": [component]}
         assert list(validator.iter_errors(document)), kind

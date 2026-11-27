@@ -14,7 +14,14 @@ from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from nexus_symbiote.cli import main
-from nexus_symbiote.core.aibom import AIBOM, DependencyEdge, native_document
+from nexus_symbiote.core.aibom import (
+    AIBOM,
+    DependencyEdge,
+    ExportCheckError,
+    NativeFormatError,
+    native_document,
+)
+from nexus_symbiote.core.canonical import content_digest, json_text
 from nexus_symbiote.core.enums import ComponentType, RiskSeverity
 from nexus_symbiote.core.models import (
     AgentComponent,
@@ -137,8 +144,109 @@ def test_no_other_text_of_a_credential_may_hold_a_value(values: dict[str, Any]) 
 
 
 def test_a_credential_records_no_digest_of_its_value() -> None:
-    with pytest.raises(ValidationError, match="no digest"):
+    with pytest.raises(ValidationError):
         CredentialComponent(bom_ref="credential:A", name="A", hashes={"SHA-256": "0" * 64})
+    # The schema refuses what the model refuses.
+    document = _inventory().to_dict()
+    _credential(document)["hashes"] = {"SHA-256": "0" * 64}
+    assert list(_schema().iter_errors(document))
+
+
+@pytest.mark.parametrize("version", ["1.0.0", "1.1.0"])
+def test_only_a_format_that_defines_credentials_carries_one(tmp_path: Path, version: str) -> None:
+    document = _inventory().to_dict()
+    document["metadata"]["spec_version"] = version
+    assert list(_schema().iter_errors(document))
+    with pytest.raises(ValidationError):
+        AIBOM.from_document(document)
+    path = tmp_path / "bom.json"
+    path.write_text(json.dumps(document))
+    with pytest.raises(NativeFormatError):
+        AIBOM.load(path)
+    with pytest.raises(ValidationError):
+        AIBOM(metadata=AIBOMMetadata(spec_version=version), components=_inventory().components)
+    # An older document without credentials is read as before.
+    document["components"] = [
+        c for c in document["components"] if c["component_type"] != "credential"
+    ]
+    document["dependencies"] = [
+        d for d in document["dependencies"] if d["relationship"] != "acts-as-identity"
+    ]
+    assert list(_schema().iter_errors(document)) == []
+    path.write_text(json.dumps(document))
+    assert AIBOM.load(path).metadata.spec_version == version
+
+
+def test_a_document_that_declares_no_version_carries_no_credential() -> None:
+    (credential,) = (
+        c for c in _inventory().to_dict()["components"] if c["component_type"] == "credential"
+    )
+    document = {"components": [credential]}
+    assert list(_schema().iter_errors(document))
+    with pytest.raises(ValidationError):
+        AIBOM.from_document(document)
+
+
+def _hash_added(bom: AIBOM) -> None:
+    next(c for c in bom.components if isinstance(c, CredentialComponent)).hashes["SHA-256"] = (
+        "ab" * 32
+    )
+
+
+def _token_assigned(bom: AIBOM) -> None:
+    next(c for c in bom.components if isinstance(c, CredentialComponent)).description = TOKEN
+
+
+def _token_in_a_property(bom: AIBOM) -> None:
+    credential = next(c for c in bom.components if isinstance(c, CredentialComponent))
+    credential.properties.setdefault("notes", []).append(TOKEN)
+
+
+def _built_unvalidated(bom: AIBOM) -> None:
+    bom.components.append(CredentialComponent.model_construct(bom_ref="credential:x", name=TOKEN))
+
+
+def _older_format(bom: AIBOM) -> None:
+    bom.metadata.spec_version = "1.1.0"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [_hash_added, _token_assigned, _token_in_a_property, _built_unvalidated, _older_format],
+)
+def test_every_export_refuses_a_credential_changed_after_it_was_built(
+    tmp_path: Path, change: Any
+) -> None:
+    bom = _inventory(exposed=True)
+    change(bom)
+    with pytest.raises(NativeFormatError) as refused:
+        bom.to_native_json()
+    assert TOKEN not in str(refused.value)
+    target = tmp_path / "bom.json"
+    with pytest.raises(NativeFormatError):
+        bom.save(target)
+    assert not target.exists()
+    for exporter in (
+        CycloneDXGenerator(),
+        CycloneDXGenerator(spec_version="1.6", projection_version=3),
+        SPDXGenerator(),
+        SPDXGenerator(projection_version=4),
+        SARIFGenerator(scan_root=tmp_path),
+    ):
+        with pytest.raises(ExportCheckError) as refused_export:
+            exporter.generate(bom)
+        assert TOKEN not in str(refused_export.value)
+
+
+def test_recovery_refuses_an_embedded_credential_that_carries_a_digest() -> None:
+    document = CycloneDXGenerator().generate(_inventory(exposed=True))
+    properties = {p["name"]: p for p in document["metadata"]["properties"]}
+    embedded = json.loads(properties["nexus-symbiote:document"]["value"])
+    _credential(embedded)["hashes"] = {"SHA-256": "ab" * 32}
+    properties["nexus-symbiote:document"]["value"] = json_text(embedded)
+    properties["nexus-symbiote:documentDigest"]["value"] = content_digest(embedded)
+    with pytest.raises(ValueError):
+        CycloneDXGenerator.recover(document)
 
 
 def test_credential_kinds_are_a_closed_vocabulary() -> None:

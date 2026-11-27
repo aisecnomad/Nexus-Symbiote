@@ -332,7 +332,7 @@
       "properties": {
         "spec_version": {
           "default": "1.0.0",
-          "description": "Native format version. This build reads 1.0.x and 1.1.x; 1.1.0 records scan-root-relative paths",
+          "description": "Native format version. This build reads 1.0.x, 1.1.x and 1.2.x; 1.1.0 records scan-root-relative paths, and 1.2.0 adds credential components, which no earlier version carries",
           "title": "Spec Version",
           "type": "string"
         },
@@ -1348,7 +1348,7 @@
     },
     "CredentialComponent": {
       "additionalProperties": false,
-      "description": "A credential that a component authenticates with, recorded by name, never by value.\n\nThe name is what holds the credential: an environment variable, the label under\nwhich a workflow tool stores it, or the parameter a literal is passed as. A name or\nreference shaped like a credential value is refused, as is any other text of the record\nshaped like one and any digest, so neither a token nor an unkeyed digest of one can\nreach the inventory or any export of it.",
+      "description": "A credential that a component authenticates with, recorded by name, never by value.\n\nThe name is what holds the credential: an environment variable, the label under\nwhich a workflow tool stores it, or the parameter a literal is passed as. A record\nwith any text shaped like a credential value, or with any digest, is refused when it\nis built and again by every export (``core.aibom.prepare``), which a record changed\nafter it was built cannot bypass. Only format 1.2.0 and later documents carry one.",
       "properties": {
         "bom_ref": {
           "description": "Unique reference within this BOM",
@@ -1405,6 +1405,8 @@
           "additionalProperties": {
             "type": "string"
           },
+          "description": "Always empty: an unkeyed digest of a secret can be checked against a guessed or leaked value",
+          "maxProperties": 0,
           "title": "Hashes",
           "type": "object"
         },
@@ -4491,6 +4493,26 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Agent Bill of Materials \u2014 a supply chain inventory.\n\nIts metadata.completeness claim says what it covers.",
+  "if": {
+    "properties": {
+      "components": {
+        "contains": {
+          "properties": {
+            "component_type": {
+              "const": "credential"
+            }
+          },
+          "required": [
+            "component_type"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    "required": [
+      "components"
+    ]
+  },
   "properties": {
     "metadata": {
       "$ref": "#/$defs/AIBOMMetadata"
@@ -4583,6 +4605,23 @@
       "title": "Dependencies",
       "type": "array"
     }
+  },
+  "then": {
+    "properties": {
+      "metadata": {
+        "properties": {
+          "spec_version": {
+            "pattern": "^1\\.(?:[2-9]|[1-9][0-9]{1,3})\\.(?:0|[1-9][0-9]{0,5})$"
+          }
+        },
+        "required": [
+          "spec_version"
+        ]
+      }
+    },
+    "required": [
+      "metadata"
+    ]
   },
   "title": "AIBOM",
   "type": "object"

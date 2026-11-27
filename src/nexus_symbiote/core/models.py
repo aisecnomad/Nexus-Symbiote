@@ -84,6 +84,20 @@ def check_spec_version(value: object) -> None:
     )
 
 
+CREDENTIAL_SPEC_VERSION = (1, 2)
+"""The first native format version, as (major, minor), whose documents carry credentials."""
+
+CREDENTIAL_FORMAT_REFUSAL = "credential components need native format 1.2.0 or later"
+
+CREDENTIAL_SPEC_VERSION_PATTERN = r"^1\.(?:[2-9]|[1-9][0-9]{1,3})\.(?:0|[1-9][0-9]{0,5})$"
+"""A supported 1.x version at or after ``CREDENTIAL_SPEC_VERSION``, for the native schema."""
+
+
+def admits_credentials(spec_version: str) -> bool:
+    match = _SPEC_VERSION.fullmatch(spec_version)
+    return match is not None and (int(match[1]), int(match[2])) >= CREDENTIAL_SPEC_VERSION
+
+
 class InventoryModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -591,13 +605,21 @@ class CredentialComponent(ComponentBase):
     """A credential that a component authenticates with, recorded by name, never by value.
 
     The name is what holds the credential: an environment variable, the label under
-    which a workflow tool stores it, or the parameter a literal is passed as. A name or
-    reference shaped like a credential value is refused, as is any other text of the record
-    shaped like one and any digest, so neither a token nor an unkeyed digest of one can
-    reach the inventory or any export of it.
+    which a workflow tool stores it, or the parameter a literal is passed as. A record
+    with any text shaped like a credential value, or with any digest, is refused when it
+    is built and again by every export (``core.aibom.prepare``), which a record changed
+    after it was built cannot bypass. Only format 1.2.0 and later documents carry one.
     """
 
     component_type: Literal[ComponentType.CREDENTIAL] = ComponentType.CREDENTIAL
+    hashes: dict[str, str] = Field(
+        default_factory=dict,
+        max_length=0,
+        description=(
+            "Always empty: an unkeyed digest of a secret can be checked against a guessed or "
+            "leaked value"
+        ),
+    )
     credential_kind: CredentialKind | None = Field(
         default=None,
         description=(
@@ -618,12 +640,19 @@ class CredentialComponent(ComponentBase):
 
     @model_validator(mode="after")
     def _holds_no_value(self) -> CredentialComponent:
-        # An unkeyed digest of a secret can be checked against a guessed or leaked value.
-        if self.hashes:
-            raise ValueError("a credential records no digest of its value")
-        if any(holds_token_shape(text) for text in _texts(self.model_dump(mode="json"))):
-            raise ValueError("a credential record holds text shaped like a credential value")
+        problem = credential_value_problem(self)
+        if problem is not None:
+            raise ValueError(problem)
         return self
+
+
+def credential_value_problem(component: CredentialComponent) -> str | None:
+    """Why a credential record may not be written, as fixed text, or ``None``."""
+    if component.hashes:
+        return "a credential records no digest of its value"
+    if any(holds_token_shape(text) for text in _texts(component.model_dump(mode="json"))):
+        return "a credential record holds text shaped like a credential value"
+    return None
 
 
 def _texts(value: Any) -> Iterator[str]:
@@ -765,8 +794,9 @@ class AIBOMMetadata(InventoryModel):
     spec_version: str = Field(
         default=NATIVE_SPEC_VERSION,
         description=(
-            "Native format version. This build reads 1.0.x and 1.1.x; 1.1.0 records "
-            "scan-root-relative paths"
+            "Native format version. This build reads 1.0.x, 1.1.x and 1.2.x; 1.1.0 records "
+            "scan-root-relative paths, and 1.2.0 adds credential components, which no earlier "
+            "version carries"
         ),
     )
     serial_number: str | None = None
