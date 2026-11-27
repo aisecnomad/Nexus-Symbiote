@@ -2094,3 +2094,115 @@ def test_typescript_a_getter_named_like_a_database_client_returns_one(
 ) -> None:
     tool = _ts(tmp_path, handler, header)
     assert any("caller-supplied" in r.detail for r in tool.risks) is raw, handler
+
+
+# ---- Verification of 62717237: the Python statement dataflow -----------------------------
+
+
+def test_module_names_are_solved_once_for_every_tool_in_the_file() -> None:
+    from tests.support import scaling_ratio
+
+    def source(scale: int) -> ast.Module:
+        tools, length = 40 * scale, 400 * scale
+        head = "A0 = 'DROP TABLE t'\n" + "".join(f"A{i} = A{i - 1}\n" for i in range(1, length))
+        body = "".join(f"def t{i}(cur):\n    cur.execute(A{length - 1})\n" for i in range(tools))
+        return ast.parse(head + body)
+
+    trees = {scale: source(scale) for scale in (1, 4)}
+
+    def run(scale: int) -> None:
+        scopes = PythonScopes(trees[scale])
+        for node in trees[scale].body:
+            if isinstance(node, ast.FunctionDef):
+                assert classify_python(node, scopes).profile is SideEffectProfile.DESTRUCTIVE
+
+    assert scaling_ratio(run) < 10
+
+
+@pytest.mark.parametrize("order", ["reader-first", "writer-first"])
+def test_a_parameter_written_to_a_global_is_caller_supplied_only_in_its_own_tool(
+    order: str,
+) -> None:
+    tree = ast.parse(
+        "SQL = 'DELETE FROM t'\n"
+        "def write(cur, q):\n    global SQL\n    SQL = q\n    cur.execute(SQL)\n"
+        "def read(cur):\n    cur.execute(SQL)\n"
+    )
+    scopes = PythonScopes(tree)
+    write, read = (n for n in tree.body if isinstance(n, ast.FunctionDef))
+    first, second = (read, write) if order == "reader-first" else (write, read)
+    found = {f.name: classify_python(f, scopes) for f in (first, second)}
+    assert any("caller-supplied" in r.detail for r in found["write"].risks)
+    assert not any("caller-supplied" in r.detail for r in found["read"].risks)
+    assert found["read"].profile is SideEffectProfile.DESTRUCTIVE
+
+
+@pytest.mark.parametrize(
+    ("source", "raw"),
+    [
+        (
+            "ALLOWED = {'name': 'name', 'owner': 'owner_id'}\n"
+            "def tool(conn, filters):\n    sql = 'SELECT * FROM t WHERE 1=1'\n"
+            "    for key, value in filters.items():\n        if key in ALLOWED:\n"
+            "            sql += f' AND {ALLOWED[key]} = ?'\n    return conn.execute(sql)\n",
+            False,
+        ),
+        (
+            "ALLOWED = {'name': 'name', 'owner': 'owner_id'}\n"
+            "def tool(conn, field, value):\n"
+            "    return conn.execute(f'SELECT * FROM t WHERE {ALLOWED[field]} = ?', (value,))\n",
+            False,
+        ),
+        (
+            "ALLOWED = {'name': 'name', 'owner': 'owner_id'}\n"
+            "def tool(conn, field, value):\n"
+            "    return conn.execute('SELECT * FROM t WHERE {} = ?'.format(ALLOWED[field]))\n",
+            False,
+        ),
+        (
+            "ALLOWED = {'name': 'name', 'owner': 'owner_id'}\n"
+            "def tool(conn, field):\n"
+            "    return conn.execute('SELECT * FROM t WHERE %s = 1' % ALLOWED[field])\n",
+            False,
+        ),
+        (
+            "def tool(conn, descending):\n"
+            "    return conn.execute(f\"SELECT * FROM t ORDER BY a {'DESC' if descending else 'ASC'}\")\n",
+            False,
+        ),
+        (
+            "def tool(conn, name):\n    return conn.execute(f\"SELECT * FROM t WHERE n = '{name}'\")\n",
+            True,
+        ),
+        (
+            "def tool(conn, args):\n    return conn.execute(f'SELECT * FROM t WHERE n = {args[0]}')\n",
+            True,
+        ),
+        (
+            "def tool(conn, n):\n    return conn.execute(f'SELECT * FROM t WHERE n = {norm(n)}')\n",
+            True,
+        ),
+        (
+            "def tool(conn, d, col):\n    return conn.execute(f\"SELECT * FROM t ORDER BY {col if d else 'id'}\")\n",
+            True,
+        ),
+    ],
+    ids=[
+        "allow-listed-field-after-augmented-assignment",
+        "allow-listed-field",
+        "allow-listed-format-argument",
+        "allow-listed-percent-operand",
+        "condition-that-only-chooses",
+        "parameter-in-a-field-control",
+        "item-of-a-parameter-control",
+        "helper-over-a-parameter-control",
+        "chosen-parameter-control",
+    ],
+)
+def test_a_parameter_that_selects_an_allow_listed_fragment_is_not_caller_supplied(
+    source: str, raw: bool
+) -> None:
+    tree = ast.parse(source)
+    tool = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
+    found = classify_python(tool, PythonScopes(tree))
+    assert any("caller-supplied" in r.detail for r in found.risks) is raw, source

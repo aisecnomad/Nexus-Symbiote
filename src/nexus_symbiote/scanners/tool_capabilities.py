@@ -391,6 +391,8 @@ _Key = tuple[_Scope, str]
 _Binding = tuple[ast.AST, ast.AST | None, ast.AST | None, _Scope]
 # Whether a statement may be caller-supplied, and the rank of what its text does.
 _Value = tuple[bool, int]
+# The functions whose parameters a value may hold, one bit each, and the rank of its text.
+_Held = tuple[int, int]
 # A name's bindings in its own frame, each with where it starts and ends and where the block
 # that always runs it ends; their starts; and what its bindings elsewhere may give it.
 _Placed = tuple[list[tuple[int, int, int, _Binding]], list[int], _Value]
@@ -398,6 +400,10 @@ _Placed = tuple[list[tuple[int, int, int, _Binding]], list[int], _Value]
 
 def _join(a: _Value, b: _Value) -> _Value:
     return a[0] or b[0], max(a[1], b[1])
+
+
+def _hold(a: _Held, b: _Held) -> _Held:
+    return a[0] | b[0], max(a[1], b[1])
 
 
 class PythonScopes:
@@ -414,6 +420,12 @@ class PythonScopes:
         # Each name's bindings with the values they bind, under the scope that owns the name.
         self.bindings: dict[_Key, list[_Binding]] = {}
         self._statements: dict[ast.AST | None, tuple[int, list[_Key]]] = {}
+        # A function, and each parameter of it that may be caller input, to the function's bit;
+        # what each name and binding may hold, solved once for every tool in the file.
+        self.function_bits: dict[ast.AST, int] = {}
+        self._parameter_bits: dict[ast.AST, int] = {}
+        self._summaries: dict[_Key, _Held] = {}
+        self._contributions: dict[_Binding, _Held] = {}
         if tree is not None:
             self._fill(tree, self.module)
 
@@ -494,8 +506,11 @@ class PythonScopes:
             inner = self._scopes[node] = _Scope(kind, scope)
             if isinstance(node, _PY_FUNCTIONS):
                 a = node.args
+                bit = self.function_bits[node] = 1 << len(self.function_bits)
                 for argument in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg):
                     if argument is not None:
+                        if argument.arg not in {"self", "cls"}:
+                            self._parameter_bits[argument] = bit
                         self._bind(inner, argument.arg, (), (argument, None, None, inner))
         elif isinstance(node, ast.Global):
             scope.declared_global.update(node.names)
@@ -623,6 +638,67 @@ class PythonScopes:
             current = current.parent
         return nearest or self.module
 
+    def contribution(self, binding: _Binding) -> _Held:
+        """What one binding may give its name: its own text and what it is built from."""
+        if binding not in self._contributions:
+            rank, keys = self.statement(binding[2], binding[3])
+            held = self._parameter_bits.get(binding[0], 0), rank
+            for key in keys:
+                held = _hold(held, self.summary(key))
+            self._contributions[binding] = held
+        return self._contributions[binding]
+
+    def summary(self, key: _Key) -> _Held:
+        """What ``key`` may hold anywhere: every binding of it and of the names it is built
+        from. Names built from each other hold one value, so each group of them is solved
+        once, after the groups it is built from, and each reference is joined once."""
+        if key in self._summaries:
+            return self._summaries[key]
+        order: dict[_Key, int] = {}
+        low: dict[_Key, int] = {}
+        place: dict[_Key, int] = {}  # Where a name sits on ``group``.
+        held: dict[_Key, _Held] = {}
+        refs: dict[_Key, list[_Key]] = {}
+        group: list[_Key] = []
+        frames = [(key, 0)]
+        while frames:
+            current, at = frames[-1]
+            if at == 0:
+                order[current] = low[current] = len(order)
+                place[current] = len(group)
+                group.append(current)
+                value, found = (0, 0), []
+                for where, _, source, reads in self.bindings.get(current, ()):
+                    rank, keys = self.statement(source, reads)
+                    value = _hold(value, (self._parameter_bits.get(where, 0), rank))
+                    found.extend(keys)
+                held[current], refs[current] = value, found
+            if at < len(refs[current]):
+                frames[-1] = (current, at + 1)
+                ref = refs[current][at]
+                if ref in self._summaries:
+                    held[current] = _hold(held[current], self._summaries[ref])
+                elif ref not in order:
+                    frames.append((ref, 0))
+                else:  # Visited and not solved: part of the group being solved.
+                    low[current] = min(low[current], order[ref])
+                continue
+            frames.pop()
+            if low[current] == order[current]:
+                start = place[current]
+                value = (0, 0)
+                for member in group[start:]:
+                    value = _hold(value, held[member])
+                self._summaries.update(dict.fromkeys(group[start:], value))
+                del group[start:]
+            if frames:
+                parent = frames[-1][0]
+                if current in self._summaries:
+                    held[parent] = _hold(held[parent], self._summaries[current])
+                else:
+                    low[parent] = min(low[parent], low[current])
+        return self._summaries[key]
+
     def statement(self, node: ast.AST | None, scope: _Scope) -> tuple[int, list[_Key]]:
         """The rank of the SQL text ``node`` may evaluate to, with each alternative read on
         its own and any other part as ``?``, and the names that text is taken from."""
@@ -730,7 +806,22 @@ def _chain_through(node: ast.AST) -> tuple[str, bool] | None:
 
 
 def _names_in(node: ast.AST) -> set[str]:
-    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    """The names a value put into a statement may take its text from: every name in it but
+    the item it selects with, as ``field`` in ``ALLOWED[field]``, and a condition that only
+    chooses between values."""
+    names: set[str] = set()
+    pending = [node]
+    while pending:
+        part = pending.pop()
+        if isinstance(part, ast.Name):
+            names.add(part.id)
+        elif isinstance(part, ast.Subscript):
+            pending.append(part.value)
+        elif isinstance(part, ast.IfExp):
+            pending += [part.body, part.orelse]
+        elif not isinstance(part, ast.Compare):
+            pending.extend(ast.iter_child_nodes(part))
+    return names
 
 
 def _literal(node: ast.AST | None) -> str | None:
@@ -772,9 +863,8 @@ class _PythonBody:
         a = function.args
         every = (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg)
         self.arguments = {p for p in every if p is not None and p.arg not in {"self", "cls"}}
-        self.summaries: dict[_Key, _Value] = {}
+        self.bit = scopes.function_bits.get(function, 0)
         self._placed: dict[_Key, _Placed] = {}
-        self._contributions: dict[_Binding, _Value] = {}
 
     def evaluate(self, node: ast.AST | None, scope: _Scope) -> _Value:
         """What the statement ``node`` may be where the current node runs."""
@@ -831,43 +921,14 @@ class _PythonBody:
         return self._placed[key]
 
     def contribution(self, binding: _Binding) -> _Value:
-        """What one binding may give its name: its own text and what it is built from."""
-        if binding not in self._contributions:
-            rank, keys = self.scopes.statement(binding[2], binding[3])
-            value = (binding[0] in self.arguments, rank)
-            for key in keys:
-                value = _join(value, self.summary(key))
-            self._contributions[binding] = value
-        return self._contributions[binding]
+        """What one binding may give its name, for this tool's parameters."""
+        held, rank = self.scopes.contribution(binding)
+        return bool(held & self.bit), rank
 
     def summary(self, key: _Key) -> _Value:
-        """What ``key`` may hold anywhere: every binding of it and of the names it is built
-        from, solved for every name reached at once so that a cycle reads every value."""
-        if key not in self.summaries:
-            found: dict[_Key, _Value] = {}
-            users: dict[_Key, set[_Key]] = {}
-            pending = [key]
-            while pending:
-                current = pending.pop()
-                if current in found or current in self.summaries:
-                    continue
-                found[current] = (False, 0)
-                for where, _, source, reads in self.scopes.bindings.get(current, ()):
-                    rank, keys = self.scopes.statement(source, reads)
-                    found[current] = _join(found[current], (where in self.arguments, rank))
-                    for ref in keys:
-                        users.setdefault(ref, set()).add(current)
-                        pending.append(ref)
-            queue = list(users)
-            while queue:
-                ref = queue.pop()
-                known = self.summaries[ref] if ref in self.summaries else found[ref]
-                for user in users.get(ref, ()):
-                    if (joined := _join(found[user], known)) != found[user]:
-                        found[user] = joined
-                        queue.append(user)
-            self.summaries.update(found)
-        return self.summaries[key]
+        """What ``key`` may hold anywhere, for this tool's parameters."""
+        held, rank = self.scopes.summary(key)
+        return bool(held & self.bit), rank
 
 
 def _open_mode(call: ast.Call) -> str | None:
