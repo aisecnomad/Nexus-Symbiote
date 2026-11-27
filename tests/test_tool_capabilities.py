@@ -850,3 +850,89 @@ def test_typescript_literal_sql_is_classified_by_its_statement(
     tool = _ts(tmp_path, handler)
     assert _caps(tool) == expected, handler
     assert not [r for r in tool.risks if r.category == "capability_scope"], handler
+
+
+@pytest.mark.parametrize(
+    ("body", "expected", "raw"),
+    [
+        (
+            "    sql = 'DELETE FROM t'\n    conn.execute(sql)\n    sql = 'SELECT 1'\n"
+            "    return conn.execute(sql)\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    sql = f'DELETE FROM t WHERE n = {q}'\n    conn.execute(sql)\n    sql = 'SELECT 1'\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            True,
+        ),
+        ("    sql = 'SELECT 1'\n    conn.execute(sql)\n    sql = 'DELETE FROM t'\n", set(), False),
+        (
+            "    if q:\n        sql = 'DELETE FROM t'\n    else:\n        sql = 'SELECT 1'\n"
+            "    conn.execute(sql)\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    sql = 'SELECT 1'\n    for row in q:\n        conn.execute(sql)\n"
+            "        sql = 'UPDATE t SET seen = 1'\n",
+            {E.WRITE},
+            False,
+        ),
+        ("    return conn.execute('EXPLAIN DELETE FROM t')\n", set(), False),
+        ("    return conn.execute('EXPLAIN QUERY PLAN DELETE FROM t')\n", set(), False),
+        (
+            "    return conn.execute('EXPLAIN ANALYZE DELETE FROM t')\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    return conn.execute('EXPLAIN (ANALYZE, BUFFERS) UPDATE t SET a = 1')\n",
+            {E.WRITE},
+            False,
+        ),
+        (
+            "    return conn.execute('SELECT $doc$ Use UPDATE t SET a = 1; DROP TABLE t $doc$')\n",
+            set(),
+            False,
+        ),
+        ("    return conn.execute('SELECT $$ (DELETE FROM t) $$')\n", set(), False),
+        (
+            "    return conn.execute('DELETE FROM t WHERE id = $1', (q,))\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+    ],
+    ids=[
+        "later-assignment",
+        "later-assignment-of-caller-text",
+        "assignment-after-the-call",
+        "either-branch",
+        "loop-carried",
+        "explain",
+        "explain-query-plan",
+        "explain-analyze",
+        "explain-options",
+        "dollar-quoted",
+        "empty-dollar-tag",
+        "positional-parameter",
+    ],
+)
+def test_sql_is_classified_at_the_call_as_it_runs(
+    body: str, expected: set[CapabilityClass], raw: bool
+) -> None:
+    found = _classify(f"def tool(q, conn):\n{body}")
+    assert set(found.capabilities) == expected, body
+    assert any("caller-supplied" in r.detail for r in found.risks) is raw, body
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        "() => db.query('EXPLAIN UPDATE t SET a = 1')",
+        "() => db.query('SELECT $$; DROP TABLE t $$')",
+    ],
+    ids=["explain", "dollar-quoted"],
+)
+def test_typescript_plans_and_quoted_sql_write_nothing(tmp_path: Path, handler: str) -> None:
+    assert _caps(_ts(tmp_path, handler)) == set(), handler

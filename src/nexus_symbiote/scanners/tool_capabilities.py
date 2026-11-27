@@ -109,6 +109,8 @@ _SQL_OBJECTS = frozenset(
 # Words after which the next word still starts the statement.
 _SQL_PREFIXES = frozenset({"EXPLAIN", "ANALYZE", "VERBOSE", "BEGIN", "DO"})
 _SQL_WORD = re.compile(r"[^\W\d]\w*")
+_SQL_DOLLAR = re.compile(r"\$(?:[^\W\d]\w*)?\$")
+_SQL_RANK = {None: 0, "write": 1, "destructive": 2}
 
 # ---- TypeScript ---------------------------------------------------------------------------
 _TS_EXECUTE = frozenset(
@@ -241,6 +243,10 @@ def _sql_tokens(text: str) -> list[str]:
         elif char in "();":
             tokens.append(char)
             i += 1
+        elif tag := _SQL_DOLLAR.match(text, i):
+            # PostgreSQL dollar quoting; ``$1`` is a parameter, not a quote.
+            end = text.find(tag.group(), tag.end())
+            i = n if end < 0 else end + len(tag.group())
         elif word := _SQL_WORD.match(text, i):
             tokens.append(word.group().upper())
             i = word.end()
@@ -264,7 +270,9 @@ def _sql_effect(text: str | None) -> str | None:
     for end in [*(k for k, part in enumerate(tokens) if part == ";"), len(tokens)]:
         statement, begin = tokens[begin:end], end + 1
         words = set(statement)
-        common_table = bool(statement) and statement[0] == "WITH"
+        if statement[:1] == ["EXPLAIN"] and "ANALYZE" not in words:
+            continue  # A plan: the statement it describes does not run.
+        restart = statement[:1] in (["WITH"], ["EXPLAIN"])
         start, depth = True, 0
         for k, word in enumerate(statement):
             if word == "(":
@@ -272,7 +280,7 @@ def _sql_effect(text: str | None) -> str | None:
                 continue
             if word == ")":
                 depth = max(depth - 1, 0)
-                start = common_table and depth == 0
+                start = restart and depth == 0
                 continue
             if start and word in _SQL_PREFIXES:
                 continue
@@ -578,15 +586,17 @@ def _literal(node: ast.AST | None) -> str | None:
 
 
 class _PythonBody:
-    """A tool's parameters and the values its body assigns, for the SQL it passes on."""
+    """A tool's parameters and the statements its body assigns, by program point."""
 
     def __init__(
         self,
         function: ast.FunctionDef | ast.AsyncFunctionDef,
-        nodes: list[ast.AST],
+        nodes: list[tuple[ast.AST, _Scope, int]],
         scopes: PythonScopes,
     ) -> None:
         self.scopes = scopes
+        self.loops = [loop for _, _, loop in nodes]
+        self.at = 0  # The node being classified.
         arguments = function.args
         self.parameters = {
             a.arg for a in arguments.posonlyargs + arguments.args + arguments.kwonlyargs
@@ -594,8 +604,10 @@ class _PythonBody:
         for extra in (arguments.vararg, arguments.kwarg):
             if extra is not None:
                 self.parameters.add(extra.arg)
-        self.values: dict[str, ast.expr] = {}
-        for node in nodes:
+        # Per name, each statement assigned to it: where, in which outermost loop, whether it
+        # is caller-supplied, and the rank of what its text does.
+        self.values: dict[str, list[tuple[int, int, bool, int]]] = {}
+        for index, (node, scope, loop) in enumerate(nodes):
             targets: list[tuple[ast.expr, ast.expr | None]] = []
             if isinstance(node, ast.Assign):
                 targets = [(target, node.value) for target in node.targets]
@@ -605,7 +617,19 @@ class _PythonBody:
                 targets = [(i.optional_vars, i.context_expr) for i in node.items if i.optional_vars]
             for target, value in targets:
                 if isinstance(target, ast.Name) and value is not None:
-                    self.values[target.id] = value
+                    text = self.unwrap(value, scope)
+                    rank = _SQL_RANK[_sql_effect(_literal(text))]
+                    entry = (index, loop, self.caller_supplied(text), rank)
+                    self.values.setdefault(target.id, []).append(entry)
+
+    def reaching(self, name: str) -> tuple[bool, int]:
+        """Whether a statement ``name`` may hold at the current call is caller-supplied, and
+        the strongest rank: assigned before the call, or anywhere in the same loop."""
+        loop, supplied, rank = self.loops[self.at], False, 0
+        for index, assigned_loop, assigned_supplied, assigned_rank in self.values.get(name, ()):
+            if index < self.at or (loop >= 0 and assigned_loop == loop):
+                supplied, rank = supplied or assigned_supplied, max(rank, assigned_rank)
+        return supplied, rank
 
     def unwrap(self, node: ast.AST | None, scope: _Scope) -> ast.AST | None:
         """The text a SQLAlchemy ``text()`` wraps, through ``.bindparams()`` and the like."""
@@ -623,15 +647,10 @@ class _PythonBody:
             base = base.func.value
         return node
 
-    def caller_supplied(self, node: ast.AST | None, scope: _Scope, depth: int = 0) -> bool:
+    def caller_supplied(self, node: ast.AST | None) -> bool:
         """A statement that is a parameter, or text built from one."""
-        if node is None:
-            return False
         if isinstance(node, ast.Name):
-            if node.id in self.parameters:
-                return True
-            value = self.unwrap(self.values.get(node.id), scope)
-            return depth == 0 and value is not None and self.caller_supplied(value, scope, 1)
+            return node.id in self.parameters
         if isinstance(node, ast.JoinedStr):
             interpolated = set().union(
                 *(_names_in(p) for p in node.values if isinstance(p, ast.FormattedValue))
@@ -648,11 +667,6 @@ class _PythonBody:
             return bool(set().union(*(_names_in(a) for a in arguments)) & self.parameters)
         return False
 
-    def statement_text(self, node: ast.AST | None, scope: _Scope) -> str | None:
-        if isinstance(node, ast.Name) and node.id in self.values:
-            node = self.unwrap(self.values[node.id], scope)
-        return _literal(node)
-
 
 def _open_mode(call: ast.Call) -> str | None:
     modes = list(call.args[1:2]) + [k.value for k in call.keywords if k.arg == "mode"]
@@ -668,19 +682,23 @@ def classify_python(
 ) -> ToolCapabilities:
     """Classify a Python tool body by the calls it names, never by its decorators."""
     scopes = scopes if scopes is not None else PythonScopes()
-    nodes: list[tuple[ast.AST, _Scope]] = []
+    # Each node with its scope and the index of its outermost enclosing loop, or -1.
+    nodes: list[tuple[ast.AST, _Scope, int]] = []
     own = scopes.scope(function)
-    pending: list[tuple[ast.AST, _Scope]] = [(s, own) for s in reversed(function.body)]
+    pending: list[tuple[ast.AST, _Scope, int]] = [(s, own, -1) for s in reversed(function.body)]
     while pending:
-        node, scope = pending.pop()
-        nodes.append((node, scope))
+        node, scope, loop = pending.pop()
+        nodes.append((node, scope, loop))
         if len(nodes) > MAX_BODY_NODES:
             return ToolCapabilities(unclassified=True)
-        pending.extend(reversed(scopes.children(node, scope)))
-    body = _PythonBody(function, [node for node, _ in nodes], scopes)
+        if loop < 0 and isinstance(node, ast.For | ast.AsyncFor | ast.While):
+            loop = len(nodes) - 1
+        pending.extend((c, s, loop) for c, s in reversed(scopes.children(node, scope)))
     seen = _Observed()
     try:
-        for node, scope in nodes:
+        body = _PythonBody(function, nodes, scopes)
+        for index, (node, scope, _) in enumerate(nodes):
+            body.at = index
             _python_node(node, scope, scopes, body, seen)
     except _TooManyTargetsError:
         return ToolCapabilities(unclassified=True)
@@ -776,17 +794,21 @@ def _python_call(
 
 def _python_sql(call: ast.Call, scope: _Scope, body: _PythonBody, seen: _Observed) -> None:
     statement = body.unwrap(call.args[0] if call.args else None, scope)
-    if body.caller_supplied(statement, scope):
+    if isinstance(statement, ast.Name) and statement.id not in body.parameters:
+        supplied, rank = body.reaching(statement.id)
+    else:
+        supplied = body.caller_supplied(statement)
+        rank = _SQL_RANK[_sql_effect(_literal(statement))]
+    if supplied:
         seen.raw_sql = True
-        seen.delete()
-        return
-    _sql_record(_sql_effect(body.statement_text(statement, scope)), seen)
+        rank = 2
+    _sql_record(rank, seen)
 
 
-def _sql_record(effect: str | None, seen: _Observed) -> None:
-    if effect == "destructive":
+def _sql_record(rank: int, seen: _Observed) -> None:
+    if rank == 2:
         seen.delete()
-    elif effect == "write":
+    elif rank == 1:
         seen.write()
 
 
@@ -1281,7 +1303,7 @@ def _ts_call(
             seen.raw_sql = True
             seen.delete()
         else:
-            _sql_record(_sql_effect(_ts_literal_text(statement)), seen)
+            _sql_record(_SQL_RANK[_sql_effect(_ts_literal_text(statement))], seen)
 
 
 def _ts_literal_text(node: Node) -> str | None:
