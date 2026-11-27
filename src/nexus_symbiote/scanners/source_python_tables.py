@@ -79,8 +79,7 @@ ROUTERS: dict[tuple[str, str], str] = {
     ("langchain.embeddings", "init_embeddings"): ":",
     ("pydantic_ai", "Agent"): ":", ("pydantic_ai", "infer_model"): ":",
 }  # fmt: skip
-# Libraries, and classes elsewhere, that load a model to run here, where options may let it
-# run its own code. A hosted endpoint, a hub client and a GGUF or ONNX runtime run none.
+# Loaders that run a model here, whose options may let it run its own code; GGUF and ONNX hold none.
 WEIGHT_ROOTS = ("diffusers", "peft", "sentence_transformers", "transformers", "vllm")
 WEIGHT_CLASSES = frozenset(
     {
