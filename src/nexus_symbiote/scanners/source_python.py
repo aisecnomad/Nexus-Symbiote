@@ -697,11 +697,14 @@ class PythonReader:
         self._follow_into(_Value(module, node), found, set(), depth)
         return found
 
-    def _follow_into(self, value: _Value, out: list[_Value], seen: set[int], depth: int) -> None:
+    def _follow_into(
+        self, value: _Value, out: list[_Value], seen: set[tuple[int, frozenset[str]]], depth: int
+    ) -> None:
         module, node = value.module, value.node
-        if id(node) in seen:
+        # Reached under other variables, as a fallback two of them share, it is new.
+        if (id(node), value.variables) in seen:
             return
-        seen.add(id(node))
+        seen.add((id(node), value.variables))
         self._steps -= 1
         if depth > MAX_DEPTH or self._steps <= 0:
             self._shallow = self._cut = True
@@ -840,7 +843,8 @@ class PythonReader:
         read = self._environment_read(module, node)
         if read is not None:
             name, default = read
-            if default is None:
+            if default is None or _falsy(default):
+                # No default, or one that names no model: the environment alone sets it.
                 return (), False
             texts, complete = self._strings(module, default, depth + 1)
             if environment_name(name) is None:
@@ -919,6 +923,7 @@ class PythonReader:
                 return None
             held = resolved[1][0].node
         given: dict[str, ast.expr] = {}
+        self._steps -= len(held.keys) if isinstance(held, ast.Dict) else 1
         if isinstance(held, ast.Dict):
             for key, item in zip(held.keys, held.values, strict=True):
                 if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
@@ -927,10 +932,10 @@ class PythonReader:
         elif isinstance(held, ast.Call) and self.origin(module, held.func) == "builtins.dict":
             if held.args or any(keyword.arg is None for keyword in held.keywords):
                 return None
+            self._steps -= len(held.keywords)
             given = _keywords(held)
         else:
             return None
-        self._steps -= len(given)
         return given
 
     def _analyse(self, module: Module) -> None:
@@ -991,8 +996,10 @@ class PythonReader:
         for keyword in call.keywords:
             given = None if keyword.arg is not None else self._spread(module, keyword.value)
             if given is not None:
-                for key, item in given.items():
-                    keywords.setdefault(key, item)
+                if keywords.keys() & given.keys():
+                    # Python refuses a call given one keyword twice, so it gives no model.
+                    return
+                keywords.update(given)
             elif keyword.arg is None:
                 spread.append(keyword.value)
         embedding = "embed" in (origin or "").lower()
@@ -1074,7 +1081,7 @@ class PythonReader:
         """Account for what a value of a model argument holds besides the text read."""
         module, node = value.module, value.node
         read = self._environment_read(module, node)
-        if read is not None and read[1] is None and environment_name(read[0]):
+        if read is not None and _falsy(read[1]) and environment_name(read[0]):
             # A model that only the environment sets has no value here to record.
             first = self._found.unresolved_environment.setdefault((module.path, read[0]), point[0])
             self._found.unresolved_environment[(module.path, read[0])] = min(first, point[0])
