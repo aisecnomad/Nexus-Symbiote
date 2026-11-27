@@ -278,6 +278,42 @@ env_http_headers = { X-Auth = "SECONDARY_TOKEN", X-Backup = "SHARED_API_TOKEN" }
     assert "unrelated-value-in-test-environment" not in bom.model_dump_json()
 
 
+def test_codex_http_env_references_require_a_valid_header_name(tmp_path):
+    from nexus_symbiote.core.aibom import AIBOM
+    from nexus_symbiote.graph import blast_radius
+
+    toml = """
+[mcp_servers.catalog]
+url = "https://catalog.example.test/mcp"
+bearer_token_env_var = "BEARER_TOKEN"
+[mcp_servers.catalog.env_http_headers]
+"Bad Header" = "UNUSED_TOKEN"
+"Bad:Header" = "UNUSED_TOKEN"
+"Ü" = "UNUSED_TOKEN"
+"" = "UNUSED_TOKEN"
+"+" = "ONE_CHAR_TOKEN"
+"X-Auth" = "FIRST_TOKEN"
+"x-auth" = "SECOND_TOKEN"
+[mcp_servers.local]
+command = "catalog"
+env_vars = ["UNUSED_TOKEN", "FIRST_TOKEN"]
+"""
+    result = scan(tmp_path, {".codex/config.toml": toml})
+    assert not result.scan_failures
+    found = servers(result)
+    catalog = found["catalog"]
+    assert catalog.properties["env_vars_referenced"] == [
+        "BEARER_TOKEN",
+        "FIRST_TOKEN",
+        "ONE_CHAR_TOKEN",
+        "SECOND_TOKEN",
+    ]
+    shared = blast_radius(AIBOM(components=result.components), catalog.bom_ref)
+    assert shared["shared_credential_surfaces"] == {
+        "FIRST_TOKEN": sorted([catalog.bom_ref, found["local"].bom_ref])
+    }
+
+
 def test_codex_only_emits_safe_names_in_interpreted_locations(tmp_path):
     toml = """
 [mcp_servers.remote]

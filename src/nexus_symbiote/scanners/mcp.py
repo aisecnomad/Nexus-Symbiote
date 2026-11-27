@@ -2479,6 +2479,8 @@ _LIST_FIELDS = _names(
 )
 _MAP_FIELDS = frozenset({"env", "headers", "http_headers", "env_http_headers"})
 _CODEX_FORWARDING_FIELDS = frozenset({"env_vars", "env_http_headers", "bearer_token_env_var"})
+# http::HeaderName::from_bytes accepts ASCII field-name tokens up to 65,535 bytes.
+_CODEX_HTTP_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~A-Za-z0-9-]{1,65535}")
 # Codex's NON_INHERITABLE_ENV_VARS, pinned in docs/collectors.md.
 _CODEX_STDIO_BLOCKED_ENV = _names(
     "CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN NODE_REPL_AUTH_TOKEN CODEX_GUARDIAN_DECISIONS_API_KEY "
@@ -2884,7 +2886,11 @@ def _codex_env_references(
             return {}
         if "bearer_token_env_var" in config:
             local.add(config["bearer_token_env_var"])
-        local.update(config.get("env_http_headers", {}).values())
+        local.update(
+            name
+            for header, name in config.get("env_http_headers", {}).items()
+            if _CODEX_HTTP_HEADER_NAME.fullmatch(header)
+        )
     # These fields take arbitrary strings. Export identifier-shaped names only, using
     # the same scan-wide literal and token checks that protect names in findings.
     properties = {}

@@ -28,6 +28,9 @@ For local and remote stdio servers, the collector omits names that Codex removes
 from the child environment, including explicit `env` assignments. Codex matches
 these names without regard to ASCII case. HTTP bearer and header variables are
 resolved separately. [Codex restricted names](https://github.com/openai/codex/blob/57b493a648aa44547f5debf6e3344fcd2b2af529/codex-rs/protocol/src/shell_environment.rs#L18-L35) · [Codex MCP environment handling](https://github.com/openai/codex/blob/57b493a648aa44547f5debf6e3344fcd2b2af529/codex-rs/rmcp-client/src/utils.rs#L16-L100).
+An `env_http_headers` entry contributes a credential reference only when its
+header name is valid HTTP syntax. Case variants of the same header can reference
+different variables, so the inventory lists each candidate. [Codex header handling](https://github.com/openai/codex/blob/57b493a648aa44547f5debf6e3344fcd2b2af529/codex-rs/rmcp-client/src/utils.rs#L101-L155)
 `blast-radius` uses only the local names when identifying shared credential
 references. Remote HTTP configurations do not establish a local host credential.
 The collector reads the declarations without looking up the variables. Runtime
