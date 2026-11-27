@@ -785,6 +785,31 @@ def _operator_policy_options(func: _F) -> _F:
     )
 
 
+def _project_replay_options(func: _F) -> _F:
+    return _apply_options(
+        func,
+        click.option(
+            "--all-packages",
+            is_flag=True,
+            help="Recollect every supported package and image declaration. Requires --project.",
+        ),
+        click.option(
+            "--advisory-db",
+            type=click.Path(exists=True, path_type=Path),
+            help="Recheck findings against an offline OSV bundle outside the checkout. Requires --project.",
+        ),
+    )
+
+
+def _require_project_replay(
+    project: str | Path | None, *, all_packages: bool, advisory_db: Path | None
+) -> None:
+    if project is None:
+        for option, supplied in (("--all-packages", all_packages), ("--advisory-db", advisory_db)):
+            if supplied:
+                raise click.BadParameter(f"{option} requires --project", param_hint=option)
+
+
 def _step_summary_path(
     ctx: click.Context, param: click.Parameter, value: str | None
 ) -> Path | None:
@@ -2100,6 +2125,7 @@ def _attestation_collection_failed(attestation_report: Mapping[str, object] | No
     type=click.Path(exists=True, file_okay=False),
     help="Project root for cross-validation; the only source of a project policy",
 )
+@_project_replay_options
 @click.option(
     "--signature-policy",
     type=click.Path(exists=True, path_type=Path),
@@ -2189,6 +2215,8 @@ def validate(
     attestation_max_age_days: int | None = None,
     detailed_exit_codes: bool = False,
     legacy_exit_codes: bool = False,
+    all_packages: bool = False,
+    advisory_db: Path | None = None,
 ) -> None:
     """Validate an AIBOM for completeness and integrity.
 
@@ -2199,6 +2227,7 @@ def validate(
     detailed = _apply_exit_code_flags(detailed_exit_codes, legacy_exit_codes)
     effective_format = _resolve_report_format(json_output, report_format)
     _unsigned_discovery_flags(fail_on_unsigned_discovery, allow_unsigned_discovery)
+    _require_project_replay(project, all_packages=all_packages, advisory_db=advisory_db)
     if require_discovery_signature and not project:
         raise click.BadParameter(
             "--require-discovery-signature requires --project",
@@ -2259,7 +2288,7 @@ def validate(
     bound_imports: frozenset[str] = frozenset()
     supplier_observed: frozenset[str] = frozenset()
     completeness: dict[str, Any] = {"status": "skipped", "skipped_by": "policy"}
-    if policy.validation.require_completeness:
+    if policy.validation.require_completeness or all_packages or advisory_db is not None:
         cv = CompletenessValidator()
         c_report = (
             cv.validate_against_project(
@@ -2268,6 +2297,8 @@ def validate(
                 exclude_paths=policy.scan.exclude_paths,
                 signature_policies=signature_policies,
                 accept_default_excludes=accept_default_excludes or accept_default_exclude,
+                all_packages=all_packages,
+                advisory_db=advisory_db,
             )
             if root is not None
             else cv.validate(bom)
@@ -2394,6 +2425,7 @@ def validate(
         "the only source of a project policy."
     ),
 )
+@_project_replay_options
 @click.option(
     "--signature-policy",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
@@ -2481,11 +2513,14 @@ def risk(
     attestation_max_age_days: int | None = None,
     detailed_exit_codes: bool = False,
     legacy_exit_codes: bool = False,
+    all_packages: bool = False,
+    advisory_db: Path | None = None,
 ) -> None:
     """Score supply-chain risks in an AIBOM."""
     detailed = _apply_exit_code_flags(detailed_exit_codes, legacy_exit_codes)
     effective_format = _resolve_report_format(json_output, report_format)
     _unsigned_discovery_flags(fail_on_unsigned_discovery, allow_unsigned_discovery)
+    _require_project_replay(project, all_packages=all_packages, advisory_db=advisory_db)
     if no_score_threshold and threshold is not None:
         raise click.UsageError("--threshold and --no-score-threshold cannot be combined")
     if require_discovery_signature and project is None:
@@ -2589,6 +2624,8 @@ def risk(
             exclude_paths=policy.scan.exclude_paths,
             signature_policies=signature_policies,
             accept_default_excludes=accept_default_excludes or accept_default_exclude,
+            all_packages=all_packages,
+            advisory_db=advisory_db,
         )
         discovery: list[str] = []
         if discovery_signature_required(

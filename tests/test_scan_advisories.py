@@ -292,7 +292,8 @@ def test_an_all_packages_scan_reconciles_against_its_unchanged_checkout(tmp_path
     }
     assert flags == {"langchain": True, "requests": False}
     validated = CliRunner().invoke(
-        main, ["validate", str(out), "--project", str(project), "--no-project-policy"]
+        main,
+        ["validate", str(out), "--project", str(project), "--all-packages", "--no-project-policy"],
     )
     assert "no matching local evidence" not in validated.output, validated.output
     assert "project-reconciliation-failed" not in validated.output, validated.output

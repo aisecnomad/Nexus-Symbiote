@@ -6,8 +6,8 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ### Added
 
-- **`scan --all-packages`:** inventories supported package and base image declarations beyond the AI catalog. PyPI and npm entries record `properties.ai_catalog`. The checked-project gate recollects the expanded inventory.
-- **`scan --advisory-db PATH`:** matches exact PyPI/npm pins against an offline OSV bundle and exports one CycloneDX vulnerability per advisory across all affected packages. The completeness receipt records the bundle's digest, matching coverage, and package counts. An unstated severity produces a medium finding with an explanation and an unknown CycloneDX rating.
+- **`scan --all-packages`:** inventories supported package and base image declarations beyond the AI catalog. PyPI and npm entries record `properties.ai_catalog`. Use `--all-packages` with `validate --project` or `risk --project` to require the same scope during recollection.
+- **`scan --advisory-db PATH`:** matches exact PyPI/npm pins against an offline OSV bundle and exports one CycloneDX vulnerability per advisory across all affected packages. The completeness receipt records the bundle's digest, matching coverage, and package counts. An unstated severity produces a medium finding with an explanation and an unknown CycloneDX rating. Project validation and risk can recheck the inventory against an explicitly selected bundle outside the checkout.
 
 ## [0.2.0] - 2026-11-25
 

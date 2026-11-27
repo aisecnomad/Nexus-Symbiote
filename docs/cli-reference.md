@@ -799,6 +799,8 @@ nexus-symbiote risk [OPTIONS] AIBOM_PATH
 | `--no-score-threshold` | Do not gate on the aggregate score. Findings at or above `--fail-on-severity`, unverified SafeTensors, incomplete coverage and missing evidence still fail the gate. Cannot be combined with `--threshold`. |
 | `--json-output` | Output as JSON |
 | `--project` `DIRECTORY` | Reconcile the supplied BOM against this project's static evidence before scoring; a failed reconciliation reports an unknown risk level and a null score. The only source of a project policy: without it the built-in policy applies |
+| `--all-packages` | Use the package and image scope of `scan --all-packages`. Requires `--project`. |
+| `--advisory-db` `PATH` | Recheck advisory findings against an offline OSV bundle outside the project. Requires `--project`. |
 | `--signature-policy` `FILE` | Explicit operator signer policy for model recollection; requires --project |
 | `--fail-on-severity` `critical\|high\|medium\|low\|info\|none` | Fail on any finding at or above this severity (default: from policy, built-in critical); none disables it. |
 | `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. `root:.git` accepts the checkout marker. Explicit `.git` also accepts regular nested Git metadata files without following their pointers. |
@@ -1030,8 +1032,8 @@ the bundle does not state is recorded as a medium finding that says so and expor
 `unknown` rating. The feed-age check uses the current clock, so a bundle older than the
 matcher's default feed age turns the match into a collection failure even under
 `SOURCE_DATE_EPOCH`. Under `--all-packages` every PyPI or npm entry records
-`properties.ai_catalog`, and `validate --project` recollects with the same scope. Nothing
-leaves the machine.
+`properties.ai_catalog`. Use the same flags when independently checking the inventory
+with `validate --project` or `risk --project`. Nothing leaves the machine.
 
 ### `summary`
 
@@ -1089,6 +1091,8 @@ nexus-symbiote validate [OPTIONS] AIBOM_PATH
 | Option | Description |
 |---|---|
 | `--project` `DIRECTORY` | Project root for cross-validation. The only source of a project policy: without it the built-in policy applies |
+| `--all-packages` | Use the package and image scope of `scan --all-packages`. Requires `--project`. |
+| `--advisory-db` `PATH` | Recheck advisory findings against an offline OSV bundle outside the project. Requires `--project`. |
 | `--signature-policy` `PATH` | Explicit operator signer policy JSON; requires --project |
 | `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. `root:.git` accepts the checkout marker. Explicit `.git` also accepts regular nested Git metadata files without following their pointers. |
 | `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`). Without this flag such an entry makes coverage partial. An empty directory does not. |
@@ -1124,14 +1128,28 @@ fresh local collection of that project, and the basis is `project-reconciled`,
 cannot confirm; each is listed as a `SUPPLIER-CLAIM` line) or
 `project-reconciliation-failed`; `risk --project` uses the same values. When the
 project policy sets `validate.require_completeness: false`, `validate --project`
-skips that comparison and reports `project-not-reconciled`; `risk --project`
-reconciles regardless. The completeness check also prints the completeness validator's own `Basis:`
+skips that comparison and reports `project-not-reconciled` unless the operator explicitly
+requests `--all-packages` or `--advisory-db`. `risk --project` always reconciles.
+The completeness check also prints the completeness validator's own `Basis:`
 (`supplied-claims` without `--project`). Integrity is `PASS`, `FAIL` or `UNKNOWN`;
 unknown fails the check, and when no issue explains it the report says that no hash
 or signature could be verified. When the inventory carries ShadowScan discovery
 evidence that no producer check covered, the report says
 `Discovery producer: not verified (unsigned evidence accepted)`. The report ends with
 `Validation: PASSED` or `Validation: FAILED`.
+
+Use `--all-packages` when checking an inventory collected with `scan --all-packages`.
+Both `validate --project` and `risk --project` take their collection scope from the
+operator's flag. The default uses the AI registry catalog. Pass the same independent
+`--advisory-db` used for the scan to reproduce the advisory findings and coverage.
+The replay compares the advisory coverage receipt, including the bundle digest.
+Without a bundle, advisory findings and coverage beyond the local collection appear
+as supplier claims. `risk` still evaluates the supplied findings against its policy.
+
+```sh
+nexus-symbiote validate inventory.json --project ./app --all-packages --advisory-db ./osv.json
+nexus-symbiote risk inventory.json --project ./app --all-packages --advisory-db ./osv.json
+```
 
 ### `verify-artifact`
 
