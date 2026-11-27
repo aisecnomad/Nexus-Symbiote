@@ -1213,6 +1213,10 @@ def scan(
     output_format = output_format or policy.output.default_format
     all_scanners = _get_scanners()
     selected = scanners or tuple(policy.scan.scanners)
+    if all_packages and "registry" not in selected:
+        echo_line(
+            "  --all-packages has no effect: the registry collector is not selected", err=True
+        )
     unknown = set(selected) - set(all_scanners)
     if unknown:
         raise click.BadParameter(
@@ -1364,12 +1368,12 @@ def scan(
     if advisory_db is not None:
         from nexus_symbiote.scan_advisories import attach_offline_advisories
 
-        advisory_failures = attach_offline_advisories(aibom, advisory_db, root)
-        if advisory_failures:
-            scan_failures.extend(advisory_failures)
-            failures_by["advisories"] = advisory_failures
-        else:
-            surfaces_scanned.append(f"advisories: offline OSV bundle {advisory_db.name}")
+        attachment = attach_offline_advisories(aibom, advisory_db, root)
+        if attachment.failures:
+            scan_failures.extend(attachment.failures)
+            failures_by["advisories"] = attachment.failures
+        if attachment.surface is not None:
+            surfaces_scanned.append(attachment.surface)
     aibom.metadata.completeness = CompletenessClaim(
         scope="repository+shadowscan" if source_report_digest else "repository",
         source_report_digest=source_report_digest,

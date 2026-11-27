@@ -593,7 +593,7 @@ every rule.
 | Framework | Entry | Severities | Rationale |
 | --- | --- | --- | --- |
 | `owasp-llm-2025` | LLM03:2025 Supply Chain | all | A vulnerable package in the agent runtime is a supply chain weakness. |
-| `owasp-llm-2026` | LLM05:2026 Data and Model Poisoning | all | A vulnerable package in the agent runtime is a supply chain weakness. |
+| `owasp-llm-2026` | LLM04:2026 Supply Chain | all | A vulnerable package in the agent runtime is a supply chain weakness. |
 | `owasp-asi-2026` | ASI04 Agentic Supply Chain Vulnerabilities | all | A compromised or vulnerable dependency reaches every agent that loads it. |
 | `mitre-atlas-2026.10` | AML.T0010 Supply Chain Compromise | all | A vulnerable dependency is a supply chain compromise vector. |
 | `nist-ai-rmf-1.0` | MEASURE-2.7 Security and resilience are evaluated | all | Records a security-relevant property of the configuration, an input to evaluating its security. |

@@ -1022,7 +1022,15 @@ covers the whole dependency set the agent process loads. `--advisory-db` `PATH` 
 exact PyPI/npm pin against an offline OSV bundle (a JSON file or a flat directory of OSV
 records, outside the scanned project) during the scan: each match is a `known_vulnerability`
 finding on the package, with the advisory's identifiers and severity, and the CycloneDX export
-lists it under `vulnerabilities`. Nothing leaves the machine.
+lists it under `vulnerabilities`. Every run records a surface line with the bundle's file
+name and SHA-256 and how many exact pins it checked and advisories it recorded, so a clean
+inventory states what it was checked against and one with no exact pins says so. A severity
+the bundle does not state is recorded as a medium finding that says so and exported with an
+`unknown` rating. The feed-age check uses the current clock, so a bundle older than the
+matcher's default feed age turns the match into a collection failure even under
+`SOURCE_DATE_EPOCH`. Under `--all-packages` every PyPI or npm entry records
+`properties.ai_catalog`, and `validate --project` recollects with the same scope. Nothing
+leaves the machine.
 
 ### `summary`
 

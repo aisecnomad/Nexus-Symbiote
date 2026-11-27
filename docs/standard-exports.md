@@ -120,7 +120,7 @@ Messages and recommendations are one line of plain text: control, bidirectional 
 | `instruction_layering` | Layered instruction files | none | LLM01:2025 | LLM01:2026 | ASI01 | none | MEASURE-2.7 |
 | `invalid_safetensors` | Unverified SafeTensors structure | none | LLM03:2025 | LLM04:2026 | ASI04 | AML.T0011.000 | MANAGE-3.2 |
 | `invisible_characters` | Invisible characters in instructions | CWE-451, CWE-1427 | LLM01:2025 | LLM01:2026 | ASI01 | AML.T0068 | MEASURE-2.7 |
-| `known_vulnerability` | Known vulnerability in a pinned package | CWE-1395 | LLM03:2025 | LLM05:2026 | ASI04 | AML.T0010 | MEASURE-2.7 |
+| `known_vulnerability` | Known vulnerability in a pinned package | CWE-1395 | LLM03:2025 | LLM04:2026 | ASI04 | AML.T0010 | MEASURE-2.7 |
 | `launch_context` | Widened MCP launch context | none | none | none | ASI05 | none | MEASURE-2.7 |
 | `launcher_identity` | Unknown MCP launcher identity | none | LLM03:2025 | LLM04:2026 | ASI04 | AML.T0010.005 | MEASURE-2.7 |
 | `line_separators` | Line or paragraph separators | none | LLM01:2025 | none | none | none | MEASURE-2.7 |

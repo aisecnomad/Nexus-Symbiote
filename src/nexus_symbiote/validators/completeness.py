@@ -365,6 +365,8 @@ class CompletenessValidator:
         """
         from nexus_symbiote.graph import assemble_repository_agent
         from nexus_symbiote.scanners import ALL_SCANNERS, ModelScanner
+        from nexus_symbiote.scanners.base import Scanner
+        from nexus_symbiote.scanners.registry import AllPackagesRegistryScanner, RegistryScanner
         from nexus_symbiote.text_poisoning import apply_text_poisoning_rules
 
         report = self._validate_claims(bom)
@@ -378,13 +380,21 @@ class CompletenessValidator:
         accepted_default_names: set[str] = set()
         status: dict[str, str] = {}
         report_digest: str | None = None
+        # A scan under --all-packages marks every PyPI/npm entry; the recollection must
+        # take the same scope or every package outside the catalog reads as unevidenced.
+        all_packages = any(
+            isinstance(component, RegistryEntryComponent) and "ai_catalog" in component.properties
+            for component in bom.components
+        )
 
         for scanner_type in ALL_SCANNERS:
-            scanner = (
-                ModelScanner(signature_policies=signature_policies)
-                if scanner_type is ModelScanner
-                else scanner_type()
-            )
+            scanner: Scanner
+            if scanner_type is ModelScanner:
+                scanner = ModelScanner(signature_policies=signature_policies)
+            elif scanner_type is RegistryScanner and all_packages:
+                scanner = AllPackagesRegistryScanner()
+            else:
+                scanner = scanner_type()
             scanner.configure(
                 exclude_paths=exclude_paths,
                 accept_default_excludes=accept_default_excludes,

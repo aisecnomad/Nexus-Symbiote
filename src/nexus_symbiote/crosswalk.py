@@ -441,7 +441,7 @@ CROSSWALK: dict[str, tuple[Reference, ...]] = {
         ),
         _ref(
             OWASP_LLM_2026,
-            "LLM05:2026",
+            "LLM04:2026",
             "A vulnerable package in the agent runtime is a supply chain weakness.",
         ),
         _ref(

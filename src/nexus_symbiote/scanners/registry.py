@@ -1379,6 +1379,8 @@ def _yarn_lockfile_stanzas(
 
 class RegistryScanner(Scanner):
     name = "registry"
+    # `--all-packages` widens what is inventoried; the catalog predicate itself is unchanged.
+    inventory_all_packages = False
 
     def scan(self, project_root: Path) -> ScanResult:
         result = ScanResult(scanner_name=self.name)
@@ -1655,10 +1657,10 @@ class RegistryScanner(Scanner):
             alias_targets = {t for _, _, k, t, _ in parsed_specs if k == "alias" and t}
             fetches = any(k in ("registry", "alias") for _, _, k, _, _ in parsed_specs)
             if not (
-                self._is_ai_package(key)
-                or self._is_ai_package(package)
-                or any(self._is_ai_package(t) for t in alias_targets)
-                or (installed is not None and self._is_ai_package(installed))
+                self._inventoried(key)
+                or self._inventoried(package)
+                or any(self._inventoried(t) for t in alias_targets)
+                or (installed is not None and self._inventoried(installed))
             ):
                 if (
                     any(k in ("git", "url", "path") for _, _, k, _, _ in parsed_specs)
@@ -1718,12 +1720,12 @@ class RegistryScanner(Scanner):
                 fetched.append((component, package))
             if kind in ("registry", "alias") and not patched:
                 registry.append(component)
-        if overrides is None or any(self._is_ai_package(t) for t in overrides[1]):
+        if overrides is None or any(self._inventoried(t) for t in overrides[1]):
             # Too many overrides to read, or one that installs an AI package under
             # another package's name.
             gaps[self._NPM_GAPS["override"]] = None
         for source, names in patches.items():
-            if names is None or any(self._is_ai_package(name) for name in names):
+            if names is None or any(self._inventoried(name) for name in names):
                 # Also a patch of an AI package that package.json does not declare,
                 # such as one an inventoried package depends on: no component binds
                 # it, yet what is installed is not the registry artifact.
@@ -1732,7 +1734,7 @@ class RegistryScanner(Scanner):
             # As for a dependency: a git, URL or path source is installed under the
             # name whatever package it holds, and only a lock record names that.
             record = resolutions.get("node_modules/" + replaced)
-            if not self._is_ai_package(replaced) and (
+            if (self.inventory_all_packages or not self._is_ai_package(replaced)) and (
                 self._installed_name(replaced, record, resolutions) is None
             ):
                 gaps[self._NPM_GAPS["unclassified"]] = None
@@ -2586,7 +2588,7 @@ class RegistryScanner(Scanner):
             result.scan_failures.append("pnpm-lock.yaml: invalid or unsupported lockfile")
             return False
         lock_digest = hash_bytes(lock_bytes)
-        if any(self._is_ai_package(name) for name in lock_patches):
+        if any(self._inventoried(name) for name in lock_patches):
             # As for package.json: an AI package that no component binds is patched too.
             self._pnpm_patch_gap(result)
         packages = packages or {}
@@ -3244,7 +3246,7 @@ class RegistryScanner(Scanner):
     ) -> _PipDeclaration | None:
         """A declaration of an inventoried PyPI package, or None for any other name."""
         match = self._PIP_NAME.match(reference)
-        if not match or not self._is_ai_package(match.group()):
+        if not match or not self._inventoried(match.group()):
             return None
         # Redacted before canonicalize_name lowercases a credential out of its shape.
         shown, redacted = _identifier(match.group())
@@ -4501,7 +4503,7 @@ class RegistryScanner(Scanner):
             failures[failure] = None
             sources = {}
         for name in sources:
-            if cls._is_ai_package(str(name)):
+            if cls._inventoried(str(name)):
                 # A git, URL, path, workspace or index source replaces the package.
                 declarations.append((str(name), "", "source"))
                 gaps[cls._UV_GAPS["source"]] = None
@@ -4526,7 +4528,7 @@ class RegistryScanner(Scanner):
             for value in values:
                 # uv reads a requirement past leading whitespace.
                 name = cls._PIP_NAME.match(value.strip())
-                if name is not None and cls._is_ai_package(name.group()):
+                if name is not None and cls._inventoried(name.group()):
                     gaps[gap] = None
                     if key == "override-dependencies":
                         declarations.append((name.group(), "", "override"))
@@ -4636,7 +4638,7 @@ class RegistryScanner(Scanner):
             failures[failure] = None
             return
         for name in overrides:
-            if cls._is_ai_package(str(name)):
+            if cls._inventoried(str(name)):
                 declarations.append((str(name), "", "override"))
                 gaps["pyproject.toml: PDM override not followed"] = None
 
@@ -4668,7 +4670,7 @@ class RegistryScanner(Scanner):
                 failures[self._POETRY_PROBLEMS["table"]] = None
                 continue
             for name, value in table.items():
-                if not self._is_ai_package(name):
+                if not self._inventoried(name):
                     continue
                 if not _PEP508_NAME.fullmatch(name):
                     failures[self._POETRY_PROBLEMS["invalid"]] = None
@@ -5172,6 +5174,11 @@ class RegistryScanner(Scanner):
         state.add(first)
         return state.add(second)
 
+    @classmethod
+    def _inventoried(cls, name: str) -> bool:
+        """Whether a PyPI or npm package is in scope: the catalog, or every package."""
+        return cls.inventory_all_packages or cls._is_ai_package(name)
+
     @staticmethod
     def _is_ai_package(name: str) -> bool:
         """Whether a PyPI or npm package name is in the catalog, after normalisation.
@@ -5452,13 +5459,23 @@ class _ComposeWalk:
 
 
 class AllPackagesRegistryScanner(RegistryScanner):
-    """The registry collector without its AI catalog filter.
+    """The registry collector with every declared or locked package in scope.
 
-    Every declared or locked package and base image is inventoried, so that an offline
-    advisory match covers the whole dependency set an agent process loads, not only the
-    AI frameworks. The catalog still labels which entries are AI-related.
+    ``scan --all-packages`` inventories every PyPI and npm package and every base image,
+    not only the AI catalog, so that an offline advisory match covers the whole dependency
+    set an agent process loads. The catalog predicate is unchanged: each PyPI or npm entry
+    records whether it is in the AI catalog under ``properties.ai_catalog``, which also
+    tells project reconciliation to recollect with this scope.
     """
 
-    @classmethod
-    def _is_ai_package(cls, name: str) -> bool:
-        return True
+    inventory_all_packages = True
+
+    def scan(self, project_root: Path) -> ScanResult:
+        result = super().scan(project_root)
+        for component in result.components:
+            if isinstance(component, RegistryEntryComponent) and component.registry_type in {
+                "pypi",
+                "npm",
+            }:
+                component.properties["ai_catalog"] = self._is_ai_package(component.name)
+        return result

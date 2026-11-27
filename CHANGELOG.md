@@ -6,8 +6,8 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ### Added
 
-- **`scan --all-packages`:** inventories every declared or locked package and base image, not only the AI catalog.
-- **`scan --advisory-db PATH`:** matches every exact PyPI/npm pin against an offline OSV bundle during the scan, records `known_vulnerability` findings on the package and exports them as CycloneDX `vulnerabilities`. The bundle must lie outside the scanned project; no network I/O.
+- **`scan --all-packages`:** inventories every declared or locked package and base image, not only the AI catalog; each PyPI or npm entry records `properties.ai_catalog`, and `validate --project` recollects with the same scope.
+- **`scan --advisory-db PATH`:** matches every exact PyPI/npm pin against an offline OSV bundle during the scan, records `known_vulnerability` findings on the package (an unstated severity is recorded as medium and says so) and exports them as CycloneDX `vulnerabilities`, one per advisory across every package it affects. Every run records the bundle's digest and the number of exact pins checked as a scanned surface. The bundle must lie outside the scanned project; no network I/O.
 
 ## [0.2.0] - 2026-11-25
 
