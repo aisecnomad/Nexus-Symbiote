@@ -106,10 +106,11 @@ POSITIONAL_MODELS: dict[tuple[str, str], int] = {
     ("replicate", "run"): 0, ("diffusers", "from_pretrained"): 0, ("vllm", "LLM"): 0,
     ("peft", "PeftModel.from_pretrained"): 1, ("peft", "from_pretrained"): 0,
 }  # fmt: skip
-# Calls that return text or a path, not an object an SDK makes: SDK helpers and str's methods.
+# Calls that give text or a path rather than an object an SDK makes: SDK helpers, str's
+# methods and a type of model names. Neither does an SDK's ``types``, which hold its data.
 TEXT_CALLS = frozenset({
-    *dir(str), "cached_file", "get", "get_from_dict_or_env", "get_from_env", "get_secret",
-    "hf_hub_download", "hf_hub_url", "snapshot_download", "try_to_load_from_cache",
+    *dir(str), "KnownModelName", "cached_file", "get", "get_from_dict_or_env", "get_from_env",
+    "get_secret", "hf_hub_download", "hf_hub_url", "snapshot_download", "try_to_load_from_cache",
 })  # fmt: skip
 # Calls that call their first argument with the rest, so its keywords are that callee's.
 FORWARDERS = frozenset(

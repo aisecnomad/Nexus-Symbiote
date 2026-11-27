@@ -1933,3 +1933,28 @@ def test_of_a_librarys_and_the_projects_import_of_one_name_the_projects_is_read(
         },
     )
     assert list(result.surfaces_excluded) == [f"app/main.py:7: a model argument is {GIVEN}"]
+
+
+def test_a_parameter_typed_as_an_sdks_model_names_holds_text_not_an_object(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from openai import OpenAI
+from openai.types import ChatModel
+from pydantic_ai.models import KnownModelName
+
+client = OpenAI()
+
+
+def ask(prompt: str, model: ChatModel):
+    return client.chat.completions.create(model=model, messages=[])
+
+
+def plan(model: KnownModelName):
+    return client.responses.create(model=model, input="hi")
+"""
+        },
+    )
+    # An SDK's data types and its type of model names are text a caller may give.
+    assert list(result.surfaces_excluded) == [unread("run.py", 9, 2)]

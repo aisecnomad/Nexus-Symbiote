@@ -769,6 +769,7 @@ class PythonReader:
             and origin.endswith("()")
             and _sdk(origin)
             and origin[:-2].rsplit(".", 1)[-1] not in TEXT_CALLS
+            and ".types." not in origin
         )
 
     def _imported_leaf(self, module: Module, node: ast.AST) -> bool:
