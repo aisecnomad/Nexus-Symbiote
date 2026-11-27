@@ -6,7 +6,7 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ### Security
 
-- **Deno sandbox, TLS-bypass, and runtime debugger launch auditing:** `scanners/mcp_launch.py` and `scanners/mcp.py` now flag unrestricted Deno permissions (`-A`/`--allow-all`), dangerous host permissions (`--allow-run`/`--allow-ffi`/`--allow-sys`), disabled TLS verification (`--unsafely-ignore-certificate-errors`), unscoped Deno permissions (`--allow-read`/`--allow-write`/`--allow-net`/`--allow-env` without targets), and exposed Node/Deno debuggers (`--inspect*`, `--debug-port`).
+- **Deno sandbox, TLS-bypass, and runtime debugger launch auditing:** `scanners/mcp_launch.py` and `scanners/mcp.py` now flag unrestricted Deno permissions (`-A`/`--allow-all`), scoped and unscoped host permissions (`--allow-run`/`--allow-ffi`/`--allow-sys`), disabled TLS verification (`--unsafely-ignore-certificate-errors`), unscoped Deno permissions (`--allow-read`/`--allow-write`/`--allow-net`/`--allow-env` without targets), and Node/Deno flags that enable the inspector (`--inspect`, `--inspect-brk`, `--inspect-wait`). Configuring a debugger port alone leaves the inspector inactive.
 
 ## [0.2.0] - 2026-11-25
 

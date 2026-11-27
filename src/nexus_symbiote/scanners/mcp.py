@@ -2645,7 +2645,8 @@ _CONTEXT_HIGH = {
     "security_options_disabled": "disabled confinement",
     "dangerous_capabilities": "a host-level capability",
     "deno_all_permissions": "unrestricted Deno permissions",
-    "deno_dangerous_permissions": "unrestricted Deno host permissions (run/ffi/sys)",
+    "deno_dangerous_permissions": "unscoped Deno host permissions (run/ffi/sys)",
+    "deno_scoped_host_permissions": "Deno host permissions for specified targets (run/ffi/sys)",
     "tls_verification_disabled": "disabled TLS certificate verification",
 }
 _CONTEXT_MEDIUM = {

@@ -61,22 +61,31 @@ def test_scoped_deno_permissions_are_not_flagged_as_broad() -> None:
 
 
 @pytest.mark.parametrize(
-    ("cmd", "args"),
+    ("args", "enabled"),
     [
-        ("node", ["--inspect", "./server.js"]),
-        ("node", ["--inspect-brk=0.0.0.0:9229", "./server.js"]),
-        ("node", ["--inspect-wait", "./server.js"]),
-        ("node", ["--inspect-port", "9229", "./server.js"]),
-        ("node", ["--inspect_brk=0.0.0.0:9229", "./server.js"]),
-        ("node", ["--inspect_port", "9229", "./server.js"]),
-        ("node", ["--debug_port=5858", "./server.js"]),
-        ("node", ["--debug-port=5858", "./server.js"]),
-        ("ts-node", ["--inspect", "./server.ts"]),
+        (["--inspect", "./server.js"], True),
+        (["--inspect-brk=127.0.0.1:9229", "./server.js"], True),
+        (["--inspect-wait", "./server.js"], True),
+        (["--inspect-port", "9229", "./server.js"], False),
+        (["--inspect_brk=127.0.0.1:9229", "./server.js"], True),
+        (["--inspect_port", "9229", "./server.js"], False),
+        (["--debug_port=5858", "./server.js"], False),
+        (["--debug-port=5858", "./server.js"], False),
+        (["--inspect-port", "9230", "--inspect", "./server.js"], True),
+        (["./server.js", "--inspect"], False),
     ],
 )
-def test_node_debugger_launch_context_flagged(cmd: str, args: list[str]) -> None:
-    launch = analyze(cmd, args)
-    assert launch.context.get("debugger_enabled", 0) >= 1
+def test_node_debugger_activation(args: list[str], enabled: bool) -> None:
+    launch = analyze("node", args)
+    assert launch.unknown is None
+    assert bool(launch.context.get("debugger_enabled")) == enabled
+
+
+@pytest.mark.parametrize("option", ["--inspect", "--inspect-port=9230"])
+def test_direct_ts_node_refuses_node_inspector_args(option: str) -> None:
+    launch = analyze("ts-node", [option, "./server.ts"])
+    assert launch.unknown == "direct ts-node arguments do not accept Node inspector flags"
+    assert "debugger_enabled" not in launch.context
 
 
 def test_mcp_scanner_emits_high_and_medium_launch_context_findings(tmp_path: Path) -> None:
@@ -94,6 +103,18 @@ def test_mcp_scanner_emits_high_and_medium_launch_context_findings(tmp_path: Pat
             "deno-scoped": {
                 "command": "deno",
                 "args": ["run", "--allow-net=api.example.com", "npm:@acme/mcp@1.2.3"],
+            },
+            "deno-host-unscoped": {
+                "command": "deno",
+                "args": ["run", "--allow-sys", "./server.js"],
+            },
+            "deno-host-scoped": {
+                "command": "deno",
+                "args": ["run", "--allow-sys=hostname", "./server.js"],
+            },
+            "node-port": {
+                "command": "node",
+                "args": ["--inspect-port=9229", "./server.js"],
             },
             "node-debug": {
                 "command": "node",
@@ -115,6 +136,16 @@ def test_mcp_scanner_emits_high_and_medium_launch_context_findings(tmp_path: Pat
     scoped_risks = [r for r in by_name["deno-scoped"].risks if r.category == "launch_context"]
     assert not scoped_risks
 
+    assert any(
+        r.category == "launch_context" and "unscoped Deno host permissions" in r.detail
+        for r in by_name["deno-host-unscoped"].risks
+    )
+    scoped_host_risks = [
+        r for r in by_name["deno-host-scoped"].risks if r.category == "launch_context"
+    ]
+    assert any("for specified targets" in r.detail for r in scoped_host_risks)
+    assert not any("unscoped" in r.detail for r in scoped_host_risks)
+    assert not any(r.category == "launch_context" for r in by_name["node-port"].risks)
     debug_risks = [r for r in by_name["node-debug"].risks if r.category == "launch_context"]
     assert any(
         r.severity is RiskSeverity.MEDIUM and "enabled runtime debugger" in r.detail

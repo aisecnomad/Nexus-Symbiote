@@ -82,9 +82,8 @@ _JSR = re.compile(r"(@[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*)(?:@([^/]+))?(?:/.
 
 _NODE_INLINE = frozenset({"-e", "--eval", "-p", "--print", "-pe", "-ep", "-"})
 _NODE_PRELOAD = frozenset({"-r", "--require", "--import", "--loader", "--experimental-loader"})
-_NODE_DEBUGGERS = frozenset(
-    {"--inspect", "--inspect-brk", "--inspect-wait", "--inspect-port", "--debug-port"}
-)
+_NODE_DEBUGGERS = frozenset({"--inspect", "--inspect-brk", "--inspect-wait"})
+_NODE_DEBUG_PORTS = frozenset({"--inspect-port", "--debug-port"})
 # Node options that take a value as the next word (node --help); the value is never the script.
 _NODE_VALUES = _NODE_PRELOAD | _set(
     "--allow-fs-read --allow-fs-write --build-snapshot-config -C --conditions --cpu-prof-dir"
@@ -1507,6 +1506,8 @@ def _interpreter_reason(
                 return _inline(family, launch)
             if norm in _NODE_PRELOAD and launch is not None:
                 launch.mark("preload_module")
+            if family == "ts-node" and (norm in _NODE_DEBUGGERS or norm in _NODE_DEBUG_PORTS):
+                return "direct ts-node arguments do not accept Node inspector flags"
             if norm in _NODE_DEBUGGERS and launch is not None:
                 launch.mark("debugger_enabled")
             takes = norm in _NODE_VALUES or (
@@ -3750,7 +3751,7 @@ def _deno(name: str, rest: list[str], launch: Launch) -> None:
         elif option in _DENO_ALL_PERMISSIONS:
             launch.mark("deno_all_permissions")
         elif option in _DENO_DANGEROUS_PERMISSIONS:
-            launch.mark("deno_dangerous_permissions")
+            launch.mark("deno_scoped_host_permissions" if value else "deno_dangerous_permissions")
         elif option in _DENO_BROAD_PERMISSIONS and not value:
             launch.mark("deno_broad_permissions")
         elif option == "--unsafely-ignore-certificate-errors":
