@@ -2074,3 +2074,23 @@ def test_typescript_taint_flows_through_loops_callbacks_and_assignments(
 ) -> None:
     tool = _ts(tmp_path, handler, _PG)
     assert any("caller-supplied" in r.detail for r in tool.risks) is raw, handler
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "raw"),
+    [
+        ("", "async ({ q }) => getPool().query(q)", True),
+        ('import { getDb } from "./db";\n', "async ({ q }) => getDb().query(q)", True),
+        ("", "async ({ q }) => (await getClient()).query(q)", True),
+        ("", "async ({ q }) => getConnection().execute(q)", True),
+        ("", "async ({ q }) => getUser().query(q)", False),
+        ("", "async ({ q }) => getter.query(q)", False),
+    ],
+    ids=["getter", "getter-from-a-local-module", "awaited-getter", "connection-getter"]
+    + ["other-getter-control", "get-prefix-alone-control"],
+)
+def test_typescript_a_getter_named_like_a_database_client_returns_one(
+    tmp_path: Path, header: str, handler: str, raw: bool
+) -> None:
+    tool = _ts(tmp_path, handler, header)
+    assert any("caller-supplied" in r.detail for r in tool.risks) is raw, handler

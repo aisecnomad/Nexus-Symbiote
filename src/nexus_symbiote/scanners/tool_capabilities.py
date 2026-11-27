@@ -1582,7 +1582,11 @@ def _ts_call(
     # it is bound to: a pool is often imported from the project's own ``./db``. Prisma's
     # ``$``-prefixed raw methods exist on no other client.
     client = last.startswith("$") or any(module in _TS_DB_MODULES for module, _ in candidates)
-    named = len(chain) > 1 and chain[-2].lower() in _TS_DB_RECEIVERS  # D1's binding is ``env.DB``
+    # In any case, as D1's ``env.DB``, and through a getter, as ``getPool().query(...)``.
+    receiver_name = chain[-2].lower() if len(chain) > 1 else ""
+    named = (
+        receiver_name in _TS_DB_RECEIVERS or receiver_name.removeprefix("get") in _TS_DB_RECEIVERS
+    )
     callee = node.child_by_field_name("function")
     receiver = callee.child_by_field_name("object") if callee is not None else None
     if arguments is not None and arguments.type == "template_string":
