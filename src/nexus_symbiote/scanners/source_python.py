@@ -49,6 +49,8 @@ MAX_DEPTH = 12
 MAX_CANDIDATES = 16
 MAX_STRINGS = 16
 MAX_TEXT = 256
+# Environment variables that may override one text, past which the rest are cut.
+MAX_VARIABLES = 16
 MAX_STEPS = 2_000_000
 # A dotted name longer than this is not followed: a short alias for a long name would
 # otherwise cost the long name's length at every read.
@@ -72,6 +74,8 @@ _ANYTHING = frozenset({"builtins.object", "typing.Any", "typing_extensions.Any"}
 _ACCESSORS = frozenset({"builtins.getattr", "typing.cast", "typing_extensions.cast"})
 # What Python's containers and ``random`` hand back may be any object.
 _TAKES = (".choice", ".get", ".pop", ".setdefault")
+# Keywords whose value a call reads as options, as it reads a ``**`` spread.
+_OPTIONS_KEYWORDS = (None, "model_kwargs", "config_kwargs")
 # Roots whose objects are not another library's: what they make may be text.
 _NOT_LIBRARIES = frozenset({"builtins", *sys.stdlib_module_names})
 _T = TypeVar("_T")
@@ -112,9 +116,11 @@ class Module:
     bindings: dict[ast.AST | None, dict[str, list[ast.AST]]] = field(default_factory=dict)
     definitions: dict[ast.AST | None, dict[str, ast.AST]] = field(default_factory=dict)
     parameters: dict[ast.AST, dict[str, ast.arg]] = field(default_factory=dict)
-    # Names the file reads other than by spreading them into a call with ``**``.
+    # Names the file reads other than by spreading them into a call with ``**`` or giving
+    # them as a call's options, and whether an import with ``*`` may bind any name.
     touched: set[str] = field(default_factory=set)
     spread: set[int] = field(default_factory=set)
+    starred: bool = False
 
 
 @dataclass(frozen=True, eq=False)
@@ -325,7 +331,9 @@ class PythonReader:
                 module.declared.setdefault(scope, {}).update(dict.fromkeys(node.names, kind))
             elif isinstance(node, ast.Call):
                 module.spread.update(
-                    id(keyword.value) for keyword in node.keywords if keyword.arg is None
+                    id(keyword.value)
+                    for keyword in node.keywords
+                    if keyword.arg in _OPTIONS_KEYWORDS
                 )
             elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
                 if id(node) not in module.spread:
@@ -356,6 +364,7 @@ class PythonReader:
             for alias in node.names:
                 if alias.name == "*":
                     module.modules.add(base)
+                    module.starred = True
                 else:
                     name = f"{base}.{alias.name}" if base else alias.name
                     module.members.add(name)
@@ -711,6 +720,10 @@ class PythonReader:
         if isinstance(node, ast.Name):
             resolved = self._resolve(module, node.id, node)
             inner = None if resolved is None else ((bound.node, same) for bound in resolved[1])
+            if resolved is not None and resolved[0] == _scope_key(module, None, node.id):
+                if node.id in module.imports or module.starred:
+                    # An import of the name, or one with ``*``, may bind it instead.
+                    out.append(value)
         elif isinstance(node, (ast.Await, ast.NamedExpr)):
             inner = [(node.value, same)]
         elif isinstance(node, ast.IfExp):
@@ -742,18 +755,22 @@ class PythonReader:
             if name is None:
                 yield operand, variables
             else:
-                variables = variables | {name}
+                variables = self._merge(variables, frozenset({name}))
 
     def _unset_variable(self, module: Module, node: ast.AST) -> str | None:
         """The variable an operand reads, when the environment alone gives its value: a
         call with no default, made there or bound to a name the operand is."""
         reads: list[ast.AST] = [node]
-        if isinstance(node, ast.Name):
+        if isinstance(node, ast.Name) and self._steps > 0:
             resolved = self._resolve(module, node.id, node)
             reads = [] if resolved is None else [bound.node for bound in resolved[1]]
         self._steps -= len(reads)
+        if len(reads) > MAX_CANDIDATES or self._steps <= 0:
+            # Past the bound an operand is followed as any other, so nothing is dropped.
+            self._cut = True
+            return None
         names = set()
-        for read in reads[: MAX_CANDIDATES + 1]:
+        for read in reads:
             found = self._environment_read(module, read)
             if not isinstance(read, ast.Call) or found is None or not _falsy(found[1]):
                 return None
@@ -821,7 +838,9 @@ class PythonReader:
             self._shallow = self._shallow or outer
         texts, complete = known
         if value.variables:
-            texts = tuple((text, variables | value.variables) for text, variables in texts)
+            texts = tuple(
+                (text, self._merge(variables, value.variables)) for text, variables in texts
+            )
         return texts, complete
 
     def _spell_node(self, module: Module, node: ast.AST, depth: int) -> _Spelling:
@@ -846,7 +865,10 @@ class PythonReader:
             if environment_name(name) is None:
                 # The variable that may override the default cannot be named.
                 return texts, False
-            return tuple((text, variables | {name}) for text, variables in texts), complete
+            named = frozenset({name})
+            return tuple(
+                (text, self._merge(variables, named)) for text, variables in texts
+            ), complete
         if isinstance(node, ast.JoinedStr):
             parts: list[ast.AST] = []
             for part in node.values:
@@ -874,7 +896,7 @@ class PythonReader:
             whole = whole and complete
             self._steps -= len(built) * len(options)
             joined = [
-                (text + more, variables | others)
+                (text + more, self._merge(variables, others))
                 for text, variables in built
                 for more, others in options
                 if len(text) + len(more) <= MAX_TEXT
@@ -914,6 +936,9 @@ class PythonReader:
         any other way may be changed or handed on, so what it holds is not known."""
         held: ast.AST = node
         if isinstance(node, ast.Name):
+            if self._steps <= 0:
+                self._cut = True
+                return None
             resolved = None if node.id in module.touched else self._resolve(module, node.id, node)
             if resolved is None or len(resolved[1]) != 1:
                 return None
@@ -1037,6 +1062,9 @@ class PythonReader:
 
     def _pairs(self, module: Module, options: ast.expr | None) -> Sequence[tuple[object, ast.expr]]:
         """The keys and values of options given as a dict; what it cannot read has no key."""
+        given = self._spread(module, options) if isinstance(options, ast.Name) else None
+        if given is not None:
+            return list(given.items())
         if isinstance(options, ast.Dict):
             return [(_constant(k), v) for k, v in zip(options.keys, options.values, strict=True)]
         if isinstance(options, ast.Call) and self.origin(module, options.func) == "builtins.dict":
@@ -1056,6 +1084,9 @@ class PythonReader:
         kept = 0
         for value in values:
             texts, complete = self._spell(value)
+            if not texts:
+                # A fallback that names no model, such as None, leaves it to the variables.
+                self._set_by_environment(module, value.variables, point)
             for text, variables in texts:
                 kept += 1
                 self._steps -= 1
@@ -1073,6 +1104,8 @@ class PythonReader:
                 )
                 if ref is None and not placeholder(text):
                     self._unread.add(point)
+                if ref is None:
+                    self._set_by_environment(module, variables, point)
             if not complete:
                 self._unread_value(value, point)
 
@@ -1082,16 +1115,33 @@ class PythonReader:
         read = self._environment_read(module, node)
         if read is not None and _falsy(read[1]) and environment_name(read[0]):
             # A model that only the environment sets has no value here to record.
-            first = self._found.unresolved_environment.setdefault((module.path, read[0]), point[0])
-            self._found.unresolved_environment[(module.path, read[0])] = min(first, point[0])
+            self._set_by_environment(module, frozenset({read[0]}), point)
         elif self._imported_leaf(module, node):
             self._found.gap(module.path, point[0], _ELSEWHERE)
         elif not self._built(module, node):
             self._unread.add(point)
 
+    def _set_by_environment(
+        self, module: Module, variables: frozenset[str], point: tuple[int, int]
+    ) -> None:
+        """File each variable that alone may set a model argument, at its first place."""
+        unset = self._found.unresolved_environment
+        for name in variables:
+            unset[(module.path, name)] = min(point[0], unset.get((module.path, name), point[0]))
+
+    def _merge(self, variables: frozenset[str], others: frozenset[str]) -> frozenset[str]:
+        """The variables that may override a text: charged, and cut past their bound."""
+        merged = variables | others
+        self._steps -= len(merged)
+        if len(merged) > MAX_VARIABLES:
+            self._cut = True
+            merged = frozenset(sorted(merged)[:MAX_VARIABLES])
+        return merged
+
     def _built(self, module: Module, node: ast.AST) -> bool:
         """Whether a value is an object an SDK makes, not text, a path or what may hold one."""
-        origin = self.origin(module, node)
+        # A parameter is judged by its annotation, as when it is called.
+        origin = self._value_origin(_Value(module, node), 0)
         return (
             origin is not None
             and origin.endswith("()")

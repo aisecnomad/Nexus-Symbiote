@@ -195,7 +195,10 @@ class Declarations:
         if kind:
             record.kinds.add(kind)
         record.remote_code = record.remote_code or remote_code
-        record.environment.update(filter(environment_name, environment))
+        # Each name was checked where it was read; one is checked again once for a model.
+        record.environment.update(
+            filter(environment_name, frozenset(environment) - record.environment)
+        )
         return model_ref(name)
 
     def close(self) -> None:

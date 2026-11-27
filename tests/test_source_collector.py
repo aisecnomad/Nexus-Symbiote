@@ -2663,3 +2663,156 @@ def test_a_text_longer_than_any_identifier_is_judged_and_not_kept():
     assert found.model("x" * 300, "run.py", 1, method="python-ast") is None
     assert found.model("gpt-4o", "run.py", 2, method="python-ast") == "model:source:gpt-4o"
     assert list(found._written) == ["gpt-4o"]
+
+
+ONLY_BY = "model set only by environment variable OPENAI_MODEL; not inventoried"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        'os.getenv("OPENAI_MODEL", "")',
+        'os.environ.get("OPENAI_MODEL", None)',
+        'config("OPENAI_MODEL", default=None)',
+        'os.getenv("OPENAI_MODEL") or None',
+        'os.getenv("OPENAI_MODEL", "default")',
+        'os.getenv("OPENAI_MODEL", "./models/local.gguf")',
+    ],
+    ids=["empty", "none", "decouple-none", "or-none", "placeholder", "project-file"],
+)
+def test_a_model_only_the_environment_names_is_a_gap_whatever_names_no_model_beside_it(
+    tmp_path: Path, value: str
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom decouple import config\nfrom openai import OpenAI\n"
+            f"OpenAI().responses.create(model={value})\n"
+        },
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [f"run.py:4: {ONLY_BY}"]
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        'try:\n    from settings import MODEL\nexcept ImportError:\n    MODEL = "gpt-4o"\n',
+        'MODEL = "gpt-4o"\nfrom settings_local import *\n',
+    ],
+    ids=["optional-import", "star-import"],
+)
+def test_an_import_may_bind_a_name_in_place_of_the_value_read(tmp_path: Path, binding: str):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": f"from openai import OpenAI\n{binding}"
+            "OpenAI().responses.create(model=MODEL)\n",
+            "settings.py": 'MODEL = "o3"\n',
+        },
+    )
+    line = binding.count("\n") + 2
+    assert set(models(result)) == {"gpt-4o"}
+    assert list(result.surfaces_excluded) == [unread("run.py", line)]
+
+
+def test_a_parameter_annotated_with_an_sdk_class_holds_an_object_it_makes(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from crewai import LLM, Agent
+from langchain_core.language_models import BaseChatModel
+from langgraph.prebuilt import create_react_agent
+
+
+def build(llm: BaseChatModel, tools):
+    return create_react_agent(model=llm, tools=tools)
+
+
+def make(llm: LLM):
+    return Agent(role="r", goal="g", backstory="b", llm=llm)
+"""
+        },
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == []
+
+
+def test_a_variable_read_past_the_bound_is_cut_and_never_dropped_unseen(tmp_path: Path):
+    reads = 'M = os.getenv("CHAT_MODEL")\n' * 17
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom openai import OpenAI\n"
+            + reads
+            + 'M = "o3"\nOpenAI().responses.create(model=M or "gpt-4o")\n'
+        },
+    )
+    assert f"run.py:1: {CUT}" in result.surfaces_excluded
+
+
+def test_options_bound_once_to_a_dict_are_read_where_they_are_given(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from langchain_huggingface import HuggingFaceEmbeddings
+from sentence_transformers import SentenceTransformer
+
+model_kwargs = {"device": "cpu"}
+encode_kwargs = {"normalize_embeddings": False}
+HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    model_kwargs=model_kwargs,
+    encode_kwargs=encode_kwargs,
+)
+TRUSTED = {"trust_remote_code": True}
+SentenceTransformer("someorg/trusted", model_kwargs=TRUSTED)
+CHANGED = {"device": "cpu"}
+CHANGED.update(trust_remote_code=True)
+SentenceTransformer("someorg/changed", model_kwargs=CHANGED)
+"""
+        },
+    )
+    found = models(result)
+    assert found["sentence-transformers/all-MiniLM-L6-v2"].trust_remote_code is None
+    assert found["someorg/trusted"].trust_remote_code is True
+    assert found["someorg/changed"].trust_remote_code is None
+    # A dict the file changes may hold anything by the time it is given.
+    assert list(result.surfaces_excluded) == [f"run.py:15: {REMOTE}"]
+
+
+def test_the_variables_of_one_text_are_bounded_and_the_rest_cut(tmp_path: Path):
+    parts = "".join(f"{{os.getenv('MODEL_PART_{index:02d}', 'g-')}}" for index in range(20))
+    result = scan(
+        tmp_path,
+        {
+            "run.py": f'import os\nfrom openai import OpenAI\nE = f"{parts}"\n'
+            + 'OpenAI().responses.create(model=E + "x")\n'
+        },
+    )
+    (model,) = models(result).values()
+    assert len(model.properties["environment_variables"]) == source_python.MAX_VARIABLES
+    assert list(result.surfaces_excluded) == [f"run.py:1: {CUT}"]
+
+
+def test_a_variable_is_checked_once_for_a_model_however_often_it_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    checked: list[object] = []
+    exported = source_references.environment_name
+
+    def counted(name: object) -> str | None:
+        checked.append(name)
+        return exported(name)
+
+    monkeypatch.setattr(source_references, "environment_name", counted)
+    calls = "OpenAI().responses.create(model=M)\n" * 50
+    scan(
+        tmp_path,
+        {
+            "run.py": f'import os\nfrom openai import OpenAI\nM = os.getenv("CHAT_MODEL", "gpt-4o")\n{calls}'
+        },
+    )
+    assert checked == ["CHAT_MODEL"]

@@ -50,7 +50,7 @@ and `:=`, conditionals (`if`/`else`, `or`, `and`), an environment variable's def
 (`os.getenv`, `os.environ.get`, `decouple.config`), joined text (`+`, `+=` and
 f-strings), `str()`, `.lower()`, `.upper()` and `.strip()`, and a dict spread with `**`
 that is written out there or bound once to a name the file reads only to spread it. A
-name is looked up as Python looks it up: in its function, honouring `global` and
+dict of `model_kwargs` or `config_kwargs` is read the same way. A name is looked up as Python looks it up: in its function, honouring `global` and
 `nonlocal`, then in the scopes around it, skipping a class body from its methods. A
 parameter's default and a decorator, annotation or base class are read in the scope
 around their function or class. In `or`, a variable read with no default falls
@@ -80,16 +80,19 @@ What the reader knows is there and cannot read is a coverage gap:
   or built from itself, which may grow when run again; a loop, `with`, `except` or
   pattern variable; a dict that is changed, handed on, spread from another or bound more
   than once; `**options` without a model; a starred positional argument; a path on a
-  host, behind a routing prefix or not; and text that is no identifier, or a default a
+  host, behind a routing prefix or not; a name of the module that the file also imports,
+  or that an import with `*` may bind; and text that is no identifier, or a default a
   variable that cannot be named may override;
-- a model that only an environment variable sets, once for each file that reads it so;
+- a model that only an environment variable sets, once for each file that reads it so,
+  as when its default names no model, such as `None`, `""` or `"default"`;
 - options a weights library is given that the reader cannot read, such as
   `model_kwargs=options` or `**options`, which may let the model run its own code;
 - a model argument given to a function or class the project defines, or to a method of
   one of its classes, which the reader does not follow;
 - a bound the reader reached: a callee depth of 32, a following depth of 12, 16 values
-  for one argument, 16 joined texts of up to 256 characters, the directories it looks in
-  for a module, a dotted name of 256 characters, or the steps one file allows.
+  for one argument, 16 joined texts of up to 256 characters, 16 environment variables
+  for one text, the directories it looks in for a module, a dotted name of 256
+  characters, or the steps one file allows.
 
 Unread arguments, and those given to the project's callees, are each counted in one gap
 for the file, at the first of them; an argument bound in another module is a gap of its own.
