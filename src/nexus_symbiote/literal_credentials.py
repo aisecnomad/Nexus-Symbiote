@@ -11,8 +11,10 @@ collection failure and produces no finding from that file.
 
 from __future__ import annotations
 
+import io
 import re
 import unicodedata
+from bisect import bisect_right
 from collections.abc import Iterable, Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -34,6 +36,7 @@ _JOIN_CHARS = 2048
 _OPEN_PREFIX = re.compile(
     r"(?:sk-|ghp_|gho_|ghu_|ghs_|ghr_|hf_|github_pat_|glpat-|xox[abeoprs]-)[\w-]*$"
 )
+_BACKSLASH_JOIN = re.compile(r"\\\n")
 _PLUS_JOIN = re.compile(r"""(?s)(['"])\s*\+\s*\1""")
 _ADJACENT_QUOTES = re.compile(r"""(?s)(['"])\s*\1""")
 _CONFIG_SUFFIXES = frozenset({".json", ".jsonc", ".yaml", ".yml", ".toml"})
@@ -89,10 +92,10 @@ def _direct_matches(visible: str) -> Iterator[re.Match[str]]:
     return (match for match in TOKEN_SHAPE.finditer(visible) if holds_token_shape(match.group()))
 
 
-def _literals(visible: str) -> Iterable[str]:
+def _literals(visible: str) -> Iterator[tuple[int, str]]:
     """Yield direct matches first, then recover shapes split by whitespace."""
     for match in _direct_matches(visible):
-        yield normalize_credential(match.group())
+        yield match.start(), normalize_credential(match.group())
 
     # Both iterators advance in source order. Keep just the next covered span.
     covered = _direct_matches(visible)
@@ -123,7 +126,7 @@ def _literals(visible: str) -> Iterable[str]:
             index += 1
         candidate = normalize_credential(prefix.group() + "".join(chars))
         if holds_token_shape(candidate) and TOKEN_SHAPE.fullmatch(candidate):
-            yield candidate
+            yield prefix.start(), candidate
 
 
 def _commitment(rel_path: str, line_no: int, literal: str) -> str:
@@ -175,20 +178,30 @@ def _window_continues(parts: list[str]) -> bool:
     return stripped.endswith(("\\", "+")) or _quotes_open("\n".join(parts))
 
 
-def _collapse_joins(text: str) -> str:
-    """Drop backslash newlines and the quotes around ``"a" + "b"``. One pass each."""
-    pieces: list[str] = []
-    index = 0
-    length = len(text)
-    while index < length:
-        if text[index] == "\\" and index + 1 < length and text[index + 1] == "\n":
-            index += 2
-            continue
-        pieces.append(text[index])
-        index += 1
-    collapsed = "".join(pieces)
-    collapsed = _PLUS_JOIN.sub("", collapsed)
-    return _ADJACENT_QUOTES.sub("", collapsed)
+def _normalized_window(parts: list[str]) -> tuple[str, list[int]]:
+    """Keep the start of each continuation line through join removal and normalization."""
+    text = "\n".join(parts)
+    boundaries: list[int] = []
+    start = 0
+    for part in parts[:-1]:
+        start += len(part) + 1
+        boundaries.append(start)
+
+    for pattern in (_BACKSLASH_JOIN, _PLUS_JOIN, _ADJACENT_QUOTES):
+        # Each physical boundary moves left by the characters removed before
+        # it, including the part of a join that straddles the line break.
+        if boundaries:
+            adjusted = boundaries.copy()
+            for match in pattern.finditer(text):
+                for index, boundary in enumerate(boundaries):
+                    if match.start() < boundary:
+                        adjusted[index] -= min(boundary, match.end()) - match.start()
+            boundaries = adjusted
+        text = pattern.sub("", text)
+
+    # A window has at most eight physical lines. Keeping their offsets avoids
+    # allocating a line number for every character of an ordinary source file.
+    return _visible(text), [len(_visible(text[:offset])) for offset in boundaries]
 
 
 def _cut_off_token(visible: str) -> bool:
@@ -197,13 +210,13 @@ def _cut_off_token(visible: str) -> bool:
     return found is not None and not holds_token_shape(found.group())
 
 
-def _literal_windows(text: str) -> Iterable[tuple[int, str, bool]]:
-    """``(first line, normalized text, truncated)`` for each continued span.
+def _literal_windows(text: str) -> Iterator[tuple[int, str, list[int], bool]]:
+    """First line, normalized text, continuation offsets and truncation for each span.
 
     Hidden characters are removed and whitespace is kept, so a token in prose stays
     a separate word. A space or mark inside the token body is joined afterwards.
     """
-    lines = text.splitlines()
+    lines = [line.removesuffix("\n") for line in io.StringIO(text, newline=None)]
     index = 0
     while index < len(lines):
         parts = [lines[index]]
@@ -219,8 +232,8 @@ def _literal_windows(text: str) -> Iterable[tuple[int, str, bool]]:
                 break
             index += 1
             parts.append(lines[index])
-        normalized = _visible(_collapse_joins("\n".join(parts)))
-        yield start, normalized, truncated
+        normalized, boundaries = _normalized_window(parts)
+        yield start, normalized, boundaries, truncated
         index += 1
 
 
@@ -272,7 +285,7 @@ def apply_literal_credential_findings(
                 continue
             found: list[tuple[int, str]] = []
             refused = False
-            for line_no, normalized, truncated in _literal_windows(text):
+            for first_line, normalized, boundaries, truncated in _literal_windows(text):
                 if truncated and _cut_off_token(normalized):
                     own_failures.append(
                         f"{neutralize(rel_path)}: a vendor token continues past the "
@@ -280,12 +293,13 @@ def apply_literal_credential_findings(
                     )
                     refused = True
                     break
-                seen: set[str] = set()
-                for literal in _literals(normalized):
-                    if literal in seen or placeholder(literal):
+                seen: set[tuple[int, str]] = set()
+                for offset, literal in _literals(normalized):
+                    location = (first_line + bisect_right(boundaries, offset), literal)
+                    if location in seen or placeholder(literal):
                         continue
-                    seen.add(literal)
-                    found.append((line_no, literal))
+                    seen.add(location)
+                    found.append(location)
                     if len(found) > MAX_LITERALS:
                         own_failures.append(
                             f"{neutralize(rel_path)}: more than {MAX_LITERALS} vendor token "
