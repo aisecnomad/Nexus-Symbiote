@@ -179,3 +179,101 @@ def test_mcp_scanner_emits_high_and_medium_launch_context_findings(
         r.severity is RiskSeverity.MEDIUM and "enabled runtime debugger" in r.detail
         for r in debug_risks
     )
+
+
+@pytest.mark.parametrize(
+    ("command", "args", "expected"),
+    [
+        ("env", ["NODE_TLS_REJECT_UNAUTHORIZED=0", "node", "./server.js"], True),
+        ("env", ["NODE_TLS_REJECT_UNAUTHORIZED=0", "tsx", "./server.ts"], True),
+        ("env", ["NODE_TLS_REJECT_UNAUTHORIZED=0", "npx", "-y", "@acme/mcp@1.2.3"], True),
+        ("env", ["NODE_TLS_REJECT_UNAUTHORIZED=0", "bunx", "@acme/mcp@1.2.3"], True),
+        ("env", ["-i", "NODE_TLS_REJECT_UNAUTHORIZED=0", "node", "./server.js"], True),
+        ("sh", ["-c", "NODE_TLS_REJECT_UNAUTHORIZED=0 node ./server.js"], True),
+        ("env", ["NODE_TLS_REJECT_UNAUTHORIZED=1", "node", "./server.js"], False),
+        ("env", ["NODE_TLS_REJECT_UNAUTHORIZED= 0", "node", "./server.js"], False),
+        ("env", ["NODE_TLS_REJECT_UNAUTHORIZED=false", "node", "./server.js"], False),
+        ("env", ["NODE_TLS_REJECT_UNAUTHORIZED=00", "node", "./server.js"], False),
+        ("env", ["NODE_TLS_REJECT_UNAUTHORIZED=0", "python", "./server.py"], False),
+        ("env", ["NODE_TLS_REJECT_UNAUTHORIZED=0", "deno", "run", "./server.ts"], False),
+    ],
+)
+def test_node_tls_reject_unauthorized_wrapper_detection(
+    command: str, args: list[str], expected: bool
+) -> None:
+    launch = analyze(command, args)
+    assert bool(launch.context.get("tls_verification_disabled")) == expected
+
+
+def test_mcp_scanner_reports_effective_node_tls_bypass_and_honors_overrides(
+    tmp_path: Path,
+) -> None:
+    config = {
+        "mcpServers": {
+            "node-tls-env": {
+                "command": "node",
+                "args": ["./server.js"],
+                "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+            },
+            "npx-tls-env": {
+                "command": "npx",
+                "args": ["-y", "@acme/mcp@1.2.3"],
+                "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+            },
+            "node-tls-wrapper": {
+                "command": "env",
+                "args": ["NODE_TLS_REJECT_UNAUTHORIZED=0", "node", "./server.js"],
+            },
+            "node-tls-re-enabled": {
+                "command": "env",
+                "args": ["NODE_TLS_REJECT_UNAUTHORIZED=1", "node", "./server.js"],
+                "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+            },
+            "node-tls-unset": {
+                "command": "env",
+                "args": ["-u", "NODE_TLS_REJECT_UNAUTHORIZED", "node", "./server.js"],
+                "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+            },
+            "node-tls-cleared": {
+                "command": "env",
+                "args": ["-i", "node", "./server.js"],
+                "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+            },
+            "node-tls-non-zero-string": {
+                "command": "node",
+                "args": ["./server.js"],
+                "env": {"NODE_TLS_REJECT_UNAUTHORIZED": " 0"},
+            },
+            "python-ignores-node-tls": {
+                "command": "python3",
+                "args": ["./server.py"],
+                "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+            },
+        }
+    }
+    (tmp_path / "server.js").write_text("// benign\n", encoding="utf-8")
+    (tmp_path / "server.py").write_text("# benign\n", encoding="utf-8")
+    (tmp_path / ".mcp.json").write_text(json.dumps(config), encoding="utf-8")
+
+    result = MCPScanner().scan(tmp_path)
+    by_name = {c.name: c for c in result.components}
+
+    for name in ("node-tls-env", "npx-tls-env", "node-tls-wrapper"):
+        assert any(
+            r.category == "launch_context"
+            and r.severity is RiskSeverity.HIGH
+            and "disabled TLS certificate verification" in r.detail
+            for r in by_name[name].risks
+        ), name
+
+    for name in (
+        "node-tls-re-enabled",
+        "node-tls-unset",
+        "node-tls-cleared",
+        "node-tls-non-zero-string",
+        "python-ignores-node-tls",
+    ):
+        assert not any(
+            r.category == "launch_context" and "disabled TLS certificate verification" in r.detail
+            for r in by_name[name].risks
+        ), name

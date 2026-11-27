@@ -24,7 +24,7 @@ import fnmatch
 import posixpath
 import re
 import shlex
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -240,6 +240,9 @@ class Launch:
     script_shell: bool = False
     # env -S and --split-string values read so far, across every env wrapper.
     split_strings: int = 0
+    # Wrapper override for NODE_TLS_REJECT_UNAUTHORIZED: None = inherit server env,
+    # "" = explicitly cleared/unset by env -i/-u, otherwise the last wrapper value.
+    node_tls_override: str | None = None
 
     def mark(self, flag: str, count: int = 1) -> None:
         self.context[flag] = self.context.get(flag, 0) + count
@@ -2125,6 +2128,29 @@ def _command_words(command: str, args: list[str]) -> tuple[list[str] | None, str
     return [stripped], ""
 
 
+_NODE_TLS_FAMILIES = frozenset({"npm", "yarn", "bun"})
+
+
+def node_tls_runtime(launch: Launch) -> bool:
+    """Whether the launch runs on Node.js or Bun, which honor NODE_TLS_REJECT_UNAUTHORIZED=0."""
+    return launch.family in _NODE_TLS_FAMILIES or (
+        launch.executable is not None
+        and _interpreter_family(launch.executable) in {"node", "ts-node"}
+    )
+
+
+def node_tls_disabled(launch: Launch, server_env: Mapping[str, object] | None = None) -> bool:
+    """Whether the effective launch environment disables Node/Bun TLS verification."""
+    if not node_tls_runtime(launch):
+        return False
+    if launch.node_tls_override is not None:
+        return launch.node_tls_override == "0"
+    if server_env is None:
+        return False
+    value = server_env.get("NODE_TLS_REJECT_UNAUTHORIZED")
+    return isinstance(value, str) and value == "0"
+
+
 def analyze(command: str, args: list[str]) -> Launch:
     """Classify a declared command and its arguments, recording no argument value."""
     launch = Launch()
@@ -2150,6 +2176,8 @@ def analyze(command: str, args: list[str]) -> Launch:
             return launch
         if inner is None:
             _classify(tokens, launch)
+            if node_tls_disabled(launch):
+                launch.mark("tls_verification_disabled")
             return launch
         tokens = inner
     launch.fail("wrapper nesting limit")
@@ -2226,16 +2254,21 @@ def _unwrap_env(rest: list[str], launch: Launch) -> list[str] | None:
     while index < len(rest):
         word = rest[index]
         if word in {"-i", "-", "--ignore-environment", "-0", "--null", "-v", "--debug", "--"}:
+            if word in {"-i", "-", "--ignore-environment"}:
+                launch.node_tls_override = ""
             index += 1
         elif word in {"-u", "-C", "--unset", "--chdir"}:
-            if word in {"-C", "--chdir"} and _moves(
-                rest[index + 1] if index + 1 < len(rest) else ""
-            ):
+            target = rest[index + 1] if index + 1 < len(rest) else ""
+            if word in {"-C", "--chdir"} and _moves(target):
                 launch.relocated = True
+            elif word in {"-u", "--unset"} and target == "NODE_TLS_REJECT_UNAUTHORIZED":
+                launch.node_tls_override = ""
             index += 2
         elif word.startswith(("--unset=", "--chdir=")):
             if word.startswith("--chdir=") and _moves(word.partition("=")[2]):
                 launch.relocated = True
+            elif word.partition("=")[2] == "NODE_TLS_REJECT_UNAUTHORIZED":
+                launch.node_tls_override = ""
             index += 1
         elif word in {"-S", "--split-string"} or word.startswith(("-S", "--split-string=")):
             if word in {"-S", "--split-string"}:
@@ -2265,6 +2298,8 @@ def _unwrap_env(rest: list[str], launch: Launch) -> list[str] | None:
         elif _ENV_ASSIGNMENT.match(word):
             name, _, value = word.partition("=")
             launch.environment.append((name, value))
+            if name == "NODE_TLS_REJECT_UNAUTHORIZED":
+                launch.node_tls_override = value
             index += 1
         else:
             launch.wrappers.append("env")
@@ -2277,6 +2312,8 @@ def _script_words(words: list[str], launch: Launch) -> list[str] | None:
     while words and _ASSIGNMENT.match(words[0]):
         name, _, value = words[0].partition("=")
         launch.environment.append((name, value))
+        if name == "NODE_TLS_REJECT_UNAUTHORIZED":
+            launch.node_tls_override = value
         words = words[1:]
     if words and words[0] == "exec":
         return _exec_operands("exec", words[1:], launch)

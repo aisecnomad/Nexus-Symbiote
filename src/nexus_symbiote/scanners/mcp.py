@@ -98,6 +98,7 @@ from nexus_symbiote.scanners.mcp_launch import (
     analyze,
     expands,
     known_executable,
+    node_tls_disabled,
     origin,
 )
 from nexus_symbiote.utils.confined import (
@@ -4555,6 +4556,10 @@ class MCPScanner(Scanner):
         ]
         if loading:
             context["code_loading_environment"] = len(loading)
+        if node_tls_disabled(launch, env):
+            context["tls_verification_disabled"] = max(
+                context.get("tls_verification_disabled", 0), 1
+            )
         if command_fields:
             context["command_fields"] = len(command_fields)
         if view.code:
