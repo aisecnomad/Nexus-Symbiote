@@ -22,6 +22,7 @@ from nexus_symbiote.core.hashing import TOOL_DEFINITION_HASH_VERSION, canonical_
 from nexus_symbiote.core.models import (
     UNBOUND_VALUES_DETAIL,
     AnyComponent,
+    CapabilityDeclaration,
     CompletenessClaim,
     MCPServerComponent,
     check_spec_version,
@@ -230,6 +231,23 @@ def _readable_spec_version(version: object) -> bool:
 def _clip(value: object) -> str:
     text = str(value)
     return text if len(text) <= _SHOWN else text[: _SHOWN - 1] + "…"
+
+
+def _oauth_scopes(capabilities: object) -> set[str]:
+    if not isinstance(capabilities, dict):
+        return set()
+    return {s for s in capabilities.get("oauth_scopes") or () if isinstance(s, str)}
+
+
+def _without_scopes(capabilities: object) -> dict[str, Any] | None:
+    """The declaration with its scopes blanked, or None when it is not a declaration."""
+    if capabilities is not None and not isinstance(capabilities, dict):
+        return None
+    try:
+        declared = CapabilityDeclaration.model_validate(capabilities or {})
+    except ValueError:
+        return None
+    return declared.model_dump(mode="json") | {"oauth_scopes": []}
 
 
 def _listing(values: Iterable[str]) -> str:
@@ -838,9 +856,11 @@ class AIBOMDiffer:
                 }
             )
         old_caps, new_caps = old_fields.get("capabilities"), new_fields.get("capabilities")
-        if isinstance(old_caps, dict) and isinstance(new_caps, dict):
-            before_scopes = {s for s in old_caps.get("oauth_scopes") or () if isinstance(s, str)}
-            after_scopes = {s for s in new_caps.get("oauth_scopes") or () if isinstance(s, str)}
+        if isinstance(old_caps, dict) or isinstance(new_caps, dict):
+            # A first grant arrives with the whole block and a last removal takes it away,
+            # so an absent block is compared as a declaration with no scopes.
+            before_scopes = _oauth_scopes(old_caps)
+            after_scopes = _oauth_scopes(new_caps)
             added_scopes = sorted(after_scopes - before_scopes)
             removed_scopes = sorted(before_scopes - after_scopes)
             scope_changes = [
@@ -856,7 +876,7 @@ class AIBOMDiffer:
                         "severity": "high" if added_scopes else "medium",
                     }
                 )
-                if old_caps | {"oauth_scopes": []} == new_caps | {"oauth_scopes": []}:
+                if _without_scopes(old_caps) == _without_scopes(new_caps):
                     handled.add("capabilities")
         old_props, new_props = old_fields.get("properties"), new_fields.get("properties")
         if isinstance(old_props, dict) and isinstance(new_props, dict):
