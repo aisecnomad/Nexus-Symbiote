@@ -1613,11 +1613,19 @@ def _validate_rings(
 
 
 def _descriptor_is_poisoned(definition: Mapping[str, Any]) -> bool:
-    """Check a served tool descriptor for hidden characters or text-poisoning directives."""
+    """Check a served tool descriptor for hidden characters or text-poisoning directives.
+
+    Only high and critical hidden-text findings count: directional marks and line
+    separators are rated lower because ordinary right-to-left and pasted text holds them.
+    """
+    from nexus_symbiote.core.enums import RiskSeverity
     from nexus_symbiote.scanners.prompt import definition_text_risks
     from nexus_symbiote.text_poisoning import scan_text_block
 
-    if definition_text_risks(definition, "served-tool", include_name=True):
+    if any(
+        risk.severity in (RiskSeverity.CRITICAL, RiskSeverity.HIGH)
+        for risk in definition_text_risks(definition, "served-tool", include_name=True)
+    ):
         return True
     pending: list[object] = [definition]
     while pending:

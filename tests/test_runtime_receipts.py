@@ -289,6 +289,50 @@ def test_reference_gateway_blocks_hidden_unicode_descriptor(tmp_path: Path) -> N
     assert exc_info.value.reason == "descriptor-poisoned"
 
 
+@pytest.mark.parametrize(
+    ("description", "admitted"),
+    [
+        # Rated medium and low by the inventory: ordinary in right-to-left text and in
+        # pasted paragraphs, not hidden text.
+        ("\u05d7\u05d9\u05e4\u05d5\u05e9\u200f (search)", True),
+        ("\u0628\u062d\u062b\u061c 2024", True),
+        ("Search the knowledge base.\u2028Returns matching articles.", True),
+        ("Search docs\u200b quietly", False),
+        ("Benign description\u202ehidden", False),
+    ],
+)
+def test_reference_gateway_gates_only_high_and_critical_hidden_text(
+    tmp_path: Path, description: str, admitted: bool
+) -> None:
+    definition = {
+        "name": "search_docs",
+        "description": description,
+        "inputSchema": {"type": "object", "properties": {}},
+    }
+    gateway, bundle = _setup_gateway(tmp_path, tool_definition=definition)
+    call = ToolCall(
+        server_id="docs-mcp",
+        tool_name="search_docs",
+        action="read",
+        resource="kb:public",
+        arguments={},
+    )
+    try:
+        result: str | None = gateway.invoke(
+            call,
+            snapshot=bundle["snapshot"],  # type: ignore[arg-type]
+            trust=bundle["trust"],  # type: ignore[arg-type]
+            bom=bundle["bom"],  # type: ignore[arg-type]
+        )
+        reason = None
+    except AuthorizationError as exc:
+        result, reason = None, exc.reason
+    if admitted:
+        assert (result, reason) == ("executed:search_docs", None)
+    else:
+        assert (result, reason) == (None, "descriptor-poisoned")
+
+
 def test_runtime_verify_receipts_cli(tmp_path: Path) -> None:
     key_dir = tmp_path / "keys"
     key_dir.mkdir()
