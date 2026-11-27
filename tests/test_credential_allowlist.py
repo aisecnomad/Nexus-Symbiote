@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from unittest.mock import patch
 
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.models import PromptComponent
@@ -14,6 +15,7 @@ from nexus_symbiote.credential_allowlist import (
 )
 from nexus_symbiote.literal_credentials import apply_literal_credential_findings
 from nexus_symbiote.scanners.mcp_credentials import normalize_credential, placeholder
+from nexus_symbiote.utils.confined import ConfinedCollection
 
 _FAKE = "sk-proj-thisisfake0123456789ab"
 _LOW = "sk-proj-" + ("a" * 24)
@@ -201,3 +203,25 @@ def test_non_file_allowlist_is_a_collection_failure(tmp_path: Path) -> None:
     (tmp_path / ".nexus-symbiote-credential-allowlist.yaml").mkdir()
     allowlist, error = load_credential_allowlist(tmp_path)
     assert error is not None and not allowlist.allow
+
+
+def test_allowlist_read_and_close_failures_discard_valid_policy(tmp_path: Path) -> None:
+    policy = tmp_path / ".nexus-symbiote-credential-allowlist.yaml"
+    policy.write_text("allow:\n  - path: docs/sample.md\n    reason: Documentation fixture.\n")
+    valid, error = load_credential_allowlist(tmp_path)
+    assert error is None and len(valid.allow) == 1
+
+    close = ConfinedCollection.__exit__
+
+    def failed_close(collection: ConfinedCollection, *args: object) -> None:
+        close(collection, *args)
+        raise OSError("fixture close failed")
+
+    for operation in (
+        patch.object(ConfinedCollection, "read_bytes", side_effect=OSError("fixture read failed")),
+        patch.object(ConfinedCollection, "__exit__", failed_close),
+    ):
+        with operation:
+            rejected, error = load_credential_allowlist(tmp_path)
+        assert not rejected.allow
+        assert error == "credential allowlist: file could not be read; nothing is suppressed"
