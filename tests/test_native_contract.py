@@ -21,11 +21,11 @@ from nexus_symbiote.core.models import NATIVE_SPEC_VERSION, AgentComponent, Capa
 # tagged; from then on it is frozen (docs/releasing.md, step 1, re-verifies the pin).
 PINNED_NATIVE_SCHEMA_BYTES_SHA256: dict[str, str] = {
     "1.1.0": "876a82dcd9737a21d391201be3762ebbbff562badeb44646ce570c71445ce64f",
-    "1.2.0": "bfab95e64b8c78efee69b5c5c2d006cb573cbad5ec0da7c4aca53c6c4a65144f",
+    "1.2.0": "f4261752a959a1b6fb0a43365f5194b7894d305b25d9c04475c9d8f04fd8974c",
 }
 PINNED_NATIVE_SCHEMA_CANONICAL_SHA256: dict[str, str] = {
     "1.1.0": "59cbd2c45069fd66039d034fd692c2944f28bf3b83d1cf457d879fd164fff309",
-    "1.2.0": "a9f26a0ab3f35f3f945f57ec58af2443071600c5c1688e08737182a4fbed6457",
+    "1.2.0": "e2df31eebd2ebfd277217c453ecc8042cd9f605da1b32797b490bea0eea6ced5",
 }
 
 

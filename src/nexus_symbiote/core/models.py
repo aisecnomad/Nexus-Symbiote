@@ -18,6 +18,8 @@ from pydantic import (
     SerializerFunctionWrapHandler,
     StrictBool,
     StrictInt,
+    ValidationError,
+    WithJsonSchema,
     field_validator,
     model_serializer,
     model_validator,
@@ -600,18 +602,70 @@ class VerifiedExtensionComponent(ComponentBase):
 
 CredentialKind = Literal["environment-variable", "workflow-credential", "source-literal"]
 
+CollectionMode = Literal[
+    "environment-key-reference",
+    "imported-unverified-report",
+    "live-observation",
+    "lockfile-resolution-claim",
+    "manifest-reference",
+    "recommended-extension",
+    "static-agent-card",
+    "static-config",
+    "static-file-digest",
+    "static-import-reference",
+    "static-project-configuration",
+    "static-source-declaration",
+    "static-source-reference",
+    "static-syntax-reference",
+]
+
+
+class CredentialProperties(InventoryModel):
+    """The only properties a credential records: how and where it was collected.
+
+    A closed set, so no property can hold a value: a collector that needs another one
+    adds it here, typed, where review sees it.
+    """
+
+    collection_mode: CollectionMode | None = None
+    declaration_line: Annotated[StrictInt, Field(ge=1, le=2**31 - 1)] | None = Field(
+        default=None, description="The 1-based source line the reference is declared on"
+    )
+    neutralized_raw_sha256: (
+        dict[
+            Literal["name", "description", "supplier", "trimmed_name"],
+            Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")],
+        ]
+        | None
+    ) = Field(
+        default=None,
+        description=(
+            "Digests of the raw text of fields that terminal neutralization rewrote "
+            "(core.identifiers.RAW_DIGESTS)"
+        ),
+    )
+
 
 class CredentialComponent(ComponentBase):
     """A credential that a component authenticates with, recorded by name, never by value.
 
     The name is what holds the credential: an environment variable, the label under
-    which a workflow tool stores it, or the parameter a literal is passed as. A record
+    which a workflow tool stores it, or the parameter a literal is passed as. No field
+    holds a value: ``properties`` is limited to ``CredentialProperties``, and a record
     with any text shaped like a credential value, or with any digest, is refused when it
     is built and again by every export (``core.aibom.prepare``), which a record changed
-    after it was built cannot bypass. Only format 1.2.0 and later documents carry one.
+    after it was built cannot bypass. Free text whose value has no known shape cannot be
+    told from a name, so collectors never read values. Only format 1.2.0 and later
+    documents carry a credential.
     """
 
+    # Errors never quote the record, which may hold what was refused.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     component_type: Literal[ComponentType.CREDENTIAL] = ComponentType.CREDENTIAL
+    properties: Annotated[
+        dict[str, Any], WithJsonSchema(CredentialProperties.model_json_schema())
+    ] = Field(default_factory=dict)
     hashes: dict[str, str] = Field(
         default_factory=dict,
         max_length=0,
@@ -650,6 +704,10 @@ def credential_value_problem(component: CredentialComponent) -> str | None:
     """Why a credential record may not be written, as fixed text, or ``None``."""
     if component.hashes:
         return "a credential records no digest of its value"
+    try:
+        CredentialProperties.model_validate(component.properties)
+    except ValidationError:
+        return "a credential's properties record only how and where it was collected"
     if any(holds_token_shape(text) for text in _texts(component.model_dump(mode="json"))):
         return "a credential record holds text shaped like a credential value"
     return None

@@ -51,7 +51,9 @@ A `credential` component names a secret that another component authenticates wit
 environment variable, the label a workflow tool stores it under, or the parameter a
 literal is passed as. It records the name and whether a value sits in the checkout,
 never the value or a digest of it; a record with text shaped like a credential value is
-refused. An `acts-as-identity` edge leads from the component that uses it.
+refused, and its properties only say how and where it was collected. A credential whose
+value sits in the checkout is a high `credential_exposure` finding. An `acts-as-identity`
+edge leads from the component that uses it.
 
 ## Collection and coverage
 

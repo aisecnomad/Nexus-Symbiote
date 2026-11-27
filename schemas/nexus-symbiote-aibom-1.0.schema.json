@@ -1348,7 +1348,7 @@
     },
     "CredentialComponent": {
       "additionalProperties": false,
-      "description": "A credential that a component authenticates with, recorded by name, never by value.\n\nThe name is what holds the credential: an environment variable, the label under\nwhich a workflow tool stores it, or the parameter a literal is passed as. A record\nwith any text shaped like a credential value, or with any digest, is refused when it\nis built and again by every export (``core.aibom.prepare``), which a record changed\nafter it was built cannot bypass. Only format 1.2.0 and later documents carry one.",
+      "description": "A credential that a component authenticates with, recorded by name, never by value.\n\nThe name is what holds the credential: an environment variable, the label under\nwhich a workflow tool stores it, or the parameter a literal is passed as. No field\nholds a value: ``properties`` is limited to ``CredentialProperties``, and a record\nwith any text shaped like a credential value, or with any digest, is refused when it\nis built and again by every export (``core.aibom.prepare``), which a record changed\nafter it was built cannot bypass. Free text whose value has no known shape cannot be\ntold from a name, so collectors never read values. Only format 1.2.0 and later\ndocuments carry a credential.",
       "properties": {
         "bom_ref": {
           "description": "Unique reference within this BOM",
@@ -1433,10 +1433,80 @@
           "title": "Source Path"
         },
         "properties": {
-          "type": "object",
-          "additionalProperties": true,
-          "description": "Extension properties",
-          "title": "Properties"
+          "additionalProperties": false,
+          "description": "The only properties a credential records: how and where it was collected.\n\nA closed set, so no property can hold a value: a collector that needs another one\nadds it here, typed, where review sees it.",
+          "properties": {
+            "collection_mode": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "environment-key-reference",
+                    "imported-unverified-report",
+                    "live-observation",
+                    "lockfile-resolution-claim",
+                    "manifest-reference",
+                    "recommended-extension",
+                    "static-agent-card",
+                    "static-config",
+                    "static-file-digest",
+                    "static-import-reference",
+                    "static-project-configuration",
+                    "static-source-declaration",
+                    "static-source-reference",
+                    "static-syntax-reference"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Collection Mode"
+            },
+            "declaration_line": {
+              "anyOf": [
+                {
+                  "maximum": 2147483647,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "The 1-based source line the reference is declared on",
+              "title": "Declaration Line"
+            },
+            "neutralized_raw_sha256": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "pattern": "^sha256:[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "propertyNames": {
+                    "enum": [
+                      "name",
+                      "description",
+                      "supplier",
+                      "trimmed_name"
+                    ]
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Digests of the raw text of fields that terminal neutralization rewrote (core.identifiers.RAW_DIGESTS)",
+              "title": "Neutralized Raw Sha256"
+            }
+          },
+          "title": "CredentialProperties",
+          "type": "object"
         },
         "claims": {
           "additionalProperties": {

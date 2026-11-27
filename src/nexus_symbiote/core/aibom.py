@@ -186,6 +186,8 @@ class AIBOM(BaseModel):
 
     model_config = ConfigDict(
         extra="forbid",
+        # A refused document is never quoted back, whatever reads the error.
+        hide_input_in_errors=True,
         json_schema_extra={
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "$id": SCHEMA_ID,

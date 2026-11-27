@@ -23,10 +23,13 @@ from nexus_symbiote.core.aibom import (
 )
 from nexus_symbiote.core.canonical import content_digest, json_text
 from nexus_symbiote.core.enums import ComponentType, RiskSeverity
+from nexus_symbiote.core.identifiers import RAW_DIGESTS, neutralize_identifiers
 from nexus_symbiote.core.models import (
     AgentComponent,
     AIBOMMetadata,
+    ClaimEvidence,
     CredentialComponent,
+    CredentialProperties,
     ModelComponent,
     RiskAssessment,
 )
@@ -40,9 +43,11 @@ from nexus_symbiote.validators.risk import RiskScorer
 ROOT = Path(__file__).resolve().parents[1]
 # Assembled at run time so no token-shaped literal sits in this file.
 TOKEN = "ghp_" + "Zq7" * 12
+# A value with no recognisable shape: only the closed property set keeps it out.
+PLAIN = "hunter2-plain-value"
 
 
-def _inventory(*, exposed: bool = False) -> AIBOM:
+def _inventory(*, exposed: bool = False, supplied_risk: bool = True) -> AIBOM:
     credential = CredentialComponent(
         bom_ref="credential:OPENAI_API_KEY",
         name="OPENAI_API_KEY",
@@ -57,7 +62,7 @@ def _inventory(*, exposed: bool = False) -> AIBOM:
                 recommendation="Remove the value, rotate it and load it from a secret store",
             )
         ]
-        if exposed
+        if exposed and supplied_risk
         else [],
     )
     # A collection time keeps reference libraries from stamping their own, which recovery
@@ -152,6 +157,54 @@ def test_a_credential_records_no_digest_of_its_value() -> None:
     assert list(_schema().iter_errors(document))
 
 
+def test_a_credential_records_only_how_and_where_it_was_collected() -> None:
+    allowed = {
+        "collection_mode": "static-source-declaration",
+        "declaration_line": 12,
+        RAW_DIGESTS: {"name": "sha256:" + "a" * 64},
+    }
+    credential = CredentialComponent(bom_ref="credential:A", name="A", properties=allowed)
+    assert credential.properties == allowed
+    document = _inventory().to_dict()
+    _credential(document)["properties"] = allowed
+    assert list(_schema().iter_errors(document)) == []
+
+
+@pytest.mark.parametrize(
+    "properties",
+    [
+        {"value": PLAIN},
+        {"password": PLAIN},
+        {"collection_mode": PLAIN},
+        {"declaration_line": 0},
+        {"declaration_line": True},
+        {RAW_DIGESTS: {"name": PLAIN}},
+        {RAW_DIGESTS: {"value": "sha256:" + "a" * 64}},
+    ],
+    ids=["value", "password", "mode", "line-zero", "line-bool", "digest-shape", "digest-field"],
+)
+def test_no_property_of_a_credential_holds_a_value(properties: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError) as built:
+        CredentialComponent(bom_ref="credential:A", name="A", properties=properties)
+    document = _inventory().to_dict()
+    _credential(document)["properties"] = properties
+    assert list(_schema().iter_errors(document))
+    with pytest.raises(ValidationError) as read:
+        AIBOM.from_document(document)
+    # Neither error quotes the record it refused.
+    assert PLAIN not in str(built.value) + str(read.value)
+
+
+def test_neutralized_text_keeps_its_digests_on_a_credential() -> None:
+    assert RAW_DIGESTS in CredentialProperties.model_fields
+    bom = _inventory()
+    credential = next(c for c in bom.components if isinstance(c, CredentialComponent))
+    credential.description = "Read by the agent\x1b[2J"
+    neutralize_identifiers(credential)
+    assert set(credential.properties[RAW_DIGESTS]) == {"description"}
+    assert "\\u001b" not in bom.to_native_json()
+
+
 @pytest.mark.parametrize("version", ["1.0.0", "1.1.0"])
 def test_only_a_format_that_defines_credentials_carries_one(tmp_path: Path, version: str) -> None:
     document = _inventory().to_dict()
@@ -202,6 +255,11 @@ def _token_in_a_property(bom: AIBOM) -> None:
     credential.properties.setdefault("notes", []).append(TOKEN)
 
 
+def _value_property_added(bom: AIBOM) -> None:
+    credential = next(c for c in bom.components if isinstance(c, CredentialComponent))
+    credential.properties["value"] = PLAIN
+
+
 def _built_unvalidated(bom: AIBOM) -> None:
     bom.components.append(CredentialComponent.model_construct(bom_ref="credential:x", name=TOKEN))
 
@@ -212,7 +270,14 @@ def _older_format(bom: AIBOM) -> None:
 
 @pytest.mark.parametrize(
     "change",
-    [_hash_added, _token_assigned, _token_in_a_property, _built_unvalidated, _older_format],
+    [
+        _hash_added,
+        _token_assigned,
+        _token_in_a_property,
+        _value_property_added,
+        _built_unvalidated,
+        _older_format,
+    ],
 )
 def test_every_export_refuses_a_credential_changed_after_it_was_built(
     tmp_path: Path, change: Any
@@ -221,7 +286,7 @@ def test_every_export_refuses_a_credential_changed_after_it_was_built(
     change(bom)
     with pytest.raises(NativeFormatError) as refused:
         bom.to_native_json()
-    assert TOKEN not in str(refused.value)
+    assert TOKEN not in str(refused.value) and PLAIN not in str(refused.value)
     target = tmp_path / "bom.json"
     with pytest.raises(NativeFormatError):
         bom.save(target)
@@ -235,7 +300,8 @@ def test_every_export_refuses_a_credential_changed_after_it_was_built(
     ):
         with pytest.raises(ExportCheckError) as refused_export:
             exporter.generate(bom)
-        assert TOKEN not in str(refused_export.value)
+        shown = str(refused_export.value)
+        assert TOKEN not in shown and PLAIN not in shown
 
 
 def test_recovery_refuses_an_embedded_credential_that_carries_a_digest() -> None:
@@ -347,6 +413,46 @@ def test_a_credential_finding_gates_and_reaches_sarif(tmp_path: Path) -> None:
     )
 
 
+def _exposure_findings(bom: AIBOM) -> list[Any]:
+    _, report = RiskScorer().passes_gate(bom)
+    return [f for f in report.findings if f.category == "credential_exposure"]
+
+
+def test_a_value_in_the_checkout_is_a_high_finding_from_the_recorded_fact(tmp_path: Path) -> None:
+    bom = _inventory(exposed=True, supplied_risk=False)
+    (finding,) = _exposure_findings(bom)
+    assert finding.severity is RiskSeverity.HIGH
+    assert finding.component_ref == "credential:OPENAI_API_KEY"
+    sarif = json.loads(SARIFGenerator(scan_root=tmp_path).generate_json(bom))
+    assert [r["ruleId"] for r in sarif["runs"][0]["results"]] == [
+        "nexus_symbiote/credential_exposure/high"
+    ]
+    # A collector's own finding stands in for it; no value in the checkout, no finding.
+    assert len(_exposure_findings(_inventory(exposed=True))) == 1
+    assert _exposure_findings(_inventory()) == []
+
+
+def _without_the_credential() -> AIBOM:
+    bom = _inventory()
+    bom.components = [c for c in bom.components if c.bom_ref != "credential:OPENAI_API_KEY"]
+    bom.dependencies = [d for d in bom.dependencies if d.relationship != "acts-as-identity"]
+    return bom
+
+
+@pytest.mark.parametrize("supplied_risk", [True, False])
+def test_an_added_credential_with_a_value_in_the_checkout_is_a_high_drift_alert(
+    supplied_risk: bool,
+) -> None:
+    report = AIBOMDiffer().diff(
+        _without_the_credential(), _inventory(exposed=True, supplied_risk=supplied_risk)
+    )
+    (added,) = (c for c in report.components_added if c.bom_ref == "credential:OPENAI_API_KEY")
+    assert added.severity == "high"
+    quiet = AIBOMDiffer().diff(_without_the_credential(), _inventory())
+    (plain,) = (c for c in quiet.components_added if c.bom_ref == "credential:OPENAI_API_KEY")
+    assert plain.severity == "medium"
+
+
 def test_a_new_identity_an_agent_acts_as_is_a_drift_alert() -> None:
     before = _inventory()
     before.components = [c for c in before.components if c.bom_ref != "credential:OPENAI_API_KEY"]
@@ -355,8 +461,12 @@ def test_a_new_identity_an_agent_acts_as_is_a_drift_alert() -> None:
     assert any("credential:OPENAI_API_KEY" in str(alert) for alert in result.security_alerts)
 
 
-def test_a_value_newly_committed_for_a_credential_is_a_high_drift_alert() -> None:
-    report = AIBOMDiffer().diff(_inventory(), _inventory(exposed=True))
+@pytest.mark.parametrize("supplied_risk", [True, False])
+def test_a_value_newly_committed_for_a_credential_is_a_high_drift_alert(
+    supplied_risk: bool,
+) -> None:
+    exposed = _inventory(exposed=True, supplied_risk=supplied_risk)
+    report = AIBOMDiffer().diff(_inventory(), exposed)
     (change,) = report.components_modified
     assert change.bom_ref == "credential:OPENAI_API_KEY"
     assert change.severity == "high"
@@ -366,7 +476,7 @@ def test_a_value_newly_committed_for_a_credential_is_a_high_drift_alert() -> Non
     assert not any("now committed" in d for c in reverse.components_modified for d in c.details)
 
 
-def test_reconciliation_vouches_for_no_credential_that_no_collector_records(tmp_path: Path) -> None:
+def _validated_with(tmp_path: Path, credential: CredentialComponent) -> Any:
     project = tmp_path / "project"
     project.mkdir()
     (project / "AGENTS.md").write_text("Keep receipts.\n")
@@ -376,14 +486,45 @@ def test_reconciliation_vouches_for_no_credential_that_no_collector_records(tmp_
     )
     assert scanned.exit_code == 0, scanned.output
     document = json.loads(target.read_text())
-    document["components"].append(
-        CredentialComponent(bom_ref="credential:STRIPE_KEY", name="STRIPE_KEY").model_dump(
-            mode="json", exclude_none=True
-        )
-    )
+    document["components"].append(credential.model_dump(mode="json", exclude_none=True))
     target.write_text(json.dumps(document))
-    validated = CliRunner().invoke(
+    return CliRunner().invoke(
         main, ["validate", str(target), "--project", str(project), "--no-project-policy"]
+    )
+
+
+def test_reconciliation_vouches_for_no_credential_that_no_collector_records(tmp_path: Path) -> None:
+    validated = _validated_with(
+        tmp_path, CredentialComponent(bom_ref="credential:STRIPE_KEY", name="STRIPE_KEY")
     )
     assert validated.exit_code != 0
     assert "credential:STRIPE_KEY" in validated.output
+
+
+_RUNTIME = {"presence": ClaimEvidence(method="observed", scope="runtime")}
+
+
+@pytest.mark.parametrize("in_checkout", [True, False])
+def test_a_checkout_fact_needs_local_evidence_whatever_else_is_claimed(
+    tmp_path: Path, in_checkout: bool
+) -> None:
+    credential = CredentialComponent(
+        bom_ref="credential:STRIPE_KEY",
+        name="STRIPE_KEY",
+        value_in_checkout=in_checkout,
+        claims=_RUNTIME,
+    )
+    validated = _validated_with(tmp_path, credential)
+    assert validated.exit_code != 0
+    assert "no matching local evidence: credential:STRIPE_KEY" in validated.output
+
+
+def test_a_runtime_observed_credential_with_no_checkout_fact_is_a_supplier_claim(
+    tmp_path: Path,
+) -> None:
+    credential = CredentialComponent(
+        bom_ref="credential:STRIPE_KEY", name="STRIPE_KEY", claims=_RUNTIME
+    )
+    validated = _validated_with(tmp_path, credential)
+    assert validated.exit_code == 0, validated.output
+    assert "supplementary observation" in validated.output
