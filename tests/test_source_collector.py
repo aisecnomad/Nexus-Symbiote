@@ -997,11 +997,29 @@ def test_a_name_bound_again_in_any_form_is_not_taken_for_a_library_alone(
     assert set(models(result)) == {"gpt-4o"}
 
 
-def test_a_method_of_a_standard_library_object_is_not_read(tmp_path: Path):
-    source = 'import logging\nfrom openai import OpenAI\n\nclient = logging.getLogger("x")\n'
-    result = scan(tmp_path, {"run.py": source + 'client.create(model="gpt-4o")\n'})
+def test_a_method_of_what_python_builds_is_not_read(tmp_path: Path):
+    source = (
+        "import logging\nfrom openai import OpenAI\n\n"
+        'client = logging.getLogger("x")\n'
+        'client.create(model="gpt-4o")\n'
+        'line = "Using {model}".format(model="gpt-4o")\n'
+        "params = {}\n"
+        'params.update(model="gpt-4o")\n'
+        "OpenAI().responses.create(**params)\n"
+    )
+    result = scan(tmp_path, {"run.py": source})
+    # A logger's, a string's and a dict's methods take no model; what the SDK call is
+    # given through ``**params`` is unread.
     assert result.components == []
-    assert result.surfaces_excluded == []
+    assert list(result.surfaces_excluded) == [unread("run.py", 9)]
+
+
+def test_an_sdk_imported_only_with_a_star_is_read(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {"run.py": 'from openai import *\n\nOpenAI().responses.create(model="gpt-4o")\n'},
+    )
+    assert set(models(result)) == {"gpt-4o"}
 
 
 def test_an_sdk_imported_by_its_full_dotted_name_alone_is_read(tmp_path: Path):
