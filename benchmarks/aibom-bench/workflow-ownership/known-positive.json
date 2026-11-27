@@ -1,0 +1,46 @@
+{
+  "metadata": {
+    "spec_version": "1.1.0",
+    "tool_name": "synthetic workflow acceptance control"
+  },
+  "components": [
+    {
+      "component_type": "agent",
+      "bom_ref": "agent:order-router",
+      "name": "atlas_order_router",
+      "framework": "LangGraph",
+      "source_path": "agent.py",
+      "properties": {"source_line": 39},
+      "tool_refs": ["tool:order-lookup"]
+    },
+    {
+      "component_type": "model",
+      "bom_ref": "model:openai/order-chat",
+      "name": "gpt-4o-mini",
+      "properties": {"reference_path": "agent.py", "declaration_line": 22}
+    },
+    {
+      "component_type": "tool",
+      "bom_ref": "tool:order-lookup",
+      "name": "lookup_order",
+      "claims": {"declaration": {"method": "static-source", "scope": "repository", "locator": "agent.py:16"}}
+    },
+    {
+      "component_type": "prompt-template",
+      "bom_ref": "prompt:order-policy",
+      "name": "Order policy",
+      "source_path": "prompts/order_policy.md"
+    },
+    {
+      "component_type": "tool",
+      "bom_ref": "tool:sample-lookup",
+      "name": "sample_order_lookup",
+      "source_path": "examples/unregistered.py"
+    }
+  ],
+  "dependencies": [
+    {"source_ref": "agent:order-router", "target_ref": "model:openai/order-chat", "relationship": "uses-model"},
+    {"source_ref": "agent:order-router", "target_ref": "tool:order-lookup", "relationship": "invokes"},
+    {"source_ref": "agent:order-router", "target_ref": "prompt:order-policy", "relationship": "reads-instructions"}
+  ]
+}
