@@ -52,6 +52,7 @@ _KEPT_FIELDS = (
 _MAX_ALIASES = 16
 _MAX_ERRORS = 16
 _ADVISORY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
+_OSV_URL = "https://osv.dev/vulnerability/"
 _FEED_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 # Which registry declarations the inventory holds, widest first.
 REGISTRY_PACKAGES = ("all-supported", "ai-catalog", "not-collected")
@@ -189,7 +190,7 @@ def attach_offline_advisories(
                 category=ADVISORY_CATEGORY,
                 detail=" ".join([detail, *notes])[:1000],
                 recommendation="Upgrade to a fixed release or record a VEX decision.",
-                references=[f"https://osv.dev/vulnerability/{entry['id']}"],
+                references=[_OSV_URL + entry["id"]],
             )
         )
     # Encode the receipt in the existing completeness claim without a native schema change.
@@ -253,22 +254,13 @@ def advisory_receipts(aibom: AIBOM) -> dict[str, str]:
     return receipts
 
 
-def cyclonedx_vulnerabilities(aibom: AIBOM) -> list[dict[str, Any]]:
-    """CycloneDX ``vulnerabilities``: one entry per advisory id across every affected package.
-
-    The rating is the highest severity any affected package recorded, ``unknown`` when none
-    states one; the aliases are the union; the description is the first summary.
-    """
+def recorded_advisories(aibom: AIBOM) -> dict[tuple[str, str], dict[str, Any]]:
+    """Each advisory entry bound to a recorded receipt, by component ref and advisory id."""
     feeds = set(advisory_receipts(aibom).values())
-    if not feeds:
-        return []
-    hits: dict[str, list[tuple[str, dict[str, Any]]]] = {}
-    component_refs = {component.bom_ref for component in aibom.components}
-    for component in sorted(aibom.components, key=lambda c: c.bom_ref):
+    recorded: dict[tuple[str, str], dict[str, Any]] = {}
+    for component in sorted(aibom.components, key=lambda c: c.bom_ref) if feeds else ():
         entries = component.properties.get(ADVISORY_PROPERTY)
-        if not isinstance(entries, list):
-            continue
-        for entry in entries:
+        for entry in entries if isinstance(entries, list) else ():
             if not isinstance(entry, dict) or entry.get("source") != "osv-offline":
                 continue
             identifier = entry.get("id")
@@ -279,7 +271,47 @@ def cyclonedx_vulnerabilities(aibom: AIBOM) -> list[dict[str, Any]]:
                 and isinstance(digest, str)
                 and digest in feeds
             ):
-                hits.setdefault(identifier, []).append((component.bom_ref, entry))
+                recorded.setdefault((component.bom_ref, identifier), entry)
+    return recorded
+
+
+def finding_advisory_id(risk: RiskAssessment) -> str | None:
+    """The advisory a ``known_vulnerability`` finding names through its OSV reference."""
+    if risk.category != ADVISORY_CATEGORY:
+        return None
+    for reference in risk.references:
+        identifier = reference.removeprefix(_OSV_URL)
+        if identifier != reference and _ADVISORY_ID.fullmatch(identifier):
+            return identifier
+    return None
+
+
+def vex_advisories(aibom: AIBOM) -> list[dict[str, Any]]:
+    """Recorded advisories in the shape of an advisory report entry, for the VEX export."""
+    return [
+        {
+            "id": identifier,
+            "component_ref": ref,
+            "severity": _matcher_severity(entry.get("matcher_severity", entry.get("severity"))),
+            "aliases": sorted(_aliases(entry.get("aliases"), identifier))[:_MAX_ALIASES],
+            "summary": entry["summary"] if isinstance(entry.get("summary"), str) else "",
+            "range_undecidable": entry.get("range_undecidable") is True,
+            "offline": True,
+        }
+        for (ref, identifier), entry in recorded_advisories(aibom).items()
+    ]
+
+
+def cyclonedx_vulnerabilities(aibom: AIBOM) -> list[dict[str, Any]]:
+    """CycloneDX ``vulnerabilities``: one entry per advisory id across every affected package.
+
+    The rating is the highest severity any affected package recorded, ``unknown`` when none
+    states one; the aliases are the union; the description is the first summary.
+    """
+    hits: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    component_refs = {component.bom_ref for component in aibom.components}
+    for (ref, identifier), entry in recorded_advisories(aibom).items():
+        hits.setdefault(identifier, []).append((ref, entry))
     records: list[dict[str, Any]] = []
     for identifier in sorted(hits):
         affected = hits[identifier]
@@ -292,7 +324,7 @@ def cyclonedx_vulnerabilities(aibom: AIBOM) -> list[dict[str, Any]]:
         )[:_MAX_ALIASES]
         record: dict[str, Any] = {
             "id": identifier,
-            "source": {"name": "OSV", "url": f"https://osv.dev/vulnerability/{identifier}"},
+            "source": {"name": "OSV", "url": _OSV_URL + identifier},
             "ratings": [{"severity": rating}],
             "affects": [{"ref": ref} for ref in sorted({ref for ref, _ in affected})],
         }

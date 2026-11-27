@@ -338,3 +338,61 @@ def test_a_cvss_v3_vector_sets_the_severity_from_its_base_score(tmp_path: Path) 
     assert "Severity is not stated" not in finding.detail
     (vulnerability,) = CycloneDXGenerator().generate(bom)["vulnerabilities"]
     assert vulnerability["ratings"] == [{"severity": "critical"}]
+
+
+def test_vex_lists_a_recorded_advisory_once_under_its_bom_id(tmp_path: Path) -> None:
+    from nexus_symbiote.core.hashing import hash_bytes
+
+    project, operator, out = (tmp_path / name for name in ("project", "operator", "out"))
+    for directory in (project, operator, out):
+        directory.mkdir()
+    (project / "requirements.txt").write_text("pillow==9.0.0\n")
+    feed = operator / "osv.json"
+    feed.write_text(
+        json.dumps([_record("PYSEC-F5-1", [("pillow", "9.0.1")], aliases=["CVE-2099-55"])])
+    )
+    inventory, report = out / "inventory.json", operator / "advisories.json"
+    bom = _scan(project, feed, inventory)
+    (bom_vulnerability,) = CycloneDXGenerator().generate(bom)["vulnerabilities"]
+    runner = CliRunner()
+    runner.invoke(
+        main, ["advisories", str(inventory), "--offline-db", str(feed), "-o", str(report)]
+    )
+    decision = {
+        "id": bom_vulnerability["id"],
+        "component_ref": "registry:pypi/pillow",
+        "state": "not_affected",
+        "justification": "code_not_reachable",
+        "detail": "The decoder is never imported.",
+        "owner": "security@example.invalid",
+        "expires_at": "2030-01-01T00:00:00Z",
+        "inventory_sha256": hash_bytes(inventory.read_bytes()),
+        "deployment_id": "prod",
+    }
+    decisions = operator / "decisions.json"
+    decisions.write_text(json.dumps({"version": 1, "decisions": [decision]}))
+    for linked in (["--advisories", str(report)], []):
+        vex = out / "vex.json"
+        result = runner.invoke(
+            main,
+            [
+                "vex",
+                str(inventory),
+                *linked,
+                "--decisions",
+                str(decisions),
+                "--project-root",
+                str(project),
+                "--deployment-id",
+                "prod",
+                "-o",
+                str(vex),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        listed = [
+            (entry["id"], entry["analysis"]["state"])
+            for entry in json.loads(vex.read_text())["vulnerabilities"]
+            if entry["affects"] == [{"ref": "registry:pypi/pillow"}]
+        ]
+        assert listed == [(bom_vulnerability["id"], "not_affected")], linked
