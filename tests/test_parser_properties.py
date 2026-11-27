@@ -800,7 +800,7 @@ SOURCE_FRAGMENTS = st.sampled_from(
     ]
 )
 SOURCE_TEXT = st.lists(st.one_of(SOURCE_FRAGMENTS, st.text(max_size=12)), max_size=24).map("".join)
-SOURCE_SECRET = st.text(
+PLANTED_SHAPES = st.text(
     alphabet="ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789", min_size=40, max_size=48
 ).map(lambda body: "sk-proj-" + body)
 
@@ -853,24 +853,24 @@ def test_python_source_that_is_not_text_is_nothing_or_a_gap(payload):
         ]
 
 
-@given(SOURCE_SECRET, st.sampled_from(["model", "api_key", "base_url", "variable", "default"]))
-def test_a_token_in_any_argument_of_source_is_never_exported(secret, argument):
-    model = secret if argument == "model" else "gpt-4o"
-    variable = secret if argument == "variable" else "CHAT_MODEL"
-    default = secret if argument == "default" else "gpt-4.1"
+@given(PLANTED_SHAPES, st.sampled_from(["model", "api_key", "base_url", "variable", "default"]))
+def test_a_token_in_any_argument_of_source_is_never_exported(planted, argument):
+    model = planted if argument == "model" else "gpt-4o"
+    variable = planted if argument == "variable" else "CHAT_MODEL"
+    default = planted if argument == "default" else "gpt-4.1"
     source = f"""\
 import os
 from openai import OpenAI
 
-client = OpenAI(api_key="{secret}", base_url="https://{secret}@gateway.example/v1")
+client = OpenAI(api_key="{planted}", base_url="https://{planted}@gateway.example/v1")
 client.chat.completions.create(model="{model}", messages=[])
 client.chat.completions.create(model="openai/{model}", messages=[])
 client.chat.completions.create(model=os.getenv("{variable}", "{default}"), messages=[])
 client.chat.completions.create(model=os.environ["{variable}"], messages=[])
 """
     _, exported = _scan_source({"app/bot.py": source.encode()})
-    assert secret not in exported
-    assert secret[8:] not in exported
+    assert planted not in exported
+    assert planted[8:] not in exported
 
 
 @given(
@@ -1012,5 +1012,5 @@ def test_the_records_of_a_tree_do_not_depend_on_the_hash_seed(tmp_path):
             check=True,
         )
         outputs.add(completed.stdout)
-    assert len(outputs) == 1
-    assert "claude-sonnet-4-5" in outputs.pop()
+    (output,) = outputs
+    assert "claude-sonnet-4-5" in output
