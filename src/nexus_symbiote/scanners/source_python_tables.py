@@ -109,13 +109,7 @@ AI_SUBMODULES = {
     "google": ("google.adk", "google.genai", "google.generativeai", "google.cloud.aiplatform"),
 }
 # Bytes that say a file may import one of the roots, tested before it is parsed.
-AI_MARKERS = tuple(
-    sorted(
-        name.encode()
-        for name in AI_ROOTS - {"google", "agents", "mcp", "datasets"}
-        | {"google.adk", "google.genai", "generativeai", "aiplatform", "agents", "mcp", "datasets"}
-    )
-)
+AI_MARKERS = tuple(sorted(name.encode() for name in AI_ROOTS))
 
 # The provider a module's clients talk to, by the longest module prefix that matches.
 MODULE_PROVIDERS: dict[str, str] = {

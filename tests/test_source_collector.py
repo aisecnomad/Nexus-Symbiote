@@ -7,6 +7,7 @@ is never executed, never contacted, and no value of a secret leaves the file.
 from __future__ import annotations
 
 import json
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -314,6 +315,49 @@ def render(model="claude-sonnet-4-5"):
     )
     assert result.components == []
     assert not result.surfaces_excluded
+
+
+def test_text_joined_to_itself_does_not_grow_without_bound(tmp_path: Path):
+    # Eleven doublings of 20,000 characters were 40 MB of text for one small file.
+    chain = "\n".join(f"n{index + 1} = n{index} + n{index}" for index in range(11))
+    formatted = "\n".join(f'f{index + 1} = f"{{f{index}}}{{f{index}}}"' for index in range(11))
+    wide = "g" * 20_000
+    files = {
+        "run.py": f'from openai import OpenAI\nn0 = "{wide}"\nf0 = n0\n{chain}\n{formatted}\n'
+        "OpenAI().responses.create(model=n11)\nOpenAI().responses.create(model=f11)\n"
+        'NAME = "gpt-4o" + "-" + "mini"\nOpenAI().responses.create(model=NAME)\n'
+    }
+    write(tmp_path, files)
+    tracemalloc.start()
+    try:
+        result = SourceScanner().scan(tmp_path)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert set(models(result)) == {"gpt-4o-mini"}
+    assert peak < 16 * 2**20
+
+
+def test_an_sdk_imported_from_its_namespace_package_is_read(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "gem.py": "from google import genai\n\n"
+            'genai.Client().models.generate_content(model="gemini-2.5-flash", contents="hi")\n'
+        },
+    )
+    assert set(models(result)) == {"gemini-2.5-flash"}
+
+
+def test_a_name_imported_from_a_shadowed_sdk_does_not_make_the_file_one_to_read(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "openai.py": "class OpenAI:\n    def create(self, **kwargs): ...\n",
+            "main.py": 'from openai import OpenAI\n\nOpenAI().create(model="gpt-4o")\n',
+        },
+    )
+    assert result.components == []
 
 
 def test_a_project_module_named_like_an_sdk_is_not_the_sdk(tmp_path: Path):

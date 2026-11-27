@@ -104,6 +104,10 @@ LOCAL = "<project>"
 MAX_DEPTH = 12
 MAX_CANDIDATES = 16
 MAX_STRINGS = 8
+# No identifier the collector records is this long, so longer text is part of none.
+MAX_TEXT = 512
+# How deep into a package a module of the project is looked for.
+MAX_PACKAGES = 8
 MAX_SERVER_ARGUMENTS = 256
 MAX_STEPS = 2_000_000
 MAX_NESTING = 48
@@ -427,8 +431,16 @@ class PythonReader:
 
     def _imports_sdk(self, module: Module) -> bool:
         return any(
-            _ai_import(dotted) and self._project_file(dotted, module) is None
+            _ai_import(dotted) and not self._in_project(dotted, module)
             for dotted in module.imports.values()
+        )
+
+    def _in_project(self, dotted: str, importer: Module) -> bool:
+        """Whether a dotted name, or a package it lies in, is a module of the project."""
+        parts = dotted.split(".", MAX_PACKAGES)[:MAX_PACKAGES]
+        return any(
+            self._project_file(".".join(parts[:count]), importer) is not None
+            for count in range(len(parts), 0, -1)
         )
 
     def _project_file(self, dotted: str, importer: Module) -> str | None:
@@ -764,7 +776,7 @@ class PythonReader:
         if depth > MAX_DEPTH:
             return
         if isinstance(node, ast.Constant):
-            if isinstance(node.value, str):
+            if isinstance(node.value, str) and len(node.value) <= MAX_TEXT:
                 out.append((node.value, None))
             return
         read = self._environment_read(module, node)
@@ -797,10 +809,13 @@ class PythonReader:
             options = self.strings(module, piece, depth + 1)
             if not options:
                 return
+            # Joined text is bounded: a name joined to itself would otherwise double
+            # at every binding it passes through.
             built = [
                 (text + more, variable or other)
                 for text, variable in built
                 for more, other in options
+                if len(text) + len(more) <= MAX_TEXT
             ][:MAX_STRINGS]
         out.extend(built)
 
