@@ -1145,10 +1145,12 @@ class AIBOMDiffer:
         regression: Callable[[str, str], None],
         improvement: Callable[[str, str], None],
     ) -> None:
-        """Lower coverage, fewer packages checked, more left out or another scope regress.
+        """Lower coverage, more packages left out or another scope regress.
 
-        A different feed, more packages checked or a different number of matches is a
-        note; the matches themselves are compared on their components.
+        Fewer packages checked regresses only with lower coverage or more left out: a
+        package removed from the project is reported on its component. A different feed, more packages checked
+        or a different number of matches is a note; the matches themselves are compared
+        on their components.
         """
         if old is None or new is None:
             if old is not None:
@@ -1166,6 +1168,13 @@ class AIBOMDiffer:
             return
         narrowed: list[str] = []
         noted: list[str] = []
+        less_covered = _RECEIPT_COVERAGE_RANK.get(
+            str(new.get("coverage")), 3
+        ) > _RECEIPT_COVERAGE_RANK.get(str(old.get("coverage")), 3) or any(
+            _receipt_count(new.get(key)) > _receipt_count(old.get(key))
+            for key in old.keys() | new.keys()
+            if key.startswith("components_") and key != "components_checked"
+        )
         if old["db_sha256"] != new["db_sha256"]:
             feed = [
                 f"{key} {_clip(old.get(key))} → {_clip(new.get(key))}"
@@ -1190,7 +1199,7 @@ class AIBOMDiffer:
             elif key == "registry_packages":
                 worse = _scope_rank(after) > _scope_rank(before)
             elif key == "components_checked":
-                worse = _receipt_count(after) < _receipt_count(before)
+                worse = _receipt_count(after) < _receipt_count(before) and less_covered
             elif key.startswith("components_"):
                 worse = _receipt_count(after) > _receipt_count(before)
             else:

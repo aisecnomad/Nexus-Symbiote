@@ -82,9 +82,19 @@ def test_narrowed_advisory_coverage_alerts(tmp_path: Path) -> None:
     project = _project(tmp_path, "langchain==0.3.27\nrequests==2.31.0\n")
     baseline = _scan(project, tmp_path / "baseline.json", *options)
 
+    # A package that leaves the project is reported on its component, not as narrowed
+    # coverage of the packages that remain.
     _project(tmp_path, "langchain==0.3.27\n")
     fewer = _scan(project, tmp_path / "fewer.json", *options)
     _, report = _diff(baseline, fewer)
+    assert not any("advisory coverage narrowed" in a["alert"] for a in report["security_alerts"])
+    assert any("'requests'" in a["alert"] for a in report["security_alerts"])
+    assert any("components_checked 2 → 1" in c["detail"] for c in report["metadata_changes"])
+
+    # A package that stays but can no longer be checked narrows coverage.
+    _project(tmp_path, "langchain==0.3.27\nrequests>=2\n")
+    floating = _scan(project, tmp_path / "floating.json", *options)
+    _, report = _diff(baseline, floating)
     assert any(
         "advisory coverage narrowed" in alert["alert"]
         and "components_checked 2 → 1" in alert["alert"]
