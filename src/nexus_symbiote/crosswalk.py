@@ -410,15 +410,15 @@ CROSSWALK: dict[str, tuple[Reference, ...]] = {
         _ref(
             OWASP_LLM_2025,
             "LLM06:2025",
-            "A tool with destructive or financial effects, or misdeclared as read-only, raises "
-            "the impact of what the agent can do.",
+            "A tool that runs commands or has destructive or financial effects, or is misdeclared "
+            "as read-only, raises the impact of what the agent can do.",
         ),
         _ref(OWASP_ASI_2026, "ASI02", "These are the tools whose misuse causes harm."),
         _ref(
             OWASP_LLM_2026,
             "LLM03:2026",
-            "A tool with destructive or financial effects, or misdeclared as read-only, raises "
-            "the impact of what the agent can do.",
+            "A tool that runs commands or has destructive or financial effects, or is misdeclared "
+            "as read-only, raises the impact of what the agent can do.",
         ),
         _ref(
             MITRE_ATLAS,

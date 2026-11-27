@@ -132,7 +132,8 @@ def test_payment_writes_filesystem_deletes_and_secret_reads() -> None:
         found.capabilities
     )
     assert found.profile is SideEffectProfile.FINANCIAL_TRANSACTION
-    assert [r.severity.value for r in found.risks] == ["medium"]
+    # A payment write is high, as a configured financial-transaction tool is.
+    assert [r.severity.value for r in found.risks] == ["high"]
 
 
 # ---- Python: never read-only, never from unresolved names ---------------------------------
@@ -198,7 +199,7 @@ def test_a_body_past_the_bound_is_unclassified_and_recorded_as_a_gap(tmp_path: P
     result = MCPScanner().scan(tmp_path)
     (tool,) = [c for c in result.components if isinstance(c, ToolComponent)]
     assert tool.capabilities is None
-    assert any("too large to classify" in gap for gap in result.surfaces_excluded)
+    assert any("too large or too ambiguous to classify" in gap for gap in result.surfaces_excluded)
 
 
 def test_python_mcp_tools_carry_capabilities_and_their_evidence(tmp_path: Path) -> None:
@@ -245,10 +246,8 @@ def test_typescript_child_process_fs_fetch_and_payment(tmp_path: Path) -> None:
     assert tool.capabilities is not None
     assert tool.capabilities.side_effect_profile is SideEffectProfile.FINANCIAL_TRANSACTION
     assert tool.properties["capability_evidence"] == EVIDENCE
-    assert {r.severity.value for r in tool.risks if r.category == "capability_scope"} == {
-        "high",
-        "medium",
-    }
+    risks = [r for r in tool.risks if r.category == "capability_scope"]
+    assert [r.severity.value for r in risks] == ["high", "high"], risks
 
 
 def test_typescript_evaluation_and_secret_reads(tmp_path: Path) -> None:
@@ -479,7 +478,7 @@ def test_a_typescript_body_past_the_bound_records_a_gap(tmp_path: Path) -> None:
         result = MCPScanner().scan(tmp_path)
     (tool,) = [c for c in result.components if isinstance(c, ToolComponent)]
     assert tool.capabilities is None
-    assert any("too large to classify" in gap for gap in result.surfaces_excluded)
+    assert any("too large or too ambiguous to classify" in gap for gap in result.surfaces_excluded)
 
 
 # ---- Final check of ca4c0f6b ----------------------------------------------------------------
@@ -1071,3 +1070,116 @@ def test_a_body_registered_under_many_names_is_read_once(tmp_path: Path) -> None
 
     small, large = cost(1), cost(200)
     assert large < max(small, 0.05) * 6, (small, large)
+
+
+# ---- Reviews of d05e5cdc and 10b2125a: SQL at the call, database receivers ----------------
+
+
+@pytest.mark.parametrize(
+    ("body", "expected", "raw"),
+    [
+        (
+            "    sql = 'DELETE FROM t'\n    sql = 'SELECT 1'\n    return conn.execute(sql)\n",
+            set(),
+            False,
+        ),
+        (
+            "    sql = 'DELETE FROM t'\n    if q:\n        sql = 'SELECT 1'\n    return conn.execute(sql)\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    sql = 'DELETE FROM t'\n    sql = conn.execute(sql)\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    sql = 'SELECT 1'\n    for r in rows:\n        sql = 'SELECT 2'\n"
+            "        conn.execute(sql)\n        sql = 'DELETE FROM t'\n",
+            set(),
+            False,
+        ),
+        (
+            "    sql = 'SELECT 1'\n    def inner():\n        sql = 'DELETE FROM t'\n        return sql\n"
+            "    return conn.execute(sql)\n",
+            set(),
+            False,
+        ),
+        (
+            "    sql = 'DELETE FROM t'\n    def run():\n        conn.execute(sql)\n    run()\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+        (
+            "    return session.execute(statement=text(f'DELETE FROM t WHERE id = {q}'))\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            True,
+        ),
+        ("    return conn.execute(query='DROP TABLE t')\n", {E.WRITE, E.DESTRUCTIVE}, False),
+        (
+            "    return session.execute(text(text=f'DELETE FROM t WHERE id = {q}'))\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            True,
+        ),
+        ("    return conn.execute('EXPLAIN (ANALYZE FALSE) DELETE FROM t')\n", set(), False),
+        ("    return conn.execute('EXPLAIN (ANALYZE OFF, BUFFERS) DELETE FROM t')\n", set(), False),
+        ("    return conn.execute('EXPLAIN (ANALYZE 0) DELETE FROM t')\n", set(), False),
+        (
+            "    return conn.execute('EXPLAIN (ANALYZE TRUE) DELETE FROM t')\n",
+            {E.WRITE, E.DESTRUCTIVE},
+            False,
+        ),
+    ],
+    ids=[
+        "definite-overwrite",
+        "overwrite-in-a-branch",
+        "assignment-of-the-call-result",
+        "killed-inside-the-loop",
+        "nested-scope-stays-there",
+        "closure-reads-the-outer-value",
+        "statement-keyword",
+        "query-keyword",
+        "text-keyword",
+        "explain-analyze-false",
+        "explain-analyze-off",
+        "explain-analyze-zero",
+        "explain-analyze-true",
+    ],
+)
+def test_sql_values_follow_the_program_and_explain_options(
+    body: str, expected: set[CapabilityClass], raw: bool
+) -> None:
+    found = _classify(f"from sqlalchemy import text\n\ndef tool(q, conn, session, rows):\n{body}")
+    assert set(found.capabilities) == expected, body
+    assert any("caller-supplied" in r.detail for r in found.risks) is raw, body
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected"),
+    [
+        ("", "async ({ query }) => searchClient.query(query)", set()),
+        ("", "async (args) => handler.execute(args)", set()),
+        ("", "async ({ v }) => index.query(v)", set()),
+        ("", "async ({ q }) => graphql.query(q)", set()),
+        ("", "async ({ sql }) => knex.raw(sql)", {E.WRITE, E.DESTRUCTIVE}),
+        ("", "async ({ q }) => this.db.query(q)", {E.WRITE, E.DESTRUCTIVE}),
+        ("", "async () => pool.query('DELETE FROM t')", {E.WRITE, E.DESTRUCTIVE}),
+        ('import pg from "pg";\n', "async ({ q }) => pg.query(q)", {E.WRITE, E.DESTRUCTIVE}),
+        ("", "async (stripe) => stripe.refunds.create({ charge: 'x' })", set()),
+    ],
+    ids=[
+        "search-client",
+        "handler",
+        "vector-index",
+        "graphql",
+        "knex",
+        "this-db",
+        "pool-literal",
+        "pg-import",
+        "stripe-parameter",
+    ],
+)
+def test_typescript_sql_needs_a_database_client(
+    tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass]
+) -> None:
+    assert _caps(_ts(tmp_path, handler, header)) == expected, handler
