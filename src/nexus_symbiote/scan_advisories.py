@@ -200,6 +200,22 @@ def attach_offline_advisories(
     return AdvisoryAttachment(failures, surface)
 
 
+def parse_receipt(surface: str) -> dict[str, Any] | None:
+    """The receipt a completeness surface line records, or None for any other line."""
+    if not surface.startswith(ADVISORY_SURFACE_PREFIX + "{"):
+        return None
+    try:
+        receipt = parse_json_strict(surface.removeprefix(ADVISORY_SURFACE_PREFIX), max_bytes=2048)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(receipt, dict):
+        return None
+    digest = receipt.get("db_sha256")
+    if not isinstance(digest, str) or not _FEED_DIGEST.fullmatch(digest):
+        return None
+    return receipt
+
+
 def advisory_receipts(aibom: AIBOM) -> dict[str, str]:
     """Return declared scan receipts and their feed digests for standards projection."""
     claim = aibom.metadata.completeness
@@ -207,16 +223,9 @@ def advisory_receipts(aibom: AIBOM) -> dict[str, str]:
         return {}
     receipts = {}
     for surface in (*claim.surfaces_scanned, *claim.unobserved_surfaces):
-        if not surface.startswith(ADVISORY_SURFACE_PREFIX + "{"):
-            continue
-        content = surface.removeprefix(ADVISORY_SURFACE_PREFIX)
-        try:
-            receipt = parse_json_strict(content, max_bytes=2048)
-        except (ValueError, RecursionError):
-            continue
-        digest = receipt.get("db_sha256") if isinstance(receipt, dict) else None
-        if isinstance(digest, str) and _FEED_DIGEST.fullmatch(digest):
-            receipts[content] = digest
+        receipt = parse_receipt(surface)
+        if receipt is not None:
+            receipts[surface.removeprefix(ADVISORY_SURFACE_PREFIX)] = receipt["db_sha256"]
     return receipts
 
 
