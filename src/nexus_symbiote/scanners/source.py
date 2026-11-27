@@ -1,17 +1,8 @@
-"""Collect what a project's own source declares about the models it uses.
+"""Collect the model identifiers a project's own Python code gives an SDK.
 
-The other collectors read the files a coding agent or an MCP client reads. This one
-reads the application: the model identifiers its Python code gives an SDK.
-
-Everything it records is a declaration at declared assurance, with the file and line
-it was read from. Nothing is imported, executed or contacted: a file is parsed to a
-syntax tree. What the reader could not resolve is a coverage gap, never silence, and a
-file it does not understand declares nothing it can record.
-
-Tests, documentation, examples, benchmarks and build output are not read, as the MCP
-source search does not read them, and a link is read only when the file it reaches is
-not one of these. A file named as one that holds credentials is read like any other:
-the collector exports no value but a model identifier that passes the export checks.
+Nothing is imported, executed or contacted, and each record is a declaration with the
+file and line it was read from. What the reader knows is there and cannot read is a
+coverage gap; ``docs/collectors.md`` says which files are read and what is a gap.
 """
 
 from __future__ import annotations

@@ -74,10 +74,16 @@ _TRANSFORMS: dict[str, Callable[[str], str]] = {
 _BUILTINS = frozenset(dir(builtins))
 _ANYTHING = frozenset({"builtins.object", "typing.Any", "typing_extensions.Any"})
 _ACCESSORS = frozenset({"builtins.getattr", "typing.cast", "typing_extensions.cast"})
-# What Python's containers and ``random`` hand back may be any object.
-_TAKES = (".choice", ".get", ".pop", ".setdefault")
+# What Python's containers, ``random``, ``copy``, ``next``, ``min`` and ``max`` hand back
+# may be any object, and so may an object typed as any client of a service.
+_TAKES = (".choice", ".copy", ".deepcopy", ".get", ".max", ".min", ".next", ".pop", ".popitem",
+          ".popleft", ".setdefault")  # fmt: skip
+_STUBS = ("botocore.", "mypy_boto3", "types_boto3")
+# Keywords that hold the options a model is loaded with, and what may hold such a dict.
+_KWARGS = ("config_kwargs", "model_kwargs")
+_DICTS = (ast.Dict, ast.Call)
 # Keywords whose value a call reads as options, as it reads a ``**`` spread.
-_OPTIONS_KEYWORDS = (None, "model_kwargs", "config_kwargs")
+_OPTIONS_KEYWORDS = (None, *_KWARGS)
 # Roots whose objects are not another library's: what they make may be text.
 _NOT_LIBRARIES = frozenset({"builtins", *sys.stdlib_module_names})
 _T = TypeVar("_T")
@@ -123,6 +129,8 @@ class Module:
     touched: set[str] = field(default_factory=set)
     spread: set[int] = field(default_factory=set)
     starred: bool = False
+    # The calls each name is given to as options, which may change the dict they are given.
+    options: dict[str, list[ast.Call]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, eq=False)
@@ -223,9 +231,10 @@ def _model_call(function: ast.expr) -> bool:
 
 
 def _loads_weights(origin: str) -> bool:
-    base = origin.split("()", 1)[0]
-    _, symbol, _ = _split(base)
-    return symbol in WEIGHT_CLASSES or any(_under(base, root) for root in WEIGHT_ROOTS)
+    """Whether a call is a weights library's loader, not a method of what one made."""
+    _, symbol, _ = _split(origin)
+    loads = symbol in WEIGHT_CLASSES or any(_under(origin, root) for root in WEIGHT_ROOTS)
+    return loads and "(" not in origin
 
 
 def _outside(node: ast.AST) -> list[ast.AST]:
@@ -244,6 +253,34 @@ def _outside(node: ast.AST) -> list[ast.AST]:
     if isinstance(node, _COMPREHENSIONS):
         return [node.generators[0].iter]
     return []
+
+
+def _members(annotation: ast.expr | None) -> list[ast.expr]:
+    """The classes an annotation names: each of ``Optional[X]``, ``Union[...]`` and ``X | Y``
+    but ``None``; none for a string or no annotation."""
+    if annotation is None or isinstance(annotation, ast.Constant):
+        return []
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        parts = [*_members(annotation.left), *_members(annotation.right)]
+    elif isinstance(annotation, ast.Subscript) and _named(annotation.value) in (
+        "Optional",
+        "Union",
+    ):
+        inner = annotation.slice
+        parts = [*(inner.elts if isinstance(inner, ast.Tuple) else [inner])]
+    else:
+        return [annotation]
+    return [part for part in parts if not (isinstance(part, ast.Constant) and part.value is None)]
+
+
+def _named(node: ast.expr) -> str | None:
+    return (
+        node.id
+        if isinstance(node, ast.Name)
+        else node.attr
+        if isinstance(node, ast.Attribute)
+        else None
+    )
 
 
 def _falsy(node: ast.AST | None) -> bool:
@@ -335,11 +372,14 @@ class PythonReader:
                 kind = "global" if isinstance(node, ast.Global) else "nonlocal"
                 module.declared.setdefault(scope, {}).update(dict.fromkeys(node.names, kind))
             elif isinstance(node, ast.Call):
-                module.spread.update(
-                    id(keyword.value)
-                    for keyword in node.keywords
-                    if keyword.arg in _OPTIONS_KEYWORDS
-                )
+                for keyword in node.keywords:
+                    if keyword.arg in _OPTIONS_KEYWORDS:
+                        module.spread.add(id(keyword.value))
+                    if keyword.arg in _KWARGS and isinstance(keyword.value, ast.Name):
+                        module.options.setdefault(keyword.value.id, []).append(node)
+            elif isinstance(node, ast.Assign) and len(node.targets) > 1:
+                # ``a = b = {...}`` binds one dict to two names, so one may change the other's.
+                module.touched.update(t.id for t in node.targets if isinstance(t, ast.Name))
             elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
                 if id(node) not in module.spread:
                     module.touched.add(node.id)
@@ -421,8 +461,8 @@ class PythonReader:
             self._bind_name(module, bound, alias, scope)
         elif not dotted:
             module.imports.pop(bound, None)
-        elif bound not in module.imports or _ai_import(dotted):
-            # Of a module's imports of one name, an SDK's may be the one that runs.
+        elif bound not in module.imports or _ai_import(dotted) or self._in_project(dotted, module):
+            # Of a module's imports of one name, the project's or an SDK's may be the one run.
             module.imports[bound] = dotted
 
     def _bind_name(self, module: Module, name: str, value: ast.AST, scope: ast.AST | None) -> None:
@@ -690,13 +730,16 @@ class PythonReader:
             dotted = value.module.imported.get(node)
             return self._dotted_origin(value.module, dotted) if dotted else None
         if isinstance(node, ast.arg):
-            if node.annotation is None or isinstance(node.annotation, ast.Constant):
+            bases = [
+                self.origin(value.module, part, depth + 1) for part in _members(node.annotation)
+            ]
+            # ``Any``, ``object`` and a type stub's class say nothing of what an SDK makes, and
+            # of several classes only SDK classes do.
+            if not bases or any(b is None or b in _ANYTHING or b.startswith(_STUBS) for b in bases):
                 return None
-            base = self.origin(value.module, node.annotation, depth + 1)
-            # ``Any``, ``object`` and a type stub's class say nothing of what an SDK makes.
-            if base is None or base in _ANYTHING or base.startswith(("mypy_boto3", "types_boto3")):
+            if len(set(bases)) > 1 and not all(_sdk(base) for base in bases):
                 return None
-            return f"{base}()"
+            return f"{bases[0]}()"
         if isinstance(node, ast.expr):
             return self.origin(value.module, node, depth + 1)
         return None
@@ -867,6 +910,9 @@ class PythonReader:
                 # No default, or one that names no model: the environment alone sets it.
                 return (), False
             texts, complete = self._strings(module, default, depth + 1)
+            if not texts and complete:
+                # A default that names no model, such as a name bound to None.
+                return (), False
             if environment_name(name) is None:
                 # The variable that may override the default cannot be named.
                 return texts, False
@@ -947,6 +993,11 @@ class PythonReader:
             resolved = None if node.id in module.touched else self._resolve(module, node.id, node)
             if resolved is None or len(resolved[1]) != 1:
                 return None
+            if resolved[0] == _scope_key(module, None, node.id) and (
+                node.id in module.imports or module.starred
+            ):
+                # An import of the name, or one with ``*``, may bind it in place of the dict.
+                return None
             held = resolved[1][0].node
         given: dict[str, ast.expr] = {}
         self._steps -= len(held.keys) if isinstance(held, ast.Dict) else 1
@@ -987,7 +1038,7 @@ class PythonReader:
         if len(made) > 1:
             return made[0].rsplit(".", 1)[-1][:1].isupper()
         parts = made[0].split(".")
-        if isinstance(function, ast.Name) or any(part[:1].isupper() for part in parts[:-1]):
+        if isinstance(function, ast.Name) or parts[0][:1].isupper() or _class_member(made[0]):
             return True
         base = function.value if isinstance(function, ast.Attribute) else None
         dotted = module.imports.get(base.id) if isinstance(base, ast.Name) else None
@@ -1017,12 +1068,12 @@ class PythonReader:
         keywords = _keywords(call)
         spread: list[ast.expr] = []
         for keyword in call.keywords:
-            given = None if keyword.arg is not None else self._spread(module, keyword.value)
-            if given is not None:
-                if keywords.keys() & given.keys():
+            spelled = None if keyword.arg is not None else self._spread(module, keyword.value)
+            if spelled is not None:
+                if keywords.keys() & spelled.keys():
                     # Python refuses a call given one keyword twice, so it gives no model.
                     return
-                keywords.update(given)
+                keywords.update(spelled)
             elif keyword.arg is None:
                 spread.append(keyword.value)
         embedding = "embed" in (origin or "").lower()
@@ -1041,11 +1092,13 @@ class PythonReader:
                 found.append((arguments[position], embedding))
         if "id" in keywords and any(_under(base, root) for root in ("agno.models", "phi.model")):
             found.append((keywords["id"], False))
-        if not (found or unread or keywords.keys() & MODEL_KEYWORDS) and (
-            origin is not None or not isinstance(function, ast.Name)
-        ):
-            # What ``**options`` holds may be the model, though not where a wrapper calls
-            # what it was handed by a name the reader cannot tell.
+        named = None
+        if isinstance(function, ast.Name) and self._steps > 0:
+            named = self._resolve(module, function.id, function)
+        handed = named is not None and all(isinstance(value.node, ast.arg) for value in named[1])
+        if not (found or unread or keywords.keys() & MODEL_KEYWORDS) and (origin or not handed):
+            # What ``**options`` holds may be the model, though not where a wrapper calls a
+            # function it was given with what it was handed.
             unread.extend(spread)
         if local:
             self._given.update((value.lineno, value.col_offset) for value, _ in found)
@@ -1053,15 +1106,19 @@ class PythonReader:
         self._unread.update((value.lineno, value.col_offset) for value in unread)
         routes = origin is not None and any(_under(base, router) for router in ROUTERS)
         flags, opaque = [keywords.get("trust_remote_code")], list(spread)
-        for options in (keywords.get("model_kwargs"), keywords.get("config_kwargs")):
-            pairs = self._pairs(module, options)
+        given = [(value, key in _KWARGS) for key, value in keywords.items()]
+        for options, named_options in given:
+            pairs = (
+                self._pairs(module, options) if named_options or isinstance(options, _DICTS) else []
+            )
             flags += [value for key, value in pairs if key == "trust_remote_code"]
-            opaque += [value for key, value in pairs if not isinstance(key, str)]
+            opaque += [value for key, value in pairs if named_options and not isinstance(key, str)]
+            given += [(v, k in _KWARGS) for k, v in pairs if k and isinstance(v, _DICTS)]
         remote = any(
             flag is not None and not (isinstance(flag, ast.Constant) and not flag.value)
             for flag in flags
         )
-        if opaque and not remote and origin is not None and _loads_weights(origin):
+        if opaque and found and not remote and origin is not None and _loads_weights(origin):
             self._found.gap(module.path, call.lineno, _OPTIONS)
         for expression, embeds in found:
             self._model_references(
@@ -1070,9 +1127,13 @@ class PythonReader:
 
     def _pairs(self, module: Module, options: ast.expr | None) -> Sequence[tuple[object, ast.expr]]:
         """The keys and values of options given as a dict; what it cannot read has no key."""
-        given = self._spread(module, options) if isinstance(options, ast.Name) else None
-        if given is not None:
-            return list(given.items())
+        # A dict given as options to a call that is not an SDK's may be changed there.
+        if isinstance(options, ast.Name) and all(
+            _sdk(self.origin(module, call.func)) for call in module.options.get(options.id, ())
+        ):
+            given = self._spread(module, options)
+            if given is not None:
+                return list(given.items())
         if isinstance(options, ast.Dict):
             return [(_constant(k), v) for k, v in zip(options.keys, options.values, strict=True)]
         if isinstance(options, ast.Call) and self.origin(module, options.func) == "builtins.dict":
@@ -1092,7 +1153,7 @@ class PythonReader:
         kept = 0
         for value in values:
             texts, complete = self._spell(value)
-            if not texts:
+            if not texts and complete:
                 # A fallback that names no model, such as None, leaves it to the variables.
                 self._set_by_environment(module, value.variables, point)
             for text, variables in texts:
@@ -1122,13 +1183,22 @@ class PythonReader:
         """Account for what a value of a model argument holds besides the text read."""
         module, node = value.module, value.node
         read = self._environment_read(module, node)
-        if read is not None and _falsy(read[1]) and environment_name(read[0]):
+        names_none = read is not None and self._names_no_model(module, read[1])
+        if read is not None and names_none and environment_name(read[0]):
             # A model that only the environment sets has no value here to record.
             self._set_by_environment(module, frozenset({read[0]}), point)
         elif self._imported_leaf(module, node):
             self._found.gap(module.path, point[0], _ELSEWHERE)
         elif not self._built(module, node):
             self._unread.add(point)
+
+    def _names_no_model(self, module: Module, default: ast.expr | None) -> bool:
+        """Whether a default is absent, falsy, or bound to what names no model."""
+        return (
+            _falsy(default)
+            or default is not None
+            and self._strings(module, default, 0) == ((), True)
+        )
 
     def _set_by_environment(
         self, module: Module, variables: frozenset[str], point: tuple[int, int]
@@ -1156,6 +1226,7 @@ class PythonReader:
             and origin.endswith("()")
             and _sdk(origin)
             and origin[:-2].rsplit(".", 1)[-1] not in TEXT_CALLS
+            and ".types." not in origin
         )
 
     def _imported_leaf(self, module: Module, node: ast.AST) -> bool:

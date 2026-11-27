@@ -1024,6 +1024,7 @@ def test_an_excluded_path_is_not_read(tmp_path: Path):
         ("anthropic.claude-3-5-sonnet-20241022-v2:0", True),
         ("BAAI/bge-small-en-v1.5", True),
         ("ft:gpt-4o-mini-2024-07-18:acme:support:AbCd1234", True),
+        ("ft:gpt-4o-mini-2024-07-18:acme:a:9wXyZ12", True),
         ("", False),
         ("x", False),
         ("1234", False),
@@ -1151,6 +1152,8 @@ SentenceTransformer("all-MiniLM-L6-v2")
         "import os, \\\n    openai\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
         "import \uff4f\uff50\uff45\uff4e\uff41\uff49\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
         "import x\u0301y, openai\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
+        "import os . path, openai\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
+        "import os\\\n.path as p, openai\nopenai.OpenAI().responses.create(model='gpt-4o')\n",
     ],
     ids=[
         "try",
@@ -1162,6 +1165,8 @@ SentenceTransformer("all-MiniLM-L6-v2")
         "continued-list",
         "compatibility-spelling",
         "combining-mark-in-an-earlier-name",
+        "spaced-dots-in-an-earlier-name",
+        "continued-dots-in-an-earlier-name",
     ],
 )
 def test_every_import_statement_python_runs_is_found(tmp_path: Path, source: str):
@@ -1256,6 +1261,12 @@ def handle(metric, client, store, settings):
         + "cast(Any, ollama.Client()).chat(model='nova')\n",
         "import ollama\nCLIENTS = {}\nCLIENTS.setdefault('h', ollama.Client()).chat(model='nova')\n",
         "import random\nPOOL = []\nrandom.choice(POOL).chat(model='nova')\n",
+        "from botocore.client import BaseClient\n\n"
+        + "def ask(client: BaseClient):\n    client.converse(modelId='nova')\n",
+        "import itertools, ollama\nPOOL = itertools.cycle([ollama.Client()])\nnext(POOL).chat(model='nova')\n",
+        "import copy, ollama\nBASE = ollama.Client()\ncopy.copy(BASE).chat(model='nova')\n",
+        "import ollama\nCLIENTS = [ollama.Client()]\nmin(CLIENTS, key=id).chat(model='nova')\n",
+        "import collections, ollama\nQ = collections.deque([ollama.Client()])\nQ.popleft().chat(model='nova')\n",
     ],
     ids=[
         "any",
@@ -1268,6 +1279,11 @@ def handle(metric, client, store, settings):
         "backported-cast",
         "set-default",
         "random-choice",
+        "service-client-base",
+        "next",
+        "copy",
+        "min",
+        "pop-left",
     ],
 )
 def test_an_object_typed_as_anything_is_read_as_one_the_reader_cannot_tell(
@@ -1381,6 +1397,8 @@ def test_a_relative_import_past_the_top_package_binds_nothing(tmp_path: Path):
         ("C:Users/alice/models/minilm", False, True),
         ("file:/home/alice/models/minilm", False, True),
         (".\\checkpoints\\final", False, False),
+        ("hosted_vllm//home/alice/models/Meta-Llama-3-8B-Instruct", False, True),
+        ("openai//models/Meta-Llama-3-8B-Instruct", False, True),
     ],
     ids=[
         "drive",
@@ -1397,6 +1415,8 @@ def test_a_relative_import_past_the_top_package_binds_nothing(tmp_path: Path):
         "drive-relative",
         "one-slash-file-scheme",
         "windows-relative",
+        "root-behind-a-slash-route",
+        "root-after-a-slash-route",
     ],
 )
 def test_a_path_or_a_key_is_never_a_model_and_a_project_file_is_no_gap(
@@ -2590,6 +2610,23 @@ REMOTE = "a model is loaded with options the collector cannot read; whether it m
         ('SentenceTransformer("someorg/custom-7b", model_kwargs={"device": "cpu"})', None, False),
         ('SentenceTransformer("someorg/custom-7b", model_kwargs=None)', None, False),
         ('litellm.completion("someorg/custom-7b", messages=[], **OPTIONS)', None, False),
+        (
+            'HuggingFaceLocalChatGenerator(model="someorg/custom-7b", '
+            'huggingface_pipeline_kwargs={"trust_remote_code": True})',
+            True,
+            False,
+        ),
+        (
+            'HuggingFaceLocalChatGenerator(model="someorg/custom-7b", huggingface_pipeline_kwargs='
+            '{"device_map": "auto", "model_kwargs": {"trust_remote_code": True}})',
+            True,
+            False,
+        ),
+        (
+            'SentenceTransformer("someorg/custom-7b", tokenizer_kwargs={"trust_remote_code": 1})',
+            True,
+            False,
+        ),
     ],
     ids=[
         "wrapper-of-a-weights-library",
@@ -2603,6 +2640,9 @@ REMOTE = "a model is loaded with options the collector cannot read; whether it m
         "readable-options",
         "no-options",
         "hosted-call",
+        "another-options-dict",
+        "options-nested-in-options",
+        "tokenizer-options",
     ],
 )
 def test_remote_code_is_read_on_every_sdk_call_and_options_it_cannot_read_are_a_gap(
@@ -2613,8 +2653,9 @@ def test_remote_code_is_read_on_every_sdk_call_and_options_it_cannot_read_are_a_
         {
             "run.py": "import litellm\nfrom langchain_community.llms import VLLM\n"
             "from sentence_transformers import SentenceTransformer\n"
-            "from transformers import AutoModel\nfrom vllm import LLM\n\nOPTIONS = load_options()\n"
-            f"{call}\n"
+            "from transformers import AutoModel\nfrom vllm import LLM\n"
+            "from haystack.components.generators.chat import HuggingFaceLocalChatGenerator\n"
+            f"OPTIONS = load_options()\n{call}\n"
         },
     )
     assert models(result)["someorg/custom-7b"].trust_remote_code is remote
@@ -2708,11 +2749,13 @@ ChatOpenAI(model=get_from_env("model", "OPENAI_MODEL"))
 secrets = boto3.client("secretsmanager")
 ChatOpenAI(model=secrets.get_secret_value(SecretId="m").get("SecretString"))
 ChatOpenAI(model=ChatOpenAI().model_name)
+ChatOpenAI(model=get_from_env("model", "OPENAI_MODEL").strip())
+ChatOpenAI(model=ChatOpenAI().model_name.lower())
 """
         },
     )
     assert result.components == []
-    assert list(result.surfaces_excluded) == [unread("run.py", 7, 4)]
+    assert list(result.surfaces_excluded) == [unread("run.py", 7, 6)]
 
 
 def test_a_method_reached_through_a_class_is_the_classs_and_no_sdk_call(tmp_path: Path):
@@ -2951,3 +2994,288 @@ def test_the_answers_kept_across_files_are_bounded(monkeypatch: pytest.MonkeyPat
         kept.append(len(reader._resolved) + len(reader._local))
     # Each file asks of its own imports; what earlier files kept is let go past the bound.
     assert max(kept) == kept[0] and kept[0] > 10
+
+
+@pytest.mark.parametrize(
+    "chosen",
+    [
+        "Chat = ChatAnthropic if CONFIG['provider'] == 'anthropic' else ChatOpenAI",
+        "Chat = PROVIDERS[CONFIG['provider']]",
+    ],
+    ids=["class-chosen-by-a-branch", "class-chosen-from-a-table"],
+)
+def test_an_sdk_class_chosen_at_run_time_and_given_a_spread_is_a_gap(tmp_path: Path, chosen: str):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import yaml\nfrom langchain_anthropic import ChatAnthropic\n"
+            "from langchain_openai import ChatOpenAI\n\nCONFIG = yaml.safe_load(open('llm.yaml'))\n"
+            "PROVIDERS = {'openai': ChatOpenAI, 'anthropic': ChatAnthropic}\n"
+            f"{chosen}\nllm = Chat(**CONFIG['llm'])\n"
+        },
+    )
+    # Only a function a wrapper was given, and calls with what it was handed, is no SDK call.
+    assert list(result.surfaces_excluded) == [unread("run.py", 8)]
+
+
+def test_a_constant_holding_a_client_is_read_and_a_class_of_the_file_is_the_projects(
+    tmp_path: Path,
+):
+    result = scan(
+        tmp_path,
+        {
+            "app/__init__.py": "",
+            "app/clients.py": "from openai import OpenAI\n\nOPENAI_CLIENT = OpenAI()\n",
+            "app/service.py": "import openai\nfrom app.clients import OPENAI_CLIENT\n\n\n"
+            "class LLM:\n    @classmethod\n    def create(cls, model):\n        return model\n\n\n"
+            'OPENAI_CLIENT.chat.completions.create(model="gpt-4o-mini", messages=[])\n'
+            'LLM.create(model="planner")\n',
+        },
+    )
+    assert set(models(result)) == {"gpt-4o-mini"}
+    assert list(result.surfaces_excluded) == [f"app/service.py:12: a model argument is {GIVEN}"]
+
+
+def test_a_method_of_a_loaded_model_given_a_spread_is_no_load_with_unread_options(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from huggingface_hub import InferenceClient
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from vllm import LLM, SamplingParams
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+out = model.generate(**tok("hello", return_tensors="pt"), max_new_tokens=32)
+GEN = {"temperature": 0.2}
+LLM(model="Qwen/Qwen2.5-7B-Instruct").generate(["hi"], SamplingParams(**GEN))
+InferenceClient("Qwen/Qwen2.5-7B-Instruct").text_generation("hi", model="Qwen/QwQ-32B", **GEN)
+"""
+        },
+    )
+    # Generating text loads no model, so options it cannot read do not say how one loads.
+    assert not any("loaded with options" in gap for gap in result.surfaces_excluded)
+
+
+@pytest.mark.parametrize("project_first", [True, False], ids=["project-first", "library-first"])
+def test_of_a_librarys_and_the_projects_import_of_one_name_the_projects_is_read(
+    tmp_path: Path, project_first: bool
+):
+    imports = ["from app.router import Router", "from llm_toolkit import Router"]
+    first, second = imports if project_first else imports[::-1]
+    result = scan(
+        tmp_path,
+        {
+            "app/__init__.py": "",
+            "app/router.py": "def Router(**kw):\n    return kw\n",
+            "app/main.py": f"import openai\n\ntry:\n    {first}\nexcept ImportError:\n    {second}\n"
+            "Router(model='gpt-4o')\n",
+        },
+    )
+    assert list(result.surfaces_excluded) == [f"app/main.py:7: a model argument is {GIVEN}"]
+
+
+def test_a_parameter_typed_as_an_sdks_model_names_holds_text_not_an_object(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from openai import OpenAI
+from openai.types import ChatModel
+from pydantic_ai.models import KnownModelName
+
+client = OpenAI()
+
+
+def ask(prompt: str, model: ChatModel):
+    return client.chat.completions.create(model=model, messages=[])
+
+
+def plan(model: KnownModelName):
+    return client.responses.create(model=model, input="hi")
+"""
+        },
+    )
+    # An SDK's data types and its type of model names are text a caller may give.
+    assert list(result.surfaces_excluded) == [unread("run.py", 9, 2)]
+
+
+@pytest.mark.parametrize(
+    ("files", "where"),
+    [
+        (
+            {
+                "app/__init__.py": "",
+                "app/hf.py": "def allow(model_kwargs):\n    model_kwargs.update(trust_remote_code=True)\n",
+                "app/embed.py": "from sentence_transformers import SentenceTransformer\n\n"
+                "from app.hf import allow\n\noptions = {'device': 'cpu'}\nallow(model_kwargs=options)\n"
+                "SentenceTransformer('someorg/custom-7b', model_kwargs=options)\n",
+            },
+            "app/embed.py:7",
+        ),
+        (
+            {
+                "settings_local.py": "MODEL_KWARGS = {'trust_remote_code': True}\n",
+                "app.py": "from sentence_transformers import SentenceTransformer\n\ntry:\n"
+                "    from settings_local import MODEL_KWARGS\nexcept ImportError:\n"
+                "    MODEL_KWARGS = {'device': 'cpu'}\n\n"
+                "SentenceTransformer('someorg/custom-7b', model_kwargs=MODEL_KWARGS)\n",
+            },
+            "app.py:8",
+        ),
+        (
+            {
+                "app.py": "from sentence_transformers import SentenceTransformer\n\n"
+                "options = defaults = {'device': 'cpu'}\ndefaults['trust_remote_code'] = True\n"
+                "SentenceTransformer('someorg/custom-7b', model_kwargs=options)\n",
+            },
+            "app.py:5",
+        ),
+    ],
+    ids=[
+        "changed-by-the-callee-it-is-handed-to",
+        "an-import-may-bind-it",
+        "changed-through-another-name",
+    ],
+)
+def test_options_another_name_or_callee_may_change_are_a_gap(
+    tmp_path: Path, files: dict[str, str], where: str
+):
+    result = scan(tmp_path, files)
+    assert models(result)["someorg/custom-7b"].trust_remote_code is None
+    assert list(result.surfaces_excluded) == [f"{where}: {REMOTE}"]
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "try:\n    from settings import LLM_KWARGS\nexcept ImportError:\n    LLM_KWARGS = {'model': 'gpt-4o'}\n",
+        "LLM_KWARGS = {'model': 'gpt-4o'}\nfrom settings_local import *\n",
+    ],
+    ids=["optional-import", "star-import"],
+)
+def test_an_import_may_bind_a_spread_dict_in_place_of_the_one_read(tmp_path: Path, binding: str):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": f"from openai import OpenAI\n{binding}"
+            "OpenAI().chat.completions.create(messages=[], **LLM_KWARGS)\n",
+            "settings.py": "LLM_KWARGS = {'model': 'o3'}\n",
+        },
+    )
+    assert list(result.surfaces_excluded) == [unread("run.py", binding.count("\n") + 2)]
+
+
+@pytest.mark.parametrize(
+    ("read", "gap"),
+    [
+        ('os.getenv("OPENAI_MODEL", DEFAULT_MODEL)', ONLY_BY),
+        ('os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)', ONLY_BY),
+        ('config("OPENAI_MODEL", default=DEFAULT_MODEL)', ONLY_BY),
+        # Through ``str()`` it is read as a value the reader cannot tell, never as silence.
+        ('str(os.getenv("OPENAI_MODEL", DEFAULT_MODEL))', f"a model argument is {UNREAD}"),
+    ],
+    ids=["getenv", "environ-get", "decouple", "str"],
+)
+def test_a_default_bound_to_what_names_no_model_leaves_it_to_the_environment(
+    tmp_path: Path, read: str, gap: str
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom decouple import config\nfrom openai import OpenAI\n"
+            f"DEFAULT_MODEL = None\nOpenAI().responses.create(model={read})\n"
+        },
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [f"run.py:5: {gap}"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["a94a8fe5ccb19ba61c4c0873d391e987982fbbd3", "Qx7rT2mLk9VwZp4NsYb8HcJd3FgEa6Ru"],
+    ids=["hex", "mixed-case-run"],
+)
+def test_a_variable_named_like_a_key_is_never_exported(tmp_path: Path, name: str):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom openai import OpenAI\n"
+            f'OpenAI().responses.create(model=os.getenv("{name}") or None)\n'
+            f'OpenAI().responses.create(model=os.getenv("{name}", "gpt-4o"))\n'
+        },
+    )
+    assert name not in exported(result) and name not in " ".join(result.surfaces_excluded)
+    assert set(models(result)) == {"gpt-4o"}
+    assert list(result.surfaces_excluded) == [unread("run.py", 3, 2)]
+
+
+def test_an_environment_variable_is_checked_once_however_many_operands_read_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    checked: list[str] = []
+    unchanged = source_references.unchanged_by_redaction
+
+    def counted(text: str) -> bool:
+        checked.append(text)
+        return unchanged(text)
+
+    source_references.environment_name.cache_clear()
+    monkeypatch.setattr(source_references, "unchanged_by_redaction", counted)
+    chain = " or ".join(["M"] * 200)
+    scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom openai import OpenAI\n"
+            f'M = os.getenv("CHAT_MODEL_NAME")\nX = {chain} or "gpt-4o"\n'
+            + "OpenAI().responses.create(model=X)\n"
+            * 50
+        },
+    )
+    assert checked.count("CHAT_MODEL_NAME") == 1
+
+
+@pytest.mark.parametrize(
+    ("annotation", "gaps"),
+    [
+        ("Optional[BaseChatModel] = None", 0),
+        ("BaseChatModel | None = None", 0),
+        ("Union[ChatOpenAI, ChatAnthropic]", 0),
+        ("Optional[ChatModel] = None", 1),
+    ],
+    ids=["optional", "or-none", "union-of-sdk-classes", "optional-model-name"],
+)
+def test_a_parameter_that_may_be_none_is_judged_by_its_class(
+    tmp_path: Path, annotation: str, gaps: int
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "from typing import Optional, Union\n"
+            "from langchain_anthropic import ChatAnthropic\n"
+            "from langchain_core.language_models import BaseChatModel\n"
+            "from langchain_openai import ChatOpenAI\nfrom langgraph.prebuilt import create_react_agent\n"
+            "from openai.types import ChatModel\n\n\n"
+            f"def build(tools, llm: {annotation}):\n"
+            "    return create_react_agent(model=llm, tools=tools)\n"
+        },
+    )
+    assert list(result.surfaces_excluded) == ([unread("run.py", 10)] if gaps else [])
+
+
+def test_a_variable_with_an_unread_fallback_does_not_set_the_model_alone(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "app/__init__.py": "",
+            "app/settings.py": "DEFAULT_MODEL = 'gpt-4o'\n",
+            "app/llm.py": "import os\n\nfrom langchain_openai import ChatOpenAI\n\n"
+            "from app import settings\n\n"
+            "llm = ChatOpenAI(model=os.getenv('OPENAI_MODEL') or settings.DEFAULT_MODEL)\n",
+        },
+    )
+    assert list(result.surfaces_excluded) == [
+        "app/llm.py:7: model argument is bound in another module of the project, which the "
+        + "collector does not follow; not inventoried"
+    ]

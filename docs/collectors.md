@@ -41,26 +41,28 @@ not. Of an object the reader cannot tell, such as an untyped or `Any` parameter 
 framework's state, a call is read when it is named as SDK calls are (`create`, `chat`,
 `completions`, `invoke`, `generate_content` and the like), so a metrics label or an
 ORM query is not. A call of a name the reader cannot tell, such as a class chosen at run
-time, is read, though not a `**` spread a wrapper hands on that way. A method reached
-through a class, as an ORM's manager is, is the class's: a library's is not read, and a
-project's is a gap.
+time, is read, but not a `**` spread a wrapper hands a function it was given. A method
+reached through a class, as an ORM's manager is, is the class's: a library's is not
+read, and a project's is a gap.
 
 A model argument is followed within its file, to each text it can hold: through names
 and `:=`, conditionals (`if`/`else`, `or`, `and`), an environment variable's default
 (`os.getenv`, `os.environ.get`, `decouple.config`), joined text (`+`, `+=` and
 f-strings), `str()`, `.lower()`, `.upper()` and `.strip()`, and a dict spread with `**`
 that is written out there or bound once to a name the file reads only to spread it. A
-dict of `model_kwargs` or `config_kwargs` is read the same way. A name is looked up as Python looks it up: in its function, honouring `global` and
-`nonlocal`, then in the scopes around it, skipping a class body from its methods. A
-parameter's default and a decorator, annotation or base class are read in the scope
-around their function or class. In `or`, a variable read with no default falls
+dict given as `model_kwargs` or `config_kwargs` is read the same way where only SDK calls
+are given it. A name is looked up as Python looks it up: in its function, honouring
+`global` and `nonlocal`, then in the scopes around it, skipping a class body from its
+methods. A parameter's default and a decorator, annotation or base class are read in the
+scope around their function or class. In `or`, a variable read with no default falls
 through to what follows when it is unset, so `os.environ.get("CHAT_MODEL") or
 "gpt-4o"` gives `gpt-4o`.
 
 Each model identifier becomes one `model` component for the project at `declared`
 assurance. Its `source_reference` claim names the file and the line of the argument,
 up to 16 places, and `references_unlisted` counts the rest. The environment variables
-that may give a model in place of a value read are listed in `environment_variables`.
+that may give a model in place of a value read are listed in `environment_variables`,
+unless a name is shaped like a key, which is never exported.
 Where the call routes by a prefix on the identifier (LiteLLM, PydanticAI, LangChain's
 `init_chat_model`, CrewAI, DSPy, smolagents), the prefix names the provider:
 `anthropic/claude-sonnet-4-5` is the model `claude-sonnet-4-5` with provider
@@ -73,8 +75,8 @@ providers is two components, and one written without a route is another, since a
 opaque name such as an Azure deployment may name different models at each. A provider
 other than one that serves local weights (`ollama`) makes the model `hosted`, which
 `trace-diff` lists as `unobserved` when no trace names it.
-Any `trust_remote_code` but a false literal, given to a call or in its `model_kwargs` or
-`config_kwargs`, records that the model may run its own code. A relative path or a
+Any `trust_remote_code` but a false literal, given to a call or in a dict of its options,
+such as `model_kwargs`, records that the model may run its own code. A relative path or a
 weight file names a file in the project, which the model collector reads.
 
 What the reader knows is there and cannot read is a coverage gap:
@@ -89,14 +91,15 @@ What the reader knows is there and cannot read is a coverage gap:
   makes rather than text or a path one returns: a parameter, whatever its default; an
   attribute, an item or a call other than those above; text joined to something unread,
   or built from itself, which may grow when run again; a loop, `with`, `except` or
-  pattern variable; a dict that is changed, handed on, spread from another or bound more
-  than once; `**options` without a model; a starred positional argument; a path on a
-  host, behind a routing prefix or not; a name of the module that the file also imports,
-  or that an import with `*` may bind; and text that is no identifier, or a default a
+  pattern variable; a dict that is changed, handed on, spread from another, bound more
+  than once or to two names at once, or given as options to a call that is not an
+  SDK's; `**options` without a model; a starred positional argument; a path on a host,
+  behind a routing prefix or not; a name of the module that the file also imports, or
+  that an import with `*` may bind; and text that is no identifier, or a default a
   variable that cannot be named may override;
 - a model that only an environment variable sets, once for each file that reads it so,
   as when its default names no model, such as `None`, `""` or `"default"`;
-- options a weights library is given that the reader cannot read, such as
+- options a weights library loads a model with that the reader cannot read, such as
   `model_kwargs=options` or `**options`, which may let the model run its own code;
 - a model argument given to a function or class the project defines, or to a method of
   one of its classes, which the reader does not follow;

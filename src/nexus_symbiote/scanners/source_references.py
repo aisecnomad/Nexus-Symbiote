@@ -1,17 +1,11 @@
-"""Vocabulary and records of the source collector.
-
-The source collector reads what application source declares. Every record is a
-declaration read from a file, never an observation of a running system, so each is
-recorded at declared assurance with the file and line it was read from, and what a
-reader could not resolve is a named coverage gap.
-
-This module holds what the readers share: what an identifier must look like to be
-recorded, the routing prefixes a model router reads off the front of one, and the
-accumulator that turns the readers' records into components.
+"""Vocabulary and records of the source collector: what an identifier must look like to
+be recorded, and the accumulator that turns the readers' records into components, each a
+declaration with the file and line it was read from.
 """
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -32,6 +26,7 @@ MAX_RECORDS = 5_000
 
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{1,127}")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,63}")
+_RUN = re.compile(r"[A-Za-z0-9]{24,}")
 # A long run of hex or of base64 with no separator, or user information before an
 # ``@``: what a key, a token or a connection string looks like, and no model's name.
 _SECRET_SHAPED = re.compile(
@@ -39,9 +34,9 @@ _SECRET_SHAPED = re.compile(
 )
 # A model pinned by its version's digest, which is a hash, not a key.
 _PINNED = re.compile(r"[\w.-]+/[\w.-]+:[0-9a-f]{64}")
-# A path on this or another host, after a routing prefix or none: a drive, a share, the
-# root or a home directory.
-_ABSOLUTE = re.compile(r"(?:^|:)(?:[A-Za-z]:|\\\\|/|~)")
+# A path on this or another host, after a routing prefix or none: a drive with a path, a
+# share, the root or a home directory. No identifier holds ``//``.
+_ABSOLUTE = re.compile(r"(?:^|[:/@])(?:[A-Za-z]:(?=[^:]*[\\/])|\\\\|/|~)")
 # Words a model argument holds that name no model on purpose.
 _NOT_A_MODEL = frozenset(
     {
@@ -144,11 +139,14 @@ def model_kind(name: str, *, embedding: bool = False) -> str | None:
     return None
 
 
+@functools.lru_cache(maxsize=4096)
 def environment_name(name: object) -> str | None:
-    """``name`` when it can be exported as the name of an environment variable."""
-    if isinstance(name, str) and _ENVIRONMENT_NAME.fullmatch(name) and unchanged_by_redaction(name):
-        return name
-    return None
+    """``name`` when it can be exported as the name of an environment variable: one shaped
+    like a key, a long run of hex or of letters and digits not all in capitals, is not."""
+    if not isinstance(name, str) or not _ENVIRONMENT_NAME.fullmatch(name):
+        return None
+    keylike = _SECRET_SHAPED.search(name) or any(not run.isupper() for run in _RUN.findall(name))
+    return None if keylike or not unchanged_by_redaction(name) else name
 
 
 def model_ref(name: str, provider: str | None = None) -> str:
