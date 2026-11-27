@@ -1790,3 +1790,23 @@ def test_a_text_longer_than_any_identifier_is_judged_and_not_kept():
     assert found.model("x" * 300, "run.py", 1, method="python-ast") is None
     assert found.model("gpt-4o", "run.py", 2, method="python-ast") == "model:source:gpt-4o"
     assert list(found._written) == ["gpt-4o"]
+
+
+def test_the_answers_kept_across_files_are_bounded(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(source_python, "MAX_CACHED", 10)
+    files = {
+        f"app/m{index}.py": "".join(
+            f"from openai import sub{index}_{part}\nsub{index}_{part}.chat(model='gpt-4o')\n"
+            for part in range(20)
+        )
+        for index in range(5)
+    }
+    reader = source_python.PythonReader(
+        Declarations(ScanResult(scanner_name="source")), frozenset(files)
+    )
+    kept = []
+    for path, text in sorted(files.items()):
+        reader.add(path, text)
+        kept.append(len(reader._resolved) + len(reader._local))
+    # Each file asks of its own imports; what earlier files kept is let go past the bound.
+    assert max(kept) == kept[0] and kept[0] > 10
