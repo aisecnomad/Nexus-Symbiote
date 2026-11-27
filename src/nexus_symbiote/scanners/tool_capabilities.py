@@ -12,6 +12,7 @@ raises risk, never ``read`` or ``read-only``, and a body past a bound records a 
 from __future__ import annotations
 
 import ast
+import itertools
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -563,17 +564,18 @@ def _ts_module(specifier: str) -> str:
 Bindings = Mapping[str, tuple[tuple[str, str], ...]]
 
 
-def _bind(names: dict[str, list[tuple[str, str]]], name: str, binding: tuple[str, str]) -> None:
-    known = names.setdefault(name, [])
-    if binding not in known:
-        known.append(binding)
+_Names = dict[str, dict[tuple[str, str], None]]  # Each name's bindings, in the order found.
+
+
+def _bind(names: _Names, name: str, binding: tuple[str, str]) -> None:
+    names.setdefault(name, {})[binding] = None
 
 
 def typescript_imports(nodes: Iterable[Node]) -> dict[str, tuple[tuple[str, str], ...]]:
     """Every (module, export or '') a name is bound to by ``import`` or ``require``, in any
     scope, so a second binding adds a candidate and never hides the first."""
     nodes = list(nodes)
-    names: dict[str, list[tuple[str, str]]] = {}
+    names: _Names = {}
     for node in nodes:
         if node.type == "import_statement":
             source = node.child_by_field_name("source")
@@ -620,7 +622,7 @@ def typescript_imports(nodes: Iterable[Node]) -> dict[str, tuple[tuple[str, str]
             elif target.type == "object_pattern":
                 for local, key in _ts_destructured(target, export):
                     _bind(names, local, (loaded, key))
-    _bind_promisified(nodes, names)
+    _bind_derived(nodes, names)
     return {name: tuple(bindings) for name, bindings in names.items()}
 
 
@@ -655,24 +657,42 @@ def _ts_unwrap_await(node: Node | None) -> Node | None:
     return node
 
 
-def _bind_promisified(nodes: Iterable[Node], names: dict[str, list[tuple[str, str]]]) -> None:
-    """``const run = promisify(exec)`` runs what ``exec`` runs."""
+def _bind_derived(nodes: Iterable[Node], names: _Names) -> None:
+    """A name bound from an imported name holds what that name holds, in source order."""
     for node in nodes:
-        if node.type != "variable_declarator":
-            continue
-        target, value = node.child_by_field_name("name"), node.child_by_field_name("value")
-        if target is None or target.type != "identifier" or value is None:
-            continue
-        if value.type != "call_expression":
-            continue
-        callee = _ts_text(value.child_by_field_name("function"))
-        arguments = value.child_by_field_name("arguments")
-        if callee not in {"promisify", "util.promisify"} or arguments is None:
-            continue
-        first = arguments.named_children[0] if arguments.named_children else None
-        if first is not None and first.type == "identifier" and _ts_text(first) in names:
-            for binding in list(names[_ts_text(first)]):
+        target = node.child_by_field_name("name") if node.type == "variable_declarator" else None
+        if target is not None and target.type == "identifier":
+            value = _ts_unwrap_await(node.child_by_field_name("value"))
+            for binding in _ts_derived(value, names):
                 _bind(names, _ts_text(target), binding)
+
+
+def _ts_derived(
+    value: Node | None, names: Mapping[str, Iterable[tuple[str, str]]]
+) -> list[tuple[str, str]]:
+    """What a value taken from an imported name holds: another name for it, a member of it,
+    ``promisify`` of it, or what calling or constructing it returns, as in
+    ``const run = cp.execSync``, ``const api = axios.create()`` or ``new Stripe(key)``. A
+    server an http module creates is not a client. Past ``_MAX_TARGETS``, one more binding
+    is enough for a read of the name to be unclassified."""
+    called = value is not None and value.type in {"call_expression", "new_expression"}
+    if called and value is not None:
+        callee = value.child_by_field_name("function") or value.child_by_field_name("constructor")
+        arguments = value.child_by_field_name("arguments")
+        if _ts_text(callee) in {"promisify", "util.promisify"}:
+            value = arguments.named_children[0] if arguments and arguments.named_children else None
+            called = False
+        else:
+            value = callee
+    chain = _ts_chain(value)
+    if not chain or (called and chain[-1] in _TS_HTTP_SERVER):
+        return []
+    head = chain[0]
+    held = [(head.removeprefix(_MODULE_HEAD), "")] if head.startswith(_MODULE_HEAD) else []
+    held = held or list(itertools.islice(names.get(head, ()), _MAX_TARGETS + 1))
+    if called or len(chain) == 1:
+        return held
+    return [(module, chain[-1]) for module, _ in held]
 
 
 def _ts_loaded_module(call: Node) -> str | None:
@@ -803,18 +823,17 @@ def _ts_env_name(node: Node) -> str | None:
     return _ts_property(node) or None
 
 
-def _ts_import_binding(value: Node | None) -> bool:
-    """Whether a declarator binds a module or a promisified export, as imports do."""
+def _ts_import_binding(value: Node | None, imports: Bindings) -> bool:
+    """Whether a declarator binds a module or a value taken from an import, as imports do."""
     value = _ts_unwrap_await(value)
+    if _ts_derived(value, imports):
+        return True
     if value is not None and value.type == "member_expression":
         value = _ts_unwrap_await(value.child_by_field_name("object"))
-    if value is None or value.type != "call_expression":
-        return False
-    callee = _ts_text(value.child_by_field_name("function"))
-    return _ts_loaded_module(value) is not None or callee in {"promisify", "util.promisify"}
+    return value is not None and value.type == "call_expression" and bool(_ts_loaded_module(value))
 
 
-def _ts_locals(handler: Node) -> set[str]:
+def _ts_locals(handler: Node, imports: Bindings) -> set[str]:
     """Names the body binds at its top level, which shadow imports."""
     names: set[str] = set()
     body = handler.child_by_field_name("body")
@@ -827,7 +846,9 @@ def _ts_locals(handler: Node) -> set[str]:
             elif statement.type in {"lexical_declaration", "variable_declaration"}:
                 for declarator in statement.named_children:
                     value = declarator.child_by_field_name("value")
-                    if declarator.type == "variable_declarator" and not _ts_import_binding(value):
+                    if declarator.type == "variable_declarator" and not _ts_import_binding(
+                        value, imports
+                    ):
                         names.update(_ts_bound_names(declarator.child_by_field_name("name")))
     return names
 
@@ -862,7 +883,7 @@ def classify_typescript(
     """Classify a handler by the calls in its syntax tree; ``skip`` holds other tools' ids."""
     seen = _Observed()
     parameters = frozenset(_ts_parameters(handler))
-    local = _ts_locals(handler)
+    local = _ts_locals(handler, imports)
     imports = {name: bound for name, bound in imports.items() if name not in local}
     shadowed = parameters | local
     stack = [handler]
@@ -873,7 +894,10 @@ def classify_typescript(
         if visited > MAX_BODY_NODES:
             return ToolCapabilities(unclassified=True)
         if node.type == "call_expression":
-            _ts_call(node, imports, shadowed, parameters, seen)
+            try:
+                _ts_call(node, imports, shadowed, parameters, seen)
+            except _TooManyTargetsError:
+                return ToolCapabilities(unclassified=True)
         elif node.type == "new_expression":
             constructor = _ts_chain(node.child_by_field_name("constructor"))
             if (
@@ -919,6 +943,8 @@ def _ts_call(
         candidates = ((head.removeprefix(_MODULE_HEAD), ""),)
     else:
         candidates = () if head in shadowed else imports.get(head, ())
+    if len(candidates) > _MAX_TARGETS:
+        raise _TooManyTargetsError
     unbound_global = not candidates and head not in shadowed
     arguments = node.child_by_field_name("arguments")
     values = (
@@ -955,8 +981,10 @@ def _ts_call(
     if last in {"sendMail", "sendEmail"} and len(chain) > 1:
         seen.add(CapabilityClass.NETWORK)
         seen.write()
+    # A receiver named stripe, such as ``this.stripe``, unless the chain starts at a parameter.
+    named = any(part.lower() == "stripe" for part in chain[:-2]) and head not in parameters
     if (
-        (stripe_bound or (head.lower() == "stripe" and head not in parameters))
+        (stripe_bound or named)
         and len(chain) >= 3
         and chain[-2] in _TS_PAYMENT_RESOURCES
         and last in _TS_PAYMENT_WRITE

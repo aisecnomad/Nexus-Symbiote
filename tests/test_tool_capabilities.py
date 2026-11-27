@@ -840,4 +840,105 @@ def test_a_body_registered_under_many_names_is_read_once(tmp_path: Path) -> None
     assert large < max(small, 0.05) * 6, (small, large)
 
 
-# ---- Reviews of d05e5cdc and 10b2125a: SQL at the call, database receivers ----------------
+# ---- Review of 899c7384: names TypeScript takes from an import ----------------------------
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected"),
+    [
+        (
+            'import * as cp from "child_process";\nconst run = cp.execSync;\n',
+            "(c) => run(c)",
+            {E.EXECUTE},
+        ),
+        (
+            'import { exec } from "child_process";\nconst run = exec;\n',
+            "(c) => run(c)",
+            {E.EXECUTE},
+        ),
+        (
+            'import cp from "child_process";\nimport { promisify } from "util";\n'
+            "const run = promisify(cp.exec);\n",
+            "async (c) => run(c)",
+            {E.EXECUTE},
+        ),
+        (
+            'import axios from "axios";\nconst api = axios.create({ baseURL: "https://x" });\n',
+            "async (a) => api.post('/items', a)",
+            {E.NETWORK, E.WRITE},
+        ),
+        (
+            'import axios from "axios";\n',
+            "async (a) => { const api = axios.create(); return api.post('/items', a); }",
+            {E.NETWORK, E.WRITE},
+        ),
+        (
+            'import Stripe from "stripe";\nconst payments = new Stripe("k");\n',
+            "async ({ charge }) => payments.refunds.create({ charge })",
+            {E.NETWORK, E.WRITE, E.PAYMENT},
+        ),
+        (
+            'const pay = require("stripe")("k");\n',
+            "async ({ charge }) => pay.refunds.create({ charge })",
+            {E.NETWORK, E.WRITE, E.PAYMENT},
+        ),
+        (
+            'import Stripe from "stripe";\n',
+            "async function ({ charge }) { return this.stripe.refunds.create({ charge }); }",
+            {E.NETWORK, E.WRITE, E.PAYMENT},
+        ),
+        (
+            "",
+            "async ({ charge }) => clients.stripe.refunds.create({ charge })",
+            {E.NETWORK, E.WRITE, E.PAYMENT},
+        ),
+        ("", "async (args) => args.stripe.refunds.create({ charge: 'c' })", set()),
+        (
+            'import http from "http";\nconst srv = http.createServer(() => {});\n',
+            "async () => { srv.close(); srv.on('x', () => {}); }",
+            set(),
+        ),
+        (
+            'import * as cp from "child_process";\n',
+            "async (c) => { const child = cp.spawn('ls'); child.kill(); }",
+            {E.EXECUTE},
+        ),
+        (
+            'import { exec } from "child_process";\n',
+            "(c) => { const exec = (x) => x; return exec(c); }",
+            set(),
+        ),
+    ],
+    ids=[
+        "member-alias",
+        "name-alias",
+        "promisified-member",
+        "created-client",
+        "client-created-in-the-handler",
+        "constructed-client",
+        "called-module",
+        "this-stripe",
+        "property-stripe",
+        "stripe-under-a-parameter",
+        "server-is-not-a-client",
+        "child-process-handle",
+        "local-function-shadows",
+    ],
+)
+def test_typescript_names_taken_from_an_import_hold_what_it_holds(
+    tmp_path: Path, header: str, handler: str, expected: set[CapabilityClass]
+) -> None:
+    assert _caps(_ts(tmp_path, handler, header)) == expected
+
+
+def test_a_typescript_name_with_too_many_bindings_is_unclassified(tmp_path: Path) -> None:
+    imports = "".join(f'import {{ x }} from "m{i}";\n' for i in range(33))
+    tool = _ts(tmp_path / "direct", "(c) => x(c)", imports)
+    assert tool.capabilities is None
+    derived = _ts(tmp_path / "derived", "(c) => y(c)", imports + "const y = x;\n")
+    assert derived.capabilities is None
+    root = tmp_path / "direct"
+    assert any("too large or too ambiguous" in s for s in MCPScanner().scan(root).surfaces_excluded)
+    at_the_bound = "".join(f'import {{ x }} from "m{i}";\n' for i in range(31))
+    at_the_bound += 'import { exec as x } from "child_process";\n'
+    assert _caps(_ts(tmp_path / "bound", "(c) => x(c)", at_the_bound)) == {E.EXECUTE}
