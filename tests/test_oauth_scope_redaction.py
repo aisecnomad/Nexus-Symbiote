@@ -28,6 +28,10 @@ WITHHELD = [
     f"user:{PASSWORD}@host.example/scope",
     f"user:{PASSWORD}@localhost/scope",
     f"user:{PASSWORD}@db:5432",
+    # What the rules leave of a scope they reduced in part is checked too.
+    f"https://host.example/cb?token={PASSWORD} x{PAT}",
+    f"https://user:{PASSWORD}@host.example/a x{PAT}",
+    f"x user:{PASSWORD}@host.example/scope",
 ]
 
 

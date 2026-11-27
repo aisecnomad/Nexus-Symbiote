@@ -1135,10 +1135,8 @@ def redact_oauth_scope(value: str) -> str:
     """Show an OAuth scope (RFC 6749 section 3.3) unless it may contain a secret."""
     shown = _shown_scope(value)
     # A token glued to a letter or digit, or user information in a URL without a scheme,
-    # passes the rules below. A scope they already reduced keeps the form they gave it.
-    if shown == value and (
-        holds_token_shape(value, require_sk_boundary=True) or _SCHEMELESS_USERINFO.match(value)
-    ):
+    # passes the rules below, also in what remains of a scope they reduced in part.
+    if holds_token_shape(shown, require_sk_boundary=True) or _SCHEMELESS_USERINFO.search(shown):
         return REDACTED
     return shown
 
