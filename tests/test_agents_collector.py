@@ -398,3 +398,38 @@ def test_a_checkout_without_agent_code_records_nothing_and_stays_complete(tmp_pa
     assert result.components == []
     assert result.surfaces_scanned == ["agents (no agent framework declarations found)"]
     assert not result.surfaces_excluded
+
+
+def test_project_reconciliation_accepts_the_collector_edges(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from nexus_symbiote.cli import main
+
+    project = tmp_path / "project"
+    _write(
+        project,
+        "billing.py",
+        """
+from agents import Agent, function_tool
+
+@function_tool
+def lookup_invoice(invoice_id: str) -> str:
+    \"\"\"Look up an invoice.\"\"\"
+    return invoice_id
+
+billing = Agent(name="Billing Agent", model="gpt-4.1", tools=[lookup_invoice])
+""",
+    )
+    runner = CliRunner()
+    output = tmp_path / "bom.json"
+    scanned = runner.invoke(
+        main, ["scan", str(project), "--no-project-policy", "--report-only", "-o", str(output)]
+    )
+    assert scanned.exit_code == 0, scanned.output
+    document = json.loads(output.read_text())
+    assert {e["relationship"] for e in document["dependencies"]} >= {"uses-model", "invokes"}
+    validated = runner.invoke(
+        main, ["validate", str(output), "--project", str(project), "--no-project-policy"]
+    )
+    assert "[relationship]" not in validated.output, validated.output
+    assert "no local evidence" not in validated.output
