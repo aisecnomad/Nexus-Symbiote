@@ -936,3 +936,99 @@ def test_sql_is_classified_at_the_call_as_it_runs(
 )
 def test_typescript_plans_and_quoted_sql_write_nothing(tmp_path: Path, handler: str) -> None:
     assert _caps(_ts(tmp_path, handler)) == set(), handler
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "import subprocess\n\ndef register():\n    run = subprocess.run\n\n"
+            "    def tool(c):\n        nonlocal run\n        run = subprocess.call\n        return run(c)\n",
+            {E.EXECUTE},
+        ),
+        (
+            "from subprocess import run\n\ndef register():\n    run = print\n\n"
+            "    def tool(c):\n        nonlocal run\n        return run(c)\n",
+            set(),
+        ),
+        (
+            "import subprocess\n\ndef tool(c):\n    if (run := subprocess.run):\n        return run(c)\n",
+            {E.EXECUTE},
+        ),
+        (
+            "import subprocess\n\ndef tool(cs):\n    [(run := subprocess.run) for _ in cs]\n    return run(cs)\n",
+            {E.EXECUTE},
+        ),
+        (
+            "from subprocess import run\n\ndef tool(c, lock):\n    with lock:\n        del run\n    return run(c)\n",
+            set(),
+        ),
+        (
+            "from subprocess import run\n\ndef tool(c):\n    try:\n        pass\n"
+            "    except Exception as run:\n        pass\n    return run(c)\n",
+            set(),
+        ),
+        (
+            "from subprocess import run\n\ndef tool(c):\n    match c:\n        case {'a': 1, **run}:\n"
+            "            pass\n        case [*rest] if rest:\n            pass\n    return run(c)\n",
+            set(),
+        ),
+        (
+            "from subprocess import run\n\ndef tool(c):\n    match c:\n        case str() as run:\n"
+            "            pass\n    return run(c)\n",
+            set(),
+        ),
+        (
+            "from subprocess import run\n\ndef tool(c, pair):\n    run, *rest = pair\n    return run(c)\n",
+            set(),
+        ),
+        (
+            "from subprocess import run\n\ndef tool(c, pair):\n    *rest, run = pair\n    return run(c)\n",
+            set(),
+        ),
+        (
+            "from os import *\nimport subprocess\n\ndef tool(c):\n    return subprocess.run(c)\n",
+            {E.EXECUTE},
+        ),
+        ("def tool(x):\n    x" + ".a" * 20 + ".unlink()\n", set()),
+    ],
+    ids=[
+        "nonlocal-rebinding",
+        "nonlocal-local-value",
+        "walrus",
+        "walrus-in-comprehension",
+        "del",
+        "except-target",
+        "match-mapping-and-star",
+        "match-as",
+        "unpacking",
+        "starred-unpacking",
+        "star-import",
+        "chain-past-the-bound",
+    ],
+)
+def test_python_binding_forms(source: str, expected: set[CapabilityClass]) -> None:
+    found = _classify_named(source, "tool")
+    assert set(found.capabilities) == expected, source
+    if not expected:
+        assert found.declaration is None and not found.risks, source
+
+
+def test_a_name_aliasing_one_with_too_many_targets_is_unclassified() -> None:
+    imports = "".join(f"from m{i} import f as x\n" for i in range(40))
+    source = imports + "run = x\n\ndef tool(c):\n    return run(c)\n"
+    assert _classify_named(source, "tool").unclassified
+
+
+def test_a_function_classified_without_its_module_scopes_still_reads_its_own() -> None:
+    tree = ast.parse("def tool(c):\n    import subprocess\n    return subprocess.run(c)\n")
+    function = tree.body[0]
+    assert isinstance(function, ast.FunctionDef)
+    assert set(classify_python(function).capabilities) == {E.EXECUTE}
+
+
+def test_a_doubled_quote_stays_inside_its_literal() -> None:
+    found = _classify(
+        "def tool(conn):\n    conn.execute(\"INSERT INTO t VALUES ('it''s; DROP TABLE x')\")\n"
+    )
+    assert set(found.capabilities) == {E.WRITE}
