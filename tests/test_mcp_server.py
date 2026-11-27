@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -432,7 +433,7 @@ def test_all_eight_tools_filters_sorting_and_sanitization(tmp_path):
     )["structuredContent"]
     assert high_trifecta["total"] <= flows["total"]
 
-    # evidence_profile with cleaned bom_ref lookup + global
+    # evidence_profile exact bom_ref lookup + global
     ev = _call_tool(server, "evidence_profile", {"component_ref": "pkg:pypi/requests@2.31.0"})[
         "structuredContent"
     ]
@@ -466,6 +467,127 @@ def test_all_eight_tools_filters_sorting_and_sanitization(tmp_path):
     assert "\u202e" not in dumped
 
 
+def test_evidence_profile_matches_original_ref_before_display_redaction():
+    origin = "https://inventory.example"
+    names = ["alpha", "bravo"]
+    bom = AIBOM(
+        components=[
+            ToolComponent(name=name, bom_ref=f"{origin}/components/{name}") for name in names
+        ]
+    )
+    server = OfflineMCPServer(bom)
+    for name in names:
+        response = _call_tool(
+            server, "evidence_profile", {"component_ref": f"{origin}/components/{name}"}
+        )
+        profile = response["structuredContent"]
+        assert profile["total"] == profile["count"] == 1
+        assert [(row["name"], row["bom_ref"]) for row in profile["components"]] == [(name, origin)]
+        assert f"/components/{name}" not in response["content"][0]["text"]
+    missing = _call_tool(
+        server, "evidence_profile", {"component_ref": f"{origin}/components/missing"}
+    )
+    assert missing["structuredContent"]["total"] == 0
+
+
+def test_unscored_and_unchecked_advisories_remain_distinct(tmp_path):
+    bom = _build_rich_bom()
+    digest = hash_bytes(bom.to_native_json().encode())
+    path = _write_bound_advisories(tmp_path, digest)
+    report = json.loads(path.read_bytes())
+    ref = "pkg:pypi/requests@2.31.0"
+    report["advisories"].extend(
+        [
+            {"id": "OSV-unscored", "component_ref": ref, "severity": "unknown", "in_kev": False},
+            {"id": "OSV-unchecked", "component_ref": ref},
+        ]
+    )
+    path.write_text(json.dumps(report), encoding="utf-8")
+    loaded = load_advisory_report(path, expected_inventory_sha256=digest)
+    server = OfflineMCPServer(bom, advisory_report=loaded)
+
+    def rows(**filters):
+        items = _call_tool(server, "get_advisories", filters)["structuredContent"]["advisories"]
+        return {item["id"]: item for item in items}
+
+    advisories = rows(component_ref=ref)
+    assert (
+        advisories["OSV-unscored"]["severity"]
+        == advisories["OSV-unchecked"]["severity"]
+        == "unknown"
+    )
+    assert advisories["OSV-unscored"]["in_kev"] is False
+    assert advisories["OSV-unchecked"]["in_kev"] is None
+    assert advisories["CVE-2024-KEV1"]["in_kev"] is True
+    assert set(rows(min_severity="info")) == set(advisories) - {"OSV-unscored", "OSV-unchecked"}
+    assert set(rows(kev_only=True)) == {"CVE-2024-KEV1"}
+    counts = _call_tool(server, "inventory_summary")["structuredContent"]["advisories"]
+    assert (counts["kev"], counts["kev_unknown"]) == (1, 2)
+
+    report["provenance"] = {"offline": True, "kev_catalogs": []}
+    path.write_text(json.dumps(report), encoding="utf-8")
+    loaded = load_advisory_report(path, expected_inventory_sha256=digest)
+    server = OfflineMCPServer(bom, advisory_report=loaded)
+    assert rows()["OSV-unscored"]["in_kev"] is None
+    assert not rows(kev_only=True)
+
+
+def test_protocol_error_fields_protect_credentials_and_keep_ordinary_ids():
+    server = OfflineMCPServer(_build_rich_bom())
+    for fields in (
+        {"method": _SYNTHETIC_FIXTURE},
+        {"method": "tools/call", "params": {"name": _SYNTHETIC_FIXTURE}},
+        {
+            "method": "tools/call",
+            "params": {"name": "list_components", "arguments": {_SYNTHETIC_FIXTURE: 1}},
+        },
+    ):
+        reply = server.handle_message({"jsonrpc": "2.0", "id": "request-7", **fields})
+        assert reply is not None and "error" in reply and reply["id"] == "request-7"
+        assert _SYNTHETIC_FIXTURE not in json.dumps(reply)
+    unsafe_id = server.handle_message(
+        {"jsonrpc": "2.0", "id": _SYNTHETIC_FIXTURE, "method": "ping"}
+    )
+    assert unsafe_id is not None and unsafe_id["error"]["code"] == -32600
+    assert unsafe_id["id"] is None and _SYNTHETIC_FIXTURE not in json.dumps(unsafe_id)
+
+
+def test_framed_length_checked_before_decimal_conversion(monkeypatch):
+    from nexus_symbiote import mcp_server
+
+    monkeypatch.setattr(mcp_server, "MAX_FRAME_BYTES", 12)
+    converted = []
+
+    def record_integer(digits):
+        converted.append(digits)
+        return int(digits)
+
+    monkeypatch.setattr(mcp_server, "int", record_integer, raising=False)
+    read = mcp_server._read_content_length_frame
+    assert read(b"Content-Length: 00012\r\n", io.BytesIO(b"\r\n" + b"x" * 12)) == b"x" * 12
+    for value in (b"0", b"13", b"100"):
+        with pytest.raises(mcp_server.FrameError, match="outside allowed range"):
+            read(b"Content-Length: " + value + b"\r\n", io.BytesIO(b"\r\n"))
+    assert converted == ["12"]
+
+
+@pytest.mark.parametrize(
+    ("score", "expected"), [(-0.1, None), (0, 0.0), (0.5, 0.5), (1, 1.0), (1.1, None)]
+)
+def test_advisory_epss_score_uses_probability_range(score, expected):
+    component = RegistryEntryComponent(
+        bom_ref="pkg:demo",
+        name="demo",
+        properties={"advisories": [{"id": "sample", "epss_score": score}]},
+    )
+    server = OfflineMCPServer(AIBOM(components=[component]))
+    (row,) = _call_tool(server, "get_advisories")["structuredContent"]["advisories"]
+    if expected is None:
+        assert "epss_score" not in row
+    else:
+        assert row["epss_score"] == expected
+
+
 def test_advisory_row_edge_cases_and_json_rpc_validation():
     bom = _build_rich_bom()
     server = OfflineMCPServer(bom)
@@ -475,7 +597,7 @@ def test_advisory_row_edge_cases_and_json_rpc_validation():
         component_ref="c:1",
         source="embedded-component",
     ) == _normalize_advisory_row(
-        {"id": "CVE-2025-0001", "epss_score": True, "severity": "medium"},
+        {"id": "CVE-2025-0001", "epss_score": True, "severity": "unknown"},
         component_ref="c:1",
         source="embedded-component",
     )
@@ -852,6 +974,29 @@ def test_mcp_server_cli_round_trip_and_refusals(tmp_path, runner):
     # Offline run without --advisories
     plain_res = runner.invoke(main, ["mcp-server", str(inv_path)], input=req_init + b"\n")
     assert plain_res.exit_code == 0, plain_res.output
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX operator file ownership and modes")
+@pytest.mark.parametrize("placement", ["group-writable", "extra-link", "writable-ancestor"])
+def test_mcp_cli_requires_operator_owned_advisory_report(tmp_path, runner, placement):
+    bom = _build_rich_bom().to_native_json().encode()
+    inventory = tmp_path / "inventory.json"
+    inventory.write_bytes(bom)
+    report = _write_bound_advisories(tmp_path, hash_bytes(bom))
+    if placement == "group-writable":
+        report.chmod(0o660)
+    elif placement == "extra-link":
+        (tmp_path / "other-name.json").hardlink_to(report)
+    else:
+        report.parent.chmod(0o770)
+    result = runner.invoke(main, ["mcp-server", str(inventory), "--advisories", str(report)])
+    assert result.exit_code == 1
+    expected = {
+        "group-writable": "group/world writable",
+        "extra-link": "additional hard links",
+        "writable-ancestor": "writable or untrusted ancestor",
+    }
+    assert expected[placement] in result.stderr
 
 
 def test_mcp_server_cli_unexpected_io_and_digest_fallbacks(tmp_path, runner, monkeypatch):

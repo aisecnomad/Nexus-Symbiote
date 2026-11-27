@@ -1398,6 +1398,8 @@ nexus-symbiote mcp-server [OPTIONS] AIBOM_PATH
 | `--project-root` `DIR` | Scanned project root used to refuse advisory files inside the checkout (requires `--advisories`). |
 | `--max-requests` `INT` | Maximum JSON-RPC requests/notifications served before exiting (`10000` by default). |
 
-When `--advisories` is supplied, the report must be a regular, single-link, non-group/world-writable file located in a trusted directory chain and bound to `AIBOM_PATH`'s SHA-256; with `--project-root`, paths inside the scanned checkout are refused. All responses redact recognized credentials and neutralize terminal control and bidirectional formatting sequences. Exposed read-only tools are `inventory_summary`, `list_components`, `get_findings`, `get_advisories`, `blast_radius`, `trifecta_flows`, `evidence_profile` and `minimum_elements`.
+Advisory reports must be regular, single-link files owned by a trusted user, with group and world write permissions disabled. The server checks the directory chain, refuses reports inside the scanned checkout and verifies the report against the SHA-256 of the supplied inventory.
 
+The server redacts recognized credentials and neutralizes terminal controls and bidirectional formatting sequences. Use ordinary integer or string request IDs. A string ID that requires redaction or neutralization is rejected with a null response ID.
 
+The read-only tools are `inventory_summary`, `list_components`, `get_findings`, `get_advisories`, `blast_radius`, `trifecta_flows`, `evidence_profile` and `minimum_elements`. Unscored advisories have severity `unknown` and appear in results without a minimum severity. Missing KEV status is `null`, including for offline reports produced without a KEV catalog. Only recorded KEV matches pass `kev_only`, and the summary counts rows without a recorded status in `kev_unknown`.

@@ -499,6 +499,7 @@ class LoadedAdvisoryReport:
     skipped: int
     excluded: int
     errors: int
+    lacks_kev_catalog: bool = False
 
 
 def load_advisory_report(
@@ -506,9 +507,12 @@ def load_advisory_report(
     *,
     expected_inventory_sha256: str | None = None,
     allow_partial: bool = False,
+    require_operator_trust: bool = False,
 ) -> LoadedAdvisoryReport:
     """Load an advisory report JSON produced by ``advisories`` (live or offline)."""
-    raw = _read_regular_bytes(path, MAX_REPORT_BYTES, "Advisory report")
+    raw = _read_regular_bytes(
+        path, MAX_REPORT_BYTES, "Advisory report", single_link=require_operator_trust
+    )
     payload = parse_json_strict(raw.decode("utf-8"), max_bytes=MAX_REPORT_BYTES)
     if not isinstance(payload, dict) or not isinstance(payload.get("advisories"), list):
         raise VEXDecisionError("Advisory report must be a JSON object with an 'advisories' array")
@@ -551,6 +555,20 @@ def load_advisory_report(
         for a in advisories
     ):
         raise VEXDecisionError("Malformed advisory report entry")
+    provenance = payload.get("provenance")
+    # The offline matcher emits in_kev=False even when no KEV catalog was supplied.
+    lacks_kev_catalog = (
+        isinstance(provenance, dict)
+        and provenance.get("offline") is True
+        and provenance.get("kev_catalogs") == []
+    )
     return LoadedAdvisoryReport(
-        advisories, hash_bytes(raw), coverage, checked, skipped, excluded, len(errors)
+        advisories,
+        hash_bytes(raw),
+        coverage,
+        checked,
+        skipped,
+        excluded,
+        len(errors),
+        lacks_kev_catalog=lacks_kev_catalog,
     )

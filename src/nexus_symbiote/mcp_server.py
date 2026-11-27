@@ -9,7 +9,6 @@ terminal neutralization.
 from __future__ import annotations
 
 import json
-import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -285,11 +284,10 @@ def _highest_sev(risks: list[Any]) -> str | None:
 def _validate_tool_args(tool_name: str, args: Mapping[str, Any]) -> str | None:
     schema = _TOOL_SCHEMAS.get(tool_name)
     if schema is None:
-        return f"Unknown tool: {neutralize(tool_name)}"
+        return "Unknown tool"
     props: dict[str, dict[str, Any]] = schema.get("properties", {})
-    unknown = sorted(set(args) - set(props))
-    if unknown:
-        return f"Unexpected argument(s): {', '.join(neutralize(k) for k in unknown)}"
+    if any(key not in props for key in args):
+        return "Unexpected tool argument"
     for req in schema.get("required", ()):
         if req not in args or args[req] is None:
             return f"Missing required argument: {req}"
@@ -330,7 +328,7 @@ class _AdvisoryEntry:
     source: str
     summary: str | None
     fixed_versions: tuple[str, ...]
-    in_kev: bool
+    in_kev: bool | None
     epss_score: float | None
 
     def to_dict(self) -> dict[str, Any]:
@@ -359,12 +357,14 @@ def _normalize_advisory_row(
     *,
     component_ref: str,
     source: str,
+    lacks_kev_catalog: bool = False,
 ) -> _AdvisoryEntry | None:
     adv_id = raw.get("advisory_id") or raw.get("id")
     if not isinstance(adv_id, str) or not adv_id.strip():
         return None
-    sev_raw = str(raw.get("severity", "medium")).lower()
-    severity = sev_raw if sev_raw in _SEVERITY_ORDER else "medium"
+    sev_raw = raw.get("severity")
+    severity = sev_raw.lower() if isinstance(sev_raw, str) else "unknown"
+    kev = raw.get("in_kev")
     aliases_raw = raw.get("aliases")
     aliases = (
         tuple(sorted({a.strip() for a in aliases_raw if isinstance(a, str) and a.strip()}))
@@ -384,7 +384,7 @@ def _normalize_advisory_row(
         float(epss_raw)
         if isinstance(epss_raw, int | float)
         and not isinstance(epss_raw, bool)
-        and math.isfinite(float(epss_raw))
+        and 0 <= epss_raw <= 1
         else None
     )
     summary_raw = raw.get("summary")
@@ -392,7 +392,7 @@ def _normalize_advisory_row(
     return _AdvisoryEntry(
         advisory_id=adv_id.strip(),
         component_ref=component_ref,
-        severity=severity,
+        severity=severity if severity in _SEVERITY_ORDER else "unknown",
         aliases=aliases,
         package=str(raw.get("package", "")).strip(),
         version=str(raw.get("version", "")).strip(),
@@ -400,7 +400,7 @@ def _normalize_advisory_row(
         source=source,
         summary=summary,
         fixed_versions=fixed_versions,
-        in_kev=raw.get("in_kev") is True,
+        in_kev=kev if isinstance(kev, bool) and not lacks_kev_catalog else None,
         epss_score=epss_score,
     )
 
@@ -413,7 +413,10 @@ def _collect_advisories(bom: AIBOM, report: LoadedAdvisoryReport | None) -> list
             if not isinstance(comp_ref, str) or not comp_ref.strip():
                 continue
             parsed = _normalize_advisory_row(
-                row, component_ref=comp_ref.strip(), source="advisory-report"
+                row,
+                component_ref=comp_ref.strip(),
+                source="advisory-report",
+                lacks_kev_catalog=report.lacks_kev_catalog,
             )
             if parsed is not None:
                 deduped[(parsed.component_ref, parsed.advisory_id)] = parsed
@@ -480,7 +483,12 @@ class OfflineMCPServer:
 
         req_id = message["id"]
         if req_id is not None and not (
-            (isinstance(req_id, str) and len(req_id) <= MAX_REQUEST_ID_CHARS) or type(req_id) is int
+            type(req_id) is int
+            or (
+                isinstance(req_id, str)
+                and len(req_id) <= MAX_REQUEST_ID_CHARS
+                and _clean_text(req_id) == req_id
+            )
         ):
             return self._error(None, -32600, "Invalid JSON-RPC request id")
 
@@ -534,7 +542,7 @@ class OfflineMCPServer:
                 return self._error(req_id, -32602, "tools/call requires non-empty string name")
             return self._dispatch_tool(req_id, name, arguments)
 
-        return self._error(req_id, -32601, f"Unsupported method: {neutralize(method)}")
+        return self._error(req_id, -32601, "Unsupported method")
 
     def _dispatch_tool(self, req_id: Any, name: str, args: Mapping[str, Any]) -> dict[str, Any]:
         validation_error = _validate_tool_args(name, args)
@@ -576,7 +584,8 @@ class OfflineMCPServer:
         trifecta = self._trifecta()
         advisory_meta: dict[str, Any] = {
             "total": len(self._advisories),
-            "kev": sum(1 for item in self._advisories if item.in_kev),
+            "kev": sum(1 for item in self._advisories if item.in_kev is True),
+            "kev_unknown": sum(1 for item in self._advisories if item.in_kev is None),
         }
         if self.advisory_report is not None:
             advisory_meta["report"] = {
@@ -717,7 +726,7 @@ class OfflineMCPServer:
             for entry in self._advisories
             if (not isinstance(ref_filter, str) or entry.component_ref == ref_filter)
             and (min_rank < 0 or _severity_rank(entry.severity) >= min_rank)
-            and (not kev_only or entry.in_kev)
+            and (not kev_only or entry.in_kev is True)
         ]
         page = matched[offset : offset + limit]
         result: dict[str, Any] = {
@@ -777,11 +786,13 @@ class OfflineMCPServer:
         ref_filter = args.get("component_ref")
         offset = args.get("offset", 0)
         limit = args.get("limit", DEFAULT_LIST_LIMIT)
-        profile = build_evidence_profile(self.bom)
-        components = profile.get("components", [])
+        selected = self.bom
         if isinstance(ref_filter, str):
-            target = _clean_text(ref_filter)
-            components = [c for c in components if _clean_text(c.get("bom_ref")) == target]
+            selected = AIBOM(
+                components=[comp for comp in self.bom.components if comp.bom_ref == ref_filter]
+            )
+        profile = build_evidence_profile(selected)
+        components = profile["components"]
         page = components[offset : offset + limit]
         return {
             "schema": profile.get("schema"),
@@ -837,7 +848,7 @@ class OfflineMCPServer:
         return {
             "jsonrpc": "2.0",
             "id": req_id,
-            "error": {"code": code, "message": neutralize(message)},
+            "error": {"code": code, "message": _clean_text(message)},
         }
 
 
@@ -870,13 +881,15 @@ def _read_content_length_frame(first_line: bytes, client_in: IO[bytes]) -> bytes
         if match is not None:
             if content_length is not None:
                 raise FrameError(-32700, "Duplicate Content-Length header", fatal=True)
-            content_length = int(match.group(1))
-            if content_length <= 0 or content_length > MAX_FRAME_BYTES:
+            digits = match.group(1).lstrip("0")
+            maximum = str(MAX_FRAME_BYTES)
+            if not digits or (len(digits), digits) > (len(maximum), maximum):
                 raise FrameError(
                     -32600,
                     f"Content-Length outside allowed range (1..{MAX_FRAME_BYTES})",
                     fatal=True,
                 )
+            content_length = int(digits)
         header_lines += 1
         if header_lines > MAX_HEADER_LINES:
             raise FrameError(-32700, "Too many headers before JSON-RPC body", fatal=True)
@@ -917,9 +930,7 @@ def _next_frame(client_in: IO[bytes]) -> tuple[bytes, Literal["ndjson", "content
 def _write_reply(
     client_out: IO[bytes], reply: Mapping[str, Any], framing: Literal["ndjson", "content-length"]
 ) -> None:
-    payload = json.dumps(reply, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode(
-        "utf-8"
-    )
+    payload = json.dumps(reply, separators=(",", ":"), sort_keys=True).encode("ascii")
     if framing == "content-length":
         header = f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
         client_out.write(header + payload)

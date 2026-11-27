@@ -104,6 +104,7 @@ def register_mcp_server_commands(main: click.Group) -> None:
                     advisories_path,
                     expected_inventory_sha256=inv_sha256,
                     allow_partial=allow_partial_advisories,
+                    require_operator_trust=True,
                 )
             except VEXDecisionError as exc:
                 raise click.ClickException(neutralize(exc)) from None
