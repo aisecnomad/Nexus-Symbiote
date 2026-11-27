@@ -61,6 +61,31 @@ def test_scoped_deno_permissions_are_not_flagged_as_broad() -> None:
 
 
 @pytest.mark.parametrize(
+    ("short_name", "long_name", "scope", "expected_context"),
+    [
+        ("-R", "--allow-read", "./data", {}),
+        ("-W", "--allow-write", "./reports", {}),
+        ("-N", "--allow-net", "api.example.test", {}),
+        ("-E", "--allow-env", "PORT", {}),
+        ("-S", "--allow-sys", "hostname", {"deno_scoped_host_permissions": 1}),
+    ],
+)
+def test_scoped_deno_permission_aliases_agree(
+    short_name: str, long_name: str, scope: str, expected_context: dict[str, int]
+) -> None:
+    for name in (short_name, long_name):
+        launch = analyze("deno", ["run", f"{name}={scope}", "./catalog.ts"])
+        assert launch.unknown is None
+        assert launch.context == expected_context
+
+
+@pytest.mark.parametrize("option", ["-A=example", "-q=example", "-Z=example", "-Rdata", "-NS=host"])
+def test_other_deno_short_forms_still_require_a_known_option(option: str) -> None:
+    launch = analyze("deno", ["run", option, "./catalog.ts"])
+    assert launch.unknown == "unrecognised deno run option"
+
+
+@pytest.mark.parametrize(
     ("args", "enabled"),
     [
         (["--inspect", "./server.js"], True),
@@ -88,7 +113,10 @@ def test_direct_ts_node_refuses_node_inspector_args(option: str) -> None:
     assert "debugger_enabled" not in launch.context
 
 
-def test_mcp_scanner_emits_high_and_medium_launch_context_findings(tmp_path: Path) -> None:
+@pytest.mark.parametrize("system_permission", ["--allow-sys=hostname", "-S=hostname"])
+def test_mcp_scanner_emits_high_and_medium_launch_context_findings(
+    tmp_path: Path, system_permission: str
+) -> None:
     config = {
         "mcpServers": {
             "deno-unsafe": {
@@ -110,7 +138,7 @@ def test_mcp_scanner_emits_high_and_medium_launch_context_findings(tmp_path: Pat
             },
             "deno-host-scoped": {
                 "command": "deno",
-                "args": ["run", "--allow-sys=hostname", "./server.js"],
+                "args": ["run", system_permission, "./server.js"],
             },
             "node-port": {
                 "command": "node",

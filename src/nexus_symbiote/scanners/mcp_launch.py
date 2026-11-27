@@ -1014,7 +1014,7 @@ _DENO_RUN = _table(
         r"--unsafely-ignore-certificate-errors",
         r"--(?:reload|lock|node-modules-dir|env-file|inspect|inspect-brk|inspect-wait"
         r"|allow-scripts|check|watch|watch-hmr|v8-flags|frozen|cached-only)",
-        r"-r",
+        r"-[rRWNES]",  # Reload and permission short options accept an attached =value.
     ),
 )
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "fish"})
