@@ -78,6 +78,7 @@ change them. See [collection limits](collection-limits.md).
 | [`runtime digest`](#runtime-digest) | offline | Print the digest a runtime contract, approval or revocation list binds |
 | [`runtime key-id`](#runtime-key-id) | offline | Print the key ID of an Ed25519 public key |
 | [`runtime register`](#runtime-register) | offline | Make a newly issued runtime snapshot current in a gateway state store |
+| [`runtime verify-receipts`](#runtime-verify-receipts) | offline | Verify a hash-chained runtime receipt JSONL log, its Merkle root and optional Ed25519 signatures |
 | [`attest`](#attest) | offline | Sign a file's exact bytes, usually an inventory or a baseline, for a stated purpose |
 | [`verify-attestation`](#verify-attestation) | offline | Check that trusted keys attested a file's bytes or inventory content for a purpose |
 | [`trace-diff`](#trace-diff) | offline | Compare the runtime use that OpenTelemetry traces report with an AgentBOM |
@@ -163,6 +164,7 @@ What exit status 1 means for each gate:
 | `baseline` | The scan gate failed, under the project policy or the built-in one. |
 | `verify-artifact`, `verify-discovery` | The digest, signature or projection does not match. |
 | `verify-attestation` | Too few trusted keys signed the attestation, or it does not cover the file's bytes or content, the purpose or the age limit, or an input could not be read. |
+| `runtime verify-receipts` | The receipt JSONL log is unreadable, malformed, tampered, has a sequence or hash-chain gap, lacks required trusted Ed25519 signatures, or disagrees with `--expected-merkle-root`. |
 | `verify-live` | A stdio server could not be observed completely (a run with no stdio server observes nothing), or a server's served tools, declarations or identity differ from the inventory; with `--record`, such drift fails unless `--accept-drift` is given. |
 | `discover-mcp` | The observation is incomplete; with `--record`, nothing is written. |
 | `advisories` | An advisory was found (unless `--no-fail-on-advisory`), or not every package in scope was looked up (`coverage` is `partial` or `none`); with `--dry-run`, only when the report lists an error. |
@@ -955,6 +957,23 @@ git working tree that holds SNAPSHOT_PATH, the `--trust`, `--state` or
 `--signer-scopes` file or the current directory, or with other hard links, is a usage
 error (exit 2): a key planted there could register a snapshot or trust status at the
 highest serial and lock the tenant out of every gateway sharing the store.
+
+### `runtime verify-receipts`
+
+Verify a hash-chained runtime receipt JSONL log (`nexus-symbiote/runtime-receipt/v1`), its RFC 6962 SHA-256 Merkle root, and optional Ed25519 signatures offline.
+
+```text
+nexus-symbiote runtime verify-receipts [OPTIONS] RECEIPT_LOG
+```
+
+| Option | Description |
+|---|---|
+| `--trusted-key` `PATH` | Trusted Ed25519 public key PEM for signed receipts; repeat to build the ring. Must lie outside every git working tree holding `RECEIPT_LOG` or the current directory. |
+| `--threshold` `INTEGER RANGE` | Minimum distinct trusted receipt signers required per entry (default: 1). |
+| `--require-signatures` | Fail unless every receipt entry carries verified Ed25519 signatures from `--trusted-key`. |
+| `--expected-merkle-root` `TEXT` | Expected `sha256:<hex>` RFC 6962 Merkle root over the ordered receipt digests. |
+
+Prints a JSON verification summary (`verified`, `entry_count`, `admitted_count`, `denied_count`, `head_receipt_sha256`, `merkle_root`, `signers`) and exits 1 if the chain is broken, tampered, missing required signatures, or mismatched against `--expected-merkle-root`.
 
 ### `scan`
 

@@ -157,6 +157,7 @@ REASONS: dict[str, str] = {
     "descriptor-too-large": "served descriptor exceeds the supported JSON budget",
     "descriptor-not-json": "served descriptor is outside the canonical JSON domain",
     "descriptor-changed": "served descriptor changed since approval",
+    "descriptor-poisoned": "served descriptor matches deterministic text-poisoning or hidden-text rules",
     "approval-required": "operation requires a signed approval",
     "approver-revoked": "an approval signer is revoked",
     "approval-actor-unbound": "approval actor is not bound to its signing keys",
@@ -1634,6 +1635,7 @@ class ReferenceGateway(Generic[T]):
         allow_shared_keys: bool = False,
         on_decision: Callable[[Decision], None] | None = None,
         canonical_arguments: bool = True,
+        reject_poisoned_descriptors: bool = True,
     ) -> None:
         for threshold, keys in (
             (snapshot_threshold, snapshot_keys),
@@ -1681,6 +1683,7 @@ class ReferenceGateway(Generic[T]):
         self.allow_shared_keys = allow_shared_keys
         self.on_decision = on_decision
         self.canonical_arguments = canonical_arguments
+        self.reject_poisoned_descriptors = reject_poisoned_descriptors
 
     @staticmethod
     def registrar(
@@ -2035,6 +2038,11 @@ class ReferenceGateway(Generic[T]):
             raise AuthorizationError(
                 "served descriptor changed since approval", reason="descriptor-changed"
             )
+        if self.reject_poisoned_descriptors and _descriptor_has_poisoning_risk(definition):
+            raise AuthorizationError(
+                "served descriptor matches deterministic text-poisoning or hidden-text rules",
+                reason="descriptor-poisoned",
+            )
         consent: ActionApproval | None = None
         approval_signers: set[str] = set()
         if grant.require_approval:
@@ -2168,3 +2176,49 @@ class ReferenceGateway(Generic[T]):
                 reason="approval-request-mismatch",
             )
         return consent, unrevoked
+
+
+def _descriptor_has_poisoning_risk(definition: Mapping[str, Any]) -> bool:
+    """Return True when ``definition`` triggers critical/high hidden-text or poisoning rules."""
+    from nexus_symbiote.core.enums import RiskSeverity
+    from nexus_symbiote.core.models import ToolComponent
+    from nexus_symbiote.scanners.prompt import definition_text_risks
+    from nexus_symbiote.text_poisoning import (
+        _scan_component_fields,
+        extract_json_text_entries,
+        scan_text_block,
+    )
+
+    name = str(definition.get("name") or "tool")
+    for risk in definition_text_risks(dict(definition), f"tool:{name}", include_name=True):
+        if risk.severity in {RiskSeverity.CRITICAL, RiskSeverity.HIGH}:
+            return True
+    desc = definition.get("description")
+    title = definition.get("title")
+    schema = definition.get("inputSchema")
+    annotations = definition.get("annotations")
+    comp = ToolComponent(
+        bom_ref=f"tool:{name}",
+        name=name,
+        description_text=desc if isinstance(desc, str) else None,
+        description=title if isinstance(title, str) else None,
+        input_schema=schema if isinstance(schema, dict) else None,
+        annotations=annotations if isinstance(annotations, dict) else {},
+    )
+    if any(
+        hit.severity in {RiskSeverity.CRITICAL, RiskSeverity.HIGH}
+        for hit in _scan_component_fields(comp)
+    ):
+        return True
+    extra = {
+        k: v
+        for k, v in definition.items()
+        if k not in {"name", "description", "title", "inputSchema"}
+    }
+    for path, text in extract_json_text_entries(extra, max_depth=64, max_entries=1024):
+        if text and any(
+            hit.severity in {RiskSeverity.CRITICAL, RiskSeverity.HIGH}
+            for hit in scan_text_block(text, surface=name, is_tool_surface=True, where=path)
+        ):
+            return True
+    return False

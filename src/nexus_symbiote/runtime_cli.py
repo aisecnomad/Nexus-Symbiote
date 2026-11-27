@@ -771,5 +771,65 @@ def register(
         raise click.ClickException(_safe_error(exc, "registration")) from None
 
 
+@runtime_group.command("verify-receipts")
+@click.argument("receipt_log", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--trusted-key",
+    "trusted_keys",
+    multiple=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Trusted Ed25519 public key PEM for signed receipts; repeat to build the ring.",
+)
+@click.option(
+    "--threshold",
+    type=click.IntRange(min=1, max=32),
+    default=1,
+    help="Minimum distinct trusted receipt signers required per entry (default: 1).",
+)
+@click.option(
+    "--require-signatures",
+    is_flag=True,
+    help="Fail unless every receipt entry carries verified Ed25519 signatures.",
+)
+@click.option(
+    "--expected-merkle-root",
+    type=str,
+    default=None,
+    help="Expected sha256:<hex> RFC 6962 Merkle root over the receipt log.",
+)
+def verify_receipts_cmd(
+    receipt_log: Path,
+    trusted_keys: tuple[Path, ...],
+    threshold: int,
+    require_signatures: bool,
+    expected_merkle_root: str | None,
+) -> None:
+    """Verify a hash-chained runtime receipt JSONL log, its Merkle root, and optional signatures."""
+    from nexus_symbiote.runtime_receipts import ReceiptVerificationError, verify_receipt_log
+    from nexus_symbiote.utils.terminal import neutralize
+
+    if trusted_keys:
+        _check_key_placement(
+            trusted_keys,
+            (receipt_log,),
+            option="--trusted-key",
+            holders="RECEIPT_LOG",
+        )
+    try:
+        ring = _ring(trusted_keys) if trusted_keys else {}
+        verified = verify_receipt_log(
+            receipt_log,
+            trusted_keys=ring,
+            threshold=threshold,
+            require_signatures=require_signatures,
+            expected_merkle_root=expected_merkle_root,
+        )
+        click.echo(json_text(json.dumps(verified.to_dict())))
+    except ReceiptVerificationError as exc:
+        raise click.ClickException(f"{neutralize(exc)} ({exc.reason})") from None
+    except _HANDLED as exc:
+        raise click.ClickException(_safe_error(exc, "receipt verification")) from None
+
+
 def register_runtime_commands(main: click.Group) -> None:
     main.add_command(runtime_group)

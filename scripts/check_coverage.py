@@ -100,6 +100,7 @@ MODULE_FLOORS: dict[str, tuple[int, int | None]] = {
     "nexus_symbiote/scanners/credential_files.py": (84, 75),
     "nexus_symbiote/scanners/mcp_credentials.py": (78, 66),
     "nexus_symbiote/vex_decisions.py": (85, 72),
+    "nexus_symbiote/runtime_receipts.py": (92, 86),
 }
 COUNTS = (
     ("statement", "covered_lines", "num_statements"),

@@ -379,6 +379,9 @@ consumed; a fresh approval does not establish that a retry is safe.
    descriptor's digest must equal the grant's (`descriptor-unsupported`,
    `descriptor-too-large`, `descriptor-not-json`, `descriptor-changed`). The
    bounded descriptor is copied once; hashing and schema validation use that copy.
+   When `reject_poisoned_descriptors=True` (the default), the copied descriptor is
+   also checked against deterministic hidden-text and text-poisoning rules
+   (`descriptor-poisoned`).
 9. Approval, when the grant requires one (`approval-required`): signatures with
    the approval ring and quorum, validity window (`approval-*`), revoked approvers
    (`approver-revoked`), signer scopes, approvers (`approval-actor-unbound`,
@@ -498,6 +501,7 @@ other code is permanent for the evidence presented.
 | `descriptor-too-large` | Served descriptor exceeds the supported JSON budget |
 | `descriptor-not-json` | Served descriptor is outside the canonical JSON domain |
 | `descriptor-changed` | Served descriptor changed since approval |
+| `descriptor-poisoned` | Served descriptor matches deterministic text-poisoning or hidden-text rules |
 | `isolation-unavailable` | The pinned launcher's process isolation is unavailable |
 | `isolation-teardown-failed` | The launcher's processes could not be confirmed ended |
 | `approval-required` | Operation requires a signed approval |
@@ -551,8 +555,9 @@ or written safely, and `runtime-contract-error` for any other failure.
 | `state` | A `StateStore` |
 | `authenticate`, `describe`, `resolve_scope`, `execute` | The integrator's adapters, below |
 | `clock` | Returns the current time as an aware `datetime` (default: system UTC time) |
-| `on_decision` | Called with a `Decision` for every admitted or denied call |
+| `on_decision` | Called with a `Decision` for every admitted or denied call (for example `nexus_symbiote.runtime_receipts.ReceiptSink`) |
 | `canonical_arguments` | Give `resolve_scope` and `execute` the RFC 8785 canonical form of the arguments that the approval binds instead of the caller's non-canonical form (default `True`) |
+| `reject_poisoned_descriptors` | Deny served tool descriptors that match critical or high deterministic text-poisoning or hidden-text rules with `descriptor-poisoned` before execution (default `True`) |
 
 An approval quorum counts people, not keys: the signers' `approval_actors` must
 include at least `approval_threshold` distinct names, and the approval's `actor`

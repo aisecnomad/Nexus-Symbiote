@@ -4,6 +4,10 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Added
+
+- **Runtime hash-chained receipts & gateway poisoning gate:** Added `nexus_symbiote.runtime_receipts.ReceiptSink` (`0600` append-only JSONL observation sink with RFC 8785 JCS hash chaining, RFC 6962 Merkle roots, and optional Ed25519 signatures), offline `nexus-symbiote runtime verify-receipts`, and default-on `ReferenceGateway` `descriptor-poisoned` quarantine before tool execution (`reject_poisoned_descriptors=True`).
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).
