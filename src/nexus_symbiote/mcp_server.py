@@ -484,7 +484,7 @@ class OfflineMCPServer:
             return None
 
         req_id = message["id"]
-        if req_id is not None and not (
+        if not (
             type(req_id) is int
             or (
                 isinstance(req_id, str)

@@ -282,9 +282,12 @@ def test_initialize_ping_notifications_and_tool_list():
         "result": {},
     }
 
-    tools_reply = server.handle_message({"jsonrpc": "2.0", "id": None, "method": "tools/list"})
+    # MCP request IDs are strings or integers. An omitted ID is a notification.
+    invalid_id = server.handle_message({"jsonrpc": "2.0", "id": None, "method": "tools/list"})
+    assert invalid_id is not None and invalid_id["error"]["code"] == -32600
+    tools_reply = server.handle_message({"jsonrpc": "2.0", "id": 4, "method": "tools/list"})
     assert tools_reply is not None
-    assert tools_reply["id"] is None
+    assert tools_reply["id"] == 4
     tools = tools_reply["result"]["tools"]
     names = {t["name"] for t in tools}
     assert names == {
