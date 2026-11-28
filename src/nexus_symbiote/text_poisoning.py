@@ -1198,10 +1198,22 @@ def _side_channel_subtree_hit(
 
     # A component field is displayed as a dotted path. A literal dot in a key
     # makes that rendering ambiguous, so only inspect the actual subtree.
+    scanned_subtrees: set[int] = set()
     sub_truncated: list[bool] = []
     for _, sub, path in side_entries:
-        if sub is None:
+        if sub is None or id(sub) in scanned_subtrees:
             continue
+        stack: list[Any] = [sub]
+        while stack:
+            current = stack.pop()
+            cid = id(current)
+            if cid in scanned_subtrees:
+                continue
+            scanned_subtrees.add(cid)
+            if isinstance(current, dict):
+                stack.extend(v for v in current.values() if isinstance(v, (dict, list)))
+            elif isinstance(current, list):
+                stack.extend(v for v in current if isinstance(v, (dict, list)))
         for sub_path, value in extract_json_text_entries(
             sub, max_depth=64, max_entries=512, truncated=sub_truncated
         ):

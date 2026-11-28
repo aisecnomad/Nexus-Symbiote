@@ -184,6 +184,7 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
                 conditions="served descriptor observed; backend behavior and authorization unverified",
             )
         )
+    from nexus_symbiote.core.enums import RiskSeverity
     from nexus_symbiote.text_poisoning import (
         TextPoisoningHit,
         _append_consolidated_risks,
@@ -193,23 +194,49 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
         scan_text_block,
     )
 
+    _severity_rank = {
+        RiskSeverity.CRITICAL: 0,
+        RiskSeverity.HIGH: 1,
+        RiskSeverity.MEDIUM: 2,
+        RiskSeverity.LOW: 3,
+        RiskSeverity.INFO: 4,
+    }
+
     def _dedupe_distinct_hits(
         raw_hits: list[TextPoisoningHit], max_per_group: int = 16
     ) -> list[TextPoisoningHit]:
         seen_exact: set[tuple[str, str, str, str, int]] = set()
-        counts: dict[tuple[str, str], int] = {}
-        unique: list[TextPoisoningHit] = []
-        for hit in sorted(raw_hits, key=_hit_sort_key):
+        deduped: list[TextPoisoningHit] = []
+        for hit in sorted(
+            raw_hits,
+            key=lambda item: (_severity_rank.get(item.severity, 9), _hit_sort_key(item)),
+        ):
             exact = (hit.category, hit.surface, hit.rule_id, hit.where, hit.byte_offset)
             if exact in seen_exact:
                 continue
             seen_exact.add(exact)
+            deduped.append(hit)
+        best_per_rule: dict[tuple[str, str, str], TextPoisoningHit] = {}
+        extras: list[TextPoisoningHit] = []
+        for hit in deduped:
+            rule_key = (hit.category, hit.surface, hit.rule_id)
+            if rule_key not in best_per_rule:
+                best_per_rule[rule_key] = hit
+            else:
+                extras.append(hit)
+        counts: dict[tuple[str, str], int] = {}
+        kept: list[TextPoisoningHit] = []
+        for hit in best_per_rule.values():
+            group = (hit.category, hit.surface)
+            counts[group] = counts.get(group, 0) + 1
+            kept.append(hit)
+        for hit in extras:
             group = (hit.category, hit.surface)
             if counts.get(group, 0) >= max_per_group:
                 continue
             counts[group] = counts.get(group, 0) + 1
-            unique.append(hit)
-        return unique
+            kept.append(hit)
+        return sorted(kept, key=_hit_sort_key)
 
     scan_failures: list[str] = []
 
@@ -347,17 +374,23 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
                 if fh:
                     matched_values.append((field_text, fh))
         sidenote_trunc: list[bool] = []
-        tool_hits.extend(
-            check_sidenote_tool_schema(
-                tool_comp.input_schema,
-                "\n".join(parts),
-                tool_comp.annotations,
-                surface=tool_comp.name,
-                existing_hits=tool_hits,
-                matched_values=matched_values,
-                truncated=sidenote_trunc,
+        try:
+            tool_hits.extend(
+                check_sidenote_tool_schema(
+                    tool_comp.input_schema,
+                    "\n".join(parts),
+                    tool_comp.annotations,
+                    surface=tool_comp.name,
+                    existing_hits=tool_hits,
+                    matched_values=matched_values,
+                    truncated=sidenote_trunc,
+                )
             )
-        )
+        except (ValueError, RecursionError) as exc:
+            _record_scan_limit(
+                tool_subject,
+                f"text-poisoning sidenote rules could not be applied ({type(exc).__name__})",
+            )
         if sidenote_trunc:
             _record_scan_limit(
                 tool_subject,
