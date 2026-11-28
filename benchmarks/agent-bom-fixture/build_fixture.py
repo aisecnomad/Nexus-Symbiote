@@ -48,7 +48,7 @@ def _relative(path: object) -> PurePosixPath:
     if not isinstance(path, str) or not path or "\\" in path or "\x00" in path:
         raise CorpusError(f"invalid corpus path: {path!r}")
     relative = PurePosixPath(path)
-    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in path.split("/")):
         raise CorpusError(f"corpus path escapes the output directory: {path!r}")
     return relative
 
@@ -87,6 +87,9 @@ def load(corpus: Path = CORPUS) -> list[tuple[PurePosixPath, bytes, int]]:
         if mode not in (0o644, 0o755):
             raise CorpusError(f"{relative}: unsupported mode {mode!r}")
         entries.append((relative, data, mode))
+    for relative, _, _ in entries:
+        if any(parent in seen for parent in relative.parents):
+            raise CorpusError(f"{relative}: a parent path is also a corpus file")
     return entries
 
 

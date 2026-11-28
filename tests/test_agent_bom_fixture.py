@@ -137,6 +137,20 @@ def test_the_builder_refuses_a_path_that_escapes_the_output(tmp_path: Path) -> N
     assert not (tmp_path / "escape.txt").exists()
 
 
+@pytest.mark.parametrize("paths", [(".",), ("first", "first/nested"), ("first/nested", "first")])
+def test_invalid_file_tree_is_rejected_before_writing(
+    tmp_path: Path, paths: tuple[str, ...]
+) -> None:
+    builder = _builder()
+    record = json.loads((BENCH / "corpus.json").read_text())["files"][0]
+    corpus = tmp_path / "corpus.json"
+    corpus.write_text(json.dumps({"files": [record | {"path": name} for name in paths]}))
+    out = tmp_path / "out"
+    with pytest.raises(builder.CorpusError):
+        builder.build(out, corpus)
+    assert not out.exists()
+
+
 def test_the_builder_refuses_a_digest_mismatch_and_a_non_empty_output(tmp_path: Path) -> None:
     builder = _builder()
     corpus = tmp_path / "corpus.json"
