@@ -1562,3 +1562,52 @@ def test_secret_purl_repository_provenance_trojan_and_ipv6_hardening(tmp_path):
     empty_rt.write_text(json.dumps(_cdx()), encoding="utf-8")
     with pytest.raises(RuntimeBOMInputError, match="invalid host or port"):
         collect(bad_ipv6_inv, [empty_rt])
+
+
+@pytest.mark.parametrize(
+    "qualifier",
+    [
+        "repository_url=https://packages.example.test/simple",
+        "platform=linux",
+        "arch=arm64",
+        "file_name=torch.whl",
+    ],
+)
+def test_digest_disagreement_is_scoped_to_the_package_artifact(tmp_path, qualifier):
+    inventory = tmp_path / "static.json"
+    stem = "pkg:pypi/torch@2.5.0"
+    purls = [stem, f"{stem}?{qualifier}"]
+    AIBOM(
+        components=[
+            RegistryEntryComponent(name="torch", bom_ref=f"package:{index}", package_url=purl)
+            for index, purl in enumerate(purls)
+        ]
+    ).save(inventory)
+    snapshot = tmp_path / "runtime.json"
+
+    def write_snapshot(purls):
+        snapshot.write_text(
+            json.dumps(
+                _cdx(
+                    components=[
+                        {
+                            "type": "library",
+                            "name": "torch",
+                            "purl": purl,
+                            "hashes": [{"alg": "SHA-256", "content": digest}],
+                        }
+                        for purl, digest in zip(purls, (_SHA_A, _SHA_B), strict=True)
+                    ]
+                )
+            )
+        )
+
+    write_snapshot(purls)
+    assert collect(inventory, [snapshot], fail_on="drift")["gate"]["passed"]
+    write_snapshot([stem, stem + "?repository_url=https://pypi.org/simple"])
+    conflicts = collect(inventory, [snapshot], fail_on="drift")
+    assert not conflicts["gate"]["passed"]
+    assert all(
+        "conflicting_reported_digests" in row["drift_reasons"]
+        for row in conflicts["reconciliation"]["drifted"]
+    )

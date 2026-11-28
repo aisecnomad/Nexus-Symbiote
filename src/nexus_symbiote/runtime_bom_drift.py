@@ -67,6 +67,9 @@ _ORIGIN_ONLY_COLLECTION_MODES = frozenset(
 )
 
 
+_DigestKey = tuple[str, str, str | None, str, str, str | None, str, frozenset[tuple[str, str]]]
+
+
 class RuntimeBOMInputError(ValueError):
     """A runtime CycloneDX BOM file could not be opened, parsed, or validated."""
 
@@ -761,10 +764,27 @@ def collect(
     undeclared: list[dict[str, Any]] = []
     seen_static_refs: set[str] = set()
 
-    def digest_key(obs: _RuntimeObservation) -> tuple[str, str, str | None, str, str]:
-        return obs.kind, obs.key, obs.version, obs.provider.casefold(), obs.supplier.casefold()
+    def digest_key(obs: _RuntimeObservation) -> _DigestKey:
+        package = _parse_purl(obs.purl) if obs.kind == "package" else None
+        # Distributions for different sources, architectures or file names can
+        # have different bytes. A reported checksum is evidence about the bytes.
+        qualifiers = frozenset(
+            (k, v)
+            for k, v in (package.qualifiers.items() if package else ())
+            if k not in {"repository_url", "checksum"}
+        )
+        return (
+            obs.kind,
+            obs.key,
+            obs.version,
+            obs.provider.casefold(),
+            obs.supplier.casefold(),
+            obs.repository,
+            (package.subpath or "") if package else "",
+            qualifiers,
+        )
 
-    observed_digests: dict[tuple[str, str, str | None, str, str], set[str]] = {}
+    observed_digests: dict[_DigestKey, set[str]] = {}
     for obs in observations:
         if obs.sha256:
             observed_digests.setdefault(digest_key(obs), set()).add(obs.sha256)
