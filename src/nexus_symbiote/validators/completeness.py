@@ -364,6 +364,7 @@ class CompletenessValidator:
         local collection's. Integrity and signer policy are checked separately.
         """
         from nexus_symbiote.graph import assemble_repository_agent
+        from nexus_symbiote.literal_credentials import apply_literal_credential_findings
         from nexus_symbiote.scanners import ALL_SCANNERS, ModelScanner
         from nexus_symbiote.text_poisoning import apply_text_poisoning_rules
 
@@ -436,6 +437,18 @@ class CompletenessValidator:
         )
         for reason in text_failures:
             incomplete("text_poisoning", f"Local collection incomplete: {reason}")
+        literal_failures: list[str] = []
+        literal_exclusions: list[str] = []
+        apply_literal_credential_findings(
+            expected,
+            root,
+            exclude_paths=exclude_paths,
+            failures=literal_failures,
+            exclusions=literal_exclusions,
+        )
+        excluded.extend(literal_exclusions)
+        for reason in (*literal_failures, *literal_exclusions):
+            incomplete("literal_credentials", f"Local collection incomplete: {reason}")
         coverage = self._local_coverage(
             report_digest,
             surfaces,
