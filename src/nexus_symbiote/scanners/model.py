@@ -10,10 +10,12 @@ code. Weight files count as signed only under an operator signature policy.
 from __future__ import annotations
 
 import ast
+import bz2
 import hashlib
 import hmac
 import io
 import json
+import lzma
 import os
 import pickletools
 import re
@@ -39,6 +41,7 @@ from nexus_symbiote.core.hashing import (
     descriptor_binding,
     hash_bytes,
     hash_canonical,
+    json_nesting_exceeds,
     open_regular_file,
 )
 from nexus_symbiote.core.models import (
@@ -166,6 +169,159 @@ _ZIP_TAIL_BYTES = MAX_ZIP_DIRECTORY_BYTES + _ZIP_END_RECORD_BYTES
 ZIP_PICKLE_MEMBER = "ZIP archive with a pickle member; torch.load unpickles it"
 ZIP_OBJECT_ARRAY = (
     "ZIP archive with a NumPy object-dtype array member; np.load(allow_pickle=True) unpickles it"
+)
+ZIP_KERAS_CODE_EXECUTION = (
+    "ZIP archive with a Keras config declaring a Lambda layer or executable custom callable; "
+    "keras.models.load_model can execute arbitrary code"
+)
+MAX_KERAS_CONFIG_BYTES = 1024 * 1024
+# A valid, incompressible descriptor can grow slightly when compressed. Limit
+# compressed input too: the inflater can consume bytes without producing output.
+MAX_KERAS_COMPRESSED_BYTES = MAX_KERAS_CONFIG_BYTES + 65536
+MAX_KERAS_CONFIG_DEPTH = 64
+MAX_KERAS_CONFIG_NODES = 100_000
+_KERAS_CODE_CLASSES = frozenset({"Lambda", "__lambda__"})
+_KERAS_OP_LAMBDA_CLASSES = frozenset({"TFOpLambda", "SlicingOpLambda"})
+# Keras v3 resolves function descriptors against its public API, including
+# an unqualified lookup for module="builtins". Inspect names without imports.
+_KERAS_ACTIVATIONS = frozenset(
+    [
+        "relu",
+        "leaky_relu",
+        "relu6",
+        "softmax",
+        "celu",
+        "elu",
+        "selu",
+        "softplus",
+        "softsign",
+        "squareplus",
+        "soft_shrink",
+        "sparse_plus",
+        "silu",
+        "gelu",
+        "glu",
+        "tanh",
+        "tanh_shrink",
+        "threshold",
+        "sigmoid",
+        "exponential",
+        "hard_sigmoid",
+        "hard_silu",
+        "hard_tanh",
+        "hard_shrink",
+        "linear",
+        "mish",
+        "log_softmax",
+        "log_sigmoid",
+        "sparsemax",
+        "swish",
+        "hard_swish",
+    ]
+)
+_KERAS_LOSS_METRICS = frozenset(
+    {
+        "binary_crossentropy",
+        "binary_focal_crossentropy",
+        "categorical_crossentropy",
+        "categorical_focal_crossentropy",
+        "categorical_hinge",
+        "hinge",
+        "huber",
+        "kl_divergence",
+        "log_cosh",
+        "mean_absolute_error",
+        "mean_absolute_percentage_error",
+        "mean_squared_error",
+        "mean_squared_logarithmic_error",
+        "poisson",
+        "sparse_categorical_crossentropy",
+        "squared_hinge",
+    }
+)
+_KERAS_FUNCTIONS_BY_MODULE = {
+    "keras.activations": _KERAS_ACTIVATIONS,
+    "keras.losses": _KERAS_LOSS_METRICS | {"circle", "cosine_similarity", "ctc", "dice", "tversky"},
+    "keras.metrics": _KERAS_LOSS_METRICS
+    | {
+        "binary_accuracy",
+        "categorical_accuracy",
+        "concordance_correlation",
+        "pearson_correlation",
+        "sparse_categorical_accuracy",
+        "sparse_top_k_categorical_accuracy",
+        "top_k_categorical_accuracy",
+    },
+}
+_KERAS_FUNCTIONS_BY_MODULE["builtins"] = frozenset(
+    name for functions in _KERAS_FUNCTIONS_BY_MODULE.values() for name in functions
+)
+_KERAS_DANGEROUS_BUILTINS = frozenset(
+    {
+        "eval",
+        "exec",
+        "compile",
+        "__import__",
+        "getattr",
+        "setattr",
+        "delattr",
+        "open",
+        "input",
+        "breakpoint",
+        "globals",
+        "locals",
+        "vars",
+        "memoryview",
+    }
+)
+_KERAS_ARITHMETIC_OPS = frozenset(
+    {"math.add", "math.subtract", "math.multiply", "math.divide", "math.maximum", "math.minimum"}
+)
+_KERAS_DANGEROUS_MODULES = frozenset(
+    {
+        "asyncio",
+        "bdb",
+        "builtins",
+        "code",
+        "codecs",
+        "ctypes",
+        "doctest",
+        "ensurepip",
+        "ftplib",
+        "http",
+        "importlib",
+        "logging",
+        "marshal",
+        "multiprocessing",
+        "nt",
+        "operator",
+        "os",
+        "pathlib",
+        "pdb",
+        "pickle",
+        "_pickle",
+        "pip",
+        "pipes",
+        "pkgutil",
+        "posix",
+        "pty",
+        "pydoc",
+        "runpy",
+        "shutil",
+        "smtplib",
+        "socket",
+        "subprocess",
+        "sys",
+        "tarfile",
+        "tempfile",
+        "timeit",
+        "urllib",
+        "venv",
+        "webbrowser",
+        "xmlrpc",
+        "zipfile",
+        "zipimport",
+    }
 )
 ZIP_WITHOUT_PICKLE = (
     "ZIP archive whose directory lists no pickle member; no bounded structural validator "
@@ -383,7 +539,10 @@ def _content_format(explanation: str) -> tuple[str, str]:
     """The (format key, format name) of a file inventoried by what its content is."""
     if explanation in (NUMPY_OBJECT_ARRAY, NUMPY_HEADER_UNREAD):
         return "npy", "numpy"
-    if explanation in (ZIP_PICKLE_MEMBER, ZIP_OBJECT_ARRAY) or explanation in _ZIP_UNRATED:
+    if (
+        explanation in (ZIP_PICKLE_MEMBER, ZIP_OBJECT_ARRAY, ZIP_KERAS_CODE_EXECUTION)
+        or explanation in _ZIP_UNRATED
+    ):
         return "zip", "zip-archive"
     return "pickle", "pickle"
 
@@ -563,6 +722,8 @@ class _ZipMember(NamedTuple):
     method: int
     size: int
     offset: int
+    uncompressed_size: int = 0
+    flag_bits: int = 0
 
 
 def _zip_directory(
@@ -726,17 +887,19 @@ def _directory_members(data: bytes, begin: int, size: int, end: int) -> list[_Zi
         name = _listed_name(
             data[position + 46 : extra_at], data[extra_at : extra_at + extra_length]
         )
+        flag_bits = _little(data, position + 8, 2)
         method = _little(data, position + 10, 2)
-        located = _zip64_location(
+        sizes = _zip64_sizes(
             data[extra_at : extra_at + extra_length],
             _little(data, position + 24, 4),
             _little(data, position + 20, 4),
             _little(data, position + 42, 4),
         )
-        if located is not None:
-            members.append(_ZipMember(name, method, *located))
+        if sizes is not None:
+            uncompressed, compressed, offset = sizes
+            members.append(_ZipMember(name, method, compressed, offset, uncompressed, flag_bits))
         elif _pickle_member(name):
-            members.append(_ZipMember(name, method, 0, -1))
+            members.append(_ZipMember(name, method, 0, -1, 0, flag_bits))
         else:
             unlocated = True
         position = extra_at + extra_length + _little(data, position + 32, 2)
@@ -752,6 +915,7 @@ def _listed_name(name: bytes, extra: bytes) -> bytes:
     so a pickle name either way rates the member.
     """
     position = 0
+    keras_candidate: bytes | None = None
     while position + 4 <= len(extra):
         length = _little(extra, position + 2, 2)
         field = extra[position + 4 : position + 4 + length]
@@ -760,11 +924,14 @@ def _listed_name(name: bytes, extra: bytes) -> bytes:
             and len(field) >= 5
             and field[0] == 1
             and _little(field, 1, 4) == zlib.crc32(name)
-            and _pickle_member(field[5:])
         ):
-            return field[5:]
+            unicode_name = field[5:]
+            if _pickle_member(unicode_name):
+                return unicode_name
+            if not _pickle_member(name) and _keras_config_member(unicode_name):
+                keras_candidate = unicode_name
         position += 4 + length
-    return name
+    return keras_candidate if keras_candidate is not None else name
 
 
 def _listed(members: list[_ZipMember], *, complete: bool) -> list[_ZipMember] | None:
@@ -772,21 +939,12 @@ def _listed(members: list[_ZipMember], *, complete: bool) -> list[_ZipMember] | 
     return members if complete or any(_pickle_member(m.name) for m in members) else None
 
 
-def _zip64_location(
+def _zip64_sizes(
     extra: bytes, uncompressed: int, compressed: int, offset: int
-) -> tuple[int, int] | None:
-    """A member's compressed size and local header offset, from ZIP64 when they overflow.
-
-    The ZIP64 extra field holds, in this order, each of the uncompressed size, the
-    compressed size and the offset whose 32-bit field is 0xFFFFFFFF (or 0xFFFFFFFFFFFFFFFF
-    for a chained uncompressed size). ``zipfile._decodeExtra`` loops through every 0x0001
-    extra field in order; ``None`` is returned when a field is truncated or too short for
-    the remaining sentinel slots, which ``zipfile`` refuses as a corrupt archive. Without
-    the field, ``zipfile`` keeps the 32-bit values as written and reads the archive, so
-    they are kept here too.
-    """
+) -> tuple[int, int, int] | None:
+    """A member's uncompressed size, compressed size, and local header offset."""
     if 0xFFFFFFFF not in (uncompressed, compressed, offset):
-        return compressed, offset
+        return uncompressed, compressed, offset
     values = [uncompressed, compressed, offset]
     position = 0
     while position + 4 <= len(extra):
@@ -803,7 +961,24 @@ def _zip64_location(
                     values[index] = _little(field, cursor, 8)
                     cursor += 8
         position += 4 + length
-    return values[1], values[2]
+    return values[0], values[1], values[2]
+
+
+def _zip64_location(
+    extra: bytes, uncompressed: int, compressed: int, offset: int
+) -> tuple[int, int] | None:
+    """A member's compressed size and local header offset, from ZIP64 when they overflow.
+
+    The ZIP64 extra field holds, in this order, each of the uncompressed size, the
+    compressed size and the offset whose 32-bit field is 0xFFFFFFFF (or 0xFFFFFFFFFFFFFFFF
+    for a chained uncompressed size). ``zipfile._decodeExtra`` loops through every 0x0001
+    extra field in order; ``None`` is returned when a field is truncated or too short for
+    the remaining sentinel slots, which ``zipfile`` refuses as a corrupt archive. Without
+    the field, ``zipfile`` keeps the 32-bit values as written and reads the archive, so
+    they are kept here too.
+    """
+    sizes = _zip64_sizes(extra, uncompressed, compressed, offset)
+    return None if sizes is None else (sizes[1], sizes[2])
 
 
 def _reread(stream: BinaryIO, offset: int, size: int) -> bytes:
@@ -819,18 +994,88 @@ def _reread(stream: BinaryIO, offset: int, size: int) -> bytes:
     return os.pread(stream.fileno(), size, offset)
 
 
+MAX_ZIP_LZMA_DICT_BYTES = 16 * 1024 * 1024
+
+
+class _ZipLzmaDecompressor:
+    """Bounded ZIP method-14 (LZMA1) decompressor using public ``FORMAT_ALONE`` headers."""
+
+    def __init__(self, *, uncompressed_size: int | None = None) -> None:
+        self._header = bytearray()
+        self._decomp: lzma.LZMADecompressor | None = None
+        self._uncompressed_size = uncompressed_size
+
+    @property
+    def eof(self) -> bool:
+        return self._decomp is not None and self._decomp.eof
+
+    @property
+    def needs_input(self) -> bool:
+        return True if self._decomp is None else self._decomp.needs_input
+
+    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+        if self._decomp is None:
+            self._header.extend(data)
+            if len(self._header) < 4:
+                return b""
+            props_size = _little(bytes(self._header), 2, 2)
+            if props_size != 5:
+                raise FormatError(ZIP_MEMBER_UNREAD)
+            if len(self._header) < 9:
+                return b""
+            props = bytes(self._header[4:9])
+            if _little(props, 1, 4) > MAX_ZIP_LZMA_DICT_BYTES:
+                raise FormatError(ZIP_MEMBER_UNREAD)
+            remainder = bytes(self._header[9:])
+            self._header.clear()
+            size_field = (
+                self._uncompressed_size.to_bytes(8, "little")
+                if self._uncompressed_size is not None
+                else b"\xff" * 8
+            )
+            try:
+                decomp = lzma.LZMADecompressor(lzma.FORMAT_ALONE, memlimit=MAX_ZIP_LZMA_DICT_BYTES)
+                decomp.decompress(props + size_field, max_length=0)
+            except (MemoryError, lzma.LZMAError) as exc:
+                raise FormatError(ZIP_MEMBER_UNREAD) from exc
+            self._decomp = decomp
+            data = remainder
+        return self._decomp.decompress(data, max_length=max_length)
+
+
 class _MemberData:
-    """The data of one ZIP member, read again from the archive, inflated if DEFLATE.
+    """The data of one ZIP member, read again from the archive, decompressed if needed.
 
     Compressed input is read again in growing chunks, so a member costs about what its
-    array header needs; it never reads past the member's compressed size.
+    array header or Keras descriptor needs; it never reads past the member's compressed size.
     """
 
-    def __init__(self, stream: BinaryIO, start: int, size: int, *, deflated: bool) -> None:
+    def __init__(
+        self,
+        stream: BinaryIO,
+        start: int,
+        size: int,
+        *,
+        deflated: bool = False,
+        method: int | None = None,
+        uncompressed_size: int | None = None,
+    ) -> None:
         self._stream = stream
         self._position = start
         self._remaining = size
-        self._inflater = zlib.decompressobj(wbits=-zlib.MAX_WBITS) if deflated else None
+        resolved_method = (8 if deflated else 0) if method is None else method
+        self._method = resolved_method
+        self._inflater: Any
+        if resolved_method == 0:
+            self._inflater = None
+        elif resolved_method == 8:
+            self._inflater = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
+        elif resolved_method == 12:
+            self._inflater = bz2.BZ2Decompressor()
+        elif resolved_method == 14:
+            self._inflater = _ZipLzmaDecompressor(uncompressed_size=uncompressed_size)
+        else:
+            raise FormatError(ZIP_MEMBER_UNREAD)
         self._pending = b""
         self._chunk = 512
 
@@ -840,18 +1085,38 @@ class _MemberData:
         self._remaining -= len(data)
         return data
 
+    @property
+    def complete(self) -> bool:
+        return self._remaining == 0 if self._inflater is None else self._inflater.eof
+
     def read(self, size: int) -> bytes:
         if self._inflater is None:
             return self._input(size)
         out = bytearray()
         while len(out) < size and not self._inflater.eof:
-            if not self._pending:
-                if self._remaining <= 0:
-                    break
-                self._pending = self._input(self._chunk)
-                self._chunk = min(2 * self._chunk, 65536)
-            out += self._inflater.decompress(self._pending, size - len(out))
-            self._pending = self._inflater.unconsumed_tail
+            if self._method == 8:
+                if not self._pending:
+                    if self._remaining <= 0:
+                        break
+                    self._pending = self._input(self._chunk)
+                    self._chunk = min(2 * self._chunk, 65536)
+                    if not self._pending:
+                        break
+                out += self._inflater.decompress(self._pending, size - len(out))
+                self._pending = self._inflater.unconsumed_tail
+            else:
+                feed = b""
+                if self._inflater.needs_input:
+                    if self._remaining <= 0:
+                        break
+                    feed = self._input(self._chunk)
+                    self._chunk = min(2 * self._chunk, 65536)
+                    if not feed:
+                        break
+                try:
+                    out += self._inflater.decompress(feed, max_length=size - len(out))
+                except (EOFError, MemoryError, OSError) as exc:
+                    raise FormatError(ZIP_MEMBER_UNREAD) from exc
         return bytes(out)
 
 
@@ -1022,31 +1287,233 @@ def _object_dtype_string(text: str) -> bool:
     )
 
 
-def _recognized_code_container(
-    stream: BinaryIO, prefix: bytes, size: int, budget: InspectionBudget, *, by_content: bool
-) -> tuple[SerializationSafety, str] | None:
-    """A verdict on content a loader can run code from, or ``None`` for content not recognized.
+def _keras_config_member(name: bytes) -> bool:
+    """Keras opens the case-sensitive root member; ZipInfo truncates names at NUL."""
+    return name.partition(b"\0")[0] == b"config.json"
 
-    A pickle, a NumPy array with an object dtype, and a ZIP archive with a pickle-family
-    member or such an array as a member are recognized. ``torch.save`` writes
-    ``data.pkl``, usually first, so the first local header is read forward before the
-    directory at the end of the archive, which lists every member, is read.
+
+def _keras_config_has_code(document: object, *, required: bool) -> bool | None:
+    """Whether a parsed Keras v3 config declares Lambda or dangerous custom-module execution.
+
+    Return ``None`` for incomplete descriptors, unresolved functions or a traversal
+    that exceeds the node bound. A hazardous declaration elsewhere still takes precedence.
     """
-    if prefix[:6] == _NUMPY_MAGIC:
-        array = _object_array(prefix, stream.read, budget)
-        if array is None:
-            return SerializationSafety.UNKNOWN, NUMPY_HEADER_UNREAD
-        return (SerializationSafety.UNSAFE_CODE_EXECUTION, NUMPY_OBJECT_ARRAY) if array else None
-    # np.load hands zipfile a file that starts with an end record too, as an empty
-    # archive does; zipfile reads the archive whose end record ends the file.
-    if prefix[:4] not in (b"PK\x03\x04", b"PK\x05\x06"):
-        return _recognized_pickle(stream, prefix, size, by_content=by_content)
-    # Every byte read so far is kept for the directory search. In a small archive the
-    # first local header and its name can hold the ZIP64 locator or record, and zipfile
-    # and miniz read them there; an end record at offset 0 is all an empty archive holds.
-    kept = prefix
-    if prefix[:4] == b"PK\x03\x04":
-        header = prefix + stream.read(22)
+    if not required:
+        # Other archive formats use both config.json and class_name for their own
+        # settings. A serialized Keras namespace provides independent evidence.
+        module = document.get("module") if isinstance(document, dict) else None
+        if not isinstance(module, str) or module.split(".", 1)[0] != "keras":
+            return False
+    if not isinstance(document, dict) or not isinstance(document.get("class_name"), str):
+        return None
+    pending: list[object] = [document]
+    visited = 0
+    incomplete = False
+    while pending:
+        visited += 1
+        if visited > MAX_KERAS_CONFIG_NODES:
+            return None
+        node = pending.pop()
+        if isinstance(node, dict):
+            class_name = node.get("class_name")
+            module = node.get("module")
+            if "class_name" in node and not isinstance(class_name, str):
+                incomplete = True
+            if isinstance(class_name, str):
+                cfg = node.get("config")
+                config_type = str if class_name == "function" else (dict, list)
+                if not class_name or not isinstance(cfg, config_type):
+                    incomplete = True
+                if class_name in ("Sequential", "Functional", "Model"):
+                    layers = cfg.get("layers") if isinstance(cfg, dict) else cfg
+                    if not isinstance(layers, list) or any(
+                        not isinstance(layer, dict) or not isinstance(layer.get("class_name"), str)
+                        for layer in layers
+                    ):
+                        incomplete = True
+                if class_name in _KERAS_CODE_CLASSES:
+                    return True
+                if class_name in _KERAS_OP_LAMBDA_CLASSES:
+                    function = cfg.get("function") if isinstance(cfg, dict) else None
+                    if (
+                        isinstance(function, str)
+                        and function.split(".", 1)[0] in _KERAS_DANGEROUS_MODULES
+                    ):
+                        return True
+                    if (
+                        not isinstance(module, str)
+                        or not (
+                            module == "keras.layers"
+                            or module.startswith(
+                                (
+                                    "keras.layers.",
+                                    "keras.src.layers.",
+                                    "tensorflow.python.keras.layers.",
+                                )
+                            )
+                        )
+                        or not isinstance(function, str)
+                        or function not in _KERAS_ARITHMETIC_OPS
+                    ):
+                        incomplete = True
+                if class_name == "function":
+                    if (
+                        module == "builtins"
+                        and isinstance(cfg, str)
+                        and cfg in _KERAS_DANGEROUS_BUILTINS
+                    ):
+                        return True
+                    if (
+                        not isinstance(module, str)
+                        or not isinstance(cfg, str)
+                        or cfg not in _KERAS_FUNCTIONS_BY_MODULE.get(module, ())
+                    ):
+                        incomplete = True
+            if isinstance(module, str) and not (module == "builtins" and class_name == "function"):
+                root_module = module.split(".", 1)[0].strip().lower()
+                if root_module in _KERAS_DANGEROUS_MODULES and (
+                    isinstance(class_name, str)
+                    or isinstance(node.get("registered_name"), str)
+                    or isinstance(node.get("function"), (str, dict, list))
+                ):
+                    return True
+            if len(node) > MAX_KERAS_CONFIG_NODES - visited - len(pending):
+                return None
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            if len(node) > MAX_KERAS_CONFIG_NODES - visited - len(pending):
+                return None
+            pending.extend(node)
+    return None if incomplete else False
+
+
+def _keras_descriptor_bytes(data: _MemberData, budget: InspectionBudget) -> bytes | None:
+    raw = bytearray()
+    while not data.complete:
+        reserved = min(8192, MAX_KERAS_CONFIG_BYTES - len(raw), budget.remaining)
+        if reserved <= 0:
+            return None
+        budget.charge(reserved, ZIP_MEMBER_UNREAD)
+        chunk = data.read(reserved)
+        budget.remaining += reserved - len(chunk)
+        if not chunk and not data.complete:
+            return None
+        raw += chunk
+    return bytes(raw)
+
+
+def _member_holds_keras_code(
+    stream: BinaryIO, member: _ZipMember, end: int, budget: InspectionBudget, *, required: bool
+) -> bool | None:
+    """Inspect a single ``config.json`` ZIP member for Keras v3 code-execution constructs."""
+    if not _keras_config_member(member.name):
+        return False
+    if not 0 < member.size <= MAX_KERAS_COMPRESSED_BYTES:
+        return None
+    if member.offset < 0 or member.offset + 30 > end:
+        return None
+    header = _reread(stream, member.offset, 30)
+    if header[:4] != b"PK\x03\x04":
+        return None
+    start = member.offset + 30 + _little(header, 26, 2) + _little(header, 28, 2)
+    if start + member.size > end:
+        return None
+    if member.method not in (0, 8, 12, 14):
+        return None
+    lzma_uncompressed: int | None = None
+    if member.method == 14 and (member.flag_bits & 2) == 0:
+        if member.uncompressed_size <= 0 or member.uncompressed_size > MAX_KERAS_CONFIG_BYTES:
+            return None
+        lzma_uncompressed = member.uncompressed_size
+    # zipfile also opens streams whose writer left bit 1 clear despite including
+    # an end marker. Older liblzma rejects that marker when the header gives a
+    # size. Retry only this decoder error and charge both attempts to the budget.
+    sizes = (lzma_uncompressed, None) if lzma_uncompressed is not None else (None,)
+    for size in sizes:
+        data = _MemberData(stream, start, member.size, method=member.method, uncompressed_size=size)
+        try:
+            raw_bytes = _keras_descriptor_bytes(data, budget)
+        except lzma.LZMAError:
+            continue
+        except (FormatError, zlib.error):
+            return None
+        if raw_bytes is None or (
+            lzma_uncompressed is not None and len(raw_bytes) != lzma_uncompressed
+        ):
+            return None
+        break
+    else:
+        return None
+    try:
+        encoding = json.detect_encoding(raw_bytes)
+        text = raw_bytes.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        return None
+    if json_nesting_exceeds(text, MAX_KERAS_CONFIG_DEPTH):
+        return None
+    try:
+        document = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    return _keras_config_has_code(document, required=required)
+
+
+def _members_hold_keras_code(
+    stream: BinaryIO,
+    members: list[_ZipMember],
+    directory: int,
+    budget: InspectionBudget,
+    *,
+    required: bool,
+) -> bool | None:
+    """Inspect the root descriptor, including when the extension changed."""
+    config_indices = [
+        index for index, member in enumerate(members) if _keras_config_member(member.name)
+    ]
+    # Keras saves custom models outside its own module namespace too. Its native
+    # root metadata and weights together identify renamed archives in that case.
+    names = {member.name.partition(b"\0")[0] for member in members}
+    required = required or (
+        b"metadata.json" in names
+        and (b"model.weights.h5" in names or b"model.weights.npz" in names)
+    )
+    if not config_indices:
+        return None if required else False
+    ordered = sorted(enumerate(members), key=lambda pair: pair[1].offset)
+    boundaries = {
+        cd_idx: (
+            min(ordered[pos + 1][1].offset, directory) if pos + 1 < len(ordered) else directory
+        )
+        for pos, (cd_idx, _) in enumerate(ordered)
+    }
+    # zipfile/Keras opens the last central-directory entry named config.json; inspect it
+    # first and bound it by directory so a decoy at offset 0 cannot shrink its read range.
+    active_idx = config_indices[-1]
+    inspection_order = [active_idx] + [
+        cd_idx for _, cd_idx in sorted((members[i].offset, i) for i in config_indices[:-1])
+    ]
+    unread = False
+    for cd_idx in inspection_order:
+        end = directory if cd_idx == active_idx else boundaries[cd_idx]
+        found = _member_holds_keras_code(stream, members[cd_idx], end, budget, required=required)
+        if found:
+            return True
+        unread = unread or found is None
+    return None if unread else False
+
+
+def _inspect_zip_container(
+    stream: BinaryIO,
+    kept: bytes,
+    size: int,
+    budget: InspectionBudget,
+    *,
+    check_first_local: bool = False,
+    expect_keras: bool = False,
+) -> tuple[SerializationSafety, str] | None:
+    """Inspect a trailing/standard ZIP central directory and rate any executable members."""
+    if check_first_local and kept[:4] == b"PK\x03\x04":
+        header = kept + stream.read(max(0, 30 - len(kept)))
         first = b""
         if len(header) == 30:
             name_length = int.from_bytes(header[26:28], "little")
@@ -1057,7 +1524,7 @@ def _recognized_code_container(
             return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_PICKLE_MEMBER
     directory = _zip_directory(stream, len(kept), size, kept)
     if directory is None:
-        return SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD
+        return None
     readings, undecided = directory
     # A member any reading lists counts, even when another reader's directory is not
     # decided: a locator or directory that cannot be read must not hide one that can.
@@ -1065,6 +1532,13 @@ def _recognized_code_container(
         return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_PICKLE_MEMBER
     arrays: bool | None = False
     for members, offset in readings:
+        keras_code = _members_hold_keras_code(
+            stream, members, offset, budget, required=expect_keras
+        )
+        if keras_code:
+            return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_KERAS_CODE_EXECUTION
+        if keras_code is None:
+            arrays = None
         found = _members_hold_object_array(stream, members, offset, budget)
         if found:
             return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_OBJECT_ARRAY
@@ -1073,6 +1547,61 @@ def _recognized_code_container(
     if undecided:
         return SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD
     return SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE if arrays is False else ZIP_MEMBER_UNREAD
+
+
+def _recognized_code_container(
+    stream: BinaryIO,
+    prefix: bytes,
+    size: int,
+    budget: InspectionBudget,
+    *,
+    by_content: bool,
+    expect_keras: bool = False,
+) -> tuple[SerializationSafety, str] | None:
+    """A verdict on content a loader can run code from, or ``None`` for content not recognized.
+
+    A pickle, a NumPy array with an object dtype, and a ZIP archive with a pickle-family
+    member or such an array as a member are recognized. ``torch.save`` writes
+    ``data.pkl``, usually first, so the first local header is read forward before the
+    directory at the end of the archive, which lists every member, is read.
+    """
+    # np.load hands zipfile a file that starts with an end record too, as an empty
+    # archive does; zipfile reads the archive whose end record ends the file.
+    if prefix[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
+        verdict = _inspect_zip_container(
+            stream, prefix, size, budget, check_first_local=True, expect_keras=expect_keras
+        )
+        return (
+            verdict if verdict is not None else (SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD)
+        )
+    if not expect_keras:
+        if prefix[:6] == _NUMPY_MAGIC:
+            array = _object_array(prefix, stream.read, budget)
+            if array is None:
+                return SerializationSafety.UNKNOWN, NUMPY_HEADER_UNREAD
+            return (
+                (SerializationSafety.UNSAFE_CODE_EXECUTION, NUMPY_OBJECT_ARRAY) if array else None
+            )
+        return _recognized_pickle(stream, prefix, size, by_content=by_content)
+    # Keras opens .keras containers via zipfile, which scans backward from EOF and loads
+    # prefixed archives (zipapp shebangs, leading metadata, or arbitrary padding bytes).
+    capture = _CaptureReader(stream)
+    if prefix[:6] == _NUMPY_MAGIC:
+        array = _object_array(prefix, capture.read, budget)
+        if array is True:
+            return SerializationSafety.UNSAFE_CODE_EXECUTION, NUMPY_OBJECT_ARRAY
+        non_zip: tuple[SerializationSafety, str] | None = (
+            (SerializationSafety.UNKNOWN, NUMPY_HEADER_UNREAD) if array is None else None
+        )
+    else:
+        non_zip = _recognized_pickle(cast(BinaryIO, capture), prefix, size, by_content=by_content)
+        if non_zip is not None and non_zip[0] is SerializationSafety.UNSAFE_CODE_EXECUTION:
+            return non_zip
+    kept = prefix + bytes(capture.captured)
+    zip_verdict = _inspect_zip_container(stream, kept, size, budget, expect_keras=True)
+    if zip_verdict is None:
+        return non_zip
+    return zip_verdict
 
 
 def inspect_model_format(
@@ -1172,6 +1701,7 @@ def inspect_model_format(
                     size,
                     budget or InspectionBudget(),
                     by_content=model_format(path) is None,
+                    expect_keras=path.suffix.lower() == ".keras",
                 )
                 # 'G' is an opcode byte, so GGUF content can parse as a pickle stream; the
                 # name rating says what the file is.
