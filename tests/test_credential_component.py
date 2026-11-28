@@ -41,6 +41,7 @@ from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
 from nexus_symbiote.generators.sarif import SARIFGenerator
 from nexus_symbiote.generators.spdx import SPDXGenerator
 from nexus_symbiote.generators.validation import spdx_errors, validate_cyclonedx
+from nexus_symbiote.graph_view import build_view
 from nexus_symbiote.scanners.base import Scanner, ScanResult
 from nexus_symbiote.scanners.rag import RAGScanner
 from nexus_symbiote.validators.risk import RiskScorer
@@ -151,6 +152,27 @@ def test_no_other_text_of_a_credential_may_hold_a_value(values: dict[str, Any]) 
     with pytest.raises(ValidationError) as caught:
         CredentialComponent(bom_ref="credential:A", name="A", **values)
     assert TOKEN not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "-----BEGIN RSA " + "PRIVATE KEY-----\nsynthetic",
+        "database postgresql://reader:synthetic@store.example/db",
+    ],
+    ids=["private-key", "connection-userinfo"],
+)
+def test_structured_secrets_are_refused_at_construction_and_export(text: str) -> None:
+    with pytest.raises(ValidationError) as error:
+        CredentialComponent(bom_ref="credential:A", name="A", description=text)
+    assert text not in str(error.value)
+
+    bom = _inventory()
+    (credential,) = (c for c in bom.components if isinstance(c, CredentialComponent))
+    credential.claims["ref"] = ClaimEvidence(method="lookup", scope="repository", locator=text)
+    with pytest.raises(NativeFormatError) as export:
+        bom.to_native_json()
+    assert text not in str(export.value)
 
 
 def test_a_credential_records_no_digest_of_its_value() -> None:
@@ -432,6 +454,10 @@ def test_a_value_in_the_checkout_is_a_high_finding_from_the_recorded_fact(tmp_pa
     assert [r["ruleId"] for r in sarif["runs"][0]["results"]] == [
         "nexus_symbiote/credential_exposure/high"
     ]
+    view = build_view(bom, max_nodes=10)
+    (node,) = (node for node in view.nodes if node.type is ComponentType.CREDENTIAL)
+    assert node.findings.highest is RiskSeverity.HIGH
+    assert any(path.nodes[-1] == node.index for path in view.paths)
     # A collector's own finding stands in for it; no value in the checkout, no finding.
     assert len(_exposure_findings(_inventory(exposed=True))) == 1
     assert _exposure_findings(_inventory()) == []

@@ -353,6 +353,13 @@ def private_key_block(value: str) -> bool:
     return next(iter(_private_key_spans(value)), None) is not None
 
 
+def holds_credential_value(text: str) -> bool:
+    """Detect token formats, private key blocks, and URL user information in free text."""
+    return (
+        holds_token_shape(text) or private_key_block(text) or _URL_USERINFO.search(text) is not None
+    )
+
+
 def credential_shaped(value: str) -> bool:
     """Whether a bare word reads as a credential, by the shape rule for scheme values.
 

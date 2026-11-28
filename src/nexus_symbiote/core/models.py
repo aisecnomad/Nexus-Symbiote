@@ -38,7 +38,7 @@ from nexus_symbiote.core.enums import (
     TrustTier,
 )
 from nexus_symbiote.core.evidence import DeploymentProfile, Timestamp
-from nexus_symbiote.utils.secrets import holds_token_shape
+from nexus_symbiote.utils.secrets import holds_credential_value
 
 NATIVE_SPEC_VERSION = "1.2.0"
 """Version written by this build. 1.1.0 records scan-root-relative POSIX paths; 1.2.0 adds
@@ -708,7 +708,7 @@ def credential_value_problem(component: CredentialComponent) -> str | None:
         CredentialProperties.model_validate(component.properties)
     except ValidationError:
         return "a credential's properties record only how and where it was collected"
-    if any(holds_token_shape(text) for text in _texts(component.model_dump(mode="json"))):
+    if any(holds_credential_value(text) for text in _texts(component.model_dump(mode="json"))):
         return "a credential record holds text shaped like a credential value"
     return None
 
