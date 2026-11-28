@@ -35,6 +35,7 @@ src/nexus_symbiote/
   reporting.py                         — Neutralized text and JSON gate reporting
   scanner_catalog.py                   — Built-in collector universe for coverage checks
   text_poisoning.py                    — Deterministic O(N) text-poisoning and injection rules
+  source_unicode.py                    — Mixed-script and hidden characters in collected code and Dockerfiles
   cli.py, live_cli.py, runtime_cli.py, supply_chain_cli.py — Click CLI entrypoints
 ```
 

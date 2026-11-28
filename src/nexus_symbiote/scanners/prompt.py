@@ -207,7 +207,7 @@ def _line_separator_risks(counts: dict[str, int], source_name: str) -> list[Risk
 
 
 def detect_invisible_characters(
-    content: str, source_name: str, *, decoded: str | None = None
+    content: str, source_name: str, *, decoded: str | None = None, at_start: bool = True
 ) -> list[RiskAssessment]:
     """Detect invisible Unicode characters that could be used for prompt trojans.
 
@@ -224,7 +224,7 @@ def detect_invisible_characters(
     its raw text does not hold; each character counts as often as the text that holds it
     more often, so one written raw counts once.
     """
-    counts, tags = _hidden_counts(content, at_start=True)
+    counts, tags = _hidden_counts(content, at_start=at_start)
     separators = _line_separator_counts(content)
     if decoded is not None:
         escaped, escaped_tags = _hidden_counts(decoded, at_start=False)
@@ -418,6 +418,27 @@ class _HiddenCharacterStream:
         self._pending, self._at_start = text[end:], False
 
 
+def directional_mark_risk(counts: dict[str, int], source_name: str) -> RiskAssessment | None:
+    """A single observation for directional marks at the supplied location."""
+    shown = neutralize(source_name)
+    marks = [
+        f"{name} (U+{ord(char):04X}) x{counts[char]}"
+        for char, name in DIRECTIONAL_MARKS.items()
+        if char in counts
+    ]
+    if not marks:
+        return None
+    return RiskAssessment(
+        severity=RiskSeverity.MEDIUM,
+        category="directional_marks",
+        detail=(
+            f"'{shown}' contains invisible directional marks: {', '.join(marks)}. "
+            "They are ordinary in right-to-left text but can reorder neutral characters."
+        ),
+        recommendation="Confirm that each directional mark belongs to right-to-left text.",
+    )
+
+
 def _hidden_character_risks(
     counts: dict[str, int], tags: int, source_name: str
 ) -> list[RiskAssessment]:
@@ -465,23 +486,8 @@ def _hidden_character_risks(
             )
         )
 
-    marks = [
-        f"{name} (U+{ord(char):04X}) x{counts[char]}"
-        for char, name in DIRECTIONAL_MARKS.items()
-        if char in counts
-    ]
-    if marks:
-        risks.append(
-            RiskAssessment(
-                severity=RiskSeverity.MEDIUM,
-                category="directional_marks",
-                detail=(
-                    f"'{shown}' contains invisible directional marks: {', '.join(marks)}. "
-                    "They are ordinary in right-to-left text but can reorder neutral characters."
-                ),
-                recommendation="Confirm that each directional mark belongs to right-to-left text.",
-            )
-        )
+    if mark_risk := directional_mark_risk(counts, shown):
+        risks.append(mark_risk)
 
     if tags or plane_14:
         found = []

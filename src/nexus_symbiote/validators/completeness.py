@@ -365,6 +365,7 @@ class CompletenessValidator:
         """
         from nexus_symbiote.graph import assemble_repository_agent
         from nexus_symbiote.scanners import ALL_SCANNERS, ModelScanner
+        from nexus_symbiote.source_unicode import apply_source_unicode_findings
         from nexus_symbiote.text_poisoning import apply_text_poisoning_rules
 
         report = self._validate_claims(bom)
@@ -436,6 +437,18 @@ class CompletenessValidator:
         )
         for reason in text_failures:
             incomplete("text_poisoning", f"Local collection incomplete: {reason}")
+        unicode_failures: list[str] = []
+        unicode_exclusions: list[str] = []
+        apply_source_unicode_findings(
+            expected,
+            root,
+            exclude_paths=exclude_paths,
+            failures=unicode_failures,
+            exclusions=unicode_exclusions,
+        )
+        excluded.extend(unicode_exclusions)
+        for reason in (*unicode_failures, *unicode_exclusions):
+            incomplete("source_unicode", f"Local collection incomplete: {reason}")
         coverage = self._local_coverage(
             report_digest,
             surfaces,

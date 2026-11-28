@@ -1294,14 +1294,30 @@ def _parse(source: bytes, jsx: bool, seconds: float) -> Tree:
     raise _RefusedError("TypeScript parsing exceeded its time limit")
 
 
+def _source_tree(source: bytes, suffix: str) -> Tree:
+    scale = max(1.0, limits.current().syntax_bytes / limits.DEFAULTS.syntax_bytes)
+    return _parse(source, _JSX.get(suffix, False), MAX_PARSE_SECONDS * scale)
+
+
+def typescript_identifiers(source: bytes, suffix: str) -> Iterator[tuple[int, str]]:
+    """Yield physical line numbers and identifier spellings from a bounded UTF-8 tree."""
+    root = _source_tree(source, suffix).root_node
+    if root.has_error:
+        raise _RefusedError("invalid syntax")
+    for node in _nodes(root, limits.bound("ts-nodes")):
+        if node.child_count == 0 and (
+            node.type == "identifier" or node.type.endswith("_identifier")
+        ):
+            yield node.start_point.row + 1, _name(node)
+
+
 def _collect_source(
     content: bytes, path: Path, result: ScanResult, known: KnownValues | None
 ) -> None:
     text = source_text(content)
     # The parser reads UTF-8; the file digest stays that of the bytes as stored.
     source = content if content[:2] not in UTF16_BYTE_ORDER_MARKS else text.encode("utf-8")
-    scale = max(1.0, limits.current().syntax_bytes / limits.DEFAULTS.syntax_bytes)
-    tree = _parse(source, _JSX.get(path.suffix, False), MAX_PARSE_SECONDS * scale)
+    tree = _source_tree(source, path.suffix)
     root = tree.root_node
     location = path.as_posix()
     javascript = path.suffix in _JAVASCRIPT
