@@ -140,6 +140,10 @@ def _is_ai_package_name(name: str) -> bool:
     ) or any(kw in lowered for kw in _reg.AI_IMAGE_KEYWORDS)
 
 
+def _is_sha256_alg(alg: str) -> bool:
+    return alg.strip().upper().replace("-", "") == "SHA256"
+
+
 def _find_sha256(items: Any, alg_key: str, val_key: str) -> str | None:
     if isinstance(items, list):
         for item in items:
@@ -149,9 +153,7 @@ def _find_sha256(items: Any, alg_key: str, val_key: str) -> str | None:
                 and isinstance(item.get(val_key), str)
             ):
                 val = item[val_key].strip().removeprefix("sha256:").lower()
-                if item[alg_key].strip().upper().replace(
-                    "-", ""
-                ) == "SHA256" and _SHA256_HEX_RE.fullmatch(val):
+                if _is_sha256_alg(item[alg_key]) and _SHA256_HEX_RE.fullmatch(val):
                     return f"sha256:{val}"
     return None
 
@@ -449,21 +451,61 @@ def _record_bucket_item(
             setattr(bucket, overflow_attr, getattr(bucket, overflow_attr) + 1)
 
 
-def _extract_cdx_entries(doc: dict[str, Any]) -> list[dict[str, Any]]:
+def _require_cdx_entry(node: dict[str, Any], kind: str) -> None:
+    required = ("name",) if kind == "service" else ("name", "type")
+    for key in (*required, "version", "purl"):
+        if key in required or key in node:
+            if not isinstance(node.get(key), str) or not node[key].strip():
+                raise ValueError(f"CycloneDX {key} must be a nonempty string")
+    if "endpoints" in node and (
+        not isinstance(node["endpoints"], list)
+        or not all(isinstance(ep, str) for ep in node["endpoints"])
+    ):
+        raise ValueError("CycloneDX endpoints must be an array of strings")
+    if "hashes" in node:
+        if not isinstance(node["hashes"], list):
+            raise ValueError("CycloneDX hashes must be an array")
+        digests = set()
+        for item in node["hashes"]:
+            if not isinstance(item, dict) or not all(
+                isinstance(item.get(k), str) for k in ("alg", "content")
+            ):
+                raise ValueError("CycloneDX hashes must contain an algorithm and digest")
+            if _is_sha256_alg(item["alg"]):
+                digest = _find_sha256([item], "alg", "content")
+                if not digest:
+                    raise ValueError("CycloneDX SHA-256 digest has an invalid value")
+                digests.add(digest)
+        if len(digests) > 1:
+            raise ValueError("CycloneDX component has conflicting SHA-256 digests")
+
+
+def _extract_cdx_entries(doc: dict[str, Any], *, strict: bool = False) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     stack: list[tuple[dict[str, Any], int, str]] = []
     seen_nodes = 0
     for key_name, kind in (("services", "service"), ("components", "component")):
         raw = doc.get(key_name)
-        if raw is not None and not isinstance(raw, list):
+        if (raw is not None or (strict and key_name in doc)) and not isinstance(raw, list):
             raise ValueError(f"CycloneDX {key_name} field must be a JSON array")
         if isinstance(raw, list):
             if len(raw) > MAX_FOREIGN_COMPONENTS:
                 raise ValueError(
                     f"foreign SBOM exceeds maximum component count ({MAX_FOREIGN_COMPONENTS})"
                 )
+            if strict and not all(isinstance(item, dict) for item in raw):
+                raise ValueError(f"CycloneDX {key_name} must contain objects")
             stack.extend((item, 0, kind) for item in reversed(raw) if isinstance(item, dict))
     meta = doc.get("metadata")
+    if (
+        strict
+        and "metadata" in doc
+        and (
+            not isinstance(meta, dict)
+            or ("component" in meta and not isinstance(meta["component"], dict))
+        )
+    ):
+        raise ValueError("CycloneDX metadata and its component must be objects")
     if isinstance(meta, dict) and isinstance(meta.get("component"), dict):
         stack.append((meta["component"], 0, "root"))
 
@@ -477,6 +519,8 @@ def _extract_cdx_entries(doc: dict[str, Any]) -> list[dict[str, Any]]:
             )
         if depth > MAX_NESTED_CDX_DEPTH:
             raise ValueError("CycloneDX nested components exceed maximum depth")
+        if strict:
+            _require_cdx_entry(node, kind)
         name = node.get("name")
         if isinstance(name, str) and name.strip():
             nt = node.get("type")
@@ -495,6 +539,15 @@ def _extract_cdx_entries(doc: dict[str, Any]) -> list[dict[str, Any]]:
                 )
         for key_name, child_kind in (("components", "component"), ("services", "service")):
             children = node.get(key_name)
+            if (
+                strict
+                and key_name in node
+                and (
+                    not isinstance(children, list)
+                    or not all(isinstance(child, dict) for child in children)
+                )
+            ):
+                raise ValueError(f"CycloneDX nested {key_name} must be an array of objects")
             if isinstance(children, list):
                 if seen_nodes + len(children) > MAX_FOREIGN_COMPONENTS:
                     raise ValueError(

@@ -1,0 +1,1613 @@
+"""Tests for the offline ``k8s-drift`` cluster CycloneDX ML-BOM vs AgentBOM check."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from nexus_symbiote.cli import main
+from nexus_symbiote.core.aibom import AIBOM
+from nexus_symbiote.core.enums import RiskSeverity
+from nexus_symbiote.core.models import (
+    A2AServerComponent,
+    MCPServerComponent,
+    ModelComponent,
+    RegistryEntryComponent,
+)
+from nexus_symbiote.generators.validation import validate_sarif
+from nexus_symbiote.modes import Mode, enforce
+from nexus_symbiote.runtime_bom_drift import (
+    ASSURANCE,
+    FORMAT,
+    MAX_RUNTIME_BOMS,
+    MAX_RUNTIME_DEPTH,
+    RuntimeBOMInputError,
+    collect,
+    render,
+    sarif_document,
+)
+
+_SYNTHETIC_CRED = "sk-ant-" + "api03-clustersecret1234567890"
+_SHA_A = "a" * 64
+_SHA_B = "b" * 64
+_SHA_C = "c" * 64
+
+
+def _write_static_bom(tmp_path: Path) -> Path:
+    bom = AIBOM(
+        components=[
+            ModelComponent(
+                bom_ref="model:llama3",
+                name="meta-llama/Llama-3.1-8B",
+                version="1.0.0",
+                requested_alias="llama-3.1-8b",
+                hashes={"SHA-256": _SHA_A},
+            ),
+            MCPServerComponent(
+                bom_ref="mcp:tools",
+                name="tools-gateway",
+                version="2.1.0",
+                endpoint_url="https://tools.cluster.local:8443/mcp",
+            ),
+            A2AServerComponent(
+                bom_ref="a2a:planner",
+                name="planner-agent",
+                version="1.0.0",
+                endpoint_url="https://planner.cluster.local/a2a",
+            ),
+            RegistryEntryComponent(
+                bom_ref="pkg:oci/agent-runner",
+                name="ghcr.io/org/agent-runner",
+                version=f"sha256:{_SHA_A}",
+                package_url=f"pkg:oci/agent-runner@sha256:{_SHA_A}",
+                registry_type="oci",
+            ),
+            RegistryEntryComponent(
+                bom_ref="pkg:oci/unpinned-sidecar",
+                name="ghcr.io/org/sidecar",
+                version="1.2.0",
+                package_url="pkg:oci/sidecar:1.2.0",
+                registry_type="oci",
+            ),
+            RegistryEntryComponent(
+                bom_ref="pkg:pypi/langchain-core",
+                name="langchain-core",
+                version="0.3.1",
+                package_url="pkg:pypi/langchain-core@0.3.1",
+                registry_type="pypi",
+            ),
+            RegistryEntryComponent(
+                bom_ref="pkg:pypi/unobserved-sdk",
+                name="openai",
+                version="1.50.0",
+                registry_type="pypi",
+            ),
+        ]
+    )
+    path = tmp_path / "static.aibom.json"
+    path.write_text(bom.to_native_json(), encoding="utf-8")
+    return path
+
+
+def _cdx(
+    *,
+    components: list[dict[str, Any]] | None = None,
+    services: list[dict[str, Any]] | None = None,
+    metadata: dict[str, Any] | None = None,
+    spec_version: str = "1.6",
+) -> dict[str, Any]:
+    doc: dict[str, Any] = {
+        "bomFormat": "CycloneDX",
+        "specVersion": spec_version,
+        "version": 1,
+    }
+    if metadata is not None:
+        doc["metadata"] = metadata
+    if components is not None:
+        doc["components"] = components
+    if services is not None:
+        doc["services"] = services
+    return doc
+
+
+def test_clean_cluster_match_and_reported_assurance(tmp_path):
+    inv = _write_static_bom(tmp_path)
+    runtime = tmp_path / "cluster.cdx.json"
+    runtime.write_text(
+        json.dumps(
+            _cdx(
+                metadata={
+                    "properties": [
+                        {"name": "k8s.namespace", "value": "ai-prod"},
+                        {"name": "other.prop", "value": "ignored"},
+                        "not-a-dict",
+                        {"name": 123, "value": "skip"},
+                        *[{"name": f"k8s.tag{i}", "value": f"v{i}"} for i in range(20)],
+                    ],
+                    "component": {
+                        "type": "container",
+                        "name": "ghcr.io/org/agent-runner",
+                        "version": f"sha256:{_SHA_A}",
+                        "purl": f"pkg:oci/agent-runner@sha256:{_SHA_A}",
+                    },
+                },
+                services=[
+                    {
+                        "name": "tools-gateway",
+                        "version": "2.1.0",
+                        "endpoints": ["https://tools.cluster.local:8443/mcp"],
+                    },
+                    {
+                        "name": "planner-agent",
+                        "version": "1.0.0",
+                        "endpoints": ["https://planner.cluster.local/a2a"],
+                    },
+                ],
+                components=[
+                    {
+                        "type": "machine-learning-model",
+                        "name": "llama-3.1-8b:latest",
+                        "version": "1.0.0",
+                        "hashes": [{"alg": "SHA-256", "content": _SHA_A}],
+                    },
+                    {
+                        "type": "library",
+                        "name": "langchain_core",
+                        "version": "0.3.1",
+                        "purl": "pkg:pypi/langchain-core@0.3.1",
+                    },
+                    # Non-AI OS package & non-package asset ignored cleanly.
+                    {"type": "library", "name": "libc6", "version": "2.39"},
+                    {"type": "file", "name": "/etc/passwd"},
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with enforce(Mode.OFFLINE):
+        doc = collect(inv, [runtime], fail_on="drift")
+
+    assert doc["format"] == FORMAT
+    assert doc["assurance"] == ASSURANCE
+    assert doc["gate"]["passed"] is True
+    assert doc["coverage"]["non_ai_packages_ignored"] == 2
+    assert len(doc["reconciliation"]["matched"]) == 5
+    assert doc["reconciliation"]["drifted"] == []
+    assert doc["reconciliation"]["undeclared"] == []
+    assert doc["reconciliation"]["mutable_tags"] == []
+    assert any(
+        u["bom_ref"] == "pkg:pypi/unobserved-sdk" for u in doc["reconciliation"]["unobserved"]
+    )
+    assert doc["reconciliation"]["matched"][0]["cluster_context"]["k8s.namespace"] == "ai-prod"
+    assert render(doc) == render(doc)
+
+    sarif = sarif_document(doc, ".nexus-symbiote.yaml")
+    assert validate_sarif(sarif) == []
+    assert sarif["runs"][0]["results"] == []
+
+
+def test_drift_mutable_tags_undeclared_sanitization_and_sarif(tmp_path):
+    inv = _write_static_bom(tmp_path)
+    runtime_a = tmp_path / "a.cdx.json"
+    runtime_b = tmp_path / "b.cdx.json"
+
+    runtime_a.write_text(
+        json.dumps(
+            _cdx(
+                services=[
+                    {
+                        "name": "tools-gateway",
+                        "version": "9.9.9",
+                        "endpoints": ["https://wrong.cluster.local:9000/v2"],
+                    },
+                    {
+                        "name": f"shadow-mcp\x1b[31m-{_SYNTHETIC_CRED}",
+                        "endpoints": ["https://evil.example.com/sse"],
+                    },
+                ],
+                components=[
+                    {
+                        "type": "machine-learning-model",
+                        "name": "meta-llama/Llama-3.1-8B",
+                        "version": "1.0.1",
+                        "hashes": [{"alg": "SHA-256", "content": _SHA_B}],
+                    },
+                    {
+                        "type": "container",
+                        "name": "ghcr.io/org/sidecar:latest",
+                        "version": "latest",
+                        "purl": "pkg:oci/sidecar:latest",
+                        "properties": [{"name": "k8s.workload", "value": "deployment/sidecar"}],
+                    },
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    runtime_b.write_text(
+        json.dumps(
+            _cdx(
+                spec_version="1.7",
+                components=[
+                    {
+                        "type": "machine-learning-model",
+                        "name": "rogue\u202emodel",
+                        "version": "0.1",
+                        "hashes": [{"alg": "SHA-256", "content": _SHA_C}],
+                    },
+                    {
+                        "type": "container",
+                        "name": "unpinned-worker",
+                        "purl": "pkg:docker/unpinned-worker",
+                    },
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    doc_undeclared = collect(inv, [runtime_a, runtime_b], fail_on="undeclared")
+    assert doc_undeclared["gate"]["passed"] is False
+    rec = doc_undeclared["reconciliation"]
+    assert len(rec["undeclared"]) == 3  # shadow-mcp, rogue model, unpinned-worker
+    assert len(rec["drifted"]) == 3  # tools-gateway (ver+ep), llama3 (ver+sha), sidecar (ver)
+    assert len(rec["mutable_tags"]) == 1  # sidecar:latest
+
+    reasons_by_name = {d["name"]: d["drift_reasons"] for d in rec["drifted"]}
+    assert "digest_mismatch" in reasons_by_name["meta-llama/Llama-3.1-8B"]
+    assert "version_mismatch" in reasons_by_name["meta-llama/Llama-3.1-8B"]
+    assert reasons_by_name["tools-gateway"] == ["version_mismatch", "endpoint_mismatch"]
+
+    # Deterministic order regardless of CLI arg ordering
+    assert render(collect(inv, [runtime_b, runtime_a])) == render(
+        collect(inv, [runtime_a, runtime_b])
+    )
+
+    # SARIF validation + secret redaction + URL defanging
+    sarif = sarif_document(doc_undeclared, ".nexus-symbiote.yaml")
+    assert validate_sarif(sarif) == []
+    sarif_text = json.dumps(sarif)
+    assert _SYNTHETIC_CRED not in sarif_text
+    assert "\x1b" not in sarif_text
+    assert "\u202e" not in sarif_text
+    rule_ids = {r["id"] for r in sarif["runs"][0]["tool"]["driver"]["rules"]}
+    assert rule_ids == {
+        f"nexus_symbiote/runtime_undeclared/{RiskSeverity.HIGH.value}",
+        f"nexus_symbiote/data_integrity/{RiskSeverity.HIGH.value}",
+        f"nexus_symbiote/mutable_image_tag/{RiskSeverity.MEDIUM.value}",
+    }
+
+
+def test_runtime_bom_input_refusals(tmp_path):
+    inv = _write_static_bom(tmp_path)
+
+    with pytest.raises(RuntimeBOMInputError, match="between 1 and"):
+        collect(inv, [])
+    with pytest.raises(RuntimeBOMInputError, match="between 1 and"):
+        collect(inv, [inv] * (MAX_RUNTIME_BOMS + 1))
+
+    # Symlink refused
+    real = tmp_path / "real.cdx.json"
+    real.write_text(json.dumps(_cdx(components=[])), encoding="utf-8")
+    link = tmp_path / "link.cdx.json"
+    link.symlink_to(real)
+    with pytest.raises(RuntimeBOMInputError, match="symbolic link"):
+        collect(inv, [link])
+
+    hardlink = tmp_path / "also-real.json"
+    hardlink.hardlink_to(real)
+    with pytest.raises(RuntimeBOMInputError, match="single-link"):
+        collect(inv, [hardlink])
+
+    # Missing & non-CycloneDX & unsupported version & duplicate JSON keys & deep nesting & bad UTF-8
+    missing = tmp_path / "missing.cdx.json"
+    with pytest.raises(RuntimeBOMInputError, match="does not exist"):
+        collect(inv, [missing])
+
+    not_cdx = tmp_path / "spdx.json"
+    not_cdx.write_text(json.dumps({"spdxVersion": "SPDX-2.3"}), encoding="utf-8")
+    with pytest.raises(RuntimeBOMInputError, match="bomFormat='CycloneDX'"):
+        collect(inv, [not_cdx])
+
+    bad_ver = tmp_path / "old.cdx.json"
+    bad_ver.write_text(json.dumps(_cdx(spec_version="1.2")), encoding="utf-8")
+    with pytest.raises(RuntimeBOMInputError, match="specVersion"):
+        collect(inv, [bad_ver])
+
+    dup = tmp_path / "dup.cdx.json"
+    dup.write_text('{"bomFormat":"CycloneDX","specVersion":"1.6","version":1,"version":2}')
+    with pytest.raises(RuntimeBOMInputError, match="duplicate keys"):
+        collect(inv, [dup])
+
+    arr = tmp_path / "arr.cdx.json"
+    arr.write_text("[1, 2, 3]")
+    with pytest.raises(RuntimeBOMInputError, match="JSON object"):
+        collect(inv, [arr])
+
+    bad_utf8 = tmp_path / "raw.cdx.json"
+    bad_utf8.write_bytes(b"\xff\xfe")
+    with pytest.raises(RuntimeBOMInputError, match="UTF-8"):
+        collect(inv, [bad_utf8])
+
+    deep: Any = {"type": "library", "name": "torch"}
+    for _ in range(MAX_RUNTIME_DEPTH + 4):
+        deep = [deep]
+    nested = tmp_path / "deep.cdx.json"
+    nested.write_text(json.dumps({"bomFormat": "CycloneDX", "specVersion": "1.6", "x": deep}))
+    with pytest.raises(RuntimeBOMInputError, match="nesting limit"):
+        collect(inv, [nested])
+
+
+def test_k8s_drift_cli_gates_outputs_and_errors(tmp_path, runner):
+    inv = _write_static_bom(tmp_path)
+    drifted_only = tmp_path / "drifted.cdx.json"
+    drifted_only.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "container",
+                        "name": "ghcr.io/org/sidecar:main",
+                        "version": "main",
+                        "purl": "pkg:oci/sidecar@main",
+                    }
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    out_json = tmp_path / "drift.json"
+    out_sarif = tmp_path / "drift.sarif"
+
+    # --fail-on undeclared passes when only matched drift/mutable-tag exists
+    ok_res = runner.invoke(
+        main,
+        [
+            "k8s-drift",
+            str(inv),
+            str(drifted_only),
+            "-o",
+            str(out_json),
+            "--sarif",
+            str(out_sarif),
+        ],
+    )
+    assert ok_res.exit_code == 0, ok_res.output
+    assert out_json.exists()
+    assert validate_sarif(json.loads(out_sarif.read_text(encoding="utf-8"))) == []
+
+    # --fail-on drift fails with exit 1 on drifted + mutable tag
+    drift_fail = runner.invoke(
+        main,
+        ["k8s-drift", str(inv), str(drifted_only), "--fail-on", "drift", "--json-output"],
+    )
+    assert drift_fail.exit_code == 1
+    assert json.loads(drift_fail.stdout)["gate"]["passed"] is False
+
+    # --fail-on none never fails even on empty BOM
+    empty_cdx = tmp_path / "empty.cdx.json"
+    empty_cdx.write_text(json.dumps(_cdx(components=[])), encoding="utf-8")
+    empty_fail = runner.invoke(main, ["k8s-drift", str(inv), str(empty_cdx)])
+    assert empty_fail.exit_code == 1
+    report_only = runner.invoke(main, ["k8s-drift", str(inv), str(empty_cdx), "--fail-on", "none"])
+    assert report_only.exit_code == 0, report_only.output
+
+    # Overwrite protection and bad inputs
+    overwrite = runner.invoke(main, ["k8s-drift", str(inv), str(drifted_only), "-o", str(inv)])
+    assert overwrite.exit_code == 2
+    same_outs = runner.invoke(
+        main,
+        ["k8s-drift", str(inv), str(drifted_only), "-o", str(out_json), "--sarif", str(out_json)],
+    )
+    assert same_outs.exit_code == 2
+
+    too_many = runner.invoke(
+        main, ["k8s-drift", str(inv), *([str(drifted_only)] * (MAX_RUNTIME_BOMS + 1))]
+    )
+    assert too_many.exit_code == 2
+
+    bad_inv = tmp_path / "bad.aibom.json"
+    bad_inv.write_text("{bad", encoding="utf-8")
+    assert runner.invoke(main, ["k8s-drift", str(bad_inv), str(drifted_only)]).exit_code == 1
+
+    sym_rt = tmp_path / "sym.cdx.json"
+    sym_rt.symlink_to(drifted_only)
+    assert runner.invoke(main, ["k8s-drift", str(inv), str(sym_rt)]).exit_code == 1
+
+
+def test_mutability_helpers_endpoint_defaults_and_edge_branches(tmp_path, monkeypatch):
+    from nexus_symbiote import runtime_bom_drift as mod
+
+    assert mod._clean("x" * 700, limit=16).endswith("...")
+    assert mod._normalize_sha256("not-a-hash") is None
+    assert mod._normalize_endpoint("") is None
+    assert (
+        mod._normalize_endpoint("http://svc.cluster.local/api") == "http://svc.cluster.local:80/api"
+    )
+    assert mod._normalize_endpoint("https://") is None
+    assert mod._check_container_mutability("img", "sha256:" + _SHA_A, None) is None
+    assert (
+        mod._check_container_mutability("img", "latest", None) == "mutable container tag ':latest'"
+    )
+    assert (
+        mod._check_container_mutability("img:nightly", None, None)
+        == "mutable container tag ':nightly'"
+    )
+    assert (
+        mod._static_sha256(
+            RegistryEntryComponent(bom_ref="r:1", name="x", hashes={"sha512": _SHA_A * 2})
+        )
+        is None
+    )
+
+    # Distinct snapshots retain their own digests and endpoints.
+    inv = _write_static_bom(tmp_path)
+    p1 = tmp_path / "p1.cdx.json"
+    p2 = tmp_path / "p2.cdx.json"
+    p1.write_text(
+        json.dumps(
+            _cdx(
+                services=[
+                    {"name": "tools-gateway", "version": "2.1.0", "endpoints": ["https://a:443"]}
+                ],
+                components=[
+                    {"type": "machine-learning-model", "name": "llama-3.1-8b", "version": "1.0.0"}
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    p2.write_text(
+        json.dumps(
+            _cdx(
+                services=[
+                    {
+                        "name": "tools-gateway",
+                        "version": "2.1.0",
+                        "endpoints": ["https://tools.cluster.local:8443/mcp"],
+                    }
+                ],
+                components=[
+                    {
+                        "type": "machine-learning-model",
+                        "name": "llama-3.1-8b",
+                        "version": "1.0.0",
+                        "hashes": [{"alg": "SHA-256", "content": _SHA_A}],
+                    }
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    merged = collect(inv, [p1, p2])
+    assert any(
+        m["name"] == "llama-3.1-8b" and m["sha256"] == f"sha256:{_SHA_A}"
+        for m in merged["reconciliation"]["matched"]
+    )
+
+    # Size limit & non-regular error + permission error + missing digest fallback + large SARIF cap
+    monkeypatch.setattr(mod, "MAX_FOREIGN_SBOM_BYTES", 8)
+    with pytest.raises(RuntimeBOMInputError, match="byte limit"):
+        collect(inv, [p1])
+    monkeypatch.undo()
+
+    from nexus_symbiote.generators import sarif as sarif_mod
+
+    monkeypatch.setattr(sarif_mod, "GITHUB_MAX_RESULTS", 1)
+    monkeypatch.setattr(
+        mod, "inventory_content_digest", lambda _d: (_ for _ in ()).throw(ValueError("bad"))
+    )
+    assert mod._check_container_mutability("img", None, f"pkg:oci/img@sha256:{_SHA_A}") is None
+    assert "without digest" in (mod._check_container_mutability("img", None, "pkg:oci/img") or "")
+    assert "no immutable" in (mod._check_container_mutability("img", None, None) or "")
+    huge_rt = tmp_path / "many.cdx.json"
+    huge_rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "container",
+                        "name": f"rogue-{i}:latest",
+                        "purl": f"pkg:oci/rogue-{i}:latest",
+                    }
+                    for i in range(3)
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    doc_many = collect(inv, [huge_rt])
+    assert doc_many["inputs"]["inventory"]["content_digest"] is None
+    sarif_many = sarif_document(doc_many, ".nexus-symbiote.yaml")
+    assert len(sarif_many["runs"][0]["invocations"][0]["toolExecutionNotifications"]) == 2
+    # CLI human text output for undeclared items
+    from click.testing import CliRunner
+
+    text_res = CliRunner().invoke(main, ["k8s-drift", str(inv), str(huge_rt)])
+    assert text_res.exit_code == 1
+    assert "Undeclared (container):" in text_res.output
+
+    # Permission & non-regular open error formatting
+    assert "not a regular file" in mod._open_error(p1, OSError(None, "dir"))
+    perm = PermissionError(13, "denied")
+    assert "cannot be read" in mod._open_error(p1, perm)
+    assert "exceeds bounds" in mod._open_error(p1, OSError(5, "eio"))
+
+
+def test_cluster_identities_and_endpoints(tmp_path):
+    inv = _write_static_bom(tmp_path)
+    rt = tmp_path / "reported.cdx.json"
+    rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {"type": "library", "name": "openai", "purl": "pkg:npm/openai@1.50.0"},
+                    {"type": "library", "name": "openai", "purl": "pkg:pypi/openai@1.50.0"},
+                    {
+                        "type": "machine-learning-model",
+                        "name": "other/Llama-3.1-8B",
+                        "version": "1.0.0",
+                    },
+                    {
+                        "type": "machine-learning-model",
+                        "name": "Llama-3.1-8B",
+                        "supplier": {"name": "other"},
+                        "version": "1.0.0",
+                    },
+                ],
+                services=[
+                    {"name": "tools-gateway", "endpoints": ["https://planner.cluster.local/a2a"]},
+                    {"name": "tools-gateway", "endpoints": []},
+                    {"name": "tools-gateway", "endpoints": ["http://tools.cluster.local:8443/mcp"]},
+                    {
+                        "name": "tools-gateway",
+                        "endpoints": [
+                            "https://tools.cluster.local:8443/mcp",
+                            "https://aux.cluster.local/mcp",
+                        ],
+                    },
+                ],
+                metadata={
+                    "properties": [
+                        {"name": "cdx:k8s:token", "value": "ordinary-property-sample"},
+                        {"name": "k8s.namespace", "value": "training"},
+                    ]
+                },
+            )
+        )
+    )
+    with enforce(Mode.OFFLINE):
+        result = collect(inv, [rt], fail_on="drift")
+    assert not result["gate"]["passed"]
+    rec = result["reconciliation"]
+    assert [x["purl"] for x in rec["matched"]] == ["pkg:pypi/openai@1.50.0"]
+    assert sorted(x["name"] for x in rec["undeclared"]) == [
+        "Llama-3.1-8B",
+        "openai",
+        "other/Llama-3.1-8B",
+    ]
+    assert len(rec["drifted"]) == 4
+    assert all(x["drift_reasons"] == ["endpoint_mismatch"] for x in rec["drifted"])
+    assert "ordinary-property-sample" not in render(result)
+    assert rec["matched"][0]["cluster_context"]["k8s.namespace"] == "training"
+
+
+def test_each_declaration_binds_one_version_and_digest(tmp_path):
+    inv = tmp_path / "inventory.json"
+    inv.write_text(
+        AIBOM(
+            components=[
+                ModelComponent(
+                    name="org/weights", bom_ref="model:a", version="1", hashes={"SHA-256": _SHA_A}
+                ),
+                ModelComponent(
+                    name="org/weights", bom_ref="model:b", version="2", hashes={"SHA-256": _SHA_B}
+                ),
+                RegistryEntryComponent(
+                    name="openai", bom_ref="pkg:openai", version="==1.9.0", registry_type="pypi"
+                ),
+            ]
+        ).to_native_json()
+    )
+    reports = []
+    for label, digest in (("first", _SHA_A), ("second", _SHA_B)):
+        path = tmp_path / f"{label}.json"
+        path.write_text(
+            json.dumps(
+                _cdx(
+                    components=[
+                        {
+                            "type": "machine-learning-model",
+                            "name": "org/weights",
+                            "version": "1",
+                            "hashes": [{"alg": "SHA-256", "content": digest}],
+                        },
+                        {"type": "library", "name": "openai", "purl": "pkg:pypi/openai@1.9.0"},
+                    ]
+                )
+            )
+        )
+        reports.append(path)
+    with enforce(Mode.OFFLINE):
+        one = collect(inv, [reports[1]], fail_on="drift")
+        combined = collect(inv, reports, fail_on="drift")
+        assert render(combined) == render(collect(inv, reports[::-1], fail_on="drift"))
+    assert not one["gate"]["passed"]
+    assert one["reconciliation"]["drifted"][0]["drift_reasons"] == [
+        "version_mismatch",
+        "digest_mismatch",
+    ]
+    assert combined["reconciliation"]["matched"][0]["inventory_refs"] == ["pkg:openai"]
+    assert not combined["gate"]["passed"]
+    assert {r["sha256"] for r in combined["reconciliation"]["drifted"]} == {
+        f"sha256:{_SHA_A}",
+        f"sha256:{_SHA_B}",
+    }
+    assert all(
+        "conflicting_reported_digests" in r["drift_reasons"]
+        for r in combined["reconciliation"]["drifted"]
+    )
+    assert len(sarif_document(combined, "inventory.json")["runs"][0]["results"]) == 2
+
+
+def test_cluster_image_pin_and_observation_cap(tmp_path, monkeypatch):
+    from nexus_symbiote import runtime_bom_drift as mod
+
+    inv = _write_static_bom(tmp_path)
+    rt = tmp_path / "reported.cdx.json"
+    rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {"type": "container", "name": "ghcr.io/org/agent-runner@sha256:" + _SHA_B},
+                    {"type": "container", "name": "ghcr.io/org/agent-runner@sha256:" + _SHA_A},
+                    {"type": "container", "name": "ghcr.io/org/sidecar:1.2.0", "version": "1.2.0"},
+                ]
+            )
+        )
+    )
+    result = collect(inv, [rt], fail_on="drift")
+    assert not result["gate"]["passed"]
+    assert [r["name"] for r in result["reconciliation"]["mutable_tags"]] == [
+        "ghcr.io/org/sidecar:1.2.0"
+    ]
+    assert any("digest_mismatch" in r["drift_reasons"] for r in result["reconciliation"]["drifted"])
+    assert mod._check_container_mutability("image@sha512:" + "a" * 128, None, None) is None
+    assert mod._check_container_mutability("image", _SHA_A, None)
+    monkeypatch.setattr(mod, "MAX_DRIFT_ITEMS", 2)
+    with pytest.raises(RuntimeBOMInputError, match="observation limit"):
+        collect(inv, [rt], fail_on="none")
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"components": [None]}, "objects"),
+        ({"components": None}, "JSON array"),
+        ({"metadata": {"component": []}}, "objects"),
+        ({"components": [{"name": "model"}]}, "type"),
+        ({"components": [{"type": "library", "name": "torch", "version": 1}]}, "version"),
+        (
+            {"components": [{"type": "library", "name": "torch", "purl": "unstructured"}]},
+            "package URL",
+        ),
+        (
+            {
+                "components": [
+                    {"type": "library", "name": "torch", "purl": "pkg:pypi/torch@1", "version": "2"}
+                ]
+            },
+            "disagree",
+        ),
+        ({"services": [{"name": "chat", "endpoints": 123}]}, "endpoints"),
+        ({"services": [{"name": "chat", "endpoints": ["https://"]}]}, "no host"),
+        ({"services": [{"name": "chat", "endpoints": ["https://host:port"]}]}, "host or port"),
+        ({"services": [{"name": "chat", "services": {}}]}, "nested services"),
+        ({"components": [{"type": "library", "name": "torch", "hashes": {}}]}, "array"),
+        (
+            {"components": [{"type": "library", "name": "torch", "hashes": [{"content": "aaa"}]}]},
+            "algorithm",
+        ),
+        (
+            {
+                "components": [
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "hashes": [{"alg": "SHA-256", "content": "abc"}],
+                    }
+                ]
+            },
+            "invalid value",
+        ),
+        (
+            {
+                "components": [
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "hashes": [
+                            {"alg": "SHA-256", "content": _SHA_A},
+                            {"alg": "SHA-256", "content": _SHA_B},
+                        ],
+                    }
+                ]
+            },
+            "conflicting",
+        ),
+        (
+            {
+                "components": [
+                    {
+                        "type": "container",
+                        "name": "image@sha256:" + _SHA_A,
+                        "purl": "pkg:oci/image@sha256:" + _SHA_B,
+                    }
+                ]
+            },
+            "conflicting",
+        ),
+        (
+            {
+                "components": [
+                    {
+                        "type": "container",
+                        "name": "image@sha256:" + _SHA_A,
+                        "hashes": [{"alg": "SHA-256", "content": _SHA_B}],
+                    }
+                ]
+            },
+            "disagree",
+        ),
+    ],
+)
+def test_invalid_comparison_fields_are_refused(tmp_path, change, message):
+    inv = _write_static_bom(tmp_path)
+    rt = tmp_path / "reported.cdx.json"
+    rt.write_text(json.dumps({**_cdx(), **change}))
+    with enforce(Mode.OFFLINE), pytest.raises(RuntimeBOMInputError, match=message):
+        collect(inv, [rt], fail_on="none")
+
+
+def test_qualified_model_names_retain_snapshot_supplier_and_one_declaration(tmp_path):
+    def write_snapshot(path, supplier, digest):
+        path.write_text(
+            json.dumps(
+                _cdx(
+                    components=[
+                        {
+                            "type": "machine-learning-model",
+                            "name": "fieldlab/forecast",
+                            "version": "1",
+                            "supplier": {"name": supplier},
+                            "hashes": [{"alg": "SHA-256", "content": digest}],
+                        }
+                    ]
+                )
+            )
+        )
+        return path
+
+    def static(provider, digest):
+        return ModelComponent(
+            name="fieldlab/forecast",
+            bom_ref=f"model:{provider}",
+            version="1",
+            provider=provider,
+            hashes={"SHA-256": digest},
+        )
+
+    inv = tmp_path / "inventory.json"
+    AIBOM(components=[static("Provider A", _SHA_A)]).save(inv)
+    a = write_snapshot(tmp_path / "a.json", "Provider A", _SHA_A)
+    b = write_snapshot(tmp_path / "b.json", "Provider B", _SHA_A)
+    for order in ([a, b], [b, a]):
+        report = collect(inv, order, fail_on="undeclared")
+        assert not report["gate"]["passed"]
+        assert report["coverage"]["observed_distinct"] == 2
+        assert [(row["supplier"], row["source_files"]) for row in report["observed"]] == [
+            ("Provider A", ["a.json"]),
+            ("Provider B", ["b.json"]),
+        ]
+        assert [row["supplier"] for row in report["reconciliation"]["undeclared"]] == ["Provider B"]
+        assert report["reconciliation"]["matched"][0]["inventory_refs"] == ["model:Provider A"]
+
+    write_snapshot(b, "Provider B", _SHA_B)
+    AIBOM(components=[static("Provider A", _SHA_A), static("Provider B", _SHA_B)]).save(inv)
+    independent = collect(inv, [a, b], fail_on="drift")
+    assert independent["gate"]["passed"]
+    assert {tuple(row["inventory_refs"]) for row in independent["reconciliation"]["matched"]} == {
+        ("model:Provider A",),
+        ("model:Provider B",),
+    }
+    write_snapshot(b, "Provider A", _SHA_B)
+    conflicts = collect(inv, [a, b], fail_on="drift")
+    assert not conflicts["gate"]["passed"]
+    assert all(
+        "conflicting_reported_digests" in row["drift_reasons"]
+        for row in conflicts["reconciliation"]["drifted"]
+    )
+
+
+def test_producer_model_provider_property_is_independent_of_supplier(tmp_path):
+    from nexus_symbiote.generators.cyclonedx import CycloneDXGenerator
+
+    model = ModelComponent(
+        name="fieldlab/forecast",
+        bom_ref="model:forecast",
+        provider="Compute A",
+        supplier="Distribution",
+        version="1",
+    )
+    bom = AIBOM(components=[model])
+    inventory = tmp_path / "static.json"
+    bom.save(inventory)
+    snapshot = tmp_path / "snapshot.json"
+    doc = CycloneDXGenerator(projection_version=3).generate(bom)
+    (row,) = [c for c in doc["components"] if c["type"] == "machine-learning-model"]
+    (prop,) = [v for v in row["properties"] if v["name"] == "nexus-symbiote:provider"]
+    assert prop["value"] == "Compute A" and row["supplier"]["name"] == "Distribution"
+    for provider, supplier, passed in [
+        ("Compute A", "Distribution", True),
+        ("Compute B", "Distribution", False),
+        ("Compute A", "Distribution B", False),
+    ]:
+        prop["value"] = provider
+        row["supplier"]["name"] = supplier
+        snapshot.write_text(json.dumps(_cdx(components=[row])))
+        result = collect(inventory, [snapshot], fail_on="undeclared")
+        assert result["gate"]["passed"] is passed
+        (observed,) = result["observed"]
+        assert (observed["provider"], observed["supplier"]) == (provider, supplier)
+    row["properties"].append({"name": "nexus-symbiote:provider", "value": "Compute B"})
+    snapshot.write_text(json.dumps(_cdx(components=[row])))
+    with pytest.raises(RuntimeBOMInputError, match="conflicting provider"):
+        collect(inventory, [snapshot])
+
+
+def test_context_key_redaction_recognizes_nested_names(tmp_path):
+    inv = _write_static_bom(tmp_path)
+    snapshot = tmp_path / "properties.json"
+    sensitive = [
+        "k8s.secret.value",
+        "container.env.API_TOKEN.value",
+        "k8s.http.authorization",
+        "k8s.http.authorization.value",
+        "cdx:k8s:headers:cookie:value",
+    ]
+    props = [{"name": name, "value": "session=inert-ordinary-sample"} for name in sensitive]
+    props.append({"name": "k8s.workload.label", "value": "training"})
+    snapshot.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "machine-learning-model",
+                        "name": "fieldlab/model",
+                        "properties": props,
+                    }
+                ]
+            )
+        )
+    )
+    report = collect(inv, [snapshot], fail_on="none")
+    assert "inert-ordinary-sample" not in render(report)
+    (observed,) = report["observed"]
+    assert set(observed["cluster_context"]) == {*sensitive, "k8s.workload.label"}
+    assert observed["cluster_context"]["k8s.workload.label"] == "training"
+
+
+@pytest.mark.parametrize(
+    ("declared", "observed", "matches"),
+    [
+        ("http://hub.example", "http://hub.example:80/", True),
+        ("https://hub.example/", "https://hub.example", True),
+        ("ws://hub.example:80", "ws://hub.example/", True),
+        ("https://hub.example?view=public", "https://hub.example/?view=overview", False),
+        ("https://hub.example/mcp?view=public", "https://hub.example/mcp?view=public", True),
+        (
+            "https://hub.example/mcp",
+            "https://hub.example/mcp?upstream=attacker.example",
+            False,
+        ),
+        ("https://hub.example", "https://hub.example:8443/", False),
+    ],
+)
+def test_http_root_endpoint_identity(tmp_path, declared, observed, matches):
+    component = MCPServerComponent(bom_ref="mcp:hub", name="hub", endpoint_url=declared)
+    inventory = tmp_path / "static.json"
+    inventory.write_text(AIBOM(components=[component]).to_native_json(), encoding="utf-8")
+    snapshot = tmp_path / "cluster.cdx.json"
+    snapshot.write_text(
+        json.dumps(_cdx(services=[{"name": "hub", "endpoints": [observed]}])), encoding="utf-8"
+    )
+    report = collect(inventory, [snapshot], fail_on="drift")
+    assert report["gate"]["passed"] is matches
+    if matches:
+        assert report["reconciliation"]["matched"][0]["inventory_refs"] == ["mcp:hub"]
+        assert report["reconciliation"]["matched"][0]["endpoint_comparison"] == "full"
+    else:
+        assert report["reconciliation"]["drifted"][0]["drift_reasons"] == ["endpoint_mismatch"]
+
+
+def test_trailing_slash_route_identity_preserved(tmp_path):
+    static_bom = AIBOM(
+        components=[
+            MCPServerComponent(
+                bom_ref="mcp:tools",
+                name="tools-gateway",
+                endpoint_url="https://tools.cluster.local:8443/mcp",
+            ),
+            A2AServerComponent(
+                bom_ref="a2a:planner",
+                name="planner-agent",
+                endpoint_url="https://planner.cluster.local/a2a",
+            ),
+        ]
+    )
+    inv = tmp_path / "static.json"
+    inv.write_text(static_bom.to_native_json(), encoding="utf-8")
+
+    snapshot = tmp_path / "cluster.cdx.json"
+    snapshot.write_text(
+        json.dumps(
+            _cdx(
+                services=[
+                    {
+                        "name": "tools-gateway",
+                        "endpoints": ["https://tools.cluster.local:8443/mcp/"],
+                    },
+                    {
+                        "name": "planner-agent",
+                        "endpoints": ["https://planner.cluster.local/a2a/"],
+                    },
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    report = collect(inv, [snapshot], fail_on="drift")
+    assert report["gate"]["passed"] is False
+    drifted = report["reconciliation"]["drifted"]
+    assert {item["name"]: item["drift_reasons"] for item in drifted} == {
+        "tools-gateway": ["endpoint_mismatch"],
+        "planner-agent": ["endpoint_mismatch"],
+    }
+
+
+def test_sha256_whitespace_normalization_and_static_digest_conflicts(tmp_path):
+    inv = _write_static_bom(tmp_path)
+    runtime_conflict = tmp_path / "runtime-conflict.cdx.json"
+    runtime_conflict.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "machine-learning-model",
+                        "name": "meta-llama/Llama-3.1-8B",
+                        "version": "1.0.0",
+                        "hashes": [
+                            {"alg": " SHA-256 ", "content": _SHA_A},
+                            {"alg": "SHA-256", "content": _SHA_B},
+                        ],
+                    }
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError):
+        collect(inv, [runtime_conflict])
+
+    clean_runtime = tmp_path / "clean.cdx.json"
+    clean_runtime.write_text(json.dumps(_cdx()), encoding="utf-8")
+
+    inv_dup = tmp_path / "static-conflict.json"
+    inv_dup.write_text(
+        AIBOM(
+            components=[
+                ModelComponent(
+                    bom_ref="model:dup",
+                    name="meta-llama/Llama-3.1-8B",
+                    version="1.0.0",
+                    hashes={"sha256": _SHA_A, "SHA-256": _SHA_B},
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError):
+        collect(inv_dup, [clean_runtime])
+
+    inv_bad = tmp_path / "static-invalid.json"
+    inv_bad.write_text(
+        AIBOM(
+            components=[
+                ModelComponent(
+                    bom_ref="model:bad",
+                    name="meta-llama/Llama-3.1-8B",
+                    version="1.0.0",
+                    hashes={" SHA-256 ": "invalid-hex"},
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError):
+        collect(inv_bad, [clean_runtime])
+
+    inv_pin_conflict = tmp_path / "static-pin-conflict.json"
+    inv_pin_conflict.write_text(
+        AIBOM(
+            components=[
+                RegistryEntryComponent(
+                    bom_ref="reg:conflict",
+                    name=f"ghcr.io/org/agent-runner@sha256:{_SHA_B}",
+                    package_url=f"pkg:oci/agent-runner@sha256:{_SHA_B}",
+                    hashes={"SHA-256": _SHA_A},
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError):
+        collect(inv_pin_conflict, [clean_runtime])
+
+
+@pytest.mark.parametrize(
+    ("image_name", "bad_purl"),
+    [
+        (
+            f"ghcr.io/org/agent-runner@sha256:{_SHA_A}",
+            f"pkg:oci/other@sha256:{_SHA_A}",
+        ),
+        (
+            f"ghcr.io/org/agent-runner@sha256:{_SHA_A}",
+            f"pkg:oci/agent-runner@sha256:{_SHA_A}?repository_url=quay.io/evil/agent-runner",
+        ),
+        (
+            f"ghcr.io/org/agent-runner@sha256:{_SHA_A}",
+            f"pkg:docker/otherorg/agent-runner@sha256:{_SHA_A}",
+        ),
+        (
+            "ghcr.io/org/agent-runner:v1",
+            f"pkg:oci/agent-runner@sha256:{_SHA_A}?tag=v2",
+        ),
+    ],
+)
+def test_oci_purl_repository_reconciliation_rejects_mismatches(tmp_path, image_name, bad_purl):
+    inv = _write_static_bom(tmp_path)
+    runtime_bad = tmp_path / "runtime-bad-oci.cdx.json"
+    runtime_bad.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "container",
+                        "name": image_name,
+                        "purl": bad_purl,
+                    }
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError):
+        collect(inv, [runtime_bad])
+
+    clean_runtime = tmp_path / "clean-oci.cdx.json"
+    clean_runtime.write_text(json.dumps(_cdx()), encoding="utf-8")
+    bad_static = tmp_path / "static-bad-oci.json"
+    bad_static.write_text(
+        AIBOM(
+            components=[
+                RegistryEntryComponent(
+                    bom_ref="reg:bad",
+                    name=image_name,
+                    package_url=bad_purl,
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError):
+        collect(bad_static, [clean_runtime])
+
+
+def test_docker_purl_repository_url_may_name_only_the_registry(tmp_path):
+    # purl-spec: a docker repository_url names the registry (gcr.io); the namespace
+    # and name give the repository path.
+    image = f"gcr.io/customer/dockerimage@sha256:{_SHA_A}"
+    purl = f"pkg:docker/customer/dockerimage@sha256%3A{_SHA_A}?repository_url="
+
+    def snapshot(name: str, qualifier: str) -> Path:
+        path = tmp_path / name
+        path.write_text(
+            json.dumps(
+                _cdx(components=[{"type": "container", "name": image, "purl": purl + qualifier}])
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    inv = tmp_path / "static.json"
+    inv.write_text(
+        AIBOM(
+            components=[
+                RegistryEntryComponent(
+                    bom_ref="reg:dockerimage",
+                    name=image,
+                    package_url=purl + "gcr.io",
+                    registry_type="oci",
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    for qualifier in ("gcr.io", "gcr.io/customer/dockerimage"):
+        report = collect(inv, [snapshot(f"{qualifier.count('/')}.cdx.json", qualifier)])
+        assert report["gate"]["passed"] is True
+        assert [m["inventory_refs"] for m in report["reconciliation"]["matched"]] == [
+            ["reg:dockerimage"]
+        ]
+    for qualifier in ("quay.io", "gcr.io/other/dockerimage"):
+        with pytest.raises(RuntimeBOMInputError, match="repository disagree"):
+            collect(inv, [snapshot("elsewhere.cdx.json", qualifier)])
+
+
+def test_pypi_package_repository_provenance_isolation(tmp_path):
+    static = AIBOM(
+        components=[
+            RegistryEntryComponent(
+                bom_ref="pkg:pypi/torch-default",
+                name="torch",
+                version="2.5.0",
+                registry_type="pypi",
+                package_url="pkg:pypi/torch@2.5.0?repository_url=https://pypi.org/simple",
+            ),
+            RegistryEntryComponent(
+                bom_ref="pkg:pypi/internal-sdk",
+                name="internal-ai-sdk",
+                version="1.0.0",
+                registry_type="pypi",
+                registry_uri="https://pypi.internal.example/simple",
+                package_url="pkg:pypi/internal-ai-sdk@1.0.0?repository_url=https://pypi.internal.example/simple",
+            ),
+        ]
+    )
+    inv = tmp_path / "static-pkgs.json"
+    inv.write_text(static.to_native_json(), encoding="utf-8")
+
+    matching_rt = tmp_path / "match.cdx.json"
+    matching_rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "purl": "pkg:pypi/torch@2.5.0?repository_url=https://files.pythonhosted.org",
+                    },
+                    {
+                        "type": "library",
+                        "name": "internal-ai-sdk",
+                        "purl": "pkg:pypi/internal-ai-sdk@1.0.0?repository_url=https://pypi.internal.example/simple/",
+                    },
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    matched = collect(inv, [matching_rt], fail_on="drift")
+    assert matched["gate"]["passed"] is True
+    assert len(matched["reconciliation"]["matched"]) == 2
+    assert {row["repository"] for row in matched["reconciliation"]["matched"]} == {
+        "https://pypi.org",
+        "https://pypi.internal.example",
+    }
+
+    mismatch_rt = tmp_path / "mismatch.cdx.json"
+    mismatch_rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "purl": "pkg:pypi/torch@2.5.0?repository_url=https://evil.example/simple",
+                    },
+                    {
+                        "type": "library",
+                        "name": "internal-ai-sdk",
+                        "purl": "pkg:pypi/internal-ai-sdk@1.0.0",
+                    },
+                    {
+                        "type": "library",
+                        "name": "internal-ai-sdk",
+                        "purl": "pkg:pypi/internal-ai-sdk@1.0.0?repository_url=https://pypi.internal.example/other",
+                    },
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "purl": "pkg:pypi/torch@2.5.0?repository_url=https://pypi.org/simple&platform=linux",
+                    },
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "purl": "pkg:pypi/torch@2.5.0?repository_url=https://pypi.org/simple#pkg/sub",
+                    },
+                    {
+                        "type": "library",
+                        "name": "torch",
+                        "purl": "pkg:pypi/torch@2.5.0?repository_url=https%3A%2F%2Fuser%3Asecretpass%40evil2.example%2Fsimple",
+                    },
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    mismatched = collect(inv, [mismatch_rt], fail_on="undeclared")
+    assert mismatched["gate"]["passed"] is False
+    assert len(mismatched["reconciliation"]["undeclared"]) == 6
+    assert mismatched["reconciliation"]["matched"] == []
+    assert "secretpass" not in render(mismatched)
+
+    clean_rt = tmp_path / "clean.cdx.json"
+    clean_rt.write_text(json.dumps(_cdx()), encoding="utf-8")
+    for bad_comp in (
+        RegistryEntryComponent(
+            bom_ref="pkg:bad-uri",
+            name="torch",
+            registry_type="pypi",
+            registry_uri="https://a.example/simple",
+            package_url="pkg:pypi/torch@2.5.0?repository_url=https://b.example/simple",
+        ),
+        RegistryEntryComponent(
+            bom_ref="pkg:empty-uri",
+            name="torch",
+            registry_type="pypi",
+            registry_uri="   ",
+        ),
+        RegistryEntryComponent(
+            bom_ref="pkg:bad-eco",
+            name="openai",
+            registry_type="pypi",
+            package_url="pkg:npm/openai@1.50.0",
+        ),
+        RegistryEntryComponent(
+            bom_ref="pkg:bad-name",
+            name="openai",
+            registry_type="pypi",
+            package_url="pkg:pypi/other-pkg@1.50.0",
+        ),
+    ):
+        bad_inv = tmp_path / f"{bad_comp.bom_ref.replace(':', '_')}.json"
+        bad_inv.write_text(AIBOM(components=[bad_comp]).to_native_json(), encoding="utf-8")
+        with pytest.raises(RuntimeBOMInputError):
+            collect(bad_inv, [clean_rt])
+
+
+def test_origin_only_scanner_inventory_matches_unchanged_runtime_and_redacts_query(tmp_path):
+    from nexus_symbiote.scanners.mcp import MCPScanner
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "tools-gateway": {
+                        "url": "https://tools.cluster.local:8443/mcp?tenant=prod&token=secretval123"
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    scan_res = MCPScanner().scan(project)
+    inv = tmp_path / "scanned.aibom.json"
+    inv.write_text(AIBOM(components=scan_res.components).to_native_json(), encoding="utf-8")
+
+    # Same configured origin matches without false drift and documents origin-only granularity.
+    same_origin_rt = tmp_path / "same-origin.cdx.json"
+    same_origin_rt.write_text(
+        json.dumps(
+            _cdx(
+                services=[
+                    {
+                        "name": "tools-gateway",
+                        "endpoints": [
+                            "https://tools.cluster.local:8443/mcp?tenant=prod&flag&token=secretval123"
+                        ],
+                    }
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    ok = collect(inv, [same_origin_rt], fail_on="drift")
+    assert ok["gate"]["passed"] is True
+    (matched_row,) = ok["reconciliation"]["matched"]
+    assert matched_row["endpoint_comparison"] == "origin-only"
+    assert matched_row["endpoint_path_query_unverified"] is True
+    assert "secretval123" not in render(ok)
+    assert matched_row["endpoints"] == ["https://tools.cluster.local:8443"]
+
+    # Origin fallback matches when runtime service name differs but origin matches.
+    renamed_rt = tmp_path / "renamed.cdx.json"
+    renamed_rt.write_text(
+        json.dumps(
+            _cdx(
+                services=[
+                    {"name": "gateway-pod", "endpoints": ["https://tools.cluster.local:8443/sse"]}
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    renamed = collect(inv, [renamed_rt], fail_on="drift")
+    assert renamed["gate"]["passed"] is True
+    assert renamed["reconciliation"]["matched"][0]["endpoint_comparison"] == "origin-only"
+
+    # Changing host, port, or scheme against origin-only static export still drifts.
+    changed_origin_rt = tmp_path / "changed-origin.cdx.json"
+    changed_origin_rt.write_text(
+        json.dumps(
+            _cdx(
+                services=[
+                    {"name": "tools-gateway", "endpoints": ["https://attacker.example:8443/mcp"]}
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    drifted = collect(inv, [changed_origin_rt], fail_on="drift")
+    assert drifted["gate"]["passed"] is False
+    assert drifted["reconciliation"]["drifted"][0]["drift_reasons"] == ["endpoint_mismatch"]
+    assert drifted["reconciliation"]["drifted"][0]["endpoint_comparison"] == "origin-only"
+
+    # Redacted static endpoint ("[redacted]" from env expansion) does not abort and flags mismatch.
+    redacted_inv = tmp_path / "redacted-static.json"
+    redacted_inv.write_text(
+        AIBOM(
+            components=[
+                MCPServerComponent(
+                    bom_ref="mcp:env",
+                    name="env-gw",
+                    endpoint_url="[redacted]",
+                    properties={"collection_mode": "static-config"},
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    env_rt = tmp_path / "env-rt.cdx.json"
+    env_rt.write_text(
+        json.dumps(_cdx(services=[{"name": "env-gw", "endpoints": ["https://env.example/mcp"]}])),
+        encoding="utf-8",
+    )
+    redacted_report = collect(redacted_inv, [env_rt], fail_on="drift")
+    assert redacted_report["gate"]["passed"] is False
+    assert redacted_report["reconciliation"]["drifted"][0]["drift_reasons"] == ["endpoint_mismatch"]
+
+    # Additional repository, subpath, empty repository_url and IPv6 endpoint edge branches.
+    from nexus_symbiote.runtime_bom_drift import _normalize_endpoint, _package_repository
+
+    assert _normalize_endpoint("https://[::1]/mcp") == "https://[::1]:443/mcp"
+    assert _package_repository("npm", None) == "https://registry.npmjs.org"
+    assert _package_repository("cargo", "pkg:cargo/candle-core@0.8.0") is None
+    for bad_purl in (
+        "pkg:pypi/torch@2.5.0?repository_url=",
+        "pkg:pypi/torch@2.5.0?repository_url=%20",
+        "pkg:pypi/torch@2.5.0?repository_url=https://pypi.org&repository_url=https://evil.example",
+    ):
+        with pytest.raises(RuntimeBOMInputError, match="Invalid package URL"):
+            _package_repository("pypi", bad_purl)
+
+
+def test_secret_purl_repository_provenance_trojan_and_ipv6_hardening(tmp_path):
+    static = AIBOM(
+        components=[
+            RegistryEntryComponent(
+                bom_ref="pkg:pypi/langchain",
+                name="langchain",
+                version="0.3.27",
+                registry_type="pypi",
+                package_url="pkg:pypi/langchain@0.3.27",
+            ),
+            RegistryEntryComponent(
+                bom_ref="pkg:npm/langchain-core",
+                name="@langchain/core",
+                version="0.3.0",
+                registry_type="npm",
+                package_url="pkg:npm/%40langchain/core@0.3.0",
+            ),
+        ]
+    )
+    inv = tmp_path / "static.json"
+    inv.write_text(static.to_native_json(), encoding="utf-8")
+
+    # 1. Withheld secret PURL never falls back to raw self.purl; schemeless & double-encoded
+    #    repository credentials redact cleanly.
+    secret_rt = tmp_path / "secret-purl.cdx.json"
+    secret_rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "library",
+                        "name": "langchain",
+                        "version": "0.3.27",
+                        "purl": "pkg:pypi/langchain@0.3.27?repository_url=alice%3Ahunter2%40evil.example%2Fsimple",
+                    },
+                    {
+                        "type": "library",
+                        "name": "langchain",
+                        "version": "0.3.27",
+                        "purl": "pkg:pypi/langchain@0.3.27?repository_url=https%3A%2F%2Fbob%253As3cr3t%40evil2.example%2Fsimple",
+                    },
+                    {
+                        "type": "library",
+                        "name": "langchain",
+                        "version": "0.3.27",
+                        "purl": "pkg:pypi/langchain@0.3.27#ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+                    },
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    sec_report = collect(inv, [secret_rt], fail_on="undeclared")
+    rendered = render(sec_report)
+    for leak in ("hunter2", "s3cr3t", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"):
+        assert leak not in rendered
+    assert any(obs.get("repository") == "***" for obs in sec_report["observed"])
+
+    # 2. Provenance qualifiers (download_url, vcs_url, checksum) are NOT stripped during matching.
+    prov_rt = tmp_path / "prov-qualifiers.cdx.json"
+    prov_rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "library",
+                        "name": "langchain",
+                        "version": "0.3.27",
+                        "purl": "pkg:pypi/langchain@0.3.27?download_url=https://evil.invalid/langchain.whl",
+                    },
+                    {
+                        "type": "library",
+                        "name": "langchain",
+                        "version": "0.3.27",
+                        "purl": "pkg:pypi/langchain@0.3.27?vcs_url=git+https://evil.invalid/langchain.git",
+                    },
+                    {
+                        "type": "library",
+                        "name": "langchain",
+                        "version": "0.3.27",
+                        "purl": f"pkg:pypi/langchain@0.3.27?checksum=sha256:{_SHA_B}",
+                    },
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    prov_report = collect(inv, [prov_rt], fail_on="undeclared")
+    assert prov_report["gate"]["passed"] is False
+    assert prov_report["reconciliation"]["matched"] == []
+    assert len(prov_report["reconciliation"]["undeclared"]) == 3
+
+    # 3. Runtime package name/group disagreeing with PURL raises RuntimeBOMInputError; valid group matches.
+    group_ok_rt = tmp_path / "group-ok.cdx.json"
+    group_ok_rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "library",
+                        "group": "@langchain",
+                        "name": "core",
+                        "version": "0.3.0",
+                        "purl": "pkg:npm/%40langchain/core@0.3.0",
+                    }
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    ok_group = collect(inv, [group_ok_rt], fail_on="drift")
+    assert ok_group["gate"]["passed"] is True
+
+    trojan_rt = tmp_path / "trojan.cdx.json"
+    trojan_rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "library",
+                        "name": "evil-trojan",
+                        "version": "0.3.27",
+                        "purl": "pkg:pypi/langchain@0.3.27",
+                    }
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError, match="name and package URL disagree"):
+        collect(inv, [trojan_rt])
+
+    # 4. Malformed static IPv6 endpoint in origin-only check raises RuntimeBOMInputError, not ValueError.
+    bad_ipv6_inv = tmp_path / "bad-ipv6.json"
+    bad_ipv6_inv.write_text(
+        AIBOM(
+            components=[
+                MCPServerComponent(
+                    bom_ref="mcp:bad-v6",
+                    name="bad-v6",
+                    endpoint_url="https://[::1",
+                    properties={"collection_mode": "static-config"},
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    empty_rt = tmp_path / "empty-rt.cdx.json"
+    empty_rt.write_text(json.dumps(_cdx()), encoding="utf-8")
+    with pytest.raises(RuntimeBOMInputError, match="invalid host or port"):
+        collect(bad_ipv6_inv, [empty_rt])
+
+
+@pytest.mark.parametrize(
+    "qualifier",
+    [
+        "repository_url=https://packages.example.test/simple",
+        "platform=linux",
+        "arch=arm64",
+        "file_name=torch.whl",
+    ],
+)
+def test_digest_disagreement_is_scoped_to_the_package_artifact(tmp_path, qualifier):
+    inventory = tmp_path / "static.json"
+    stem = "pkg:pypi/torch@2.5.0"
+    purls = [stem, f"{stem}?{qualifier}"]
+    AIBOM(
+        components=[
+            RegistryEntryComponent(name="torch", bom_ref=f"package:{index}", package_url=purl)
+            for index, purl in enumerate(purls)
+        ]
+    ).save(inventory)
+    snapshot = tmp_path / "runtime.json"
+
+    def write_snapshot(purls):
+        snapshot.write_text(
+            json.dumps(
+                _cdx(
+                    components=[
+                        {
+                            "type": "library",
+                            "name": "torch",
+                            "purl": purl,
+                            "hashes": [{"alg": "SHA-256", "content": digest}],
+                        }
+                        for purl, digest in zip(purls, (_SHA_A, _SHA_B), strict=True)
+                    ]
+                )
+            )
+        )
+
+    write_snapshot(purls)
+    assert collect(inventory, [snapshot], fail_on="drift")["gate"]["passed"]
+    write_snapshot([stem, stem + "?repository_url=https://pypi.org/simple"])
+    conflicts = collect(inventory, [snapshot], fail_on="drift")
+    assert not conflicts["gate"]["passed"]
+    assert all(
+        "conflicting_reported_digests" in row["drift_reasons"]
+        for row in conflicts["reconciliation"]["drifted"]
+    )

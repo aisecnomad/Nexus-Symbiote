@@ -208,5 +208,126 @@ def trace_diff(
         raise click.exceptions.Exit(1)
 
 
+def _drift_summary(document: Mapping[str, Any]) -> None:
+    coverage = document["coverage"]
+    rec = document["reconciliation"]
+    gate = document["gate"]
+    echo_line(
+        "Cluster BOM drift: ",
+        "reported CycloneDX cluster snapshot; missing items cannot prove absence",
+    )
+    echo_line(
+        "  Read: ",
+        f"runtime BOMs {coverage['runtime_boms_read']}, entries {coverage['cyclonedx_entries_read']}, "
+        f"matched {len(rec['matched'])}, drifted {len(rec['drifted'])}, "
+        f"mutable tags {len(rec['mutable_tags'])}, undeclared {len(rec['undeclared'])}, "
+        f"unobserved {len(rec['unobserved'])}",
+    )
+    for item in rec["undeclared"][:LISTED]:
+        echo_line(f"  Undeclared ({item['kind']}): ", item["name"])
+    for item in rec["drifted"][:LISTED]:
+        reasons = ", ".join(item.get("drift_reasons", ()))
+        echo_line(f"  Drifted ({item['kind']}): ", f"{item['name']} ({reasons})")
+    for item in rec["mutable_tags"][:LISTED]:
+        echo_line(
+            f"  Mutable image tag ({item['kind']}): ",
+            f"{item['name']} ({item.get('mutable_tag_reason', 'unpinned')})",
+        )
+    if gate["fail_on"] == "none":
+        echo_line("Drift gate: ", "not applied (--fail-on none)")
+    elif gate["passed"]:
+        echo_line("Drift gate passed: ", "no failing cluster BOM drift found in these inputs")
+    else:
+        echo_line("Drift gate failed: ", "; ".join(gate["reasons"]))
+
+
+@click.command("k8s-drift")
+@click.argument("inventory", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument(
+    "runtime_boms",
+    nargs=-1,
+    required=True,
+    metavar="RUNTIME_BOM...",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(path_type=Path),
+    help="Write the JSON drift report to this file.",
+)
+@click.option(
+    "--json-output",
+    is_flag=True,
+    help="Print the drift report as canonical JSON instead of a text summary.",
+)
+@click.option(
+    "--sarif",
+    "sarif_path",
+    type=click.Path(path_type=Path),
+    metavar="SARIF_PATH",
+    help="Also write schema-valid SARIF 2.1.0 findings for runtime drift.",
+)
+@click.option(
+    "--fail-on",
+    type=click.Choice(["undeclared", "drift", "none"]),
+    default="undeclared",
+    show_default=True,
+    help=(
+        "undeclared: fail on undeclared runtime items or empty BOMs; "
+        "drift: also fail on version, SHA-256 digest, endpoint drift or mutable tags; "
+        "none: report only."
+    ),
+)
+def k8s_drift(
+    inventory: Path,
+    runtime_boms: tuple[Path, ...],
+    output: Path | None,
+    json_output: bool,
+    sarif_path: Path | None,
+    fail_on: str,
+) -> None:
+    """Compare CycloneDX cluster/runtime BOMs against a static native AgentBOM (offline)."""
+    from nexus_symbiote.core.aibom import NativeFormatError
+    from nexus_symbiote.runtime_bom_drift import (
+        MAX_RUNTIME_BOMS,
+        RuntimeBOMInputError,
+        collect,
+        render,
+        sarif_document,
+    )
+
+    if len(runtime_boms) > MAX_RUNTIME_BOMS:
+        raise click.UsageError(
+            f"at most {MAX_RUNTIME_BOMS} runtime BOM files can be checked at once"
+        )
+    _refuse_overwrite(
+        [path for path in (output, sarif_path) if path is not None],
+        [inventory, *runtime_boms],
+    )
+    try:
+        document = collect(inventory, runtime_boms, fail_on=fail_on)
+    except NativeFormatError as exc:
+        raise click.ClickException(
+            f"{neutralize(inventory)} is not a valid native AIBOM file. {neutralize(exc)}"
+        ) from None
+    except RuntimeBOMInputError as exc:
+        raise click.ClickException(neutralize(exc)) from None
+
+    text = render(document)
+    if sarif_path is not None:
+        sarif = sarif_document(document, _anchor(inventory))
+        write_cli_output(sarif_path, json.dumps(sarif, indent=2) + "\n")
+    if output is not None:
+        write_cli_output(output, text + "\n")
+    if json_output:
+        click.echo(json_text(text))
+    else:
+        _drift_summary(document)
+    if not document["gate"]["passed"]:
+        raise click.exceptions.Exit(1)
+
+
 def register_trace_commands(main: click.Group) -> None:
     main.add_command(trace_diff)
+    main.add_command(k8s_drift)

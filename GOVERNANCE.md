@@ -111,6 +111,7 @@ Every gate prints each of its failure reasons. How many findings the console lis
 | `import-sbom` | Experimental | offline | Foreign CycloneDX or SPDX SBOM imported as declared evidence |
 | `evidence-profile` | Experimental | offline | Evidence attributes per component, without a scalar trust score |
 | `export-policy` | Experimental | offline | Default-deny Cedar, Rego v1 or JSON runtime allowlist from an inventory |
+| `k8s-drift` | Experimental | offline | Offline CycloneDX cluster/runtime ML-BOM vs static AgentBOM drift check |
 | `discover-mcp` | Experimental | **live** | Opt-in HTTPS MCP tool listing without calling tools |
 | `advisories` | Experimental | **live** | Opt-in OSV lookup for exact PyPI and npm package versions |
 | `verify-live` | Experimental | **live** | Opt-in namespace-isolated stdio MCP verification against operator launch policy |

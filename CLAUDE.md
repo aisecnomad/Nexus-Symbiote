@@ -23,7 +23,7 @@ src/nexus_symbiote/
   risk_classes.py, graph_view.py, graph_cli.py — Risk classes, exposure paths; the `graph` HTML/JSON view
   digest_cli.py                        — `digest`: file, canonical and content digests of an inventory
   attestation.py, attestation_cli.py   — DSSE/in-toto inventory attestations; `attest`, `verify-attestation`
-  otlp.py, trace_evidence.py, trace_cli.py — Bounded OTLP/JSON trace reading, reported evidence; `trace-diff`
+  otlp.py, trace_evidence.py, runtime_bom_drift.py, trace_cli.py — Bounded OTLP/JSON & cluster CycloneDX reconciliation, reported evidence; `trace-diff`, `k8s-drift`
   crosswalk.py, crosswalk_cli.py       — Framework crosswalk that SARIF tags come from; `crosswalk`
   minimum_elements.py, minimum_elements_cli.py — G7 AI SBOM minimum-element coverage; `minimum-elements`
   inventory_export.py, inventory_export_cli.py — ShadowScan simple-list export; `export-inventory`
