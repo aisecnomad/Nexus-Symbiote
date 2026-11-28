@@ -808,8 +808,9 @@ def _mermaid_node_id(raw: str) -> str:
 
 
 def _mermaid_label(raw: str) -> str:
-    escaped = html.escape(neutralize(raw), quote=True)
+    cleaned = neutralize(raw)
     for char, repl in (
+        ("\\", "/"),
         ("|", "/"),
         ("[", "("),
         ("]", ")"),
@@ -817,8 +818,8 @@ def _mermaid_label(raw: str) -> str:
         ("#", ""),
         (";", ","),
     ):
-        escaped = escaped.replace(char, repl)
-    return escaped
+        cleaned = cleaned.replace(char, repl)
+    return html.escape(cleaned, quote=True).replace("%", "&#37;")
 
 
 _MD_PUNCTUATION = re.compile("([" + re.escape(string.punctuation) + "])")

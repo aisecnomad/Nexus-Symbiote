@@ -1042,3 +1042,18 @@ def test_component_identity_assurance_does_not_promote_static_reference_hops() -
             hop.relationship != "data_refs"
         ):
             assert hop.assurance == "declared"
+
+
+def test_mermaid_label_preserves_html_entities_and_blocks_comment_and_quote_breakout() -> None:
+    from nexus_symbiote.security_graph import _mermaid_label
+
+    # HTML entities must remain intact (no '#'/';' mangling after html.escape).
+    assert _mermaid_label("a\"b<c>'d") == "a&quot;b&lt;c&gt;&#x27;d"
+    # Mermaid comment delimiters (including odd-length runs) and trailing backslashes stay inert.
+    escaped_comment = _mermaid_label("%%{init: {'securityLevel':'loose'}}%%%\\")
+    assert "%%" not in escaped_comment
+    assert "\\" not in escaped_comment
+    assert "&#37;" in escaped_comment
+    assert not escaped_comment.endswith("\\")
+    # Raw Mermaid structural syntax is stripped before escaping without corrupting entities.
+    assert _mermaid_label("a|b[c]`d#e;f") == "a/b(c)&#x27;de,f"
