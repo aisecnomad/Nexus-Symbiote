@@ -1308,7 +1308,7 @@ def typescript_identifiers(source: bytes, suffix: str) -> Iterator[tuple[int, st
         if node.child_count == 0 and (
             node.type == "identifier" or node.type.endswith("_identifier")
         ):
-            yield node.start_point.row + 1, _value(node)
+            yield node.start_point.row + 1, _name(node)
 
 
 def _collect_source(

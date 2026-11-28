@@ -203,3 +203,24 @@ def test_credential_store_target_is_an_explicit_coverage_exclusion(
     )
     assert len(exclusions) == 1 and "not read" in exclusions[0]
     assert not server.risks
+
+
+def test_ascii_js_escape_is_interpreted_only_in_identifier_nodes(tmp_path: Path) -> None:
+    (tmp_path / "agent.js").write_text(r'const comment = "x\u0435";' + "\n" + r"let x\u0435 = 1;")
+    server = _server("agent.js")
+    assert apply_source_unicode_findings(AIBOM(components=[server]), tmp_path) == 1
+    assert server.risks[0].detail == "agent.js:2 mixes the Cyrillic, Latin scripts."
+
+
+def test_repeated_rtl_marks_keep_their_count_and_other_findings(tmp_path: Path) -> None:
+    (tmp_path / "agent.py").write_text(("# مرحبا\u200f\n" * 40) + _BIDI)
+    server = _server("agent.py")
+    failures: list[str] = []
+    assert (
+        apply_source_unicode_findings(AIBOM(components=[server]), tmp_path, failures=failures) == 2
+    )
+    assert failures == []
+    assert _categories(server) == {"directional_marks", "bidi_override"}
+    assert any(
+        "U+200F) x40" in risk.detail and "agent.py:1" in risk.detail for risk in server.risks
+    )

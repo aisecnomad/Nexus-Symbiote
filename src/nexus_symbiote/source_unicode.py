@@ -20,7 +20,11 @@ from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.identifiers import mixed_scripts
 from nexus_symbiote.core.models import AnyComponent, RiskAssessment
 from nexus_symbiote.scanners.credential_files import credential_gap, credential_shaped
-from nexus_symbiote.scanners.prompt import detect_invisible_characters
+from nexus_symbiote.scanners.prompt import (
+    DIRECTIONAL_MARKS,
+    detect_invisible_characters,
+    directional_mark_risk,
+)
 from nexus_symbiote.scanners.ts_tools import SCRIPT_SUFFIXES, typescript_identifiers
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.terminal import neutralize
@@ -109,7 +113,9 @@ def apply_source_unicode_findings(
                     f"{neutralize(rel_path)}: source characters were not read (not UTF-8)"
                 )
                 continue
-            if text.isascii():
+            if text.isascii() and not (
+                PurePosixPath(rel_path).suffix.lower() in SCRIPT_SUFFIXES and "\\u" in text
+            ):
                 continue
             text = text.replace("\r\n", "\n").replace("\r", "\n")
             identifier_lines = _mixed_identifier_lines(text, rel_path, len(raw), own_failures)
@@ -120,9 +126,11 @@ def apply_source_unicode_findings(
                 if any(risk.category == "identifier_characters" for risk in component.risks)
             }
             found: list[RiskAssessment] = []
+            mark_counts: dict[str, int] = {}
+            first_mark = ""
             refused = False
             for line_no, line in enumerate(io.StringIO(text), start=1):
-                if line.isascii():
+                if line.isascii() and line_no not in identifier_lines:
                     continue
                 where = f"{neutralize(rel_path)}:{line_no}"
                 scripts = identifier_lines.get(line_no)
@@ -138,14 +146,24 @@ def apply_source_unicode_findings(
                             ),
                         )
                     )
-                found.extend(detect_invisible_characters(line, where, at_start=line_no == 1))
-                if len(found) > MAX_FINDINGS:
+                if not line.isascii():
+                    for risk in detect_invisible_characters(line, where, at_start=line_no == 1):
+                        if risk.category == "directional_marks":
+                            first_mark = first_mark or where
+                            for char in DIRECTIONAL_MARKS:
+                                if count := line.count(char):
+                                    mark_counts[char] = mark_counts.get(char, 0) + count
+                        else:
+                            found.append(risk)
+                if len(found) + bool(first_mark) > MAX_FINDINGS:
                     own_failures.append(
                         f"{neutralize(rel_path)}: more than {MAX_FINDINGS} source Unicode "
                         "findings; not collected"
                     )
                     refused = True
                     break
+            if first_mark and (mark_risk := directional_mark_risk(mark_counts, first_mark)):
+                found.append(mark_risk)
             if refused or not found:
                 continue
             owner = min(group, key=lambda item: item.bom_ref)
