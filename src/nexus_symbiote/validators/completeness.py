@@ -363,6 +363,7 @@ class CompletenessValidator:
         a supplier claim, never presented as reconciled. The report's coverage is the
         local collection's. Integrity and signer policy are checked separately.
         """
+        from nexus_symbiote.env_credentials import apply_env_credential_findings
         from nexus_symbiote.graph import assemble_repository_agent
         from nexus_symbiote.literal_credentials import apply_literal_credential_findings
         from nexus_symbiote.scanners import ALL_SCANNERS, ModelScanner
@@ -378,6 +379,7 @@ class CompletenessValidator:
         accepted_default_exclusions: set[str] = set()
         accepted_default_names: set[str] = set()
         status: dict[str, str] = {}
+        prior_walk_failures: set[str] = set()
         report_digest: str | None = None
 
         for scanner_type in ALL_SCANNERS:
@@ -399,6 +401,7 @@ class CompletenessValidator:
                 status[scanner.name] = "failed"
                 continue
             local.make_portable(root)
+            prior_walk_failures.update(local.scan_failures)
             for reason in (*local.scan_failures, *local.surfaces_excluded):
                 incomplete(scanner.name, f"Local collection incomplete: {reason}")
             if scanner.name == "shadowscan":
@@ -449,6 +452,16 @@ class CompletenessValidator:
         excluded.extend(literal_exclusions)
         for reason in (*literal_failures, *literal_exclusions):
             incomplete("literal_credentials", f"Local collection incomplete: {reason}")
+        env_failures: list[str] = []
+        apply_env_credential_findings(
+            expected,
+            root,
+            exclude_paths=exclude_paths,
+            failures=env_failures,
+            prior_failures=prior_walk_failures,
+        )
+        for reason in env_failures:
+            incomplete("env_credentials", f"Local collection incomplete: {reason}")
         coverage = self._local_coverage(
             report_digest,
             surfaces,
