@@ -308,3 +308,34 @@ def test_an_unterminated_quoted_value_fails_closed(tmp_path: Path) -> None:
     )
     assert notes.risks == []
     assert failures == ["an env file: env file has an unterminated quoted value; not collected"]
+
+
+def test_backtick_continuations_stay_private_and_single_quotes_are_literal(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(
+        "NOTE=`first\nprivateBody=padded\nlast`\nWIN='path\\'\nNEXT='ordinary'\n"
+    )
+    notes = _bom(tmp_path)
+    failures: list[str] = []
+    assert (
+        apply_env_credential_findings(AIBOM(components=[notes]), tmp_path, failures=failures) == 3
+    )
+    assert failures == []
+    assert [risk.detail.split(" holds")[0] for risk in notes.risks] == [
+        ".env:1: NOTE",
+        ".env:4: WIN",
+        ".env:5: NEXT",
+    ]
+    assert "privateBody" not in notes.model_dump_json()
+
+
+def test_store_assignments_never_use_fingerprint_matching(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".env").write_text("MODE=ordinary\n")
+    notes = _bom(tmp_path)
+
+    def unexpected(*args: object, **kwargs: object) -> bool:
+        pytest.fail("store assignment reached fingerprint matching")
+
+    monkeypatch.setattr(env_credentials, "credential_suppressed", unexpected)
+    assert apply_env_credential_findings(AIBOM(components=[notes]), tmp_path) == 1

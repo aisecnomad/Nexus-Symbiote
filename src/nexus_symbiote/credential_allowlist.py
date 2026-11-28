@@ -138,6 +138,10 @@ def load_credential_allowlist(
             exclude_paths=exclude_paths,
             max_file_bytes=min(_MAX_BYTES, limits.current().file_bytes),
         ) as files:
+            if any(files.case_variants(name) for name in ALLOWLIST_NAMES):
+                return CredentialAllowlist(), (
+                    "credential allowlist: unexpected filename case; nothing is suppressed"
+                )
             present = [name for name in ALLOWLIST_NAMES if files.entry_exists(name)]
             if len(present) > 1:
                 return CredentialAllowlist(), (
@@ -195,3 +199,11 @@ def credential_suppressed(literal: str, *, rel_path: str | None = None) -> bool:
         return False
     digest = hashlib.sha256(normalize_credential(literal).encode("utf-8")).hexdigest()
     return allow.suppresses(_PATH.get() if rel_path is None else rel_path, digest)
+
+
+def credential_path_suppressed(rel_path: str) -> bool:
+    """Store assignments can only be suppressed by path, without hashing their values."""
+    allow = _ALLOW.get()
+    return allow is not None and any(
+        entry.path is not None and path_glob_matches(entry.path, rel_path) for entry in allow.allow
+    )

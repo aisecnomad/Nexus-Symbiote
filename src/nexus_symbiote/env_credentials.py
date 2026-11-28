@@ -17,7 +17,7 @@ from typing import Any
 from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.models import RiskAssessment
-from nexus_symbiote.credential_allowlist import bind_credential_path, credential_suppressed
+from nexus_symbiote.credential_allowlist import credential_path_suppressed, credential_suppressed
 from nexus_symbiote.literal_credentials import MAX_LITERALS, _commitment
 from nexus_symbiote.scanners.base import KnownValues, declared_server_name
 from nexus_symbiote.scanners.mcp_credentials import CredentialScrubber, normalize_credential
@@ -30,7 +30,6 @@ MAX_ENV_LINES = 10_000
 MAX_ENV_LINE_CHARS = 8_192
 _TEMPLATE_SUFFIXES = frozenset({".example", ".sample", ".template"})
 _KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_QUOTED_VALUE = re.compile(r"""(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')\s*(?:#.*)?""")
 _PREFIXES = (
     ("github_pat_", "github"),
     ("ghp_", "github"),
@@ -91,12 +90,15 @@ def _assignment(line: str) -> tuple[str, str, str | None] | None:
     key = key.strip()
     value = value.strip()
     opened = None
-    if quoted := _QUOTED_VALUE.fullmatch(value):
-        value = quoted[1] if quoted[1] is not None else quoted[2]
-    elif not value.startswith(('"', "'")):
+    if value.startswith(('"', "'", "`")):
+        quote = value[0]
+        end = _quote_end(value, quote, 1)
+        if end is None:
+            opened = quote
+        elif not value[end + 1 :].strip() or value[end + 1 :].lstrip().startswith("#"):
+            value = value[1:end]
+    else:
         value = re.split(r"(?<=\s)#", value, maxsplit=1)[0].rstrip()
-    elif _quote_end(value, value[0], 1) is None:
-        opened = value[0]
     if not _KEY.fullmatch(key) or TOKEN_SHAPE.search(key):
         key = "a key name"
     return key, value, opened
@@ -104,6 +106,9 @@ def _assignment(line: str) -> tuple[str, str, str | None] | None:
 
 def _quote_end(text: str, quote: str, start: int = 0) -> int | None:
     """The index of the first ``quote`` at or after ``start`` that no backslash escapes."""
+    if quote == "'":
+        end = text.find(quote, start)
+        return end if end >= 0 else None
     escaped = False
     for index in range(start, len(text)):
         char = text[index]
@@ -232,8 +237,7 @@ def apply_env_credential_findings(
             if component is None:
                 read_failures.append("env credential has no component to record it")
                 continue
-            with bind_credential_path(rel_path):
-                findings = _line_findings(rel_path, lines, kind == "template", read_failures, known)
+            findings = _line_findings(rel_path, lines, kind == "template", read_failures, known)
             if findings:
                 pending.append((component, rel_path, findings))
     # A location or key can contain an assignment from a later file, including an
@@ -293,6 +297,7 @@ def _line_findings(
     failures: list[str],
     known: _EnvValues,
 ) -> list[_EnvFinding] | None:
+    path_allowed = credential_path_suppressed(rel_path)
     found: list[_EnvFinding] = []
     index = 0
     while index < len(lines):
@@ -316,12 +321,16 @@ def _line_findings(
             index += 1
             value = "\n".join(parts)
         known.add(value)
-        if credential_suppressed(value):
+        if path_allowed:
             continue
         if template:
             normalized = normalize_credential(value)
             match = TOKEN_SHAPE.search(normalized)
-            if match is None or not holds_token_shape(match.group()):
+            if (
+                match is None
+                or not holds_token_shape(match.group())
+                or credential_suppressed(match.group(), rel_path=rel_path)
+            ):
                 continue
             finding = _EnvFinding(
                 line_no, None, f"is committed ({_commitment(rel_path, line_no, match.group())})."

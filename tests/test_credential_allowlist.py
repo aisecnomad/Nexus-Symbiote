@@ -254,3 +254,14 @@ def test_a_match_everything_glob_or_a_blank_reason_suppresses_nothing(
     docs = PromptComponent(bom_ref="prompt:docs", name="docs", source_path="docs/sample.md")
     with bind_credential_allowlist(allowlist):
         assert apply_literal_credential_findings(AIBOM(components=[docs]), tmp_path) == 1
+
+
+@pytest.mark.parametrize("canonical", [False, True])
+def test_case_variant_refuses_checkout_suppressions(tmp_path: Path, canonical: bool) -> None:
+    name = ".nexus-symbiote-credential-allowlist.yaml"
+    (tmp_path / name.upper()).write_text('allow: [{path: "docs/**", reason: "Fixture"}]')
+    if canonical:
+        (tmp_path / name).write_text("allow: []")
+    allow, error = load_credential_allowlist(tmp_path)
+    assert not allow.allow
+    assert error and "case" in error

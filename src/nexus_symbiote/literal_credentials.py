@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import re
+import tokenize
 import unicodedata
 from bisect import bisect_right
 from collections.abc import Iterable, Iterator
@@ -58,13 +59,17 @@ _TEXT_SUFFIXES = frozenset(
         ".bash",
     }
 )
-_TOKEN_WORD = re.compile(r"[\w-]++")
-_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)\s*[:=]\s*$")
+_TOKEN_WORD = re.compile(r"[\w-]++(?:[.=][\w-]++)*+=*+")
+_REVERSED_ASSIGNMENT = re.compile(r"\s*[:=]\s*([A-Za-z_0-9]+)")
 # A prefix a space may interrupt. The match itself still has to satisfy the shape table.
 _SPLIT_PREFIX = re.compile(
     r"(?<![\w-])(?:"
     r"sk-(?:proj-|svcacct-|admin-|ant-(?:[a-z]+[0-9]{2}-)?|or-v1-|lf-)?"
-    r"|github_pat_|gh[oprsu]_|glpat-|xox[abeoprs]-|hf_|npm_|AIza|(?:AKIA|ASIA)"
+    r"|github_pat_|gh[oprsu]_|glpat-|xox[abeoprs]-|hf_|npm_|AIza|AKIA|ASIA"
+    r"|[rs]k_(?:live|test)_|ya29\.|pypi-|pcsk_|gsk_|r8_|pplx-|xai-|lsv2_(?:pt|sk)_"
+    r"|tvly-|fw_|SG\.|dckr_pat_|shp(?:at|ss|ca|pa)_|SK|dapi|xapp-|PMAK-"
+    r"|dp\.(?:pt|ct|sa|scim|audit|st(?:\.[a-z0-9_-]{2,35}+)?)\.|do[opr]_v1_|lin_(?:api|oauth)_"
+    r"|ATATT3|AGE-SECRET-KEY-1|eyJ"
     r")"
 )
 _BINDING_PROFILE = "vendor-token"
@@ -98,22 +103,30 @@ def _ends_assigned_value(visible: str, start: int, end: int) -> bool:
         return False
     if visible[start - 1] != visible[end]:
         return False
-    assignment = _ASSIGNMENT.search(visible, max(0, start - _CANDIDATE_CHARS), start - 1)
-    return assignment is not None and credential_name(assignment[1])
+    # Start at the opening quote. The separator and the name each consume a
+    # single run, even when the preceding text is one long unbroken word.
+    context = visible[max(0, start - _CANDIDATE_CHARS) : start - 1]
+    assignment = _REVERSED_ASSIGNMENT.match(context[::-1])
+    if assignment is None:
+        return False
+    name = assignment[1][::-1]
+    return not name[0].isdigit() and credential_name(name)
 
 
 def _complete_candidate(candidate: str) -> bool:
     return TOKEN_SHAPE.fullmatch(candidate) is not None and holds_token_shape(candidate)
 
 
+def _alphabetic_word(word: str) -> bool:
+    return word.replace("-", "").isalpha()
+
+
 def _split_candidate(visible: str, prefix: re.Match[str]) -> tuple[str, int]:
     """Read one bounded candidate, keeping ordinary words outside the token."""
     limit = min(len(visible), prefix.start() + _CANDIDATE_CHARS)
     word = _TOKEN_WORD.match(visible, prefix.end(), limit)
-    if word is None:
-        return prefix.group(), prefix.end()
-    candidate = prefix.group() + word.group()
-    end = word.end()
+    end = prefix.end() if word is None else word.end()
+    candidate = visible[prefix.start() : end]
     while end < limit and visible[end].isspace() and not _complete_candidate(candidate):
         next_start = end + 1
         while next_start < limit and visible[next_start].isspace():
@@ -121,7 +134,9 @@ def _split_candidate(visible: str, prefix: re.Match[str]) -> tuple[str, int]:
         word = _TOKEN_WORD.match(visible, next_start, limit)
         if word is None:
             break
-        if word.group().replace("-", "").isalpha() and not _ends_assigned_value(
+        if _SPLIT_PREFIX.match(visible, next_start, word.end()):
+            break
+        if _alphabetic_word(word.group()) and not _ends_assigned_value(
             visible, prefix.start(), word.end()
         ):
             # An ordinary word is insufficient evidence outside a complete assigned value.
@@ -252,29 +267,124 @@ def _cut_off_token(visible: str) -> bool:
     return False
 
 
-def _literal_windows(text: str) -> Iterator[tuple[int, str, list[int], bool]]:
-    """First line, normalized text, continuation offsets and truncation for each span.
+def _continues_after_cut(parts: list[str], next_line: str) -> bool:
+    """Check whether a bounded preview can extend a candidate from this window."""
+    if len(next_line) > _CANDIDATE_CHARS:
+        # Clipping can hide a word boundary or assignment terminator.
+        return True
+    preview, offsets = _normalized_window([*parts, next_line])
+    boundary = offsets[-1]
+    following = preview[boundary:].lstrip()
+    if not following:
+        # A blank preview cannot rule out a later continuation.
+        return True
+
+    # A direct match across an explicit join can have a body longer than the
+    # whitespace recovery budget. Inspect only the adjoining lexical suffix.
+    start = boundary
+    while start and (preview[start - 1].isalnum() or preview[start - 1] in "_.=-"):
+        start -= 1
+    suffix_boundary = boundary - start
+    if any(
+        match.start() < suffix_boundary < match.end() for match in _direct_matches(preview[start:])
+    ):
+        return True
+
+    for prefix in _SPLIT_PREFIX.finditer(preview, max(0, boundary - _CANDIDATE_CHARS)):
+        if prefix.start() >= boundary:
+            break
+        _, end = _split_candidate(preview, prefix)
+        if end > boundary:
+            return True
+        if end == prefix.end() and not preview[end:boundary].strip():
+            # A bare prefix can be uncertain at the limit. Ordinary alphabetic
+            # prose cannot complete it, but a token-like body can.
+            word = _TOKEN_WORD.match(preview, len(preview) - len(following))
+            if word is not None and (
+                not _alphabetic_word(word.group())
+                or _ends_assigned_value(preview, prefix.start(), word.end())
+            ):
+                return True
+    return False
+
+
+_PYTHON_LITERAL_OPEN = re.compile(r"""(?i:[ru]?)(?P<quote>"{3}|'{3}|"|')""")
+_POSSIBLE_PYTHON_JOIN = re.compile(
+    r"""['"][ \t]*(?:\+[ \t]*)?(?:\r\n?|\n)[ \t]*(?:\+[ \t]*)?[rRuU]?['"]"""
+)
+
+
+def _python_literal_joins(text: str) -> dict[int, tuple[int, int]]:
+    """Columns bounding the syntax between two plain Python string literals."""
+    joins: dict[int, tuple[int, int]] = {}
+    if not _POSSIBLE_PYTHON_JOIN.search(text):
+        return joins
+    previous: tokenize.TokenInfo | None = None
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text, newline=None).readline):
+            if token.type == tokenize.NL or (token.type == tokenize.OP and token.string == "+"):
+                continue
+            if (
+                token.type == tokenize.STRING
+                and previous is not None
+                and previous.type == tokenize.STRING
+                and token.start[0] == previous.end[0] + 1
+                and (left := _PYTHON_LITERAL_OPEN.match(previous.string))
+                and (right := _PYTHON_LITERAL_OPEN.match(token.string))
+            ):
+                joins[previous.end[0]] = (
+                    previous.end[1] - len(left["quote"]),
+                    token.start[1] + right.end(),
+                )
+            previous = token
+    except (tokenize.TokenError, SyntaxError):
+        # Keep joins proven before a later incomplete statement.
+        pass
+    return joins
+
+
+def _literal_windows(
+    text: str, *, python_source: bool = False
+) -> Iterator[tuple[int, str, list[int], bool]]:
+    """First line, normalized text, continuation offsets and unresolved cutoff for each span.
 
     Hidden characters are removed and whitespace is kept, so a token in prose stays
     a separate word. A space or mark inside the token body is joined afterwards.
     """
-    lines = [line.removesuffix("\n") for line in io.StringIO(text, newline=None)]
+    original = [line.removesuffix("\n") for line in io.StringIO(text, newline=None)]
+    joins = _python_literal_joins(text) if python_source else {}
+    lines = original.copy() if joins else original
+    # A middle line can participate in both joins. Remove its closing syntax
+    # before its opening syntax, so both columns still refer to the source.
+    for boundary, (left, right) in reversed(joins.items()):
+        lines[boundary - 1] = lines[boundary - 1][:left] + "\\"
+        lines[boundary] = lines[boundary][right:]
     index = 0
     while index < len(lines):
         parts = [lines[index]]
         start = index + 1
-        window_chars = len(lines[index])
-        truncated = False
-        while index + 1 < len(lines) and _window_continues(parts):
-            next_chars = 1 + len(lines[index + 1])
+        window_chars = len(original[index])
+        continuation = None
+        while index + 1 < len(lines) and (
+            index + 1 in joins or _window_continues(original[start - 1 : index + 1])
+        ):
+            next_chars = 1 + len(original[index + 1])
             if len(parts) >= _JOIN_LINES or window_chars + next_chars > _JOIN_CHARS:
-                truncated = True
+                continuation = lines[index + 1]
                 break
             index += 1
             window_chars += next_chars
             parts.append(lines[index])
         normalized, boundaries = _normalized_window(parts)
-        yield start, normalized, boundaries, truncated
+        incomplete = (
+            continuation is not None
+            and (index + 1 in joins or _cut_off_token(normalized))
+            and (
+                len(original[index + 1]) > _CANDIDATE_CHARS
+                or _continues_after_cut(parts, continuation)
+            )
+        )
+        yield start, normalized, boundaries, incomplete
         index += 1
 
 
@@ -326,8 +436,10 @@ def apply_literal_credential_findings(
                 continue
             found: list[tuple[int, str]] = []
             refused = False
-            for first_line, normalized, boundaries, truncated in _literal_windows(text):
-                if truncated and _cut_off_token(normalized):
+            for first_line, normalized, boundaries, incomplete in _literal_windows(
+                text, python_source=PurePosixPath(rel_path).suffix.lower() in {".py", ".pyi"}
+            ):
+                if incomplete:
                     own_failures.append(
                         f"{neutralize(rel_path)}: a vendor token may continue past the "
                         "bounded source window; not collected"

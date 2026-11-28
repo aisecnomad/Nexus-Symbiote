@@ -13,7 +13,7 @@ Suppression is a file at the scan root, not a key in `.nexus-symbiote.yaml` (tha
 
 A checkout can request credential suppressions. Pass `--accept-project-policy` to apply a reviewed allowlist to `scan`, `validate --project`, and `risk --project`. Each command records the accepted relaxation in `policy_weakened`. An operator policy withholds checkout credential suppressions. The MCP collector still redacts recognized literals from output, including reviewed samples.
 
-A missing file suppresses nothing. Both names at once, a file over 64 KiB, undecodable bytes, or a document that is not the mapping below suppresses nothing and is a collection failure. `--no-project-policy` does not load the file.
+A missing file suppresses nothing. A case variant of either filename, both names at once, a file over 64 KiB, undecodable bytes, or a document that is not the mapping below suppresses nothing and is a collection failure. `--no-project-policy` does not load the file.
 
 ```yaml
 allow:
@@ -34,13 +34,15 @@ A path entry suppresses every vendor-shaped token in each matching file. A finge
 
 The finding still does not contain the token. An allowlist entry does not either: it names a digest or a path.
 
+Fingerprint entries are portable and use an unkeyed digest. Anyone with the allowlist can test guesses offline. Use fingerprints only for reviewed, publicly known sample tokens. A narrowly scoped path entry lets a reviewer allow a fixture without publishing a fingerprint.
+
 ## `.env` files
 
 A `.env*` file is reported by path, line, key name and vendor type. Its value is not hashed: many of those values are low-entropy passwords, and a published unsalted SHA-256 can be attacked. A source finding does not publish an unkeyed digest either. With `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` set it records a keyed HMAC; otherwise it says the value is unbound.
 
 `.env.example`, `.env.sample` and `.env.template` are templates. They use that same commitment, and still never include the token.
 
-A path-glob allowlist entry suppresses a `.env` file. A fingerprint entry can match a value, but the finding does not record the digest.
+A path-glob allowlist entry suppresses a `.env` file. Fingerprint entries apply only to vendor shapes in templates. Store assignments use path entries exclusively, so matching a store never needs a digest of its value.
 
 If a path or key contains an assignment value from any scanned `.env` file,
 the finding displays `an env file` or `a key name`. Allowlisted assignments
