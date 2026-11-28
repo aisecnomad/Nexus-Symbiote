@@ -316,7 +316,7 @@ def test_build_security_graph_correlates_cve_package_mcp_agent_credentials_and_s
     assert "GHSA-6xpm-ggf7-wc3p" in mermaid
     markdown = render_security_graph_markdown(report)
     assert "Security Graph Correlation Report" in markdown
-    assert "OPENAI_API_KEY" in markdown
+    assert r"OPENAI\_API\_KEY" in markdown
     html_doc = render_security_graph_html(report)
     assert "Content-Security-Policy" in html_doc
     assert "default-src 'none'" in html_doc
@@ -656,15 +656,18 @@ def test_security_graph_audit_regressions_kev_truncation_escaping_and_epss_zero(
 
 
 def test_markdown_cells_keep_supplied_link_and_image_syntax_inert() -> None:
+    import importlib.util
+    import re
+    import string
     from html.parser import HTMLParser
 
-    import markdown_it
-
     samples = [
-        ("https://docs.example.invalid/guide?a=1&b=2", "data:url-docs"),
+        ("pkg:pypi/mcp@1.2.0", "data:url-docs"),
+        ("https://docs.example.invalid/guide?a=1&b=2#top", "www.example.invalid/path"),
         ("![x](https://beacon.example.invalid/p.png)", "data:[docs](https://example.invalid/)"),
-        ("\\![y](https://beacon.example.invalid/q.png)", "data:a|b\\|c"),
-        ("*bold* _italic_ ~del~ `code` &copy; &#65;", "data:`edge`"),
+        ("\\![y](https://beacon.example.invalid/q.png)", "data:a|b\\|c\\\\|d"),
+        ("x\\|![beacon](https://beacon.example.invalid/r.png)", "ops@example.invalid"),
+        ("*bold* _italic_ ~~del~~ `code` $math$ &copy; &#65; &#x41;", "data:`edge`<img src=x>"),
     ]
     bom = AIBOM()
     for index, (advisory_id, subject_ref) in enumerate(samples):
@@ -677,59 +680,103 @@ def test_markdown_cells_keep_supplied_link_and_image_syntax_inert() -> None:
         )
     md = render_security_graph_markdown(build_security_graph(bom))
 
-    class _CellParser(HTMLParser):
-        def __init__(self) -> None:
-            super().__init__()
-            self.rows: list[list[tuple[str, list[str]]]] = []
-            self._row: list[tuple[str, list[str]]] | None = None
-            self._in_td = False
-            self._text: list[str] = []
-            self._tags: list[str] = []
+    unescape_re = re.compile(r"\\([" + re.escape(string.punctuation) + r"])")
 
-        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-            if tag == "tr":
-                self._row = []
-            elif tag == "td":
-                self._in_td = True
-                self._text = []
-                self._tags = []
-            elif self._in_td:
-                self._tags.append(tag)
+    def _split_cmark_gfm_row(row: str) -> list[str]:
+        cells: list[str] = []
+        cur: list[str] = []
+        idx = 0
+        while idx < len(row):
+            if row[idx] == "\\":
+                run = 0
+                while idx + run < len(row) and row[idx + run] == "\\":
+                    run += 1
+                cur.append(row[idx : idx + run])
+                idx += run
+                if run % 2 == 1 and idx < len(row):
+                    cur.append(row[idx])
+                    idx += 1
+                continue
+            if row[idx] == "|":
+                cells.append("".join(cur))
+                cur = []
+            else:
+                cur.append(row[idx])
+            idx += 1
+        cells.append("".join(cur))
+        return cells
 
-        def handle_endtag(self, tag: str) -> None:
-            if tag == "td" and self._row is not None:
+    data_rows = [
+        line
+        for line in md.splitlines()
+        if line.startswith("| ") and not line.startswith(("| Severity |", "| --- |"))
+    ]
+    assert len(data_rows) == len(samples)
+
+    observed_pairs: dict[str, str] = {}
+    for row in data_rows:
+        parts = _split_cmark_gfm_row(row)
+        assert parts[0] == "" and parts[-1] == "", row
+        cells = [cell.strip() for cell in parts[1:-1]]
+        assert len(cells) == 7, row
+        for cell in cells:
+            if cell == "-":
+                continue
+            for index, char in enumerate(cell):
+                if char in string.punctuation and char != "\\":
+                    escapes = len(cell[:index]) - len(cell[:index].rstrip("\\"))
+                    assert escapes % 2 == 1, (cell, index, char)
+        observed_pairs[unescape_re.sub(r"\1", cells[1])] = unescape_re.sub(r"\1", cells[2])
+    assert observed_pairs == dict(samples)
+
+    if importlib.util.find_spec("markdown_it") is not None:
+        import markdown_it
+
+        class _CellParser(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self.rows: list[list[tuple[str, list[str]]]] = []
+                self._row: list[tuple[str, list[str]]] | None = None
                 self._in_td = False
-                self._row.append(("".join(self._text), list(self._tags)))
-            elif tag == "tr" and self._row:
-                self.rows.append(self._row)
-                self._row = None
+                self._text: list[str] = []
+                self._tags: list[str] = []
 
-        def handle_data(self, data: str) -> None:
-            if self._in_td:
-                self._text.append(data)
+            def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                if tag == "tr":
+                    self._row = []
+                elif tag == "td":
+                    self._in_td = True
+                    self._text = []
+                    self._tags = []
+                elif self._in_td:
+                    self._tags.append(tag)
 
-    from nexus_symbiote.security_graph import _md_cell
+            def handle_endtag(self, tag: str) -> None:
+                if tag == "td" and self._row is not None:
+                    self._in_td = False
+                    self._row.append(("".join(self._text), list(self._tags)))
+                elif tag == "tr" and self._row:
+                    self.rows.append(self._row)
+                    self._row = None
 
-    assert _md_cell("") == ""
-    assert _md_cell(" ") == "` `"
-    assert _md_cell(" x ") == "`  x  `"
+            def handle_data(self, data: str) -> None:
+                if self._in_td:
+                    self._text.append(data)
 
-    renderer = markdown_it.MarkdownIt("gfm-like", {"linkify": False})
-    rendered_html = renderer.render(md)
-    parser = _CellParser()
-    parser.feed(rendered_html)
-
-    assert len(parser.rows) == len(samples)
-    by_trigger: dict[str, str] = {}
-    for row in parser.rows:
-        assert len(row) == 7
-        trigger_text, trigger_tags = row[1]
-        subject_text, subject_tags = row[2]
-        # Only inert <code> wrappers are permitted; never <a>, <img>, <em>, <del>, etc.
-        assert trigger_tags == ["code"]
-        assert subject_tags == ["code"]
-        by_trigger[trigger_text] = subject_text
-    assert by_trigger == dict(samples)
+        renderer = markdown_it.MarkdownIt("commonmark").enable(["table", "strikethrough"])
+        if importlib.util.find_spec("linkify_it") is not None:
+            renderer.options["linkify"] = True
+            renderer.enable("linkify")
+        parser = _CellParser()
+        parser.feed(renderer.render(md))
+        assert len(parser.rows) == len(samples)
+        html_pairs: dict[str, str] = {}
+        for row in parser.rows:
+            assert len(row) == 7
+            for _, tags in row:
+                assert tags == []
+            html_pairs[row[1][0]] = row[2][0]
+        assert html_pairs == dict(samples)
 
 
 def test_component_scoping_precedes_global_limit_and_counts_scoped_omissions(

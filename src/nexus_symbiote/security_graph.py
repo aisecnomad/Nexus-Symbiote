@@ -17,6 +17,8 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import re
+import string
 from bisect import bisect_left
 from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
@@ -819,30 +821,15 @@ def _mermaid_label(raw: str) -> str:
     return escaped
 
 
-def _md_cell(raw: str) -> str:
-    """Render untrusted text literally inside a GFM table cell as a fenced code span.
+_MD_PUNCTUATION = re.compile("([" + re.escape(string.punctuation) + "])")
 
-    Wrapping in a CommonMark code span disables GFM bare-URL autolinking, explicit
-    links/images, emphasis, strikethrough, raw HTML, and HTML character entities while
-    preserving the exact label; escaping ``|`` keeps GFM table columns intact.
-    """
-    text = neutralize(raw).replace("\r", " ").replace("\n", " ")
-    if not text:
-        return ""
-    escaped = text.replace("|", "\\|")
-    fence_len = 1
-    run = 0
-    for ch in escaped:
-        if ch == "`":
-            run += 1
-            if run >= fence_len:
-                fence_len = run + 1
-        else:
-            run = 0
-    fence = "`" * fence_len
-    if escaped.strip(" ") and (escaped.startswith(("`", " ")) or escaped.endswith(("`", " "))):
-        return f"{fence} {escaped} {fence}"
-    return f"{fence}{escaped}{fence}"
+
+def _md_cell(raw: str) -> str:
+    # Backslash-escaping all 32 CommonMark §2.4 ASCII punctuation characters keeps
+    # supplied text literal across cmark-gfm, Pandoc, and markdown-it (every k-backslash
+    # run before '|' becomes 2k+1 odd backslashes, preventing backslash-pipe code-span
+    # breakouts as well as autolinks, links/images, emphasis, raw HTML, and entities).
+    return _MD_PUNCTUATION.sub(r"\\\1", neutralize(raw))
 
 
 def render_security_graph_mermaid(report: SecurityGraphReport) -> str:
