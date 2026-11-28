@@ -362,3 +362,228 @@ def test_keras_infozip_unicode_path_0x7075_disguised_config_json_detected(
     safety, explanation = inspect_model_format(model_path)
     assert safety is SerializationSafety.UNSAFE_CODE_EXECUTION
     assert explanation == ZIP_KERAS_CODE_EXECUTION
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"#!/usr/bin/env python3\n",
+        b"\x00" * 4096,
+        b"N" * 16,
+        b"(\n",
+        b'{"container":"inert-metadata-envelope"}\n',
+    ],
+    ids=["zipapp", "nul4k", "opcode_N", "opcode_mark", "inert_metadata"],
+)
+def test_prefixed_keras_containers_match_zipfile_and_hash_once(
+    tmp_path: Path, prefix: bytes
+) -> None:
+    import hashlib
+
+    benign_cfg = {
+        "module": "keras",
+        "class_name": "Sequential",
+        "config": {
+            "layers": [
+                {
+                    "module": "keras.layers",
+                    "class_name": "Dense",
+                    "config": {"units": 8, "activation": "relu"},
+                }
+            ]
+        },
+    }
+    raw_benign = _write_keras_zip(tmp_path / "raw_benign.keras", benign_cfg).read_bytes()
+    (tmp_path / "raw_benign.keras").unlink()
+
+    benign_dir = tmp_path / "benign"
+    benign_dir.mkdir()
+    benign_prefixed = benign_dir / "model.keras"
+    benign_prefixed.write_bytes(prefix + raw_benign)
+    assert zipfile.is_zipfile(benign_prefixed)
+    assert inspect_model_format(benign_prefixed) == (
+        SerializationSafety.UNKNOWN,
+        ZIP_WITHOUT_PICKLE,
+    )
+    benign_scan = ModelScanner().scan(benign_dir)
+    assert len(benign_scan.components) == 1
+    assert (
+        benign_scan.components[0].hashes["sha256"]
+        == f"sha256:{hashlib.sha256(prefix + raw_benign).hexdigest()}"
+    )
+
+    lambda_cfg = {
+        "module": "keras",
+        "class_name": "Sequential",
+        "config": {
+            "layers": [
+                {
+                    "module": "keras.layers",
+                    "class_name": "Lambda",
+                    "config": {
+                        "function": {"class_name": "__lambda__", "config": {"code": "AA=="}}
+                    },
+                }
+            ]
+        },
+    }
+    raw_lambda = _write_keras_zip(tmp_path / "raw_lambda.keras", lambda_cfg).read_bytes()
+    (tmp_path / "raw_lambda.keras").unlink()
+
+    evil_dir = tmp_path / "evil"
+    evil_dir.mkdir()
+    evil_prefixed = evil_dir / "model.keras"
+    evil_prefixed.write_bytes(prefix + raw_lambda)
+    assert inspect_model_format(evil_prefixed) == (
+        SerializationSafety.UNSAFE_CODE_EXECUTION,
+        ZIP_KERAS_CODE_EXECUTION,
+    )
+    evil_scan = ModelScanner().scan(evil_dir)
+    assert len(evil_scan.components) == 1
+    assert evil_scan.components[0].serialization_safety is SerializationSafety.UNSAFE_CODE_EXECUTION
+    assert (
+        evil_scan.components[0].hashes["sha256"]
+        == f"sha256:{hashlib.sha256(prefix + raw_lambda).hexdigest()}"
+    )
+    assert any(
+        risk.severity is RiskSeverity.CRITICAL and risk.category == "serialization_format"
+        for risk in evil_scan.components[0].risks
+    )
+
+
+def test_non_zip_and_pickle_keras_named_files_remain_fail_closed(tmp_path: Path) -> None:
+    import pickle
+
+    hdf5_keras = tmp_path / "legacy.keras"
+    hdf5_keras.write_bytes(b"\x89HDF\r\n\x1a\n" + b"\x00" * 32)
+    assert inspect_model_format(hdf5_keras) == (
+        SerializationSafety.UNKNOWN,
+        "No bounded structural validator for this format/loader",
+    )
+
+    class _Exploit:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (eval, ("1+1",))
+
+    pickle_keras = tmp_path / "disguised_pickle.keras"
+    pickle_keras.write_bytes(pickle.dumps(_Exploit()))
+    safety, _ = inspect_model_format(pickle_keras)
+    assert safety is SerializationSafety.UNSAFE_CODE_EXECUTION
+
+
+@pytest.mark.parametrize("func_name", ["eval", "exec", "__import__", "getattr", "open"])
+def test_keras_dangerous_builtins_function_descriptors_flagged(
+    tmp_path: Path, func_name: str
+) -> None:
+    config = {
+        "module": "keras",
+        "class_name": "Sequential",
+        "config": {
+            "layers": [
+                {
+                    "module": "keras.layers",
+                    "class_name": "Dense",
+                    "config": {
+                        "units": 4,
+                        "activation": {
+                            "module": "builtins",
+                            "class_name": "function",
+                            "config": func_name,
+                        },
+                    },
+                }
+            ]
+        },
+    }
+    archive = _write_keras_zip(tmp_path / "builtin_exec.keras", config)
+    assert inspect_model_format(archive) == (
+        SerializationSafety.UNSAFE_CODE_EXECUTION,
+        ZIP_KERAS_CODE_EXECUTION,
+    )
+
+
+def test_keras_zipfile_chosen_last_config_inspected_before_decoy_budget_drain(
+    tmp_path: Path,
+) -> None:
+    decoy_cfg = json.dumps(
+        {
+            "module": "keras",
+            "class_name": "Sequential",
+            "config": {"layers": [], "pad": "x" * 2048},
+        }
+    ).encode("utf-8")
+    evil_cfg = json.dumps(
+        {
+            "module": "keras",
+            "class_name": "Sequential",
+            "config": {
+                "layers": [{"module": "keras.layers", "class_name": "Lambda", "config": {}}]
+            },
+        }
+    ).encode("utf-8")
+
+    # Ten decoy config.json entries precede the final central-directory entry that zipfile opens.
+    last_active = tmp_path / "decoy_first.keras"
+    with (
+        pytest.warns(UserWarning, match="Duplicate name: 'config.json'"),
+        zipfile.ZipFile(last_active, "w", compression=zipfile.ZIP_STORED) as archive,
+    ):
+        for _ in range(10):
+            archive.writestr("config.json", decoy_cfg)
+        archive.writestr("config.json", evil_cfg)
+    assert inspect_model_format(last_active, budget=InspectionBudget(len(evil_cfg) + 64)) == (
+        SerializationSafety.UNSAFE_CODE_EXECUTION,
+        ZIP_KERAS_CODE_EXECUTION,
+    )
+
+    # An earlier central-directory config.json carrying Lambda is also caught.
+    earlier_evil = tmp_path / "decoy_last.keras"
+    benign_cfg = json.dumps(
+        {"module": "keras", "class_name": "Sequential", "config": {"layers": []}}
+    ).encode("utf-8")
+    with (
+        pytest.warns(UserWarning, match="Duplicate name: 'config.json'"),
+        zipfile.ZipFile(earlier_evil, "w", compression=zipfile.ZIP_STORED) as archive,
+    ):
+        archive.writestr("config.json", evil_cfg)
+        archive.writestr("config.json", benign_cfg)
+    assert inspect_model_format(earlier_evil) == (
+        SerializationSafety.UNSAFE_CODE_EXECUTION,
+        ZIP_KERAS_CODE_EXECUTION,
+    )
+
+
+@pytest.mark.parametrize("compression", [zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA])
+def test_keras_bzip2_and_lzma_config_members_are_inspected_and_bounded(
+    tmp_path: Path, compression: int
+) -> None:
+    # Object-array inspection keeps BZIP2/LZMA members conservatively rated as unread
+    # (test_model_object_arrays.py), while Keras forensic inspection still catches
+    # Lambda configs and bounds oversized decompression inside those methods.
+    benign = _write_keras_zip(
+        tmp_path / f"benign_{compression}.keras",
+        {"module": "keras", "class_name": "Sequential", "config": {"layers": []}},
+        compression=compression,
+    )
+    assert inspect_model_format(benign) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
+
+    evil = _write_keras_zip(
+        tmp_path / f"evil_{compression}.keras",
+        {
+            "module": "keras",
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Lambda", "config": {}}]},
+        },
+        compression=compression,
+    )
+    assert inspect_model_format(evil) == (
+        SerializationSafety.UNSAFE_CODE_EXECUTION,
+        ZIP_KERAS_CODE_EXECUTION,
+    )
+
+    bomb = _write_keras_zip(
+        tmp_path / f"bomb_{compression}.keras",
+        b'{"padding":"' + (b"a" * (MAX_KERAS_CONFIG_BYTES + 1024)) + b'"}',
+        compression=compression,
+    )
+    assert inspect_model_format(bomb) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)

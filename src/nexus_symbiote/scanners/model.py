@@ -10,10 +10,12 @@ code. Weight files count as signed only under an operator signature policy.
 from __future__ import annotations
 
 import ast
+import bz2
 import hashlib
 import hmac
 import io
 import json
+import lzma
 import os
 import pickletools
 import re
@@ -250,6 +252,24 @@ _KERAS_FUNCTIONS_BY_MODULE = {
 }
 _KERAS_FUNCTIONS_BY_MODULE["builtins"] = frozenset(
     name for functions in _KERAS_FUNCTIONS_BY_MODULE.values() for name in functions
+)
+_KERAS_DANGEROUS_BUILTINS = frozenset(
+    {
+        "eval",
+        "exec",
+        "compile",
+        "__import__",
+        "getattr",
+        "setattr",
+        "delattr",
+        "open",
+        "input",
+        "breakpoint",
+        "globals",
+        "locals",
+        "vars",
+        "memoryview",
+    }
 )
 _KERAS_ARITHMETIC_OPS = frozenset(
     {"math.add", "math.subtract", "math.multiply", "math.divide", "math.maximum", "math.minimum"}
@@ -959,18 +979,73 @@ def _reread(stream: BinaryIO, offset: int, size: int) -> bytes:
     return os.pread(stream.fileno(), size, offset)
 
 
+class _ZipLzmaDecompressor:
+    """Bounded ZIP method-14 (LZMA1) decompressor using public ``FORMAT_ALONE`` headers."""
+
+    def __init__(self) -> None:
+        self._header = bytearray()
+        self._decomp: lzma.LZMADecompressor | None = None
+
+    @property
+    def eof(self) -> bool:
+        return self._decomp is not None and self._decomp.eof
+
+    @property
+    def needs_input(self) -> bool:
+        return True if self._decomp is None else self._decomp.needs_input
+
+    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+        if self._decomp is None:
+            self._header.extend(data)
+            if len(self._header) < 4:
+                return b""
+            props_size = _little(bytes(self._header), 2, 2)
+            if props_size != 5:
+                raise FormatError(ZIP_MEMBER_UNREAD)
+            if len(self._header) < 9:
+                return b""
+            props = bytes(self._header[4:9])
+            remainder = bytes(self._header[9:])
+            self._header.clear()
+            decomp = lzma.LZMADecompressor(lzma.FORMAT_ALONE)
+            decomp.decompress(props + b"\xff" * 8, max_length=0)
+            self._decomp = decomp
+            data = remainder
+        return self._decomp.decompress(data, max_length=max_length)
+
+
 class _MemberData:
-    """The data of one ZIP member, read again from the archive, inflated if DEFLATE.
+    """The data of one ZIP member, read again from the archive, decompressed if needed.
 
     Compressed input is read again in growing chunks, so a member costs about what its
-    array header needs; it never reads past the member's compressed size.
+    array header or Keras descriptor needs; it never reads past the member's compressed size.
     """
 
-    def __init__(self, stream: BinaryIO, start: int, size: int, *, deflated: bool) -> None:
+    def __init__(
+        self,
+        stream: BinaryIO,
+        start: int,
+        size: int,
+        *,
+        deflated: bool = False,
+        method: int | None = None,
+    ) -> None:
         self._stream = stream
         self._position = start
         self._remaining = size
-        self._inflater = zlib.decompressobj(wbits=-zlib.MAX_WBITS) if deflated else None
+        resolved_method = (8 if deflated else 0) if method is None else method
+        self._method = resolved_method
+        self._inflater: Any
+        if resolved_method == 0:
+            self._inflater = None
+        elif resolved_method == 8:
+            self._inflater = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
+        elif resolved_method == 12:
+            self._inflater = bz2.BZ2Decompressor()
+        elif resolved_method == 14:
+            self._inflater = _ZipLzmaDecompressor()
+        else:
+            raise FormatError(ZIP_MEMBER_UNREAD)
         self._pending = b""
         self._chunk = 512
 
@@ -989,15 +1064,29 @@ class _MemberData:
             return self._input(size)
         out = bytearray()
         while len(out) < size and not self._inflater.eof:
-            if not self._pending:
-                if self._remaining <= 0:
-                    break
-                self._pending = self._input(self._chunk)
-                self._chunk = min(2 * self._chunk, 65536)
+            if self._method == 8:
                 if not self._pending:
-                    break
-            out += self._inflater.decompress(self._pending, size - len(out))
-            self._pending = self._inflater.unconsumed_tail
+                    if self._remaining <= 0:
+                        break
+                    self._pending = self._input(self._chunk)
+                    self._chunk = min(2 * self._chunk, 65536)
+                    if not self._pending:
+                        break
+                out += self._inflater.decompress(self._pending, size - len(out))
+                self._pending = self._inflater.unconsumed_tail
+            else:
+                feed = b""
+                if self._inflater.needs_input:
+                    if self._remaining <= 0:
+                        break
+                    feed = self._input(self._chunk)
+                    self._chunk = min(2 * self._chunk, 65536)
+                    if not feed:
+                        break
+                try:
+                    out += self._inflater.decompress(feed, max_length=size - len(out))
+                except (EOFError, OSError, lzma.LZMAError) as exc:
+                    raise FormatError(ZIP_MEMBER_UNREAD) from exc
         return bytes(out)
 
 
@@ -1239,6 +1328,12 @@ def _keras_config_has_code(document: object, *, required: bool) -> bool | None:
                         incomplete = True
                 if class_name == "function":
                     if (
+                        module == "builtins"
+                        and isinstance(cfg, str)
+                        and cfg in _KERAS_DANGEROUS_BUILTINS
+                    ):
+                        return True
+                    if (
                         not isinstance(module, str)
                         or not isinstance(cfg, str)
                         or cfg not in _KERAS_FUNCTIONS_BY_MODULE.get(module, ())
@@ -1278,9 +1373,9 @@ def _member_holds_keras_code(
     start = member.offset + 30 + _little(header, 26, 2) + _little(header, 28, 2)
     if start + member.size > end:
         return None
-    if member.method not in (0, 8):
+    if member.method not in (0, 8, 12, 14):
         return None
-    data = _MemberData(stream, start, member.size, deflated=member.method == 8)
+    data = _MemberData(stream, start, member.size, method=member.method)
     raw = bytearray()
     try:
         while not data.complete:
@@ -1319,7 +1414,10 @@ def _members_hold_keras_code(
     required: bool,
 ) -> bool | None:
     """Inspect the root descriptor, including when the extension changed."""
-    if not any(_keras_config_member(member.name) for member in members):
+    config_indices = [
+        index for index, member in enumerate(members) if _keras_config_member(member.name)
+    ]
+    if not config_indices:
         return None if required else False
     # Keras saves custom models outside its own module namespace too. Its native
     # root metadata and weights together identify renamed archives in that case.
@@ -1328,48 +1426,41 @@ def _members_hold_keras_code(
         b"metadata.json" in names
         and (b"model.weights.h5" in names or b"model.weights.npz" in names)
     )
-    ordered = sorted(members, key=lambda member: member.offset)
+    ordered = sorted(enumerate(members), key=lambda pair: pair[1].offset)
+    boundaries = {
+        cd_idx: (
+            min(ordered[pos + 1][1].offset, directory) if pos + 1 < len(ordered) else directory
+        )
+        for pos, (cd_idx, _) in enumerate(ordered)
+    }
+    # zipfile/Keras opens the last central-directory entry named config.json; inspect it
+    # first so earlier decoy entries cannot drain the budget before the active config.
+    inspection_order = [config_indices[-1]] + [
+        cd_idx for _, cd_idx in sorted((members[i].offset, i) for i in config_indices[:-1])
+    ]
     unread = False
-    for index, member in enumerate(ordered):
-        end = min(ordered[index + 1].offset, directory) if index + 1 < len(ordered) else directory
-        found = _member_holds_keras_code(stream, member, end, budget, required=required)
+    for cd_idx in inspection_order:
+        found = _member_holds_keras_code(
+            stream, members[cd_idx], boundaries[cd_idx], budget, required=required
+        )
         if found:
             return True
         unread = unread or found is None
     return None if unread else False
 
 
-def _recognized_code_container(
+def _inspect_zip_container(
     stream: BinaryIO,
-    prefix: bytes,
+    kept: bytes,
     size: int,
     budget: InspectionBudget,
     *,
-    by_content: bool,
+    check_first_local: bool = False,
     expect_keras: bool = False,
 ) -> tuple[SerializationSafety, str] | None:
-    """A verdict on content a loader can run code from, or ``None`` for content not recognized.
-
-    A pickle, a NumPy array with an object dtype, and a ZIP archive with a pickle-family
-    member or such an array as a member are recognized. ``torch.save`` writes
-    ``data.pkl``, usually first, so the first local header is read forward before the
-    directory at the end of the archive, which lists every member, is read.
-    """
-    if prefix[:6] == _NUMPY_MAGIC:
-        array = _object_array(prefix, stream.read, budget)
-        if array is None:
-            return SerializationSafety.UNKNOWN, NUMPY_HEADER_UNREAD
-        return (SerializationSafety.UNSAFE_CODE_EXECUTION, NUMPY_OBJECT_ARRAY) if array else None
-    # np.load hands zipfile a file that starts with an end record too, as an empty
-    # archive does; zipfile reads the archive whose end record ends the file.
-    if prefix[:4] not in (b"PK\x03\x04", b"PK\x05\x06"):
-        return _recognized_pickle(stream, prefix, size, by_content=by_content)
-    # Every byte read so far is kept for the directory search. In a small archive the
-    # first local header and its name can hold the ZIP64 locator or record, and zipfile
-    # and miniz read them there; an end record at offset 0 is all an empty archive holds.
-    kept = prefix
-    if prefix[:4] == b"PK\x03\x04":
-        header = prefix + stream.read(22)
+    """Inspect a trailing/standard ZIP central directory and rate any executable members."""
+    if check_first_local and kept[:4] == b"PK\x03\x04":
+        header = kept + stream.read(max(0, 30 - len(kept)))
         first = b""
         if len(header) == 30:
             name_length = int.from_bytes(header[26:28], "little")
@@ -1380,7 +1471,7 @@ def _recognized_code_container(
             return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_PICKLE_MEMBER
     directory = _zip_directory(stream, len(kept), size, kept)
     if directory is None:
-        return SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD
+        return None
     readings, undecided = directory
     # A member any reading lists counts, even when another reader's directory is not
     # decided: a locator or directory that cannot be read must not hide one that can.
@@ -1403,6 +1494,61 @@ def _recognized_code_container(
     if undecided:
         return SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD
     return SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE if arrays is False else ZIP_MEMBER_UNREAD
+
+
+def _recognized_code_container(
+    stream: BinaryIO,
+    prefix: bytes,
+    size: int,
+    budget: InspectionBudget,
+    *,
+    by_content: bool,
+    expect_keras: bool = False,
+) -> tuple[SerializationSafety, str] | None:
+    """A verdict on content a loader can run code from, or ``None`` for content not recognized.
+
+    A pickle, a NumPy array with an object dtype, and a ZIP archive with a pickle-family
+    member or such an array as a member are recognized. ``torch.save`` writes
+    ``data.pkl``, usually first, so the first local header is read forward before the
+    directory at the end of the archive, which lists every member, is read.
+    """
+    # np.load hands zipfile a file that starts with an end record too, as an empty
+    # archive does; zipfile reads the archive whose end record ends the file.
+    if prefix[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
+        verdict = _inspect_zip_container(
+            stream, prefix, size, budget, check_first_local=True, expect_keras=expect_keras
+        )
+        return (
+            verdict if verdict is not None else (SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD)
+        )
+    if not expect_keras:
+        if prefix[:6] == _NUMPY_MAGIC:
+            array = _object_array(prefix, stream.read, budget)
+            if array is None:
+                return SerializationSafety.UNKNOWN, NUMPY_HEADER_UNREAD
+            return (
+                (SerializationSafety.UNSAFE_CODE_EXECUTION, NUMPY_OBJECT_ARRAY) if array else None
+            )
+        return _recognized_pickle(stream, prefix, size, by_content=by_content)
+    # Keras opens .keras containers via zipfile, which scans backward from EOF and loads
+    # prefixed archives (zipapp shebangs, leading metadata, or arbitrary padding bytes).
+    capture = _CaptureReader(stream)
+    if prefix[:6] == _NUMPY_MAGIC:
+        array = _object_array(prefix, capture.read, budget)
+        if array is True:
+            return SerializationSafety.UNSAFE_CODE_EXECUTION, NUMPY_OBJECT_ARRAY
+        if array is None:
+            return SerializationSafety.UNKNOWN, NUMPY_HEADER_UNREAD
+        non_zip: tuple[SerializationSafety, str] | None = None
+    else:
+        non_zip = _recognized_pickle(cast(BinaryIO, capture), prefix, size, by_content=by_content)
+        if non_zip is not None and non_zip[0] is SerializationSafety.UNSAFE_CODE_EXECUTION:
+            return non_zip
+    kept = prefix + bytes(capture.captured)
+    zip_verdict = _inspect_zip_container(stream, kept, size, budget, expect_keras=True)
+    if zip_verdict is None:
+        return non_zip
+    return zip_verdict
 
 
 def inspect_model_format(
