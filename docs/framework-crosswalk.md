@@ -339,6 +339,7 @@ every rule.
 | CWE-502 | Deserialization of Untrusted Data |
 | CWE-798 | Use of Hard-coded Credentials |
 | CWE-829 | Inclusion of Functionality from Untrusted Control Sphere |
+| CWE-1395 | Dependency on Vulnerable Third-Party Component |
 | CWE-1336 | Improper Neutralization of Special Elements Used in a Template Engine |
 | CWE-1427 | Improper Neutralization of Input Used for LLM Prompting |
 
@@ -586,6 +587,18 @@ every rule.
 | `eu-ai-act-2024` | Art. 15 Robustness and cybersecurity, including resistance to manipulation | all | Records a property of the system that bears on its robustness and cybersecurity. |
 | `cwe` | CWE-451 User Interface (UI) Misrepresentation of Critical Information | all | The file can display differently from what the agent processes. |
 | `cwe` | CWE-1427 Improper Neutralization of Input Used for LLM Prompting | all | Instruction text reaches the model with characters that are not neutralized. |
+
+### `known_vulnerability`
+
+| Framework | Entry | Severities | Rationale |
+| --- | --- | --- | --- |
+| `owasp-llm-2025` | LLM03:2025 Supply Chain | all | A vulnerable package in the agent runtime is a supply chain weakness. |
+| `owasp-llm-2026` | LLM04:2026 Supply Chain | all | A vulnerable package in the agent runtime is a supply chain weakness. |
+| `owasp-asi-2026` | ASI04 Agentic Supply Chain Vulnerabilities | all | A compromised or vulnerable dependency reaches every agent that loads it. |
+| `mitre-atlas-2026.10` | AML.T0010 Supply Chain Compromise | all | A vulnerable dependency is a supply chain compromise vector. |
+| `nist-ai-rmf-1.0` | MEASURE-2.7 Security and resilience are evaluated | all | Records a security-relevant property of the configuration, an input to evaluating its security. |
+| `eu-ai-act-2024` | Art. 15 Robustness and cybersecurity, including resistance to manipulation | all | Records a property of the system that bears on its robustness and cybersecurity. |
+| `cwe` | CWE-1395 Dependency on Vulnerable Third-Party Component | all | A dependency with a known vulnerability is part of the agent's supply chain. |
 
 ### `launch_context`
 

@@ -4,6 +4,11 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Added
+
+- **`scan --all-packages`:** inventories PyPI, npm and image declarations in supported root manifests beyond the AI catalog. Lockfiles resolve declared packages. The advisory receipt identifies lockfile-only dependencies as outside registry collection. PyPI and npm entries record `properties.ai_catalog`. Use `--all-packages` with `validate --project` or `risk --project` to require the same scope during recollection.
+- **`scan --advisory-db PATH`:** matches exact PyPI/npm pins against an offline OSV bundle and exports one CycloneDX vulnerability per advisory across all affected packages. The completeness receipt records the bundle's digest, matching coverage, package counts and registry package scope. Without `--all-packages`, `scan` warns and coverage is at most partial, as it is when an MCP launcher package has no exact version. Without a severity label, a CVSS v3 vector in OSV's `severity` array, or else in the matched package's `affected[].severity`, sets the severity from its base score. A record with neither produces a medium finding with an explanation and an unknown CycloneDX rating. Project validation and risk can recheck the inventory against an explicitly selected bundle outside the checkout, within the bundle's 30-day feed age. A PyPI or npm entry without an exact pin fails the scan gate as incomplete collection instead of being reported as unaffected. `vex` lists each recorded advisory once per package under the id the CycloneDX export gives it, and a suppressing decision applies to it only when its receipt's coverage is complete, as for a linked report. `diff` compares two receipts by meaning: lower coverage, fewer packages checked, more packages left out or another scope is a high alert, and a different bundle is an info note that names both digests.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

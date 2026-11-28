@@ -98,6 +98,7 @@ CWE_NAMES = {
     "CWE-451": "User Interface (UI) Misrepresentation of Critical Information",
     "CWE-494": "Download of Code Without Integrity Check",
     "CWE-502": "Deserialization of Untrusted Data",
+    "CWE-1395": "Dependency on Vulnerable Third-Party Component",
     "CWE-798": "Use of Hard-coded Credentials",
     "CWE-829": "Inclusion of Functionality from Untrusted Control Sphere",
     "CWE-1336": "Improper Neutralization of Special Elements Used in a Template Engine",

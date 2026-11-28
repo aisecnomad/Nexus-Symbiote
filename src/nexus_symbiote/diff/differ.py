@@ -26,6 +26,7 @@ from nexus_symbiote.core.models import (
     MCPServerComponent,
     check_spec_version,
 )
+from nexus_symbiote.scan_advisories import REGISTRY_PACKAGES, parse_receipt
 from nexus_symbiote.utils.crypto import (
     VERIFIED_SIGNING_STATUSES,
     SigningStatus,
@@ -197,6 +198,8 @@ _WEAKEST_SIGNING = max(_SIGNING_RANK.values()) + 1
 _STATUS_RANK = {"complete": 0, "partial": 1, "failed": 2, "unknown": 2}
 _ASSURANCE_RANK = {"verified": 0, "observed": 1, "declared": 2}
 _SOURCE_STATUS_RANK = {"complete": 0, "incomplete": 1, "unknown": 2}
+_RECEIPT_COVERAGE_RANK = {"complete": 0, "partial": 1, "none": 2}
+_RECEIPT_FEED_FIELDS = ("db_sha256", "records_loaded", "db_newest_record")
 _INFO_METADATA = frozenset({"tool_version"})
 _LISTED = 5
 _SHOWN = 200
@@ -261,6 +264,27 @@ def _incompleteness(claim: CompletenessClaim) -> list[str]:
     if claim.source_unmapped_count:
         found.append(f"ShadowScan entries left unmapped: {claim.source_unmapped_count}.")
     return found
+
+
+def _advisory_receipts(claim: CompletenessClaim) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (surface, receipt)
+        for surface in (*claim.surfaces_scanned, *claim.unobserved_surfaces)
+        if (receipt := parse_receipt(surface)) is not None
+    ]
+
+
+# A count a new receipt states in a form no count takes is as many as can be left out.
+_UNREADABLE_COUNT = 1 << 62
+
+
+def _receipt_count(value: object, default: int) -> int:
+    """A receipt's count, or ``default`` when it records none or not a count."""
+    return value if type(value) is int and value >= 0 else default
+
+
+def _scope_rank(value: object) -> int:
+    return REGISTRY_PACKAGES.index(value) if value in REGISTRY_PACKAGES else len(REGISTRY_PACKAGES)
 
 
 def _semantic_value(value: Any, path: tuple[str, ...]) -> Any:
@@ -996,6 +1020,18 @@ class AIBOMDiffer:
         old_fields = old.model_dump(mode="json")
         new_fields = new.model_dump(mode="json")
         handled = {"timestamp"}
+        # An advisory receipt names its feed and counts, so a refreshed feed or one more
+        # pinned package rewrites it; compare one receipt per snapshot by meaning instead.
+        old_receipts, new_receipts = _advisory_receipts(old), _advisory_receipts(new)
+        receipts: set[str] = set()
+        if len(old_receipts) <= 1 and len(new_receipts) <= 1:
+            receipts = {surface for surface, _ in (*old_receipts, *new_receipts)}
+            self._diff_advisory_receipt(
+                old_receipts[0][1] if old_receipts else None,
+                new_receipts[0][1] if new_receipts else None,
+                regression,
+                improvement,
+            )
 
         handled.add("scope")
         if old.scope != new.scope:
@@ -1059,8 +1095,8 @@ class AIBOMDiffer:
         ):
             handled.add(name)
             # Multisets: a second identical gap or failure is a new one.
-            before_items = Counter(str(item) for item in getattr(old, name))
-            after_items = Counter(str(item) for item in getattr(new, name))
+            before_items = Counter(str(item) for item in getattr(old, name) if item not in receipts)
+            after_items = Counter(str(item) for item in getattr(new, name) if item not in receipts)
             added, removed = after_items - before_items, before_items - after_items
             lost, gained = (added, removed) if growth_regresses else (removed, added)
             if lost:
@@ -1069,7 +1105,8 @@ class AIBOMDiffer:
                 improvement(name, f"{better}: {_listing(gained.elements())}.")
 
         handled.add("surfaces_scanned")
-        scanned_before, scanned_after = set(old.surfaces_scanned), set(new.surfaces_scanned)
+        scanned_before = set(old.surfaces_scanned) - receipts
+        scanned_after = set(new.surfaces_scanned) - receipts
         lost_surfaces = scanned_before - scanned_after
         gained_surfaces = scanned_after - scanned_before
         if lost_surfaces:
@@ -1105,6 +1142,86 @@ class AIBOMDiffer:
                 regression(name, f"Completeness field {name} changed.")
 
         self._note_shared_gaps(old, new, report)
+
+    @staticmethod
+    def _diff_advisory_receipt(
+        old: dict[str, Any] | None,
+        new: dict[str, Any] | None,
+        regression: Callable[[str, str], None],
+        improvement: Callable[[str, str], None],
+    ) -> None:
+        """Lower coverage, more packages left out or another scope regress.
+
+        Fewer packages checked regresses only with lower coverage or more left out: a
+        package removed from the project is reported on its component. A different feed, more packages checked
+        or a different number of matches is a note; the matches themselves are compared
+        on their components.
+        """
+        if old is None or new is None:
+            if old is not None:
+                regression(
+                    "advisories",
+                    "Offline advisory matching is no longer recorded (the baseline recorded "
+                    f"coverage {_clip(old.get('coverage'))} against {_clip(old['db_sha256'])}).",
+                )
+            elif new is not None:
+                improvement(
+                    "advisories",
+                    f"Offline advisory matching is now recorded (coverage "
+                    f"{_clip(new.get('coverage'))} against {_clip(new['db_sha256'])}).",
+                )
+            return
+        narrowed: list[str] = []
+        noted: list[str] = []
+        less_covered = _RECEIPT_COVERAGE_RANK.get(
+            str(new.get("coverage")), 3
+        ) > _RECEIPT_COVERAGE_RANK.get(str(old.get("coverage")), 3) or any(
+            _receipt_count(new.get(key), _UNREADABLE_COUNT) > _receipt_count(old.get(key), 0)
+            for key in old.keys() | new.keys()
+            if key.startswith("components_") and key != "components_checked"
+        )
+        if old["db_sha256"] != new["db_sha256"]:
+            feed = [
+                f"{key} {_clip(old.get(key))} → {_clip(new.get(key))}"
+                for key in _RECEIPT_FEED_FIELDS[1:]
+                if old.get(key) != new.get(key)
+            ]
+            noted.append(
+                f"advisory database changed from {old['db_sha256']} to {new['db_sha256']}"
+                + (f" ({', '.join(feed)})" if feed else "")
+            )
+        for key in sorted((old.keys() | new.keys()) - set(_RECEIPT_FEED_FIELDS)):
+            before, after = old.get(key), new.get(key)
+            if before == after and type(before) is type(after):
+                continue
+            change = f"{key} {_clip(before)} → {_clip(after)}"
+            # A count a baseline from before it existed does not record is compared as zero;
+            # a field the baseline records and the new receipt drops is narrowing.
+            if key in old and key not in new:
+                worse = True
+            elif key == "coverage":
+                worse = _RECEIPT_COVERAGE_RANK.get(str(after), 3) > _RECEIPT_COVERAGE_RANK.get(
+                    str(before), 3
+                )
+            elif key == "advisories_recorded":
+                worse = False
+            elif key == "registry_packages":
+                worse = _scope_rank(after) > _scope_rank(before)
+            elif key == "components_checked":
+                checked = _receipt_count(after, -1)
+                worse = checked < 0 or (less_covered and checked < _receipt_count(before, 0))
+            elif key.startswith("components_"):
+                worse = _receipt_count(after, _UNREADABLE_COUNT) > _receipt_count(before, 0)
+            else:
+                # Any other field states the scope the counts are over.
+                worse = True
+            (narrowed if worse else noted).append(change)
+        if narrowed:
+            regression(
+                "advisories", "Offline advisory coverage narrowed: " + "; ".join(narrowed) + "."
+            )
+        if noted:
+            improvement("advisories", "Offline advisory receipt changed: " + "; ".join(noted) + ".")
 
     @staticmethod
     def _diff_source_report(

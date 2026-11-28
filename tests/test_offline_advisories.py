@@ -1171,3 +1171,45 @@ def test_offline_advisories_git_range_beside_an_ecosystem_range_is_not_an_error(
     assert report.complete is True
     assert report.errors == []
     assert [a["fixed_versions"] for a in report.advisories] == [["5.0"]]
+
+
+@pytest.mark.parametrize(
+    ("vector", "score"),
+    [
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 9.8),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H", 10.0),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", 7.5),
+        ("CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H", 7.8),
+        ("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:L/I:L/A:N/E:P/RL:O", 6.4),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1),
+        ("CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N", 5.3),
+        ("CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N", 3.1),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N", 0.0),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H", None),
+        ("CVSS:3.1/AV:N/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", None),
+        ("CVSS:3.1/AV:X/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", None),
+        ("CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", None),
+        ("AV:N/AC:L/Au:N/C:P/I:P/A:P", None),
+    ],
+)
+def test_cvss_v3_base_score(vector: str, score: float | None) -> None:
+    from nexus_symbiote.offline_advisories import cvss3_base_score
+
+    assert cvss3_base_score(vector) == score
+
+
+@pytest.mark.parametrize(
+    ("score", "severity"),
+    [
+        (9.0, "critical"),
+        (8.9, "high"),
+        (7.0, "high"),
+        (6.9, "medium"),
+        (4.0, "medium"),
+        (3.9, "low"),
+    ],
+)
+def test_a_cvss_v3_score_maps_to_its_qualitative_rating(score: float, severity: str) -> None:
+    from nexus_symbiote.offline_advisories import cvss3_severity
+
+    assert cvss3_severity(score) == severity

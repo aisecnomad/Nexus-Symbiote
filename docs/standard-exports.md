@@ -120,6 +120,7 @@ Messages and recommendations are one line of plain text: control, bidirectional 
 | `instruction_layering` | Layered instruction files | none | LLM01:2025 | LLM01:2026 | ASI01 | none | MEASURE-2.7 |
 | `invalid_safetensors` | Unverified SafeTensors structure | none | LLM03:2025 | LLM04:2026 | ASI04 | AML.T0011.000 | MANAGE-3.2 |
 | `invisible_characters` | Invisible characters in instructions | CWE-451, CWE-1427 | LLM01:2025 | LLM01:2026 | ASI01 | AML.T0068 | MEASURE-2.7 |
+| `known_vulnerability` | Known vulnerability in a pinned package | CWE-1395 | LLM03:2025 | LLM04:2026 | ASI04 | AML.T0010 | MEASURE-2.7 |
 | `launch_context` | Widened MCP launch context | none | none | none | ASI05 | none | MEASURE-2.7 |
 | `launcher_identity` | Unknown MCP launcher identity | none | LLM03:2025 | LLM04:2026 | ASI04 | AML.T0010.005 | MEASURE-2.7 |
 | `line_separators` | Line or paragraph separators | none | LLM01:2025 | none | none | none | MEASURE-2.7 |
@@ -166,6 +167,7 @@ The `nexus-symbiote/vex-content/v2` serial profile identifies the complete expor
 - Its version is the inventory's version. `metadata` names the producing tool and includes the inventory timestamp when recorded. An external reference of type `bom` points at the inventory with a BOM-Link (`urn:cdx:<serial>/<version>`). An inventory without a serial number gets the content-derived serial its CycloneDX export would have, so the link names that export. An inventory with a serial outside the `urn:uuid:` format omits the link. Like the CycloneDX and SPDX exports, `vex` rejects an inventory whose timestamp has no time zone, whose component references repeat, or whose dependencies name an unknown component.
 - Components carry the type, version, package URL and digests the CycloneDX inventory export gives them.
 - Each finding's identifier is `NEXUS-` and the SARIF `nexus_symbiote/v1` fingerprint: it stays the same when an artifact digest or the severity changes, and changes with the finding text.
+- An advisory that `scan --advisory-db` recorded is listed once per package under the id the CycloneDX export gives it, not as a `NEXUS-` finding, so a decision for that id applies. A suppressing decision applies only when the receipt that recorded the advisory has `complete` coverage, the same rule a linked report follows; otherwise the entry stays `in_triage`. A scan in the default mode inventories only the AI catalog's packages, so its receipt is `partial` and a suppressing decision needs a scan with `--all-packages`. When `--advisories` links a report that matched the same id on the same package, the report's entry is the one listed.
 - Descriptions and details are neutralized like SARIF messages.
 - Findings on components imported from a ShadowScan report are omitted; the metadata property `nexus-symbiote:omittedImportedFindings` counts them.
 

@@ -67,6 +67,17 @@ _CHEAP_STEPS = 32
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
 
 
+def feed_in_input_repository(feed: Path, *input_directories: Path) -> bool:
+    """Check every Git working tree enclosing an input directory or the working directory."""
+    resolved = feed.resolve()
+    for directory in (*input_directories, Path.cwd()):
+        start = directory.resolve()
+        for tree in (start, *start.parents):
+            if os.path.lexists(tree / ".git") and resolved.is_relative_to(tree):
+                return True
+    return False
+
+
 @dataclass(frozen=True)
 class _ParsedAdvisory:
     record_id: str
@@ -160,6 +171,50 @@ def _parse_epss_unit(raw: object, field_name: str) -> float:
     return value
 
 
+_CVSS3_WEIGHTS: dict[str, dict[str, float]] = {
+    "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
+    "AC": {"L": 0.77, "H": 0.44},
+    "UI": {"N": 0.85, "R": 0.62},
+    **dict.fromkeys(("C", "I", "A"), {"H": 0.56, "L": 0.22, "N": 0.0}),
+}
+# Privileges Required weighs more when the scope changes.
+_CVSS3_PRIVILEGES = {"U": {"N": 0.85, "L": 0.62, "H": 0.27}, "C": {"N": 0.85, "L": 0.68, "H": 0.5}}
+
+
+def cvss3_base_score(vector: str) -> float | None:
+    """The CVSS v3.0 or v3.1 base score (CVSS 3.1 equations), or None for any other text."""
+    version, _, metrics_text = vector.strip().partition("/")
+    metrics: dict[str, str] = {}
+    for part in metrics_text.split("/"):
+        key, found, value = part.partition(":")
+        if not found or not key or not value or key in metrics:
+            return None
+        metrics[key] = value
+    scope = metrics.get("S")
+    if version not in {"CVSS:3.0", "CVSS:3.1"} or scope not in _CVSS3_PRIVILEGES:
+        return None
+    try:
+        weights = {key: table[metrics[key]] for key, table in _CVSS3_WEIGHTS.items()}
+        privileges = _CVSS3_PRIVILEGES[scope][metrics["PR"]]
+    except KeyError:
+        return None
+    iss = 1 - (1 - weights["C"]) * (1 - weights["I"]) * (1 - weights["A"])
+    changed = scope == "C"
+    impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15 if changed else 6.42 * iss
+    if impact <= 0:
+        return 0.0
+    exploitability = 8.22 * weights["AV"] * weights["AC"] * privileges * weights["UI"]
+    total = min((impact + exploitability) * (1.08 if changed else 1.0), 10.0)
+    # CVSS 3.1 Roundup: the smallest one-decimal value at or above the total.
+    scaled = round(total * 100_000)
+    return scaled / 100_000 if scaled % 10_000 == 0 else (scaled // 10_000 + 1) / 10
+
+
+def cvss3_severity(score: float) -> str:
+    """The CVSS 3.1 qualitative rating; a 0.0 ("none") score is the lowest finding, low."""
+    return "critical" if score >= 9 else "high" if score >= 7 else "medium" if score >= 4 else "low"
+
+
 def _extract_severity(record: dict[str, Any]) -> str:
     db_spec = record.get("database_specific")
     candidates = [
@@ -171,7 +226,21 @@ def _extract_severity(record: dict[str, Any]) -> str:
             norm = "medium" if raw.strip().lower() == "moderate" else raw.strip().lower()
             if norm in _SEVERITY_ORDER:
                 return norm
-    return "unknown"
+    # Without a label, the highest CVSS v3 base score in OSV's severity array decides.
+    return _cvss_severity(record.get("severity"))
+
+
+def _cvss_severity(entries: object) -> str:
+    """The rating of the highest CVSS v3 base score in an OSV ``severity`` array."""
+    scores = [
+        score
+        for entry in (entries if isinstance(entries, list) else [])
+        if isinstance(entry, dict)
+        and entry.get("type") == "CVSS_V3"
+        and isinstance(entry.get("score"), str)
+        and (score := cvss3_base_score(entry["score"])) is not None
+    ]
+    return cvss3_severity(max(scores)) if scores else "unknown"
 
 
 def _parse_osv_records(payload: object) -> list[_ParsedAdvisory]:
@@ -514,7 +583,13 @@ class _PackageMatcher:
         budget: _MatchBudget,
     ) -> None:
         self._ecosystem = ecosystem
-        self._advisories = [adv for adv, _ in blocks]
+        # A record that states no severity takes the one OSV states for this package.
+        self._advisories = [
+            replace(adv, severity=_cvss_severity(affected.get("severity")))
+            if adv.severity == "unknown"
+            else adv
+            for adv, affected in blocks
+        ]
         self._listed: dict[Any, list[int]] = {}
         self._listed_text: dict[str, list[int]] = {}
         self._nodes: dict[int, list[_Hit]] = {}

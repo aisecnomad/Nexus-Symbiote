@@ -98,12 +98,13 @@ Security alerts appear first in text output, followed by notes and component/rel
 | Relationship assurance or conditions changed | high |
 | Coverage regressed (new failure/gap/exclusion, worse or missing collector status, fewer collectors, changed scope, more unobserved surfaces, lower coverage assurance, or missing completeness claim) | high (naming collector/entries) |
 | Scanned surface removed from completeness claim (`1 scanned surface removed (src/old.py): coverage narrowed; components found there are no longer compared.`); added surfaces are info | high |
+| Offline advisory receipt narrowed or removed (`Offline advisory coverage narrowed: coverage complete → partial.`): lower `coverage`, fewer `components_checked`, more packages skipped, excluded or unidentified, or another scope; a count the new receipt drops or garbles is narrowing, while a count a baseline from before it existed lacks is compared as zero. The receipt is compared by meaning, not as a scanned surface | high |
 | Collector newly recorded as non-complete (`Collector 'model' is now recorded as failed; the baseline does not show this gap predates the change.`); newly `complete` is an improvement | high |
 | ShadowScan report content/bytes changed without matching digests, worse status, more unmapped entries, new projection limits, or lossy format | high |
 | New graph consistency errors (dangling/mistyped refs), `spec_version` mismatch, or unsupported `spec_version` | high |
 | IDE settings guardrail removed or widened (`deny_rule_removed`, `sandbox_egress_widened`, `scope_widened`, `malformed_settings_metadata`) | high |
 
-**Non-alerting changes & notes:** Added scanned surfaces, coverage improvements, different Nexus SymBiote `tool_version`, unchanged regenerated ShadowScan reports, and reordered unmapped ShadowScan entries never alert. **Notes** (printed even with zero changes) highlight shared gaps in both snapshots, shared graph problems, reversed snapshot timestamps, and absolute-vs-relative path mismatches.
+**Non-alerting changes & notes:** Added scanned surfaces, coverage improvements, different Nexus SymBiote `tool_version`, a different advisory bundle or more packages checked (an info note that names both bundle digests), unchanged regenerated ShadowScan reports, and reordered unmapped ShadowScan entries never alert. **Notes** (printed even with zero changes) highlight shared gaps in both snapshots, shared graph problems, reversed snapshot timestamps, and absolute-vs-relative path mismatches.
 
 ## Exit status
 

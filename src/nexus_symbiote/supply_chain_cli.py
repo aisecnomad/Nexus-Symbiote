@@ -980,29 +980,22 @@ def register_supply_chain_commands(main: click.Group) -> None:
             ) from exc
         try:
             if offline_db is not None:
-                advisory_trees = [
-                    *_repository_roots(aibom_path.resolve().parent),
-                    *_repository_roots(Path.cwd().resolve()),
-                ]
+                from nexus_symbiote.offline_advisories import (
+                    DEFAULT_MAX_FEED_AGE_DAYS,
+                    feed_in_input_repository,
+                    match_offline_advisories,
+                )
+
                 for feed_path, feed_flag in (
                     (offline_db, "--offline-db"),
                     *((kp, "--kev") for kp in kev_paths),
                     *(([(epss_path, "--epss")]) if epss_path is not None else ()),
                 ):
-                    resolved_feed = feed_path.resolve()
-                    if any(
-                        resolved_feed == tree or resolved_feed.is_relative_to(tree)
-                        for tree in advisory_trees
-                    ):
+                    if feed_in_input_repository(feed_path, aibom_path.resolve().parent):
                         raise click.UsageError(
                             f"{feed_flag} must lie outside every git repository enclosing "
                             "AIBOM_PATH or the current directory"
                         )
-                from nexus_symbiote.offline_advisories import (
-                    DEFAULT_MAX_FEED_AGE_DAYS,
-                    match_offline_advisories,
-                )
-
                 report, provenance = match_offline_advisories(
                     bom,
                     db_path=offline_db,

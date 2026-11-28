@@ -177,6 +177,11 @@ class VEXGenerator(Generator):
         self._deployment_id = deployment_id
 
     def generate(self, bom: AIBOM) -> dict[str, Any]:
+        from nexus_symbiote.scan_advisories import (
+            finding_advisory_id,
+            recorded_advisories,
+            vex_advisories,
+        )
         from nexus_symbiote.validators.risk import effective_component_risks
 
         # The same content-derived serial as the inventory exports, so the BOM-Link
@@ -203,6 +208,9 @@ class VEXGenerator(Generator):
         expired_warnings: list[str] = []
         omitted = 0
         comp_by_ref = {comp.bom_ref: comp for comp in bom.components}
+        # A scan-recorded advisory is listed once per package, under the id the CycloneDX
+        # export gives it, rather than again as a finding with a NEXUS- identifier.
+        recorded = recorded_advisories(bom)
 
         for comp in sorted(bom.components, key=lambda c: c.bom_ref):
             risks = effective_component_risks(comp)
@@ -214,6 +222,8 @@ class VEXGenerator(Generator):
             components.append(standard_component(comp))
             included_comp_refs.add(comp.bom_ref)
             for risk in sorted(risks, key=lambda r: (SEVERITY_ORDER[r.severity], r.category)):
+                if (comp.bom_ref, finding_advisory_id(risk)) in recorded:
+                    continue
                 identifier = finding_id(comp.bom_ref, risk.category, risk.detail)
                 if identifier in seen:
                     continue
@@ -270,7 +280,10 @@ class VEXGenerator(Generator):
                 str(entry.get("advisory_id") or entry.get("id") or ""),
             )
 
-        for adv in sorted(self._advisories, key=_adv_key):
+        # A linked report's entry comes first, so it represents a match both record.
+        listed = [(adv, True) for adv in self._advisories]
+        listed.extend((adv, False) for adv in vex_advisories(bom))
+        for adv, reported in sorted(listed, key=lambda item: _adv_key(item[0])):
             adv_id = adv.get("advisory_id") or adv.get("id")
             comp_ref = adv.get("component_ref") or adv.get("bom_ref")
             if not isinstance(adv_id, str) or not adv_id or not isinstance(comp_ref, str):
@@ -330,8 +343,10 @@ class VEXGenerator(Generator):
                 expired_warnings=expired_warnings,
                 inventory_sha256=decision_subject,
                 deployment_id=self._deployment_id,
-                advisory_complete=self._advisory_report is None
-                or self._advisory_report.coverage == "complete",
+                # Embedded and linked evidence alike must be complete to suppress.
+                advisory_complete=adv.get("coverage") == "complete"
+                if not reported
+                else self._advisory_report is None or self._advisory_report.coverage == "complete",
             )
             vulnerabilities.append(
                 {

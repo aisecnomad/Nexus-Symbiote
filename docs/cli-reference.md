@@ -799,6 +799,8 @@ nexus-symbiote risk [OPTIONS] AIBOM_PATH
 | `--no-score-threshold` | Do not gate on the aggregate score. Findings at or above `--fail-on-severity`, unverified SafeTensors, incomplete coverage and missing evidence still fail the gate. Cannot be combined with `--threshold`. |
 | `--json-output` | Output as JSON |
 | `--project` `DIRECTORY` | Reconcile the supplied BOM against this project's static evidence before scoring; a failed reconciliation reports an unknown risk level and a null score. The only source of a project policy: without it the built-in policy applies |
+| `--all-packages` | Use the package and image scope of `scan --all-packages`. Requires `--project`. |
+| `--advisory-db` `PATH` | Recheck advisory findings against an offline OSV bundle outside the project. Requires `--project`. |
 | `--signature-policy` `FILE` | Explicit operator signer policy for model recollection; requires --project |
 | `--fail-on-severity` `critical\|high\|medium\|low\|info\|none` | Fail on any finding at or above this severity (default: from policy, built-in critical); none disables it. |
 | `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. `root:.git` accepts the checkout marker. Explicit `.git` also accepts regular nested Git metadata files without following their pointers. |
@@ -1016,6 +1018,43 @@ directory otherwise, so two SARIF files are identical too when the scanned direc
 lies at the same path below the working directory in both scans, or below it in
 neither. See [reproducible inventories](reproducible-inventories.md).
 
+`--all-packages` inventories PyPI, npm and image declarations from supported root manifests,
+including declarations outside the [AI package catalog](registry-collector.md#ai-package-catalog).
+Lockfiles supply resolution evidence for declared packages. Transitive dependencies present only
+in a lockfile are outside registry collection.
+`--advisory-db` `PATH` matches every
+exact PyPI/npm pin in the inventory against an offline OSV bundle (a JSON file or a flat directory of OSV
+records, outside the scanned project) during the scan. Keep the bundle outside every Git
+working tree enclosing the project, the working directory, and, for replay, the supplied
+inventory. Each match is a `known_vulnerability`
+finding on the package, with the advisory's identifiers and severity, and the CycloneDX export
+lists it under `vulnerabilities`. The native completeness claim records the bundle SHA-256,
+newest record, coverage, and counts as a JSON receipt. Its `scope` is
+`inventoried-pypi-and-npm`. Its `registry_packages` is `all-supported` with `--all-packages`,
+`ai-catalog` without it, and `not-collected` when the registry collector is not selected. In the
+last two cases registry packages outside the AI catalog are never checked, so `scan` prints a
+warning and the receipt's coverage is at most `partial`. An MCP server whose npm or PyPI
+launcher package has no exact package URL (no exact pin, or a registry other than the default)
+has an unknown version: `components_unidentified` counts it, and coverage is at most `partial`. The receipt records `registry_lockfile_only_dependencies` as
+`not-collected` even when every eligible inventory entry was checked. CycloneDX exposes the same receipt as
+`nexus-symbiote:advisories:collection`. The CycloneDX `vulnerabilities` list is built only from
+advisories recorded against a bundle digest that a receipt in the inventory names, so an inventory
+without the receipt exports no `vulnerabilities`. A scan with zero exact targets records
+`coverage: none` under `unobserved_surfaces`. A PyPI or npm entry that is not one unconditional
+exact pin, such as a range, a wildcard, a pin with an environment marker, a URL or a bare name,
+is never reported as unaffected: it is recorded as the collection failure `exact package
+identity unavailable`, the receipt's coverage becomes `partial` (`none` when no entry is
+pinned), and the scan gate fails because collection is incomplete. A record without a severity label takes its
+severity from the highest CVSS v3.0 or v3.1 base score in OSV's `severity` array, or else in the
+matched package's `affected[].severity`, using the
+CVSS 3.1 equations and rating ranges (a 0.0 score is low); CVSS v2 and v4 vectors are not
+scored. A severity the bundle states neither way is recorded as a medium finding that says so
+and exported with an `unknown` rating. The feed-age check uses the current clock, so a bundle older than the
+matcher's default feed age turns the match into a collection failure even under
+`SOURCE_DATE_EPOCH`. Under `--all-packages` every PyPI or npm entry records
+`properties.ai_catalog`. Use the same flags when independently checking the inventory
+with `validate --project` or `risk --project`. Nothing leaves the machine.
+
 ### `summary`
 
 Print a summary of an AIBOM.
@@ -1072,6 +1111,8 @@ nexus-symbiote validate [OPTIONS] AIBOM_PATH
 | Option | Description |
 |---|---|
 | `--project` `DIRECTORY` | Project root for cross-validation. The only source of a project policy: without it the built-in policy applies |
+| `--all-packages` | Use the package and image scope of `scan --all-packages`. Requires `--project`. |
+| `--advisory-db` `PATH` | Recheck advisory findings against an offline OSV bundle outside the project. Requires `--project`. |
 | `--signature-policy` `PATH` | Explicit operator signer policy JSON; requires --project |
 | `--accept-default-exclude` `NAME` | Accept one built-in exclusion. Repeat for multiple names. Accepted occupied paths are recorded in coverage metadata. `root:.git` accepts the checkout marker. Explicit `.git` also accepts regular nested Git metadata files without following their pointers. |
 | `--accept-default-excludes` | Do not record a coverage gap for a non-empty default-excluded name (`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`). Without this flag such an entry makes coverage partial. An empty directory does not. |
@@ -1107,14 +1148,37 @@ fresh local collection of that project, and the basis is `project-reconciled`,
 cannot confirm; each is listed as a `SUPPLIER-CLAIM` line) or
 `project-reconciliation-failed`; `risk --project` uses the same values. When the
 project policy sets `validate.require_completeness: false`, `validate --project`
-skips that comparison and reports `project-not-reconciled`; `risk --project`
-reconciles regardless. The completeness check also prints the completeness validator's own `Basis:`
+skips that comparison and reports `project-not-reconciled` unless the operator explicitly
+requests `--all-packages` or `--advisory-db`. `risk --project` always reconciles.
+The completeness check also prints the completeness validator's own `Basis:`
 (`supplied-claims` without `--project`). Integrity is `PASS`, `FAIL` or `UNKNOWN`;
 unknown fails the check, and when no issue explains it the report says that no hash
 or signature could be verified. When the inventory carries ShadowScan discovery
 evidence that no producer check covered, the report says
 `Discovery producer: not verified (unsigned evidence accepted)`. The report ends with
 `Validation: PASSED` or `Validation: FAILED`.
+
+Use `--all-packages` when checking an inventory collected with `scan --all-packages`.
+Both `validate --project` and `risk --project` take their collection scope from the
+operator's flag. The default uses the AI registry catalog. Pass the same independent
+`--advisory-db` used for the scan to reproduce the advisory findings and coverage.
+The replay compares the advisory coverage receipt, including the bundle digest. It applies the
+same 30-day feed age as `scan`, counted from the bundle's newest record to the current clock.
+`advisories --offline-db` takes `--max-feed-age-days`; `scan`, `validate` and `risk` do not.
+An inventory therefore replays against its own bundle only within 30 days of that record. After
+that the check fails with `offline advisory DB is N days old` and `Advisory coverage receipt is
+missing or differs from the offline bundle replay.`; scan again with a current bundle and keep
+that inventory as the new baseline.
+Without a bundle, advisory findings and coverage beyond the local collection appear
+as supplier claims. `risk` still evaluates the supplied findings against its policy. The
+bundle path below is absolute because a bundle inside a Git working tree that encloses the
+project, the inventory or the working directory, such as `./osv.json` at a checkout root, is
+refused.
+
+```sh
+nexus-symbiote validate inventory.json --project ./app --all-packages --advisory-db /srv/osv/osv.json
+nexus-symbiote risk inventory.json --project ./app --all-packages --advisory-db /srv/osv/osv.json
+```
 
 ### `verify-artifact`
 

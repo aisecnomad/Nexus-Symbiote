@@ -6,7 +6,7 @@ import hmac
 import json
 import unicodedata
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -351,6 +351,9 @@ class CompletenessValidator:
         exclude_paths: Sequence[str] = (),
         signature_policies: Sequence[SigstoreArtifactPolicy] = (),
         accept_default_excludes: bool | tuple[str, ...] = False,
+        all_packages: bool = False,
+        advisory_db: Path | None = None,
+        inventory_path: Path | None = None,
     ) -> CompletenessReport:
         """Recollect the supported static inventory under caller-selected scope.
 
@@ -365,6 +368,8 @@ class CompletenessValidator:
         """
         from nexus_symbiote.graph import assemble_repository_agent
         from nexus_symbiote.scanners import ALL_SCANNERS, ModelScanner
+        from nexus_symbiote.scanners.base import Scanner
+        from nexus_symbiote.scanners.registry import AllPackagesRegistryScanner, RegistryScanner
         from nexus_symbiote.text_poisoning import apply_text_poisoning_rules
 
         report = self._validate_claims(bom)
@@ -378,13 +383,14 @@ class CompletenessValidator:
         accepted_default_names: set[str] = set()
         status: dict[str, str] = {}
         report_digest: str | None = None
-
         for scanner_type in ALL_SCANNERS:
-            scanner = (
-                ModelScanner(signature_policies=signature_policies)
-                if scanner_type is ModelScanner
-                else scanner_type()
-            )
+            scanner: Scanner
+            if scanner_type is ModelScanner:
+                scanner = ModelScanner(signature_policies=signature_policies)
+            elif scanner_type is RegistryScanner and all_packages:
+                scanner = AllPackagesRegistryScanner()
+            else:
+                scanner = scanner_type()
             scanner.configure(
                 exclude_paths=exclude_paths,
                 accept_default_excludes=accept_default_excludes,
@@ -436,6 +442,22 @@ class CompletenessValidator:
         )
         for reason in text_failures:
             incomplete("text_poisoning", f"Local collection incomplete: {reason}")
+        advisory_unobserved = None
+        if advisory_db is not None:
+            from nexus_symbiote.scan_advisories import attach_offline_advisories
+
+            attachment = attach_offline_advisories(
+                expected,
+                advisory_db,
+                root,
+                registry_packages="all-supported" if all_packages else "ai-catalog",
+                inventory_path=inventory_path,
+            )
+            for reason in attachment.failures:
+                incomplete("advisories", reason)
+            if attachment.surface is not None:
+                surfaces.append(attachment.surface)
+            advisory_unobserved = attachment.unobserved_surface
         coverage = self._local_coverage(
             report_digest,
             surfaces,
@@ -446,6 +468,8 @@ class CompletenessValidator:
         coverage.unobserved_surfaces.extend(
             f"accepted default exclusion: {name}" for name in sorted(accepted_default_names)
         )
+        if advisory_unobserved is not None:
+            coverage.unobserved_surfaces.append(advisory_unobserved)
         # Exclusions also include configured names even on an empty checkout. A path
         # receipt binds a decision to an occupied entry in this inventory.
         prior_coverage = bom.metadata.completeness
@@ -459,7 +483,13 @@ class CompletenessValidator:
         report.assurance_level = coverage.assurance_level
         report.surfaces_covered = coverage.surfaces_scanned
         report.surfaces_missing = coverage.surfaces_excluded
-        self._reconcile_coverage(bom.metadata.completeness, coverage, root, report)
+        self._reconcile_coverage(
+            bom.metadata.completeness,
+            coverage,
+            root,
+            report,
+            replay_advisories=advisory_db is not None,
+        )
 
         # An agent inferred without a manifest is evidence of nothing in the checkout.
         inferred_agent = (
@@ -595,6 +625,8 @@ class CompletenessValidator:
         local: CompletenessClaim,
         root: Path,
         report: CompletenessReport,
+        *,
+        replay_advisories: bool = False,
     ) -> None:
         """Refuse coverage the local run contradicts; list coverage it cannot confirm.
 
@@ -603,7 +635,9 @@ class CompletenessValidator:
         collector records are supplier claims where they state more than the local run:
         a surface or collector it did not record, or a path it excluded that the claim
         does not. Recording less claims less coverage, which the local run already shows.
+        An explicit advisory replay compares the receipt in its recorded coverage field.
         """
+        from nexus_symbiote.scan_advisories import ADVISORY_SURFACE_PREFIX
         from nexus_symbiote.scanners.base import project_relative
 
         if claim is None:
@@ -619,7 +653,12 @@ class CompletenessValidator:
                 "Coverage claim asserts verified assurance; offline collection cannot "
                 "establish it.",
             )
-        missing = sorted(set(local.unobserved_surfaces).difference(claim.unobserved_surfaces))
+        local_unobserved = set(local.unobserved_surfaces)
+        missing = sorted(
+            surface
+            for surface in local_unobserved.difference(claim.unobserved_surfaces)
+            if not surface.startswith(ADVISORY_SURFACE_PREFIX)
+        )
         if missing:
             report.add_issue(
                 COVERAGE_CLAIM,
@@ -628,8 +667,23 @@ class CompletenessValidator:
             )
         relative = project_relative(root)
         scanned = {relative(surface) for surface in claim.surfaces_scanned}
+        local_scanned = set(local.surfaces_scanned)
+
+        def advisory_receipts(surfaces: Iterable[str]) -> set[str]:
+            return {surface for surface in surfaces if surface.startswith(ADVISORY_SURFACE_PREFIX)}
+
+        unobserved_receipts = advisory_receipts(claim.unobserved_surfaces)
+        if replay_advisories and (
+            advisory_receipts(scanned) != advisory_receipts(local_scanned)
+            or unobserved_receipts != advisory_receipts(local_unobserved)
+        ):
+            report.add_issue(
+                COVERAGE_CLAIM,
+                "Advisory coverage receipt is missing or differs from the offline bundle replay.",
+            )
         beyond_local = {
-            "surfaces_scanned": scanned - set(local.surfaces_scanned),
+            "surfaces_scanned": scanned - local_scanned,
+            "unobserved_surfaces": unobserved_receipts - local_unobserved,
             # A default name is excluded at every level, whichever list names it.
             "exclusions": set(local.exclusions) - DEFAULT_EXCLUDES - set(claim.exclusions),
             "collectors_requested": set(claim.collectors_requested)

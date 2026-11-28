@@ -212,6 +212,11 @@ class CycloneDXGenerator(Generator):
             services = self._services(aibom)
             if services:
                 document["services"] = services
+        from nexus_symbiote.scan_advisories import cyclonedx_vulnerabilities
+
+        vulnerabilities = cyclonedx_vulnerabilities(aibom)
+        if vulnerabilities:
+            document["vulnerabilities"] = vulnerabilities
         return document
 
     @staticmethod
@@ -468,6 +473,13 @@ class CycloneDXGenerator(Generator):
             {"name": PROJECTION_PROPERTY, "value": self._projection_marker},
         ]
         claim = aibom.metadata.completeness
+        if claim:
+            from nexus_symbiote.scan_advisories import advisory_receipts
+
+            meta["properties"].extend(
+                {"name": "nexus-symbiote:advisories:collection", "value": receipt}
+                for receipt in sorted(advisory_receipts(aibom))
+            )
         if claim and claim.source_report_digest:
             meta["properties"].extend(
                 [
