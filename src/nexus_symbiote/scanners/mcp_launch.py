@@ -83,6 +83,7 @@ _JSR = re.compile(r"(@[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*)(?:@([^/]+))?(?:/.
 _NODE_INLINE = frozenset({"-e", "--eval", "-p", "--print", "-pe", "-ep", "-"})
 _NODE_PRELOAD = frozenset({"-r", "--require", "--import", "--loader", "--experimental-loader"})
 _NODE_DEBUGGERS = frozenset({"--inspect", "--inspect-brk", "--inspect-wait"})
+_NODE_DEBUGGER_NEGATIONS = {option.replace("--", "--no-", 1): option for option in _NODE_DEBUGGERS}
 _NODE_DEBUG_PORTS = frozenset({"--inspect-port", "--debug-port"})
 # Node options that take a value as the next word (node --help); the value is never the script.
 _NODE_VALUES = _NODE_PRELOAD | _set(
@@ -1488,6 +1489,7 @@ def _interpreter_reason(
     start: int = 0,
 ) -> str | None:
     """Inline code, or a package runner run as a module, among an interpreter's options."""
+    debugger_flags: set[str] = set()
     index = start
     while index < len(words):
         word = words[index]
@@ -1509,10 +1511,22 @@ def _interpreter_reason(
                 return _inline(family, launch)
             if norm in _NODE_PRELOAD and launch is not None:
                 launch.mark("preload_module")
-            if family == "ts-node" and (norm in _NODE_DEBUGGERS or norm in _NODE_DEBUG_PORTS):
+            negated = _NODE_DEBUGGER_NEGATIONS.get(norm)
+            if family == "ts-node" and (
+                norm in _NODE_DEBUGGERS or negated or norm in _NODE_DEBUG_PORTS
+            ):
                 return "direct ts-node arguments do not accept Node inspector flags"
-            if norm in _NODE_DEBUGGERS and launch is not None:
-                launch.mark("debugger_enabled")
+            if launch is not None and (norm in _NODE_DEBUGGERS or negated):
+                if negated:
+                    debugger_flags.discard(negated)
+                else:
+                    # Starting with a break/wait also enables the inspector. Negating
+                    # either switch later clears only its own flag.
+                    debugger_flags.update(("--inspect", norm))
+                if debugger_flags:
+                    launch.context["debugger_enabled"] = 1
+                else:
+                    launch.context.pop("debugger_enabled", None)
             takes = norm in _NODE_VALUES or (
                 family == "ts-node" and (option in _TS_NODE_VALUES or norm in _TS_NODE_VALUES)
             )

@@ -98,6 +98,13 @@ def test_other_deno_short_forms_still_require_a_known_option(option: str) -> Non
         (["--debug-port=5858", "./server.js"], False),
         (["--inspect-port", "9230", "--inspect", "./server.js"], True),
         (["./server.js", "--inspect"], False),
+        (["--inspect", "--no_inspect", "./server.js"], False),
+        (["--no-inspect", "--inspect", "./server.js"], True),
+        (["--inspect-brk", "--no-inspect-brk", "./server.js"], True),
+        (["--inspect-brk", "--no-inspect", "./server.js"], True),
+        (["--inspect-brk", "--no-inspect-brk", "--no-inspect", "./server.js"], False),
+        (["--inspect-wait", "--no-inspect-wait", "./server.js"], True),
+        (["--inspect", "./server.js", "--no-inspect"], True),
     ],
 )
 def test_node_debugger_activation(args: list[str], enabled: bool) -> None:
