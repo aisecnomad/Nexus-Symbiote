@@ -195,6 +195,12 @@ def test_drift_output_withholds_a_webhook_secret_in_a_scope_uri(tmp_path: Path) 
         ("https://api.telegram.org/bot123:token/sendMessage", "https://api.telegram.org"),
         ("hooks.slack.com/services/TEAM/BOT/onlywordshere", REDACTED),
         ("discord.com/api/webhooks/1/short", REDACTED),
+        ("//hooks.slack.com/services/T/B/publicfixture", REDACTED),
+        (r"https://hooks.slack.com\services\T\B\publicfixture", REDACTED),
+        ("hooks.slack.com./services/T/B/publicfixture", REDACTED),
+        ("discord.com/api/%77ebhooks/1/publicfixture", REDACTED),
+        ("read hooks.slack.com/services/T/B/publicfixture", REDACTED),
+        ("https://docs.example/read hooks.slack.com/services/T/B/publicfixture", REDACTED),
     ],
     ids=[
         "slack-words",
@@ -209,6 +215,12 @@ def test_drift_output_withholds_a_webhook_secret_in_a_scope_uri(tmp_path: Path) 
         "telegram",
         "slack-without-scheme",
         "discord-without-scheme",
+        "network-path",
+        "backslash",
+        "absolute-dns-name",
+        "encoded-route",
+        "scope-list",
+        "mixed-scope-uri-list",
     ],
 )
 def test_a_recognised_webhook_route_is_withheld_however_it_is_spelled(

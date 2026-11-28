@@ -10,7 +10,7 @@ import re
 import string
 from collections.abc import Iterable, Iterator, Mapping
 from typing import Any, cast
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from nexus_symbiote.utils._legacy_redaction import (
     hidden_spans,
@@ -1133,6 +1133,10 @@ _SCHEMELESS_USERINFO = re.compile(r"//[^\s/?#@]*+@|[^\s/?#@:]++:[^\s/?#@]++@[^\s
 
 def redact_oauth_scope(value: str) -> str:
     """Show an OAuth scope (RFC 6749 section 3.3) unless it may contain a secret."""
+    # Backslashes are outside the OAuth scope grammar. Browsers may treat them as
+    # URL separators where urlsplit considers them part of the host.
+    if "\\" in value:
+        return REDACTED
     shown = _shown_scope(value)
     # A token glued to a letter or digit, user information in a URL without a scheme, or a
     # webhook route written without one passes the rules below, also in what remains of a
@@ -1140,7 +1144,7 @@ def redact_oauth_scope(value: str) -> str:
     if (
         holds_token_shape(shown, require_sk_boundary=True)
         or _SCHEMELESS_USERINFO.search(shown)
-        or ("://" not in shown and _webhook_route(shown))
+        or any("://" not in word and _webhook_route(word) for word in shown.split())
     ):
         return REDACTED
     return shown
@@ -1180,10 +1184,11 @@ _WEBHOOK_PATHS = (
 def _webhook_route(text: str) -> bool:
     """Whether ``text``, with or without a scheme, is a URL on a recognised webhook route."""
     try:
-        parts = urlsplit(text if "://" in text else "//" + text)
+        parts = urlsplit(text if text.startswith("//") or "://" in text else "//" + text)
     except ValueError:
         return False
-    host, path = (parts.hostname or "").lower(), parts.path.lower()
+    host = unquote(parts.hostname or "").rstrip(".").lower()
+    path = unquote(parts.path).lower()
     return path not in {"", "/"} and (
         host in _WEBHOOK_HOSTS
         or any(
