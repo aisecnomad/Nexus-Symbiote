@@ -68,6 +68,17 @@ MODEL_CALLS = frozenset(
         "transcriptions", "with_options", "with_structured_output",
     }
 )  # fmt: skip
+# Calls that route by a prefix on the identifier, as LiteLLM reads ``anthropic/``, to the
+# separators they read it by. A native owner/name, as Replicate and model hubs read it, an
+# OpenAI-compatible gateway's names and a model class given its provider are no routes.
+ROUTERS: dict[tuple[str, str], str] = {
+    ("crewai", "Agent"): "/", ("crewai", "Crew"): "/", ("crewai", "LLM"): "/",
+    ("dspy", "Embedder"): "/", ("dspy", "LM"): "/", ("litellm", "*"): "/",
+    ("smolagents", "LiteLLMModel"): "/", ("smolagents", "LiteLLMRouterModel"): "/",
+    ("langchain.chat_models", "init_chat_model"): ":",
+    ("langchain.embeddings", "init_embeddings"): ":",
+    ("pydantic_ai", "Agent"): ":", ("pydantic_ai", "infer_model"): ":",
+}  # fmt: skip
 # Loaders that run a model here, whose options may let it run its own code; GGUF and ONNX hold none.
 WEIGHT_ROOTS = ("diffusers", "peft", "sentence_transformers", "transformers", "vllm")
 WEIGHT_CLASSES = frozenset(

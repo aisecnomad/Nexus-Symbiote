@@ -30,6 +30,7 @@ from nexus_symbiote.scanners.source_python_tables import (
     MODEL_KEYWORDS,
     POSITIONAL_MODELS,
     REPO_ID_CLASSES,
+    ROUTERS,
     TEXT_CALLS,
     WEIGHT_CLASSES,
     WEIGHT_ROOTS,
@@ -1160,6 +1161,9 @@ class PythonReader:
             self._given.update((value.lineno, value.col_offset) for value, _ in found)
             return
         self._unread.update((value.lineno, value.col_offset) for value in unread)
+        # A call that names its provider by keyword reads no route off the identifier.
+        provided = keywords.keys() & {"model_provider", "provider"}
+        routes = "" if origin is None or provided else _row(base, ROUTERS) or ""
         flags, opaque = [keywords.get("trust_remote_code")], list(spread)
         given = [(value, key in _KWARGS) for key, value in keywords.items()]
         for options, named_options in given:
@@ -1176,7 +1180,9 @@ class PythonReader:
         if opaque and found and not remote and origin is not None and _loads_weights(origin):
             self._found.gap(module.path, call.lineno, _OPTIONS)
         for expression, embeds in found:
-            self._model_references(module, expression, embedding=embeds, remote=remote)
+            self._model_references(
+                module, expression, embedding=embeds, routes=routes, remote=remote
+            )
 
     def _pairs(self, module: Module, options: ast.expr | None) -> Sequence[tuple[object, ast.expr]]:
         """The keys and values of options given as a dict; what it cannot read has no key."""
@@ -1194,7 +1200,7 @@ class PythonReader:
         return [] if options is None or isinstance(options, ast.Constant) else [(None, options)]
 
     def _model_references(
-        self, module: Module, expression: ast.expr, *, embedding: bool, remote: bool
+        self, module: Module, expression: ast.expr, *, embedding: bool, routes: str, remote: bool
     ) -> None:
         """Record each identifier a model argument can hold, and account for what else
         it can hold."""
@@ -1221,6 +1227,7 @@ class PythonReader:
                     point[0],
                     method=METHOD,
                     embedding=embedding,
+                    routes=routes,
                     remote_code=remote,
                     environment=variables,
                 )

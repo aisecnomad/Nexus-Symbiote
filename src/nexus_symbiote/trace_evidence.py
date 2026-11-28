@@ -23,6 +23,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from nexus_symbiote.core.aibom import AIBOM, MAX_NATIVE_BYTES
+from nexus_symbiote.core.collection import SOURCE_REFERENCE_MODE
 from nexus_symbiote.core.content_digest import INVENTORY_CONTENT_PROFILE, inventory_content_digest
 from nexus_symbiote.core.hashing import (
     hash_bytes,
@@ -53,6 +54,7 @@ from nexus_symbiote.otlp import (
     file_name,
 )
 from nexus_symbiote.risk_classes import plain_authority
+from nexus_symbiote.scanners.source_references import split_route
 
 FORMAT = "nexus-symbiote/trace-evidence/v1"
 ASSURANCE = "reported"
@@ -112,6 +114,14 @@ SARIF_HELP_URI = (
     "https://github.com/aisecnomad/Nexus-Symbiote/blob/main/docs/trace-evidence.md#sarif"
 )
 _LOCAL_TRANSPORTS = ("pipe", "unix")
+# Names that instrumentations and model routers give a provider, to the one OpenTelemetry's
+# gen_ai.provider.name gives it, so that each side's spelling finds the other.
+_PROVIDER_ALIASES = {
+    "aws-bedrock": "aws.bedrock", "az.ai.openai": "azure.ai.openai", "azure": "azure.ai.openai",
+    "azure-openai": "azure.ai.openai", "bedrock": "aws.bedrock", "gemini": "gcp.gemini",
+    "google-vertex-ai": "gcp.vertex_ai", "mistral": "mistral_ai", "vertex_ai": "gcp.vertex_ai",
+    "watsonx": "ibm.watsonx.ai", "xai": "x_ai",
+}  # fmt: skip
 _DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 _TRIM = " \t\r\n"
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -366,6 +376,11 @@ def _time(nanoseconds: int | None) -> str | None:
     return moment.strftime("%Y-%m-%dT%H:%M:%S") + f".{fraction:09d}Z"
 
 
+def _provider_key(provider: str) -> str:
+    lowered = provider.lower()
+    return _PROVIDER_ALIASES.get(lowered, lowered)
+
+
 def _trimmed(value: str | None) -> str | None:
     text = value.strip(_TRIM) if value is not None else ""
     return text or None
@@ -455,13 +470,30 @@ class _Inventory:
                 if component.model_type == "hosted":
                     self.declared.append(("model", component))
                 provider = _trimmed(component.provider)
+                keys = {name} if name is not None else set()
                 alias = _trimmed(component.requested_alias)
-                for key in {name, None if alias is None else name_key(alias)} - {None}:
+                if alias is not None:
+                    keys.add(name_key(alias))
+                aliases = component.properties.get("requested_aliases")
+                if (
+                    component.properties.get("collection_mode") == SOURCE_REFERENCE_MODE
+                    and provider is not None
+                    and isinstance(aliases, list)
+                ):
+                    # A property only contributes alternative routes to this declared model.
+                    for route in aliases:
+                        if (
+                            isinstance(route, str)
+                            and len(route) <= MAX_IDENTIFIER_CHARS
+                            and split_route(route) == (component.name, provider)
+                        ):
+                            keys.add(name_key(route))
+                for key in keys:
                     groups["models"][key].append(component)
                     if provider is None:
                         groups["models_open"][key].append(component)
                     else:
-                        groups["models_for"][(key, provider.lower())].append(component)
+                        groups["models_for"][(key, _provider_key(provider))].append(component)
             elif isinstance(component, AgentComponent) and not _inferred(component):
                 self.declared.append(("agent", component))
                 # A manifest that declares an id derives the agent's reference from it.
@@ -534,7 +566,7 @@ class _Inventory:
             model = None if raw is None else name_key(raw)
             if provider is None:
                 return [(self._get("models", model), "name")]
-            if exact := self._get("models_for", (model, provider.lower())):
+            if exact := self._get("models_for", (model, _provider_key(provider))):
                 return [(exact, "name-and-provider")]
             return [(self._get("models_open", model), "name")]
         if kind == "agent":

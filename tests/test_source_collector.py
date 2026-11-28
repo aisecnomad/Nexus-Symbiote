@@ -27,6 +27,7 @@ from nexus_symbiote.scanners.source_references import (
     Declarations,
     environment_name,
     model_identifier,
+    split_route,
 )
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.validators.completeness import CompletenessValidator
@@ -1474,7 +1475,7 @@ def test_each_file_is_read_as_it_is_given_and_only_the_first_places_are_kept(tmp
     (model,) = found.components()
     assert model.properties["references_unlisted"] == 80 - 16
     assert len(model.claims["source_reference"].evidence_refs) == 16
-    assert len(found._models["gpt-4o"].locations) == 16
+    assert len(found._models[("gpt-4o", None)].locations) == 16
 
 
 def test_a_reference_another_collector_contradicts_is_not_vouched_for(
@@ -1489,7 +1490,7 @@ def test_a_reference_another_collector_contradicts_is_not_vouched_for(
     )
     (root / "weights.pkl").write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
     # The two collectors name different subjects by one reference.
-    monkeypatch.setattr(source_references, "model_ref", lambda name: "model:weights.pkl")
+    monkeypatch.setattr(source_references, "model_ref", lambda *_: "model:weights.pkl")
     report = CompletenessValidator().validate_against_project(AIBOM(components=[]), root)
     assert any(
         "Conflicting local reference: model:weights.pkl" in i.description for i in report.issues
@@ -1581,64 +1582,6 @@ def test_an_unsafe_format_claim_on_a_reference_still_fails(tmp_path: Path):
     )
     assert "critical" in {issue.severity for issue in report.issues}
     assert not report.is_valid
-
-
-@pytest.mark.parametrize(
-    ("source", "expected"),
-    [
-        (
-            'from langchain.chat_models import init_chat_model\ninit_chat_model("openai:gpt-4.1")\n',
-            {"openai:gpt-4.1"},
-        ),
-        (
-            'from sentence_transformers import SentenceTransformer\nSentenceTransformer("BAAI/bge-m3")\n',
-            {"BAAI/bge-m3"},
-        ),
-        (
-            'from transformers import AutoModel\nAutoModel.from_pretrained("openai/whisper-large-v3")\n',
-            {"openai/whisper-large-v3"},
-        ),
-        ('import dspy\ndspy.LM("anthropic/claude-sonnet-4-5")\n', {"anthropic/claude-sonnet-4-5"}),
-        (
-            'from agno.models.openai import OpenAIChat\nOpenAIChat(id="gpt-4.1-mini")\n',
-            {"gpt-4.1-mini"},
-        ),
-        (
-            'from langchain_huggingface import HuggingFaceEndpoint\nHuggingFaceEndpoint(repo_id="mistralai/Mistral-7B-Instruct-v0.3")\n',
-            {"mistralai/Mistral-7B-Instruct-v0.3"},
-        ),
-        (
-            'from huggingface_hub import hf_hub_download\nhf_hub_download(repo_id="acme/rules-dataset")\n',
-            set(),
-        ),
-        (
-            'from langchain.chat_models import init_chat_model\ninit_chat_model("ignored", model="gpt-4o")\n',
-            {"gpt-4o"},
-        ),
-        (
-            'import boto3\nboto3.client("bedrock-runtime").converse(modelId="anthropic.claude-3-5-haiku-20241022-v1:0")\n',
-            {"anthropic.claude-3-5-haiku-20241022-v1:0"},
-        ),
-        ('from crewai import LLM\nLLM(model="ollama/llama3.1:8b")\n', {"ollama/llama3.1:8b"}),
-    ],
-)
-def test_which_arguments_hold_a_model(tmp_path: Path, source: str, expected: set[str]):
-    result = scan(tmp_path, {"run.py": source})
-    # An identifier is recorded as written; no provider is read from it here.
-    assert set(models(result)) == expected
-    assert all(model.provider is None for model in models(result).values())
-
-
-def test_positional_models_of_common_entry_points_are_read(tmp_path: Path):
-    result = scan(
-        tmp_path,
-        {
-            "run.py": "import litellm\nimport ollama\nfrom pydantic_ai import Agent\n\n"
-            'Agent("openai:gpt-4o")\nlitellm.completion("gpt-4o-mini", [])\n'
-            'ollama.chat("llama3.2", messages=[])\n'
-        },
-    )
-    assert set(models(result)) == {"openai:gpt-4o", "gpt-4o-mini", "llama3.2"}
 
 
 def test_more_entry_points_name_their_models(tmp_path: Path):
@@ -2523,6 +2466,153 @@ def test_two_variables_that_share_a_fallback_are_both_kept(tmp_path: Path):
     assert variables == ["BACKUP_MODEL", "PRIMARY_MODEL"]
 
 
+# -- providers read off a routing prefix ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            'from langchain.chat_models import init_chat_model\ninit_chat_model("openai:gpt-4.1")\n',
+            {"gpt-4.1": "openai"},
+        ),
+        (
+            'from sentence_transformers import SentenceTransformer\nSentenceTransformer("BAAI/bge-m3")\n',
+            {"BAAI/bge-m3": None},
+        ),
+        (
+            'from transformers import AutoModel\nAutoModel.from_pretrained("openai/whisper-large-v3")\n',
+            {"openai/whisper-large-v3": None},
+        ),
+        (
+            'import dspy\ndspy.LM("anthropic/claude-sonnet-4-5")\n',
+            {"claude-sonnet-4-5": "anthropic"},
+        ),
+        (
+            'from agno.models.openai import OpenAIChat\nOpenAIChat(id="gpt-4.1-mini")\n',
+            {"gpt-4.1-mini": None},
+        ),
+        (
+            'from langchain_huggingface import HuggingFaceEndpoint\nHuggingFaceEndpoint(repo_id="mistralai/Mistral-7B-Instruct-v0.3")\n',
+            {"mistralai/Mistral-7B-Instruct-v0.3": None},
+        ),
+        (
+            'from huggingface_hub import hf_hub_download\nhf_hub_download(repo_id="acme/rules-dataset")\n',
+            {},
+        ),
+        (
+            'from langchain.chat_models import init_chat_model\ninit_chat_model("ignored", model="gpt-4o")\n',
+            {"gpt-4o": None},
+        ),
+        (
+            'import boto3\nboto3.client("bedrock-runtime").converse(modelId="anthropic.claude-3-5-haiku-20241022-v1:0")\n',
+            {"anthropic.claude-3-5-haiku-20241022-v1:0": None},
+        ),
+        ('from crewai import LLM\nLLM(model="ollama/llama3.1:8b")\n', {"llama3.1:8b": "ollama"}),
+    ],
+)
+def test_which_arguments_hold_a_model(tmp_path: Path, source: str, expected: dict[str, str | None]):
+    result = scan(tmp_path, {"run.py": source})
+    assert {name: model.provider for name, model in models(result).items()} == expected
+
+
+def test_a_routed_identifier_keeps_the_text_as_written(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "a.py": "import litellm\nfrom pydantic_ai import Agent\n"
+            + 'litellm.completion(model="anthropic/claude-sonnet-4-5")\n'
+            + 'Agent("anthropic:claude-sonnet-4-5")\n'
+            + 'litellm.completion(model="anthropic:claude-sonnet-4-5")\n',
+            "b.py": 'import litellm\nlitellm.completion(model="bedrock/claude-sonnet-4-5")\n'
+            + 'litellm.completion(model="ollama/llama3.2")\n'
+            + 'litellm.completion(model="huggingface/meta-llama/Llama-3.3-70B-Instruct")\n',
+        },
+    )
+    found = {(c.name, c.provider): c for c in result.components}
+    # Routed to two providers, one name is two models until something says they are one.
+    anthropic = found[("claude-sonnet-4-5", "anthropic")]
+    bedrock = found[("claude-sonnet-4-5", "aws.bedrock")]
+    # LiteLLM routes by ``/`` alone, so its ``anthropic:`` is kept as written.
+    assert ("anthropic:claude-sonnet-4-5", None) in found
+    assert anthropic.bom_ref == "model:source:claude-sonnet-4-5?provider=anthropic"
+    assert anthropic.model_type == bedrock.model_type == "hosted"
+    assert anthropic.properties["requested_aliases"] == [
+        "anthropic/claude-sonnet-4-5",
+        "anthropic:claude-sonnet-4-5",
+    ]
+    assert bedrock.requested_alias == "bedrock/claude-sonnet-4-5"
+    # A runtime that serves weights on the machine is no hosted service; Hugging Face's
+    # route through LiteLLM is its hosted inference service.
+    local = found[("llama3.2", "ollama")]
+    assert (local.model_type, local.requested_alias) == (None, "ollama/llama3.2")
+    assert found[("meta-llama/Llama-3.3-70B-Instruct", "huggingface")].model_type == "hosted"
+
+
+def test_a_prefix_is_a_route_only_where_the_call_routes_by_it(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import litellm\nimport replicate\nfrom openai import OpenAI\n\n"
+            + 'replicate.run("openai/gpt-4o-mini", input={})\n'
+            + 'litellm.completion(model="openai/gpt-4o-mini")\n'
+            + 'OpenAI(base_url="https://gateway.example/v1").chat.completions.create(\n'
+            + '    model="anthropic/claude-3.5-sonnet", messages=[]\n)\n'
+            + 'litellm.completion(model="azure/prod-chat")\n'
+            + 'litellm.completion(model="ollama/prod-chat")\n'
+        },
+    )
+    found = {(c.name, c.provider): c.bom_ref for c in result.components}
+    # Replicate's own owner/name and a gateway's name through the OpenAI SDK are kept as
+    # written; LiteLLM's prefix names the provider. An opaque deployment name at two
+    # providers is two models.
+    assert found == {
+        ("openai/gpt-4o-mini", None): "model:source:openai%2Fgpt-4o-mini",
+        ("gpt-4o-mini", "openai"): "model:source:gpt-4o-mini?provider=openai",
+        ("anthropic/claude-3.5-sonnet", None): "model:source:anthropic%2Fclaude-3.5-sonnet",
+        ("prod-chat", "azure.ai.openai"): "model:source:prod-chat?provider=azure.ai.openai",
+        ("prod-chat", "ollama"): "model:source:prod-chat?provider=ollama",
+    }
+
+
+def test_positional_models_of_common_entry_points_are_read(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import litellm\nimport ollama\nfrom pydantic_ai import Agent\n\n"
+            'Agent("openai:gpt-4o")\nlitellm.completion("gpt-4o-mini", [])\n'
+            'ollama.chat("llama3.2", messages=[])\n'
+        },
+    )
+    found = models(result)
+    assert set(found) == {"gpt-4o", "gpt-4o-mini", "llama3.2"}
+    assert found["gpt-4o"].provider == "openai"
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected"),
+    [
+        ("openai/gpt-4o", ("gpt-4o", "openai")),
+        ("anthropic:claude-sonnet-4-5", ("claude-sonnet-4-5", "anthropic")),
+        (
+            "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+            ("anthropic.claude-3-haiku-20240307-v1:0", "aws.bedrock"),
+        ),
+        ("llama3.1:8b", ("llama3.1:8b", None)),
+        ("openai/", ("", "openai")),
+        ("openai/x", ("", "openai")),
+        ("openai/whisper-large-v3", ("openai/whisper-large-v3", None)),
+        ("mistralai/Mistral-7B-Instruct-v0.3", ("mistralai/Mistral-7B-Instruct-v0.3", None)),
+        ("mistralai:mistral-large-latest", ("mistral-large-latest", "mistral_ai")),
+        ("meta-llama/Llama-3.3-70B-Instruct", ("meta-llama/Llama-3.3-70B-Instruct", None)),
+    ],
+)
+def test_a_routing_prefix_is_split_from_the_identifier(
+    literal: str, expected: tuple[str, str | None]
+):
+    assert split_route(literal) == expected
+
+
 def test_a_folded_import_statement_longer_than_a_slice_is_found(tmp_path: Path):
     names = ", ".join(f"m{index}" for index in range(1500))
     (tmp_path / "run.py").write_text(
@@ -2971,6 +3061,34 @@ def test_a_variable_is_checked_once_for_a_model_however_often_it_is_read(
     assert checked == ["CHAT_MODEL"]
 
 
+def test_a_prefix_is_read_as_routers_write_it_and_a_bare_name_keeps_no_provider(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "a.py": "from openai import AzureOpenAI\n\n"
+            + 'AzureOpenAI().chat.completions.create(model="gpt-4o", messages=[])\n',
+            "b.py": "import litellm\nfrom llama_cpp import Llama\nfrom vllm import LLM\n\n"
+            + 'litellm.completion(model="openai/gpt-4o")\n'
+            + 'litellm.completion(model="Groq/Llama-3-Groq-8B-Tool-Use")\n'
+            + 'LLM(model="Groq/Llama-3-Groq-8B-Tool-Use")\n'
+            + 'Llama.from_pretrained(repo_id="Groq/Llama-3-Groq-8B-Tool-Use-GGUF", filename="*")\n',
+        },
+    )
+    found = {(c.name, c.provider): c for c in result.components}
+    # A router's prefixes are lower case: ``Groq/`` names the owner of weights on a hub.
+    assert set(found) == {
+        ("gpt-4o", None),
+        ("gpt-4o", "openai"),
+        ("Groq/Llama-3-Groq-8B-Tool-Use", None),
+        ("Groq/Llama-3-Groq-8B-Tool-Use-GGUF", None),
+    }
+    # A name written without a route takes no provider from one written with it.
+    bare = found[("gpt-4o", None)]
+    assert (bare.requested_alias, bare.model_type) == (None, None)
+    assert bare.claims["source_reference"].locator == "a.py:3"
+    assert found[("gpt-4o", "openai")].requested_alias == "openai/gpt-4o"
+
+
 def test_the_answers_kept_across_files_are_bounded(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(source_python, "MAX_CACHED", 10)
     files = {
@@ -3305,8 +3423,105 @@ def test_a_router_and_a_crews_other_models_are_read_or_a_gap(tmp_path: Path):
         },
     )
     # A router's deployments and fallbacks are read by a later slice; until then, a gap.
-    assert set(models(result)) == {"groq/llama-3.1-8b", "o3", "gpt-4o", "gpt-4o-mini"}
+    assert set(models(result)) == {"llama-3.1-8b", "o3", "gpt-4o", "gpt-4o-mini"}
     assert list(result.surfaces_excluded) == [unread("proxy.py", 4, 2)]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "from langchain.chat_models import init_chat_model\n"
+            'init_chat_model("mistral:7b", model_provider="ollama")\n',
+            ("mistral:7b", None),
+        ),
+        (
+            "from pydantic_ai.models.openai import OpenAIChatModel\n"
+            "from pydantic_ai.providers.openrouter import OpenRouterProvider\n"
+            'OpenAIChatModel("anthropic/claude-3.5-sonnet", provider=OpenRouterProvider())\n',
+            ("anthropic/claude-3.5-sonnet", None),
+        ),
+        (
+            "from smolagents import OpenAIServerModel\n"
+            'OpenAIServerModel(model_id="deepseek/deepseek-r1", api_base="https://or.example/v1")\n',
+            ("deepseek/deepseek-r1", None),
+        ),
+        (
+            'from smolagents import TransformersModel\nTransformersModel(model_id="cerebras/btlm-3b")\n',
+            ("cerebras/btlm-3b", None),
+        ),
+        (
+            "from langchain.chat_models import ChatOpenAI\n"
+            'ChatOpenAI(model="deepseek/deepseek-chat", openai_api_base="https://or.example/v1")\n',
+            ("deepseek/deepseek-chat", None),
+        ),
+        (
+            'from langchain.chat_models import init_chat_model\ninit_chat_model("azure_openai:gpt-4.1")\n',
+            ("gpt-4.1", "azure.ai.openai"),
+        ),
+        (
+            'from pydantic_ai import Agent\nAgent("openai-responses:gpt-4.1")\n',
+            ("gpt-4.1", "openai"),
+        ),
+        ('from pydantic_ai import Agent\nAgent("grok:grok-3")\n', ("grok-3", "x_ai")),
+        (
+            'import litellm\nlitellm.completion(model="huggingface/together/deepseek-ai/DeepSeek-R1")\n',
+            ("deepseek-ai/DeepSeek-R1", "huggingface"),
+        ),
+    ],
+    ids=[
+        "provider-named-by-keyword",
+        "model-class-given-its-provider",
+        "openai-compatible-server",
+        "weights-library",
+        "chat-model-class",
+        "azure-openai-route",
+        "responses-route",
+        "grok-route",
+        "inference-provider-before-a-hub-id",
+    ],
+)
+def test_only_a_router_reads_a_route_and_only_by_its_own_prefixes(
+    tmp_path: Path, source: str, expected: tuple[str, str | None]
+):
+    result = scan(tmp_path, {"run.py": source})
+    assert [(c.name, c.provider) for c in result.components] == [expected]
+
+
+def test_a_bedrock_api_selector_names_no_model_and_a_route_before_no_name_is_a_gap(
+    tmp_path: Path,
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import litellm\n"
+            'litellm.completion(model="bedrock/converse/anthropic.claude-3-5-sonnet-20240620-v1:0")\n'
+            'litellm.completion(model="bedrock/invoke/anthropic.claude-3-5-sonnet-20240620-v1:0")\n'
+            'litellm.completion(model="bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0")\n'
+            'litellm.completion(model="openai/x")\n'
+        },
+    )
+    assert [(c.name, c.provider) for c in result.components] == [
+        ("anthropic.claude-3-5-sonnet-20240620-v1:0", "aws.bedrock")
+    ]
+    assert list(result.surfaces_excluded) == [unread("run.py", 5)]
+
+
+def test_a_routed_text_is_split_once_however_often_it_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    splits: list[str] = []
+    split = source_references.split_route
+
+    def counted(literal: str, separators: str = "/:") -> tuple[str, str | None]:
+        splits.append(literal)
+        return split(literal, separators)
+
+    monkeypatch.setattr(source_references, "split_route", counted)
+    calls = 'litellm.completion(model="anthropic/claude-sonnet-4-5")\n' * 50
+    result = scan(tmp_path, {"run.py": f"import litellm\n{calls}"})
+    assert [(c.name, c.provider) for c in result.components] == [("claude-sonnet-4-5", "anthropic")]
+    assert splits == ["anthropic/claude-sonnet-4-5"]
 
 
 def test_an_import_of_a_dotted_name_of_many_parts_is_a_gap_and_never_parsed(tmp_path: Path):

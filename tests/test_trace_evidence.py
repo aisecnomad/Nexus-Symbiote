@@ -1160,6 +1160,46 @@ def test_a_hosted_model_matches_by_its_requested_alias_when_its_name_differs(tmp
     assert _entries(evidence, "undeclared", "model") == []
 
 
+def test_source_routing_aliases_match_only_the_declared_model_and_provider(tmp_path):
+    model = ModelComponent(
+        bom_ref="model:source:gpt-4o?provider=openai",
+        name="gpt-4o",
+        provider="openai",
+        properties={
+            "collection_mode": "static-source-reference",
+            "requested_aliases": [
+                "openai/gpt-4o",
+                "openai:gpt-4o",
+                "openai/gpt-4o",
+                "openai/other-model",
+                None,
+            ],
+        },
+    )
+    spans = [
+        otlp_span({"gen_ai.request.model": alias, "gen_ai.provider.name": provider})
+        for provider, alias in [
+            ("openai", "openai/gpt-4o"),
+            ("openai", "openai:gpt-4o"),
+            ("anthropic", "openai:gpt-4o"),
+            ("openai", "openai/other-model"),
+        ]
+    ]
+    evidence = _evidence(tmp_path, [model], *spans)
+    assert {
+        (item["model"], item["inventory_ref"]) for item in _entries(evidence, "matched", "model")
+    } == {
+        ("openai/gpt-4o", model.bom_ref),
+        ("openai:gpt-4o", model.bom_ref),
+    }
+    assert {
+        (item["provider"], item["model"]) for item in _entries(evidence, "undeclared", "model")
+    } == {
+        ("anthropic", "openai:gpt-4o"),
+        ("openai", "openai/other-model"),
+    }
+
+
 def test_models_match_by_alias_or_name_and_providers_must_agree(tmp_path):
     components = [
         _hosted("model:gpt", "gpt-4o-mini", "OpenAI"),
@@ -2055,3 +2095,20 @@ def test_a_caller_span_reports_its_own_identity_and_gates_an_unreadable_one(tmp_
     hidden = _evidence(tmp_path, [agent], otlp_span({**own, "spiffe.id": secret}, kind=kind))
     assert hidden["reconciliation"]["matched"][0]["workload_identity_matched"] is False
     assert hidden["gate"]["passed"] is False
+
+
+@pytest.mark.parametrize(
+    ("declared", "reported"),
+    [
+        ("aws.bedrock", "aws.bedrock"),
+        ("aws.bedrock", "bedrock"),
+        ("gcp.vertex_ai", "vertex_ai"),
+        ("azure.ai.openai", "az.ai.openai"),
+        ("mistral_ai", "mistral"),
+    ],
+)
+def test_a_provider_spelled_another_way_by_a_router_still_matches(tmp_path, declared, reported):
+    span = otlp_span({"gen_ai.request.model": "model-x", "gen_ai.provider.name": reported})
+    evidence = _evidence(tmp_path, [_hosted("model:x", "model-x", declared)], span)
+    [entry] = _entries(evidence, "matched", "model")
+    assert (entry["inventory_ref"], entry["basis"]) == ("model:x", "name-and-provider")

@@ -55,7 +55,26 @@ up to 16 places, and `references_unlisted` counts the rest. The environment vari
 that may give a model in place of a value read are listed in `environment_variables`,
 the first 16 in order, with `environment_variables_unlisted` when there are more, unless
 a name is shaped like a key, which is never exported.
-The identifier is kept as written, routing prefix and all, and no provider is recorded.
+Where the call routes by a prefix on the identifier, the prefix names the provider.
+LiteLLM's functions, CrewAI's `LLM`, `Agent` and `Crew`, DSPy's `LM` and `Embedder` and
+smolagents' `LiteLLMModel` read `anthropic/claude-sonnet-4-5`, and PydanticAI's `Agent`
+and `infer_model` and LangChain's `init_chat_model` and `init_embeddings` read
+`anthropic:claude-sonnet-4-5`, as the model `claude-sonnet-4-5` with provider
+`anthropic`. The text as written is kept in `requested_alias`, or in `requested_aliases`
+when it is written more than one way. A provider is named as OpenTelemetry's
+`gen_ai.provider.name` names it, where it names one (`aws.bedrock`, `gcp.vertex_ai`,
+`azure.ai.openai`), and LiteLLM's `bedrock/converse/` and `bedrock/invoke/`, which choose
+an API, are no part of the name. A prefix is read as written, in lower case as routers
+spell them, so `Groq/` is an owner on a model hub, and a call that names its provider by
+keyword (`model_provider=`, `provider=`) reads no route. Elsewhere an identifier is kept
+as written: Replicate's `owner/name`, a weights library's `owner/name`, and the names a
+model class or an OpenAI-compatible gateway is given. A route before what is no
+identifier, such as `openai/x`, is a coverage gap. A name routed to two providers is two
+components, and one written without a route is another, since an opaque name such as an
+Azure deployment may name different models at each. A model of no other kind whose
+provider does not serve local weights (`ollama`) is `hosted`, which `trace-diff` lists as
+`unobserved` when no trace names it; `trace-diff` reads a provider's other spellings,
+such as LiteLLM's `bedrock`, as OpenTelemetry's.
 Any `trust_remote_code` but a false literal, given to a call or in a dict of its options,
 such as `model_kwargs`, records that the model may run its own code. A relative path or a
 weight file names a file in the project, which the model collector reads.
