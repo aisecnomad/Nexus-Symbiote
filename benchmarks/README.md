@@ -27,3 +27,10 @@ tool, and a graded report of ten tools ([REPORT.md](aibom-bench/REPORT.md)).
 Unlike the corpus above, it does compare tools, and its report says for every
 score whether it was verified by a run, read from source, or taken from
 documentation.
+
+## Agent BOM regression fixture
+
+`agent-bom-fixture/` is the 109-item, ten-decoy fixture of the external ten-tool Agent BOM
+benchmark, stored as data and materialized on demand
+([README](agent-bom-fixture/README.md)). `tests/test_agent_bom_fixture.py` checks that no
+decoy is reported and that discovery holds its recorded floors on every run.
