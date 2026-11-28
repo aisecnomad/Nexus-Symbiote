@@ -23,6 +23,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from nexus_symbiote.core.aibom import AIBOM, MAX_NATIVE_BYTES
+from nexus_symbiote.core.collection import SOURCE_REFERENCE_MODE
 from nexus_symbiote.core.content_digest import INVENTORY_CONTENT_PROFILE, inventory_content_digest
 from nexus_symbiote.core.hashing import (
     hash_bytes,
@@ -53,6 +54,7 @@ from nexus_symbiote.otlp import (
     file_name,
 )
 from nexus_symbiote.risk_classes import plain_authority
+from nexus_symbiote.scanners.source_references import split_route
 
 FORMAT = "nexus-symbiote/trace-evidence/v1"
 ASSURANCE = "reported"
@@ -468,8 +470,25 @@ class _Inventory:
                 if component.model_type == "hosted":
                     self.declared.append(("model", component))
                 provider = _trimmed(component.provider)
+                keys = {name} if name is not None else set()
                 alias = _trimmed(component.requested_alias)
-                for key in {name, None if alias is None else name_key(alias)} - {None}:
+                if alias is not None:
+                    keys.add(name_key(alias))
+                aliases = component.properties.get("requested_aliases")
+                if (
+                    component.properties.get("collection_mode") == SOURCE_REFERENCE_MODE
+                    and provider is not None
+                    and isinstance(aliases, list)
+                ):
+                    # A property only contributes alternative routes to this declared model.
+                    for route in aliases:
+                        if (
+                            isinstance(route, str)
+                            and len(route) <= MAX_IDENTIFIER_CHARS
+                            and split_route(route) == (component.name, provider)
+                        ):
+                            keys.add(name_key(route))
+                for key in keys:
                     groups["models"][key].append(component)
                     if provider is None:
                         groups["models_open"][key].append(component)

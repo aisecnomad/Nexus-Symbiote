@@ -331,7 +331,7 @@ def _source_encoding(
     return encoding, _followed(_declared_codec(skipped.line) or "utf-8")
 
 
-def _python_text(content: bytes) -> str:
+def _python_text(content: bytes, names_sdk: Callable[[str], bool] | None = None) -> str:
     """The text CPython compiles from one complete Python source file."""
     encoding, skipped = _source_encoding(content, complete=True, skipped=_skipped_line(content))
     try:
@@ -350,7 +350,7 @@ def _python_text(content: bytes) -> str:
         other = rest.decode(skipped)
     except UnicodeDecodeError:
         return text
-    if _names_sdk(other):
+    if (names_sdk or _names_sdk)(other):
         raise _UnreadableError(_UNSUPPORTED_ENCODING)
     return text
 

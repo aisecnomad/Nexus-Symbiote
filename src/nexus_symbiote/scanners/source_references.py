@@ -171,10 +171,6 @@ class _Model:
     count: int = 0
 
 
-def _evidence(locations: Iterable[tuple[str, int]]) -> list[str]:
-    return [f"{path}:{line}" for path, line in sorted(locations)[:MAX_EVIDENCE_LOCATIONS]]
-
-
 class Declarations:
     """What the readers found: one component for each model, in an order fixed by what was read."""
 
@@ -280,7 +276,7 @@ class Declarations:
         built: list[AnyComponent] = []
         for name, provider in sorted(self._models, key=lambda key: (key[0], key[1] or "")):
             model = self._models[(name, provider)]
-            listed = _evidence(model.locations)
+            listed = [f"{path}:{line}" for path, line in sorted(model.locations)]
             first = min(model.locations)
             method = sorted(model.methods)[0]
             properties: dict[str, Any] = {
