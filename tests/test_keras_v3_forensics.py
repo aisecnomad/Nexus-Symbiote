@@ -246,6 +246,28 @@ def test_renamed_custom_model_with_keras_archive_layout_is_inspected(tmp_path: P
     assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
 
 
+def test_renamed_keras_archive_with_no_descriptor_is_unread(tmp_path: Path) -> None:
+    archive = tmp_path / "snapshot.npz"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("metadata.json", '{"keras_version":"3.9.2"}')
+        bundle.writestr("model.weights.h5", b"")
+    assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
+
+
+def test_descriptor_compressed_input_limit_is_independent_of_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nexus_symbiote.scanners import model
+
+    archive = _write_keras_zip(tmp_path / "bounded.keras", {"class_name": "Dense", "config": {}})
+    with zipfile.ZipFile(archive) as bundle:
+        compressed_size = bundle.getinfo("config.json").compress_size
+    monkeypatch.setattr(model, "MAX_KERAS_COMPRESSED_BYTES", compressed_size)
+    assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, ZIP_WITHOUT_PICKLE)
+    monkeypatch.setattr(model, "MAX_KERAS_COMPRESSED_BYTES", compressed_size - 1)
+    assert inspect_model_format(archive) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
+
+
 @pytest.mark.parametrize("capacity", [0, 4, None, 128])
 def test_descriptor_read_reserves_its_output_budget_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capacity: int | None

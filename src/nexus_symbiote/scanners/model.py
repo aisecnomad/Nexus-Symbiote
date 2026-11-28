@@ -175,6 +175,9 @@ ZIP_KERAS_CODE_EXECUTION = (
     "keras.models.load_model can execute arbitrary code"
 )
 MAX_KERAS_CONFIG_BYTES = 1024 * 1024
+# A valid, incompressible descriptor can grow slightly when compressed. Limit
+# compressed input too: the inflater can consume bytes without producing output.
+MAX_KERAS_COMPRESSED_BYTES = MAX_KERAS_CONFIG_BYTES + 65536
 MAX_KERAS_CONFIG_DEPTH = 64
 MAX_KERAS_CONFIG_NODES = 100_000
 _KERAS_CODE_CLASSES = frozenset({"Lambda", "__lambda__"})
@@ -1390,7 +1393,7 @@ def _member_holds_keras_code(
     """Inspect a single ``config.json`` ZIP member for Keras v3 code-execution constructs."""
     if not _keras_config_member(member.name):
         return False
-    if member.size == 0:
+    if not 0 < member.size <= MAX_KERAS_COMPRESSED_BYTES:
         return None
     if member.offset < 0 or member.offset + 30 > end:
         return None
@@ -1455,8 +1458,6 @@ def _members_hold_keras_code(
     config_indices = [
         index for index, member in enumerate(members) if _keras_config_member(member.name)
     ]
-    if not config_indices:
-        return None if required else False
     # Keras saves custom models outside its own module namespace too. Its native
     # root metadata and weights together identify renamed archives in that case.
     names = {member.name.partition(b"\0")[0] for member in members}
@@ -1464,6 +1465,8 @@ def _members_hold_keras_code(
         b"metadata.json" in names
         and (b"model.weights.h5" in names or b"model.weights.npz" in names)
     )
+    if not config_indices:
+        return None if required else False
     ordered = sorted(enumerate(members), key=lambda pair: pair[1].offset)
     boundaries = {
         cd_idx: (
