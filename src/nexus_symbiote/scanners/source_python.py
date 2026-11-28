@@ -277,7 +277,11 @@ def _members(annotation: ast.expr | None) -> list[ast.expr] | None:
                 pending.extend(reversed(inner.elts))
             else:
                 pending.append(inner)
-        elif not isinstance(item, ast.Constant):
+        elif isinstance(item, ast.Constant):
+            if item.value is not None:
+                # A quoted forward reference can name any type, including a non-SDK one.
+                return []
+        else:
             members.append(item)
             if len(members) > MAX_CANDIDATES:
                 return None

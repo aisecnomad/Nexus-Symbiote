@@ -3360,8 +3360,19 @@ def test_an_environment_variable_is_checked_once_however_many_operands_read_it(
         ("BaseChatModel | None = None", 0),
         ("Union[ChatOpenAI, ChatAnthropic]", 0),
         ("Optional[ChatModel] = None", 1),
+        ('Union[BaseChatModel, "str"]', 1),
+        ('Optional[Union["PendingType", BaseChatModel]]', 1),
+        ('"BaseChatModel"', 1),
     ],
-    ids=["optional", "or-none", "union-of-sdk-classes", "optional-model-name"],
+    ids=[
+        "optional",
+        "or-none",
+        "union-of-sdk-classes",
+        "optional-model-name",
+        "union-with-forward-reference",
+        "nested-forward-reference",
+        "quoted-annotation",
+    ],
 )
 def test_a_parameter_that_may_be_none_is_judged_by_its_class(
     tmp_path: Path, annotation: str, gaps: int
