@@ -675,7 +675,29 @@ def _raw_zip_with_entries(entries: list[tuple[bytes, int, int, bytes, int]]) -> 
     return bytes(body + cd + eocd)
 
 
-def test_keras_lzma_huge_dict_no_eos_numpy_prefix_budget_and_decoy(tmp_path: Path) -> None:
+@pytest.mark.parametrize("declared_size", [34, 35, 36])
+def test_markerless_lzma_descriptor_requires_its_actual_size(
+    tmp_path: Path, declared_size: int
+) -> None:
+    # LZMA1EXT with a 64 KiB dictionary and ext_flags=0 (no EOS); the exact
+    # 35-byte plaintext is {"class_name":"Lambda","config":{}}.
+    payload = bytes.fromhex(
+        "140905005d00000100"
+        "003d888867039a29a85b856d8c6ef27028c6cfd1dd165c39f508db6a025710a1b1692c87c7ae3100"
+    )
+    path = tmp_path / "markerless.keras"
+    path.write_bytes(_raw_zip_with_entries([(b"config.json", 0, 14, payload, declared_size)]))
+    expected = (
+        (SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_KERAS_CODE_EXECUTION)
+        if declared_size == 35
+        else (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
+    )
+    assert inspect_model_format(path) == expected
+
+
+def test_keras_lzma_huge_dict_misflagged_marker_numpy_prefix_budget_and_decoy(
+    tmp_path: Path,
+) -> None:
     import lzma
 
     # 1. Method-14 LZMA declaring a 4 GiB dictionary fails closed without MemoryError.
@@ -684,7 +706,7 @@ def test_keras_lzma_huge_dict_no_eos_numpy_prefix_budget_and_decoy(tmp_path: Pat
     lzma_dos.write_bytes(_raw_zip_with_entries([(b"config.json", 2, 14, huge_dict_payload, 64)]))
     assert inspect_model_format(lzma_dos) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
 
-    # 2. APPNOTE §5.8.8 no-EOS method-14 (flag_bits & 2 == 0) detects Lambda RCE cleanly.
+    # 2. Python's LZMA encoder writes an EOS marker, even when the ZIP flag omits it.
     raw_lambda = json.dumps(
         {
             "module": "keras",
@@ -702,12 +724,12 @@ def test_keras_lzma_huge_dict_no_eos_numpy_prefix_budget_and_decoy(tmp_path: Pat
     ).encode("utf-8")
     filters = [{"id": lzma.FILTER_LZMA1, "lc": 3, "lp": 0, "pb": 2, "dict_size": 1 << 16}]
     alone = lzma.compress(raw_lambda, format=lzma.FORMAT_ALONE, filters=filters)
-    no_eos_payload = struct.pack("<HH", 0x0914, 5) + alone[:5] + alone[13:]
-    no_eos_keras = tmp_path / "lzma_no_eos.keras"
-    no_eos_keras.write_bytes(
-        _raw_zip_with_entries([(b"config.json", 0, 14, no_eos_payload, len(raw_lambda))])
+    misflagged_payload = struct.pack("<HH", 0x0914, 5) + alone[:5] + alone[13:]
+    misflagged_keras = tmp_path / "lzma_misflagged.keras"
+    misflagged_keras.write_bytes(
+        _raw_zip_with_entries([(b"config.json", 0, 14, misflagged_payload, len(raw_lambda))])
     )
-    assert inspect_model_format(no_eos_keras) == (
+    assert inspect_model_format(misflagged_keras) == (
         SerializationSafety.UNSAFE_CODE_EXECUTION,
         ZIP_KERAS_CODE_EXECUTION,
     )

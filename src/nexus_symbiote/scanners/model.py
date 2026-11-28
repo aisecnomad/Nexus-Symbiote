@@ -1115,7 +1115,7 @@ class _MemberData:
                         break
                 try:
                     out += self._inflater.decompress(feed, max_length=size - len(out))
-                except (EOFError, MemoryError, OSError, lzma.LZMAError) as exc:
+                except (EOFError, MemoryError, OSError) as exc:
                     raise FormatError(ZIP_MEMBER_UNREAD) from exc
         return bytes(out)
 
@@ -1387,6 +1387,21 @@ def _keras_config_has_code(document: object, *, required: bool) -> bool | None:
     return None if incomplete else False
 
 
+def _keras_descriptor_bytes(data: _MemberData, budget: InspectionBudget) -> bytes | None:
+    raw = bytearray()
+    while not data.complete:
+        reserved = min(8192, MAX_KERAS_CONFIG_BYTES - len(raw), budget.remaining)
+        if reserved <= 0:
+            return None
+        budget.charge(reserved, ZIP_MEMBER_UNREAD)
+        chunk = data.read(reserved)
+        budget.remaining += reserved - len(chunk)
+        if not chunk and not data.complete:
+            return None
+        raw += chunk
+    return bytes(raw)
+
+
 def _member_holds_keras_code(
     stream: BinaryIO, member: _ZipMember, end: int, budget: InspectionBudget, *, required: bool
 ) -> bool | None:
@@ -1410,28 +1425,25 @@ def _member_holds_keras_code(
         if member.uncompressed_size <= 0 or member.uncompressed_size > MAX_KERAS_CONFIG_BYTES:
             return None
         lzma_uncompressed = member.uncompressed_size
-    data = _MemberData(
-        stream,
-        start,
-        member.size,
-        method=member.method,
-        uncompressed_size=lzma_uncompressed,
-    )
-    raw = bytearray()
-    try:
-        while not data.complete:
-            reserved = min(8192, MAX_KERAS_CONFIG_BYTES - len(raw), budget.remaining)
-            if reserved <= 0:
-                return None
-            budget.charge(reserved, ZIP_MEMBER_UNREAD)
-            chunk = data.read(reserved)
-            budget.remaining += reserved - len(chunk)
-            if not chunk and not data.complete:
-                return None
-            raw += chunk
-    except (FormatError, zlib.error):
+    # zipfile also opens streams whose writer left bit 1 clear despite including
+    # an end marker. Older liblzma rejects that marker when the header gives a
+    # size. Retry only this decoder error and charge both attempts to the budget.
+    sizes = (lzma_uncompressed, None) if lzma_uncompressed is not None else (None,)
+    for size in sizes:
+        data = _MemberData(stream, start, member.size, method=member.method, uncompressed_size=size)
+        try:
+            raw_bytes = _keras_descriptor_bytes(data, budget)
+        except lzma.LZMAError:
+            continue
+        except (FormatError, zlib.error):
+            return None
+        if raw_bytes is None or (
+            lzma_uncompressed is not None and len(raw_bytes) != lzma_uncompressed
+        ):
+            return None
+        break
+    else:
         return None
-    raw_bytes = bytes(raw)
     try:
         encoding = json.detect_encoding(raw_bytes)
         text = raw_bytes.decode(encoding)
