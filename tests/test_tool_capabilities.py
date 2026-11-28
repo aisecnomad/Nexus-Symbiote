@@ -2681,7 +2681,7 @@ def test_python_sql_text_transformations_preserve_provenance(expression: str) ->
         "<string>text",
         "text || 'SELECT 1'",
         "text ?? 'SELECT 1'",
-        "text && 'SELECT 1'",
+        "'run' && text",
         "String(text)",
         "'SELECT X'.replace('X', text)",
         "{ text }",
@@ -2768,3 +2768,48 @@ def test_shadowed_function_constructor_and_renamed_public_env_key(tmp_path: Path
         "(Function) => { const { COLOR: API_TOKEN } = process.env; new Function(API_TOKEN); }",
     )
     assert not _caps(tool)
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected"),
+    [
+        ("", "(process) => { const { API_TOKEN: label } = process.env; return label; }", False),
+        ("", "(globalThis) => globalThis.process.env.API_TOKEN", False),
+        ("const process = { env: { API_TOKEN: 'sample' } };", "() => process.env.API_TOKEN", False),
+        ("import process from './demo';", "() => process.env.API_TOKEN", False),
+        ("import proc from 'node:process';", "() => proc.env.API_TOKEN", True),
+        ("", "(process) => globalThis.process.env.API_TOKEN", True),
+        ("", "() => process.env.API_TOKEN", True),
+    ],
+)
+def test_env_capability_follows_the_process_binding(tmp_path, header, handler, expected):
+    assert (E.CREDENTIALS in _caps(_ts(tmp_path, handler, header + "\n"))) is expected
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        '(enabled: boolean) => db.query(enabled && "SELECT 1")',
+        '(args) => { const statement = (args.enabled && "SELECT 1"); return db.query(statement); }',
+        '(args) => { let statement; statement = args.enabled && "SELECT 1"; return db.query(statement); }',
+    ],
+)
+def test_a_query_condition_cannot_supply_its_statement(tmp_path, handler):
+    tool = _ts(tmp_path, handler)
+    assert not _caps(tool) and not tool.risks
+
+
+def test_an_enabled_dynamic_statement_remains_caller_supplied_through_alias(tmp_path):
+    tool = _ts(
+        tmp_path,
+        "(args) => { const statement = args.enabled && args.sql; return db.query(statement); }",
+    )
+    assert any("caller-supplied" in risk.detail for risk in tool.risks)
+
+
+def test_local_string_function_does_not_prove_sql_argument_provenance(tmp_path):
+    tool = _ts(
+        tmp_path,
+        "(title: string) => { function String(_: string) { return 'SELECT 1'; } return db.query(String(title)); }",
+    )
+    assert not _caps(tool) and not tool.risks

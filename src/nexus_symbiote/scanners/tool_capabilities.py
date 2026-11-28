@@ -1262,6 +1262,14 @@ class _View(Mapping[str, tuple[tuple[str, str], ...]]):
             raise KeyError(name)
         return tuple(found)
 
+    def is_global(self, name: str) -> bool:
+        view: _View | None = self
+        while view is not None:
+            if name in view.hidden or name in view.own:
+                return False
+            view = view.outer
+        return name not in self.module
+
     def __iter__(self) -> Iterator[str]:
         names: set[str] = set(self.module)
         view: _View | None = self
@@ -1342,10 +1350,17 @@ def typescript_imports(nodes: Iterable[Node]) -> TypeScriptNames:
             found.outer[node.id] = function
             function = node.id
         stack.extend((child, function) for child in reversed(node.named_children))
+    root = _View(None, {})
+    top = _ts_top_declarations(nodes[0] if nodes else None, root.hidden)
     for declarator in found.declared.get(None, []):
-        for name, binding in _ts_declared(declarator, names):
+        bound = _ts_declared(declarator, names)
+        if not bound and declarator.id in top:
+            root.hidden.update(_ts_bound_names(declarator.child_by_field_name("name")))
+        for name, binding in bound:
             _bind(names, name, binding)
-    found.module = {name: tuple(bindings) for name, bindings in names.items()}
+    root.module = found.module = {name: tuple(bindings) for name, bindings in names.items()}
+    root.hidden.difference_update(found.module)
+    found._views[None] = root
     return found
 
 
@@ -1378,6 +1393,28 @@ def _bind_import(node: Node, names: _Names) -> None:
                     _bind(names, local, (module, _ts_text(imported)))
 
 
+def _ts_top_declarations(body: Node | None, hidden: set[str]) -> set[int]:
+    """Collect names and variable declarators directly within this scope."""
+    top: set[int] = set()
+    for statement in (
+        body.named_children
+        if body is not None and body.type in {"statement_block", "program"}
+        else []
+    ):
+        if statement.type == "export_statement":
+            declaration = statement.child_by_field_name("declaration")
+            if declaration is None:
+                continue
+            statement = declaration
+        if statement.type in _TS_DECLARATIONS:
+            declared = statement.child_by_field_name("name")
+            if declared is not None:
+                hidden.add(_ts_text(declared))
+        elif statement.type in {"lexical_declaration", "variable_declaration"}:
+            top.update(d.id for d in statement.named_children if d.type == "variable_declarator")
+    return top
+
+
 def _ts_scope(function: Node, declarators: list[Node], outer: _View) -> _View:
     """What names hold in a function. Its parameters, its own name and what its body declares
     at the top level otherwise than from a bound name hide the names around it; then each
@@ -1388,17 +1425,7 @@ def _ts_scope(function: Node, declarators: list[Node], outer: _View) -> _View:
         own = function.child_by_field_name("name")
         if own is not None:
             view.hidden.add(_ts_text(own))
-    body = function.child_by_field_name("body")
-    top: set[int] = set()
-    for statement in (
-        body.named_children if body is not None and body.type == "statement_block" else []
-    ):
-        if statement.type in _TS_DECLARATIONS:
-            declared = statement.child_by_field_name("name")
-            if declared is not None:
-                view.hidden.add(_ts_text(declared))
-        elif statement.type in {"lexical_declaration", "variable_declaration"}:
-            top.update(d.id for d in statement.named_children if d.type == "variable_declarator")
+    top = _ts_top_declarations(function.child_by_field_name("body"), view.hidden)
     for declarator in declarators:
         bound = _ts_declared(declarator, view)
         if not bound and declarator.id in top:
@@ -1650,7 +1677,7 @@ def _ts_property(node: Node) -> str:
     return _ts_text(index).strip("'\"`") if index is not None and index.type == "string" else ""
 
 
-def _ts_is_env(node: Node | None) -> bool:
+def _ts_is_env(node: Node | None, bindings: _View) -> bool:
     """Whether ``node`` is ``process.env`` (or ``globalThis.process["env"]``), at constant depth."""
     if node is None or node.type not in {"member_expression", "subscript_expression"}:
         return False
@@ -1658,7 +1685,10 @@ def _ts_is_env(node: Node | None) -> bool:
         return False
     obj = node.child_by_field_name("object")
     if obj is not None and obj.type == "identifier":
-        return _ts_text(obj) == "process"
+        name = _ts_text(obj)
+        return (name == "process" and bindings.is_global(name)) or ("process", "") in bindings.get(
+            name, ()
+        )
     if obj is not None and obj.type in {"member_expression", "subscript_expression"}:
         base = obj.child_by_field_name("object")
         return (
@@ -1666,13 +1696,14 @@ def _ts_is_env(node: Node | None) -> bool:
             and base is not None
             and base.type == "identifier"
             and _ts_text(base) in _TS_GLOBALS
+            and bindings.is_global(_ts_text(base))
         )
     return False
 
 
-def _ts_env_name(node: Node) -> str | None:
+def _ts_env_name(node: Node, bindings: _View) -> str | None:
     """The variable name of ``process.env.NAME`` or ``process.env["NAME"]``, else None."""
-    if not _ts_is_env(node.child_by_field_name("object")):
+    if not _ts_is_env(node.child_by_field_name("object"), bindings):
         return None
     return _ts_property(node) or None
 
@@ -1736,6 +1767,15 @@ def _ts_flows(node: Node) -> list[tuple[Iterable[str], Node | None]]:
     fields = _TS_FLOWS.get(node.type)
     if fields is not None:
         target, source = (node.child_by_field_name(field) for field in fields)
+        # A falsy left operand of && cannot supply nonempty SQL text. Only the
+        # right operand can become such a string, including through an alias.
+        source = _ts_unwrap(source)
+        while (
+            source is not None
+            and source.type == "binary_expression"
+            and _ts_text(source.child_by_field_name("operator")) == "&&"
+        ):
+            source = _ts_unwrap(source.child_by_field_name("right"))
         return [(_ts_assigned(target), source)]
     callee, arguments = node.child_by_field_name("function"), node.child_by_field_name("arguments")
     if callee is None or callee.type != "member_expression" or arguments is None:
@@ -1820,12 +1860,16 @@ def classify_typescript(
                 seen.add(CapabilityClass.EXECUTE)
                 seen.execute = True
         elif node.type in {"member_expression", "subscript_expression"}:
-            name = _ts_env_name(node)
+            name = _ts_env_name(node, imports)
             if name is not None and _secret_name(name):
                 seen.add(CapabilityClass.CREDENTIALS)
         elif node.type == "variable_declarator":
             target, value = node.child_by_field_name("name"), node.child_by_field_name("value")
-            if target is not None and target.type == "object_pattern" and _ts_is_env(value):
+            if (
+                target is not None
+                and target.type == "object_pattern"
+                and _ts_is_env(value, imports)
+            ):
                 for part in target.named_children:
                     key = (
                         part.child_by_field_name("key") or part.child_by_field_name("left") or part
@@ -1842,7 +1886,7 @@ def classify_typescript(
 
 def _ts_call(
     node: Node,
-    imports: Bindings,
+    imports: _View,
     shadowed: frozenset[str],
     parameters: frozenset[str],
     seen: _Observed,
@@ -1925,7 +1969,7 @@ def _ts_call(
         if any(module in _TS_TAGGED for module, _ in candidates) or (
             len(chain) > 1 and last in _TS_SQL and (client or named)
         ):
-            _sql_record(_ts_statement(arguments, tainted, bound=True)[1], seen)
+            _sql_record(_ts_statement(arguments, tainted, imports, bound=True)[1], seen)
         return
     statement = values[0] if values else None
     if receiver is not None and receiver.type == "call_expression" and last in _TS_SQL:
@@ -1939,14 +1983,16 @@ def _ts_call(
     if statement is None or prepared or len(chain) < 2:
         return
     if (last in _TS_SQL and (client or named)) or (last in _TS_SQL_CLIENT and client):
-        supplied, rank = _ts_statement(statement, tainted)
+        supplied, rank = _ts_statement(statement, tainted, imports)
         if supplied:
             seen.raw_sql = True
             rank = 2
         _sql_record(rank, seen)
 
 
-def _ts_statement(node: Node, tainted: set[str], *, bound: bool = False) -> tuple[bool, int]:
+def _ts_statement(
+    node: Node, tainted: set[str], bindings: _View, *, bound: bool = False
+) -> tuple[bool, int]:
     """Whether a statement may be caller-supplied, and the rank of its text: the parts of a
     concatenation, template or conditional, the object a member or item is read from, a
     method's receiver, the value of an assignment or comma expression and a query config's
@@ -1980,7 +2026,9 @@ def _ts_statement(node: Node, tainted: set[str], *, bound: bool = False) -> tupl
             operator = _ts_text(part.child_by_field_name("operator"))
             if operator == "+":
                 pending += [part.child_by_field_name("right"), part.child_by_field_name("left")]
-            elif operator in {"||", "??", "&&"}:
+            elif operator == "&&":
+                pending.append(part.child_by_field_name("right"))
+            elif operator in {"||", "??"}:
                 pending += [
                     None,
                     part.child_by_field_name("right"),
@@ -2000,7 +2048,10 @@ def _ts_statement(node: Node, tainted: set[str], *, bound: bool = False) -> tupl
             if arguments is not None and arguments.type == "template_string":
                 runs[-1].append(_ts_literal_text(arguments) or "")
             elif (
-                callee is not None and callee.type == "identifier" and _ts_text(callee) == "String"
+                callee is not None
+                and callee.type == "identifier"
+                and _ts_text(callee) == "String"
+                and bindings.is_global("String")
             ):
                 if arguments is not None:
                     pending.extend(arguments.named_children[:1])
