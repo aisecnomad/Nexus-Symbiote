@@ -6,6 +6,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from nexus_symbiote.cli import main
@@ -414,7 +415,10 @@ def test_a_package_level_cvss_vector_sets_the_matched_package_severity(tmp_path:
     assert vulnerability["ratings"] == [{"severity": "critical"}]
 
 
-def test_a_partial_receipt_does_not_let_a_decision_suppress_its_advisory(tmp_path: Path) -> None:
+@pytest.mark.parametrize("extra_surface", [None, "surfaces_scanned", "unobserved_surfaces"])
+def test_a_partial_receipt_does_not_let_a_decision_suppress_its_advisory(
+    tmp_path: Path, extra_surface: str | None
+) -> None:
     from nexus_symbiote.core.hashing import hash_bytes
 
     project, operator, out = (tmp_path / name for name in ("project", "operator", "out"))
@@ -428,6 +432,12 @@ def test_a_partial_receipt_does_not_let_a_decision_suppress_its_advisory(tmp_pat
     bom = _scan(project, feed, inventory)
     (receipt,) = [s for s in _claim(bom).surfaces_scanned if s.startswith(ADVISORY_SURFACE_PREFIX)]
     assert '"coverage":"partial"' in receipt
+    if extra_surface:
+        document = json.loads(inventory.read_bytes())
+        document["metadata"]["completeness"][extra_surface].append(
+            receipt.replace('"coverage":"partial"', '"coverage":"complete"')
+        )
+        inventory.write_text(json.dumps(document))
     runner = CliRunner()
     runner.invoke(
         main, ["advisories", str(inventory), "--offline-db", str(feed), "-o", str(report)]

@@ -169,6 +169,9 @@ def test_a_receipt_that_drops_or_garbles_a_count_narrows(tmp_path: Path) -> None
     for name, edit in (
         ("dropped", lambda r: r.pop("components_excluded")),
         ("garbled", lambda r: r.update(components_skipped="none")),
+        ("checked-text", lambda r: r.update(components_checked="two")),
+        ("checked-negative", lambda r: r.update(components_checked=-1)),
+        ("checked-float", lambda r: r.update(components_checked=2.0)),
     ):
         new = _scan(project, tmp_path / f"{name}.json", *options)
         _edit_receipt(new, edit)

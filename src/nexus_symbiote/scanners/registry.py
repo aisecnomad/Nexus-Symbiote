@@ -4671,6 +4671,9 @@ class RegistryScanner(Scanner):
                 failures[self._POETRY_PROBLEMS["table"]] = None
                 continue
             for name, value in table.items():
+                # Poetry reserves this entry for the supported interpreter range.
+                if name.lower() == "python":
+                    continue
                 if not self._inventoried(name):
                     continue
                 if not _PEP508_NAME.fullmatch(name):

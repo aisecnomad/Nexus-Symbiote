@@ -290,11 +290,24 @@ def vex_advisories(aibom: AIBOM) -> list[dict[str, Any]]:
     """Recorded advisories in the shape of an advisory report entry, for the VEX export, each
     with the coverage of the receipt that recorded it."""
     claim = aibom.metadata.completeness
-    coverage = {
-        receipt["db_sha256"]: receipt.get("coverage")
-        for surface in ((*claim.surfaces_scanned, *claim.unobserved_surfaces) if claim else ())
-        if (receipt := parse_receipt(surface)) is not None
-    }
+    coverage: dict[str, str] = {}
+    if claim:
+        # A digest identifies the feed, not the scope of a particular scan. Missing or
+        # conflicting coverage for that digest cannot authorize a VEX suppression.
+        for surface in claim.surfaces_scanned:
+            receipt = parse_receipt(surface)
+            if receipt is not None:
+                digest = receipt["db_sha256"]
+                level = receipt.get("coverage")
+                if level not in ("complete", "partial", "none"):
+                    level = "partial"
+                previous = coverage.setdefault(digest, level)
+                if previous != level:
+                    coverage[digest] = "partial"
+        for surface in claim.unobserved_surfaces:
+            receipt = parse_receipt(surface)
+            if receipt is not None:
+                coverage[receipt["db_sha256"]] = "none"
     return [
         {
             "id": identifier,
@@ -304,7 +317,7 @@ def vex_advisories(aibom: AIBOM) -> list[dict[str, Any]]:
             "summary": entry["summary"] if isinstance(entry.get("summary"), str) else "",
             "range_undecidable": entry.get("range_undecidable") is True,
             "offline": True,
-            "coverage": coverage.get(entry.get("db_sha256")),
+            "coverage": coverage.get(entry["db_sha256"]),
         }
         for (ref, identifier), entry in recorded_advisories(aibom).items()
     ]

@@ -280,7 +280,7 @@ _UNREADABLE_COUNT = 1 << 62
 
 def _receipt_count(value: object, default: int) -> int:
     """A receipt's count, or ``default`` when it records none or not a count."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else default
+    return value if type(value) is int and value >= 0 else default
 
 
 def _scope_rank(value: object) -> int:
@@ -1192,7 +1192,7 @@ class AIBOMDiffer:
             )
         for key in sorted((old.keys() | new.keys()) - set(_RECEIPT_FEED_FIELDS)):
             before, after = old.get(key), new.get(key)
-            if before == after:
+            if before == after and type(before) is type(after):
                 continue
             change = f"{key} {_clip(before)} → {_clip(after)}"
             # A count a baseline from before it existed does not record is compared as zero;
@@ -1208,7 +1208,8 @@ class AIBOMDiffer:
             elif key == "registry_packages":
                 worse = _scope_rank(after) > _scope_rank(before)
             elif key == "components_checked":
-                worse = _receipt_count(after, -1) < _receipt_count(before, 0) and less_covered
+                checked = _receipt_count(after, -1)
+                worse = checked < 0 or (less_covered and checked < _receipt_count(before, 0))
             elif key.startswith("components_"):
                 worse = _receipt_count(after, _UNREADABLE_COUNT) > _receipt_count(before, 0)
             else:

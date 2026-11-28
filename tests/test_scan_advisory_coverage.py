@@ -337,3 +337,21 @@ def test_an_mcp_launcher_package_without_an_exact_version_keeps_coverage_partial
         ],
     )
     assert json.loads(replay.stdout)["assessment_basis"] == "project-reconciled", replay.output
+
+
+def test_poetry_interpreter_constraint_is_outside_the_package_inventory(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        '[tool.poetry.dependencies]\nPython = "^3.11"\nrequests = "2.32.0"\n'
+        '[tool.poetry.group.dev.dependencies]\npython = "^3.11"\n'
+        '[tool.poetry.dev-dependencies]\nPYTHON = "^3.11"\n'
+    )
+    feed = _clean_bundle(tmp_path / "operator" / "feed.json")
+    document = _scan(project, feed, tmp_path / "inventory.json")
+    packages = {
+        c["name"] for c in document["components"] if c["component_type"] == "registry-entry"
+    }
+    assert packages == {"requests"}
+    receipt = _receipt(document, "surfaces_scanned")
+    assert receipt["coverage"] == "complete" and receipt["components_checked"] == 1
