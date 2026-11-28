@@ -159,8 +159,23 @@ def test_no_other_text_of_a_credential_may_hold_a_value(values: dict[str, Any]) 
     [
         "-----BEGIN RSA " + "PRIVATE KEY-----\nsynthetic",
         "database postgresql://reader:synthetic@store.example/db",
+        "database //reader:synthetic@store.example/db",
+        "Authorization: Bearer " + "fixture-credential-value",
+        "PrOxY-AuThOrIzAtIoN: Basic " + "Zml4dHVyZTpwYXNzd29yZA==",
+        "access_token=" + "fixture-credential-value",
+        "apiKey: " + "fixture-credential-value",
+        "Cookie: session=" + "fixture-credential-value",
     ],
-    ids=["private-key", "connection-userinfo"],
+    ids=[
+        "private-key",
+        "connection-userinfo",
+        "network-userinfo",
+        "bearer",
+        "proxy-basic",
+        "token-assignment",
+        "camel-case-key",
+        "session-cookie",
+    ],
 )
 def test_structured_secrets_are_refused_at_construction_and_export(text: str) -> None:
     with pytest.raises(ValidationError) as error:
@@ -173,6 +188,44 @@ def test_structured_secrets_are_refused_at_construction_and_export(text: str) ->
     with pytest.raises(NativeFormatError) as export:
         bom.to_native_json()
     assert text not in str(export.value)
+
+
+def test_credential_shape_in_a_claim_name_is_refused() -> None:
+    claims = {"accessToken=fixture-marker": ClaimEvidence(method="lookup", scope="repository")}
+    with pytest.raises(ValidationError) as error:
+        CredentialComponent(bom_ref="credential:A", name="A", claims=claims)
+    assert "fixture-marker" not in str(error.value)
+
+
+def test_ref_payload_is_checked_after_the_type_prefix() -> None:
+    with pytest.raises(ValidationError):
+        CredentialComponent(bom_ref="credential:apiKey=synthetic", name="API_KEY")
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "See https://docs.example/guide",
+        "Use token=${API_TOKEN}",
+        'Use token="${API_TOKEN}"',
+        'Removed password="***"',
+    ],
+)
+def test_public_documentation_and_variable_references_remain_usable(description: str) -> None:
+    credential = CredentialComponent(
+        bom_ref="credential:API_TOKEN",
+        name="API_TOKEN",
+        description=description,
+    )
+    assert credential.bom_ref == "credential:API_TOKEN"
+
+
+def test_evidence_references_check_the_payload_without_treating_the_namespace_as_a_value() -> None:
+    claim = ClaimEvidence(method="lookup", scope="repository", evidence_refs=["credential:API_KEY"])
+    assert CredentialComponent(bom_ref="credential:A", name="A", claims={"ref": claim})
+    claim.evidence_refs = ["credential:password=synthetic"]
+    with pytest.raises(ValidationError):
+        CredentialComponent(bom_ref="credential:A", name="A", claims={"ref": claim})
 
 
 def test_a_credential_records_no_digest_of_its_value() -> None:

@@ -713,16 +713,22 @@ def credential_value_problem(component: CredentialComponent) -> str | None:
     return None
 
 
-def _texts(value: Any) -> Iterator[str]:
+def _texts(value: Any, field: str = "") -> Iterator[str]:
     if isinstance(value, str):
+        # In a reference field, the component namespace is syntax. Still check
+        # its entire payload, including credential assignments and URL userinfo.
+        if field in {"bom_ref", "evidence_refs", "references"}:
+            namespace, separator, payload = value.partition(":")
+            if separator and namespace.lower() == "credential":
+                value = payload
         yield value
     elif isinstance(value, dict):
         for key, item in value.items():
             yield str(key)
-            yield from _texts(item)
+            yield from _texts(item, key)
     elif isinstance(value, list):
         for item in value:
-            yield from _texts(item)
+            yield from _texts(item, field)
 
 
 class DiscoveryVerification(InventoryModel):
