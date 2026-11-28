@@ -697,6 +697,7 @@ class _Reader:
         self.stack = [_Block("document")]
         self.line = ""
         self.offset = self.column = 0
+        self.paragraph_offset: int | None = None
         self.next_nonspace = self.next_column = self.indent = 0
         self.blank = self.indented = self.partial = False
         self.all_closed = True
@@ -716,6 +717,7 @@ class _Reader:
         self.after_text = prior_text
         self.line = line
         self.offset = self.column = 0
+        self.paragraph_offset = None
         self.blank = self.partial = self.opened = False
         self.after_code_text, self.code_text = self.code_text, False
         self.found = (-1, 0)
@@ -1118,6 +1120,8 @@ class _Reader:
         tip = self.stack[-1]
         content = self.line[self.offset :]
         if tip.kind == "paragraph":
+            if self.all_closed:
+                self.paragraph_offset = self.offset
             if not tip.lines:
                 tip.definition = _may_open_with_definition(content)
             tip.lines.append(content)
@@ -1189,6 +1193,40 @@ class _Reader:
                 inline = _outside_spans(content, import_boundaries_only=True)
                 self.parts.append(inline)
                 self.blocks.append(("literal", inline))
+
+
+class MarkdownParagraphs:
+    """Locate explicit paragraph content in successive physical source lines."""
+
+    def __init__(self, characters: int) -> None:
+        self._reader: _Reader | None = _Reader(characters + _SPARE_MATCHES, ascii_html=False)
+        self._previous: _Block | None = None
+        self._number = 0
+
+    def read(self, line: str | None) -> tuple[int, int] | None:
+        """Return the content offset and paragraph number, or break continuity at a gap."""
+        reader = self._reader
+        if reader is None:
+            return None
+        if line is None:
+            self._reader = _Reader(reader.matches, ascii_html=False)
+            self._previous = None
+            return None
+        try:
+            reader.read(line)
+        except _AmbiguousError:
+            self._reader = None
+            return None
+        reader.parts.clear()
+        reader.blocks.clear()
+        reader.after_code.clear()
+        if reader.paragraph_offset is None or reader.recovered_blocks:
+            return None
+        paragraph = reader.stack[-1]
+        if paragraph is not self._previous:
+            self._previous = paragraph
+            self._number += 1
+        return reader.paragraph_offset, self._number
 
 
 def _may_open_with_definition(line: str) -> bool:

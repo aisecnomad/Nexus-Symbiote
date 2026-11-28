@@ -42,11 +42,11 @@ from nexus_symbiote.scanners.base import YAML_TOKEN_LIMIT
 from nexus_symbiote.scanners.prompt import HIDDEN_CHARACTERS
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.jsonc import strip_jsonc
-from nexus_symbiote.utils.markdown import front_matter_candidates
+from nexus_symbiote.utils.markdown import MarkdownParagraphs, front_matter_candidates
 from nexus_symbiote.utils.terminal import neutralize
 from nexus_symbiote.utils.toml import loads as toml_loads
 
-RULE_PACK_VERSION = "1.0.0"
+RULE_PACK_VERSION = "1.1.0"
 
 CATEGORY_TOOL_POISONING = "tool_description_poisoning"
 CATEGORY_INSTRUCTION_INJECTION = "instruction_injection"
@@ -277,6 +277,51 @@ _EXFIL_URL_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+# Network sinks and the commands that read a credential path into a pipe.
+# Order does not matter: ``cat file | curl`` and ``base64 file | curl`` are the
+# same finding. A sentence that only mentions both is not a pipeline.
+# Names are the command word; ``/dev/tcp`` and ``/dev/udp`` are bash redirections.
+_SHELL_SINK_NAMES = (
+    "curl",
+    "wget",
+    "nc",
+    "scp",
+    "rsync",
+    "sftp",
+    "ftp",
+    "socat",
+    "ncat",
+    "telnet",
+    "ssh",
+)
+_SHELL_SINKS = frozenset(_SHELL_SINK_NAMES)
+_DEV_NET_REDIRECTS = ("/dev/tcp", "/dev/udp")
+# ``~``, ``$HOME`` and ``${HOME}`` become this marker so every spelling of a home
+# path contains ``/.ssh`` the credential-path rule already matches.
+_HOME_MARKER = "/home"
+_SHELL_READERS = frozenset(
+    {"cat", "base64", "xxd", "gzip", "openssl", "od", "dd", "head", "tail", "cut"}
+)
+_SHELL_TOKEN_RE = re.compile(r"\S+")
+_SHELL_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)=(.+)", re.DOTALL)
+_SHELL_VARIABLE = re.compile(r"\$([A-Za-z_][A-Za-z_0-9]*)|\$\{([A-Za-z_][A-Za-z_0-9]*)\}")
+# One of these verbs may sit between a prohibition and its command: "never run cat".
+_PROHIBITION_FILLERS = frozenset({"run", "execute", "type", "use", "call", "invoke", "pipe"})
+# A prohibition lowers a shell finding only when it is the whole clause in front of the
+# command, so "never mind", "if you don't" and a word of the command itself never do.
+_GOVERNING_PROHIBITION_RE = re.compile(
+    r"(?i)[ \t]*(?:you[ \t]+)?(?:never|do[ \t]+not|don'?t|must[ \t]+not|avoid)[ \t]+"
+    r"(?:(?:" + "|".join(sorted(_PROHIBITION_FILLERS)) + r")[ \t]+)?"
+)
+# A clause ends at a sentence end, a shell separator, or any character str.splitlines
+# breaks at: a reader can render each of them as a new line.
+_CLAUSE_BREAKS = frozenset(".!?;|&\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
+_CLAUSE_LOOKBACK = 64
+_PROHIBITION_NOTE = "context: prohibition"
+# A continued command or a substitution longer than this is a finding, not a miss.
+_SHELL_WINDOW_CHARS = 4096
+_SHELL_WINDOW_LINES = 32
+_SUBST_CHARS = 4096
 
 _OVERRIDE_RE = re.compile(
     rf"\b{_NOT_NEGATED}(?:"
@@ -497,6 +542,788 @@ def _directive_tag_hits(normalized: str) -> Iterator[int]:
             chain, chain_end = (opened.start(), start), end
 
 
+def _expand_home(fragment: str) -> str:
+    """Expand a leading ``~`` and every ``$HOME`` / ``${HOME}`` to one marker."""
+    if fragment.startswith("~") and (len(fragment) == 1 or fragment[1] == "/"):
+        fragment = _HOME_MARKER + fragment[1:]
+    return fragment.replace("${HOME}", _HOME_MARKER).replace("$HOME", _HOME_MARKER)
+
+
+def _unescape_shell(fragment: str) -> str:
+    """Drop a backslash before the next character, as an unquoted shell word does.
+
+    A backslash-newline is whitespace and is removed by the stage walk before this
+    runs. Single-quoted text must not be passed here: a backslash stays literal there.
+    """
+    if "\\" not in fragment:
+        return fragment
+    pieces: list[str] = []
+    index = 0
+    length = len(fragment)
+    while index < length:
+        if fragment[index] == "\\" and index + 1 < length:
+            pieces.append(fragment[index + 1])
+            index += 2
+            continue
+        pieces.append(fragment[index])
+        index += 1
+    return "".join(pieces)
+
+
+def _shell_spell(token: str) -> str:
+    """The word a shell matches: quotes removed, home expanded, escapes applied.
+
+    Escapes are removed outside single quotes only. A token that is already spelled
+    has no backslash left, so spelling it again does not change it.
+    """
+    if len(token) >= 2 and token[0] == "'" and token[-1] == "'":
+        return _expand_home(token[1:-1])
+    if len(token) >= 2 and token[0] == '"' and token[-1] == '"':
+        return _expand_home(_unescape_shell(token[1:-1]))
+    return _expand_home(_unescape_shell(token))
+
+
+def _command_word(spelled: str) -> str:
+    """Basename of an already spelled word, without a second escape pass."""
+    word = spelled.lower().strip("$#@()|;<>\"'")
+    if "/" in word:
+        word = word.rsplit("/", 1)[-1].strip("$#@()|;<>\"'")
+    return word
+
+
+def _shell_word(token: str) -> str:
+    """The command word of a token, ignoring a glued ``$(`` or a closing paren."""
+    return _command_word(_shell_spell(token))
+
+
+def _is_network_sink(token: str) -> bool:
+    return _names_network_sink(_shell_spell(token))
+
+
+def _names_network_sink(spelled: str) -> bool:
+    if _command_word(spelled) in _SHELL_SINKS:
+        return True
+    lowered = spelled.lower()
+    return any(redirect in lowered for redirect in _DEV_NET_REDIRECTS)
+
+
+def _credential_path(token: str) -> re.Match[str] | None:
+    found = _CRED_PATH_RE.search(_shell_spell(token))
+    if found is None or found.group().lower().endswith(".pub"):
+        return None
+    return found
+
+
+def _matching_quote(text: str, open_at: int, end: int) -> int | None:
+    """Index of the closer for the quote at ``open_at``, or None when it never closes.
+
+    Double quotes treat a backslash as an escape. The scan is one forward pass and
+    stops at ``end``, which is already the window cap.
+    """
+    quote = text[open_at]
+    index = open_at + 1
+    while index < end:
+        if quote == '"' and text[index] == "\\" and index + 1 < end:
+            index += 2
+            continue
+        if text[index] == quote:
+            return index
+        index += 1
+    return None
+
+
+def _line_ends_continued(text: str, line_start: int, line_end: int) -> bool:
+    end = line_end
+    while end > line_start and text[end - 1] in " \t\r":
+        end -= 1
+    if end > line_start and text[end - 1] == "\\":
+        return True
+    tail = text[line_start:end].rstrip(" \t")
+    return tail.endswith(("|", ";", "&&", "||"))
+
+
+def _next_starts_continued(text: str, index: int) -> bool:
+    if index >= len(text):
+        return False
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    return text.startswith(("|", "&&", "||"), index)
+
+
+def _next_is_lone_path(text: str, index: int) -> bool:
+    if index >= len(text):
+        return False
+    line_end = text.find("\n", index, index + _SHELL_WINDOW_CHARS + 1)
+    if line_end < 0:
+        if len(text) - index > _SHELL_WINDOW_CHARS:
+            return False
+        line_end = len(text)
+    tokens = _SHELL_TOKEN_RE.findall(text[index:line_end])
+    return len(tokens) == 1 and _credential_path(tokens[0]) is not None
+
+
+def _window_has_verb(text: str, start: int, end: int) -> bool:
+    for token in _SHELL_TOKEN_RE.findall(text[start:end]):
+        spelled = _shell_spell(token)
+        if _names_network_sink(spelled) or _command_word(spelled) in _SHELL_READERS:
+            return True
+    return False
+
+
+def _logical_windows(text: str) -> Iterator[tuple[int, int, bool]]:
+    """Continued shell lines as ``(start, end, truncated)``. One forward pass.
+
+    A backslash, a trailing or leading pipe, ``&&`` / ``||`` / ``;``, or a path
+    that occupies the next line by itself extends the window. Past the character
+    or line cap the window is truncated and the caller fails closed.
+    """
+    length = len(text)
+    index = 0
+    while index < length:
+        start = index
+        end = text.find("\n", index, start + _SHELL_WINDOW_CHARS + 1)
+        if end < 0:
+            end = min(length, start + _SHELL_WINDOW_CHARS)
+            if end < length:
+                yield start, end, True
+                index = end
+                continue
+        lines = 1
+        truncated = False
+        # A lone path continues the window only after a verb. The verb check runs only
+        # then, over the lines not yet read: no word spans the newline before a line.
+        has_verb = False
+        seen = start
+        while end < length:
+            line_start = max(start, text.rfind("\n", start, end) + 1)
+            lone_path = _next_is_lone_path(text, end + 1)
+            if lone_path and not has_verb:
+                has_verb = _window_has_verb(text, seen, end)
+                seen = end
+            lone_path = lone_path and has_verb
+            if not (
+                _line_ends_continued(text, line_start, end)
+                or _next_starts_continued(text, end + 1)
+                or lone_path
+            ):
+                break
+            nxt = text.find("\n", end + 1, start + _SHELL_WINDOW_CHARS + 1)
+            if nxt < 0:
+                nxt = length
+            if lines >= _SHELL_WINDOW_LINES or nxt - start > _SHELL_WINDOW_CHARS:
+                truncated = True
+                break
+            end = nxt
+            lines += 1
+        yield start, end, truncated
+        index = end + 1 if end < length else length
+
+
+def _shell_stages(text: str, start: int, end: int) -> list[tuple[str, list[tuple[int, str]]]]:
+    """Stages of one command, split on ``|``, ``||``, ``&&`` and ``;``.
+
+    Single and double quotes are removed, backslashes outside single quotes are
+    escapes, and ``~``, ``$HOME`` and ``${HOME}`` expand to one home marker.
+    ``$(...)`` and one-backtick substitutions stay in the token stream, so a
+    path named there is a reader even when the command is not on the reader
+    list. An unbalanced quote does not swallow the rest. A backslash-newline
+    is whitespace. The walk is one pass.
+    """
+    stages: list[tuple[str, list[tuple[int, str]]]] = [("", [])]
+    index = start
+    word_at: int | None = None
+    parts: list[str] = []
+    # A quote with no closer before ``end`` means no later quote of its kind has one:
+    # the failed scan passed each of them as escaped and resumed in the same state.
+    # Skipping those rescans keeps the walk linear in the window.
+    unclosed: set[str] = set()
+
+    def flush() -> None:
+        nonlocal word_at
+        if parts:
+            stages[-1][1].append((word_at if word_at is not None else index, "".join(parts)))
+            parts.clear()
+            word_at = None
+
+    while index < end:
+        char = text[index]
+        if char == "\\" and index + 1 < end and text[index + 1] == "\n":
+            index += 2
+            continue
+        if char == "`":
+            run = index + 1
+            while run < end and text[run] == "`":
+                run += 1
+            # A fence is Markdown punctuation. One backtick is only a word boundary,
+            # so the substitution body is tokenised with the rest of the command.
+            flush()
+            index = run
+            continue
+        if char in "\"'":
+            close = None if char in unclosed else _matching_quote(text, index, end)
+            if close is None:
+                # The quote never closes. Keep the following bytes in the raw scan.
+                unclosed.add(char)
+                index += 1
+                continue
+            if word_at is None:
+                word_at = index
+            inner = text[index + 1 : close]
+            if char == "'":
+                # Keep the quotes so a later spelling does not treat backslashes as escapes.
+                parts.append("'" + _expand_home(inner) + "'")
+            else:
+                parts.append(_expand_home(_unescape_shell(inner)))
+            index = close + 1
+            continue
+        if text.startswith(("&&", "||"), index) or char in "|;":
+            flush()
+            separator = text[index : index + 2] if text.startswith(("&&", "||"), index) else char
+            stages.append((separator, []))
+            index += len(separator)
+            continue
+        if char.isspace():
+            flush()
+            index += 1
+            continue
+        if word_at is None:
+            word_at = index
+        token_end = index + 1
+        while (
+            token_end < end and not text[token_end].isspace() and text[token_end] not in "|;`'\"()"
+        ):
+            if text.startswith(("&&", "||"), token_end):
+                break
+            token_end += 1
+        parts.append(_shell_spell(text[index:token_end]))
+        index = token_end
+    flush()
+    return stages
+
+
+_Stage = list[tuple[int, str]]
+# Options of scp, rsync and sftp whose value is a file the command itself reads or
+# writes, such as a key, filter, password or log file, rather than one it transfers.
+_COPY_OPTION_VALUES = frozenset(
+    {
+        "-i",
+        "-F",
+        "-e",
+        "-o",
+        "-S",
+        "-J",
+        "-b",
+        "-f",
+        "--rsh",
+        "--exclude",
+        "--include",
+        "--exclude-from",
+        "--include-from",
+        "--files-from",
+        "--filter",
+        "--password-file",
+        "--log-file",
+        "--temp-dir",
+        "--backup-dir",
+        "--link-dest",
+        "--compare-dest",
+        "--copy-dest",
+        "--partial-dir",
+    }
+)
+
+
+def _pipeline_offset(
+    text: str, chain: list[_Stage], assignments: dict[str, int]
+) -> tuple[int, int, int] | None:
+    """A path connected to a network command by a pipe, input argument or redirect.
+
+    ``chain`` is one command: its stages joined by pipes. The result is the offset to
+    report with the stage and token that name the path. ``assignments`` carries the
+    credential paths that earlier commands in the window bound to variables.
+    """
+    pipe_path: tuple[int, int, int] | None = None
+    pipe_sink = False
+    for number, stage in enumerate(chain):
+        stage_path: tuple[int, int, int] | None = None
+        sink = ""
+        sink_index = -1
+        input_redirect: tuple[int, int, int] | None = None
+        command_pending = True
+        copy_command = False
+        copy_source: tuple[int, int, int] | None = None
+        for index, (pos, token) in enumerate(stage):
+            value = _shell_spell(token)
+            word = _command_word(value)
+            binding = _SHELL_ASSIGNMENT.fullmatch(value) if index == 0 else None
+            if binding:
+                if _credential_path(binding[2]):
+                    assignments[binding[1]] = pos
+                else:
+                    assignments.pop(binding[1], None)
+                continue
+            previous = _shell_spell(stage[index - 1][1]) if index else ""
+            if word in _SHELL_SINKS:
+                if input_redirect is not None and command_pending:
+                    return input_redirect
+                sink, sink_index = word, index
+                copy_command = word in {"scp", "rsync", "sftp"} and (
+                    index == 0
+                    or text[pos - 1 : pos] == "`"
+                    or previous.lower()
+                    in _PROHIBITION_FILLERS | {"$", "never", "not", "avoid", "don't"}
+                )
+                continue
+            if value.startswith(("/dev/tcp/", "/dev/udp/", ">/dev/tcp/", ">/dev/udp/")):
+                if stage_path is not None and (previous == ">" or value.startswith(">")):
+                    return stage_path
+            at = pos if _credential_path(token) is not None else None
+            if at is None and assignments:
+                at = next(
+                    (
+                        assignments[name]
+                        for ref in _SHELL_VARIABLE.finditer(value)
+                        if (name := ref[1] or ref[2]) in assignments
+                    ),
+                    None,
+                )
+            if at is None:
+                if value not in {"<", "command", "exec", "env"} and not _SHELL_ASSIGNMENT.fullmatch(
+                    value
+                ):
+                    command_pending = False
+                if copy_source is not None and ":" in value:
+                    return copy_source
+                continue
+            point = (at, number, index)
+            if stage_path is None:
+                stage_path = point
+            if not sink:
+                if previous == "<" or (value.startswith("<") and not value.startswith("<<")):
+                    input_redirect = point
+                else:
+                    command_pending = False
+                continue
+            if (
+                value.startswith(("@", "<", "--post-file=", "--upload-file="))
+                or (sink == "curl" and value.startswith(("-d@", "-T")))
+                or "=@" in value
+                or previous in {"<", "-T", "--upload-file", "--post-file"}
+            ):
+                return point
+            # ``--netrc-file=`` or ``--cert=`` names a file the sink reads for itself.
+            if index == sink_index + 1 and sink in {"curl", "wget"} and not value.startswith("-"):
+                return point
+            if copy_command and not value.startswith("-") and previous not in _COPY_OPTION_VALUES:
+                copy_source = point
+        if (pipe_sink and stage_path is not None) or (sink and pipe_path is not None):
+            return stage_path if stage_path is not None else pipe_path
+        if stage_path is not None:
+            pipe_path = stage_path
+        pipe_sink = pipe_sink or bool(sink)
+    return None
+
+
+def _substitution_offsets(text: str, start: int, end: int) -> Iterator[tuple[int, int | None]]:
+    """Command substitutions in ``text[start:end]``, each with its opener.
+
+    An unclosed body past the cap is a hit without an opener: no command holds it.
+    """
+    if text.find("$(", start, end) == -1 and text.find("`", start, end) == -1:
+        return
+    index = start
+    has_verb = _window_has_verb(text, start, end)
+    preceding = start
+    sink_arguments = False
+    while index < end:
+        if text[index] == "`":
+            run = index + 1
+            while run < end and text[run] == "`":
+                run += 1
+            # A fence or double backtick is Markdown, not a one-backtick substitution.
+            if run - index != 1:
+                index = run
+                continue
+        if not text.startswith("$(", index) and text[index] != "`":
+            index += 1
+            continue
+        # A single backtick also delimits Markdown code spans. Only a shell
+        # argument can connect a substitution to a preceding network command.
+        for outer in _SHELL_TOKEN_RE.finditer(text, preceding, index):
+            word = outer.group()
+            if _is_network_sink(word):
+                sink_arguments = True
+            elif word.isalpha() or word.endswith((".", "!", "?", ";", "|", "&&")):
+                sink_arguments = False
+        dollar = text.startswith("$(", index)
+        opener = 2 if dollar else 1
+        closer = ")" if dollar else "`"
+        body = index + opener
+        cap = min(end, index + _SUBST_CHARS)
+        depth = 1
+        while body < cap and depth:
+            if dollar and text.startswith("$(", body):
+                depth += 1
+                body += 2
+                continue
+            if text[body] == closer:
+                depth -= 1
+                if depth == 0:
+                    break
+            body += 1
+        preceding = body + 1
+        # Markdown can wrap a real command. Inspect explicit substitutions in
+        # the span, independently of whether the surrounding prose is a command.
+        # The body ends at the next backtick, so this can recurse only once.
+        if not dollar and text.find("$(", index + opener, body) != -1:
+            yield from _substitution_offsets(text, index + opener, body)
+        if depth:
+            # A line ending inside a Markdown span says nothing about shell
+            # behavior. A bounded, unfinished explicit shell substitution is
+            # still reported when the scan reached the actual size limit.
+            if dollar and cap - index >= _SUBST_CHARS:
+                yield index, None
+            index = body
+            continue
+        words = _SHELL_TOKEN_RE.finditer(text, index + opener, body)
+        command = next(words, None)
+        if command is not None and _credential_path(command.group()) is None:
+            reader = _shell_word(command.group()) in _SHELL_READERS
+            for token in words:
+                if dollar and _shell_word(token.group()) in _SHELL_READERS:
+                    reader = True
+                if _credential_path(token.group()) is not None and (
+                    reader or sink_arguments or (dollar and has_verb)
+                ):
+                    yield token.start(), index
+                    break
+        index = body + 1
+
+
+def _window_interesting(text: str, start: int, end: int) -> bool:
+    """Only an unfinished shell expression can turn a parser limit into a finding."""
+    window = text[start:end]
+    if "$(" in window:
+        return True
+    if end < len(text) and text[end] != "\n":
+        # The first physical line also has a size cap. A long paragraph can name
+        # SSH and its manuals many times without starting a command.
+        if "|" in window or "<" in window or ">" in window or "\\\n" in window:
+            return _window_has_verb(text, start, end) or _CRED_PATH_RE.search(window) is not None
+        if start and text[start - 1] != "\n":
+            return False
+        lead = window.split(maxsplit=2)
+        return (
+            len(lead) > 1
+            and (_is_network_sink(lead[0]) or _shell_word(lead[0]) in _SHELL_READERS)
+            and (lead[1].startswith(("-", "@", "/", "$", "~")) or "://" in lead[1])
+        )
+    return _CRED_PATH_RE.search(window) is not None or _window_has_verb(text, start, end)
+
+
+_MAX_SUBST_DEPTH = 32
+
+
+def _openers_around(text: str, start: int, end: int, anchors: list[int]) -> list[int]:
+    """Outermost ``$(`` or backtick still open at each anchor. One forward pass.
+
+    A deeper nest than the cap is not tracked, so a confused opener cannot lower a
+    finding. No substitution in the window costs one membership test.
+    """
+    if not anchors:
+        return []
+    window = text[start:end]
+    if "$(" not in window and "`" not in window:
+        return []
+    wanted = set(anchors)
+    found: list[int] = []
+    dollars: list[int] = []
+    tick: int | None = None
+    tick_anchors: list[int] = []
+    index = start
+    while index < end:
+        if text.startswith("$(", index):
+            # The ``(`` is the token start, so it is not visited by the step below.
+            if index in wanted or index + 1 in wanted:
+                found.append(dollars[0] if dollars else index)
+            if len(dollars) < _MAX_SUBST_DEPTH:
+                dollars.append(index)
+            index += 2
+            continue
+        if text[index] == "`":
+            run = index + 1
+            while run < end and text[run] == "`":
+                run += 1
+            if run - index == 1:
+                if tick is None:
+                    tick = index
+                else:
+                    found.extend(tick_anchors)
+                    tick_anchors.clear()
+                    if index in wanted:
+                        found.append(tick)
+                    tick = None
+                if tick is not None and index in wanted:
+                    tick_anchors.append(index)
+            index = run
+            continue
+        if text[index] == ")" and dollars:
+            dollars.pop()
+        if index in wanted:
+            if dollars:
+                found.append(dollars[0])
+            elif tick is not None:
+                tick_anchors.append(tick)
+        index += 1
+    return found
+
+
+def _argument_word(token: str) -> bool:
+    """An option, redirect, upload reference, URL, path, assignment, variable or number."""
+    return (
+        token.startswith(("-", "<", ">", "@"))
+        or token.isdigit()
+        or any(mark in token for mark in "/:=$")
+    )
+
+
+def _command_anchor(stage: _Stage, index: int, *, program: bool) -> int | None:
+    """Where the command that takes token ``index`` as an argument starts.
+
+    The walk goes back over argument words to the nearest network command or reader.
+    With ``program``, a bare word right before a path is the program that reads it.
+    Any other word, or a word that ends a sentence, ends the walk: prose and an
+    earlier command never lend their prohibition to this one.
+    """
+    for step in range(index, -1, -1):
+        pos, token = stage[step]
+        if _is_network_sink(token) or _shell_word(token) in _SHELL_READERS:
+            return pos
+        if step < index and token.endswith((".", "!", "?")):
+            return None
+        if not _argument_word(token):
+            return pos if program and step == index else None
+    return None
+
+
+def _substitution_anchors(
+    text: str, stages: list[tuple[str, _Stage]], subs: list[tuple[int, int | None]]
+) -> Iterator[tuple[int, int | None]]:
+    """Each substitution hit with the start of the command that holds it.
+
+    A substitution is an argument of the command before it when only argument words sit
+    between them, as in ``curl https://x/$(...)``. Otherwise it is a command of its own
+    and starts at its opener. A hit without an opener has no command.
+    """
+    words = [
+        (pos, number, index)
+        for number, (_, stage) in enumerate(stages)
+        for index, (pos, _) in enumerate(stage)
+    ]
+    positions = [pos for pos, _, _ in words]
+    for offset, opener in subs:
+        if opener is None:
+            yield offset, None
+            continue
+        at = bisect_right(positions, opener) - 1
+        anchor = None
+        tick = text[opener] == "`"
+        # A ``$(`` sits inside the word that holds it. A backtick is a word boundary, so
+        # the word before it may be the command, unless a separator comes between them.
+        if at >= 0 and not (tick and at + 1 < len(words) and words[at + 1][1] != words[at][1]):
+            _, number, index = words[at]
+            first = index if tick else index - 1
+            anchor = _command_anchor(stages[number][1], first, program=False)
+        yield offset, opener if anchor is None else anchor
+
+
+def _governed_by_prohibition(text: str, start: int, end: int, anchor: int) -> bool:
+    """Whether the clause in front of the command at ``anchor`` is only a prohibition.
+
+    A command inside a substitution or code span starts at its outermost opener. The
+    clause reaches back to the nearest sentence end, shell separator or line break, so
+    an assignment or a wrapper such as ``sudo -u never`` in front of the command, and a
+    prohibition of another command, keep the finding at full severity.
+    """
+    opened = _openers_around(text, start, end, [anchor])
+    if opened:
+        anchor = opened[0]
+    floor = max(0, anchor - _CLAUSE_LOOKBACK)
+    clause = anchor
+    while clause > floor and text[clause - 1] not in _CLAUSE_BREAKS:
+        clause -= 1
+    if clause == floor and floor and text[floor - 1] not in _CLAUSE_BREAKS:
+        return False
+    return _GOVERNING_PROHIBITION_RE.fullmatch(text, clause, anchor) is not None
+
+
+def _table_cells(text: str, start: int, end: int) -> Iterator[tuple[int, int]]:
+    """Table cells, retaining shell pipes inside code spans or escaped as Markdown."""
+    spans = _code_spans(text, start, end)
+    span = next(spans, None)
+    cell = cursor = start
+    while (pipe := text.find("|", cursor, end)) != -1:
+        cursor = pipe + 1
+        while span is not None and span[1] <= pipe:
+            span = next(spans, None)
+        if span is not None and span[0] <= pipe < span[1]:
+            cursor = span[1]
+            continue
+        slash = pipe
+        while slash > cell and text[slash - 1] == "\\":
+            slash -= 1
+        if (pipe - slash) % 2:
+            continue
+        if cell != start or text[cell:pipe].strip():
+            yield cell, pipe
+        cell = cursor
+    if text[cell:end].strip():
+        yield cell, end
+
+
+_TABLE_DELIMITER = re.compile(r"[ \t]*:?-+:?[ \t]*")
+_TABLE_DELIMITER_LINE = re.compile(r"[|:\- \t]+")
+_TABLE_BLOCK_START = re.compile(
+    r"^ {0,3}(?:#{1,6}(?:[ \t]|$)|(?P<container>>|(?:[-*+]|[0-9]{1,9}[.)])(?:[ \t]|$)))",
+    re.M,
+)
+
+
+def _shell_regions(text: str) -> Iterator[tuple[int, int]]:
+    """Scan genuine Markdown table cells independently. Preserve other shell text intact."""
+    if "|" not in text or "-" not in text:
+        yield 0, len(text)
+        return
+    paragraphs = (
+        MarkdownParagraphs(len(text))
+        if any(marker.group("container") for marker in _TABLE_BLOCK_START.finditer(text))
+        else None
+    )
+    previous = previous_content = previous_end = regular = start = 0
+    previous_paragraph = table_paragraph = 0
+    header_candidate = in_table = False
+    fence = ""
+    while start < len(text):
+        newline = text.find("\n", start)
+        end = len(text) if newline == -1 else newline
+        stop = end - 1 if end > start and text[end - 1] == "\r" else end
+        if stop - start > _SHELL_WINDOW_CHARS:
+            # Keep all content on the bounded shell path. Table recognition must
+            # never materialize an unrestricted number of cells or backticks.
+            if in_table:
+                yield start, stop
+                regular = end + 1
+            if paragraphs is not None:
+                paragraphs.read(None)
+            header_candidate = False
+            start = end + 1
+            continue
+        parsed = paragraphs.read(text[start:stop]) if paragraphs is not None else None
+        if parsed is None:
+            content, paragraph = start, 0
+            eligible = not text.startswith(("    ", "\t"), start) and not _TABLE_BLOCK_START.match(
+                text, start, stop
+            )
+        else:
+            offset, paragraph = parsed
+            content = start + offset
+            eligible = True
+        has_pipe = text.find("|", content, stop) != -1
+        if fence:
+            closer = _FENCE_CLOSE_RE.match(text, start, end)
+            if closer and closer.group(1).startswith(fence):
+                fence = ""
+            header_candidate = in_table = False
+        elif opener := _FENCE_OPEN_RE.match(text, start, end):
+            fence = opener.group(1)
+            header_candidate = in_table = False
+        elif in_table and eligible and paragraph == table_paragraph and text[content:stop].strip():
+            yield from _table_cells(text, content, stop)
+            regular = end + 1
+        else:
+            in_table = False
+            if (
+                header_candidate
+                and eligible
+                and paragraph == previous_paragraph
+                and _TABLE_DELIMITER_LINE.fullmatch(text, content, stop)
+            ):
+                columns = text[content:stop].strip().removeprefix("|").removesuffix("|").split("|")
+                if all(_TABLE_DELIMITER.fullmatch(col) for col in columns):
+                    header = list(_table_cells(text, previous_content, previous_end))
+                    if len(header) == len(columns):
+                        if regular < previous:
+                            yield regular, previous
+                        yield from header
+                        in_table = True
+                        table_paragraph = paragraph
+                        regular = end + 1
+            header_candidate = has_pipe and eligible
+        previous, previous_content, previous_end, previous_paragraph = (
+            start,
+            content,
+            stop,
+            paragraph,
+        )
+        start = end + 1
+    if regular < len(text):
+        yield regular, len(text)
+
+
+def _shell_exfil_offsets(normalized: str) -> Iterator[tuple[int, bool]]:
+    for start, end in _shell_regions(normalized):
+        for at, prohibited in _shell_region_offsets(normalized[start:end]):
+            yield start + at, prohibited
+
+
+def _shell_region_offsets(normalized: str) -> Iterator[tuple[int, bool]]:
+    """Offsets of a shell read of a credential path that reaches a network sink.
+
+    Each offset is paired with whether a prohibition governs the command that holds it.
+    A prohibition never drops the finding. It only lowers a command whose own clause is
+    nothing but the prohibition, so each command of a line is judged on its own and a
+    parser limit is never lowered. A sentence that only mentions the command, and a
+    ``Never curl`` with no credential path, stay quiet because they are not commands.
+    A ``.pub`` path stays public.
+    """
+    for start, end, truncated in _logical_windows(normalized):
+        stages = _shell_stages(normalized, start, end)
+        chains: list[list[_Stage]] = []
+        for separator, stage in stages:
+            if separator != "|" or not chains:
+                chains.append([])
+            chains[-1].append(stage)
+        assignments: dict[str, int] = {}
+        found = [
+            (hit, chain)
+            for chain in chains
+            if (hit := _pipeline_offset(normalized, chain, assignments)) is not None
+        ]
+        subs = list(_substitution_offsets(normalized, start, end))
+        truncated_hit = truncated and _window_interesting(normalized, start, end)
+        if not found and not subs and not truncated_hit:
+            continue
+        judged: list[tuple[int, int | None]] = [
+            (offset, _command_anchor(chain[number], index - 1, program=True))
+            for (offset, number, index), chain in found
+        ]
+        judged.extend(_substitution_anchors(normalized, stages, subs))
+        if truncated_hit:
+            judged.append((start, None))
+        verdicts: dict[int, bool] = {}
+        for offset, anchor in judged:
+            # The prose relay reports the raw path. Use that same offset when
+            # this shell token contains it, even if home and quotes were expanded.
+            token = _SHELL_TOKEN_RE.match(normalized, offset, end)
+            path = _CRED_PATH_RE.search(normalized, offset, token.end()) if token else None
+            at = path.start() if path else offset
+            lowered = anchor is not None and _governed_by_prohibition(
+                normalized, start, end, anchor
+            )
+            verdicts[at] = verdicts.get(at, True) and lowered
+        yield from sorted(verdicts.items())
+
+
 def scan_text_block(
     text: str,
     *,
@@ -506,29 +1333,54 @@ def scan_text_block(
     where: str = "",
 ) -> list[TextPoisoningHit]:
     """Scan a single text string using deterministic O(N) lexical rules."""
-    if not text:
+    if not text or max_hits <= 0:
         return []
 
     normalized, byte_offsets = normalize_for_lexical_scan(text)
     if not normalized:
         return []
 
-    hits: list[TextPoisoningHit] = []
+    # Keep one representative per rule as well as bounded additional evidence.
+    # A full reporting budget must never stop the scan of a later rule or severity.
+    representatives: dict[str, tuple[int, TextPoisoningHit]] = {}
+    extras: dict[RiskSeverity, list[tuple[int, TextPoisoningHit]]] = {}
+    ordinal = 0
     base_category = _default_category(is_tool_surface)
 
-    def record(rule_id: str, category: str, char_index: int) -> None:
-        if len(hits) < max_hits:
-            hits.append(
-                TextPoisoningHit(
-                    rule_id=rule_id,
-                    category=category,
-                    severity=RiskSeverity.HIGH,
-                    byte_offset=_byte_offset_at(byte_offsets, char_index),
-                    surface=surface,
-                    summary=_RULE_DESCRIPTIONS[rule_id],
-                    where=where,
-                )
-            )
+    def record(
+        rule_id: str,
+        category: str,
+        char_index: int,
+        *,
+        severity: RiskSeverity = RiskSeverity.HIGH,
+        note: str = "",
+    ) -> None:
+        nonlocal ordinal
+        prior = representatives.get(rule_id)
+        bucket = extras.setdefault(severity, [])
+        offset = _byte_offset_at(byte_offsets, char_index)
+        rank = _SEVERITY_RANK[severity]
+        represents = prior is None or (-rank, offset) < (
+            -_SEVERITY_RANK[prior[1].severity],
+            prior[1].byte_offset,
+        )
+        if not represents and len(bucket) >= max_hits:
+            return
+        description = _RULE_DESCRIPTIONS[rule_id]
+        hit = TextPoisoningHit(
+            rule_id=rule_id,
+            category=category,
+            severity=severity,
+            byte_offset=offset,
+            surface=surface,
+            summary=f"{description} {note}" if note else description,
+            where=where,
+        )
+        ordinal += 1
+        if len(bucket) < max_hits:
+            bucket.append((ordinal, hit))
+        if represents:
+            representatives[rule_id] = (ordinal, hit)
 
     # 1. TP-TAG-001: Directive tags containing coercive/exfiltration/override payload
     for tag_start in _directive_tag_hits(normalized):
@@ -578,6 +1430,25 @@ def scan_text_block(
         if not _has_negated_prefix(normalized, exfil_match.start()):
             record("TP-CRED-002", base_category, exfil_match.start())
 
+    credential_locations = {
+        hit.byte_offset
+        for bucket in extras.values()
+        for _, hit in bucket
+        if hit.rule_id == "TP-CRED-002"
+    }
+    for at, prohibited in _shell_exfil_offsets(normalized):
+        location = _byte_offset_at(byte_offsets, at)
+        if location in credential_locations:
+            continue
+        # A governing prohibition lowers the finding. It never removes it.
+        record(
+            "TP-CRED-002",
+            base_category,
+            at,
+            severity=RiskSeverity.MEDIUM if prohibited else RiskSeverity.HIGH,
+            note=_PROHIBITION_NOTE if prohibited else "",
+        )
+
     # 4. TP-CONCEAL-003: Concealment instructions ("never tell the user", "do not mention this to the user")
     for conceal_match in _CONCEAL_RE.finditer(normalized):
         if not _has_negated_prefix(normalized, conceal_match.start()):
@@ -602,7 +1473,16 @@ def scan_text_block(
         if addressed is not None and not _has_negated_prefix(normalized, aud_match.start()):
             record("II-AUD-002", CATEGORY_INSTRUCTION_INJECTION, aud_match.start())
 
-    return hits
+    priority = sorted(
+        representatives.values(), key=lambda item: (-_SEVERITY_RANK[item[1].severity], item[0])
+    )
+    chosen = dict(priority[:max_hits])
+    for severity in sorted(extras, key=_SEVERITY_RANK.__getitem__, reverse=True):
+        for order, hit in extras[severity]:
+            if len(chosen) == max_hits:
+                break
+            chosen[order] = hit
+    return [chosen[order] for order in sorted(chosen)]
 
 
 def extract_json_text_entries(
@@ -1299,6 +2179,28 @@ def _hit_sort_key(hit: TextPoisoningHit) -> tuple[str, int, bool, str]:
     return (hit.where, hit.byte_offset, hit.rule_id == "TP-SIDENOTE-004", hit.rule_id)
 
 
+_SEVERITY_RANK = {
+    RiskSeverity.INFO: 0,
+    RiskSeverity.LOW: 1,
+    RiskSeverity.MEDIUM: 2,
+    RiskSeverity.HIGH: 3,
+    RiskSeverity.CRITICAL: 4,
+}
+
+
+def _strongest_severity(hits: list[TextPoisoningHit]) -> RiskSeverity:
+    """The group keeps its strongest hit, so one lowered finding cannot hide another."""
+    return max((hit.severity for hit in hits), key=_SEVERITY_RANK.__getitem__)
+
+
+def _outranks(hit: TextPoisoningHit, other: TextPoisoningHit) -> bool:
+    """Whether ``hit`` represents its rule instead of ``other``: more severe, then earlier."""
+    rank, other_rank = _SEVERITY_RANK[hit.severity], _SEVERITY_RANK[other.severity]
+    if rank != other_rank:
+        return rank > other_rank
+    return (hit.where, hit.byte_offset) < (other.where, other.byte_offset)
+
+
 def _append_consolidated_risks(
     component: ComponentWithRisks,
     hits: list[TextPoisoningHit],
@@ -1344,7 +2246,7 @@ def _append_consolidated_risks(
         references = list(dict.fromkeys(f"{_RULE_REFERENCE_PREFIX}{hit.rule_id}" for hit in order))
         component.risks.append(
             RiskAssessment(
-                severity=RiskSeverity.HIGH,
+                severity=_strongest_severity(order),
                 category=category,
                 detail=detail,
                 recommendation=recommendation,
@@ -1704,15 +2606,20 @@ def _scan_text_source(
             by_target.setdefault(chosen_ref, (chosen, []))[1].append(h)
     if decoded_groups:
         # A decoded string is reported at its pointer, as in a JSON source, unless the raw
-        # text already gave its owner the same rule.
-        found = {
-            (ref, h.rule_id, h.unresolved_declaration)
-            for ref, (_, group) in by_target.items()
-            for h in group
-        }
+        # text already gave its owner the same rule at least as severely.
+        found: dict[tuple[str | None, str, int], int] = {}
+        for ref, (_, group) in by_target.items():
+            for h in group:
+                owner_rule = (ref, h.rule_id, h.unresolved_declaration)
+                found[owner_rule] = max(found.get(owner_rule, -1), _SEVERITY_RANK[h.severity])
         for target, decoded in decoded_groups:
             ref = None if target is None else target.bom_ref
-            extra = [h for h in decoded if (ref, h.rule_id, h.unresolved_declaration) not in found]
+            extra = [
+                h
+                for h in decoded
+                if _SEVERITY_RANK[h.severity]
+                > found.get((ref, h.rule_id, h.unresolved_declaration), -1)
+            ]
             if extra:
                 by_target.setdefault(ref, (target, []))[1].extend(extra)
     return list(by_target.values())
@@ -1775,20 +2682,20 @@ def apply_text_poisoning_rules(
     def remember(target: ComponentWithRisks, hits: list[TextPoisoningHit]) -> None:
         if not hits:
             return
-        # Source passes come first. Keep their locations for shared rules while
-        # admitting additional rules derived from component fields afterwards.
+        # A rule is reported once, so its most severe hit stands for it: a lowered hit
+        # must not hide a stronger one. Source passes come first and keep their
+        # locations for shared rules unless a later pass is more severe.
         firsts: dict[tuple[str, str, str, int], TextPoisoningHit] = {}
         for hit in hits:
             key = (hit.category, hit.surface, hit.rule_id, hit.unresolved_declaration)
             previous = firsts.get(key)
-            if previous is None or (hit.where, hit.byte_offset) < (
-                previous.where,
-                previous.byte_offset,
-            ):
+            if previous is None or _outranks(hit, previous):
                 firsts[key] = hit
         saved = located_hits.setdefault(target.bom_ref, {})
         for key, hit in firsts.items():
-            saved.setdefault(key, hit)
+            kept = saved.get(key)
+            if kept is None or _SEVERITY_RANK[hit.severity] > _SEVERITY_RANK[kept.severity]:
+                saved[key] = hit
 
     # Source files first: their findings carry file byte offsets or JSON pointers, which
     # the in-memory fields scanned after them cannot give for the same component.

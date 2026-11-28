@@ -4,6 +4,11 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Security
+
+- Text-poisoning pack `1.1.0` reports credential file references in shell pipelines, command substitutions, file-transfer arguments and network redirects under `TP-CRED-002`. A prohibition lowers a command's finding to medium only when it forms the whole clause in front of that command, so each command in a line is judged on its own. A file's finding for each rule takes its most severe hit, so a lowered hit never hides a stronger one. Ordinary SSH setup and backup prose stay quiet. Overlapping detectors report a matched path once. Shell parsing uses windows of up to 4,096 characters and 32 physical lines.
+- Re-collect and review saved inventories with text-poisoning findings after upgrading. Their finding details include the pack version, so their risk suppression and SARIF fingerprints change, including for findings from other rules in this pack. Review and update affected suppressions against the new findings.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).
