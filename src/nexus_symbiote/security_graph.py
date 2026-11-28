@@ -820,12 +820,29 @@ def _mermaid_label(raw: str) -> str:
 
 
 def _md_cell(raw: str) -> str:
-    # Escaping brackets keeps supplied text from forming a link or a remote image, and
-    # escaping backslashes first keeps it from cancelling those escapes.
-    text = neutralize(raw)
-    for char in "\\[]|":
-        text = text.replace(char, "\\" + char)
-    return text.replace("<", "&lt;").replace(">", "&gt;")
+    """Render untrusted text literally inside a GFM table cell as a fenced code span.
+
+    Wrapping in a CommonMark code span disables GFM bare-URL autolinking, explicit
+    links/images, emphasis, strikethrough, raw HTML, and HTML character entities while
+    preserving the exact label; escaping ``|`` keeps GFM table columns intact.
+    """
+    text = neutralize(raw).replace("\r", " ").replace("\n", " ")
+    if not text:
+        return ""
+    escaped = text.replace("|", "\\|")
+    fence_len = 1
+    run = 0
+    for ch in escaped:
+        if ch == "`":
+            run += 1
+            if run >= fence_len:
+                fence_len = run + 1
+        else:
+            run = 0
+    fence = "`" * fence_len
+    if escaped.strip(" ") and (escaped.startswith(("`", " ")) or escaped.endswith(("`", " "))):
+        return f"{fence} {escaped} {fence}"
+    return f"{fence}{escaped}{fence}"
 
 
 def render_security_graph_mermaid(report: SecurityGraphReport) -> str:

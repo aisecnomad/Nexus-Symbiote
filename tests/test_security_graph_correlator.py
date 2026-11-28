@@ -656,30 +656,80 @@ def test_security_graph_audit_regressions_kev_truncation_escaping_and_epss_zero(
 
 
 def test_markdown_cells_keep_supplied_link_and_image_syntax_inert() -> None:
-    image = "![x](https://beacon.example.invalid/p.png)"
-    smuggled = "\\![y](https://beacon.example.invalid/q.png)"
+    from html.parser import HTMLParser
+
+    import markdown_it
+
+    samples = [
+        ("https://docs.example.invalid/guide?a=1&b=2", "data:url-docs"),
+        ("![x](https://beacon.example.invalid/p.png)", "data:[docs](https://example.invalid/)"),
+        ("\\![y](https://beacon.example.invalid/q.png)", "data:a|b\\|c"),
+        ("*bold* _italic_ ~del~ `code` &copy; &#65;", "data:`edge`"),
+    ]
     bom = AIBOM()
-    bom.components.append(
-        DataSourceComponent(
-            name="docs",
-            bom_ref="data:[docs](https://example.invalid/)",
-            properties={
-                "advisories": [
-                    {"id": image, "severity": "high"},
-                    {"id": smuggled, "severity": "high"},
-                ]
-            },
+    for index, (advisory_id, subject_ref) in enumerate(samples):
+        bom.components.append(
+            DataSourceComponent(
+                name=f"docs-{index}",
+                bom_ref=subject_ref,
+                properties={"advisories": [{"id": advisory_id, "severity": "high"}]},
+            )
         )
-    )
     md = render_security_graph_markdown(build_security_graph(bom))
-    assert "| !\\[x\\](https://beacon.example.invalid/p.png) |" in md
-    assert "| \\\\!\\[y\\](https://beacon.example.invalid/q.png) |" in md
-    assert "| data:\\[docs\\](https://example.invalid/) |" in md
-    for line in md.splitlines():
-        for index, char in enumerate(line):
-            if char in "[]":
-                escapes = len(line[:index]) - len(line[:index].rstrip("\\"))
-                assert escapes % 2 == 1, line
+
+    class _CellParser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rows: list[list[tuple[str, list[str]]]] = []
+            self._row: list[tuple[str, list[str]]] | None = None
+            self._in_td = False
+            self._text: list[str] = []
+            self._tags: list[str] = []
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            if tag == "tr":
+                self._row = []
+            elif tag == "td":
+                self._in_td = True
+                self._text = []
+                self._tags = []
+            elif self._in_td:
+                self._tags.append(tag)
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag == "td" and self._row is not None:
+                self._in_td = False
+                self._row.append(("".join(self._text), list(self._tags)))
+            elif tag == "tr" and self._row:
+                self.rows.append(self._row)
+                self._row = None
+
+        def handle_data(self, data: str) -> None:
+            if self._in_td:
+                self._text.append(data)
+
+    from nexus_symbiote.security_graph import _md_cell
+
+    assert _md_cell("") == ""
+    assert _md_cell(" ") == "` `"
+    assert _md_cell(" x ") == "`  x  `"
+
+    renderer = markdown_it.MarkdownIt("gfm-like", {"linkify": False})
+    rendered_html = renderer.render(md)
+    parser = _CellParser()
+    parser.feed(rendered_html)
+
+    assert len(parser.rows) == len(samples)
+    by_trigger: dict[str, str] = {}
+    for row in parser.rows:
+        assert len(row) == 7
+        trigger_text, trigger_tags = row[1]
+        subject_text, subject_tags = row[2]
+        # Only inert <code> wrappers are permitted; never <a>, <img>, <em>, <del>, etc.
+        assert trigger_tags == ["code"]
+        assert subject_tags == ["code"]
+        by_trigger[trigger_text] = subject_text
+    assert by_trigger == dict(samples)
 
 
 def test_component_scoping_precedes_global_limit_and_counts_scoped_omissions(
