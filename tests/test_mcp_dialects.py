@@ -177,6 +177,410 @@ def test_codex_project_config_toml_is_inventoried(tmp_path):
     )
 
 
+def test_sse_path_transport_depends_on_client_dialect(tmp_path):
+    url = "https://catalog.example.test/namespace/sse"
+    result = scan(
+        tmp_path,
+        {
+            ".codex/config.toml": f'[mcp_servers.codex]\nurl = "{url}"\n',
+            ".zed/settings.json": json.dumps({"context_servers": {"zed": {"url": url}}}),
+            "opencode.json": json.dumps({"mcp": {"opencode": {"type": "remote", "url": url}}}),
+        },
+    )
+    assert not result.scan_failures and not result.surfaces_excluded
+    assert {name: server.transport for name, server in servers(result).items()} == {
+        "codex": "streamable-http",
+        "zed": "sse",
+        "opencode": "sse",
+    }
+
+
+def test_codex_stdio_omits_non_inheritable_names_from_local_and_remote_environments(tmp_path):
+    from nexus_symbiote.core.aibom import AIBOM
+    from nexus_symbiote.graph import blast_radius
+
+    blocked = [
+        "CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN",
+        "NODE_REPL_AUTH_TOKEN",
+        "CODEX_GUARDIAN_DECISIONS_API_KEY",
+        "OPENAI_FEDERATION_RULE_ID",
+        "OPENAI_IDENTITY_TOKEN_FILE",
+        "OPENAI_IDENTITY_TOKEN_SOURCE",
+        "OPENAI_SPIFFE_AUDIENCE",
+        "OPENAI_SPIFFE_ID",
+        "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+    ]
+    local_names = json.dumps([*blocked, "node_repl_auth_token", "SPIFFE_ENDPOINT_SOCKET"])
+    toml = f"""
+[mcp_servers.local]
+command = "catalog"
+env_vars = {local_names}
+env = {{ NODE_REPL_AUTH_TOKEN = "synthetic-local", DIRECT_KEY = "neutral-local" }}
+[mcp_servers.remote]
+command = "catalog"
+environment_id = "remote-catalog"
+env_vars = ["Node_Repl_Auth_Token", "ALLOWED_TOKEN",
+            {{ name = "openai_identity_token_file", source = "remote" }},
+            {{ name = "OTHER_TOKEN", source = "remote" }}]
+env = {{ Node_Repl_Auth_Token = "synthetic-remote" }}
+[mcp_servers.http]
+url = "https://catalog.example.test/mcp"
+bearer_token_env_var = "NODE_REPL_AUTH_TOKEN"
+env_http_headers = {{ X-Auth = "openai_identity_token_file" }}
+"""
+    result = scan(tmp_path, {".codex/config.toml": toml})
+    assert not result.scan_failures
+    records = servers(result)
+    local, remote, http = records["local"], records["remote"], records["http"]
+    assert local.properties["env_vars_referenced"] == ["SPIFFE_ENDPOINT_SOCKET"]
+    assert local.env == {"DIRECT_KEY": "***"}
+    assert remote.properties["env_vars_referenced"] == ["ALLOWED_TOKEN"]
+    assert remote.properties["remote_env_vars_referenced"] == ["OTHER_TOKEN"]
+    assert remote.env == {}
+    assert http.properties["env_vars_referenced"] == [
+        "NODE_REPL_AUTH_TOKEN",
+        "openai_identity_token_file",
+    ]
+    bom = AIBOM(components=result.components)
+    assert not blast_radius(bom, http.bom_ref)["shared_credential_surfaces"]
+
+
+def test_codex_local_ca_overrides_fold_case_only_for_custom_ca_variables(tmp_path):
+    declaration = """
+command = "catalog"
+env_vars = ["SSL_CERT_FILE", "NpM_CoNfIg_CaFiLe", "SSL_CERT_DIR", "DENO_CERT", "OTHER_TOKEN"]
+env = { ssl_cert_file = "ca.pem", npm_config_cafile = "npm.pem", ssl_cert_dir = "certs", deno_cert = "deno.pem", OTHER_TOKEN = "example" }
+"""
+    toml = (
+        "[mcp_servers.local]\n"
+        + declaration
+        + '\n[mcp_servers.managed]\nenvironment_id = "managed"\n'
+        + declaration
+    )
+    result = scan(tmp_path, {".codex/config.toml": toml})
+    assert not result.scan_failures
+    found = servers(result)
+    assert found["local"].properties["env_vars_referenced"] == ["DENO_CERT", "SSL_CERT_DIR"]
+    assert found["managed"].properties["env_vars_referenced"] == [
+        "DENO_CERT",
+        "NpM_CoNfIg_CaFiLe",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+    ]
+
+
+def test_codex_environment_references_reach_blast_radius_without_reading_values(
+    tmp_path, monkeypatch
+):
+    from nexus_symbiote.core.aibom import AIBOM
+    from nexus_symbiote.graph import blast_radius
+
+    monkeypatch.setenv("SHARED_API_TOKEN", "unrelated-value-in-test-environment")
+    toml = """
+[mcp_servers.reader]
+command = "catalog"
+environment_id = "remote-catalog"
+env_vars = ["SHARED_API_TOKEN", {name = "SHARED_API_TOKEN", source = "local"},
+            {name = "ROOT_SERVICE_KEY", source = "remote"}, {name = "OVERRIDDEN_TOKEN"}]
+env = { OVERRIDDEN_TOKEN = "fixed-value" }
+[mcp_servers.search]
+url = "https://catalog.example.test/namespace/sse"
+bearer_token_env_var = "SHARED_API_TOKEN"
+env_http_headers = { X-Auth = "SECONDARY_TOKEN", X-Backup = "SHARED_API_TOKEN" }
+"""
+    result = scan(tmp_path, {".codex/config.toml": toml})
+    assert not result.scan_failures
+    found = servers(result)
+    reader, search = found["reader"], found["search"]
+    assert search.transport == "streamable-http"
+    assert reader.properties["env_vars_referenced"] == ["SHARED_API_TOKEN"]
+    assert reader.properties["remote_env_vars_referenced"] == ["ROOT_SERVICE_KEY"]
+    assert search.properties["env_vars_referenced"] == ["SECONDARY_TOKEN", "SHARED_API_TOKEN"]
+    bom = AIBOM(components=result.components)
+    shared = blast_radius(bom, search.bom_ref)["shared_credential_surfaces"]
+    assert shared == {"SHARED_API_TOKEN": sorted([reader.bom_ref, search.bom_ref])}
+    assert "unrelated-value-in-test-environment" not in bom.model_dump_json()
+
+
+def test_codex_http_env_references_require_a_valid_header_name(tmp_path):
+    from nexus_symbiote.core.aibom import AIBOM
+    from nexus_symbiote.graph import blast_radius
+
+    toml = """
+[mcp_servers.catalog]
+url = "https://catalog.example.test/mcp"
+bearer_token_env_var = "BEARER_TOKEN"
+[mcp_servers.catalog.env_http_headers]
+"Bad Header" = "UNUSED_TOKEN"
+"Bad:Header" = "UNUSED_TOKEN"
+"Ü" = "UNUSED_TOKEN"
+"" = "UNUSED_TOKEN"
+"+" = "ONE_CHAR_TOKEN"
+"X-Auth" = "FIRST_TOKEN"
+"x-auth" = "SECOND_TOKEN"
+[mcp_servers.local]
+command = "catalog"
+env_vars = ["UNUSED_TOKEN", "FIRST_TOKEN"]
+"""
+    result = scan(tmp_path, {".codex/config.toml": toml})
+    assert not result.scan_failures
+    found = servers(result)
+    catalog = found["catalog"]
+    assert catalog.properties["env_vars_referenced"] == [
+        "BEARER_TOKEN",
+        "FIRST_TOKEN",
+        "ONE_CHAR_TOKEN",
+        "SECOND_TOKEN",
+    ]
+    shared = blast_radius(AIBOM(components=result.components), catalog.bom_ref)
+    assert shared["shared_credential_surfaces"] == {
+        "FIRST_TOKEN": sorted([catalog.bom_ref, found["local"].bom_ref])
+    }
+
+
+def test_codex_only_emits_safe_names_in_interpreted_locations(tmp_path):
+    toml = """
+[mcp_servers.remote]
+url = "https://service.example.test"
+env_http_headers = { X-One = "NAME/IS/PATH", X-Two = "HIDDEN_SHARED_TOKEN", X-Three = "SAFE_API_KEY" }
+[mcp_servers.sibling]
+command = "catalog"
+env = { PRIVATE_TOKEN = "HIDDEN_SHARED_TOKEN" }
+[mcp_servers.invalid_stdio]
+command = "catalog"
+bearer_token_env_var = "WRONG_MODE_TOKEN"
+[mcp_servers.invalid_http]
+url = "https://service.example.test"
+env_vars = ["WRONG_MODE_TOKEN"]
+"""
+    other = {
+        "mcpServers": {
+            "foreign": {
+                "url": "https://other.example.test",
+                "bearer_token_env_var": "FOREIGN_TOKEN",
+            }
+        }
+    }
+    result = scan(tmp_path, {"nested/.codex/config.toml": toml, ".mcp.json": json.dumps(other)})
+    found = servers(result)
+    assert found["remote"].properties["env_vars_referenced"] == ["SAFE_API_KEY"]
+    for name in ("sibling", "foreign", "invalid_stdio", "invalid_http"):
+        assert "env_vars_referenced" not in found[name].properties
+    serialized = json.dumps([component.model_dump(mode="json") for component in result.components])
+    assert "HIDDEN_SHARED_TOKEN" not in serialized
+    assert "NAME/IS/PATH" not in serialized
+
+
+@pytest.mark.parametrize(
+    "entry", ["{name = 17}", '{name = "A", source = "other"}', '{name = "A", extra = true}']
+)
+def test_codex_rejects_uninterpretable_environment_entries(tmp_path, entry):
+    result = scan(
+        tmp_path,
+        {".codex/config.toml": f'[mcp_servers.s]\ncommand="catalog"\nenv_vars=[{entry}]\n'},
+    )
+    assert result.scan_failures == [".codex/config.toml: invalid server configuration"]
+    assert not servers(result)
+
+
+def test_codex_rejects_numeric_environment_id(tmp_path):
+    toml = """
+[mcp_servers.s]
+command = "catalog"
+environment_id = 17
+env_vars = ["LOCAL_TOKEN", { name = "FOREIGN_TOKEN", source = "remote" }]
+"""
+    result = scan(tmp_path, {".codex/config.toml": toml})
+    assert result.scan_failures == [".codex/config.toml: invalid server configuration"]
+    assert not servers(result)
+
+
+@pytest.mark.parametrize("remote_name", ["FOREIGN_TOKEN", "NODE_REPL_AUTH_TOKEN"])
+def test_codex_local_override_does_not_mask_invalid_remote_source(tmp_path, remote_name):
+    toml = f"""
+[mcp_servers.s]
+command = "catalog"
+env_vars = ["LOCAL_TOKEN", {{ name = "{remote_name}", source = "remote" }}]
+env = {{ {remote_name} = "synthetic-override-value" }}
+"""
+    result = scan(tmp_path, {".codex/config.toml": toml})
+    record = servers(result)["s"]
+    assert "env_vars_referenced" not in record.properties
+    assert "remote_env_vars_referenced" not in record.properties
+    assert "synthetic-override-value" not in record.model_dump_json()
+
+
+def test_non_codex_stdio_keeps_env_names_restricted_only_by_codex(tmp_path):
+    other, _ = single(tmp_path, {"command": "catalog", "env": {"NODE_REPL_AUTH_TOKEN": "sample"}})
+    assert other.env == {"NODE_REPL_AUTH_TOKEN": "***"}
+
+
+def test_codex_withholds_foreign_config_values_and_unresolved_environment_sources(tmp_path):
+    codex = """
+[mcp_servers.first]
+url = "https://service.example.test"
+env_http_headers = { X-Test = "SHARED_HIDDEN_NAME", X-Public = "PUBLIC_API_TOKEN" }
+[mcp_servers.remote_http]
+environment_id = "remote-catalog"
+url = "https://service.example.test"
+bearer_token_env_var = "REMOTE_TOKEN"
+[mcp_servers.local_stdio]
+command = "catalog"
+env_vars = ["LOCAL_TOKEN", { name = "FOREIGN_TOKEN", source = "remote" }]
+"""
+    other = {"servers": {"s": {"command": "catalog", "env": {"LABEL": "SHARED_HIDDEN_NAME"}}}}
+    result = scan(tmp_path, {"nested/.codex/config.toml": codex, ".mcp.json": json.dumps(other)})
+    found = servers(result)
+    assert found["first"].properties["env_vars_referenced"] == ["PUBLIC_API_TOKEN"]
+    for name in ["local_stdio", "remote_http"]:
+        assert "env_vars_referenced" not in found[name].properties
+        assert "remote_env_vars_referenced" not in found[name].properties
+    assert "SHARED_HIDDEN_NAME" not in json.dumps(
+        [c.model_dump(mode="json") for c in result.components]
+    )
+
+
+def test_codex_withholds_exact_masked_values_across_forwarding_forms(tmp_path):
+    codex = """
+[mcp_servers.local]
+command = "catalog"
+environment_id = "managed"
+env_vars = ["a", "a_label", "page", "beige", "coral", "sand", "stone", {name = "rose", source = "remote"}]
+[mcp_servers.web]
+url = "https://catalog.example.test"
+bearer_token_env_var = "linen"
+env_http_headers = { X-One = "mint", X-Two = "leaf", X-Three = "meadow" }
+[mcp_servers.sibling]
+command = "catalog"
+env = { COLOR = "rose" }
+"""
+    other = {
+        "mcpServers": {
+            "worker": {
+                "command": "catalog",
+                "env": {"DISPLAY": "a"},
+                "args": ["page", "--api-key", "linen", "--api-key=mint", "API_KEY=leaf"],
+            }
+        }
+    }
+    opencode = {
+        "mcp": {
+            "colors": {
+                "type": "local",
+                "command": [
+                    "catalog",
+                    "--api-key",
+                    "beige",
+                    "--api-key=coral",
+                    "-k",
+                    "sand",
+                    "-k=stone",
+                ],
+            }
+        }
+    }
+    result = scan(
+        tmp_path,
+        {
+            ".codex/config.toml": codex,
+            ".mcp.json": json.dumps(other),
+            "opencode.json": json.dumps(opencode),
+        },
+    )
+    assert not result.scan_failures
+    found = servers(result)
+    assert found["local"].properties["env_vars_referenced"] == ["a_label", "page"]
+    assert "remote_env_vars_referenced" not in found["local"].properties
+    assert found["web"].properties["env_vars_referenced"] == ["meadow"]
+
+
+@pytest.mark.parametrize("config_only", [False, True])
+def test_forwarded_names_respect_host_and_short_authorization_values(tmp_path, config_only):
+    codex = """
+[mcp_servers.local]
+command = "catalog"
+env_vars = ["ochre", "birch", "amber", "coral", "cedar", "cedar_name", "PUBLIC_NAME"]
+"""
+    files = {
+        ".codex/config.toml": codex,
+        "nested/.claude/settings.json": json.dumps({"env": {"COLOR": "ochre"}}),
+        ".cursor/settings.json": json.dumps({"env": {"AUTHORIZATION": "Bearer birch"}}),
+        ".mcp.json": json.dumps(
+            {
+                "mcpServers": {
+                    "other": {
+                        "command": "catalog",
+                        "args": [
+                            "--auth",
+                            "Bearer amber",
+                            "--auth",
+                            "Bearer",
+                            "coral",
+                            "--auth=Bearer",
+                            "cedar",
+                        ],
+                    }
+                }
+            }
+        ),
+    }
+    scan(tmp_path, files)
+    found = servers(MCPScanner().scan(tmp_path, config_only=config_only))["local"]
+    assert found.properties["env_vars_referenced"] == ["PUBLIC_NAME", "cedar_name"]
+    (tmp_path / ".cursor/settings.json").write_text("{")
+    found = servers(MCPScanner().scan(tmp_path, config_only=config_only))["local"]
+    assert "env_vars_referenced" not in found.properties
+
+
+def test_codex_withholds_forwarded_names_when_exact_value_index_overflows(tmp_path, monkeypatch):
+    from nexus_symbiote.scanners import mcp
+
+    monkeypatch.setattr(mcp, "_MAX_FORWARDED_NAME_VALUES", 2)
+    codex = """
+[mcp_servers.local]
+command = "catalog"
+env_vars = ["PUBLIC_LABEL"]
+[mcp_servers.sibling]
+command = "catalog"
+env = { FIRST = "one", SECOND = "two" }
+"""
+    result = scan(tmp_path, {".codex/config.toml": codex})
+    assert servers(result)["local"].properties["env_vars_referenced"] == ["PUBLIC_LABEL"]
+    codex += 'env_vars = ["OTHER_LABEL"]\n'
+    other = {"mcpServers": {"worker": {"command": "catalog", "env": {"THIRD": "three"}}}}
+    result = scan(tmp_path, {".codex/config.toml": codex, ".mcp.json": json.dumps(other)})
+    assert not result.scan_failures
+    assert "local" in servers(result)
+    assert all(
+        "env_vars_referenced" not in server.properties for server in servers(result).values()
+    )
+
+
+def test_codex_respects_forwarded_header_bounds_and_withholds_names_when_context_is_unreadable(
+    tmp_path,
+):
+    from nexus_symbiote.scanners.mcp import MAX_HEADERS
+
+    headers = ", ".join(f'H{i} = "TOKEN_{i}"' for i in range(MAX_HEADERS + 1))
+    result = scan(
+        tmp_path,
+        {
+            ".codex/config.toml": f'[mcp_servers.s]\nurl="https://a.example.test"\nenv_http_headers = {{ {headers} }}'
+        },
+    )
+    assert not servers(result)
+    assert any("header limit" in problem for problem in result.scan_failures)
+    result = scan(
+        tmp_path,
+        {
+            ".codex/config.toml": '[mcp_servers.s]\nurl="https://a.example.test"\nbearer_token_env_var="SERVICE_TOKEN"\n',
+            ".mcp.json": "{",
+        },
+    )
+    assert result.scan_failures
+    assert "env_vars_referenced" not in servers(result)["s"].properties
+
+
 def test_invalid_codex_toml_is_a_failure(tmp_path):
     result = scan(tmp_path, {".codex/config.toml": "[mcp_servers.docs\ncommand = 1"})
     assert result.scan_failures == [".codex/config.toml: invalid TOML"]

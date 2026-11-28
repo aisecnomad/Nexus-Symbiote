@@ -32,7 +32,7 @@ from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, S
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import date
-from itertools import chain, pairwise
+from itertools import chain, islice, pairwise
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
@@ -116,6 +116,7 @@ from nexus_symbiote.utils.secrets import (
     redact_descriptor,
     redact_text,
     scheme_credentials,
+    scheme_parts,
     secret_like,
     secret_values,
 )
@@ -172,7 +173,7 @@ MCP_DIALECTS = (
     McpDialect(".amazonq/mcp.json", "json", _SERVER_MAPS),
     McpDialect(".windsurf/mcp.json", "json", _SERVER_MAPS),
     McpDialect(".cline/mcp.json", "json", _SERVER_MAPS),
-    McpDialect(".codex/config.toml", "toml", ("mcp_servers",)),
+    McpDialect(".codex/config.toml", "toml", ("mcp_servers",), shape="codex"),
     McpDialect(".zed/settings.json", "jsonc", ("context_servers",), shape="zed", host="zed"),
     # opencode reads comments and trailing commas in both names.
     McpDialect("opencode.json", "jsonc", ("mcp",), shape="opencode"),
@@ -588,7 +589,11 @@ _EXTENSION_SETTINGS = "settings (zed extension)"
 # opencode's ``"oauth": false``, which turns off OAuth detection for a remote server.
 _OAUTH_DISABLED = "oauth (disabled)"
 # Fields a client's own shape is read into, uninterpreted in any other client's file.
-_SHAPE_FIELDS = {_EXTENSION_SETTINGS: "zed", _OAUTH_DISABLED: "opencode"}
+_SHAPE_FIELDS = {
+    _EXTENSION_SETTINGS: "zed",
+    _OAUTH_DISABLED: "opencode",
+    "environment_id": "codex",
+}
 _DECLARED_FIELDS = {_EXTENSION_SETTINGS: "settings", _OAUTH_DISABLED: "oauth"}
 
 
@@ -2467,13 +2472,29 @@ def _has_path_or_query(url: object) -> bool:
 
 _STRING_FIELDS = _names(
     "command url endpoint serverUrl httpUrl type transport transportType cwd envFile "
-    "description name version bearer_token_env_var"
+    "description name version bearer_token_env_var environment_id"
 )
 _LIST_FIELDS = _names(
     "args alwaysAllow autoApprove includeTools excludeTools enabled_tools disabled_tools "
     "disabledTools env_vars watchPaths"
 )
 _MAP_FIELDS = frozenset({"env", "headers", "http_headers", "env_http_headers"})
+_CODEX_FORWARDING_FIELDS = frozenset({"env_vars", "env_http_headers", "bearer_token_env_var"})
+_CODEX_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+# http::HeaderName::from_bytes accepts ASCII field-name tokens up to 65,535 bytes.
+_CODEX_HTTP_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~A-Za-z0-9-]{1,65535}")
+# Codex's NON_INHERITABLE_ENV_VARS, pinned in docs/collectors.md.
+_CODEX_STDIO_BLOCKED_ENV = _names(
+    "CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN NODE_REPL_AUTH_TOKEN CODEX_GUARDIAN_DECISIONS_API_KEY "
+    "OPENAI_FEDERATION_RULE_ID OPENAI_IDENTITY_TOKEN_FILE OPENAI_IDENTITY_TOKEN_SOURCE "
+    "OPENAI_SPIFFE_AUDIENCE OPENAI_SPIFFE_ID OPENAI_WORKLOAD_IDENTITY_CONTEXT"
+)
+# CUSTOM_CA_ENV_KEYS with case variants collapsed, for local stdio override matching.
+_CODEX_LOCAL_CA_ENV = _names(
+    "CODEX_CA_CERTIFICATE SSL_CERT_FILE REQUESTS_CA_BUNDLE CURL_CA_BUNDLE "
+    "NODE_EXTRA_CA_CERTS GIT_SSL_CAINFO CARGO_HTTP_CAINFO PIP_CERT "
+    "BUNDLE_SSL_CA_CERT NPM_CONFIG_CAFILE"
+)
 _BOOL_FIELDS = frozenset({"disabled", "trust", "enabled", _OAUTH_DISABLED})
 _NUMBER_FIELDS = _names("timeout startup_timeout_sec startup_timeout_ms tool_timeout_sec")
 _OBJECT_FIELDS = frozenset({"oauth", "auth", "dev", _EXTENSION_SETTINGS})
@@ -2818,11 +2839,94 @@ def _exported_environment(env: dict[str, Any], names: _Names | None = None) -> d
     return shown
 
 
+def _codex_env_entry(entry: Any) -> bool:
+    """The two forms of Codex's stdio env_vars declaration."""
+    return isinstance(entry, str) or (
+        isinstance(entry, dict)
+        and entry.keys() <= {"name", "source"}
+        and isinstance(entry.get("name"), str)
+        and entry.get("source", "local") in ("local", "remote")
+    )
+
+
+def _codex_stdio_blocks(name: str) -> bool:
+    return name.isascii() and name.upper() in _CODEX_STDIO_BLOCKED_ENV
+
+
+def _codex_stdio_override_key(name: str, remote_host: bool) -> str:
+    if not remote_host and name.isascii() and name.upper() in _CODEX_LOCAL_CA_ENV:
+        return name.upper()
+    return name
+
+
+def _codex_env_references(
+    config: dict[str, Any], transport: str, names: _Names, protected: KnownValues
+) -> dict[str, Any]:
+    """Declared variable names by source. No lookup or interpolation takes place."""
+    local: set[str] = set()
+    remote: set[str] = set()
+    remote_host = config.get("environment_id", "local") != "local"
+    if transport == "stdio" and config.get("command"):
+        if any(
+            k in config
+            for k in (
+                "url",
+                "http_headers",
+                "env_http_headers",
+                "bearer_token_env_var",
+                "bearer_token",
+                "http_headers_helper",
+                "oauth",
+                "oauth_resource",
+                "auth",
+            )
+        ):
+            return {}
+        overrides = {_codex_stdio_override_key(k, remote_host) for k in config.get("env", {})}
+        for entry in config.get("env_vars", ()):
+            name = entry if isinstance(entry, str) else entry["name"]
+            remote_source = isinstance(entry, dict) and entry.get("source") == "remote"
+            if remote_source and not remote_host:
+                # Codex checks source declarations before applying literal overrides.
+                return {}
+            override_key = _codex_stdio_override_key(name, remote_host)
+            if override_key not in overrides and not _codex_stdio_blocks(name):
+                (remote if remote_source else local).add(name)
+    elif transport == "streamable-http" and config.get("url"):
+        if any(k in config for k in ("command", "args", "env", "env_vars", "cwd", "bearer_token")):
+            return {}
+        if remote_host:
+            # The Codex config does not establish where a remote HTTP connector reads
+            # these variables. Avoid associating it with a local host credential.
+            return {}
+        if "bearer_token_env_var" in config:
+            local.add(config["bearer_token_env_var"])
+        local.update(
+            name
+            for header, name in config.get("env_http_headers", {}).items()
+            if _CODEX_HTTP_HEADER_NAME.fullmatch(header)
+        )
+    # These fields take arbitrary strings. Export identifier-shaped names only, using
+    # the same scan-wide literal and token checks that protect names in findings.
+    properties = {}
+    for key, candidates in (("env_vars_referenced", local), ("remote_env_vars_referenced", remote)):
+        shown = sorted(
+            name
+            for name in candidates
+            if _CODEX_ENV_NAME.fullmatch(name)
+            and names.shown(name, finding=True)
+            and not protected.held_by(name)
+        )
+        if shown:
+            properties[key] = shown
+    return properties
+
+
 def _field_names(config: dict[str, Any], shape: str, names: _Names | None = None) -> list[str]:
     """The fields a server declares, each read from the client's shape by the name the
     client file gives it."""
     fields = [
-        _DECLARED_FIELDS[field] if field in _SHAPE_FIELDS and _interpreted(field, shape) else field
+        _DECLARED_FIELDS.get(field, field) if _interpreted(field, shape) else field
         for field in config
     ]
     return _exported_names(fields, names)
@@ -3719,6 +3823,8 @@ def _text_credentials(text: str) -> list[str]:
 
 # Nodes of one configuration document read for the values a declared name must not hold.
 _KNOWN_VALUE_NODES = 1 << 17
+# Across all client files, bound the distinct literals checked by exact name.
+_MAX_FORWARDED_NAME_VALUES = 1 << 17
 # Maps whose values a client passes to a server or sends with its requests, and which
 # no record publishes: environments (opencode's `environment` too), headers and Codex's
 # query parameters and `shell_environment_policy.set`.
@@ -3729,16 +3835,73 @@ _HOST_SETTINGS = frozenset(
 )
 
 
-def _configured_values(document: Any) -> list[str] | None:
+class _ForwardedNameValues(KnownValues):
+    """Extend the usual name checks with exact matches for masked maps and credential options."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._exact: set[str] = set()
+
+    def add_exact(self, value: str) -> None:
+        scheme = scheme_parts(value)
+        if scheme is not None:
+            value = scheme[1]
+        if len(self._exact) <= _MAX_FORWARDED_NAME_VALUES and _CODEX_ENV_NAME.fullmatch(value):
+            self._exact.add(value)
+            if len(self._exact) > _MAX_FORWARDED_NAME_VALUES:
+                self.refuse()
+
+    def add_arguments(self, arguments: Iterable[Any]) -> None:
+        """Index separate and inline credential options in a client's argument vector."""
+        takes_value = False
+        for item in arguments:
+            if isinstance(item, str):
+                if takes_value:
+                    self.add_exact(item)
+                # Accept an auth scheme as a separate word between the flag and value.
+                takes_value = (takes_value and item.lower() in _ASSIGNMENT_SCHEMES) or (
+                    _is_credential_flag(item) and credential_name(item)
+                )
+                assigned = _assigned(item)
+                if assigned is not None:
+                    name, value, variable = assigned
+                    # Keep short flag spellings such as -k. An environment
+                    # assignment uses the variable name inside its option.
+                    if credential_name(name if variable else item.partition("=")[0]):
+                        self.add_exact(value)
+                        takes_value = value.lower() in _ASSIGNMENT_SCHEMES
+            else:
+                takes_value = False
+
+    def held_by(self, name: str) -> bool:
+        return name in self._exact or super().held_by(name)
+
+
+def _configured_values(
+    document: Any, *, forwarding_shape: str = "", forwarded: _ForwardedNameValues | None = None
+) -> list[str] | None:
     """Values of a configuration document that a server name declared in source must not hold.
 
     Beyond what a server's parsing collects: a credential-named value in any field, as
     Codex's `experimental_bearer_token` or a server's own `apiKey`, URL user
     information, `NAME=value` and `--flag value` arguments, and every value of at least
     ``MIN_SECRET_LENGTH`` characters in an environment, header or parameter map, none
-    of which the inventory shows. The whole document is read, a server map that is not
-    collected too. ``None`` past ``_KNOWN_VALUE_NODES`` nodes.
+    of which the inventory shows. For forwarding declarations, also index exact matches
+    of any length in masked maps and credential options. The whole document is read,
+    including uncollected server maps. ``None`` past ``_KNOWN_VALUE_NODES`` nodes.
     """
+    # When checking forwarded names, a declaration of the name itself is public.
+    # Keep every other occurrence eligible as a value, including in sibling servers.
+    servers = (
+        document.get("mcp_servers")
+        if forwarding_shape == "codex" and isinstance(document, dict)
+        else None
+    )
+    declarations = (
+        {id(server) for server in servers.values() if isinstance(server, dict)}
+        if isinstance(servers, dict)
+        else set()
+    )
     values: list[str] = []
     pending: list[tuple[object, Any]] = [(None, document)]
     visited = 0
@@ -3748,7 +3911,15 @@ def _configured_values(document: Any) -> list[str] | None:
             return None
         key, node = pending.pop()
         if isinstance(node, dict):
+            if id(node) in declarations:
+                node = {
+                    key: value for key, value in node.items() if key not in _CODEX_FORWARDING_FIELDS
+                }
             values.extend(secret_values(node))
+            if forwarded is not None:
+                for field, item in node.items():
+                    if isinstance(item, str) and (key in _VALUE_MAPS or credential_name(field)):
+                        forwarded.add_exact(item)
             if key in _VALUE_MAPS:
                 values.extend(
                     item
@@ -3758,6 +3929,11 @@ def _configured_values(document: Any) -> list[str] | None:
             pending.extend(node.items())
         elif isinstance(node, list):
             pending.extend((None, item) for item in node)
+            if forwarded is not None:
+                if key == "args":
+                    forwarded.add_arguments(node)
+                elif forwarding_shape == "opencode" and key == "command":
+                    forwarded.add_arguments(islice(node, 1, None))
             for flag, word in pairwise(node):
                 if (
                     isinstance(flag, str)
@@ -3832,6 +4008,8 @@ class MCPScanner(Scanner):
                     clients,
                     known,
                     launched,
+                    sources=sources,
+                    links=links,
                 )
             finally:
                 self._resolvers = None
@@ -3840,7 +4018,6 @@ class MCPScanner(Scanner):
                 f"{path}: {_DIRECTORY_GAP}" for path in sorted(directory_gaps)
             )
             if known is not None:
-                self._read_host_settings(files, sources, links, known)
                 self._scan_code_mcp_clients(
                     result, sources, known, [*links, *skipped], walk_complete, launched
                 )
@@ -3884,6 +4061,9 @@ class MCPScanner(Scanner):
         clients: dict[str, MCPClientComponent],
         known: KnownValues | None,
         launched: list[tuple[str, str, dict[str, Any]]] | None = None,
+        *,
+        sources: list[Path],
+        links: list[Path],
     ) -> bool:
         """Read each client file in ``paths``; whether any of them was present.
 
@@ -3972,6 +4152,31 @@ class MCPScanner(Scanner):
             collected.append((dialect, data, read, file_secrets, server_hits))
         # A name may repeat a literal or credential of any client file, so every file is read first.
         names = _Names(literals)
+        protected = _ForwardedNameValues()
+        has_forwarding = any(
+            dialect.shape == "codex"
+            and any(
+                isinstance(entry, dict) and not _CODEX_FORWARDING_FIELDS.isdisjoint(entry)
+                for _, entry in read.servers
+            )
+            for dialect, _, read, _, _ in collected
+        )
+        if known is not None or has_forwarding:
+            self._read_host_settings(
+                files, sources, links, known, protected if has_forwarding else None
+            )
+        if has_forwarding:
+            for dialect, data, _, scrubber, _hits in collected:
+                protected.add(scrubber.values)
+                configured = _configured_values(
+                    data, forwarding_shape=dialect.shape, forwarded=protected
+                )
+                if configured is None:
+                    protected.refuse()
+                    break
+                protected.add(configured)
+            if result.scan_failures or files.failures_recorded:
+                protected.refuse()
         for dialect, data, read, file_secrets, server_hits in collected:
             file_names = names.scoped(file_secrets.values)
             server_refs: list[str] = []
@@ -4001,6 +4206,7 @@ class MCPScanner(Scanner):
                         file_secrets,
                         server_hits.get(id(server_config)),
                         file_names,
+                        protected_references=protected,
                         launcher_unknown=read.unknown.get(server_name),
                         root=files.root,
                     )
@@ -4344,6 +4550,8 @@ class MCPScanner(Scanner):
                 continue
             if field in _STRING_FIELDS:
                 valid = isinstance(value, str)
+            elif field == "env_vars" and shape == "codex":
+                valid = isinstance(value, list) and all(_codex_env_entry(entry) for entry in value)
             elif field in _LIST_FIELDS:
                 valid = isinstance(value, list) and all(isinstance(item, str) for item in value)
             elif field in _MAP_FIELDS:
@@ -4370,6 +4578,8 @@ class MCPScanner(Scanner):
         """A type or size problem in a server entry; unknown fields are gaps, not failures."""
         if any(True for _ in cls._invalid_field_values(config, shape)):
             return "invalid server configuration"
+        if shape == "codex" and len(config.get("env_http_headers", ())) > MAX_HEADERS:
+            return f"MCP server header limit ({MAX_HEADERS}) exceeded"
         limits = (
             ("args", MAX_ARGUMENTS, "argument"),
             ("env", MAX_ENVIRONMENT, "environment variable"),
@@ -4416,6 +4626,7 @@ class MCPScanner(Scanner):
         credential_hits: PositionHits | None = None,
         names: _Names | None = None,
         *,
+        protected_references: KnownValues | None = None,
         launcher_unknown: str | None = None,
         root: Path | None = None,
     ) -> tuple[MCPServerComponent, list[ToolComponent]]:
@@ -4671,6 +4882,10 @@ class MCPScanner(Scanner):
         )
         binding = _keyed_binding(key, config, resolver) if key is not None else {}
 
+        # Codex strips restricted keys after applying explicit stdio environment overrides.
+        effective_env = env
+        if dialect.shape == "codex" and transport == "stdio":
+            effective_env = {k: v for k, v in env.items() if not _codex_stdio_blocks(k)}
         server_comp = MCPServerComponent(
             bom_ref=server_ref,
             name=name,
@@ -4680,7 +4895,7 @@ class MCPScanner(Scanner):
             package_url=package_url,
             command=identity.command,
             args=[REDACTED for _ in args],
-            env=_exported_environment(env, names),
+            env=_exported_environment(effective_env, names),
             endpoint_url=identity.endpoint,
             version_pinned=version_pinned,
             source_path=config_scope,
@@ -4692,6 +4907,11 @@ class MCPScanner(Scanner):
                 "endpoint_credentials_omitted": bool(endpoint_url),
                 "declared_fields": fields,
                 **launcher_properties,
+                **(
+                    _codex_env_references(config, transport, names, protected_references)
+                    if dialect.shape == "codex" and protected_references is not None
+                    else {}
+                ),
                 "source_values_bound": key is not None,
                 "static_config_hash": source_config_hash,
                 "static_config_hash_profile": STATIC_CONFIG_HASH_PROFILE,
@@ -4985,6 +5205,9 @@ class MCPScanner(Scanner):
             if declared is None and isinstance(_declared_type(config), str)
             else None
         )
+        # Codex URL servers always use Streamable HTTP, regardless of the URL path.
+        if dialect.shape == "codex" and config.get("url") and not has_command:
+            return "streamable-http", gap
         # Gemini CLI chooses the transport from command, url and httpUrl, not a type.
         if declared is not None and not (has_command and dialect.url_transport):
             return declared, None
@@ -5517,7 +5740,11 @@ class MCPScanner(Scanner):
 
     @staticmethod
     def _read_host_settings(
-        files: ConfinedCollection, sources: list[Path], links: list[Path], known: KnownValues
+        files: ConfinedCollection,
+        sources: list[Path],
+        links: list[Path],
+        known: KnownValues | None,
+        forwarded: _ForwardedNameValues | None,
     ) -> None:
         """Add the values of Claude Code and Cursor settings, whose `env` reaches servers.
 
@@ -5533,18 +5760,25 @@ class MCPScanner(Scanner):
         )
         for path in paths:
             found = files.regular_file(path)
-            if found is None or found[1] > files.max_file_bytes:
-                known.refuse()
-                continue
-            raw = files.read_bytes(path, missing_ok=True)
+            raw = (
+                files.read_bytes(path, missing_ok=True)
+                if found is not None and found[1] <= files.max_file_bytes
+                else None
+            )
             try:
-                configured = None if raw is None else _configured_values(_load_jsonc(raw.decode()))
+                configured = (
+                    None
+                    if raw is None
+                    else _configured_values(_load_jsonc(raw.decode()), forwarded=forwarded)
+                )
             except (UnicodeDecodeError, ValueError, RecursionError, MemoryError):
                 configured = None
-            if configured is None:
-                known.refuse()
-            else:
-                known.add(configured)
+            for index in (known, forwarded):
+                if index is not None:
+                    if configured is None:
+                        index.refuse()
+                    else:
+                        index.add(configured)
 
     def _scan_code_mcp_clients(
         self,
