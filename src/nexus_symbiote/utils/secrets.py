@@ -1125,6 +1125,8 @@ _A2A_TOKEN_SHAPE = re.compile(
     r"[\w-]{12,})"
 )
 _MAX_OAUTH_SCOPE = 512
+_PERCENT_ESCAPE = re.compile(r"%[A-Fa-f0-9]{2}")
+_INVALID_PERCENT_ESCAPE = re.compile(r"%(?![A-Fa-f0-9]{2})")
 # A URL written without a scheme is no URL to urlsplit or to the URL rules, yet it
 # names user information: "//user@host/..." always, and "user:pass@host" when a dot,
 # port, path, query or fragment follows the "@". A scope such as "files:read@v2" does not.
@@ -1133,6 +1135,34 @@ _SCHEMELESS_USERINFO = re.compile(r"//[^\s/?#@]*+@|[^\s/?#@:]++:[^\s/?#@]++@[^\s
 
 def redact_oauth_scope(value: str) -> str:
     """Show an OAuth scope (RFC 6749 section 3.3) unless it may contain a secret."""
+    shown = _redact_oauth_spelling(value)
+    if (
+        shown == REDACTED
+        or "%" not in value
+        or ("/" not in value and not _PERCENT_ESCAPE.search(value))
+    ):
+        return shown
+    # A URI path can encode a value the cleartext matcher would withhold. Check
+    # each spelling without ever publishing a decoded value. Keep the original
+    # spelling for ordinary permission paths.
+    spelling = value
+    for _ in range(2):
+        if _INVALID_PERCENT_ESCAPE.search(spelling):
+            return REDACTED
+        try:
+            spelling = unquote(spelling, errors="strict")
+        except UnicodeDecodeError:
+            return REDACTED
+        if any(ord(char) < 32 or ord(char) == 127 for char in spelling):
+            return REDACTED
+        if _redact_oauth_spelling(spelling) != spelling:
+            return REDACTED if "%" in shown else shown
+        if "%" not in spelling:
+            return shown
+    return REDACTED
+
+
+def _redact_oauth_spelling(value: str) -> str:
     # Backslashes are outside the OAuth scope grammar. Browsers may treat them as
     # URL separators where urlsplit considers them part of the host.
     if "\\" in value:

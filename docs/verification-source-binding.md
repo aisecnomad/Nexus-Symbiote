@@ -217,7 +217,10 @@ Several security declarations are recorded in clear:
   run, such as the secret of a Slack, Discord or Teams webhook URL: 16 or more letters and
   digits that mix both, or 20 or more that mix upper and lower case. A run is split at
   `-`, `_` and `.`, so word paths such as `task-scheduler-read-2024` stay in full. A scope
-  URI on a recognised webhook route is reduced to its origin however its path is spelled:
+  URI with percent escapes is also checked after each of up to two decoding steps. Benign
+  permission paths keep their original spelling. Invalid escapes, invalid UTF-8, decoded controls
+  or further nested escapes withhold the scope. A sensitive decoded spelling also withholds
+  any still-encoded output. A scope URI on a recognised webhook route is reduced to its origin however its path is spelled:
   any path on `hooks.slack.com`, `hooks.zapier.com`, `maker.ifttt.com`, `api.telegram.org`
   or `webhook.site`, a `/webhooks/` path on Discord, any path on `*.webhook.office.com`, and a
   `/webhook` path on Outlook. The same route written without a scheme is exported as `***`; a

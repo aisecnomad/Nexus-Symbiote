@@ -270,3 +270,20 @@ def test_the_inventory_and_drift_output_withhold_a_webhook_route(tmp_path: Path)
         )
         assert result.exit_code == 1, result.output
         assert secret not in html.unescape(result.output.replace("\\", "")), report_format
+
+
+def test_scope_uri_checks_decoded_spelling_before_restoring_path() -> None:
+    word = "ExampleMarker1234567890"
+    encoded = "".join(f"%{ord(char):02X}" for char in word)
+    ordinary = "https://service.invalid/auth/drive%2Ereadonly"
+    assert redact_oauth_scope(ordinary) == ordinary
+    for spelling in (encoded, encoded.replace("%", "%25"), "%25252E", "%ZZ", "%FF"):
+        scope = f"https://service.invalid/auth/{spelling}"
+        assert redact_oauth_scope(scope) in {REDACTED, "https://service.invalid"}
+
+
+@pytest.mark.parametrize("prefix", ["", "%2F%2F"])
+def test_encoded_path_separators_still_identify_webhook_routes(prefix: str) -> None:
+    scope = prefix + "hooks.slack.com%2Fservices%2FT%2FB%2Fsynthetic"
+    assert redact_oauth_scope(scope) == REDACTED
+    assert redact_oauth_scope("report:50%") == "report:50%"
