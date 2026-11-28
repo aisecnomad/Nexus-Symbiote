@@ -1225,3 +1225,48 @@ def test_a_typescript_member_of_a_name_bound_in_many_functions_stays_in_each(
     )
     many += 'const x = require("child_process");\nconst run = x.execSync;\n'
     assert _caps(_ts(tmp_path, "(c) => run(c)", many)) == {E.EXECUTE}
+
+
+@pytest.mark.parametrize(
+    ("setup", "call", "required"),
+    [
+        ("import builtins", "builtins.eval(value)", E.EXECUTE),
+        ("import builtins", "builtins.exec(value)", E.EXECUTE),
+        ("import builtins", "builtins.open(value, 'w')", E.WRITE),
+        ("import io", "io.open(value, mode='w')", E.WRITE),
+        ("from pathlib import Path", "Path(value).open('wb')", E.WRITE),
+        ("import os", "os.spawnvpe(0, value, [], {})", E.EXECUTE),
+        ("import stripe", "stripe.StripeClient('').refunds.create(value)", E.PAYMENT),
+        ("import stripe", "stripe.StripeClient('').invoices.pay(value)", E.PAYMENT),
+        ("import os", "os.getenv(key='API_TOKEN')", E.CREDENTIALS),
+    ],
+)
+def test_resolved_standard_api_spellings(setup: str, call: str, required: CapabilityClass) -> None:
+    assert required in _classify(f"{setup}\ndef t(value):\n    return {call}").capabilities
+
+
+@pytest.mark.parametrize(
+    ("body", "required"),
+    [
+        ("let cp; cp = require('node:child_process'); const run = cp.execSync; run(x)", E.EXECUTE),
+        ("const cp = require('node:child_process'); (cp as any).execSync(x)", E.EXECUTE),
+        ("const cp = require('node:child_process'); (<any>cp).execSync(x)", E.EXECUTE),
+        ("(eval satisfies Function)(x)", E.EXECUTE),
+        ("Function(x)()", E.EXECUTE),
+        ("globalThis.Function(x)()", E.EXECUTE),
+        ("const { API_TOKEN: value } = process.env", E.CREDENTIALS),
+        ("const { API_TOKEN = 'unset' } = process.env", E.CREDENTIALS),
+    ],
+)
+def test_typescript_call_and_env_spellings(
+    tmp_path: Path, body: str, required: CapabilityClass
+) -> None:
+    assert required in _caps(_ts(tmp_path, f"(x) => {{ {body}; }}"))
+
+
+def test_shadowed_function_constructor_and_renamed_public_env_key(tmp_path: Path) -> None:
+    tool = _ts(
+        tmp_path,
+        "(Function) => { const { COLOR: API_TOKEN } = process.env; new Function(API_TOKEN); }",
+    )
+    assert not _caps(tool)

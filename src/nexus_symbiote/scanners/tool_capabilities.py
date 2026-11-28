@@ -41,7 +41,8 @@ _PY_EXECUTE = frozenset(
     | {"os.system", "os.popen", "os.execl", "os.execle", "os.execlp", "os.execv", "os.execve"}
     | {"os.execvp", "os.execvpe", "os.spawnl", "os.spawnv", "os.spawnvp", "os.posix_spawn"}
     | {"os.posix_spawnp", "asyncio.create_subprocess_shell", "asyncio.create_subprocess_exec"}
-    | {"eval", "exec"}
+    | {"eval", "exec", "builtins.eval", "builtins.exec", "os.execlpe", "os.spawnle", "os.spawnlp"}
+    | {"os.spawnlpe", "os.spawnve", "os.spawnvpe"}
 )
 _PY_HTTP = frozenset({"requests", "httpx", "aiohttp", "urllib3"})
 _PY_NETWORK = _PY_HTTP | frozenset(
@@ -436,8 +437,10 @@ def _literal(node: ast.AST | None) -> str | None:
     return None
 
 
-def _open_mode(call: ast.Call) -> str | None:
-    modes = list(call.args[1:2]) + [k.value for k in call.keywords if k.arg == "mode"]
+def _open_mode(call: ast.Call, position: int) -> str | None:
+    modes = list(call.args[position : position + 1]) + [
+        k.value for k in call.keywords if k.arg == "mode"
+    ]
     if not modes:
         return "r"
     return _literal(modes[0])
@@ -525,15 +528,30 @@ def _python_call(node: ast.Call, name: str, through_call: bool, seen: _Observed)
         seen.add(CapabilityClass.NETWORK)
         if (module in _PY_HTTP and last in _HTTP_WRITE) or last in _MAIL_WRITE:
             seen.write()
-    if module in _PAYMENT_MODULES and not set(parts) & _PAYMENT_LOCAL and last[:1].islower():
+    if (
+        module in _PAYMENT_MODULES
+        and len(parts) >= 2
+        and not set(parts) & _PAYMENT_LOCAL
+        and last[:1].islower()
+    ):
         seen.add(CapabilityClass.NETWORK)
         if last in _PAYMENT_WRITE and (
-            set(parts) & _PAYMENT_RESOURCES or ("Invoice" in parts and last == "pay")
+            set(parts) & _PAYMENT_RESOURCES
+            or ("Invoice" in parts and last == "pay")
+            or (
+                module == "stripe"
+                and parts[-2] in {"charges", "refunds", "payment_intents", "payouts", "transfers"}
+            )
+            or (module == "stripe" and parts[-2] == "invoices" and last == "pay")
         ):
             seen.write(CapabilityClass.PAYMENT)
             seen.payment = True
-    if name == "open":
-        mode = _open_mode(node)
+    path_open = (
+        name in {"pathlib.Path.open", "pathlib.PosixPath.open", "pathlib.WindowsPath.open"}
+        and through_call
+    )
+    if name in {"open", "builtins.open", "io.open"} or path_open:
+        mode = _open_mode(node, 0 if path_open else 1)
         if mode is None or any(flag in mode for flag in "wax+"):
             seen.add(CapabilityClass.FILESYSTEM)
             if mode is not None:
@@ -547,7 +565,10 @@ def _python_call(node: ast.Call, name: str, through_call: bool, seen: _Observed)
     elif module in {"os", "shutil"} and module_call and last in _FS_MODULE_WRITE:
         seen.write(CapabilityClass.FILESYSTEM)
     if name in {"os.getenv", "os.environ.get"}:
-        key = _literal(node.args[0]) if node.args else None
+        key_arg = next(iter(node.args), None) or next(
+            (k.value for k in node.keywords if k.arg == "key"), None
+        )
+        key = _literal(key_arg)
         if key is not None and _secret_name(key):
             seen.add(CapabilityClass.CREDENTIALS)
 
@@ -743,17 +764,12 @@ def _ts_scope(function: Node, declarators: list[Node], outer: _View) -> _View:
                 view.hidden.add(_ts_text(declared))
         elif statement.type in {"lexical_declaration", "variable_declaration"}:
             top.update(d.id for d in statement.named_children if d.type == "variable_declarator")
-    for declarator in declarators:  # A top-level declaration that binds nothing is a local.
-        if declarator.id in top:
-            bound = _ts_declared(declarator, view)
-            for name, binding in bound:
-                _bind(view.own, name, binding)
-            if not bound:
-                view.hidden.update(_ts_bound_names(declarator.child_by_field_name("name")))
     for declarator in declarators:
-        if declarator.id not in top:
-            for name, binding in _ts_declared(declarator, view):
-                _bind(view.own, name, binding)
+        bound = _ts_declared(declarator, view)
+        if not bound and declarator.id in top:
+            view.hidden.update(_ts_bound_names(declarator.child_by_field_name("name")))
+        for name, binding in bound:
+            _bind(view.own, name, binding)
     return view
 
 
@@ -916,12 +932,9 @@ def _ts_chain(callee: Node | None) -> list[str]:
                 parts.append(_MODULE_HEAD + module)
                 return list(reversed(parts))
             node = node.child_by_field_name("function")
-        elif node.type in {
-            "await_expression",
-            "parenthesized_expression",
-            "non_null_expression",
-            "sequence_expression",
-        }:
+        elif node.type in {"as_expression", "satisfies_expression"}:
+            node = node.named_children[0] if node.named_children else None
+        elif node.type in _TS_WRAPPED or node.type == "sequence_expression":
             node = node.named_children[-1] if node.named_children else None
         elif node.type in {"identifier", "this"}:
             parts.append(_ts_text(node))
@@ -1058,9 +1071,11 @@ def classify_typescript(
             constructor = _ts_chain(node.child_by_field_name("constructor"))
             if (
                 constructor[-1:] == ["Function"]
-                and (len(constructor) == 1 or constructor[0] in _TS_GLOBALS)
-                and "Function" not in imports
-                and "Function" not in local
+                and (
+                    len(constructor) == 1 or len(constructor) == 2 and constructor[0] in _TS_GLOBALS
+                )
+                and constructor[0] not in imports
+                and constructor[0] not in shadowed
             ):
                 seen.add(CapabilityClass.EXECUTE)
                 seen.execute = True
@@ -1072,9 +1087,14 @@ def classify_typescript(
             target, value = node.child_by_field_name("name"), node.child_by_field_name("value")
             if target is not None and target.type == "object_pattern" and _ts_is_env(value):
                 for part in target.named_children:
-                    if part.type == "shorthand_property_identifier_pattern" and _secret_name(
-                        _ts_text(part)
-                    ):
+                    key = (
+                        part.child_by_field_name("key") or part.child_by_field_name("left") or part
+                    )
+                    if key.type in {
+                        "property_identifier",
+                        "shorthand_property_identifier_pattern",
+                        "string",
+                    } and _secret_name(_ts_text(key).strip("'\"")):
                         seen.add(CapabilityClass.CREDENTIALS)
         stack.extend(child for child in node.named_children if child.id not in skip)
     return _finish(label, seen)
@@ -1098,7 +1118,7 @@ def _ts_call(
     if head.startswith(_MODULE_HEAD):
         candidates = ((head.removeprefix(_MODULE_HEAD), ""),)
     else:
-        candidates = () if head in shadowed else imports.get(head, ())
+        candidates = imports.get(head, ())
     if len(candidates) > _MAX_TARGETS:
         raise _TooManyTargetsError
     unbound_global = not candidates and head not in shadowed
@@ -1108,7 +1128,7 @@ def _ts_call(
         if arguments is not None and arguments.type == "arguments"
         else []
     )
-    evaluates = unbound_global and head == "eval" and len(chain) == 1
+    evaluates = unbound_global and head in {"eval", "Function"} and len(chain) == 1
     if evaluates:
         seen.add(CapabilityClass.EXECUTE)
         seen.execute = True
