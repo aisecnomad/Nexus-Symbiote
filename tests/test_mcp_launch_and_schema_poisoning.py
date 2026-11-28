@@ -746,3 +746,36 @@ def test_live_dedupe_retains_distinct_rules_and_handles_sidenote_errors(
         source_hits=None,
     )
     assert scanned_values.count("Benign nested value.") == 1
+
+
+def test_nested_side_channel_remains_scannable_after_its_parent_budget(monkeypatch) -> None:
+    from nexus_symbiote import text_poisoning as tp
+
+    marker = "Nested field marker"
+    inner = {"description": marker}
+    outer = {"enum": [f"Option {i}" for i in range(520)], "properties": {"note": inner}}
+
+    def scan(text, *, surface, where, **kwargs):
+        if text != marker:
+            return []
+        return [
+            TextPoisoningHit(
+                "test-rule",
+                tp.CATEGORY_TOOL_POISONING,
+                RiskSeverity.HIGH,
+                0,
+                surface,
+                "marker",
+                where=where,
+            )
+        ]
+
+    monkeypatch.setattr(tp, "scan_text_block", scan)
+    hit = tp._side_channel_subtree_hit(
+        [("debug", outer, "properties.debug"), ("note", inner, "properties.debug.properties.note")],
+        surface="sample",
+        source_hits=None,
+    )
+    assert (
+        hit is not None and hit.where == "input_schema.properties.debug.properties.note.description"
+    )

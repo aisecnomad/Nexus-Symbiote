@@ -632,6 +632,7 @@ def extract_json_text_entries(
     max_depth: int = 32,
     max_entries: int = 4_096,
     truncated: list[bool] | None = None,
+    skip_nested_roots: set[int] | None = None,
 ) -> list[tuple[str, str]]:
     """Iteratively extract ``(dotted_field_path, string_value)`` pairs from parsed JSON."""
     results: list[tuple[str, str]] = []
@@ -642,6 +643,8 @@ def extract_json_text_entries(
     while queue:
         prefix, node, depth = queue.popleft()
         visited += 1
+        if depth and skip_nested_roots is not None and id(node) in skip_nested_roots:
+            continue
         if depth > max_depth:
             if (isinstance(node, str) and node.strip()) or (
                 isinstance(node, (dict, list)) and bool(node)
@@ -1198,24 +1201,17 @@ def _side_channel_subtree_hit(
 
     # A component field is displayed as a dotted path. A literal dot in a key
     # makes that rendering ambiguous, so only inspect the actual subtree.
-    scanned_subtrees: set[int] = set()
+    # Give each named subtree its own budget and leave nested named subtrees
+    # for their own pass, even when their enclosing scan reaches its limit.
+    roots = {id(sub) for _, sub, _ in side_entries if sub is not None}
+    scanned_roots: set[int] = set()
     sub_truncated: list[bool] = []
     for _, sub, path in side_entries:
-        if sub is None or id(sub) in scanned_subtrees:
+        if sub is None or id(sub) in scanned_roots:
             continue
-        stack: list[Any] = [sub]
-        while stack:
-            current = stack.pop()
-            cid = id(current)
-            if cid in scanned_subtrees:
-                continue
-            scanned_subtrees.add(cid)
-            if isinstance(current, dict):
-                stack.extend(v for v in current.values() if isinstance(v, (dict, list)))
-            elif isinstance(current, list):
-                stack.extend(v for v in current if isinstance(v, (dict, list)))
+        scanned_roots.add(id(sub))
         for sub_path, value in extract_json_text_entries(
-            sub, max_depth=64, max_entries=512, truncated=sub_truncated
+            sub, max_depth=64, max_entries=512, truncated=sub_truncated, skip_nested_roots=roots
         ):
             hits = scan_text_block(
                 value,
