@@ -1585,13 +1585,13 @@ def _classify_handlers(
     imports = typescript_imports(index.nodes)
     nested = frozenset(handler.id for _, handler, _ in handlers)
     for tool, handler, line in handlers:
-        classified = classify_typescript(handler, imports, tool.name, nested - {handler.id})
+        classified = classify_typescript(handler, imports, tool.name, nested)
         if classified.unclassified:
             result.surfaces_excluded.append(f"{location}:{line} ({tool.name}: {UNCLASSIFIED})")
             continue
         tool.capabilities = classified.declaration
         tool.risks = [*tool.risks, *classified.risks]
-        if classified.declaration is not None:
+        if tool.capabilities is not None:
             tool.properties["capability_evidence"] = EVIDENCE
 
 

@@ -36,14 +36,15 @@ _RISK_CAPABILITIES = frozenset(
     | {CapabilityClass.PAYMENT, CapabilityClass.NETWORK, CapabilityClass.CREDENTIALS}
 )
 
-_PY_BUILTINS = frozenset({"eval", "exec", "open"})
+_PY_BUILTINS = frozenset({"eval", "exec", "open", "str"})
 _PY_EXECUTE = frozenset(
     {"subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output"}
     | {"subprocess.Popen", "subprocess.getoutput", "subprocess.getstatusoutput", "pty.spawn"}
     | {"os.system", "os.popen", "os.execl", "os.execle", "os.execlp", "os.execv", "os.execve"}
     | {"os.execvp", "os.execvpe", "os.spawnl", "os.spawnv", "os.spawnvp", "os.posix_spawn"}
     | {"os.posix_spawnp", "asyncio.create_subprocess_shell", "asyncio.create_subprocess_exec"}
-    | {"eval", "exec"}
+    | {"eval", "exec", "builtins.eval", "builtins.exec", "os.execlpe", "os.spawnle", "os.spawnlp"}
+    | {"os.spawnlpe", "os.spawnve", "os.spawnvpe"}
 )
 _PY_HTTP = frozenset({"requests", "httpx", "aiohttp", "urllib3"})
 _PY_NETWORK = _PY_HTTP | frozenset(
@@ -106,7 +107,8 @@ _SQL_WORD = re.compile(r"[\w$]+")
 _SQL_ARGUMENTS = frozenset({"statement", "query", "sql", "operation"})
 _SQL_DOLLAR = re.compile(r"\$(?:[^\W\d]\w*)?\$")
 _SQL_RANK = {None: 0, "write": 1, "destructive": 2}
-_QUOTES = re.compile("['\"]")
+_SQL_DELIMITERS = re.compile(r"""--|/\*|\*/|['"\r\n]""")
+_SQL_LINE_END = re.compile(r"[\r\n]")
 # A literal or quoted name, by its opening character and whether a backslash escapes: a
 # doubled closing character stays inside, and an unterminated one runs to the end.
 _SQL_QUOTED = {
@@ -262,8 +264,8 @@ def _sql_tokens(text: str, escapes: bool = False) -> list[str]:
             quoted = _SQL_QUOTED[char, escapes].match(text, i)
             i = quoted.end() if quoted else n
         elif text.startswith("--", i):
-            end = text.find("\n", i)
-            i = n if end < 0 else end + 1
+            line_end = _SQL_LINE_END.search(text, i + 2)
+            i = line_end.end() if line_end else n
         elif text.startswith("/*", i):
             end = text.find("*/", i + 2)
             i = n if end < 0 else end + 2
@@ -300,14 +302,30 @@ def _sql_operations(tokens: list[str]) -> str | None:
     for end in [*(k for k, part in enumerate(tokens) if part == ";"), len(tokens)]:
         statement, begin = tokens[begin:end], end + 1
         words = set(statement)
-        # The last ANALYZE (or ANALYSE) option is the one that applies.
-        analyze = max(
-            (k for k, w in enumerate(statement) if w in {"ANALYZE", "ANALYSE"}), default=-1
-        )
-        if statement[:1] == ["EXPLAIN"] and (
-            analyze < 0 or statement[analyze + 1 : analyze + 2] in (["FALSE"], ["OFF"], ["0"])
-        ):
-            continue  # A plan: the statement it describes does not run.
+        last_set = next((k for k in reversed(range(len(statement))) if statement[k] == "SET"), -1)
+        if statement[:1] == ["EXPLAIN"]:
+            # ANALYZE inside the described query is an ordinary identifier.
+            if statement[1:2] == ["("]:
+                option_end = statement.index(")") if ")" in words else len(statement)
+            else:
+                option_end = next(
+                    (
+                        k
+                        for k in range(1, len(statement))
+                        if statement[k] not in {"ANALYZE", "ANALYSE", "VERBOSE"}
+                    ),
+                    len(statement),
+                )
+            analyze = next(
+                (
+                    k
+                    for k in reversed(range(1, option_end))
+                    if statement[k] in {"ANALYZE", "ANALYSE"}
+                ),
+                -1,
+            )
+            if analyze < 0 or statement[analyze + 1 : analyze + 2] in (["FALSE"], ["OFF"], ["0"]):
+                continue
         # Per depth, whether a ")" back to it starts a statement again: after a WITH clause's
         # last CTE, nested or not, and after EXPLAIN's options.
         restarts = [statement[:1] in (["WITH"], ["EXPLAIN"])]
@@ -325,7 +343,7 @@ def _sql_operations(tokens: list[str]) -> str | None:
                 continue
             if start and word == "WITH":
                 restarts[-1] = True
-            if start and word in {"SEARCH", "CYCLE"} and "SET" in statement[k:]:
+            if start and word in {"SEARCH", "CYCLE"} and k < last_set:
                 # A recursive query's SEARCH or CYCLE clause ends at SET <name> [USING <name>].
                 skip = statement.index("SET", k) + 2
                 skip += 2 if statement[skip : skip + 1] == ["USING"] else 0
@@ -730,8 +748,19 @@ class PythonScopes:
             if isinstance(part, ast.Constant):
                 text = part.value if isinstance(part.value, str) else "?"
                 runs[-1].append(text)
-                for found in _QUOTES.finditer(text):
-                    quote = "" if quote == found.group() else quote or found.group()
+                for found in _SQL_DELIMITERS.finditer(text):
+                    delimiter = found.group()
+                    if quote == "--":
+                        if delimiter in {"\r", "\n"}:
+                            quote = ""
+                    elif quote == "/*":
+                        if delimiter == "*/":
+                            quote = ""
+                    elif quote:
+                        if delimiter == quote:
+                            quote = ""
+                    elif delimiter in {"--", "/*", "'", '"'}:
+                        quote = delimiter
             elif isinstance(part, ast.Name | ast.FormattedValue):
                 for name in _names_in(part):
                     names[name, where] = names.get((name, where), False) or not quote
@@ -753,10 +782,17 @@ class PythonScopes:
             elif isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute):
                 # A method of the statement, such as ``.strip()`` or ``.bindparams(...)``;
                 # ``.format()`` and ``.join()`` also take their arguments into the text.
-                if part.func.attr in {"format", "join"}:
-                    for argument in (*part.args, *part.keywords):
-                        for name in _names_in(argument):
-                            names[name, where] = True
+                arguments: Iterable[ast.AST] = ()
+                if part.func.attr in {"format", "join", "format_map"}:
+                    arguments = (*part.args, *part.keywords)
+                elif part.func.attr == "replace":
+                    arguments = part.args[1:2]
+                elif part.func.attr == "get" and len(part.args) >= 2:
+                    # The lookup key only selects an entry. Its default can become the statement.
+                    pending.extend([None, (part.args[1], where), None])
+                for argument in arguments:
+                    for name in _names_in(argument):
+                        names[name, where] = True
                 pending.append((part.func.value, where))
             elif isinstance(part, ast.AugAssign):
                 pending += [(part.value, where), (part.target, where)]
@@ -782,13 +818,17 @@ class PythonScopes:
         return rank, keys
 
     def _wrapped(self, call: ast.Call, scope: _Scope) -> ast.AST | None:
-        """The statement a SQLAlchemy ``text()`` call wraps; None for any other call."""
+        """The statement passed to SQLAlchemy's text() or Python's str() conversion."""
         chain = _chain(call.func)
-        if chain is None or not any(p in _SQL_TEXT for p, _ in self.resolve(scope, chain)[0]):
+        if chain is None:
             return None
-        return next(iter(call.args), None) or next(
-            (k.value for k in call.keywords if k.arg == "text"), None
-        )
+        for path, _ in self.resolve(scope, chain)[0]:
+            if path in _SQL_TEXT or path in {"str", "builtins.str"}:
+                keyword = "text" if path in _SQL_TEXT else "object"
+                return next(iter(call.args), None) or next(
+                    (k.value for k in call.keywords if k.arg == keyword), None
+                )
+        return None
 
 
 def _alternatives(node: ast.AST) -> list[ast.expr] | None:
@@ -980,8 +1020,10 @@ class _PythonBody:
         return bool(held & self.bit), rank
 
 
-def _open_mode(call: ast.Call) -> str | None:
-    modes = list(call.args[1:2]) + [k.value for k in call.keywords if k.arg == "mode"]
+def _open_mode(call: ast.Call, position: int) -> str | None:
+    modes = list(call.args[position : position + 1]) + [
+        k.value for k in call.keywords if k.arg == "mode"
+    ]
     if not modes:
         return "r"
     return _literal(modes[0])
@@ -1073,8 +1115,15 @@ def _python_node(
         _python_call(node, name, through_call or via_call, seen)
     # Once per call, whatever targets the callee has: building a statement, such as with
     # SQLAlchemy's ``text()``, is not running it.
-    if written.rsplit(".", 1)[-1] in _DB_EXECUTE and (
-        receiver in _DB_RECEIVERS or any(n.split(".")[0] in _DB_MODULES for n, _ in names)
+    method = written.rsplit(".", 1)[-1]
+    asyncpg_fetch = method in {"fetch", "fetchrow", "fetchval"} and (
+        receiver in {"conn", "connection", "pool", "db"}
+        or any(n.startswith("asyncpg.") for n, _ in names)
+    )
+    if (
+        asyncpg_fetch
+        or method in _DB_EXECUTE
+        and (receiver in _DB_RECEIVERS or any(n.split(".")[0] in _DB_MODULES for n, _ in names))
     ):
         _python_sql(node, scope, body, seen)
 
@@ -1097,15 +1146,30 @@ def _python_call(node: ast.Call, name: str, through_call: bool, seen: _Observed)
         seen.add(CapabilityClass.NETWORK)
         if (module in _PY_HTTP and last in _HTTP_WRITE) or last in _MAIL_WRITE:
             seen.write()
-    if module in _PAYMENT_MODULES and not set(parts) & _PAYMENT_LOCAL and last[:1].islower():
+    if (
+        module in _PAYMENT_MODULES
+        and len(parts) >= 2
+        and not set(parts) & _PAYMENT_LOCAL
+        and last[:1].islower()
+    ):
         seen.add(CapabilityClass.NETWORK)
         if last in _PAYMENT_WRITE and (
-            set(parts) & _PAYMENT_RESOURCES or ("Invoice" in parts and last == "pay")
+            set(parts) & _PAYMENT_RESOURCES
+            or ("Invoice" in parts and last == "pay")
+            or (
+                module == "stripe"
+                and parts[-2] in {"charges", "refunds", "payment_intents", "payouts", "transfers"}
+            )
+            or (module == "stripe" and parts[-2] == "invoices" and last == "pay")
         ):
             seen.write(CapabilityClass.PAYMENT)
             seen.payment = True
-    if name == "open":
-        mode = _open_mode(node)
+    path_open = (
+        name in {"pathlib.Path.open", "pathlib.PosixPath.open", "pathlib.WindowsPath.open"}
+        and through_call
+    )
+    if name in {"open", "builtins.open", "io.open"} or path_open:
+        mode = _open_mode(node, 0 if path_open else 1)
         if mode is None or any(flag in mode for flag in "wax+"):
             seen.add(CapabilityClass.FILESYSTEM)
             if mode is not None:
@@ -1119,7 +1183,10 @@ def _python_call(node: ast.Call, name: str, through_call: bool, seen: _Observed)
     elif module in {"os", "shutil"} and module_call and last in _FS_MODULE_WRITE:
         seen.write(CapabilityClass.FILESYSTEM)
     if name in {"os.getenv", "os.environ.get"}:
-        key = _literal(node.args[0]) if node.args else None
+        key_arg = next(iter(node.args), None) or next(
+            (k.value for k in node.keywords if k.arg == "key"), None
+        )
+        key = _literal(key_arg)
         if key is not None and _secret_name(key):
             seen.add(CapabilityClass.CREDENTIALS)
 
@@ -1332,17 +1399,12 @@ def _ts_scope(function: Node, declarators: list[Node], outer: _View) -> _View:
                 view.hidden.add(_ts_text(declared))
         elif statement.type in {"lexical_declaration", "variable_declaration"}:
             top.update(d.id for d in statement.named_children if d.type == "variable_declarator")
-    for declarator in declarators:  # A top-level declaration that binds nothing is a local.
-        if declarator.id in top:
-            bound = _ts_declared(declarator, view)
-            for name, binding in bound:
-                _bind(view.own, name, binding)
-            if not bound:
-                view.hidden.update(_ts_bound_names(declarator.child_by_field_name("name")))
     for declarator in declarators:
-        if declarator.id not in top:
-            for name, binding in _ts_declared(declarator, view):
-                _bind(view.own, name, binding)
+        bound = _ts_declared(declarator, view)
+        if not bound and declarator.id in top:
+            view.hidden.update(_ts_bound_names(declarator.child_by_field_name("name")))
+        for name, binding in bound:
+            _bind(view.own, name, binding)
     return view
 
 
@@ -1505,12 +1567,9 @@ def _ts_chain(callee: Node | None) -> list[str]:
                 parts.append(_MODULE_HEAD + module)
                 return list(reversed(parts))
             node = node.child_by_field_name("function")
-        elif node.type in {
-            "await_expression",
-            "parenthesized_expression",
-            "non_null_expression",
-            "sequence_expression",
-        }:
+        elif node.type in {"as_expression", "satisfies_expression"}:
+            node = node.named_children[0] if node.named_children else None
+        elif node.type in _TS_WRAPPED or node.type == "sequence_expression":
             node = node.named_children[-1] if node.named_children else None
         elif node.type in {"identifier", "this"}:
             parts.append(_ts_text(node))
@@ -1752,9 +1811,11 @@ def classify_typescript(
             constructor = _ts_chain(node.child_by_field_name("constructor"))
             if (
                 constructor[-1:] == ["Function"]
-                and (len(constructor) == 1 or constructor[0] in _TS_GLOBALS)
-                and "Function" not in imports
-                and "Function" not in local
+                and (
+                    len(constructor) == 1 or len(constructor) == 2 and constructor[0] in _TS_GLOBALS
+                )
+                and constructor[0] not in imports
+                and constructor[0] not in shadowed
             ):
                 seen.add(CapabilityClass.EXECUTE)
                 seen.execute = True
@@ -1766,9 +1827,14 @@ def classify_typescript(
             target, value = node.child_by_field_name("name"), node.child_by_field_name("value")
             if target is not None and target.type == "object_pattern" and _ts_is_env(value):
                 for part in target.named_children:
-                    if part.type == "shorthand_property_identifier_pattern" and _secret_name(
-                        _ts_text(part)
-                    ):
+                    key = (
+                        part.child_by_field_name("key") or part.child_by_field_name("left") or part
+                    )
+                    if key.type in {
+                        "property_identifier",
+                        "shorthand_property_identifier_pattern",
+                        "string",
+                    } and _secret_name(_ts_text(key).strip("'\"")):
                         seen.add(CapabilityClass.CREDENTIALS)
         stack.extend(child for child in node.named_children if child.id not in skip)
     return _finish(label, seen)
@@ -1793,7 +1859,7 @@ def _ts_call(
     if head.startswith(_MODULE_HEAD):
         candidates = ((head.removeprefix(_MODULE_HEAD), ""),)
     else:
-        candidates = () if head in shadowed else imports.get(head, ())
+        candidates = imports.get(head, ())
     if len(candidates) > _MAX_TARGETS:
         raise _TooManyTargetsError
     unbound_global = not candidates and head not in shadowed
@@ -1803,7 +1869,7 @@ def _ts_call(
         if arguments is not None and arguments.type == "arguments"
         else []
     )
-    evaluates = unbound_global and head == "eval" and len(chain) == 1
+    evaluates = unbound_global and head in {"eval", "Function"} and len(chain) == 1
     if evaluates:
         seen.add(CapabilityClass.EXECUTE)
         seen.execute = True
@@ -1907,11 +1973,23 @@ def _ts_statement(node: Node, tainted: set[str], *, bound: bool = False) -> tupl
                     for child in part.named_children
                 )
             )
-        elif kind == "identifier":
+        elif kind in {"identifier", "shorthand_property_identifier"}:
             supplied = supplied or _ts_text(part) in tainted
             runs[-1].append("?")
-        elif kind == "binary_expression" and _ts_text(part.child_by_field_name("operator")) == "+":
-            pending += [part.child_by_field_name("right"), part.child_by_field_name("left")]
+        elif kind == "binary_expression":
+            operator = _ts_text(part.child_by_field_name("operator"))
+            if operator == "+":
+                pending += [part.child_by_field_name("right"), part.child_by_field_name("left")]
+            elif operator in {"||", "??", "&&"}:
+                pending += [
+                    None,
+                    part.child_by_field_name("right"),
+                    None,
+                    part.child_by_field_name("left"),
+                    None,
+                ]
+            else:
+                runs[-1].append("?")
         elif kind in {"member_expression", "subscript_expression"}:
             pending.append(part.child_by_field_name("object"))
         elif kind == "call_expression":
@@ -1921,9 +1999,20 @@ def _ts_statement(node: Node, tainted: set[str], *, bound: bool = False) -> tupl
             )
             if arguments is not None and arguments.type == "template_string":
                 runs[-1].append(_ts_literal_text(arguments) or "")
+            elif (
+                callee is not None and callee.type == "identifier" and _ts_text(callee) == "String"
+            ):
+                if arguments is not None:
+                    pending.extend(arguments.named_children[:1])
             elif callee is not None and callee.type == "member_expression":
-                if _ts_property(callee) in {"join", "concat"} and arguments is not None:
-                    supplied = supplied or _ts_uses(arguments, tainted)
+                if arguments is not None:
+                    method = _ts_property(callee)
+                    if method in {"join", "concat"}:
+                        supplied = supplied or _ts_uses(arguments, tainted)
+                    elif method in {"replace", "replaceAll"}:
+                        supplied = supplied or any(
+                            _ts_uses(arg, tainted) for arg in arguments.named_children[1:2]
+                        )
                 pending.append(callee.child_by_field_name("object"))
             else:
                 runs[-1].append("?")
@@ -1937,8 +2026,15 @@ def _ts_statement(node: Node, tainted: set[str], *, bound: bool = False) -> tupl
                 key = _ts_text(pair.child_by_field_name("key")).strip("'\"`")
                 if pair.type == "pair" and key in {"text", "sql", "query"}:
                     pending += [None, pair.child_by_field_name("value"), None]
+                elif pair.type == "shorthand_property_identifier" and _ts_text(pair) in {
+                    "text",
+                    "sql",
+                    "query",
+                }:
+                    pending += [None, pair, None]
         elif kind in _TS_WRAPPERS:
-            pending.extend(part.named_children[:1])
+            children = part.named_children
+            pending.extend(children[-1:] if kind == "type_assertion" else children[:1])
         elif kind in {"assignment_expression", "sequence_expression"}:
             pending.extend(part.named_children[-1:])
         else:
@@ -1953,10 +2049,12 @@ _TS_WRAPPERS = frozenset(
 
 
 def _ts_unescape(escaped: str) -> str:
-    """What a JavaScript escape stands for: a control character as a space, ``\\xHH``
+    """What a JavaScript escape stands for: SQL line endings preserved, ``\\xHH``
     and ``\\u`` forms as their character, a line continuation as nothing."""
     body = escaped[1:]
-    if body[:1] in {"n", "r", "t", "v", "f", "b", "0"} and len(body) == 1:
+    if body in {"n", "r"}:
+        return "\n" if body == "n" else "\r"
+    if body in {"t", "v", "f", "b", "0"}:
         return " "
     if body[:1] in {"x", "u"}:
         digits = body[1:].strip("{}")

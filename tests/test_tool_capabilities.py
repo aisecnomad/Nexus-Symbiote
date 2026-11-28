@@ -2657,3 +2657,114 @@ def test_python_statements_read_comprehensions_quotes_and_bindings_where_they_ar
     found = classify_python(tool, PythonScopes(tree))
     assert found.profile.value == profile, source
     assert any("caller-supplied" in r.detail for r in found.risks) is raw, source
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "str(value)",
+        "'SELECT X'.replace('X', value)",
+        "'{n}'.format_map({'n': value})",
+        "ALLOWED.get('name', value)",
+    ],
+)
+def test_python_sql_text_transformations_preserve_provenance(expression: str) -> None:
+    found = _classify(
+        f"ALLOWED = {{}}\ndef run(conn, value):\n    return conn.execute({expression})"
+    )
+    assert any("caller-supplied" in risk.detail for risk in found.risks)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "<string>text",
+        "text || 'SELECT 1'",
+        "text ?? 'SELECT 1'",
+        "text && 'SELECT 1'",
+        "String(text)",
+        "'SELECT X'.replace('X', text)",
+        "{ text }",
+    ],
+)
+def test_typescript_sql_text_transformations_preserve_provenance(
+    tmp_path: Path, expression: str
+) -> None:
+    tool = _ts(tmp_path, f"(text) => db.query({expression})")
+    assert any("caller-supplied" in risk.detail for risk in tool.risks)
+
+
+@pytest.mark.parametrize("ending", [r"\n", r"\r", r"\r\n"])
+def test_ts_line_comment_ends_at_decoded_line_break(tmp_path: Path, ending: str) -> None:
+    assert E.DESTRUCTIVE in _caps(
+        _ts(
+            tmp_path,
+            "() => db.query('-- blankLINE_END_DELETE FROM notes')".replace("LINE_END_", ending),
+        )
+    )
+
+
+def test_sql_comment_apostrophe_does_not_quote_the_following_binding() -> None:
+    source = (
+        'ACTION = "DELETE FROM notes"\ndef run(conn):\n'
+        '    return conn.execute(f"-- author\'s note\\n{ACTION}")'
+    )
+    assert E.DESTRUCTIVE in _classify(source).capabilities
+
+
+def test_explain_uses_only_its_own_analyze_option() -> None:
+    source = "def run(conn):\n    return conn.execute('EXPLAIN ANALYZE DELETE FROM notes WHERE analyze = 0')"
+    assert E.DESTRUCTIVE in _classify(source).capabilities
+
+
+@pytest.mark.parametrize("method", ["fetch", "fetchrow", "fetchval"])
+def test_asyncpg_fetching_methods_accept_statements(method: str) -> None:
+    found = _classify(
+        f"import asyncpg\nasync def run(q):\n    p = await asyncpg.create_pool()\n    return await p.{method}(q)"
+    )
+    assert any("caller-supplied" in risk.detail for risk in found.risks)
+
+
+@pytest.mark.parametrize(
+    ("setup", "call", "required"),
+    [
+        ("import builtins", "builtins.eval(value)", E.EXECUTE),
+        ("import builtins", "builtins.exec(value)", E.EXECUTE),
+        ("import builtins", "builtins.open(value, 'w')", E.WRITE),
+        ("import io", "io.open(value, mode='w')", E.WRITE),
+        ("from pathlib import Path", "Path(value).open('wb')", E.WRITE),
+        ("import os", "os.spawnvpe(0, value, [], {})", E.EXECUTE),
+        ("import stripe", "stripe.StripeClient('').refunds.create(value)", E.PAYMENT),
+        ("import stripe", "stripe.StripeClient('').invoices.pay(value)", E.PAYMENT),
+        ("import os", "os.getenv(key='API_TOKEN')", E.CREDENTIALS),
+    ],
+)
+def test_resolved_standard_api_spellings(setup: str, call: str, required: CapabilityClass) -> None:
+    assert required in _classify(f"{setup}\ndef t(value):\n    return {call}").capabilities
+
+
+@pytest.mark.parametrize(
+    ("body", "required"),
+    [
+        ("let cp; cp = require('node:child_process'); const run = cp.execSync; run(x)", E.EXECUTE),
+        ("const cp = require('node:child_process'); (cp as any).execSync(x)", E.EXECUTE),
+        ("const cp = require('node:child_process'); (<any>cp).execSync(x)", E.EXECUTE),
+        ("(eval satisfies Function)(x)", E.EXECUTE),
+        ("Function(x)()", E.EXECUTE),
+        ("globalThis.Function(x)()", E.EXECUTE),
+        ("const { API_TOKEN: value } = process.env", E.CREDENTIALS),
+        ("const { API_TOKEN = 'unset' } = process.env", E.CREDENTIALS),
+    ],
+)
+def test_typescript_call_and_env_spellings(
+    tmp_path: Path, body: str, required: CapabilityClass
+) -> None:
+    assert required in _caps(_ts(tmp_path, f"(x) => {{ {body}; }}"))
+
+
+def test_shadowed_function_constructor_and_renamed_public_env_key(tmp_path: Path) -> None:
+    tool = _ts(
+        tmp_path,
+        "(Function) => { const { COLOR: API_TOKEN } = process.env; new Function(API_TOKEN); }",
+    )
+    assert not _caps(tool)
