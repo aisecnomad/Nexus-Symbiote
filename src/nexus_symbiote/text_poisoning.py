@@ -848,6 +848,8 @@ def _pipeline_offset(
         stage_path: tuple[int, int, int] | None = None
         sink = ""
         sink_index = -1
+        input_redirect: tuple[int, int, int] | None = None
+        command_pending = True
         copy_command = False
         copy_source: tuple[int, int, int] | None = None
         for index, (pos, token) in enumerate(stage):
@@ -862,6 +864,8 @@ def _pipeline_offset(
                 continue
             previous = _shell_spell(stage[index - 1][1]) if index else ""
             if word in _SHELL_SINKS:
+                if input_redirect is not None and command_pending:
+                    return input_redirect
                 sink, sink_index = word, index
                 copy_command = word in {"scp", "rsync", "sftp"} and (
                     index == 0
@@ -884,6 +888,10 @@ def _pipeline_offset(
                     None,
                 )
             if at is None:
+                if value not in {"<", "command", "exec", "env"} and not _SHELL_ASSIGNMENT.fullmatch(
+                    value
+                ):
+                    command_pending = False
                 if copy_source is not None and ":" in value:
                     return copy_source
                 continue
@@ -891,9 +899,14 @@ def _pipeline_offset(
             if stage_path is None:
                 stage_path = point
             if not sink:
+                if previous == "<" or (value.startswith("<") and not value.startswith("<<")):
+                    input_redirect = point
+                else:
+                    command_pending = False
                 continue
             if (
                 value.startswith(("@", "<", "--post-file=", "--upload-file="))
+                or (sink == "curl" and value.startswith(("-d@", "-T")))
                 or "=@" in value
                 or previous in {"<", "-T", "--upload-file", "--post-file"}
             ):
@@ -1026,6 +1039,7 @@ def _openers_around(text: str, start: int, end: int, anchors: list[int]) -> list
     found: list[int] = []
     dollars: list[int] = []
     tick: int | None = None
+    tick_anchors: list[int] = []
     index = start
     while index < end:
         if text.startswith("$(", index):
@@ -1041,9 +1055,16 @@ def _openers_around(text: str, start: int, end: int, anchors: list[int]) -> list
             while run < end and text[run] == "`":
                 run += 1
             if run - index == 1:
-                if index in wanted:
-                    found.append(tick if tick is not None else index)
-                tick = None if tick is not None else index
+                if tick is None:
+                    tick = index
+                else:
+                    found.extend(tick_anchors)
+                    tick_anchors.clear()
+                    if index in wanted:
+                        found.append(tick)
+                    tick = None
+                if tick is not None and index in wanted:
+                    tick_anchors.append(index)
             index = run
             continue
         if text[index] == ")" and dollars:
@@ -1052,7 +1073,7 @@ def _openers_around(text: str, start: int, end: int, anchors: list[int]) -> list
             if dollars:
                 found.append(dollars[0])
             elif tick is not None:
-                found.append(tick)
+                tick_anchors.append(tick)
         index += 1
     return found
 
@@ -1312,14 +1333,18 @@ def scan_text_block(
     where: str = "",
 ) -> list[TextPoisoningHit]:
     """Scan a single text string using deterministic O(N) lexical rules."""
-    if not text:
+    if not text or max_hits <= 0:
         return []
 
     normalized, byte_offsets = normalize_for_lexical_scan(text)
     if not normalized:
         return []
 
-    hits: list[TextPoisoningHit] = []
+    # Keep one representative per rule as well as bounded additional evidence.
+    # A full reporting budget must never stop the scan of a later rule or severity.
+    representatives: dict[str, tuple[int, TextPoisoningHit]] = {}
+    extras: dict[RiskSeverity, list[tuple[int, TextPoisoningHit]]] = {}
+    ordinal = 0
     base_category = _default_category(is_tool_surface)
 
     def record(
@@ -1330,21 +1355,32 @@ def scan_text_block(
         severity: RiskSeverity = RiskSeverity.HIGH,
         note: str = "",
     ) -> None:
-        if len(hits) < max_hits:
-            summary = _RULE_DESCRIPTIONS[rule_id]
-            if note:
-                summary = f"{summary} {note}"
-            hits.append(
-                TextPoisoningHit(
-                    rule_id=rule_id,
-                    category=category,
-                    severity=severity,
-                    byte_offset=_byte_offset_at(byte_offsets, char_index),
-                    surface=surface,
-                    summary=summary,
-                    where=where,
-                )
-            )
+        nonlocal ordinal
+        prior = representatives.get(rule_id)
+        bucket = extras.setdefault(severity, [])
+        offset = _byte_offset_at(byte_offsets, char_index)
+        rank = _SEVERITY_RANK[severity]
+        represents = prior is None or (-rank, offset) < (
+            -_SEVERITY_RANK[prior[1].severity],
+            prior[1].byte_offset,
+        )
+        if not represents and len(bucket) >= max_hits:
+            return
+        description = _RULE_DESCRIPTIONS[rule_id]
+        hit = TextPoisoningHit(
+            rule_id=rule_id,
+            category=category,
+            severity=severity,
+            byte_offset=offset,
+            surface=surface,
+            summary=f"{description} {note}" if note else description,
+            where=where,
+        )
+        ordinal += 1
+        if len(bucket) < max_hits:
+            bucket.append((ordinal, hit))
+        if represents:
+            representatives[rule_id] = (ordinal, hit)
 
     # 1. TP-TAG-001: Directive tags containing coercive/exfiltration/override payload
     for tag_start in _directive_tag_hits(normalized):
@@ -1394,14 +1430,16 @@ def scan_text_block(
         if not _has_negated_prefix(normalized, exfil_match.start()):
             record("TP-CRED-002", base_category, exfil_match.start())
 
-    credential_locations = {hit.byte_offset for hit in hits if hit.rule_id == "TP-CRED-002"}
+    credential_locations = {
+        hit.byte_offset
+        for bucket in extras.values()
+        for _, hit in bucket
+        if hit.rule_id == "TP-CRED-002"
+    }
     for at, prohibited in _shell_exfil_offsets(normalized):
-        if len(hits) >= max_hits:
-            break
         location = _byte_offset_at(byte_offsets, at)
         if location in credential_locations:
             continue
-        credential_locations.add(location)
         # A governing prohibition lowers the finding. It never removes it.
         record(
             "TP-CRED-002",
@@ -1435,7 +1473,16 @@ def scan_text_block(
         if addressed is not None and not _has_negated_prefix(normalized, aud_match.start()):
             record("II-AUD-002", CATEGORY_INSTRUCTION_INJECTION, aud_match.start())
 
-    return hits
+    priority = sorted(
+        representatives.values(), key=lambda item: (-_SEVERITY_RANK[item[1].severity], item[0])
+    )
+    chosen = dict(priority[:max_hits])
+    for severity in sorted(extras, key=_SEVERITY_RANK.__getitem__, reverse=True):
+        for order, hit in extras[severity]:
+            if len(chosen) == max_hits:
+                break
+            chosen[order] = hit
+    return [chosen[order] for order in sorted(chosen)]
 
 
 def extract_json_text_entries(

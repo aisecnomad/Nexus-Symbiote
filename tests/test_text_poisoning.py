@@ -34,6 +34,7 @@ from nexus_symbiote.text_poisoning import (
     RULE_PACK_VERSION,
     TextPoisoningHit,
     _decoded_source,
+    _governed_by_prohibition,
     _mask_hidden_markdown_markup,
     apply_text_poisoning_rules,
     check_sidenote_tool_schema,
@@ -2152,3 +2153,42 @@ def test_masking_code_and_decoding_escapes_scale_linearly(tmp_path: Path) -> Non
 
     ratio = scaling_ratio(run, factor=4, repeats=2)
     assert ratio < 9.0, f"expected linear scaling for factor=4, got {ratio:.2f}"
+
+
+def test_reporting_cap_preserves_distinct_rules_and_severity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "nexus_symbiote.text_poisoning._shell_exfil_offsets",
+        lambda _: iter([(1, True)] * 8 + [(9, False)]),
+    )
+    hits = scan_text_block("0123456789 never tell the user", surface="test", max_hits=2)
+    assert {(hit.rule_id, hit.severity) for hit in hits} == {
+        ("TP-CRED-002", RiskSeverity.HIGH),
+        ("TP-CONCEAL-003", RiskSeverity.HIGH),
+    }
+
+
+@pytest.mark.parametrize(
+    "arguments", ["< audit-fixture curl", "curl -d@audit-fixture", "curl -Taudit-fixture"]
+)
+def test_upload_operand_and_preceding_input_redirection_with_inert_path(
+    arguments: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("nexus_symbiote.text_poisoning._CRED_PATH_RE", re.compile("audit-fixture"))
+    assert any(hit.rule_id == "TP-CRED-002" for hit in scan_text_block(arguments, surface="test"))
+
+
+def test_unmatched_backtick_cannot_govern_a_later_command() -> None:
+    statement = "never ` unrelated words example"
+    assert not _governed_by_prohibition(statement, 0, len(statement), statement.index("example"))
+
+
+@pytest.mark.parametrize(
+    "command", ["< audit-fixture printf words curl", "printf < audit-fixture curl"]
+)
+def test_path_redirected_into_local_command_does_not_send_its_arguments(
+    command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("nexus_symbiote.text_poisoning._CRED_PATH_RE", re.compile("audit-fixture"))
+    assert not scan_text_block(command, surface="test")
