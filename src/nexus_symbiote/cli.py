@@ -48,6 +48,7 @@ from nexus_symbiote.reporting import (
 )
 from nexus_symbiote.runtime_cli import register_runtime_commands
 from nexus_symbiote.sbom_cli import register_sbom_commands
+from nexus_symbiote.security_graph_cli import register_security_graph_commands
 from nexus_symbiote.supply_chain_cli import STAGED_INVENTORY, register_supply_chain_commands
 from nexus_symbiote.text_poisoning import apply_text_poisoning_rules
 from nexus_symbiote.trace_cli import register_trace_commands
@@ -2779,15 +2780,57 @@ def summary(aibom_path: str, json_output: bool = False) -> None:
 @click.argument("aibom_path", type=click.Path(exists=True))
 @click.argument("component_ref")
 @click.option("--json-output", is_flag=True, help="Output as JSON")
-def blast_radius_command(aibom_path: str, component_ref: str, json_output: bool) -> None:
+@click.option(
+    "--advisories",
+    "advisories_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional advisory report JSON to correlate against the blast radius.",
+)
+@click.option(
+    "--allow-partial-advisories",
+    is_flag=True,
+    help="Accept an advisory report with partial or empty coverage.",
+)
+def blast_radius_command(
+    aibom_path: str,
+    component_ref: str,
+    json_output: bool,
+    advisories_path: Path | None,
+    allow_partial_advisories: bool,
+) -> None:
     """Show repository dependencies potentially affected by a component compromise."""
+    from nexus_symbiote.core.hashing import hash_bytes
     from nexus_symbiote.graph import blast_radius
 
-    bom = _load_bom(aibom_path)
+    bom, raw_bom = _load_bom_with_bytes(aibom_path)
     try:
         result = blast_radius(bom, component_ref)
     except ValueError as exc:
         raise _failure(exc) from exc
+    if advisories_path is not None:
+        from nexus_symbiote.security_graph import build_security_graph
+        from nexus_symbiote.vex_decisions import VEXDecisionError, load_advisory_report
+
+        inv_sha = hash_bytes(raw_bom)
+        try:
+            adv_report = load_advisory_report(
+                advisories_path,
+                expected_inventory_sha256=inv_sha,
+                allow_partial=allow_partial_advisories,
+            )
+        except (OSError, VEXDecisionError, ValueError, RecursionError) as exc:
+            raise _failure(exc) from exc
+        correlated = build_security_graph(
+            bom,
+            advisory_report=adv_report,
+            inventory_sha256=inv_sha,
+            subject_refs=set(result["reachable_components"]) | {component_ref},
+        )
+        result["correlated_chains"] = [chain.to_dict() for chain in correlated.chains]
+        result["correlation_traversal_complete"] = correlated.traversal_complete
+        result["correlated_chains_omitted"] = correlated.chains_omitted
+        result["limitations"].extend(correlated.limitations)
     if json_output:
         click.echo(json_text(json.dumps(result, indent=2)))
         return
@@ -2800,6 +2843,19 @@ def blast_radius_command(aibom_path: str, component_ref: str, json_output: bool)
             (safe_line("  Agents: ", ", ".join(result["affected_agents"])), None),
             (safe_line("  Dependents: ", ", ".join(result["dependent_components"])), None),
             (safe_line("  Components: ", ", ".join(result["reachable_components"])), None),
+            *(
+                [
+                    (
+                        safe_line(
+                            "  Correlated chains: ",
+                            str(len(result["correlated_chains"])),
+                        ),
+                        None,
+                    )
+                ]
+                if "correlated_chains" in result
+                else []
+            ),
             *((safe_line("  Note: ", note), None) for note in result["limitations"][1:]),
         ]
     )
@@ -2866,6 +2922,7 @@ register_export_standard_commands(main)
 register_control_plane_commands(main)
 register_instruction_diff_commands(main)
 register_sbom_commands(main)
+register_security_graph_commands(main)
 
 if __name__ == "__main__":
     main()

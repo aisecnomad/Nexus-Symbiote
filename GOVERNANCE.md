@@ -97,6 +97,7 @@ Every gate prints each of its failure reasons. How many findings the console lis
 | `attest` | Supported | offline | Signs exact file or inventory bytes in an Ed25519 DSSE/in-toto envelope |
 | `verify-attestation` | Supported | offline | Verifies DSSE/in-toto attestations against out-of-project trusted keys |
 | `blast-radius` | Experimental | offline | Declared repository association traversal (`effective_authority: unknown`) |
+| `security-graph` | Experimental | offline | Correlates advisories, component risks and trace evidence with inventory relationships |
 | `graph` | Experimental | offline | Self-contained HTML/JSON risk-class and exposure-path graph view |
 | `trace-diff` | Experimental | offline | OpenTelemetry GenAI/MCP trace-versus-inventory comparison (`reported` evidence) |
 | `runtime keygen` | Supported | offline | Generates Ed25519 key pair for runtime authorization contracts |

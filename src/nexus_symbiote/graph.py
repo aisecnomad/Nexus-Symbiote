@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import quote
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
 from nexus_symbiote.core.enums import AssuranceLevel, AutonomyLevel, ComponentType, RiskSeverity
@@ -29,7 +29,7 @@ from nexus_symbiote.core.models import (
     RiskAssessment,
     SkillPackageComponent,
 )
-from nexus_symbiote.utils.secrets import redact_text
+from nexus_symbiote.utils.secrets import holds_token_shape, redact_text
 
 if TYPE_CHECKING:
     from nexus_symbiote.utils.confined import ConfinedCollection
@@ -74,6 +74,45 @@ class ModelDeclaration(BaseModel):
         return self
 
 
+_SPIFFE_ID_RE = re.compile(
+    r"^spiffe://[a-z0-9](?:[a-z0-9._-]{0,253}[a-z0-9])?(?:/[A-Za-z0-9._-]+)+$"
+)
+_EGRESS_DOMAIN_RE = re.compile(
+    r"^(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
+
+
+def _workload_value(field: str, raw: str) -> str:
+    limit = {"spiffe_id": 2048, "egress_domains": 253, "delegates_to": 256}[field]
+    if len(raw) > limit:
+        raise ValueError(f"{field} identifier too long")
+    value = raw.strip() if field != "spiffe_id" else raw
+    body = value.removeprefix("spiffe://") if field == "spiffe_id" else value
+    if holds_token_shape(body) or redact_text(body) != body:
+        raise ValueError(f"{field} requires a credential-free identifier")
+    if field == "spiffe_id" and (_SPIFFE_ID_RE.fullmatch(value) is None or "/." in value):
+        raise ValueError("invalid SPIFFE identifier")
+    if field == "egress_domains":
+        value = value.lower()
+        if _EGRESS_DOMAIN_RE.fullmatch(value) is None:
+            raise ValueError("invalid egress hostname")
+    if field == "delegates_to" and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}", value):
+        raise ValueError("invalid delegation identifier")
+    return value
+
+
+def _declared_workload_values(component: AnyComponent, field: str) -> Iterable[str]:
+    raw = component.properties.get(f"declared_{field}")
+    values = [raw] if field == "spiffe_id" else raw
+    if isinstance(values, list) and len(values) <= 256:
+        for item in values:
+            if isinstance(item, str):
+                try:
+                    yield _workload_value(field, item)
+                except ValueError:
+                    continue
+
+
 class AgentDeclaration(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str | None = Field(default=None, min_length=1)
@@ -85,6 +124,20 @@ class AgentDeclaration(BaseModel):
     instructions: list[NonemptyString] = Field(default_factory=list, max_length=1024)
     models: dict[NonemptyString, ModelDeclaration] = Field(default_factory=dict, max_length=1024)
     autonomy_level: AutonomyLevel | None = None
+    spiffe_id: str | None = Field(default=None, min_length=1, max_length=2048)
+    egress_domains: list[NonemptyString] = Field(default_factory=list, max_length=256)
+    delegates_to: list[NonemptyString] = Field(default_factory=list, max_length=256)
+
+    @field_validator("spiffe_id")
+    @classmethod
+    def _validate_spiffe_id(cls, value: str | None) -> str | None:
+        return _workload_value("spiffe_id", value) if value is not None else None
+
+    @field_validator("egress_domains", "delegates_to")
+    @classmethod
+    def _validate_workload_list(cls, values: list[str], info: ValidationInfo) -> list[str]:
+        assert info.field_name is not None
+        return [_workload_value(info.field_name, item) for item in values]
 
 
 def _clip(value: object) -> str:
@@ -548,6 +601,12 @@ def assemble_repository_agent(
     if declared:
         if declared.autonomy_level is not None:
             agent.properties["declared_autonomy_level"] = declared.autonomy_level.value
+        if declared.spiffe_id is not None:
+            agent.properties["declared_spiffe_id"] = declared.spiffe_id
+        if declared.egress_domains:
+            agent.properties["declared_egress_domains"] = sorted(set(declared.egress_domains))
+        if declared.delegates_to:
+            agent.properties["declared_delegates_to"] = sorted(set(declared.delegates_to))
         for key in (
             "name",
             "version",
@@ -557,6 +616,9 @@ def assemble_repository_agent(
             "autonomy_level",
             "instructions",
             "models",
+            "spiffe_id",
+            "egress_domains",
+            "delegates_to",
         ):
             if key in declared.model_fields_set and getattr(declared, key) is not None:
                 agent.claims[key] = ClaimEvidence(
@@ -825,6 +887,12 @@ def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
         if nodes[ref].properties.get("mcp_role") == "gateway"
         or isinstance(nodes[ref].properties.get("upstream_server_refs"), list)
     )
+
+    def workload_values(field: str) -> list[str]:
+        return sorted(
+            {value for ref in reach for value in _declared_workload_values(nodes[ref], field)}
+        )
+
     limitations = [
         "Reachability describes potential dependencies, not proven exploitability or runtime access."
     ]
@@ -843,6 +911,9 @@ def blast_radius(bom: AIBOM, component_ref: str) -> dict[str, Any]:
         "dependent_components": sorted(upstream - {component_ref}),
         "reachable_components": sorted(reach),
         "declared_principals": principals,
+        "declared_workload_identities": workload_values("spiffe_id"),
+        "declared_egress_domains": workload_values("egress_domains"),
+        "declared_delegations": workload_values("delegates_to"),
         "shared_credential_surfaces": shared_credentials,
         "shared_credential_holders_omitted": omitted_holders,
         "mcp_gateways": gateways,

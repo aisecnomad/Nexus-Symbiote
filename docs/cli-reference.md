@@ -60,6 +60,7 @@ change them. See [collection limits](collection-limits.md).
 | [`digest`](#digest) | offline | Print the digest of an AgentBOM's bytes, its canonical digest and its run-independent content digest |
 | [`blast-radius`](#blast-radius) | offline | List agents and components associated with one component |
 | [`graph`](#graph) | offline | Write a self-contained HTML or JSON view of an inventory's associations, risk classes and exposure paths |
+| [`security-graph`](#security-graph) | offline | Correlate advisories, risks, tools, agents, credentials, and data sinks into multi-hop exposure chains |
 | [`baseline`](#baseline) | offline | Write an unsigned snapshot only if the scan gate passes |
 | [`vex`](#vex) | offline | Export schema-validated VEX findings with optional operator decisions, advisories and trace evidence |
 | [`trifecta`](#trifecta) | offline | Analyze an inventory offline for lethal trifectas, chained toxic flows and tool shadowing |
@@ -462,6 +463,13 @@ nexus-symbiote blast-radius [OPTIONS] AIBOM_PATH COMPONENT_REF
 | Option | Description |
 |---|---|
 | `--json-output` | Output as JSON |
+| `--advisories` `PATH` | Optional advisory report JSON to correlate against the blast radius. |
+| `--allow-partial-advisories` | Accept an advisory report with partial or empty coverage. |
+
+With `--advisories`, the command ranks only advisory and finding subjects in the
+requested component's reachable set. `correlated_chains_omitted` counts additional
+in-scope chains beyond the output limit. `correlation_traversal_complete` reports
+whether the correlation walk reached a depth or work limit.
 
 ### `crosswalk`
 
@@ -955,6 +963,41 @@ git working tree that holds SNAPSHOT_PATH, the `--trust`, `--state` or
 `--signer-scopes` file or the current directory, or with other hard links, is a usage
 error (exit 2): a key planted there could register a snapshot or trust status at the
 highest serial and lock the tenant out of every gateway sharing the store.
+
+### `security-graph`
+
+Correlate advisories, risks, tools, agents, credentials, and data sinks into multi-hop exposure chains.
+
+```text
+nexus-symbiote security-graph [OPTIONS] INVENTORY
+```
+
+| Option | Description |
+|---|---|
+| `--advisories` `PATH` | Optional advisory report JSON produced by `advisories` (live or `--offline-db`). |
+| `--allow-partial-advisories` | Accept an advisory report whose coverage is partial or none. |
+| `--trace-evidence` `PATH` | Optional `trace-diff` report JSON annotating reported runtime invocation status. |
+| `--trace-attestation` `PATH` | Verified Ed25519 DSSE attestation envelope for `--trace-evidence`. |
+| `--trusted-key` `PATH` | Trusted Ed25519 public key PEM for `--trace-attestation` (repeatable). |
+| `--allow-unsigned-trace-evidence` | Accept unattested `--trace-evidence` explicitly. |
+| `--format` `json\|mermaid\|markdown\|html` | Output format (default: `json`). |
+| `--max-chains` `INTEGER RANGE` | Maximum correlated exposure chains to emit (default: 500). |
+| `--fail-on-chain` | Exit non-zero if any correlated exposure chain is found. |
+| `--fail-on-kev` | Exit non-zero if any KEV-listed advisory reaches an inventory component or agent. |
+| `-o`, `--output` `PATH` | Write the report to this file instead of standard output (required for HTML). |
+
+The report ranks KEV first, followed by severity, EPSS and chain ID. An explicit
+`unknown` severity ranks below `info`. For each component, advisory aliases link
+transitively. When several primary IDs refer to the same advisory, the report prefers
+a primary CVE ID, then lexical order. The chain retains the strongest severity,
+any KEV listing and the highest EPSS score across all linked records.
+`chains_omitted` counts additional known chains beyond the output limit.
+`traversal_complete` is false when the walk or displayed evidence path reaches
+a limit. In that case, reachable agents, sinks, evidence paths and derived severity
+may be incomplete. The KEV count still includes every eligible KEV advisory.
+Correlation examines up to eight hops per direction, 4,096 edges per subject and
+100,000 edges across the report. Reported runtime status includes intermediate
+components on the displayed path.
 
 ### `scan`
 
