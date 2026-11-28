@@ -98,6 +98,7 @@ from nexus_symbiote.scanners.mcp_launch import (
     analyze,
     expands,
     known_executable,
+    node_tls_disabled,
     origin,
 )
 from nexus_symbiote.utils.confined import (
@@ -2644,6 +2645,10 @@ _CONTEXT_HIGH = {
     "host_root_mount": "a host root mount",
     "security_options_disabled": "disabled confinement",
     "dangerous_capabilities": "a host-level capability",
+    "deno_all_permissions": "unrestricted Deno permissions",
+    "deno_dangerous_permissions": "unscoped Deno host permissions (run/ffi/sys)",
+    "deno_scoped_host_permissions": "Deno host permissions for specified targets (run/ffi/sys)",
+    "tls_verification_disabled": "disabled TLS certificate verification",
 }
 _CONTEXT_MEDIUM = {
     "host_namespaces": "a host namespace",
@@ -2658,6 +2663,8 @@ _CONTEXT_MEDIUM = {
     "container_environment_file": "container environment from a file the inventory does not read",
     "container_command": "a health-check command the engine runs in the container",
     "custom_security_profile": "a seccomp profile from a file",
+    "deno_broad_permissions": "unscoped Deno permissions",
+    "debugger_enabled": "an enabled runtime debugger",
 }
 
 
@@ -4549,6 +4556,10 @@ class MCPScanner(Scanner):
         ]
         if loading:
             context["code_loading_environment"] = len(loading)
+        if node_tls_disabled(launch, env):
+            context["tls_verification_disabled"] = max(
+                context.get("tls_verification_disabled", 0), 1
+            )
         if command_fields:
             context["command_fields"] = len(command_fields)
         if view.code:

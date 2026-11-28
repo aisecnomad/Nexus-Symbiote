@@ -24,7 +24,7 @@ import fnmatch
 import posixpath
 import re
 import shlex
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -82,6 +82,9 @@ _JSR = re.compile(r"(@[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*)(?:@([^/]+))?(?:/.
 
 _NODE_INLINE = frozenset({"-e", "--eval", "-p", "--print", "-pe", "-ep", "-"})
 _NODE_PRELOAD = frozenset({"-r", "--require", "--import", "--loader", "--experimental-loader"})
+_NODE_DEBUGGERS = frozenset({"--inspect", "--inspect-brk", "--inspect-wait"})
+_NODE_DEBUGGER_NEGATIONS = {option.replace("--", "--no-", 1): option for option in _NODE_DEBUGGERS}
+_NODE_DEBUG_PORTS = frozenset({"--inspect-port", "--debug-port"})
 # Node options that take a value as the next word (node --help); the value is never the script.
 _NODE_VALUES = _NODE_PRELOAD | _set(
     "--allow-fs-read --allow-fs-write --build-snapshot-config -C --conditions --cpu-prof-dir"
@@ -238,6 +241,9 @@ class Launch:
     script_shell: bool = False
     # env -S and --split-string values read so far, across every env wrapper.
     split_strings: int = 0
+    # Wrapper override for NODE_TLS_REJECT_UNAUTHORIZED: None = inherit server env,
+    # "" = explicitly cleared/unset by env -i/-u, otherwise the last wrapper value.
+    node_tls_override: str | None = None
 
     def mark(self, flag: str, count: int = 1) -> None:
         self.context[flag] = self.context.get(flag, 0) + count
@@ -1009,9 +1015,10 @@ _DENO_RUN = _table(
     flag_patterns=(
         r"--(?:allow|deny)-[a-z-]+",
         r"--unstable-[a-z-]+",
+        r"--unsafely-ignore-certificate-errors",
         r"--(?:reload|lock|node-modules-dir|env-file|inspect|inspect-brk|inspect-wait"
         r"|allow-scripts|check|watch|watch-hmr|v8-flags|frozen|cached-only)",
-        r"-r",
+        r"-[rRWNES]",  # Reload and permission short options accept an attached =value.
     ),
 )
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "fish"})
@@ -1482,6 +1489,7 @@ def _interpreter_reason(
     start: int = 0,
 ) -> str | None:
     """Inline code, or a package runner run as a module, among an interpreter's options."""
+    debugger_flags: set[str] = set()
     index = start
     while index < len(words):
         word = words[index]
@@ -1495,14 +1503,33 @@ def _interpreter_reason(
         follows = words[index + 1] if index + 1 < len(words) else ""
         step = 1
         if family in {"node", "ts-node"}:
+            norm = "--" + option[2:].replace("_", "-") if option.startswith("--") else option
             target = value if equals else follows
-            if option in _NODE_INLINE or (
-                option in _NODE_PRELOAD and target.lower().startswith(_INLINE_SOURCES)
+            if norm in _NODE_INLINE or (
+                norm in _NODE_PRELOAD and target.lower().startswith(_INLINE_SOURCES)
             ):
                 return _inline(family, launch)
-            if option in _NODE_PRELOAD and launch is not None:
+            if norm in _NODE_PRELOAD and launch is not None:
                 launch.mark("preload_module")
-            takes = option in _NODE_VALUES or (family == "ts-node" and option in _TS_NODE_VALUES)
+            negated = _NODE_DEBUGGER_NEGATIONS.get(norm)
+            if family == "ts-node" and (
+                norm in _NODE_DEBUGGERS or negated or norm in _NODE_DEBUG_PORTS
+            ):
+                return "direct ts-node arguments do not accept Node inspector flags"
+            if launch is not None and (norm in _NODE_DEBUGGERS or negated):
+                if negated:
+                    debugger_flags.discard(negated)
+                else:
+                    # Starting with a break/wait also enables the inspector. Negating
+                    # either switch later clears only its own flag.
+                    debugger_flags.update(("--inspect", norm))
+                if debugger_flags:
+                    launch.context["debugger_enabled"] = 1
+                else:
+                    launch.context.pop("debugger_enabled", None)
+            takes = norm in _NODE_VALUES or (
+                family == "ts-node" and (option in _TS_NODE_VALUES or norm in _TS_NODE_VALUES)
+            )
             step = 2 if takes and not equals else 1
         elif family == "python":
             if word == "-":
@@ -2115,6 +2142,29 @@ def _command_words(command: str, args: list[str]) -> tuple[list[str] | None, str
     return [stripped], ""
 
 
+_NODE_TLS_FAMILIES = frozenset({"npm", "yarn", "bun"})
+
+
+def node_tls_runtime(launch: Launch) -> bool:
+    """Whether the launch runs on Node.js or Bun, which honor NODE_TLS_REJECT_UNAUTHORIZED=0."""
+    return launch.family in _NODE_TLS_FAMILIES or (
+        launch.executable is not None
+        and _interpreter_family(launch.executable) in {"node", "ts-node"}
+    )
+
+
+def node_tls_disabled(launch: Launch, server_env: Mapping[str, object] | None = None) -> bool:
+    """Whether the effective launch environment disables Node/Bun TLS verification."""
+    if not node_tls_runtime(launch):
+        return False
+    if launch.node_tls_override is not None:
+        return launch.node_tls_override == "0"
+    if server_env is None:
+        return False
+    value = server_env.get("NODE_TLS_REJECT_UNAUTHORIZED")
+    return isinstance(value, str) and value == "0"
+
+
 def analyze(command: str, args: list[str]) -> Launch:
     """Classify a declared command and its arguments, recording no argument value."""
     launch = Launch()
@@ -2140,6 +2190,8 @@ def analyze(command: str, args: list[str]) -> Launch:
             return launch
         if inner is None:
             _classify(tokens, launch)
+            if node_tls_disabled(launch):
+                launch.mark("tls_verification_disabled")
             return launch
         tokens = inner
     launch.fail("wrapper nesting limit")
@@ -2203,6 +2255,9 @@ def _exec_operands(name: str, rest: list[str], launch: Launch) -> list[str] | No
         if named is None:
             launch.fail(f"unrecognised {name} option")
             return None
+        flags = word[1 : named.start(1)] if named.group(1) is not None else word[1:]
+        if "c" in flags:
+            launch.node_tls_override = ""
         if named.group(1) == "a":
             index += 1
     if index >= len(rest):
@@ -2216,16 +2271,21 @@ def _unwrap_env(rest: list[str], launch: Launch) -> list[str] | None:
     while index < len(rest):
         word = rest[index]
         if word in {"-i", "-", "--ignore-environment", "-0", "--null", "-v", "--debug", "--"}:
+            if word in {"-i", "-", "--ignore-environment"}:
+                launch.node_tls_override = ""
             index += 1
         elif word in {"-u", "-C", "--unset", "--chdir"}:
-            if word in {"-C", "--chdir"} and _moves(
-                rest[index + 1] if index + 1 < len(rest) else ""
-            ):
+            target = rest[index + 1] if index + 1 < len(rest) else ""
+            if word in {"-C", "--chdir"} and _moves(target):
                 launch.relocated = True
+            elif word in {"-u", "--unset"} and target == "NODE_TLS_REJECT_UNAUTHORIZED":
+                launch.node_tls_override = ""
             index += 2
         elif word.startswith(("--unset=", "--chdir=")):
             if word.startswith("--chdir=") and _moves(word.partition("=")[2]):
                 launch.relocated = True
+            elif word.partition("=")[2] == "NODE_TLS_REJECT_UNAUTHORIZED":
+                launch.node_tls_override = ""
             index += 1
         elif word in {"-S", "--split-string"} or word.startswith(("-S", "--split-string=")):
             if word in {"-S", "--split-string"}:
@@ -2255,6 +2315,8 @@ def _unwrap_env(rest: list[str], launch: Launch) -> list[str] | None:
         elif _ENV_ASSIGNMENT.match(word):
             name, _, value = word.partition("=")
             launch.environment.append((name, value))
+            if name == "NODE_TLS_REJECT_UNAUTHORIZED":
+                launch.node_tls_override = value
             index += 1
         else:
             launch.wrappers.append("env")
@@ -2267,6 +2329,8 @@ def _script_words(words: list[str], launch: Launch) -> list[str] | None:
     while words and _ASSIGNMENT.match(words[0]):
         name, _, value = words[0].partition("=")
         launch.environment.append((name, value))
+        if name == "NODE_TLS_REJECT_UNAUTHORIZED":
+            launch.node_tls_override = value
         words = words[1:]
     if words and words[0] == "exec":
         return _exec_operands("exec", words[1:], launch)
@@ -3643,6 +3707,12 @@ _DENO_SUBCOMMANDS = _set(
     " update upgrade vendor x"
 )
 _DENO_SOURCES = frozenset({"--import-map", "--cert"})
+_DENO_ALL_PERMISSIONS = frozenset({"-A", "--allow-all"})
+_DENO_DANGEROUS_PERMISSIONS = frozenset({"-S", "--allow-run", "--allow-ffi", "--allow-sys"})
+_DENO_BROAD_PERMISSIONS = frozenset(
+    {"-R", "-W", "-N", "-E", "--allow-read", "--allow-write", "--allow-net", "--allow-env"}
+)
+_DENO_DEBUGGERS = frozenset({"--inspect", "--inspect-brk", "--inspect-wait"})
 _DENO_TASK_VALUES = frozenset({"-c", "--config", "--cwd", "-f", "--filter", "-L", "--log-level"})
 # A short-option cluster ending in one that takes a value, with the value attached or
 # not: clap reads -qc deno.json and -cdeno.json as -c with its value.
@@ -3732,6 +3802,16 @@ def _deno(name: str, rest: list[str], launch: Launch) -> None:
                 launch.fail("explicit Deno import-map selection is not collected")
         elif option in {"--preload", "--require"}:
             launch.mark("preload_module")
+        elif option in _DENO_ALL_PERMISSIONS:
+            launch.mark("deno_all_permissions")
+        elif option in _DENO_DANGEROUS_PERMISSIONS:
+            launch.mark("deno_scoped_host_permissions" if value else "deno_dangerous_permissions")
+        elif option in _DENO_BROAD_PERMISSIONS and not value:
+            launch.mark("deno_broad_permissions")
+        elif option == "--unsafely-ignore-certificate-errors":
+            launch.mark("tls_verification_disabled")
+        elif option in _DENO_DEBUGGERS:
+            launch.mark("debugger_enabled")
         elif option == "--env-file":
             # Deno loads the file before it resolves npm: specifiers, so it may set
             # NPM_CONFIG_REGISTRY or DENO_DIR where the inventory cannot read them.
