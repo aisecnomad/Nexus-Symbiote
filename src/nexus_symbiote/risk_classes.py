@@ -2,8 +2,9 @@
 
 ``classify`` restates fields an inventory records as up to five classes (code-exec,
 write-capable, exfil-capable, network-egress, secret-access), each with the field and
-value that produced it. The evidence is mostly declared, or inferred from tool names and
-descriptions by a collector (a tool's ``capability_evidence`` property says which). A class
+value that produced it. The evidence is mostly declared, or inferred by a collector from tool
+names and descriptions or from the calls a source-declared tool body names (a tool's
+``capability_evidence`` property says which). A class
 therefore does not establish what a component can do at run time, and no class does not
 establish that it cannot. A component whose record holds nothing these rules read is
 unassessed: unknown, not safe. Nothing here is written to the inventory.

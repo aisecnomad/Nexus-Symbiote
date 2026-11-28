@@ -123,7 +123,8 @@ RULES: dict[str, RuleInfo] = {
     "capability_scope": RuleInfo(
         "Destructive tool capability",
         "A tool declares destructive or financial side effects, or is declared read-only "
-        "but named for a destructive operation.",
+        "but named for a destructive operation; or its source body runs commands or makes a "
+        "payment.",
     ),
     "data_integrity": RuleInfo(
         "Retrieval source integrity",

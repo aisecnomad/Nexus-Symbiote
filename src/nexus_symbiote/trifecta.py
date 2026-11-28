@@ -158,7 +158,7 @@ _WITHHELD_ENV_NAME_RE = re.compile(r"\[redacted-[1-9][0-9]{0,5}\]")
 # beside a datastore name, since such a locator usually embeds its credentials. That
 # test starts only where a letter-and-digit run starts and checks the run's end once,
 # so a long run of datastore names (DBDBDB...) is scanned in linear time.
-_SECRET_ENV_KEY_RE = re.compile(
+SECRET_ENV_KEY_RE = re.compile(
     r"secret|passw(?:or)?d|credential|apikey|"
     r"(?:\A|_)(?:"
     r"key|keys|token|tokens|pass|pwd|cred|creds|auth|bearer|cookie|cookies|session|"
@@ -952,7 +952,7 @@ def _private_data_basis(component: AnyComponent, rc: RiskClassification) -> tupl
         basis.add(f"component_type:{component.component_type.value}")
     if isinstance(component, MCPServerComponent):
         if any(
-            _WITHHELD_ENV_NAME_RE.fullmatch(key) or _SECRET_ENV_KEY_RE.search(key)
+            _WITHHELD_ENV_NAME_RE.fullmatch(key) or SECRET_ENV_KEY_RE.search(key)
             for key in component.env
         ):
             basis.add("mcp_server:secret_env")

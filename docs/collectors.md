@@ -27,6 +27,26 @@ that `logging` is used only for attribute reads. Passing the module as a value,
 including a default such as `def configure(mod=logging)`, produces a coverage gap
 for that call. Other server and tool declarations in the file are still inventoried.
 
+A tool the collector records from a Python decorator or a TypeScript registration
+carries a `capabilities` declaration when its own body names an operation that raises risk:
+process execution (`subprocess.run`, `os.system`, `eval`; `child_process.execSync`,
+`new Function`), network egress and whether it sends data (an HTTP client's `post`, `put`,
+`patch` or `delete`, `fetch` with such a `method`, mail), filesystem writes and deletions,
+payment API writes (`stripe.Refund.create`, `stripe.refunds.create`) and reads of
+secret-named environment variables. The profile is
+`financial-transaction`, `destructive` or `state-modifying` by the strongest of these, and
+the record says `capability_evidence: source-body-call-names`.
+
+Names are resolved only through the file's imports (in TypeScript also `require`, `import x = require()`, dynamic `import()`, and `promisify` or `.bind()` of an imported function), a name bound or assigned from an imported name, or from calling or constructing one, such as a client (`axios.create()`, `new Stripe(key)`), a connection or `run = subprocess.run`, destructuring of any of these (`const { execSync } = cp`), through a type assertion such as `as any`, and builtins. What calling an HTTP module returns is a client only when it sends requests itself, such as `axios.create()`, `got.extend()` or undici's `new Client()`; a server, a response, headers, a form or an agent is not. Python names follow Python's scoping: a name a function binds anywhere in its own body (a parameter, an assignment, a loop, `with` or `except` target, an `import`, a `def` or a `class`) is local to it, so it never reaches an import of the same name in the module or in another function, and a nested function's or comprehension's bindings stay its own. A binding in a branch that never runs still makes the name local, as it does in Python, where reading it then raises `UnboundLocalError`.
+A TypeScript parameter of the handler or of a function around it, the handler's own name, or a name one of them declares at the top of its body otherwise than from a bound name, shadows an import, in the names taken from it too, such as `const run = exec`, and a parameter named like a global, such as `self`, is the parameter. A binding in a nested block, a callback or a `catch` clause does not, so it cannot hide a call; one spelled like a module, such as `for (const fs of items)`, counts as that module. An unimported name spelled like a module names nothing. A name a TypeScript function binds reaches only the handlers inside it, so one handler's names never reach another's. A module-level name, and a TypeScript name a scope binds to a module, keeps every binding it has, so a second binding, such as an unused `require` or a fallback import of the same name, cannot hide the first. A method of a value a module returns is not the module's function: `os.getenv(...).replace(...)` writes nothing, and a server an `http` module creates is not a client.
+TypeScript is read from its syntax tree, so comments and strings name nothing either, and a
+callee chain of more than 16 steps names nothing, which keeps every node's cost constant. The classifier cannot show that a body does nothing else:
+it does not follow helpers, dynamic dispatch, a handler bound elsewhere or another file. It
+therefore never records `read` or `read-only`; a body that names only reads, or nothing it
+knows, keeps no declaration and stays `unknown`, which the graph and trifecta rules treat as
+not safe. A body of more than 20,000 syntax nodes, one that reads a name with more than 32
+distinct targets (in Python, in one scope), or a TypeScript handler inside more than 32 functions, is not classified and records a coverage gap. A TypeScript file over the `ts-nodes` limit (20,000 nodes by default) is refused as a whole first, as a collection failure that names the limit. A shell or evaluation call and a payment write are `capability_scope` findings at high, as a configured tool that declares destructive or financial effects is. A deletion alone sets the `destructive` profile without a finding, because a body often deletes what it made itself, such as a temporary file or a session row, while a configured `destructiveHint` states the tool's purpose. A TypeScript receiver named `stripe`, such as `this.stripe`, counts as a Stripe client unless its chain starts at a parameter.
+
 The `mcp` collector names a server it finds in Python, TypeScript or JavaScript
 source by the name its constructor declares as a string literal, the name clients
 see: the first argument or `name=` of `FastMCP("analytics-mcp")` or `MCPServer`,

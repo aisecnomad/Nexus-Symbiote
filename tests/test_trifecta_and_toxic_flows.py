@@ -1064,9 +1064,9 @@ def test_secret_environment_name_scan_is_linear() -> None:
     ],
 )
 def test_secret_env_key_anchors_bound_a_word(name: str, secret: bool) -> None:
-    from nexus_symbiote.trifecta import _SECRET_ENV_KEY_RE
+    from nexus_symbiote.trifecta import SECRET_ENV_KEY_RE
 
-    assert bool(_SECRET_ENV_KEY_RE.search(name)) is secret
+    assert bool(SECRET_ENV_KEY_RE.search(name)) is secret
 
 
 def test_required_approvals_are_visible_on_unverified_flow_legs():

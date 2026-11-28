@@ -405,8 +405,8 @@ every rule.
 
 | Framework | Entry | Severities | Rationale |
 | --- | --- | --- | --- |
-| `owasp-llm-2025` | LLM06:2025 Excessive Agency | all | A tool with destructive or financial effects, or misdeclared as read-only, raises the impact of what the agent can do. |
-| `owasp-llm-2026` | LLM03:2026 Excessive Agency | all | A tool with destructive or financial effects, or misdeclared as read-only, raises the impact of what the agent can do. |
+| `owasp-llm-2025` | LLM06:2025 Excessive Agency | all | A tool that runs commands or has destructive or financial effects, or is misdeclared as read-only, raises the impact of what the agent can do. |
+| `owasp-llm-2026` | LLM03:2026 Excessive Agency | all | A tool that runs commands or has destructive or financial effects, or is misdeclared as read-only, raises the impact of what the agent can do. |
 | `owasp-asi-2026` | ASI02 Tool Misuse & Exploitation | all | These are the tools whose misuse causes harm. |
 | `mitre-atlas-2026.10` | AML.T0053 AI Agent Tool Invocation | all | A tool with these effects is available for the agent to invoke. |
 | `nist-ai-rmf-1.0` | MEASURE-2.7 Security and resilience are evaluated | all | Records a security-relevant property of the configuration, an input to evaluating its security. |

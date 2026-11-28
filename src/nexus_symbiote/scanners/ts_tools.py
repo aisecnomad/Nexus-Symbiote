@@ -47,6 +47,12 @@ from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.models import ClaimEvidence, MCPServerComponent, ToolComponent
 from nexus_symbiote.limits import Bound
 from nexus_symbiote.scanners.base import KnownValues, ScanResult, declared_server_name
+from nexus_symbiote.scanners.tool_capabilities import (
+    EVIDENCE,
+    UNCLASSIFIED,
+    classify_typescript,
+    typescript_imports,
+)
 
 _SDK = "@modelcontextprotocol/"
 _MODULES = {"@modelcontextprotocol/server", "@modelcontextprotocol/sdk/server/mcp.js"}
@@ -1386,6 +1392,7 @@ def _collect_source(
         resolver.bind(scope, receiver, (server, node.end_byte))
         servers[node.id] = (server, node.end_byte)
     components: list[MCPServerComponent | ToolComponent] = [s for s, _ in servers.values()]
+    handlers: list[tuple[ToolComponent, Node, int]] = []
     scalar_literals = frozenset(
         {"number", "string", "template_string", "true", "false", "null", "undefined", "regex"}
     )
@@ -1551,7 +1558,46 @@ def _collect_source(
         server.tool_refs.append(ref)
         server.tool_count += 1
         components.append(tool)
+        handler = values[-1] if len(values) > 1 else None
+        if handler is not None and handler.type in _HANDLER_TYPES:
+            # The inline handler is the body the registration binds; a handler bound
+            # elsewhere is not followed and the tool stays unknown.
+            handlers.append((tool, handler, node.start_point.row + 1))
+    _classify_handlers(index, handlers, location, result)
     result.components.extend(components)
+
+
+def _classify_handlers(
+    index: _Index,
+    handlers: list[tuple[ToolComponent, Node, int]],
+    location: str,
+    result: ScanResult,
+) -> None:
+    """Classify each inline handler by its own syntax tree.
+
+    A handler nested in another belongs to its own tool, so the enclosing tool's walk skips
+    that handler's subtree, and only that subtree: the rest of the nested registration
+    call, such as an argument it computes, runs in the enclosing body. Every node is then
+    read for one tool, so nested registrations are classified in linear time.
+    """
+    if not handlers:
+        return
+    imports = typescript_imports(index.nodes)
+    nested = frozenset(handler.id for _, handler, _ in handlers)
+    for tool, handler, line in handlers:
+        classified = classify_typescript(handler, imports, tool.name, nested)
+        if classified.unclassified:
+            result.surfaces_excluded.append(f"{location}:{line} ({tool.name}: {UNCLASSIFIED})")
+            continue
+        tool.capabilities = classified.declaration
+        tool.risks = [*tool.risks, *classified.risks]
+        if tool.capabilities is not None:
+            tool.properties["capability_evidence"] = EVIDENCE
+
+
+_HANDLER_TYPES = frozenset(
+    {"arrow_function", "function_expression", "function", "generator_function"}
+)
 
 
 def _registration_literal_text(arguments: Node | None) -> str:
