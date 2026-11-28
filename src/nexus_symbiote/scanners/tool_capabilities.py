@@ -627,6 +627,14 @@ class _View(Mapping[str, tuple[tuple[str, str], ...]]):
             raise KeyError(name)
         return tuple(found)
 
+    def is_global(self, name: str) -> bool:
+        view: _View | None = self
+        while view is not None:
+            if name in view.hidden or name in view.own:
+                return False
+            view = view.outer
+        return name not in self.module
+
     def __iter__(self) -> Iterator[str]:
         names: set[str] = set(self.module)
         view: _View | None = self
@@ -707,10 +715,17 @@ def typescript_imports(nodes: Iterable[Node]) -> TypeScriptNames:
             found.outer[node.id] = function
             function = node.id
         stack.extend((child, function) for child in reversed(node.named_children))
+    root = _View(None, {})
+    top = _ts_top_declarations(nodes[0] if nodes else None, root.hidden)
     for declarator in found.declared.get(None, []):
-        for name, binding in _ts_declared(declarator, names):
+        bound = _ts_declared(declarator, names)
+        if not bound and declarator.id in top:
+            root.hidden.update(_ts_bound_names(declarator.child_by_field_name("name")))
+        for name, binding in bound:
             _bind(names, name, binding)
-    found.module = {name: tuple(bindings) for name, bindings in names.items()}
+    root.module = found.module = {name: tuple(bindings) for name, bindings in names.items()}
+    root.hidden.difference_update(found.module)
+    found._views[None] = root
     return found
 
 
@@ -743,6 +758,28 @@ def _bind_import(node: Node, names: _Names) -> None:
                     _bind(names, local, (module, _ts_text(imported)))
 
 
+def _ts_top_declarations(body: Node | None, hidden: set[str]) -> set[int]:
+    """Collect names and variable declarators directly within this scope."""
+    top: set[int] = set()
+    for statement in (
+        body.named_children
+        if body is not None and body.type in {"statement_block", "program"}
+        else []
+    ):
+        if statement.type == "export_statement":
+            declaration = statement.child_by_field_name("declaration")
+            if declaration is None:
+                continue
+            statement = declaration
+        if statement.type in _TS_DECLARATIONS:
+            declared = statement.child_by_field_name("name")
+            if declared is not None:
+                hidden.add(_ts_text(declared))
+        elif statement.type in {"lexical_declaration", "variable_declaration"}:
+            top.update(d.id for d in statement.named_children if d.type == "variable_declarator")
+    return top
+
+
 def _ts_scope(function: Node, declarators: list[Node], outer: _View) -> _View:
     """What names hold in a function. Its parameters, its own name and what its body declares
     at the top level otherwise than from a bound name hide the names around it; then each
@@ -753,17 +790,7 @@ def _ts_scope(function: Node, declarators: list[Node], outer: _View) -> _View:
         own = function.child_by_field_name("name")
         if own is not None:
             view.hidden.add(_ts_text(own))
-    body = function.child_by_field_name("body")
-    top: set[int] = set()
-    for statement in (
-        body.named_children if body is not None and body.type == "statement_block" else []
-    ):
-        if statement.type in _TS_DECLARATIONS:
-            declared = statement.child_by_field_name("name")
-            if declared is not None:
-                view.hidden.add(_ts_text(declared))
-        elif statement.type in {"lexical_declaration", "variable_declaration"}:
-            top.update(d.id for d in statement.named_children if d.type == "variable_declarator")
+    top = _ts_top_declarations(function.child_by_field_name("body"), view.hidden)
     for declarator in declarators:
         bound = _ts_declared(declarator, view)
         if not bound and declarator.id in top:
@@ -992,7 +1019,7 @@ def _ts_property(node: Node) -> str:
     return _ts_text(index).strip("'\"`") if index is not None and index.type == "string" else ""
 
 
-def _ts_is_env(node: Node | None) -> bool:
+def _ts_is_env(node: Node | None, bindings: _View) -> bool:
     """Whether ``node`` is ``process.env`` (or ``globalThis.process["env"]``), at constant depth."""
     if node is None or node.type not in {"member_expression", "subscript_expression"}:
         return False
@@ -1000,7 +1027,10 @@ def _ts_is_env(node: Node | None) -> bool:
         return False
     obj = node.child_by_field_name("object")
     if obj is not None and obj.type == "identifier":
-        return _ts_text(obj) == "process"
+        name = _ts_text(obj)
+        return (name == "process" and bindings.is_global(name)) or ("process", "") in bindings.get(
+            name, ()
+        )
     if obj is not None and obj.type in {"member_expression", "subscript_expression"}:
         base = obj.child_by_field_name("object")
         return (
@@ -1008,13 +1038,14 @@ def _ts_is_env(node: Node | None) -> bool:
             and base is not None
             and base.type == "identifier"
             and _ts_text(base) in _TS_GLOBALS
+            and bindings.is_global(_ts_text(base))
         )
     return False
 
 
-def _ts_env_name(node: Node) -> str | None:
+def _ts_env_name(node: Node, bindings: _View) -> str | None:
     """The variable name of ``process.env.NAME`` or ``process.env["NAME"]``, else None."""
-    if not _ts_is_env(node.child_by_field_name("object")):
+    if not _ts_is_env(node.child_by_field_name("object"), bindings):
         return None
     return _ts_property(node) or None
 
@@ -1080,12 +1111,16 @@ def classify_typescript(
                 seen.add(CapabilityClass.EXECUTE)
                 seen.execute = True
         elif node.type in {"member_expression", "subscript_expression"}:
-            name = _ts_env_name(node)
+            name = _ts_env_name(node, imports)
             if name is not None and _secret_name(name):
                 seen.add(CapabilityClass.CREDENTIALS)
         elif node.type == "variable_declarator":
             target, value = node.child_by_field_name("name"), node.child_by_field_name("value")
-            if target is not None and target.type == "object_pattern" and _ts_is_env(value):
+            if (
+                target is not None
+                and target.type == "object_pattern"
+                and _ts_is_env(value, imports)
+            ):
                 for part in target.named_children:
                     key = (
                         part.child_by_field_name("key") or part.child_by_field_name("left") or part

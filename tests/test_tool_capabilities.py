@@ -1270,3 +1270,19 @@ def test_shadowed_function_constructor_and_renamed_public_env_key(tmp_path: Path
         "(Function) => { const { COLOR: API_TOKEN } = process.env; new Function(API_TOKEN); }",
     )
     assert not _caps(tool)
+
+
+@pytest.mark.parametrize(
+    ("header", "handler", "expected"),
+    [
+        ("", "(process) => { const { API_TOKEN: label } = process.env; return label; }", False),
+        ("", "(globalThis) => globalThis.process.env.API_TOKEN", False),
+        ("const process = { env: { API_TOKEN: 'sample' } };", "() => process.env.API_TOKEN", False),
+        ("import process from './demo';", "() => process.env.API_TOKEN", False),
+        ("import proc from 'node:process';", "() => proc.env.API_TOKEN", True),
+        ("", "(process) => globalThis.process.env.API_TOKEN", True),
+        ("", "() => process.env.API_TOKEN", True),
+    ],
+)
+def test_env_capability_follows_the_process_binding(tmp_path, header, handler, expected):
+    assert (E.CREDENTIALS in _caps(_ts(tmp_path, handler, header + "\n"))) is expected
