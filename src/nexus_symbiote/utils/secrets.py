@@ -10,7 +10,7 @@ import re
 import string
 from collections.abc import Iterable, Iterator, Mapping
 from typing import Any, cast
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from nexus_symbiote.utils._legacy_redaction import (
     hidden_spans,
@@ -1115,6 +1115,146 @@ def redact_text(
     """
     spans, rewrites = _redaction(value, _scrubber(secrets), identifier=identifier)
     return _redact(value, spans, rewrites)
+
+
+# Credential formats that redact_text leaves intact in short A2A identifiers.
+# Both alternatives start only where a word starts, so a long run is scanned once.
+_A2A_TOKEN_SHAPE = re.compile(
+    r"(?<![\w-])(?:eyJ[\w-]{8,}\.[\w-]{8,}"
+    r"|(?:gh[oprsu]_|github_pat_|glpat-|xox[abeoprs]-|sk-|[rs]k_live_|AKIA|ASIA|AIza)"
+    r"[\w-]{12,})"
+)
+_MAX_OAUTH_SCOPE = 512
+_PERCENT_ESCAPE = re.compile(r"%[A-Fa-f0-9]{2}")
+_INVALID_PERCENT_ESCAPE = re.compile(r"%(?![A-Fa-f0-9]{2})")
+# A URL written without a scheme is no URL to urlsplit or to the URL rules, yet it
+# names user information: "//user@host/..." always, and "user:pass@host" when a dot,
+# port, path, query or fragment follows the "@". A scope such as "files:read@v2" does not.
+_SCHEMELESS_USERINFO = re.compile(r"//[^\s/?#@]*+@|[^\s/?#@:]++:[^\s/?#@]++@[^\s/?#@.:]*+[.:/?#]")
+
+
+def redact_oauth_scope(value: str) -> str:
+    """Show an OAuth scope (RFC 6749 section 3.3) unless it may contain a secret."""
+    shown = _redact_oauth_spelling(value)
+    if (
+        shown == REDACTED
+        or "%" not in value
+        or ("/" not in value and not _PERCENT_ESCAPE.search(value))
+    ):
+        return shown
+    # A URI path can encode a value the cleartext matcher would withhold. Check
+    # each spelling without ever publishing a decoded value. Keep the original
+    # spelling for ordinary permission paths.
+    spelling = value
+    for _ in range(2):
+        if _INVALID_PERCENT_ESCAPE.search(spelling):
+            return REDACTED
+        try:
+            spelling = unquote(spelling, errors="strict")
+        except UnicodeDecodeError:
+            return REDACTED
+        if any(ord(char) < 32 or ord(char) == 127 for char in spelling):
+            return REDACTED
+        if _redact_oauth_spelling(spelling) != spelling:
+            return REDACTED if "%" in shown else shown
+        if "%" not in spelling:
+            return shown
+    return REDACTED
+
+
+def _redact_oauth_spelling(value: str) -> str:
+    # Backslashes are outside the OAuth scope grammar. Browsers may treat them as
+    # URL separators where urlsplit considers them part of the host.
+    if "\\" in value:
+        return REDACTED
+    shown = _shown_scope(value)
+    # A token glued to a letter or digit, user information in a URL without a scheme, or a
+    # webhook route written without one passes the rules below, also in what remains of a
+    # scope they reduced in part.
+    if (
+        holds_token_shape(shown, require_sk_boundary=True)
+        or _SCHEMELESS_USERINFO.search(shown)
+        or any("://" not in word and _webhook_route(word) for word in shown.split())
+    ):
+        return REDACTED
+    return shown
+
+
+# A run of letters and digits in a scope URI's path that names a credential rather than a
+# permission: one that mixes letters with digits, or upper with lower case, as the secret
+# of a Slack, Discord or Teams webhook URL does. Permission paths are words, such as
+# ``auth/drive.readonly``, ``User.Read`` or ``task-scheduler-read-2024``.
+_SECRET_PATH_RUN = re.compile(r"[A-Za-z0-9]{16,}")
+
+
+def _secret_path(path: str) -> bool:
+    for match in _SECRET_PATH_RUN.finditer(path):
+        run = match.group()
+        mixes_kinds = not run.isdigit() and not run.isalpha()
+        mixes_case = len(run) >= 20 and run != run.lower() and run != run.upper()
+        if mixes_kinds or mixes_case:
+            return True
+    return False
+
+
+# Webhook routes whose path is the credential however it is spelled: on these hosts any path,
+# and on these host suffixes a path holding the marker.
+_WEBHOOK_HOSTS = frozenset(
+    {"hooks.slack.com", "hooks.zapier.com", "maker.ifttt.com", "api.telegram.org", "webhook.site"}
+)
+_WEBHOOK_PATHS = (
+    ("discord.com", "/webhooks/"),
+    ("discordapp.com", "/webhooks/"),
+    ("webhook.office.com", "/"),
+    ("outlook.office.com", "/webhook"),
+    ("outlook.office365.com", "/webhook"),
+)
+
+
+def _webhook_route(text: str) -> bool:
+    """Whether ``text``, with or without a scheme, is a URL on a recognised webhook route."""
+    try:
+        parts = urlsplit(text if text.startswith("//") or "://" in text else "//" + text)
+    except ValueError:
+        return False
+    host = unquote(parts.hostname or "").rstrip(".").lower()
+    path = unquote(parts.path).lower()
+    return path not in {"", "/"} and (
+        host in _WEBHOOK_HOSTS
+        or any(
+            (host == suffix or host.endswith("." + suffix)) and marker in path
+            for suffix, marker in _WEBHOOK_PATHS
+        )
+    )
+
+
+def _shown_scope(value: str) -> str:
+    if len(value) > _MAX_OAUTH_SCOPE or _A2A_TOKEN_SHAPE.search(value):
+        return REDACTED
+    redacted = redact_text(value)
+    if redacted == value:
+        return value
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return redacted
+    # Scope URIs name the permission in their path, which redact_text would omit.
+    locator = parsed.netloc + parsed.path
+    if (
+        parsed.scheme
+        and parsed.netloc
+        and not any(char in "@?#" or char.isspace() for char in value)
+        and redact_text(locator) == locator
+        and not _secret_path(parsed.path)
+        and not _webhook_route(value)
+    ):
+        return value
+    return redacted
+
+
+def a2a_header_has_credential(value: str) -> bool:
+    """Whether a short A2A signature header value looks like a pasted credential."""
+    return bool(_A2A_TOKEN_SHAPE.search(value)) or redact_text(value) != value
 
 
 def redact_keyed_text(

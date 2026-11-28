@@ -22,6 +22,7 @@ from nexus_symbiote.core.hashing import TOOL_DEFINITION_HASH_VERSION, canonical_
 from nexus_symbiote.core.models import (
     UNBOUND_VALUES_DETAIL,
     AnyComponent,
+    CapabilityDeclaration,
     CompletenessClaim,
     MCPServerComponent,
     check_spec_version,
@@ -31,6 +32,7 @@ from nexus_symbiote.utils.crypto import (
     SigningStatus,
     component_evidence_refs,
 )
+from nexus_symbiote.utils.secrets import redact_oauth_scope
 from nexus_symbiote.utils.terminal import neutralize
 
 SEVERITIES = ("info", "low", "medium", "high", "critical")
@@ -232,9 +234,51 @@ def _clip(value: object) -> str:
     return text if len(text) <= _SHOWN else text[: _SHOWN - 1] + "…"
 
 
-def _listing(values: Iterable[str]) -> str:
+def _oauth_scopes(capabilities: object) -> set[str]:
+    if not isinstance(capabilities, dict):
+        return set()
+    return {s for s in capabilities.get("oauth_scopes") or () if isinstance(s, str)}
+
+
+def _ascii_literal(text: str) -> str:
+    return json.dumps(text).replace("\x7f", "\\u007f")
+
+
+def _quoted_scope(scope: str) -> str:
+    """A redacted scope as a JSON string literal of at most ``_SHOWN`` characters.
+
+    Quotes keep a value from imitating the listing's separators and show an empty one;
+    escapes show every character outside printable ASCII, which RFC 6749 scopes never use.
+    """
+    text = redact_oauth_scope(scope)
+    literal = _ascii_literal(text)
+    if len(literal) <= _SHOWN:
+        return literal
+    kept: list[str] = []
+    used = len('"…"')
+    for char in text:
+        escaped = _ascii_literal(char)[1:-1]
+        used += len(escaped)
+        if used > _SHOWN:
+            break
+        kept.append(escaped)
+    return '"' + "".join(kept) + '…"'
+
+
+def _without_scopes(capabilities: object) -> dict[str, Any] | None:
+    """The declaration with its scopes blanked, or None when it is not a declaration."""
+    if capabilities is not None and not isinstance(capabilities, dict):
+        return None
+    try:
+        declared = CapabilityDeclaration.model_validate(capabilities or {})
+    except ValueError:
+        return None
+    return declared.model_dump(mode="json") | {"oauth_scopes": []}
+
+
+def _listing(values: Iterable[str], *, display: Callable[[str], str] = str) -> str:
     items = sorted(values)
-    shown = "; ".join(_clip(item) for item in items[:_LISTED])
+    shown = "; ".join(_clip(display(item)) for item in items[:_LISTED])
     return shown + (f"; and {len(items) - _LISTED} more" if len(items) > _LISTED else "")
 
 
@@ -837,6 +881,29 @@ class AIBOMDiffer:
                     "severity": "medium",
                 }
             )
+        old_caps, new_caps = old_fields.get("capabilities"), new_fields.get("capabilities")
+        if isinstance(old_caps, dict) or isinstance(new_caps, dict):
+            # A first grant arrives with the whole block and a last removal takes it away,
+            # so an absent block is compared as a declaration with no scopes.
+            before_scopes = _oauth_scopes(old_caps)
+            after_scopes = _oauth_scopes(new_caps)
+            added_scopes = after_scopes - before_scopes
+            removed_scopes = before_scopes - after_scopes
+            scope_changes = [
+                f"{word}: {_listing(scopes, display=_quoted_scope)}"
+                for word, scopes in (("added", added_scopes), ("removed", removed_scopes))
+                if scopes
+            ]
+            if scope_changes:
+                modifications.append(
+                    {
+                        "detail": "capabilities changed: OAuth scopes "
+                        + " and ".join(scope_changes),
+                        "severity": "high",
+                    }
+                )
+                if _same(_without_scopes(old_caps), _without_scopes(new_caps), ("capabilities",)):
+                    handled.add("capabilities")
         old_props, new_props = old_fields.get("properties"), new_fields.get("properties")
         if isinstance(old_props, dict) and isinstance(new_props, dict):
             before = old_props.pop(_DECLARED_AUTONOMY, None)

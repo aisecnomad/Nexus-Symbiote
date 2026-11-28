@@ -4,6 +4,14 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Security
+
+- **A2A OAuth scopes:** a scope holding a known token format glued to a preceding letter or digit, or a URL written without a scheme that carries user information (`//user@host/…`, or `user:pass@host` followed by a dot, port or path), is now exported as `***`, and `diff` shows it as `***`. A scope URI whose path holds a credential-shaped run, or that is on a recognised Slack, Discord, Teams, Outlook, Zapier, IFTTT, Telegram or webhook.site webhook route however its path is spelled, is reduced to its origin; such a route written without a scheme is exported as `***`. Scopes the collector already reduced keep their form. A card with such a scope records a new `static_card_hash` and, collected without `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY`, lists `redacted OAuth scopes` among its unbound values if it did not already; re-collect its baseline.
+
+### Added
+
+- **`diff`:** names the OAuth scopes added to or removed from every component that declares `capabilities.oauth_scopes`, not only A2A cards (an imported inventory can carry them on agent, tool, skill, A2A client or extension records), instead of reporting an opaque `capabilities changed.` alert. Scope values from the compared inventories now appear in drift output (text, JSON, Markdown, JUnit and step summaries): each is redacted by the A2A scope rule and quoted as a JSON string, and up to five are named in each direction. The alert stays high.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

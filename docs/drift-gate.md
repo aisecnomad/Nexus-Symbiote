@@ -103,6 +103,8 @@ Security alerts appear first in text output, followed by notes and component/rel
 | New graph consistency errors (dangling/mistyped refs), `spec_version` mismatch, or unsupported `spec_version` | high |
 | IDE settings guardrail removed or widened (`deny_rule_removed`, `sandbox_egress_widened`, `scope_widened`, `malformed_settings_metadata`) | high |
 
+An OAuth scope change names the scopes added and removed, each redacted by the [A2A scope rule](verification-source-binding.md#a2a-agent-cards-and-client-entries) and quoted as a JSON string. The text and JSON records name up to five per direction in sorted order and say how many more there are; the complete sets are the `capabilities.oauth_scopes` of the two inventories.
+
 **Non-alerting changes & notes:** Added scanned surfaces, coverage improvements, different Nexus SymBiote `tool_version`, unchanged regenerated ShadowScan reports, and reordered unmapped ShadowScan entries never alert. **Notes** (printed even with zero changes) highlight shared gaps in both snapshots, shared graph problems, reversed snapshot timestamps, and absolute-vs-relative path mismatches.
 
 ## Exit status

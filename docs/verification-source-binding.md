@@ -213,12 +213,26 @@ Several security declarations are recorded in clear:
   identifiers (RFC 6749 section 3.3), so scope URIs such as
   `https://www.googleapis.com/auth/drive.readonly` or `api://<app>/access_as_user`
   are kept in full. A scope in `scheme://` URL form with user information, a query or a
-  fragment is reduced to its origin, a recognised credential assignment such as
+  fragment is reduced to its origin, and so is one whose path holds a credential-shaped
+  run, such as the secret of a Slack, Discord or Teams webhook URL: 16 or more letters and
+  digits that mix both, or 20 or more that mix upper and lower case. A run is split at
+  `-`, `_` and `.`, so word paths such as `task-scheduler-read-2024` stay in full. A scope
+  URI with percent escapes is also checked after each of up to two decoding steps. Benign
+  permission paths keep their original spelling. Invalid escapes, invalid UTF-8, decoded controls
+  or further nested escapes withhold the scope. A sensitive decoded spelling also withholds
+  any still-encoded output. A scope URI on a recognised webhook route is reduced to its origin however its path is spelled:
+  any path on `hooks.slack.com`, `hooks.zapier.com`, `maker.ifttt.com`, `api.telegram.org`
+  or `webhook.site`, a `/webhooks/` path on Discord, any path on `*.webhook.office.com`, and a
+  `/webhook` path on Outlook. The same route written without a scheme is exported as `***`; a
+  recognised credential assignment such as
   `token=...` or `api_key=...` is reduced by the standard redaction, and one in a
   known token format (a JWT or a prefix the [security model](security-model.md#known-false-positive-and-false-negative-classes)
-  lists, such as `ghp_`, `AKIA`, `sk-`, `xox`, `glpat-`, `AIza` or `gsk_`) is
-  exported as `***`; a scheme-less scope that contains `?`, `#` or
-  `@`, such as `a?b=1`, is exported in full. A change to the set of scopes raises a high
+  lists, such as `ghp_`, `AKIA`, `sk-`, `xox`, `glpat-`, `AIza` or `gsk_`), even
+  one glued to a preceding letter or digit, is exported as `***`. So is a URL written
+  without a scheme that carries user information: `//user@host/...`, or
+  `user:pass@host` when a dot, port, path, query or fragment follows the `@`. Any other
+  scheme-less scope that contains `?`, `#` or `@`, such as `a?b=1` or `files:read@v2`,
+  is exported in full. A change to the set of scopes raises a high
   `capabilities changed` alert. A scope moved between the card and a skill, or
   between skills, changes only the structure digest below and raises a high
   `properties.static_card_hash changed` alert.
