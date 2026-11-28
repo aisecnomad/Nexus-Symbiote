@@ -631,27 +631,47 @@ def extract_json_text_entries(
     *,
     max_depth: int = 32,
     max_entries: int = 4_096,
+    truncated: list[bool] | None = None,
 ) -> list[tuple[str, str]]:
     """Iteratively extract ``(dotted_field_path, string_value)`` pairs from parsed JSON."""
     results: list[tuple[str, str]] = []
     queue: deque[tuple[str, object, int]] = deque([("", data, 0)])
-    while queue and len(results) < max_entries:
+    node_cap = sys.maxsize if max_entries == sys.maxsize else max(32_768, max_entries * 4)
+    visited = 0
+    did_truncate = False
+    while queue:
         prefix, node, depth = queue.popleft()
+        visited += 1
         if depth > max_depth:
+            if (isinstance(node, str) and node.strip()) or (
+                isinstance(node, (dict, list)) and bool(node)
+            ):
+                did_truncate = True
             continue
         if isinstance(node, str):
             if node.strip():
+                if len(results) >= max_entries:
+                    did_truncate = True
+                    break
                 results.append((prefix or "$", node))
         elif isinstance(node, dict):
             for key, val in node.items():
                 if not isinstance(key, str):
                     continue
+                if visited + len(queue) >= node_cap:
+                    did_truncate = True
+                    break
                 child = f"{prefix}.{key}" if prefix else key
                 queue.append((child, val, depth + 1))
         elif isinstance(node, list):
             for idx, item in enumerate(node):
+                if visited + len(queue) >= node_cap:
+                    did_truncate = True
+                    break
                 child = f"{prefix}[{idx}]"
                 queue.append((child, item, depth + 1))
+    if did_truncate and truncated is not None:
+        truncated.append(True)
     return results
 
 
@@ -1061,6 +1081,8 @@ def _escape_decoded_hits(
 
 def _collect_schema_properties(
     schema: dict[str, Any] | None,
+    *,
+    truncated: list[bool] | None = None,
 ) -> list[tuple[str, dict[str, Any] | None, str]]:
     if not isinstance(schema, dict):
         return []
@@ -1068,22 +1090,35 @@ def _collect_schema_properties(
     seen: set[int] = {id(schema)}
     queue: deque[tuple[dict[str, Any], str]] = deque([(schema, "")])
     visited = 0
+    did_truncate = False
 
     def _join(prefix: str, segment: str) -> str:
         return f"{prefix}.{segment}" if prefix else segment
 
-    while queue and visited < 4096:
+    def _enqueue(sub: dict[str, Any], path: str) -> None:
+        nonlocal did_truncate
+        if id(sub) in seen:
+            return
+        if visited + len(queue) >= 4096:
+            did_truncate = True
+            return
+        seen.add(id(sub))
+        queue.append((sub, path))
+
+    while queue:
         node, prefix = queue.popleft()
         visited += 1
         props = node.get("properties")
         if isinstance(props, dict):
             for k, v in props.items():
                 if isinstance(k, str):
+                    if len(found) >= 4096:
+                        did_truncate = True
+                        break
                     prop_path = _join(prefix, f"properties.{k}")
                     found.append((k, v if isinstance(v, dict) else None, prop_path))
-                    if isinstance(v, dict) and id(v) not in seen:
-                        seen.add(id(v))
-                        queue.append((v, prop_path))
+                    if isinstance(v, dict):
+                        _enqueue(v, prop_path)
         for def_key in (
             "$defs",
             "definitions",
@@ -1094,18 +1129,15 @@ def _collect_schema_properties(
             defs = node.get(def_key)
             if isinstance(defs, dict):
                 for sub_name, sub_schema in defs.items():
-                    if isinstance(sub_schema, dict) and id(sub_schema) not in seen:
-                        seen.add(id(sub_schema))
-                        queue.append((sub_schema, _join(prefix, f"{def_key}.{sub_name}")))
+                    if isinstance(sub_schema, dict):
+                        _enqueue(sub_schema, _join(prefix, f"{def_key}.{sub_name}"))
         items_val = node.get("items")
-        if isinstance(items_val, dict) and id(items_val) not in seen:
-            seen.add(id(items_val))
-            queue.append((items_val, _join(prefix, "items")))
+        if isinstance(items_val, dict):
+            _enqueue(items_val, _join(prefix, "items"))
         elif isinstance(items_val, list):
             for idx, item in enumerate(items_val):
-                if isinstance(item, dict) and id(item) not in seen:
-                    seen.add(id(item))
-                    queue.append((item, _join(prefix, f"items[{idx}]")))
+                if isinstance(item, dict):
+                    _enqueue(item, _join(prefix, f"items[{idx}]"))
         for combiner in (
             "additionalProperties",
             "unevaluatedProperties",
@@ -1117,21 +1149,17 @@ def _collect_schema_properties(
             "contains",
         ):
             sub = node.get(combiner)
-            if isinstance(sub, dict) and id(sub) not in seen:
-                seen.add(id(sub))
-                queue.append((sub, _join(prefix, combiner)))
+            if isinstance(sub, dict):
+                _enqueue(sub, _join(prefix, combiner))
         for list_key in ("anyOf", "oneOf", "allOf", "prefixItems"):
             items = node.get(list_key)
             if isinstance(items, list):
                 for idx, item in enumerate(items):
-                    if isinstance(item, dict) and id(item) not in seen:
-                        seen.add(id(item))
-                        queue.append((item, _join(prefix, f"{list_key}[{idx}]")))
+                    if isinstance(item, dict):
+                        _enqueue(item, _join(prefix, f"{list_key}[{idx}]"))
+    if did_truncate and truncated is not None:
+        truncated.append(True)
     return found
-
-
-def _collect_schema_property_names(schema: dict[str, Any] | None) -> set[str]:
-    return {k for k, _, _ in _collect_schema_properties(schema)}
 
 
 def _side_channel_subtree_hit(
@@ -1139,6 +1167,7 @@ def _side_channel_subtree_hit(
     *,
     surface: str,
     source_hits: dict[int, TextPoisoningHit] | None,
+    truncated: list[bool] | None = None,
 ) -> TextPoisoningHit | None:
     if source_hits is not None:
         # Printed source pointers mask arbitrary keys. Retain the hit assigned to
@@ -1147,7 +1176,8 @@ def _side_channel_subtree_hit(
             sub for _, sub, _ in side_entries if sub is not None
         )
         visited: set[int] = set()
-        while pending and len(visited) < 4096:
+        did_truncate = False
+        while pending:
             current = pending.popleft()
             identity = id(current)
             if identity in visited:
@@ -1156,15 +1186,25 @@ def _side_channel_subtree_hit(
             if identity in source_hits:
                 return source_hits[identity]
             children = current.values() if isinstance(current, dict) else current
-            pending.extend(child for child in children if isinstance(child, (dict, list)))
+            for child in children:
+                if isinstance(child, (dict, list)):
+                    if len(visited) + len(pending) >= 4096:
+                        did_truncate = True
+                        break
+                    pending.append(child)
+        if did_truncate and truncated is not None:
+            truncated.append(True)
         return None
 
     # A component field is displayed as a dotted path. A literal dot in a key
     # makes that rendering ambiguous, so only inspect the actual subtree.
+    sub_truncated: list[bool] = []
     for _, sub, path in side_entries:
         if sub is None:
             continue
-        for sub_path, value in extract_json_text_entries(sub, max_depth=64, max_entries=512):
+        for sub_path, value in extract_json_text_entries(
+            sub, max_depth=64, max_entries=512, truncated=sub_truncated
+        ):
             hits = scan_text_block(
                 value,
                 surface=surface,
@@ -1174,6 +1214,8 @@ def _side_channel_subtree_hit(
             for hit in hits:
                 if hit.category == CATEGORY_TOOL_POISONING:
                     return hit
+    if sub_truncated and truncated is not None:
+        truncated.append(True)
     return None
 
 
@@ -1209,6 +1251,7 @@ def check_sidenote_tool_schema(
     existing_hits: list[TextPoisoningHit],
     matched_values: Sequence[tuple[str, list[TextPoisoningHit]]] | None = None,
     source_hits: dict[int, TextPoisoningHit] | None = None,
+    truncated: list[bool] | None = None,
 ) -> list[TextPoisoningHit]:
     """Detect Sidenote cross-property escalation on tool schemas and annotations.
 
@@ -1226,18 +1269,22 @@ def check_sidenote_tool_schema(
     if poison is None:
         return []
     ann = annotations or {}
+    schema_truncated: list[bool] = []
     side_entries = [
         entry
-        for entry in _collect_schema_properties(schema)
+        for entry in _collect_schema_properties(schema, truncated=schema_truncated)
         if entry[0].lower() in _SIDE_CHANNEL_PARAM_NAMES
     ]
+    subtree_trigger: TextPoisoningHit | None = None
     trigger: TextPoisoningHit | None = None
     if side_entries:
-        trigger = _side_channel_subtree_hit(
+        subtree_trigger = _side_channel_subtree_hit(
             side_entries,
             surface=surface,
             source_hits=source_hits,
+            truncated=schema_truncated,
         )
+        trigger = subtree_trigger
         if trigger is None:
             unique_props = sorted({prop for prop, _, _ in side_entries})
             trigger = _prose_named_side_channel_hit(
@@ -1246,6 +1293,8 @@ def check_sidenote_tool_schema(
                 existing_hits=existing_hits,
                 matched_values=matched_values,
             )
+    if subtree_trigger is None and schema_truncated and truncated is not None:
+        truncated.append(True)
     if trigger is None and (ann.get("readOnlyHint") is True or ann.get("destructiveHint") is False):
         trigger = poison
     if trigger is None:
@@ -1575,7 +1624,9 @@ def _append_consolidated_risks(
     return added
 
 
-def _scan_component_fields(comp: ComponentWithRisks) -> list[TextPoisoningHit]:
+def _scan_component_fields(
+    comp: ComponentWithRisks, *, truncated: list[bool] | None = None
+) -> list[TextPoisoningHit]:
     if isinstance(comp, ToolComponent):
         surface = comp.source_path or comp.name
         hits: list[TextPoisoningHit] = []
@@ -1602,6 +1653,7 @@ def _scan_component_fields(comp: ComponentWithRisks) -> list[TextPoisoningHit]:
             surface=surface,
             existing_hits=hits,
             matched_values=matched_values,
+            truncated=truncated,
         )
     if isinstance(comp, A2AServerComponent):
         surface = comp.source_path or comp.agent_card_path or comp.name
@@ -1691,6 +1743,7 @@ def _scan_structured_source(
     include_keys: bool = False,
     tool_context: bool | None = None,
     raw_matches: _RawMatches | None = None,
+    truncated: list[bool] | None = None,
 ) -> _SourceFindings:
     """Scan a parsed configuration and evaluate each tool's text alongside its own schema.
 
@@ -1790,6 +1843,7 @@ def _scan_structured_source(
                 existing_hits=hits,
                 matched_values=group.matched_values,
                 source_hits=group.poison_by_container,
+                truncated=truncated,
             )
         unresolved = ordinal if group.unresolved else 0
         if raw_matches is not None and group.matched_values:
@@ -1807,6 +1861,8 @@ def _scan_text_source(
     raw_text: str,
     comps: list[ComponentWithRisks],
     root_agent: AgentComponent | None,
+    *,
+    truncated: list[bool] | None = None,
 ) -> _SourceFindings:
     suffix = PurePosixPath(rel_path).suffix.lower()
     is_tool_ctx = any(
@@ -1851,6 +1907,7 @@ def _scan_text_source(
                 include_keys=True,
                 tool_context=is_tool_ctx,
                 raw_matches=raw_matches,
+                truncated=truncated,
             )
         )
     by_target: dict[str | None, tuple[ComponentWithRisks | None, list[TextPoisoningHit]]] = {}
@@ -1936,6 +1993,7 @@ def apply_text_poisoning_rules(
     own_failures: list[str] = []
     own_exclusions: list[str] = []
     scanned_rel_paths: set[str] = set()
+    truncated_rel_paths: set[str] = set()
     added = 0
 
     def failed(subject: str, reason: str) -> None:
@@ -2000,11 +2058,19 @@ def apply_text_poisoning_rules(
                             # read. An instruction file named .json is text to its readers.
                             if not all(isinstance(c, _INSTRUCTION_KINDS) for c in comps):
                                 failed(rel_path, "not JSON")
+                    src_trunc: list[bool] = []
                     owned = (
-                        _scan_structured_source(rel_path, parsed, comps, root_agent)
+                        _scan_structured_source(
+                            rel_path, parsed, comps, root_agent, truncated=src_trunc
+                        )
                         if isinstance(parsed, (dict, list))
-                        else _scan_text_source(rel_path, raw_text, comps, root_agent)
+                        else _scan_text_source(
+                            rel_path, raw_text, comps, root_agent, truncated=src_trunc
+                        )
                     )
+                    if src_trunc:
+                        truncated_rel_paths.add(rel_path)
+                        failed(rel_path, "schema node budget reached")
                     for target, hits in owned:
                         if target is not None:
                             remember(target, hits)
@@ -2019,7 +2085,10 @@ def apply_text_poisoning_rules(
 
     for comp in components:
         try:
-            remember(comp, _scan_component_fields(comp))
+            comp_trunc: list[bool] = []
+            remember(comp, _scan_component_fields(comp, truncated=comp_trunc))
+            if comp_trunc and comp.source_path not in truncated_rel_paths:
+                failed(comp.bom_ref, "schema node budget reached")
         except (ValueError, RecursionError) as exc:
             failed(comp.bom_ref, type(exc).__name__)
         if comp.bom_ref in located_hits:

@@ -32,6 +32,7 @@ from nexus_symbiote.core.models import (
 )
 from nexus_symbiote.live.verify import observed_server_properties, observed_tool_properties
 from nexus_symbiote.scanners.live_mcp import DiscoveryResult
+from nexus_symbiote.utils.terminal import neutralize
 
 COLLECTOR = "live-mcp"
 _SERVER_REF = re.compile(r"[!-~]{1,256}")
@@ -210,51 +211,94 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
             unique.append(hit)
         return unique
 
+    scan_failures: list[str] = []
+
+    def _record_scan_limit(subject: str, reason: str) -> None:
+        entry = f"{subject}: {reason}"
+        if entry not in scan_failures:
+            scan_failures.append(entry)
+
+    def _scan_live_field(
+        field_text: str,
+        *,
+        surface: str,
+        where: str,
+        failure_subject: str,
+    ) -> list[TextPoisoningHit]:
+        try:
+            return scan_text_block(
+                field_text,
+                surface=surface,
+                is_tool_surface=True,
+                where=where,
+            )
+        except (ValueError, RecursionError) as exc:
+            _record_scan_limit(
+                failure_subject,
+                f"text-poisoning rules could not be applied ({type(exc).__name__})",
+            )
+            return []
+
+    server_subject = f"served server {neutralize(origin)}"
     server_hits: list[TextPoisoningHit] = []
     if isinstance(result.instructions, str) and result.instructions:
         server_hits.extend(
-            scan_text_block(
+            _scan_live_field(
                 result.instructions,
                 surface=origin,
-                is_tool_surface=True,
                 where="instructions",
+                failure_subject=server_subject,
             )
         )
     if isinstance(result.server_info, dict):
+        info_trunc: list[bool] = []
         for path, text in extract_json_text_entries(
-            result.server_info, max_depth=16, max_entries=256
+            result.server_info, max_depth=16, max_entries=256, truncated=info_trunc
         ):
             if text:
                 server_hits.extend(
-                    scan_text_block(
+                    _scan_live_field(
                         text,
                         surface=origin,
-                        is_tool_surface=True,
                         where=f"serverInfo.{path}",
+                        failure_subject=server_subject,
                     )
                 )
+        if info_trunc:
+            _record_scan_limit(
+                server_subject,
+                "text-poisoning scan truncated (serverInfo string budget reached)",
+            )
     for surface_label, items in (
         ("prompts", result.prompts),
         ("resourceTemplates", result.resource_templates),
     ):
         if items:
             for item_idx, item in enumerate(items):
+                item_subject = f"served {surface_label} {neutralize(item.identity)[:128]}"
+                item_trunc: list[bool] = []
                 for path, text in extract_json_text_entries(
-                    item.descriptor, max_depth=32, max_entries=512
+                    item.descriptor, max_depth=32, max_entries=512, truncated=item_trunc
                 ):
                     if text:
                         server_hits.extend(
-                            scan_text_block(
+                            _scan_live_field(
                                 text,
                                 surface=origin,
-                                is_tool_surface=True,
                                 where=f"{surface_label}[{item_idx}].{path}",
+                                failure_subject=item_subject,
                             )
                         )
+                if item_trunc:
+                    _record_scan_limit(
+                        item_subject,
+                        "text-poisoning scan truncated (descriptor string budget reached)",
+                    )
     if server_hits:
         _append_consolidated_risks(server, _dedupe_distinct_hits(server_hits))
 
     for observed, tool_comp in zip(result.tools, tools, strict=True):
+        tool_subject = f"served tool {neutralize(tool_comp.name)[:128]}"
         tool_hits: list[TextPoisoningHit] = []
         matched_values: list[tuple[str, list[TextPoisoningHit]]] = []
         parts: list[str] = []
@@ -262,30 +306,47 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
             ("description", tool_comp.description_text),
             ("description", tool_comp.description),
         ]
+        input_trunc: list[bool] = []
         tool_fields.extend(
             (f"input_schema.{path}", val)
             for path, val in extract_json_text_entries(
-                tool_comp.input_schema, max_depth=64, max_entries=2048
+                tool_comp.input_schema, max_depth=64, max_entries=2048, truncated=input_trunc
             )
         )
+        if input_trunc:
+            _record_scan_limit(
+                tool_subject,
+                "text-poisoning scan truncated (inputSchema string budget reached)",
+            )
         extra_fields = {
             k: v
             for k, v in observed.descriptor.items()
             if k not in {"name", "description", "inputSchema"}
         }
-        tool_fields.extend(extract_json_text_entries(extra_fields, max_depth=64, max_entries=1024))
+        extra_trunc: list[bool] = []
+        tool_fields.extend(
+            extract_json_text_entries(
+                extra_fields, max_depth=64, max_entries=1024, truncated=extra_trunc
+            )
+        )
+        if extra_trunc:
+            _record_scan_limit(
+                tool_subject,
+                "text-poisoning scan truncated (extra-field string budget reached)",
+            )
         for field_where, field_text in tool_fields:
             if field_text:
                 parts.append(field_text)
-                fh = scan_text_block(
+                fh = _scan_live_field(
                     field_text,
                     surface=tool_comp.name,
-                    is_tool_surface=True,
                     where=field_where,
+                    failure_subject=tool_subject,
                 )
                 tool_hits.extend(fh)
                 if fh:
                     matched_values.append((field_text, fh))
+        sidenote_trunc: list[bool] = []
         tool_hits.extend(
             check_sidenote_tool_schema(
                 tool_comp.input_schema,
@@ -294,8 +355,14 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
                 surface=tool_comp.name,
                 existing_hits=tool_hits,
                 matched_values=matched_values,
+                truncated=sidenote_trunc,
             )
         )
+        if sidenote_trunc:
+            _record_scan_limit(
+                tool_subject,
+                "text-poisoning scan truncated (schema node budget reached)",
+            )
         if tool_hits:
             _append_consolidated_risks(tool_comp, _dedupe_distinct_hits(tool_hits))
     surfaces = ["initialize", "tools/list"]
@@ -306,6 +373,7 @@ def observation_inventory(result: DiscoveryResult, *, server_ref: str | None = N
     bom.metadata.completeness = CompletenessClaim(
         scope="mcp-endpoint-observation",
         surfaces_scanned=[f"mcp-endpoint {origin}: {', '.join(surfaces)}"],
+        scan_failures=scan_failures,
         timestamp=observed_at,
         assurance_level=AssuranceLevel.OBSERVED,
         collectors_requested=[COLLECTOR],
