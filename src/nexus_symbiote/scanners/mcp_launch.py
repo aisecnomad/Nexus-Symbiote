@@ -2241,6 +2241,9 @@ def _exec_operands(name: str, rest: list[str], launch: Launch) -> list[str] | No
         if named is None:
             launch.fail(f"unrecognised {name} option")
             return None
+        flags = word[1 : named.start(1)] if named.group(1) is not None else word[1:]
+        if "c" in flags:
+            launch.node_tls_override = ""
         if named.group(1) == "a":
             index += 1
     if index >= len(rest):

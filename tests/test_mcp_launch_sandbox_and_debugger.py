@@ -190,6 +190,17 @@ def test_mcp_scanner_emits_high_and_medium_launch_context_findings(
         ("env", ["NODE_TLS_REJECT_UNAUTHORIZED=0", "bunx", "@acme/mcp@1.2.3"], True),
         ("env", ["-i", "NODE_TLS_REJECT_UNAUTHORIZED=0", "node", "./server.js"], True),
         ("sh", ["-c", "NODE_TLS_REJECT_UNAUTHORIZED=0 node ./server.js"], True),
+        ("bash", ["-c", "exec node ./server.js"], False),
+        ("bash", ["-c", "NODE_TLS_REJECT_UNAUTHORIZED=0 exec node ./server.js"], True),
+        ("bash", ["-c", "NODE_TLS_REJECT_UNAUTHORIZED=0 exec -c node ./server.js"], False),
+        ("bash", ["-c", "NODE_TLS_REJECT_UNAUTHORIZED=0 exec -cl node ./server.js"], False),
+        ("bash", ["-c", "NODE_TLS_REJECT_UNAUTHORIZED=0 exec -ca custom node ./server.js"], False),
+        ("bash", ["-c", "NODE_TLS_REJECT_UNAUTHORIZED=0 exec -acustom node ./server.js"], True),
+        (
+            "bash",
+            ["-c", "exec -c env NODE_TLS_REJECT_UNAUTHORIZED=0 node ./server.js"],
+            True,
+        ),
         ("env", ["NODE_TLS_REJECT_UNAUTHORIZED=1", "node", "./server.js"], False),
         ("env", ["NODE_TLS_REJECT_UNAUTHORIZED= 0", "node", "./server.js"], False),
         ("env", ["NODE_TLS_REJECT_UNAUTHORIZED=false", "node", "./server.js"], False),
@@ -239,6 +250,25 @@ def test_mcp_scanner_reports_effective_node_tls_bypass_and_honors_overrides(
                 "args": ["-i", "node", "./server.js"],
                 "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},
             },
+            "bash-exec-inherited": {
+                "command": "bash",
+                "args": ["-c", "exec node ./server.js"],
+                "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+            },
+            "bash-exec-cleared": {
+                "command": "bash",
+                "args": ["-c", "exec -c node ./server.js"],
+                "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+            },
+            "bash-exec-inline-then-cleared": {
+                "command": "bash",
+                "args": ["-c", "NODE_TLS_REJECT_UNAUTHORIZED=0 exec -c node ./server.js"],
+            },
+            "bash-exec-cleared-then-reassigned": {
+                "command": "bash",
+                "args": ["-c", "exec -c env NODE_TLS_REJECT_UNAUTHORIZED=0 node ./server.js"],
+                "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+            },
             "node-tls-non-zero-string": {
                 "command": "node",
                 "args": ["./server.js"],
@@ -258,7 +288,13 @@ def test_mcp_scanner_reports_effective_node_tls_bypass_and_honors_overrides(
     result = MCPScanner().scan(tmp_path)
     by_name = {c.name: c for c in result.components}
 
-    for name in ("node-tls-env", "npx-tls-env", "node-tls-wrapper"):
+    for name in (
+        "node-tls-env",
+        "npx-tls-env",
+        "node-tls-wrapper",
+        "bash-exec-inherited",
+        "bash-exec-cleared-then-reassigned",
+    ):
         assert any(
             r.category == "launch_context"
             and r.severity is RiskSeverity.HIGH
@@ -270,6 +306,8 @@ def test_mcp_scanner_reports_effective_node_tls_bypass_and_honors_overrides(
         "node-tls-re-enabled",
         "node-tls-unset",
         "node-tls-cleared",
+        "bash-exec-cleared",
+        "bash-exec-inline-then-cleared",
         "node-tls-non-zero-string",
         "python-ignores-node-tls",
     ):
