@@ -48,8 +48,9 @@ SDK_IMPORT = re.compile(
 )
 # The module names of import statements, whose every prefix CPython 3.12+ keeps for good.
 _GAPS = rf"{_GAP}*+"
-_DOTTED = rf"\.*+\w++(?:{_GAPS}\.{_GAPS}\w++)*+"
-_LIST = rf"(?:{_DOTTED}(?:{_GAPS}as{_GAPS}\w++)?{_GAPS},{_GAPS})*+{_DOTTED}"
+_IDENTIFIER = r"(?:[A-Za-z0-9_]|[^\x00-\x7f])++"  # Includes all Unicode identifier continuations.
+_DOTTED = rf"\.*+{_IDENTIFIER}(?:{_GAPS}\.{_GAPS}{_IDENTIFIER})*+"
+_LIST = rf"(?:{_DOTTED}(?:{_GAPS}as{_GAPS}{_IDENTIFIER})?{_GAPS},{_GAPS})*+{_DOTTED}"
 IMPORTED = re.compile(rf"(?<![\w.])(?:import|from)(?!\w){_GAPS}\(?{_GAPS}({_LIST})")
 DOTTED = re.compile(_DOTTED)
 # A root's name alone, searched for in text folded a slice at a time; the tree then decides.

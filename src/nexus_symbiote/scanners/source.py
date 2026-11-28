@@ -124,15 +124,23 @@ class SourceScanner(Scanner):
                 if not budget.admit(len(raw), path):
                     continue
                 try:
-                    text = _python_text(raw)
+                    text = _python_text(raw, _names_sdk)
                 except _UnreadableError as error:
-                    # Undecodable text does not run, unless its codec is one this reader skips.
-                    invalid = error.args[0] in (_INVALID_UTF8, _INVALID_DECLARED)
-                    if not invalid or _names_sdk(raw.decode("latin-1")):
-                        result.surfaces_excluded.append(
-                            f"{location}: source file cannot be decoded as its encoding "
-                            "declares; declarations in it were not read"
-                        )
+                    invalid = (_INVALID_UTF8, _INVALID_DECLARED)
+                    if error.args[0] in invalid and not _names_sdk(raw.decode("latin-1")):
+                        # The skipped first line may be the only reason ordinary decoding failed.
+                        try:
+                            other = _python_text(b"#\n" + raw.partition(b"\n")[2], _names_sdk)
+                        except _UnreadableError as alternate:
+                            if alternate.args[0] in invalid:
+                                continue
+                        else:
+                            if not _names_sdk(other):
+                                continue
+                    result.surfaces_excluded.append(
+                        f"{location}: source file cannot be decoded as its encoding "
+                        "declares; declarations in it were not read"
+                    )
                     continue
                 if not _names_sdk(text):
                     continue

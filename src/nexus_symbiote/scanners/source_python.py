@@ -512,6 +512,8 @@ class PythonReader:
             while True:
                 self._steps -= 1
                 if scope is None or nearest or not isinstance(scope, ast.ClassDef):
+                    if module.declared.get(scope, {}).get(name) == "global":
+                        scope = None
                     values = self._in_scope(module, scope, name)
                     if values is not None:
                         found = (_scope_key(module, scope, name), values)

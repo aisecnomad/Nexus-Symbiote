@@ -2132,3 +2132,44 @@ def test_a_model_given_when_a_partial_is_called_is_read(tmp_path: Path):
         },
     )
     assert set(models(result)) == {"gpt-4o", "o3"}
+
+
+def test_ambiguous_source_encoding_uses_the_collectors_sdk_vocabulary(tmp_path: Path):
+    (tmp_path / "dual.py").write_bytes(
+        "# coding: latin-1\n# coding: utf-8\nimport openai\n# café\n".encode()
+    )
+    result = SourceScanner().scan(tmp_path)
+    assert len(result.surfaces_excluded) == 1
+    assert result.surfaces_excluded[0].startswith("dual.py: source file cannot be decoded")
+
+
+def test_invalid_first_line_still_checks_the_skipped_interpretation(tmp_path: Path):
+    (tmp_path / "alternate.py").write_bytes(b"#\xff\n" + "import ｏｐｅｎａｉ\n".encode())
+    result = SourceScanner().scan(tmp_path)
+    assert len(result.surfaces_excluded) == 1
+    assert result.surfaces_excluded[0].startswith("alternate.py: source file cannot be decoded")
+
+
+def test_import_accounting_includes_unicode_identifier_continuations():
+    from nexus_symbiote.scanners.source_python_tables import DOTTED, IMPORTED
+
+    name = "a\u0300.service"
+    imported = IMPORTED.search(f"import {name}")
+    assert imported is not None and DOTTED.fullmatch(imported[1])
+    assert imported[1] == name
+
+
+def test_global_callee_is_resolved_in_the_module(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "app.py": "from litellm import completion as call\n"
+            "def outer():\n"
+            "    from logging import info as call\n"
+            "    def inner():\n"
+            "        global call\n"
+            "        call(model='sample-model')\n"
+        },
+    )
+    assert set(models(result)) == {"sample-model"}
+    assert not result.surfaces_excluded
