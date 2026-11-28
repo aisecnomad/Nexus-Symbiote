@@ -4,6 +4,10 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ## [Unreleased]
 
+### Security
+
+- **Tool-schema `$defs`/`sidenote` poisoning & live MCP recording parity:** Extended `TP-SIDENOTE-004` across `$defs`, `definitions`, `patternProperties`, `prefixItems`, `dependentSchemas`, `dependencies`, and `if`/`then`/`else` subtrees while binding evidence directly to the side-channel parameter's own subtree; applied unified single-pass `text_poisoning` consolidation across `discover-mcp --record` live server declarations (`instructions`, `serverInfo`, `prompts`, `resourceTemplates`) and full tool descriptors (`description`, `inputSchema`, `title`, `outputSchema`, `annotations`, `_meta`), recording explicit `CompletenessClaim.scan_failures` entries whenever bounded string or schema-node traversal caps truncate live or static poisoning inspection.
+
 ## [0.2.0] - 2026-11-25
 
 Major alpha milestone closing `0.1.0` detection gaps, adding reproducible content-addressed inventories, DSSE/in-toto inventory attestations, OTLP trace comparison, compliance crosswalks, G7 minimum-element coverage, interactive HTML risk graphs, control-plane auditing, typed CycloneDX/SPDX exports, and foreign SBOM import. Re-collect baselines after upgrading (see [Upgrading](#upgrading)).

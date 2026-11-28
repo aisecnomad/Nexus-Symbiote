@@ -20,7 +20,7 @@ import tokenize
 import unicodedata
 from bisect import bisect_left, bisect_right
 from collections import Counter, deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -85,6 +85,19 @@ _POINTER_FIELDS = frozenset(
         "allOf",
         "$defs",
         "definitions",
+        "patternProperties",
+        "prefixItems",
+        "dependentSchemas",
+        "dependencies",
+        "unevaluatedProperties",
+        "propertyNames",
+        "if",
+        "then",
+        "else",
+        "not",
+        "contains",
+        "outputSchema",
+        "_meta",
         "description",
         "title",
         "name",
@@ -103,19 +116,27 @@ _SIDE_CHANNEL_PARAM_NAMES = frozenset(
     {
         "note",
         "notes",
+        "sidenote",
+        "sidenotes",
         "debug",
         "telemetry",
+        "telemetry_payload",
         "meta",
         "metadata",
         "audit",
         "query",
         "context",
+        "hidden_context",
+        "conversation_history",
+        "system_state",
         "extra",
         "extras",
         "callback",
         "webhook",
         "reason",
         "comment",
+        "exfil",
+        "exfiltration",
     }
 )
 # Typographic apostrophes fold to ASCII so that "Don’t tell" reads as "Don't tell".
@@ -610,27 +631,50 @@ def extract_json_text_entries(
     *,
     max_depth: int = 32,
     max_entries: int = 4_096,
+    truncated: list[bool] | None = None,
+    skip_nested_roots: set[int] | None = None,
 ) -> list[tuple[str, str]]:
     """Iteratively extract ``(dotted_field_path, string_value)`` pairs from parsed JSON."""
     results: list[tuple[str, str]] = []
     queue: deque[tuple[str, object, int]] = deque([("", data, 0)])
-    while queue and len(results) < max_entries:
+    node_cap = sys.maxsize if max_entries == sys.maxsize else max(32_768, max_entries * 4)
+    visited = 0
+    did_truncate = False
+    while queue:
         prefix, node, depth = queue.popleft()
+        visited += 1
+        if depth and skip_nested_roots is not None and id(node) in skip_nested_roots:
+            continue
         if depth > max_depth:
+            if (isinstance(node, str) and node.strip()) or (
+                isinstance(node, (dict, list)) and bool(node)
+            ):
+                did_truncate = True
             continue
         if isinstance(node, str):
             if node.strip():
+                if len(results) >= max_entries:
+                    did_truncate = True
+                    break
                 results.append((prefix or "$", node))
         elif isinstance(node, dict):
             for key, val in node.items():
                 if not isinstance(key, str):
                     continue
+                if visited + len(queue) >= node_cap:
+                    did_truncate = True
+                    break
                 child = f"{prefix}.{key}" if prefix else key
                 queue.append((child, val, depth + 1))
         elif isinstance(node, list):
             for idx, item in enumerate(node):
+                if visited + len(queue) >= node_cap:
+                    did_truncate = True
+                    break
                 child = f"{prefix}[{idx}]"
                 queue.append((child, item, depth + 1))
+    if did_truncate and truncated is not None:
+        truncated.append(True)
     return results
 
 
@@ -653,8 +697,8 @@ def _pointer_segment(key: str | tuple[str, int]) -> str:
 
 def _json_strings_with_owners(
     data: object, names: Iterable[str], *, keys: bool = False
-) -> Iterator[tuple[str, str, _SourceOwner | None, bool]]:
-    """``(JSON pointer, string, owner, is_key)`` for every nonblank string, and with
+) -> Iterator[tuple[str, str, _SourceOwner | None, int]]:
+    """``(JSON pointer, string, owner, parent_id)`` for every nonblank string, and with
     ``keys`` every nonblank key at the pointer of its value, in O(size).
 
     The owner is the innermost enclosing object whose ``name`` names a component in
@@ -664,14 +708,14 @@ def _json_strings_with_owners(
     indexes and known field names only, and stop growing past the printed length.
     """
     known = frozenset(names)
-    queue: deque[tuple[str, object, _SourceOwner | None, _SourceOwner | None, str, str | None]] = (
-        deque([("", data, None, None, "", None)])
-    )
+    queue: deque[
+        tuple[str, object, _SourceOwner | None, _SourceOwner | None, str, str | None, int]
+    ] = deque([("", data, None, None, "", None, 0)])
     while queue:
-        pointer, node, by_name, by_key, slot, server = queue.popleft()
+        pointer, node, by_name, by_key, slot, server, parent_id = queue.popleft()
         if isinstance(node, str):
             if node.strip():
-                yield pointer, node, by_name or by_key, False
+                yield pointer, node, by_name or by_key, parent_id
             continue
         long = len(pointer) > _MAX_WHERE_CHARS
         if isinstance(node, dict):
@@ -700,9 +744,9 @@ def _json_strings_with_owners(
                 child = pointer if long else f"{pointer}/{_pointer_segment(key)}"
                 text = key[0] if isinstance(key, tuple) else key
                 if keys and isinstance(text, str) and text.strip():
-                    yield child, text, by_name or by_key, True
+                    yield child, text, by_name or by_key, id(node)
                 if inside_tool:
-                    queue.append((child, val, by_name, by_key, "", server))
+                    queue.append((child, val, by_name, by_key, "", server, id(node)))
                     continue
                 kind, host = "", server
                 if slot == "servers":
@@ -724,13 +768,22 @@ def _json_strings_with_owners(
                         inner,
                         kind,
                         host,
+                        id(node),
                     )
                 )
         elif isinstance(node, list):
             kind = {"servers": "server", "tools": "tool"}.get(slot, "")
             for idx, item in enumerate(node):
                 queue.append(
-                    (pointer if long else f"{pointer}/{idx}", item, by_name, by_key, kind, server)
+                    (
+                        pointer if long else f"{pointer}/{idx}",
+                        item,
+                        by_name,
+                        by_key,
+                        kind,
+                        server,
+                        id(node),
+                    )
                 )
 
 
@@ -1029,29 +1082,172 @@ def _escape_decoded_hits(
     ]
 
 
-def _collect_schema_property_names(schema: dict[str, Any] | None) -> set[str]:
+def _collect_schema_properties(
+    schema: dict[str, Any] | None,
+    *,
+    truncated: list[bool] | None = None,
+) -> list[tuple[str, dict[str, Any] | None, str]]:
     if not isinstance(schema, dict):
-        return set()
-    names: set[str] = set()
-    queue: deque[dict[str, Any]] = deque([schema])
+        return []
+    found: list[tuple[str, dict[str, Any] | None, str]] = []
+    seen: set[int] = {id(schema)}
+    queue: deque[tuple[dict[str, Any], str]] = deque([(schema, "")])
+    visited = 0
+    did_truncate = False
+
+    def _join(prefix: str, segment: str) -> str:
+        return f"{prefix}.{segment}" if prefix else segment
+
+    def _enqueue(sub: dict[str, Any], path: str) -> None:
+        nonlocal did_truncate
+        if id(sub) in seen:
+            return
+        if visited + len(queue) >= 4096:
+            did_truncate = True
+            return
+        seen.add(id(sub))
+        queue.append((sub, path))
+
     while queue:
-        node = queue.popleft()
+        node, prefix = queue.popleft()
+        visited += 1
         props = node.get("properties")
         if isinstance(props, dict):
             for k, v in props.items():
                 if isinstance(k, str):
-                    names.add(k)
-                if isinstance(v, dict):
-                    queue.append(v)
-        for combiner in ("items", "additionalProperties"):
+                    if len(found) >= 4096:
+                        did_truncate = True
+                        break
+                    prop_path = _join(prefix, f"properties.{k}")
+                    found.append((k, v if isinstance(v, dict) else None, prop_path))
+                    if isinstance(v, dict):
+                        _enqueue(v, prop_path)
+        for def_key in (
+            "$defs",
+            "definitions",
+            "patternProperties",
+            "dependentSchemas",
+            "dependencies",
+        ):
+            defs = node.get(def_key)
+            if isinstance(defs, dict):
+                for sub_name, sub_schema in defs.items():
+                    if isinstance(sub_schema, dict):
+                        _enqueue(sub_schema, _join(prefix, f"{def_key}.{sub_name}"))
+        items_val = node.get("items")
+        if isinstance(items_val, dict):
+            _enqueue(items_val, _join(prefix, "items"))
+        elif isinstance(items_val, list):
+            for idx, item in enumerate(items_val):
+                if isinstance(item, dict):
+                    _enqueue(item, _join(prefix, f"items[{idx}]"))
+        for combiner in (
+            "additionalProperties",
+            "unevaluatedProperties",
+            "propertyNames",
+            "if",
+            "then",
+            "else",
+            "not",
+            "contains",
+        ):
             sub = node.get(combiner)
             if isinstance(sub, dict):
-                queue.append(sub)
-        for list_key in ("anyOf", "oneOf", "allOf"):
+                _enqueue(sub, _join(prefix, combiner))
+        for list_key in ("anyOf", "oneOf", "allOf", "prefixItems"):
             items = node.get(list_key)
             if isinstance(items, list):
-                queue.extend(item for item in items if isinstance(item, dict))
-    return names
+                for idx, item in enumerate(items):
+                    if isinstance(item, dict):
+                        _enqueue(item, _join(prefix, f"{list_key}[{idx}]"))
+    if did_truncate and truncated is not None:
+        truncated.append(True)
+    return found
+
+
+def _side_channel_subtree_hit(
+    side_entries: Sequence[tuple[str, dict[str, Any] | None, str]],
+    *,
+    surface: str,
+    source_hits: dict[int, TextPoisoningHit] | None,
+    truncated: list[bool] | None = None,
+) -> TextPoisoningHit | None:
+    if source_hits is not None:
+        # Printed source pointers mask arbitrary keys. Retain the hit assigned to
+        # the actual parsed container, even when siblings contain identical text.
+        pending: deque[dict[Any, Any] | list[Any]] = deque(
+            sub for _, sub, _ in side_entries if sub is not None
+        )
+        visited: set[int] = set()
+        did_truncate = False
+        while pending:
+            current = pending.popleft()
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            if identity in source_hits:
+                return source_hits[identity]
+            children = current.values() if isinstance(current, dict) else current
+            for child in children:
+                if isinstance(child, (dict, list)):
+                    if len(visited) + len(pending) >= 4096:
+                        did_truncate = True
+                        break
+                    pending.append(child)
+        if did_truncate and truncated is not None:
+            truncated.append(True)
+        return None
+
+    # A component field is displayed as a dotted path. A literal dot in a key
+    # makes that rendering ambiguous, so only inspect the actual subtree.
+    # Give each named subtree its own budget and leave nested named subtrees
+    # for their own pass, even when their enclosing scan reaches its limit.
+    roots = {id(sub) for _, sub, _ in side_entries if sub is not None}
+    scanned_roots: set[int] = set()
+    sub_truncated: list[bool] = []
+    for _, sub, path in side_entries:
+        if sub is None or id(sub) in scanned_roots:
+            continue
+        scanned_roots.add(id(sub))
+        for sub_path, value in extract_json_text_entries(
+            sub, max_depth=64, max_entries=512, truncated=sub_truncated, skip_nested_roots=roots
+        ):
+            hits = scan_text_block(
+                value,
+                surface=surface,
+                is_tool_surface=True,
+                where=f"input_schema.{path}.{sub_path}",
+            )
+            for hit in hits:
+                if hit.category == CATEGORY_TOOL_POISONING:
+                    return hit
+    if sub_truncated and truncated is not None:
+        truncated.append(True)
+    return None
+
+
+def _prose_named_side_channel_hit(
+    side_props: Sequence[str],
+    combined_text: str,
+    *,
+    existing_hits: Sequence[TextPoisoningHit],
+    matched_values: Sequence[tuple[str, list[TextPoisoningHit]]] | None,
+) -> TextPoisoningHit | None:
+    patterns = [re.compile(rf"\b{re.escape(prop)}\b", re.IGNORECASE) for prop in side_props]
+    if matched_values is None:
+        # Direct single-text callers have no field map. Structured callers pass
+        # each matched field explicitly, including an empty list when none match.
+        if any(hit.where for hit in existing_hits):
+            return None
+        matched_values = [(combined_text, list(existing_hits))]
+    for value, hits in matched_values:
+        poison = next((hit for hit in hits if hit.category == CATEGORY_TOOL_POISONING), None)
+        if poison is not None:
+            normalized, _ = normalize_for_lexical_scan(value)
+            if any(pattern.search(normalized) for pattern in patterns):
+                return poison
+    return None
 
 
 def check_sidenote_tool_schema(
@@ -1061,6 +1257,9 @@ def check_sidenote_tool_schema(
     *,
     surface: str,
     existing_hits: list[TextPoisoningHit],
+    matched_values: Sequence[tuple[str, list[TextPoisoningHit]]] | None = None,
+    source_hits: dict[int, TextPoisoningHit] | None = None,
+    truncated: list[bool] | None = None,
 ) -> list[TextPoisoningHit]:
     """Detect Sidenote cross-property escalation on tool schemas and annotations.
 
@@ -1069,33 +1268,54 @@ def check_sidenote_tool_schema(
     Flags:
     1) A tool declaring ``readOnlyHint=True`` or ``destructiveHint=False`` whose text
        carries a poisoning directive.
-    2) A declared side-channel parameter (``note``, ``debug``, ``query``, ``context``,
-       ``metadata`` ...) that the tool's text names beside such a directive.
-    The finding is located at the poisoning hit that triggered it.
+    2) A declared side-channel parameter (``sidenote``, ``note``, ``debug``, ``query``,
+       ``context``, ``metadata`` ...) that the tool's text names beside such a directive
+       or whose own schema subtree houses the poisoning directive.
+    The finding is located at the side-channel subtree or prose hit that triggered it.
     """
     poison = next((h for h in existing_hits if h.category == CATEGORY_TOOL_POISONING), None)
     if poison is None:
         return []
     ann = annotations or {}
-    flagged = ann.get("readOnlyHint") is True or ann.get("destructiveHint") is False
-    if not flagged:
-        normalized, _ = normalize_for_lexical_scan(combined_text)
-        flagged = any(
-            re.search(rf"\b{re.escape(prop)}\b", normalized, re.IGNORECASE) is not None
-            for prop in sorted(_collect_schema_property_names(schema))
-            if prop.lower() in _SIDE_CHANNEL_PARAM_NAMES
+    schema_truncated: list[bool] = []
+    side_entries = [
+        entry
+        for entry in _collect_schema_properties(schema, truncated=schema_truncated)
+        if entry[0].lower() in _SIDE_CHANNEL_PARAM_NAMES
+    ]
+    subtree_trigger: TextPoisoningHit | None = None
+    trigger: TextPoisoningHit | None = None
+    if side_entries:
+        subtree_trigger = _side_channel_subtree_hit(
+            side_entries,
+            surface=surface,
+            source_hits=source_hits,
+            truncated=schema_truncated,
         )
-    if not flagged:
+        trigger = subtree_trigger
+        if trigger is None:
+            unique_props = sorted({prop for prop, _, _ in side_entries})
+            trigger = _prose_named_side_channel_hit(
+                unique_props,
+                combined_text,
+                existing_hits=existing_hits,
+                matched_values=matched_values,
+            )
+    if subtree_trigger is None and schema_truncated and truncated is not None:
+        truncated.append(True)
+    if trigger is None and (ann.get("readOnlyHint") is True or ann.get("destructiveHint") is False):
+        trigger = poison
+    if trigger is None:
         return []
     return [
         TextPoisoningHit(
             rule_id="TP-SIDENOTE-004",
             category=CATEGORY_TOOL_POISONING,
             severity=RiskSeverity.HIGH,
-            byte_offset=poison.byte_offset,
+            byte_offset=trigger.byte_offset,
             surface=surface,
             summary=_RULE_DESCRIPTIONS["TP-SIDENOTE-004"],
-            where=poison.where,
+            where=trigger.where,
         )
     ]
 
@@ -1412,11 +1632,13 @@ def _append_consolidated_risks(
     return added
 
 
-def _scan_component_fields(comp: ComponentWithRisks) -> list[TextPoisoningHit]:
+def _scan_component_fields(
+    comp: ComponentWithRisks, *, truncated: list[bool] | None = None
+) -> list[TextPoisoningHit]:
     if isinstance(comp, ToolComponent):
         surface = comp.source_path or comp.name
         hits: list[TextPoisoningHit] = []
-        parts: list[str] = []
+        matched_values: list[tuple[str, list[TextPoisoningHit]]] = []
         fields = [("description", comp.description_text), ("description", comp.description)]
         fields += [
             (f"input_schema.{path}", val)
@@ -1426,16 +1648,20 @@ def _scan_component_fields(comp: ComponentWithRisks) -> list[TextPoisoningHit]:
         ]
         for field, text in fields:
             if text:
-                parts.append(text)
-                hits.extend(
-                    scan_text_block(text, surface=surface, is_tool_surface=True, where=field)
+                field_hits = scan_text_block(
+                    text, surface=surface, is_tool_surface=True, where=field
                 )
+                hits.extend(field_hits)
+                if field_hits:
+                    matched_values.append((text, field_hits))
         return hits + check_sidenote_tool_schema(
             comp.input_schema,
-            "\n".join(parts),
+            "",
             comp.annotations,
             surface=surface,
             existing_hits=hits,
+            matched_values=matched_values,
+            truncated=truncated,
         )
     if isinstance(comp, A2AServerComponent):
         surface = comp.source_path or comp.agent_card_path or comp.name
@@ -1512,7 +1738,7 @@ class _DeclarationFindings:
     has_tool_schema: bool
     unresolved: bool
     hits: list[TextPoisoningHit] = field(default_factory=list)
-    text_values: list[str] = field(default_factory=list)
+    poison_by_container: dict[int, TextPoisoningHit] = field(default_factory=dict)
     matched_values: list[tuple[str, list[TextPoisoningHit]]] = field(default_factory=list)
 
 
@@ -1525,6 +1751,7 @@ def _scan_structured_source(
     include_keys: bool = False,
     tool_context: bool | None = None,
     raw_matches: _RawMatches | None = None,
+    truncated: list[bool] | None = None,
 ) -> _SourceFindings:
     """Scan a parsed configuration and evaluate each tool's text alongside its own schema.
 
@@ -1540,7 +1767,7 @@ def _scan_structured_source(
     file_owner = _file_level_owner(comps, root_agent)
     fallback = _fallback_component(comps, root_agent) if comps else root_agent
     groups: dict[tuple[str | None, int], _DeclarationFindings] = {}
-    for pointer, value, owner, is_key in _json_strings_with_owners(
+    for pointer, value, owner, parent_id in _json_strings_with_owners(
         parsed, known_names, keys=include_keys
     ):
         target, node, ambiguous = fallback, None, False
@@ -1592,10 +1819,13 @@ def _scan_structured_source(
             where=pointer or ("$" if include_keys else ""),
         )
         group.hits.extend(hits)
-        if raw_matches is not None and hits:
+        if (raw_matches is not None or has_tool_schema) and hits:
             group.matched_values.append((value, hits))
-        if has_tool_schema and not is_key:
-            group.text_values.append(value)
+        if has_tool_schema and parent_id not in group.poison_by_container:
+            for hit in hits:
+                if hit.category == CATEGORY_TOOL_POISONING:
+                    group.poison_by_container[parent_id] = hit
+                    break
     results: _SourceFindings = []
     for ordinal, group in enumerate(groups.values(), start=1):
         target, hits = group.target, group.hits
@@ -1615,10 +1845,13 @@ def _scan_structured_source(
             )
             hits = hits + check_sidenote_tool_schema(
                 schema if isinstance(schema, dict) else None,
-                "\n".join(group.text_values),
+                "",
                 ann if isinstance(ann, dict) else None,
                 surface=rel_path,
                 existing_hits=hits,
+                matched_values=group.matched_values,
+                source_hits=group.poison_by_container,
+                truncated=truncated,
             )
         unresolved = ordinal if group.unresolved else 0
         if raw_matches is not None and group.matched_values:
@@ -1636,6 +1869,8 @@ def _scan_text_source(
     raw_text: str,
     comps: list[ComponentWithRisks],
     root_agent: AgentComponent | None,
+    *,
+    truncated: list[bool] | None = None,
 ) -> _SourceFindings:
     suffix = PurePosixPath(rel_path).suffix.lower()
     is_tool_ctx = any(
@@ -1680,6 +1915,7 @@ def _scan_text_source(
                 include_keys=True,
                 tool_context=is_tool_ctx,
                 raw_matches=raw_matches,
+                truncated=truncated,
             )
         )
     by_target: dict[str | None, tuple[ComponentWithRisks | None, list[TextPoisoningHit]]] = {}
@@ -1765,6 +2001,7 @@ def apply_text_poisoning_rules(
     own_failures: list[str] = []
     own_exclusions: list[str] = []
     scanned_rel_paths: set[str] = set()
+    truncated_rel_paths: set[str] = set()
     added = 0
 
     def failed(subject: str, reason: str) -> None:
@@ -1829,11 +2066,19 @@ def apply_text_poisoning_rules(
                             # read. An instruction file named .json is text to its readers.
                             if not all(isinstance(c, _INSTRUCTION_KINDS) for c in comps):
                                 failed(rel_path, "not JSON")
+                    src_trunc: list[bool] = []
                     owned = (
-                        _scan_structured_source(rel_path, parsed, comps, root_agent)
+                        _scan_structured_source(
+                            rel_path, parsed, comps, root_agent, truncated=src_trunc
+                        )
                         if isinstance(parsed, (dict, list))
-                        else _scan_text_source(rel_path, raw_text, comps, root_agent)
+                        else _scan_text_source(
+                            rel_path, raw_text, comps, root_agent, truncated=src_trunc
+                        )
                     )
+                    if src_trunc:
+                        truncated_rel_paths.add(rel_path)
+                        failed(rel_path, "schema node budget reached")
                     for target, hits in owned:
                         if target is not None:
                             remember(target, hits)
@@ -1848,7 +2093,10 @@ def apply_text_poisoning_rules(
 
     for comp in components:
         try:
-            remember(comp, _scan_component_fields(comp))
+            comp_trunc: list[bool] = []
+            remember(comp, _scan_component_fields(comp, truncated=comp_trunc))
+            if comp_trunc and comp.source_path not in truncated_rel_paths:
+                failed(comp.bom_ref, "schema node budget reached")
         except (ValueError, RecursionError) as exc:
             failed(comp.bom_ref, type(exc).__name__)
         if comp.bom_ref in located_hits:
