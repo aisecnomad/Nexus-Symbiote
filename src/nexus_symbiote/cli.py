@@ -34,6 +34,7 @@ from nexus_symbiote.graph_cli import register_graph_commands
 from nexus_symbiote.instruction_diff import register_instruction_diff_commands
 from nexus_symbiote.inventory_export_cli import register_inventory_export_commands
 from nexus_symbiote.live_cli import register_live_commands
+from nexus_symbiote.mcp_server_cli import register_mcp_server_commands
 from nexus_symbiote.minimum_elements_cli import register_minimum_elements_commands
 from nexus_symbiote.policy import Policy
 from nexus_symbiote.policy import running_in_ci as _running_in_ci
@@ -2866,6 +2867,7 @@ register_export_standard_commands(main)
 register_control_plane_commands(main)
 register_instruction_diff_commands(main)
 register_sbom_commands(main)
+register_mcp_server_commands(main)
 
 if __name__ == "__main__":
     main()

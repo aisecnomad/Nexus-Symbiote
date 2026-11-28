@@ -31,6 +31,7 @@ src/nexus_symbiote/
   control_plane_audit.py, control_plane_cli.py — Hook target/preamble binding, MCP bridges, steering surface, CI/hosted tools, identity blast radius (`audit-control-plane`)
   sbom_import.py, evidence_profile.py, sbom_cli.py — Foreign SBOM import, nested manifests, per-component evidence profile; `import-sbom`, `evidence-profile`
   advisories.py, offline_advisories.py, vex_decisions.py — Explicit OSV queries, offline advisory matching, and VEX decision records
+  mcp_server.py, mcp_server_cli.py     — Offline read-only stdio JSON-RPC 2.0 MCP query server over native AgentBOMs (`mcp-server`)
   modes.py                             — Offline by default; live mode is opt-in
   reporting.py                         — Neutralized text and JSON gate reporting
   scanner_catalog.py                   — Built-in collector universe for coverage checks
