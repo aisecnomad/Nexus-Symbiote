@@ -1409,3 +1409,156 @@ def test_origin_only_scanner_inventory_matches_unchanged_runtime_and_redacts_que
     ):
         with pytest.raises(RuntimeBOMInputError, match="Invalid package URL"):
             _package_repository("pypi", bad_purl)
+
+
+def test_secret_purl_repository_provenance_trojan_and_ipv6_hardening(tmp_path):
+    static = AIBOM(
+        components=[
+            RegistryEntryComponent(
+                bom_ref="pkg:pypi/langchain",
+                name="langchain",
+                version="0.3.27",
+                registry_type="pypi",
+                package_url="pkg:pypi/langchain@0.3.27",
+            ),
+            RegistryEntryComponent(
+                bom_ref="pkg:npm/langchain-core",
+                name="@langchain/core",
+                version="0.3.0",
+                registry_type="npm",
+                package_url="pkg:npm/%40langchain/core@0.3.0",
+            ),
+        ]
+    )
+    inv = tmp_path / "static.json"
+    inv.write_text(static.to_native_json(), encoding="utf-8")
+
+    # 1. Withheld secret PURL never falls back to raw self.purl; schemeless & double-encoded
+    #    repository credentials redact cleanly.
+    secret_rt = tmp_path / "secret-purl.cdx.json"
+    secret_rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "library",
+                        "name": "langchain",
+                        "version": "0.3.27",
+                        "purl": "pkg:pypi/langchain@0.3.27?repository_url=alice%3Ahunter2%40evil.example%2Fsimple",
+                    },
+                    {
+                        "type": "library",
+                        "name": "langchain",
+                        "version": "0.3.27",
+                        "purl": "pkg:pypi/langchain@0.3.27?repository_url=https%3A%2F%2Fbob%253As3cr3t%40evil2.example%2Fsimple",
+                    },
+                    {
+                        "type": "library",
+                        "name": "langchain",
+                        "version": "0.3.27",
+                        "purl": "pkg:pypi/langchain@0.3.27#ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+                    },
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    sec_report = collect(inv, [secret_rt], fail_on="undeclared")
+    rendered = render(sec_report)
+    for leak in ("hunter2", "s3cr3t", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"):
+        assert leak not in rendered
+    assert any(obs.get("repository") == "***" for obs in sec_report["observed"])
+
+    # 2. Provenance qualifiers (download_url, vcs_url, checksum) are NOT stripped during matching.
+    prov_rt = tmp_path / "prov-qualifiers.cdx.json"
+    prov_rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "library",
+                        "name": "langchain",
+                        "version": "0.3.27",
+                        "purl": "pkg:pypi/langchain@0.3.27?download_url=https://evil.invalid/langchain.whl",
+                    },
+                    {
+                        "type": "library",
+                        "name": "langchain",
+                        "version": "0.3.27",
+                        "purl": "pkg:pypi/langchain@0.3.27?vcs_url=git+https://evil.invalid/langchain.git",
+                    },
+                    {
+                        "type": "library",
+                        "name": "langchain",
+                        "version": "0.3.27",
+                        "purl": f"pkg:pypi/langchain@0.3.27?checksum=sha256:{_SHA_B}",
+                    },
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    prov_report = collect(inv, [prov_rt], fail_on="undeclared")
+    assert prov_report["gate"]["passed"] is False
+    assert prov_report["reconciliation"]["matched"] == []
+    assert len(prov_report["reconciliation"]["undeclared"]) == 3
+
+    # 3. Runtime package name/group disagreeing with PURL raises RuntimeBOMInputError; valid group matches.
+    group_ok_rt = tmp_path / "group-ok.cdx.json"
+    group_ok_rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "library",
+                        "group": "@langchain",
+                        "name": "core",
+                        "version": "0.3.0",
+                        "purl": "pkg:npm/%40langchain/core@0.3.0",
+                    }
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    ok_group = collect(inv, [group_ok_rt], fail_on="drift")
+    assert ok_group["gate"]["passed"] is True
+
+    trojan_rt = tmp_path / "trojan.cdx.json"
+    trojan_rt.write_text(
+        json.dumps(
+            _cdx(
+                components=[
+                    {
+                        "type": "library",
+                        "name": "evil-trojan",
+                        "version": "0.3.27",
+                        "purl": "pkg:pypi/langchain@0.3.27",
+                    }
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeBOMInputError, match="name and package URL disagree"):
+        collect(inv, [trojan_rt])
+
+    # 4. Malformed static IPv6 endpoint in origin-only check raises RuntimeBOMInputError, not ValueError.
+    bad_ipv6_inv = tmp_path / "bad-ipv6.json"
+    bad_ipv6_inv.write_text(
+        AIBOM(
+            components=[
+                MCPServerComponent(
+                    bom_ref="mcp:bad-v6",
+                    name="bad-v6",
+                    endpoint_url="https://[::1",
+                    properties={"collection_mode": "static-config"},
+                )
+            ]
+        ).to_native_json(),
+        encoding="utf-8",
+    )
+    empty_rt = tmp_path / "empty-rt.cdx.json"
+    empty_rt.write_text(json.dumps(_cdx()), encoding="utf-8")
+    with pytest.raises(RuntimeBOMInputError, match="invalid host or port"):
+        collect(bad_ipv6_inv, [empty_rt])

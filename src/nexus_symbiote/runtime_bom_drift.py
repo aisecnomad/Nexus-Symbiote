@@ -16,7 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from packageurl import PackageURL
 
@@ -38,7 +38,6 @@ from nexus_symbiote.core.models import (
     RegistryEntryComponent,
 )
 from nexus_symbiote.sbom_import import (
-    _PURL_METADATA_QUALIFIERS,
     MAX_FOREIGN_SBOM_BYTES,
     _clean_exact_spec,
     _display_purl,
@@ -62,6 +61,7 @@ MAX_TEXT_FIELD = 512
 _SUPPORTED_CDX_VERSIONS = frozenset({"1.4", "1.5", "1.6", "1.7"})
 _SHA256_DIGEST_RE = re.compile(r"^(?:sha256:)?([0-9a-fA-F]{64})$", re.ASCII)
 _MUTABLE_IMAGE_TAGS = frozenset({"latest", "main", "master", "dev", "nightly", "edge", "canary"})
+_NON_PROVENANCE_QUALIFIERS = frozenset({"arch", "file_name", "tag"})
 _ORIGIN_ONLY_COLLECTION_MODES = frozenset(
     {"static-config", "static-agent-card", "static-syntax-reference"}
 )
@@ -119,7 +119,10 @@ def _is_origin_only_endpoint(comp: MCPServerComponent | A2AServerComponent) -> b
     if comp.properties.get("collection_mode") not in _ORIGIN_ONLY_COLLECTION_MODES:
         return False
     raw = comp.endpoint_url.strip()
-    parsed = urlsplit(raw if "://" in raw else f"https://{raw}")
+    try:
+        parsed = urlsplit(raw if "://" in raw else f"https://{raw}")
+    except ValueError:
+        raise RuntimeBOMInputError("Service endpoint has an invalid host or port.") from None
     return parsed.path in {"", "/"} and not parsed.query
 
 
@@ -342,7 +345,7 @@ def _package_qualifiers(purl: str | None) -> tuple[str, dict[str, str]]:
     quals = {
         k.lower(): v
         for k, v in (package.qualifiers or {}).items()
-        if k.lower() != "repository_url" and k.lower() not in _PURL_METADATA_QUALIFIERS
+        if k.lower() != "repository_url" and k.lower() not in _NON_PROVENANCE_QUALIFIERS
     }
     return package.subpath or "", quals
 
@@ -356,6 +359,24 @@ def _package_source_matches(obs: _RuntimeObservation, comp: RegistryEntryCompone
     if obs_sub != comp_sub:
         return False
     return not ((obs_quals or comp_quals) and obs_quals != comp_quals)
+
+
+def _safe_repository(value: str) -> str:
+    decoded = value
+    for _ in range(4):
+        next_decoded = unquote(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+    else:
+        return REDACTED
+    try:
+        probe = decoded if "://" in decoded or decoded.startswith("//") else "//" + decoded
+        if urlsplit(probe).username is not None:
+            return REDACTED
+    except ValueError:
+        return REDACTED
+    return _clean(decoded)
 
 
 @dataclass(frozen=True)
@@ -375,7 +396,7 @@ class _RuntimeObservation:
     repository: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        safe_purl = (_display_purl(self.purl) or self.purl) if self.purl else None
+        safe_purl = _display_purl(self.purl) if self.purl else None
         payload: dict[str, Any] = {
             "kind": self.kind,
             "name": _clean(self.name),
@@ -390,7 +411,7 @@ class _RuntimeObservation:
         if self.supplier:
             payload["supplier"] = _clean(self.supplier)
         if self.repository:
-            payload["repository"] = _clean(self.repository)
+            payload["repository"] = _safe_repository(self.repository)
         if self.endpoints:
             payload["endpoints"] = [_clean(ep) for ep in self.endpoints]
         if self.mutable_reason:
@@ -524,6 +545,18 @@ def _collect_observations(
                 sha256 = sha256 or pin
             elif raw_type in {"library", "framework", "application"}:
                 ecosystem, package_name = _package_identity(name, purl)
+                package = _parse_purl(purl)
+                if package is not None:
+                    group = raw_entry.get("group")
+                    decl_name = (
+                        f"{group.strip()}/{name}"
+                        if isinstance(group, str) and group.strip() and "/" not in name
+                        else name
+                    )
+                    expected_name = _norm_pkg(package_name) if ecosystem == "pypi" else package_name
+                    declared_norm = _norm_pkg(decl_name) if ecosystem == "pypi" else decl_name
+                    if expected_name != declared_norm:
+                        raise RuntimeBOMInputError("Runtime package name and package URL disagree.")
                 if not (
                     _is_ai_package_name(name)
                     or _is_ai_package_name(package_name)
