@@ -621,6 +621,8 @@ def test_security_graph_audit_regressions_kev_truncation_escaping_and_epss_zero(
 
     # EPSS 0.0 inside a dict is preserved (not treated as falsy None) and non-recursive.
     assert _parse_epss({"score": 0.0}) == 0.0
+    assert _parse_epss(10**400) is None
+    assert _parse_epss({"epss": -(10**400)}) is None
     assert _parse_epss({"score": {"score": 0.5}}) is None
 
     # KEV chain cannot be hidden by max_chains=1 even when non-KEV critical risks exist,

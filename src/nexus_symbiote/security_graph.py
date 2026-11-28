@@ -233,18 +233,11 @@ def _normalize_severity(raw: object) -> str:
 
 
 def _parse_epss(raw: object) -> float | None:
-    if isinstance(raw, bool):
-        return None
-    if isinstance(raw, (int, float)):
-        value = float(raw)
-        return round(value, 6) if 0.0 <= value <= 1.0 else None
     if isinstance(raw, dict):
-        leaf = raw["score"] if "score" in raw else raw.get("epss")
-        if isinstance(leaf, bool) or not isinstance(leaf, (int, float)):
-            return None
-        value = float(leaf)
-        return round(value, 6) if 0.0 <= value <= 1.0 else None
-    return None
+        raw = raw.get("score", raw.get("epss"))
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0 <= raw <= 1:
+        return None
+    return round(float(raw), 6)
 
 
 def _parse_kev(entry: Mapping[str, Any]) -> bool:
