@@ -719,6 +719,8 @@ class _ZipMember(NamedTuple):
     method: int
     size: int
     offset: int
+    uncompressed_size: int = 0
+    flag_bits: int = 0
 
 
 def _zip_directory(
@@ -882,17 +884,19 @@ def _directory_members(data: bytes, begin: int, size: int, end: int) -> list[_Zi
         name = _listed_name(
             data[position + 46 : extra_at], data[extra_at : extra_at + extra_length]
         )
+        flag_bits = _little(data, position + 8, 2)
         method = _little(data, position + 10, 2)
-        located = _zip64_location(
+        sizes = _zip64_sizes(
             data[extra_at : extra_at + extra_length],
             _little(data, position + 24, 4),
             _little(data, position + 20, 4),
             _little(data, position + 42, 4),
         )
-        if located is not None:
-            members.append(_ZipMember(name, method, *located))
+        if sizes is not None:
+            uncompressed, compressed, offset = sizes
+            members.append(_ZipMember(name, method, compressed, offset, uncompressed, flag_bits))
         elif _pickle_member(name):
-            members.append(_ZipMember(name, method, 0, -1))
+            members.append(_ZipMember(name, method, 0, -1, 0, flag_bits))
         else:
             unlocated = True
         position = extra_at + extra_length + _little(data, position + 32, 2)
@@ -932,21 +936,12 @@ def _listed(members: list[_ZipMember], *, complete: bool) -> list[_ZipMember] | 
     return members if complete or any(_pickle_member(m.name) for m in members) else None
 
 
-def _zip64_location(
+def _zip64_sizes(
     extra: bytes, uncompressed: int, compressed: int, offset: int
-) -> tuple[int, int] | None:
-    """A member's compressed size and local header offset, from ZIP64 when they overflow.
-
-    The ZIP64 extra field holds, in this order, each of the uncompressed size, the
-    compressed size and the offset whose 32-bit field is 0xFFFFFFFF (or 0xFFFFFFFFFFFFFFFF
-    for a chained uncompressed size). ``zipfile._decodeExtra`` loops through every 0x0001
-    extra field in order; ``None`` is returned when a field is truncated or too short for
-    the remaining sentinel slots, which ``zipfile`` refuses as a corrupt archive. Without
-    the field, ``zipfile`` keeps the 32-bit values as written and reads the archive, so
-    they are kept here too.
-    """
+) -> tuple[int, int, int] | None:
+    """A member's uncompressed size, compressed size, and local header offset."""
     if 0xFFFFFFFF not in (uncompressed, compressed, offset):
-        return compressed, offset
+        return uncompressed, compressed, offset
     values = [uncompressed, compressed, offset]
     position = 0
     while position + 4 <= len(extra):
@@ -963,7 +958,24 @@ def _zip64_location(
                     values[index] = _little(field, cursor, 8)
                     cursor += 8
         position += 4 + length
-    return values[1], values[2]
+    return values[0], values[1], values[2]
+
+
+def _zip64_location(
+    extra: bytes, uncompressed: int, compressed: int, offset: int
+) -> tuple[int, int] | None:
+    """A member's compressed size and local header offset, from ZIP64 when they overflow.
+
+    The ZIP64 extra field holds, in this order, each of the uncompressed size, the
+    compressed size and the offset whose 32-bit field is 0xFFFFFFFF (or 0xFFFFFFFFFFFFFFFF
+    for a chained uncompressed size). ``zipfile._decodeExtra`` loops through every 0x0001
+    extra field in order; ``None`` is returned when a field is truncated or too short for
+    the remaining sentinel slots, which ``zipfile`` refuses as a corrupt archive. Without
+    the field, ``zipfile`` keeps the 32-bit values as written and reads the archive, so
+    they are kept here too.
+    """
+    sizes = _zip64_sizes(extra, uncompressed, compressed, offset)
+    return None if sizes is None else (sizes[1], sizes[2])
 
 
 def _reread(stream: BinaryIO, offset: int, size: int) -> bytes:
@@ -979,12 +991,16 @@ def _reread(stream: BinaryIO, offset: int, size: int) -> bytes:
     return os.pread(stream.fileno(), size, offset)
 
 
+MAX_ZIP_LZMA_DICT_BYTES = 16 * 1024 * 1024
+
+
 class _ZipLzmaDecompressor:
     """Bounded ZIP method-14 (LZMA1) decompressor using public ``FORMAT_ALONE`` headers."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, uncompressed_size: int | None = None) -> None:
         self._header = bytearray()
         self._decomp: lzma.LZMADecompressor | None = None
+        self._uncompressed_size = uncompressed_size
 
     @property
     def eof(self) -> bool:
@@ -1005,10 +1021,20 @@ class _ZipLzmaDecompressor:
             if len(self._header) < 9:
                 return b""
             props = bytes(self._header[4:9])
+            if _little(props, 1, 4) > MAX_ZIP_LZMA_DICT_BYTES:
+                raise FormatError(ZIP_MEMBER_UNREAD)
             remainder = bytes(self._header[9:])
             self._header.clear()
-            decomp = lzma.LZMADecompressor(lzma.FORMAT_ALONE)
-            decomp.decompress(props + b"\xff" * 8, max_length=0)
+            size_field = (
+                self._uncompressed_size.to_bytes(8, "little")
+                if self._uncompressed_size is not None
+                else b"\xff" * 8
+            )
+            try:
+                decomp = lzma.LZMADecompressor(lzma.FORMAT_ALONE, memlimit=MAX_ZIP_LZMA_DICT_BYTES)
+                decomp.decompress(props + size_field, max_length=0)
+            except (MemoryError, lzma.LZMAError) as exc:
+                raise FormatError(ZIP_MEMBER_UNREAD) from exc
             self._decomp = decomp
             data = remainder
         return self._decomp.decompress(data, max_length=max_length)
@@ -1029,6 +1055,7 @@ class _MemberData:
         *,
         deflated: bool = False,
         method: int | None = None,
+        uncompressed_size: int | None = None,
     ) -> None:
         self._stream = stream
         self._position = start
@@ -1043,7 +1070,7 @@ class _MemberData:
         elif resolved_method == 12:
             self._inflater = bz2.BZ2Decompressor()
         elif resolved_method == 14:
-            self._inflater = _ZipLzmaDecompressor()
+            self._inflater = _ZipLzmaDecompressor(uncompressed_size=uncompressed_size)
         else:
             raise FormatError(ZIP_MEMBER_UNREAD)
         self._pending = b""
@@ -1085,7 +1112,7 @@ class _MemberData:
                         break
                 try:
                     out += self._inflater.decompress(feed, max_length=size - len(out))
-                except (EOFError, OSError, lzma.LZMAError) as exc:
+                except (EOFError, MemoryError, OSError, lzma.LZMAError) as exc:
                     raise FormatError(ZIP_MEMBER_UNREAD) from exc
         return bytes(out)
 
@@ -1375,7 +1402,18 @@ def _member_holds_keras_code(
         return None
     if member.method not in (0, 8, 12, 14):
         return None
-    data = _MemberData(stream, start, member.size, method=member.method)
+    lzma_uncompressed: int | None = None
+    if member.method == 14 and (member.flag_bits & 2) == 0:
+        if member.uncompressed_size <= 0 or member.uncompressed_size > MAX_KERAS_CONFIG_BYTES:
+            return None
+        lzma_uncompressed = member.uncompressed_size
+    data = _MemberData(
+        stream,
+        start,
+        member.size,
+        method=member.method,
+        uncompressed_size=lzma_uncompressed,
+    )
     raw = bytearray()
     try:
         while not data.complete:
@@ -1434,15 +1472,15 @@ def _members_hold_keras_code(
         for pos, (cd_idx, _) in enumerate(ordered)
     }
     # zipfile/Keras opens the last central-directory entry named config.json; inspect it
-    # first so earlier decoy entries cannot drain the budget before the active config.
-    inspection_order = [config_indices[-1]] + [
+    # first and bound it by directory so a decoy at offset 0 cannot shrink its read range.
+    active_idx = config_indices[-1]
+    inspection_order = [active_idx] + [
         cd_idx for _, cd_idx in sorted((members[i].offset, i) for i in config_indices[:-1])
     ]
     unread = False
     for cd_idx in inspection_order:
-        found = _member_holds_keras_code(
-            stream, members[cd_idx], boundaries[cd_idx], budget, required=required
-        )
+        end = directory if cd_idx == active_idx else boundaries[cd_idx]
+        found = _member_holds_keras_code(stream, members[cd_idx], end, budget, required=required)
         if found:
             return True
         unread = unread or found is None
@@ -1479,17 +1517,17 @@ def _inspect_zip_container(
         return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_PICKLE_MEMBER
     arrays: bool | None = False
     for members, offset in readings:
-        found = _members_hold_object_array(stream, members, offset, budget)
-        if found:
-            return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_OBJECT_ARRAY
-        if found is None:
-            arrays = None
         keras_code = _members_hold_keras_code(
             stream, members, offset, budget, required=expect_keras
         )
         if keras_code:
             return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_KERAS_CODE_EXECUTION
         if keras_code is None:
+            arrays = None
+        found = _members_hold_object_array(stream, members, offset, budget)
+        if found:
+            return SerializationSafety.UNSAFE_CODE_EXECUTION, ZIP_OBJECT_ARRAY
+        if found is None:
             arrays = None
     if undecided:
         return SerializationSafety.UNKNOWN, ZIP_DIRECTORY_UNREAD
@@ -1537,9 +1575,9 @@ def _recognized_code_container(
         array = _object_array(prefix, capture.read, budget)
         if array is True:
             return SerializationSafety.UNSAFE_CODE_EXECUTION, NUMPY_OBJECT_ARRAY
-        if array is None:
-            return SerializationSafety.UNKNOWN, NUMPY_HEADER_UNREAD
-        non_zip: tuple[SerializationSafety, str] | None = None
+        non_zip: tuple[SerializationSafety, str] | None = (
+            (SerializationSafety.UNKNOWN, NUMPY_HEADER_UNREAD) if array is None else None
+        )
     else:
         non_zip = _recognized_pickle(cast(BinaryIO, capture), prefix, size, by_content=by_content)
         if non_zip is not None and non_zip[0] is SerializationSafety.UNSAFE_CODE_EXECUTION:

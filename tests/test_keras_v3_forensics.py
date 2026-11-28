@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import zipfile
 from pathlib import Path
 
@@ -587,3 +588,172 @@ def test_keras_bzip2_and_lzma_config_members_are_inspected_and_bounded(
         compression=compression,
     )
     assert inspect_model_format(bomb) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
+
+
+def _raw_zip_with_entries(entries: list[tuple[bytes, int, int, bytes, int]]) -> bytes:
+    """Build a raw ZIP archive from (name, flag_bits, method, comp_data, uncomp_size) tuples."""
+    body = bytearray()
+    cd = bytearray()
+    offsets: list[int] = []
+    for name, flag_bits, method, comp_data, uncomp_size in entries:
+        offsets.append(len(body))
+        local = struct.pack(
+            "<4sHHHHHIIIHH",
+            b"PK\x03\x04",
+            20,
+            flag_bits,
+            method,
+            0,
+            0,
+            0,
+            len(comp_data),
+            uncomp_size,
+            len(name),
+            0,
+        )
+        body += local + name + comp_data
+    cd_offset = len(body)
+    for (name, flag_bits, method, comp_data, uncomp_size), offset in zip(
+        entries, offsets, strict=True
+    ):
+        cd += (
+            struct.pack(
+                "<4sHHHHHHIIIHHHHHII",
+                b"PK\x01\x02",
+                20,
+                20,
+                flag_bits,
+                method,
+                0,
+                0,
+                0,
+                len(comp_data),
+                uncomp_size,
+                len(name),
+                0,
+                0,
+                0,
+                0,
+                0,
+                offset,
+            )
+            + name
+        )
+    eocd = struct.pack(
+        "<4sHHHHIIH",
+        b"PK\x05\x06",
+        0,
+        0,
+        len(entries),
+        len(entries),
+        len(cd),
+        cd_offset,
+        0,
+    )
+    return bytes(body + cd + eocd)
+
+
+def test_keras_lzma_huge_dict_no_eos_numpy_prefix_budget_and_decoy(tmp_path: Path) -> None:
+    import lzma
+
+    # 1. Method-14 LZMA declaring a 4 GiB dictionary fails closed without MemoryError.
+    huge_dict_payload = struct.pack("<HH", 0x0914, 5) + b"\x5d\xff\xff\xff\xff" + b"\x00" * 16
+    lzma_dos = tmp_path / "lzma_4gib_dict.keras"
+    lzma_dos.write_bytes(_raw_zip_with_entries([(b"config.json", 2, 14, huge_dict_payload, 64)]))
+    assert inspect_model_format(lzma_dos) == (SerializationSafety.UNKNOWN, ZIP_MEMBER_UNREAD)
+
+    # 2. APPNOTE §5.8.8 no-EOS method-14 (flag_bits & 2 == 0) detects Lambda RCE cleanly.
+    raw_lambda = json.dumps(
+        {
+            "module": "keras",
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "module": "keras.layers",
+                        "class_name": "Lambda",
+                        "config": {"function": {"class_name": "__lambda__", "config": {}}},
+                    }
+                ]
+            },
+        }
+    ).encode("utf-8")
+    filters = [{"id": lzma.FILTER_LZMA1, "lc": 3, "lp": 0, "pb": 2, "dict_size": 1 << 16}]
+    alone = lzma.compress(raw_lambda, format=lzma.FORMAT_ALONE, filters=filters)
+    no_eos_payload = struct.pack("<HH", 0x0914, 5) + alone[:5] + alone[13:]
+    no_eos_keras = tmp_path / "lzma_no_eos.keras"
+    no_eos_keras.write_bytes(
+        _raw_zip_with_entries([(b"config.json", 0, 14, no_eos_payload, len(raw_lambda))])
+    )
+    assert inspect_model_format(no_eos_keras) == (
+        SerializationSafety.UNSAFE_CODE_EXECUTION,
+        ZIP_KERAS_CODE_EXECUTION,
+    )
+
+    # 3. Malformed NumPy v2 prefix ahead of a trailing malicious .keras archive still catches Keras.
+    base_keras = _write_keras_zip(tmp_path / "base_trailing.keras", raw_lambda)
+    polyglot = tmp_path / "numpy_v2_prefix.keras"
+    polyglot.write_bytes(
+        b"\x93NUMPY\x02\x00" + struct.pack("<I", 0x100000) + base_keras.read_bytes()
+    )
+    assert inspect_model_format(polyglot) == (
+        SerializationSafety.UNSAFE_CODE_EXECUTION,
+        ZIP_KERAS_CODE_EXECUTION,
+    )
+
+    # 4. 250 dummy .npy members cannot exhaust InspectionBudget before Keras config inspection.
+    dummy_npy = (
+        b"\x93NUMPY\x01\x00"
+        + struct.pack("<H", 118)
+        + (b"{'descr': '<f4', 'fortran_order': False, 'shape': (1,), }").ljust(117)
+        + b"\n"
+        + b"\x00\x00\x00\x00"
+    )
+    many_npy = tmp_path / "many_npy.keras"
+    with zipfile.ZipFile(many_npy, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for idx in range(250):
+            zf.writestr(f"a{idx:03d}.npy", dummy_npy)
+        zf.writestr("config.json", raw_lambda)
+    assert inspect_model_format(many_npy) == (
+        SerializationSafety.UNSAFE_CODE_EXECUTION,
+        ZIP_KERAS_CODE_EXECUTION,
+    )
+
+    # 5. A 0-byte decoy central-directory entry at offset 0 cannot shrink active config.json's end.
+    decoy_zip = tmp_path / "offset_zero_decoy.keras"
+    raw_archive = bytearray(
+        _raw_zip_with_entries([(b"config.json", 0, 0, raw_lambda, len(raw_lambda))])
+    )
+    # Insert a decoy CD entry with offset=0 ahead of config.json in the central directory.
+    local_len = 30 + len(b"config.json") + len(raw_lambda)
+    orig_cd = bytes(raw_archive[local_len : len(raw_archive) - 22])
+    decoy_cd = (
+        struct.pack(
+            "<4sHHHHHHIIIHHHHHII",
+            b"PK\x01\x02",
+            20,
+            20,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            len(b"decoy.txt"),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        + b"decoy.txt"
+    )
+    new_cd = decoy_cd + orig_cd
+    new_eocd = struct.pack("<4sHHHHIIH", b"PK\x05\x06", 0, 0, 2, 2, len(new_cd), local_len, 0)
+    decoy_zip.write_bytes(bytes(raw_archive[:local_len]) + new_cd + new_eocd)
+    assert inspect_model_format(decoy_zip) == (
+        SerializationSafety.UNSAFE_CODE_EXECUTION,
+        ZIP_KERAS_CODE_EXECUTION,
+    )
