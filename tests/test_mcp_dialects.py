@@ -494,6 +494,44 @@ env = { COLOR = "rose" }
     assert found["web"].properties["env_vars_referenced"] == ["meadow"]
 
 
+@pytest.mark.parametrize("config_only", [False, True])
+def test_forwarded_names_respect_host_and_short_authorization_values(tmp_path, config_only):
+    codex = """
+[mcp_servers.local]
+command = "catalog"
+env_vars = ["ochre", "birch", "amber", "coral", "cedar", "cedar_name", "PUBLIC_NAME"]
+"""
+    files = {
+        ".codex/config.toml": codex,
+        "nested/.claude/settings.json": json.dumps({"env": {"COLOR": "ochre"}}),
+        ".cursor/settings.json": json.dumps({"env": {"AUTHORIZATION": "Bearer birch"}}),
+        ".mcp.json": json.dumps(
+            {
+                "mcpServers": {
+                    "other": {
+                        "command": "catalog",
+                        "args": [
+                            "--auth",
+                            "Bearer amber",
+                            "--auth",
+                            "Bearer",
+                            "coral",
+                            "--auth=Bearer",
+                            "cedar",
+                        ],
+                    }
+                }
+            }
+        ),
+    }
+    scan(tmp_path, files)
+    found = servers(MCPScanner().scan(tmp_path, config_only=config_only))["local"]
+    assert found.properties["env_vars_referenced"] == ["PUBLIC_NAME", "cedar_name"]
+    (tmp_path / ".cursor/settings.json").write_text("{")
+    found = servers(MCPScanner().scan(tmp_path, config_only=config_only))["local"]
+    assert "env_vars_referenced" not in found.properties
+
+
 def test_codex_withholds_forwarded_names_when_exact_value_index_overflows(tmp_path, monkeypatch):
     from nexus_symbiote.scanners import mcp
 

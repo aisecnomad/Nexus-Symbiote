@@ -116,6 +116,7 @@ from nexus_symbiote.utils.secrets import (
     redact_descriptor,
     redact_text,
     scheme_credentials,
+    scheme_parts,
     secret_like,
     secret_values,
 )
@@ -3842,6 +3843,9 @@ class _ForwardedNameValues(KnownValues):
         self._exact: set[str] = set()
 
     def add_exact(self, value: str) -> None:
+        scheme = scheme_parts(value)
+        if scheme is not None:
+            value = scheme[1]
         if len(self._exact) <= _MAX_FORWARDED_NAME_VALUES and _CODEX_ENV_NAME.fullmatch(value):
             self._exact.add(value)
             if len(self._exact) > _MAX_FORWARDED_NAME_VALUES:
@@ -3849,11 +3853,15 @@ class _ForwardedNameValues(KnownValues):
 
     def add_arguments(self, arguments: Iterable[Any]) -> None:
         """Index separate and inline credential options in a client's argument vector."""
-        previous = ""
+        takes_value = False
         for item in arguments:
             if isinstance(item, str):
-                if _is_credential_flag(previous) and credential_name(previous):
+                if takes_value:
                     self.add_exact(item)
+                # Accept an auth scheme as a separate word between the flag and value.
+                takes_value = (takes_value and item.lower() in _ASSIGNMENT_SCHEMES) or (
+                    _is_credential_flag(item) and credential_name(item)
+                )
                 assigned = _assigned(item)
                 if assigned is not None:
                     name, value, variable = assigned
@@ -3861,7 +3869,9 @@ class _ForwardedNameValues(KnownValues):
                     # assignment uses the variable name inside its option.
                     if credential_name(name if variable else item.partition("=")[0]):
                         self.add_exact(value)
-            previous = item if isinstance(item, str) else ""
+                        takes_value = value.lower() in _ASSIGNMENT_SCHEMES
+            else:
+                takes_value = False
 
     def held_by(self, name: str) -> bool:
         return name in self._exact or super().held_by(name)
@@ -3998,6 +4008,8 @@ class MCPScanner(Scanner):
                     clients,
                     known,
                     launched,
+                    sources=sources,
+                    links=links,
                 )
             finally:
                 self._resolvers = None
@@ -4006,7 +4018,6 @@ class MCPScanner(Scanner):
                 f"{path}: {_DIRECTORY_GAP}" for path in sorted(directory_gaps)
             )
             if known is not None:
-                self._read_host_settings(files, sources, links, known)
                 self._scan_code_mcp_clients(
                     result, sources, known, [*links, *skipped], walk_complete, launched
                 )
@@ -4050,6 +4061,9 @@ class MCPScanner(Scanner):
         clients: dict[str, MCPClientComponent],
         known: KnownValues | None,
         launched: list[tuple[str, str, dict[str, Any]]] | None = None,
+        *,
+        sources: list[Path],
+        links: list[Path],
     ) -> bool:
         """Read each client file in ``paths``; whether any of them was present.
 
@@ -4139,14 +4153,19 @@ class MCPScanner(Scanner):
         # A name may repeat a literal or credential of any client file, so every file is read first.
         names = _Names(literals)
         protected = _ForwardedNameValues()
-        if any(
+        has_forwarding = any(
             dialect.shape == "codex"
             and any(
                 isinstance(entry, dict) and not _CODEX_FORWARDING_FIELDS.isdisjoint(entry)
                 for _, entry in read.servers
             )
             for dialect, _, read, _, _ in collected
-        ):
+        )
+        if known is not None or has_forwarding:
+            self._read_host_settings(
+                files, sources, links, known, protected if has_forwarding else None
+            )
+        if has_forwarding:
             for dialect, data, _, scrubber, _hits in collected:
                 protected.add(scrubber.values)
                 configured = _configured_values(
@@ -5721,7 +5740,11 @@ class MCPScanner(Scanner):
 
     @staticmethod
     def _read_host_settings(
-        files: ConfinedCollection, sources: list[Path], links: list[Path], known: KnownValues
+        files: ConfinedCollection,
+        sources: list[Path],
+        links: list[Path],
+        known: KnownValues | None,
+        forwarded: _ForwardedNameValues | None,
     ) -> None:
         """Add the values of Claude Code and Cursor settings, whose `env` reaches servers.
 
@@ -5737,18 +5760,25 @@ class MCPScanner(Scanner):
         )
         for path in paths:
             found = files.regular_file(path)
-            if found is None or found[1] > files.max_file_bytes:
-                known.refuse()
-                continue
-            raw = files.read_bytes(path, missing_ok=True)
+            raw = (
+                files.read_bytes(path, missing_ok=True)
+                if found is not None and found[1] <= files.max_file_bytes
+                else None
+            )
             try:
-                configured = None if raw is None else _configured_values(_load_jsonc(raw.decode()))
+                configured = (
+                    None
+                    if raw is None
+                    else _configured_values(_load_jsonc(raw.decode()), forwarded=forwarded)
+                )
             except (UnicodeDecodeError, ValueError, RecursionError, MemoryError):
                 configured = None
-            if configured is None:
-                known.refuse()
-            else:
-                known.add(configured)
+            for index in (known, forwarded):
+                if index is not None:
+                    if configured is None:
+                        index.refuse()
+                    else:
+                        index.add(configured)
 
     def _scan_code_mcp_clients(
         self,
