@@ -869,6 +869,12 @@ client.chat.completions.create(model="{model}", messages=[])
 client.chat.completions.create(model="openai/{model}", messages=[])
 client.chat.completions.create(model=os.getenv("{variable}", "{default}"), messages=[])
 client.chat.completions.create(model=os.environ["{variable}"], messages=[])
+NAME = "{model}"
+client.chat.completions.create(model=NAME, messages=[])
+client.chat.completions.create(model=f"{{NAME}}-mini", messages=[])
+client.chat.completions.create(model=NAME.upper(), messages=[])
+client.chat.completions.create(**{{"model": NAME}})
+client.chat.completions.create(model=os.environ.get("{variable}") or NAME, messages=[])
 """
     _, exported = _scan_source({"app/bot.py": source.encode()})
     assert planted not in exported

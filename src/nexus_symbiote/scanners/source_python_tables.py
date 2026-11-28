@@ -111,6 +111,8 @@ TEXT_CALLS = frozenset({
     *dir(str), "KnownModelName", "cached_file", "get", "get_from_dict_or_env", "get_from_env",
     "get_secret", "hf_hub_download", "hf_hub_url", "snapshot_download", "try_to_load_from_cache",
 })  # fmt: skip
+# Calls that read an environment variable: its name first, then its default.
+ENVIRONMENT_READS = frozenset({"decouple.config", "os.environ.get", "os.getenv"})
 # Calls that call their first argument with the rest, so its keywords are that callee's.
 FORWARDERS = frozenset(
     {

@@ -10,7 +10,7 @@ Notable changes to Nexus SymBiote, newest release first. Follows [Keep a Changel
 
 ### Added
 
-- **Model identifiers in application source (`source` collector):** reads, without importing or running anything, the model identifiers that Python code writes as literal arguments of calls into a known SDK, or of an object it cannot tell where the call is named as SDK calls are. A model argument that is not a literal is a coverage gap, unless an SDK makes the object it holds. Each is a `model` component at `declared` assurance whose `source_reference` claim names the file and line. See the [collector reference](docs/collectors.md#declarations-in-application-source) and the [roadmap decision](ROADMAP.md#decisions-and-non-goals).
+- **Model identifiers in application source (`source` collector):** reads, without importing or running anything, the model identifiers that Python code gives a known SDK, or an object it cannot tell where the call is named as SDK calls are. A model argument is followed within its file through names, conditionals, environment variables' defaults, joined text and string methods, and the variables that may override a value read are recorded; what it can hold besides is a coverage gap, unless an SDK makes the object it holds. Each is a `model` component at `declared` assurance whose `source_reference` claim names the file and line. See the [collector reference](docs/collectors.md#declarations-in-application-source) and the [roadmap decision](ROADMAP.md#decisions-and-non-goals).
 - **Validation of source references:** `validate --project` reports the absent artifact of a model identifier it read again from source as information, as it does for a cited model of an imported report.
 
 ## [0.2.0] - 2026-11-25

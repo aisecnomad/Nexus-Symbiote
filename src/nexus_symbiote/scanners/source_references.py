@@ -5,7 +5,9 @@ declaration with the file and line it was read from.
 
 from __future__ import annotations
 
+import functools
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
@@ -23,6 +25,8 @@ MAX_EVIDENCE_LOCATIONS = 16
 MAX_RECORDS = 5_000
 
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{1,127}")
+_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,63}")
+_RUN = re.compile(r"[A-Za-z0-9]{24,}")
 # A long run of hex or base64, or user information before an ``@``: a key's shape, no name's.
 # Elsewhere in a name, a base64 run counts when it holds a capital, as keys do and paths do not.
 _SECRET_SHAPED = re.compile(
@@ -89,6 +93,16 @@ def model_kind(name: str, *, embedding: bool = False) -> str | None:
     return None
 
 
+@functools.lru_cache(maxsize=4096)
+def environment_name(name: object) -> str | None:
+    """``name`` when it can be exported as the name of an environment variable: one shaped
+    like a key, a long run of hex or of letters and digits not all in capitals, is not."""
+    if not isinstance(name, str) or not _ENVIRONMENT_NAME.fullmatch(name):
+        return None
+    keylike = _SECRET_SHAPED.search(name) or any(not run.isupper() for run in _RUN.findall(name))
+    return None if keylike or not unchanged_by_redaction(name) else name
+
+
 def model_ref(name: str) -> str:
     return f"model:source:{quote(name, safe='._:@+-')}"
 
@@ -98,6 +112,8 @@ class _Model:
     name: str
     locations: set[tuple[str, int]] = field(default_factory=set)
     kinds: set[str] = field(default_factory=set)
+    environment: set[str] = field(default_factory=set)
+    environment_unlisted: bool = False
     methods: set[str] = field(default_factory=set)
     remote_code: bool = False
     count: int = 0
@@ -114,6 +130,8 @@ class Declarations:
         self._full = False
         self._path = ""
         self._lines: set[tuple[str, int]] = set()
+        # Where each file first reads a variable that alone sets a model, with no value.
+        self.unresolved_environment: dict[tuple[str, str], int] = {}
 
     def gap(self, path: str, line: int, reason: str) -> None:
         text = f"{path}:{line}: {reason}"
@@ -130,8 +148,10 @@ class Declarations:
         method: str,
         embedding: bool = False,
         remote_code: bool = False,
+        environment: Iterable[str] = (),
     ) -> str | None:
-        """Record one reference to a model; ``remote_code`` says its call lets it run its code."""
+        """Record one reference to a model; ``remote_code`` says its call lets it run its
+        code, and ``environment`` names the variables that, when set, give another model."""
         if not isinstance(literal, str):
             return None
         if literal not in self._written:
@@ -167,7 +187,21 @@ class Declarations:
         if kind:
             record.kinds.add(kind)
         record.remote_code = record.remote_code or remote_code
+        # Each name was checked where it was read; one is checked again once for a model.
+        record.environment.update(
+            filter(environment_name, frozenset(environment) - record.environment)
+        )
+        if len(record.environment) > MAX_EVIDENCE_LOCATIONS:
+            # The first names in order are kept, as the first places are.
+            record.environment = set(sorted(record.environment)[:MAX_EVIDENCE_LOCATIONS])
+            record.environment_unlisted = True
         return model_ref(name)
+
+    def close(self) -> None:
+        """Name each model that only an environment variable sets, once for each file that
+        reads it so: a value another read gives does not stand for this one."""
+        for (path, name), line in sorted(self.unresolved_environment.items()):
+            self.gap(path, line, f"model set only by environment variable {name}; not inventoried")
 
     def components(self) -> list[AnyComponent]:
         built: list[AnyComponent] = []
@@ -184,6 +218,10 @@ class Declarations:
             }
             if model.count > MAX_EVIDENCE_LOCATIONS:
                 properties["references_unlisted"] = model.count - MAX_EVIDENCE_LOCATIONS
+            if model.environment:
+                properties["environment_variables"] = sorted(model.environment)
+            if model.environment_unlisted:
+                properties["environment_variables_unlisted"] = True
             kind = "fine-tuned" if "fine-tuned" in model.kinds else min(model.kinds, default=None)
             built.append(
                 ModelComponent(

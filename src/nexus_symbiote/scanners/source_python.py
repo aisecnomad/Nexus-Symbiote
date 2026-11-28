@@ -1,7 +1,8 @@
 """Read the model identifiers Python source gives an SDK, without importing or running it.
 
 Only a file that imports a known SDK is analysed; ``docs/collectors.md`` says what is read
-and what is a gap. Each name in each scope is worked out once, so the work is linear.
+and what is a gap. A model argument is followed within its file to each text it may hold.
+Each name in each scope is worked out once, so the work is linear.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 import ast
 import builtins
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import TypeVar
@@ -22,6 +23,7 @@ from nexus_symbiote.scanners.source_python_tables import (
     CLASS_METHODS,
     DOTTED,
     EMBEDDING_KEYWORDS,
+    ENVIRONMENT_READS,
     FORWARDERS,
     IMPORTED,
     MODEL_CALLS,
@@ -32,12 +34,25 @@ from nexus_symbiote.scanners.source_python_tables import (
     WEIGHT_CLASSES,
     WEIGHT_ROOTS,
 )
-from nexus_symbiote.scanners.source_references import Declarations, placeholder
+from nexus_symbiote.scanners.source_references import (
+    Declarations,
+    environment_name,
+    model_identifier,
+    placeholder,
+)
 
 METHOD = "python-ast"
 LOCAL = "<project>"
 # What a callee is, is followed this far: each step is one attribute, call or alias.
 MAX_ORIGIN_DEPTH = 32
+# A model argument is followed this far through names and conditionals, to at most so
+# many values; joined text keeps at most so many texts of at most so many characters.
+MAX_DEPTH = 12
+MAX_CANDIDATES = 16
+MAX_STRINGS = 16
+MAX_TEXT = 256
+# Environment variables that may override one text, past which the rest are cut.
+MAX_VARIABLES = 16
 MAX_STEPS = 2_000_000
 # A dotted name longer than this is not followed, so no read costs a long name's length.
 MAX_ORIGIN = 256
@@ -53,6 +68,9 @@ _DISPLAYS: dict[type[ast.AST], str] = {
     ast.List: "list", ast.ListComp: "list", ast.Dict: "dict", ast.DictComp: "dict",
     ast.Set: "set", ast.SetComp: "set", ast.Tuple: "tuple", ast.JoinedStr: "str",
 }  # fmt: skip
+_TRANSFORMS: dict[str, Callable[[str], str]] = {
+    "lower": str.lower, "strip": str.strip, "upper": str.upper,
+}  # fmt: skip
 _BUILTINS = frozenset(dir(builtins))
 _ANYTHING = frozenset({"builtins.object", "typing.Any", "typing_extensions.Any"})
 _ACCESSORS = frozenset({"builtins.getattr", "typing.cast", "typing_extensions.cast"})
@@ -64,6 +82,8 @@ _STUBS = ("botocore.", "mypy_boto3", "types_boto3")
 _KWARGS = ("config_kwargs", "huggingface_pipeline_kwargs", "model_kwargs", "pipeline_kwargs",
            "tokenizer_kwargs")  # fmt: skip
 _DICTS = (ast.Dict, ast.Call)
+# Keywords whose value a call reads as options, as it reads a ``**`` spread.
+_OPTIONS_KEYWORDS = (None, *_KWARGS)
 # Roots whose objects are not another library's: what they make may be text.
 _NOT_LIBRARIES = frozenset({"builtins", *sys.stdlib_module_names})
 _T = TypeVar("_T")
@@ -103,17 +123,30 @@ class Module:
     # Names a scope declares ``global`` or ``nonlocal``, which bind in another scope.
     declared: dict[ast.AST | None, dict[str, str]] = field(default_factory=dict)
     bindings: dict[ast.AST | None, dict[str, list[ast.AST]]] = field(default_factory=dict)
-    definitions: dict[ast.AST | None, dict[str, ast.AST]] = field(default_factory=dict)
+    nonlocal_writes: dict[tuple[ast.AST, str], list[ast.AST]] = field(default_factory=dict)
     parameters: dict[ast.AST, dict[str, ast.arg]] = field(default_factory=dict)
+    # Names the file reads other than by spreading them into a call with ``**`` or giving
+    # them as a call's options, and whether an import with ``*`` may bind any name.
+    touched: set[str] = field(default_factory=set)
+    spread: set[int] = field(default_factory=set)
+    starred: bool = False
+    # The calls each name is given to as options, which may change the dict they are given.
+    options: dict[str, list[ast.Call]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, eq=False)
 class _Value:
     module: Module
     node: ast.AST
+    # Environment variables that, when set, give the value in place of this one.
+    variables: frozenset[str] = frozenset()
 
 
 _Scoped = tuple[int, str]
+# The texts an expression spells, each with the variables that may override it, and
+# whether that is all it can hold.
+_Text = tuple[str, frozenset[str]]
+_Spelling = tuple[tuple[_Text, ...], bool]
 
 
 def _split(origin: str) -> tuple[str, str, str | None]:
@@ -205,6 +238,70 @@ def _loads_weights(origin: str) -> bool:
     return loads and "(" not in origin
 
 
+def _outside(node: ast.AST) -> list[ast.AST]:
+    """What a function, class or comprehension evaluates in the scope around it."""
+    if isinstance(node, _FUNCTIONS):
+        arguments = node.args
+        parts: list[ast.AST] = [*arguments.defaults, *filter(None, arguments.kw_defaults)]
+        if not isinstance(node, ast.Lambda):
+            every = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]
+            every += filter(None, (arguments.vararg, arguments.kwarg))
+            parts += [*node.decorator_list, *filter(None, (a.annotation for a in every))]
+            parts += filter(None, [node.returns])
+        return parts
+    if isinstance(node, ast.ClassDef):
+        return [*node.decorator_list, *node.bases, *(keyword.value for keyword in node.keywords)]
+    if isinstance(node, _COMPREHENSIONS):
+        return [node.generators[0].iter]
+    return []
+
+
+def _members(annotation: ast.expr | None) -> list[ast.expr] | None:
+    """Flatten union annotations within the same bound as other candidate lists."""
+    pending = [annotation] if annotation is not None else []
+    members: list[ast.expr] = []
+    remaining = MAX_CANDIDATES * 3
+    while pending:
+        remaining -= 1
+        if remaining < 0:
+            return None
+        item = pending.pop()
+        if isinstance(item, ast.BinOp) and isinstance(item.op, ast.BitOr):
+            pending.extend((item.right, item.left))
+        elif isinstance(item, ast.Subscript) and _named(item.value) in ("Optional", "Union"):
+            inner = item.slice
+            if isinstance(inner, ast.Tuple):
+                if len(inner.elts) > MAX_CANDIDATES:
+                    return None
+                pending.extend(reversed(inner.elts))
+            else:
+                pending.append(inner)
+        elif isinstance(item, ast.Constant):
+            if item.value is not None:
+                # A quoted forward reference can name any type, including a non-SDK one.
+                return []
+        else:
+            members.append(item)
+            if len(members) > MAX_CANDIDATES:
+                return None
+    return members
+
+
+def _named(node: ast.expr) -> str | None:
+    return (
+        node.id
+        if isinstance(node, ast.Name)
+        else node.attr
+        if isinstance(node, ast.Attribute)
+        else None
+    )
+
+
+def _falsy(node: ast.AST | None) -> bool:
+    """Whether a default is absent or a constant that ``or`` passes over."""
+    return node is None or (isinstance(node, ast.Constant) and not node.value)
+
+
 def _scope_key(module: Module, scope: ast.AST | None, name: str) -> _Scoped:
     # A module's own scope is its tree, so the names of two modules never meet.
     return (id(module.tree if scope is None else scope), name)
@@ -224,6 +321,9 @@ class PythonReader:
         self._named: dict[_Scoped, str | None] = {}
         self._scoped: dict[_Scoped, list[_Value] | None] = {}
         self._lookups: dict[_Scoped, tuple[_Scoped, list[_Value]] | None] = {}
+        self._reads: dict[int, tuple[str, ast.expr | None] | None] = {}
+        self._spelled: dict[int, _Spelling] = {}
+        self._pending: set[int] = set()
         self._unread: set[tuple[int, int]] = set()
         self._given: set[tuple[int, int]] = set()
         self._steps = 0
@@ -248,7 +348,8 @@ class PythonReader:
             self._found.gap(path, 1, _SHADOWED)
         if self._cut or self._steps <= 0:
             self._found.gap(path, 1, _CUT)
-        for table in (self._origins, self._named, self._scoped, self._lookups):
+        tables = (self._origins, self._named, self._scoped, self._lookups, self._reads)
+        for table in (*tables, self._spelled):
             table.clear()
 
     @staticmethod
@@ -275,8 +376,12 @@ class PythonReader:
     def _index(self, module: Module) -> bool:
         bound = limits.current().python_nodes
         stack: list[tuple[ast.AST, ast.AST | None]] = [(module.tree, None)]
+        # Defaults, annotations, decorators, bases and a comprehension's first iterable
+        # are evaluated in the scope around what they belong to.
+        around: dict[int, ast.AST | None] = {}
         while stack:
             node, scope = stack.pop()
+            scope = around.pop(id(node), scope)
             module.nodes.append(node)
             if len(module.nodes) > bound:
                 return False
@@ -284,11 +389,36 @@ class PythonReader:
             if isinstance(node, (ast.Global, ast.Nonlocal)):
                 kind = "global" if isinstance(node, ast.Global) else "nonlocal"
                 module.declared.setdefault(scope, {}).update(dict.fromkeys(node.names, kind))
+            elif isinstance(node, ast.Call):
+                for keyword in node.keywords:
+                    if keyword.arg in _OPTIONS_KEYWORDS:
+                        module.spread.add(id(keyword.value))
+                    if keyword.arg in _KWARGS and isinstance(keyword.value, ast.Name):
+                        module.options.setdefault(keyword.value.id, []).append(node)
+            elif isinstance(node, ast.Assign) and len(node.targets) > 1:
+                # ``a = b = {...}`` binds one dict to two names, so one may change the other's.
+                module.touched.update(t.id for t in node.targets if isinstance(t, ast.Name))
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                if id(node) not in module.spread:
+                    module.touched.add(node.id)
+            if isinstance(node, _SCOPES):
+                around.update((id(part), scope) for part in _outside(node))
             inner = node if isinstance(node, _SCOPES) else scope
             stack.extend((child, inner) for child in reversed(list(ast.iter_child_nodes(node))))
         package = PurePosixPath(module.path).parent.parts
         for node in module.nodes:
             self._bind(module, node, package)
+        # An enclosing binding can occur below the nested function in source order.
+        for (inner, name), values in module.nonlocal_writes.items():
+            owner = module.scopes.get(inner)
+            while owner is not None:
+                if isinstance(owner, _FUNCTIONS) and (
+                    name in module.bindings.get(owner, {})
+                    or name in module.parameters.get(owner, {})
+                ):
+                    module.bindings.setdefault(owner, {}).setdefault(name, []).extend(values)
+                    break
+                owner = module.scopes.get(owner)
         return True
 
     def _bind(self, module: Module, node: ast.AST, package: tuple[str, ...]) -> None:
@@ -308,6 +438,7 @@ class PythonReader:
             for alias in node.names:
                 if alias.name == "*":
                     module.modules.add(base if len(base) <= MAX_ORIGIN else base.split(".")[0])
+                    module.starred = True
                 elif len(base) > MAX_ORIGIN:
                     self._bind_import(module, alias, alias.asname or alias.name, base)
                 else:
@@ -333,7 +464,7 @@ class PythonReader:
         elif isinstance(node, ast.MatchMapping) and node.rest:
             self._bind_name(module, node.rest, node, module.scopes.get(node))
         elif isinstance(node, _DEFINITIONS):
-            module.definitions.setdefault(module.scopes.get(node), {})[node.name] = node
+            self._bind_name(module, node.name, node, module.scopes.get(node))
         if isinstance(node, _FUNCTIONS):
             arguments = node.args
             positional = [*arguments.posonlyargs, *arguments.args]
@@ -369,10 +500,9 @@ class PythonReader:
         kind = module.declared.get(scope, {}).get(name)
         if kind == "global":
             scope = None
-        elif kind == "nonlocal":
-            scope = module.scopes.get(scope) if scope is not None else None
-            while scope is not None and not isinstance(scope, _FUNCTIONS):
-                scope = module.scopes.get(scope)
+        elif kind == "nonlocal" and scope is not None:
+            module.nonlocal_writes.setdefault((scope, name), []).append(value)
+            return
         module.bindings.setdefault(scope, {}).setdefault(name, []).append(value)
 
     def _bind_target(
@@ -490,13 +620,11 @@ class PythonReader:
             found = [
                 _Value(module, value) for value in module.bindings.get(scope, {}).get(name, ())
             ]
-            definition = module.definitions.get(scope, {}).get(name)
-            if definition is not None:
-                found.append(_Value(module, definition))
             parameter = None if scope is None else module.parameters.get(scope, {}).get(name)
             if parameter is not None:
                 # A caller may pass any value, whatever the default and the body bind.
                 found.append(_Value(module, parameter))
+            self._steps -= 1 + len(found)
             self._scoped[key] = found or None
         return self._scoped[key]
 
@@ -633,16 +761,318 @@ class PythonReader:
             dotted = value.module.imported.get(node)
             return self._dotted_origin(value.module, dotted) if dotted else None
         if isinstance(node, ast.arg):
-            if node.annotation is None or isinstance(node.annotation, ast.Constant):
+            members = _members(node.annotation)
+            if members is None:
+                self._cut = True
                 return None
-            base = self.origin(value.module, node.annotation, depth + 1)
-            # ``Any``, ``object`` and a type stub's class say nothing of what an SDK makes.
-            if base is None or base in _ANYTHING or base.startswith(_STUBS):
+            bases = [self.origin(value.module, part, depth + 1) for part in members]
+            # ``Any``, ``object`` and a type stub's class say nothing of what an SDK makes, and
+            # of several classes only SDK classes do.
+            if not bases or any(b is None or b in _ANYTHING or b.startswith(_STUBS) for b in bases):
                 return None
-            return f"{base}()"
+            if len(set(bases)) > 1 and not all(_sdk(base) for base in bases):
+                return None
+            return f"{bases[0]}()"
         if isinstance(node, ast.expr):
             return self.origin(value.module, node, depth + 1)
         return None
+
+    def _follow(self, module: Module, node: ast.AST, depth: int = 0) -> list[_Value]:
+        """The expressions ``node`` can stand for, each one the reader follows no further."""
+        found: list[_Value] = []
+        self._follow_into(_Value(module, node), found, set(), depth)
+        return found
+
+    def _follow_into(
+        self, value: _Value, out: list[_Value], seen: set[tuple[int, frozenset[str]]], depth: int
+    ) -> None:
+        module, node = value.module, value.node
+        # Reached under other variables, as a fallback two of them share, it is new.
+        if (id(node), value.variables) in seen:
+            return
+        seen.add((id(node), value.variables))
+        self._steps -= 1
+        if depth > MAX_DEPTH or self._steps <= 0:
+            self._shallow = self._cut = True
+            out.append(value)
+            return
+        same = value.variables
+        inner: Iterable[tuple[ast.AST, frozenset[str]]] | None = None
+        if isinstance(node, ast.Name):
+            resolved = self._resolve(module, node.id, node)
+            inner = None if resolved is None else ((bound.node, same) for bound in resolved[1])
+            if resolved is not None and resolved[0] == _scope_key(module, None, node.id):
+                if node.id in module.imports or module.starred:
+                    # An import of the name, or one with ``*``, may bind it instead.
+                    out.append(value)
+        elif isinstance(node, (ast.Await, ast.NamedExpr)):
+            inner = [(node.value, same)]
+        elif isinstance(node, ast.IfExp):
+            inner = [(node.body, same), (node.orelse, same)]
+        elif isinstance(node, ast.BoolOp):
+            inner = self._operands(module, node, same)
+        if inner is None:
+            out.append(value)
+            return
+        for index, (part, variables) in enumerate(inner):
+            if len(out) >= MAX_CANDIDATES or index > MAX_CANDIDATES:
+                # What is left is not walked: a wide expression or a name bound many
+                # times, read at many places, would otherwise cost its width at each.
+                self._cut = True
+                return
+            self._follow_into(_Value(module, part, variables), out, seen, depth + 1)
+
+    def _operands(
+        self, module: Module, node: ast.BoolOp, variables: frozenset[str]
+    ) -> Iterable[tuple[ast.AST, frozenset[str]]]:
+        """The operands of ``a or b`` and ``a and b``, made as they are walked. In ``or``,
+        a variable read with no default falls through to the operands after it when it is
+        unset, so they are its default and the variable may override them."""
+        last = len(node.values) - 1
+        for index, operand in enumerate(node.values):
+            name = None
+            if isinstance(node.op, ast.Or) and index < last:
+                name = self._unset_variable(module, operand)
+            if name is None:
+                yield operand, variables
+            else:
+                variables = self._merge(variables, frozenset({name}))
+
+    def _unset_variable(self, module: Module, node: ast.AST) -> str | None:
+        """The variable an operand reads, when the environment alone gives its value: a
+        call with no default, made there or bound to a name the operand is."""
+        reads: list[ast.AST] = [node]
+        if isinstance(node, ast.Name) and self._steps > 0:
+            resolved = self._resolve(module, node.id, node)
+            if resolved is None or (
+                resolved[0] == _scope_key(module, None, node.id)
+                and (node.id in module.imports or module.starred)
+            ):
+                return None
+            if len(resolved[1]) > MAX_CANDIDATES:
+                self._cut = True
+                return None
+            reads = [bound.node for bound in resolved[1]]
+        self._steps -= len(reads)
+        if len(reads) > MAX_CANDIDATES or self._steps <= 0:
+            # Past the bound an operand is followed as any other, so nothing is dropped.
+            self._cut = True
+            return None
+        names = set()
+        for read in reads:
+            found = self._environment_read(module, read)
+            if not isinstance(read, ast.Call) or found is None or not _falsy(found[1]):
+                return None
+            names.add(found[0])
+        name = names.pop() if len(names) == 1 else None
+        return name if environment_name(name) else None
+
+    def _environment_read(
+        self, module: Module, node: ast.AST
+    ) -> tuple[str, ast.expr | None] | None:
+        """The variable an expression reads from the environment, and its default."""
+        key = id(node)
+        if key not in self._reads:
+            self._reads[key] = self._environment_read_of(module, node)
+        return self._reads[key]
+
+    def _environment_read_of(
+        self, module: Module, node: ast.AST
+    ) -> tuple[str, ast.expr | None] | None:
+        if isinstance(node, ast.Subscript):
+            name = _constant(node.slice)
+            if isinstance(name, str) and self.origin(module, node.value) == "os.environ":
+                return name, None
+            return None
+        if not isinstance(node, ast.Call):
+            return None
+        origin = self.origin(module, node.func)
+        if origin not in ENVIRONMENT_READS:
+            return None
+        fields = (
+            ("option", "default", "cast") if origin == "decouple.config" else ("key", "default")
+        )
+        if len(node.args) > len(fields) or any(isinstance(arg, ast.Starred) for arg in node.args):
+            return None
+        options = dict(zip(fields, node.args, strict=False))
+        for keyword in node.keywords:
+            more = (
+                self._spread(module, keyword.value)
+                if keyword.arg is None
+                else {keyword.arg: keyword.value}
+            )
+            if more is None or options.keys() & more.keys() or not more.keys() <= set(fields):
+                return None
+            options.update(more)
+        cast = options.get("cast")
+        if cast is not None and self.origin(module, cast) != "builtins.str":
+            return None
+        name = _constant(options.get(fields[0]))
+        return (name, options.get("default")) if isinstance(name, str) else None
+
+    def _strings(self, module: Module, node: ast.AST, depth: int) -> _Spelling:
+        """The texts ``node`` can stand for through names and conditionals, and whether
+        that is all it can hold."""
+        unique: dict[_Text, None] = {}
+        whole = True
+        for value in self._follow(module, node, depth):
+            texts, complete = self._spell(value, depth)
+            whole = whole and complete
+            for item in texts:
+                unique[item] = None
+                if len(unique) > MAX_STRINGS:
+                    self._cut = True
+                    return tuple(unique)[:MAX_STRINGS], False
+        return tuple(unique), whole
+
+    def _spell(self, value: _Value, depth: int = 0) -> _Spelling:
+        """What one expression spells, read once however many names stand for it. An
+        expression read again while it is being read, as text built from itself is,
+        spells nothing more there, and what was read meanwhile is not kept: the answer
+        then does not depend on which name reading began at."""
+        key = id(value.node)
+        if key in self._pending:
+            self._shallow = True
+            return (), False
+        known = self._spelled.get(key)
+        if known is None:
+            self._pending.add(key)
+            outer, self._shallow = self._shallow, False
+            known = self._spell_node(value.module, value.node, depth)
+            self._pending.discard(key)
+            if not self._shallow:
+                self._spelled[key] = known
+            self._shallow = self._shallow or outer
+        texts, complete = known
+        if value.variables:
+            texts = tuple(
+                (text, self._merge(variables, value.variables)) for text, variables in texts
+            )
+        return texts, complete
+
+    def _spell_node(self, module: Module, node: ast.AST, depth: int) -> _Spelling:
+        self._steps -= 1
+        if depth > MAX_DEPTH or self._steps <= 0:
+            self._shallow = self._cut = True
+            return (), False
+        if isinstance(node, ast.Constant):
+            if not isinstance(node.value, str):
+                # None or a number: no model, and nothing the reader missed.
+                return (), True
+            return (
+                (((node.value, frozenset()),), True) if len(node.value) <= MAX_TEXT else ((), False)
+            )
+        read = self._environment_read(module, node)
+        if read is not None:
+            name, default = read
+            if default is None or _falsy(default):
+                # No default, or one that names no model: the environment alone sets it.
+                return (), False
+            texts, complete = self._strings(module, default, depth + 1)
+            if not texts and complete:
+                # A default that names no model, such as a name bound to None.
+                return (), False
+            if environment_name(name) is None:
+                # The variable that may override the default cannot be named.
+                return texts, False
+            named = frozenset({name})
+            return tuple(
+                (text, self._merge(variables, named)) for text, variables in texts
+            ), complete
+        if isinstance(node, ast.JoinedStr):
+            parts: list[ast.AST] = []
+            for part in node.values:
+                if isinstance(part, ast.FormattedValue):
+                    if part.conversion != -1 or part.format_spec is not None:
+                        return (), False
+                    part = part.value
+                parts.append(part)
+            return self._join(module, parts, depth)
+        if isinstance(node, (ast.BinOp, ast.AugAssign)) and isinstance(node.op, ast.Add):
+            if isinstance(node, ast.BinOp):
+                return self._join(module, [node.left, node.right], depth)
+            return self._join(module, [node.target, node.value], depth)
+        if isinstance(node, ast.Call):
+            return self._call_text(module, node, depth)
+        return (), False
+
+    def _join(self, module: Module, parts: list[ast.AST], depth: int) -> _Spelling:
+        """The texts ``parts`` join to. They are bounded, and each joining is charged: a
+        name joined to itself would otherwise double at every binding it passes."""
+        built: list[_Text] = [("", frozenset())]
+        whole = True
+        for part in parts:
+            options, complete = self._strings(module, part, depth + 1)
+            whole = whole and complete
+            self._steps -= len(built) * len(options)
+            joined = [
+                (text + more, self._merge(variables, others))
+                for text, variables in built
+                for more, others in options
+                if len(text) + len(more) <= MAX_TEXT
+            ]
+            whole = whole and len(joined) == len(built) * len(options)
+            if not joined:
+                return (), False
+            if len(joined) > MAX_STRINGS:
+                self._cut = True
+            built = joined[:MAX_STRINGS]
+        return tuple(built), whole
+
+    def _call_text(self, module: Module, node: ast.Call, depth: int) -> _Spelling:
+        """The text a string method or ``str()`` gives back."""
+        function = node.func
+        if isinstance(function, ast.Attribute) and function.attr in _TRANSFORMS:
+            if node.args or node.keywords:
+                return (), False
+            change = _TRANSFORMS[function.attr]
+            texts, complete = self._strings(module, function.value, depth + 1)
+            # A token stays one whatever its case, so only text that could be recorded
+            # as it is written is changed.
+            kept = tuple(
+                (change(text), variables)
+                for text, variables in texts
+                if model_identifier(text) is not None
+            )
+            return kept, complete and len(kept) == len(texts)
+        if self.origin(module, function) == "builtins.str" and len(node.args) == 1:
+            if not node.keywords:
+                return self._strings(module, node.args[0], depth + 1)
+        return (), False
+
+    def _spread(self, module: Module, node: ast.expr) -> dict[str, ast.expr] | None:
+        """The keywords ``**node`` gives, when it is a dict written out with text keys,
+        there or bound once to a name the file reads only by spreading it: a dict read in
+        any other way may be changed or handed on, so what it holds is not known."""
+        held: ast.AST = node
+        if isinstance(node, ast.Name):
+            if self._steps <= 0:
+                self._cut = True
+                return None
+            resolved = None if node.id in module.touched else self._resolve(module, node.id, node)
+            if resolved is None or len(resolved[1]) != 1:
+                return None
+            if resolved[0] == _scope_key(module, None, node.id) and (
+                node.id in module.imports or module.starred
+            ):
+                # An import of the name, or one with ``*``, may bind it in place of the dict.
+                return None
+            held = resolved[1][0].node
+        given: dict[str, ast.expr] = {}
+        self._steps -= len(held.keys) if isinstance(held, ast.Dict) else 1
+        if isinstance(held, ast.Dict):
+            for key, item in zip(held.keys, held.values, strict=True):
+                if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                    return None
+                given[key.value] = item
+        elif isinstance(held, ast.Call) and self.origin(module, held.func) == "builtins.dict":
+            if held.args or any(keyword.arg is None for keyword in held.keywords):
+                return None
+            self._steps -= len(held.keywords)
+            given = _keywords(held)
+        else:
+            return None
+        return given
 
     def _analyse(self, module: Module) -> None:
         for node in module.nodes:
@@ -693,6 +1123,16 @@ class PythonReader:
         base = "" if origin is None else origin.split("()", 1)[0]
         _, symbol, _ = _split(base)
         keywords = _keywords(call)
+        spread: list[ast.expr] = []
+        for keyword in call.keywords:
+            spelled = None if keyword.arg is not None else self._spread(module, keyword.value)
+            if spelled is not None:
+                if keywords.keys() & spelled.keys():
+                    # Python refuses a call given one keyword twice, so it gives no model.
+                    return
+                keywords.update(spelled)
+            elif keyword.arg is None:
+                spread.append(keyword.value)
         embedding = "embed" in (origin or "").lower()
         found: list[tuple[ast.expr, bool]] = []
         for key in MODEL_KEYWORDS:
@@ -709,19 +1149,18 @@ class PythonReader:
                 found.append((arguments[position], embedding))
         if "id" in keywords and any(_under(base, root) for root in ("agno.models", "phi.model")):
             found.append((keywords["id"], False))
-        spreads = [keyword.value for keyword in call.keywords if keyword.arg is None]
         named = None
         if isinstance(function, ast.Name) and self._steps > 0:
             named = self._resolve(module, function.id, function)
         handed = named is not None and all(isinstance(value.node, ast.arg) for value in named[1])
         if not (found or unread or keywords.keys() & MODEL_KEYWORDS) and (origin or not handed):
             # ``**options`` may hold the model, unless a wrapper hands it to what it was given.
-            unread.extend(spreads)
+            unread.extend(spread)
         if local:
             self._given.update((value.lineno, value.col_offset) for value, _ in found)
             return
         self._unread.update((value.lineno, value.col_offset) for value in unread)
-        flags, opaque = [keywords.get("trust_remote_code")], list(spreads)
+        flags, opaque = [keywords.get("trust_remote_code")], list(spread)
         given = [(value, key in _KWARGS) for key, value in keywords.items()]
         for options, named_options in given:
             pairs = (
@@ -741,6 +1180,13 @@ class PythonReader:
 
     def _pairs(self, module: Module, options: ast.expr | None) -> Sequence[tuple[object, ast.expr]]:
         """The keys and values of options given as a dict; what it cannot read has no key."""
+        # A dict given as options to a call that is not an SDK's may be changed there.
+        if isinstance(options, ast.Name) and all(
+            _sdk(self.origin(module, call.func)) for call in module.options.get(options.id, ())
+        ):
+            given = self._spread(module, options)
+            if given is not None:
+                return list(given.items())
         if isinstance(options, ast.Dict):
             return [(_constant(k), v) for k, v in zip(options.keys, options.values, strict=True)]
         if isinstance(options, ast.Call) and self.origin(module, options.func) == "builtins.dict":
@@ -750,11 +1196,25 @@ class PythonReader:
     def _model_references(
         self, module: Module, expression: ast.expr, *, embedding: bool, remote: bool
     ) -> None:
-        """Record a literal model argument; count one the collector cannot read."""
+        """Record each identifier a model argument can hold, and account for what else
+        it can hold."""
         point = (expression.lineno, expression.col_offset)
-        if isinstance(expression, ast.Constant):
-            text = expression.value
-            if isinstance(text, str):
+        values = self._follow(module, expression)
+        if not values:
+            # A name bound only to itself stands for nothing the reader can give.
+            self._unread.add(point)
+        kept = 0
+        for value in values:
+            texts, complete = self._spell(value)
+            if not texts and complete:
+                # A fallback that names no model, such as None, leaves it to the variables.
+                self._set_by_environment(module, value.variables, point)
+            for text, variables in texts:
+                kept += 1
+                self._steps -= 1
+                if kept > MAX_CANDIDATES:
+                    self._cut = True
+                    return
                 ref = self._found.model(
                     text,
                     module.path,
@@ -762,17 +1222,57 @@ class PythonReader:
                     method=METHOD,
                     embedding=embedding,
                     remote_code=remote,
+                    environment=variables,
                 )
                 if ref is None and not placeholder(text):
                     self._unread.add(point)
-        elif self._imported_leaf(module, expression):
+                if ref is None:
+                    self._set_by_environment(module, variables, point)
+            if not complete:
+                self._unread_value(value, point)
+
+    def _unread_value(self, value: _Value, point: tuple[int, int]) -> None:
+        """Account for what a value of a model argument holds besides the text read."""
+        module, node = value.module, value.node
+        read = self._environment_read(module, node)
+        names_none = read is not None and self._names_no_model(module, read[1])
+        if read is not None and names_none and environment_name(read[0]):
+            # A model that only the environment sets has no value here to record.
+            self._set_by_environment(module, frozenset({read[0]}), point)
+        elif self._imported_leaf(module, node):
             self._found.gap(module.path, point[0], _ELSEWHERE)
-        elif not self._built(module, expression):
+        elif not self._built(module, node):
             self._unread.add(point)
+
+    def _names_no_model(self, module: Module, default: ast.expr | None) -> bool:
+        """Whether a default is absent, falsy, or bound to what names no model."""
+        return (
+            _falsy(default)
+            or default is not None
+            and self._strings(module, default, 0) == ((), True)
+        )
+
+    def _set_by_environment(
+        self, module: Module, variables: frozenset[str], point: tuple[int, int]
+    ) -> None:
+        """File each variable that alone may set a model argument, at its first place."""
+        unset = self._found.unresolved_environment
+        for name in variables:
+            unset[(module.path, name)] = min(point[0], unset.get((module.path, name), point[0]))
+
+    def _merge(self, variables: frozenset[str], others: frozenset[str]) -> frozenset[str]:
+        """The variables that may override a text: charged, and cut past their bound."""
+        merged = variables | others
+        self._steps -= len(merged)
+        if len(merged) > MAX_VARIABLES:
+            self._cut = True
+            merged = frozenset(sorted(merged)[:MAX_VARIABLES])
+        return merged
 
     def _built(self, module: Module, node: ast.AST) -> bool:
         """Whether a value is an object an SDK makes, not text, a path or what may hold one."""
-        origin = self.origin(module, node)
+        # A parameter is judged by its annotation, as when it is called.
+        origin = self._value_origin(_Value(module, node), 0)
         return (
             origin is not None
             and origin.endswith("()")

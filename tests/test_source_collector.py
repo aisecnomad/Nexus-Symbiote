@@ -6,8 +6,10 @@ is never executed, and no value the collector may not export leaves the file.
 
 from __future__ import annotations
 
+import ast
 import json
 import pickle
+import tracemalloc
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -23,6 +25,7 @@ from nexus_symbiote.scanners.base import ScanResult
 from nexus_symbiote.scanners.source import SourceScanner, eligible
 from nexus_symbiote.scanners.source_references import (
     Declarations,
+    environment_name,
     model_identifier,
 )
 from nexus_symbiote.utils.confined import ConfinedCollection
@@ -126,9 +129,11 @@ def test_a_literal_model_argument_is_recorded_with_where_it_was_read(client: Sca
         ("None", [], 0),
         ('"default"', [], 0),
         ('"my model v2"', [], 1),
-        ("NAME", [], 1),
-        ('f"{NAME}"', [], 1),
-        ('os.getenv("M", "gpt-4o")', [], 1),
+        ("NAME", ["gpt-4.1"], 0),
+        ('f"{NAME}"', ["gpt-4.1"], 0),
+        ('os.getenv("CHAT_MODEL", "gpt-4o")', ["gpt-4o"], 0),
+        # The variable that may override the default is named so it is not exported.
+        ('os.getenv("M", "gpt-4o")', ["gpt-4o"], 1),
         ("OpenAIChatModel('gpt-4.1')", ["gpt-4.1"], 0),
         ("get_peft_model(base)", [], 0),
         ("[NAME]", [], 1),
@@ -138,7 +143,7 @@ def test_a_literal_model_argument_is_recorded_with_where_it_was_read(client: Sca
         ("yaml.safe_load(TEXT)", [], 1),
     ],
 )
-def test_a_literal_is_read_and_any_other_value_is_unread_unless_a_library_builds_it(
+def test_text_a_value_spells_is_read_and_any_other_value_is_unread_unless_a_library_builds_it(
     tmp_path: Path, argument: str, expected: list[str], unread: int
 ):
     result = scan(
@@ -202,8 +207,9 @@ client.chat.completions.create(model=os.environ["{PLANTED}"], messages=[])
         },
     )
     assert PLANTED not in exported(result) and "Zq7Zq7" not in exported(result)
-    # A literal that holds a token shape is no model; the other two are not literals.
-    assert models(result) == {}
+    # A literal that holds a token shape is no model. A variable named with one is not
+    # exported: its default is recorded, and what it may set instead is unread.
+    assert set(models(result)) == {"gpt-4o"}
     assert list(result.surfaces_excluded) == [unread("bot.py", 5, 4)]
 
 
@@ -567,13 +573,13 @@ async def reply(make):
         },
     )
     found = models(result)
-    assert set(found) == {"acme-search-v2", "gpt-4.1", "gpt-4o"}
+    assert set(found) == {"acme-search-v2", "gpt-4.1", "gpt-4o", "openai/clip-vit-base-patch32"}
     # The annotated parameter is an OpenAI client, so the call is an embeddings call.
     assert found["acme-search-v2"].model_type == "embedding"
-    # A parameter, an item of a dictionary and joined text are not literals. The
+    # A parameter and an item of a dictionary are unread; joined text is read. The
     # project's own loader is given no model argument the reader knows of, but where it
     # hands its parameter to the SDK, that is unread.
-    assert list(result.surfaces_excluded) == [unread("run.py", 10, 3)]
+    assert list(result.surfaces_excluded) == [unread("run.py", 10, 2)]
 
 
 @pytest.mark.parametrize(
@@ -788,9 +794,10 @@ def test_a_client_reached_through_a_framework_or_a_forwarder_is_read(tmp_path: P
         "o4-mini",
         "gpt-4.1",
         "gpt-4.1-mini",
+        "gpt-4.1-nano",
     }
-    # What ``**`` gives may be the model, unless a model keyword is there too.
-    assert list(result.surfaces_excluded) == [unread("framework.py", 37)]
+    # A dict the file only spreads is read; beside a model keyword, ``**`` gives none.
+    assert not result.surfaces_excluded
 
 
 def test_a_client_a_project_function_or_module_makes_is_read(tmp_path: Path):
@@ -1646,6 +1653,876 @@ def test_more_entry_points_name_their_models(tmp_path: Path):
     assert set(models(result)) == {"meta/meta-llama-3-8b-instruct", "Qwen/Qwen2-0.5B-Instruct-GGUF"}
 
 
+# -- following a model argument within its file ---------------------------------------
+
+FOLLOWED = '''\
+"""Example in a docstring: client.chat.completions.create(model="gpt-3.5-turbo")"""
+import os
+
+from openai import OpenAI
+
+# client.chat.completions.create(model="gpt-4-turbo", messages=[])
+FAMILY = "claude"
+REVIEW_MODEL = f"{FAMILY}-sonnet-4-5"
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
+client = OpenAI()
+
+
+def answer(question: str, careful: bool) -> str:
+    model = REVIEW_MODEL if careful else CHAT_MODEL
+    reply = client.chat.completions.create(model=model, messages=[])
+    client.embeddings.create(model="text-embedding-3-small", input=question)
+    return reply
+'''
+
+
+def test_a_model_argument_is_followed_to_the_values_bound_to_it(tmp_path: Path):
+    result = scan(tmp_path, {"app/client.py": FOLLOWED})
+    found = models(result)
+    assert set(found) == {"claude-sonnet-4-5", "gpt-4o-mini", "text-embedding-3-small"}
+    mini = found["gpt-4o-mini"]
+    assert mini.bom_ref == "model:source:gpt-4o-mini"
+    assert mini.assurance_level is AssuranceLevel.DECLARED
+    assert mini.properties == {
+        "collection_mode": "static-source-reference",
+        "method": "python-ast",
+        "declaration_line": 15,
+        "reference_path": "app/client.py",
+        "environment_variables": ["CHAT_MODEL"],
+    }
+    claim = mini.claims["source_reference"]
+    assert (claim.locator, claim.collector, claim.assurance) == (
+        "app/client.py:15",
+        "source",
+        AssuranceLevel.DECLARED,
+    )
+    assert "environment_variables" not in found["claude-sonnet-4-5"].properties
+    assert not result.surfaces_excluded and not result.scan_failures
+
+
+@pytest.mark.parametrize(
+    ("argument", "expected", "unread"),
+    [
+        ('"gpt-" + "4o"', ["gpt-4o"], 0),
+        ('os.environ.get("CHAT_MODEL", "gpt-4o")', ["gpt-4o"], 0),
+        ('os.environ.get("CHAT_MODEL") or "gpt-4o"', ["gpt-4o"], 0),
+        ('os.environ.get("CHAT_MODEL", "") or "gpt-4o"', ["gpt-4o"], 0),
+        ('str("gpt-4o")', ["gpt-4o"], 0),
+        ('" gpt-4o ".strip()', ["gpt-4o"], 0),
+        ('"gpt-4o" if fast else "o4-mini"', ["gpt-4o", "o4-mini"], 0),
+        ("(chosen := NAME)", ["gpt-4.1"], 0),
+        ('f"{PREFIX}-4.1"', ["gpt-4.1"], 0),
+        ("ALIAS", ["gpt-4.1"], 0),
+        ("unknown_name", [], 1),
+        ("build_name()", [], 1),
+        ('f"{unknown_name}-4.1"', [], 1),
+        ("42", [], 0),
+        # What can be read of a partly unknown value is recorded; the rest is a gap.
+        ('"gpt-4o" if fast else build_name()', ["gpt-4o"], 1),
+        ('"gpt-4o-" + ("mini" if fast else build_name())', ["gpt-4o-mini"], 1),
+    ],
+)
+def test_what_a_model_argument_can_stand_for(
+    tmp_path: Path, argument: str, expected: list[str], unread: int
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": f"""\
+import os
+from openai import OpenAI
+
+PREFIX = "gpt"
+NAME = "gpt-4.1"
+ALIAS = NAME
+fast = True
+OpenAI().chat.completions.create(model={argument}, messages=[])
+"""
+        },
+    )
+    assert sorted(models(result)) == sorted(expected)
+    assert list(result.surfaces_excluded) == ([unread_gap("run.py", 8)] if unread else [])
+
+
+def test_a_parameter_default_and_the_nearest_binding_are_what_a_name_stands_for(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from openai import OpenAI
+
+MODEL = "gpt-4o"
+
+
+def outer(client, model="o4-mini", *, fallback="gpt-4.1-nano"):
+    client.chat.completions.create(model=model, messages=[])
+    client.chat.completions.create(model=fallback, messages=[])
+
+    def inner():
+        MODEL = "gpt-4.1"
+        return OpenAI().chat.completions.create(model=MODEL, messages=[])
+
+    return inner
+
+
+class Settings:
+    MODEL = "never-read-from-a-method"
+
+    def call(self, client):
+        return client.chat.completions.create(model=MODEL, messages=[])
+"""
+        },
+    )
+    assert set(models(result)) == {"o4-mini", "gpt-4.1-nano", "gpt-4.1", "gpt-4o"}
+    # A caller may pass any value in place of a default.
+    assert list(result.surfaces_excluded) == [unread("run.py", 7, 2)]
+
+
+def test_a_default_is_read_in_the_scope_around_its_function(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "from openai import OpenAI\n\n"
+            'model = "gpt-4o"\n\n\n'
+            "def run(model=model):\n"
+            "    OpenAI().responses.create(model=model)\n"
+        },
+    )
+    # ``model=model`` takes the module's value when the function is made.
+    assert set(models(result)) == {"gpt-4o"}
+    assert list(result.surfaces_excluded) == [unread("run.py", 7)]
+
+
+def test_names_bound_by_unpacking_and_with_are_read(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from openai import OpenAI
+
+FAST, CAREFUL = "gpt-4o-mini", "o3"
+[EMBED] = ["text-embedding-3-large"]
+client = OpenAI()
+client.chat.completions.create(model=FAST, messages=[])
+client.chat.completions.create(model=CAREFUL, messages=[])
+client.embeddings.create(model=EMBED, input="x")
+with OpenAI() as scoped:
+    scoped.chat.completions.create(model="gpt-4.1", messages=[])
+"""
+        },
+    )
+    assert set(models(result)) == {"gpt-4o-mini", "o3", "text-embedding-3-large", "gpt-4.1"}
+    assert not result.surfaces_excluded
+
+
+def test_results_kept_for_one_file_are_not_read_for_the_next(tmp_path: Path):
+    # Many small files of the same shape: a result kept by the identity of a freed
+    # syntax node would be read back for a node of a later file.
+    files = {
+        f"pkg/m{index:03}.py": "from openai import OpenAI\n"
+        f'NAME = "gpt-4o-{index}"\nOpenAI().responses.create(model=NAME)\n'
+        for index in range(120)
+    }
+    found = models(scan(tmp_path, files))
+    assert set(found) == {f"gpt-4o-{index}" for index in range(120)}
+    for index in range(120):
+        assert found[f"gpt-4o-{index}"].properties["reference_path"] == f"pkg/m{index:03}.py"
+
+
+def test_a_name_read_twice_in_a_chain_is_read_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # Read afresh at each use, eight doublings are 2 ** 8 readings of the first name,
+    # which this allowance does not cover; read once each, they are a few dozen.
+    monkeypatch.setattr(source_python.PythonReader, "_allowance", staticmethod(lambda module: 150))
+    chain = "\n".join(f"n{index + 1} = n{index} + n{index}" for index in range(8))
+    result = scan(
+        tmp_path,
+        {
+            "run.py": f'from openai import OpenAI\nn0 = "g"\n{chain}\n'
+            "OpenAI().responses.create(model=n8)\n"
+        },
+    )
+    # 2 ** 8 letters were read within the allowance, and are no identifier.
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [unread("run.py", 11)]
+
+
+def test_text_joined_to_itself_does_not_grow_without_bound(tmp_path: Path):
+    # Unbounded, eleven doublings of 20,000 characters build 40 MB of text for one
+    # small file, and forty doublings of one character more memory than any host has.
+    wide = "g" * 20_000
+    chain = "\n".join(f"n{index + 1} = n{index} + n{index}" for index in range(11))
+    formatted = "\n".join(f'f{index + 1} = f"{{f{index}}}{{f{index}}}"' for index in range(11))
+    write(
+        tmp_path,
+        {
+            "run.py": f'from openai import OpenAI\nn0 = "{wide}"\nf0 = "h"\n{chain}\n{formatted}\n'
+            "OpenAI().responses.create(model=n11)\nOpenAI().responses.create(model=f11)\n"
+            'OpenAI().responses.create(model="x" * 3)\n'
+            f'OpenAI().responses.create(model="{"y" * 600}")\n'
+        },
+    )
+    tracemalloc.start()
+    try:
+        result = SourceScanner().scan(tmp_path)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 16 * 2**20
+    assert result.components == []
+    # Text the reader gave up on is not text it read: the three arguments built by
+    # joining or repeating are a gap, and so is the long constant, which is no model.
+    assert list(result.surfaces_excluded) == [unread("run.py", 26, 4)]
+
+
+def test_a_long_chain_of_joined_text_ends_at_the_depth_bound(tmp_path: Path):
+    chain = " + ".join(['"g"'] * 1000)
+    result = scan(
+        tmp_path,
+        {"run.py": f"from openai import OpenAI\nOpenAI().responses.create(model={chain})\n"},
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [unread("run.py", 2), f"run.py:1: {CUT}"]
+
+
+def test_a_short_name_built_from_parts_is_still_read(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "from openai import OpenAI\n"
+            'FAMILY = "gpt-4o"\nSIZE = "mini"\nNAME = FAMILY + "-" + SIZE\n'
+            'OpenAI().responses.create(model=NAME)\nOpenAI().responses.create(model=f"{FAMILY}-audio")\n'
+        },
+    )
+    assert set(models(result)) == {"gpt-4o-mini", "gpt-4o-audio"}
+    assert not result.surfaces_excluded
+
+
+def test_a_model_only_the_environment_sets_is_a_named_gap(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+import os
+from os import environ, getenv
+from openai import OpenAI
+
+client = OpenAI()
+client.chat.completions.create(model=os.environ["CHAT_MODEL"], messages=[])
+client.chat.completions.create(model=getenv("CHAT_MODEL"), messages=[])
+client.chat.completions.create(model=environ.get("TUNED_MODEL", "gpt-4.1"), messages=[])
+client.chat.completions.create(model=environ["TUNED_MODEL"], messages=[])
+"""
+        },
+    )
+    assert set(models(result)) == {"gpt-4.1"}
+    assert models(result)["gpt-4.1"].properties["environment_variables"] == ["TUNED_MODEL"]
+    # One gap for each variable a read needs, at its first such read in the file: a
+    # default another read gives does not stand for this one.
+    assert list(result.surfaces_excluded) == [
+        "run.py:6: model set only by environment variable CHAT_MODEL; not inventoried",
+        "run.py:9: model set only by environment variable TUNED_MODEL; not inventoried",
+    ]
+
+
+def test_a_variable_read_with_no_default_falls_through_to_what_or_gives(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+import os
+from openai import OpenAI
+
+SET = os.environ.get("CHAT_MODEL")
+CHOSEN = SET or "gpt-4o"
+OpenAI().responses.create(model=CHOSEN)
+OpenAI().responses.create(model=os.getenv("FAST_MODEL") or os.getenv("SMALL_MODEL") or "o3")
+OpenAI().responses.create(model=os.environ["STRICT_MODEL"] or "o4-mini")
+"""
+        },
+    )
+    found = models(result)
+    # When the variable is unset, ``or`` gives the text after it, which it may override.
+    assert found["gpt-4o"].properties["environment_variables"] == ["CHAT_MODEL"]
+    assert found["o3"].properties["environment_variables"] == ["FAST_MODEL", "SMALL_MODEL"]
+    # Indexing ``os.environ`` raises when the variable is unset, so nothing falls through.
+    assert "environment_variables" not in found["o4-mini"].properties
+    assert list(result.surfaces_excluded) == [
+        "run.py:8: model set only by environment variable STRICT_MODEL; not inventoried"
+    ]
+
+
+UNFOLLOWED = """\
+import os
+from openai import OpenAI
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIChatModel
+
+client = OpenAI()
+
+
+def ask(model, settings, table, fallback="gpt-4.1"):
+    client.responses.create(model=model)
+    client.responses.create(model=settings.model)
+    client.responses.create(model=table["chat"])
+    client.responses.create(model=f"gpt-{model}")
+    client.responses.create(model=unbound)
+    client.responses.create(model=os.environ[model])
+    client.responses.create(model="gpt-4o" if settings.fast else model)
+    client.responses.create(model=fallback)
+    again = again
+    client.responses.create(model=again)
+    twice = fallback or fallback
+    client.responses.create(model=twice)
+    client.responses.create(model=None)
+    client.responses.create(model=pick())
+    Agent(model=OpenAIChatModel("gpt-4o-mini"))
+    settings.client.responses.create(model=model)
+    record(model=model)
+"""
+
+
+def test_a_model_argument_the_reader_cannot_follow_is_one_gap_for_its_file(tmp_path: Path):
+    result = scan(tmp_path, {"app/ask.py": UNFOLLOWED})
+    # A value that was read is recorded, whatever else the argument can hold.
+    assert set(models(result)) == {"gpt-4o", "gpt-4.1", "gpt-4o-mini"}
+    # A parameter, with or without a default, an attribute, a subscript, text built from
+    # a parameter, a name the file does not bind, a variable named by a parameter, one
+    # side of a conditional, a name bound only to itself, a call the reader cannot give
+    # the result of, and the arguments of two callees it cannot name: thirteen. Nothing
+    # and a model's own object, which is read where it is built, are not counted.
+    assert list(result.surfaces_excluded) == [unread("app/ask.py", 10, 13)]
+
+
+def test_a_name_bound_in_terms_of_itself_costs_no_more_than_its_length(tmp_path: Path):
+    rebinds = "\n".join(f'text = text.replace("{index}", "x")' for index in range(400))
+    result = scan(
+        tmp_path,
+        {
+            "loop.py": f'from openai import OpenAI\n\ntext = "gpt-4o"\n{rebinds}\n'
+            "OpenAI().chat.completions.create(model=text, messages=[])\n"
+        },
+    )
+    # The first sixteen bindings were followed, which is not all of them, and what
+    # ``replace`` gives back is not read: the text as first written is not the last.
+    assert set(models(result)) == {"gpt-4o"}
+    assert list(result.surfaces_excluded) == [unread("loop.py", 404), f"loop.py:1: {CUT}"]
+
+
+def test_following_stops_at_its_bounds_and_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    chain = "\n".join(f"n{index + 1} = n{index}" for index in range(40))
+    files = {
+        "deep.py": f'from openai import OpenAI\nn0 = "gpt-4o"\n{chain}\n'
+        "OpenAI().chat.completions.create(model=n40, messages=[])\n"
+    }
+    deep = scan(tmp_path / "depth", files)
+    assert deep.components == []
+    assert list(deep.surfaces_excluded) == [unread("deep.py", 43), f"deep.py:1: {CUT}"]
+    monkeypatch.setattr(source_python.PythonReader, "_allowance", staticmethod(lambda module: 5))
+    starved = scan(tmp_path / "steps", files)
+    assert starved.components == []
+    # Past the allowance an argument is unread, and the file says some were not read.
+    assert list(starved.surfaces_excluded) == [unread("deep.py", 43), f"deep.py:1: {CUT}"]
+
+
+def test_a_name_bound_more_often_than_is_followed_is_read_in_part_and_says_so(tmp_path: Path):
+    bound = "\n".join(f'NAME = "gpt-4o-{index}"' for index in range(20))
+    result = scan(
+        tmp_path,
+        {"many.py": f"from openai import OpenAI\n{bound}\nOpenAI().responses.create(model=NAME)\n"},
+    )
+    assert set(models(result)) == {f"gpt-4o-{index}" for index in range(16)}
+    assert list(result.surfaces_excluded) == [f"many.py:1: {CUT}"]
+
+
+def test_an_expression_is_read_once_however_many_names_read_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    calls: list[ast.Call] = []
+    read = source_python.PythonReader._environment_read_of
+
+    def counted(reader, module, node):  # type: ignore[no-untyped-def]
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "getenv"
+        ):
+            calls.append(node)
+        return read(reader, module, node)
+
+    monkeypatch.setattr(source_python.PythonReader, "_environment_read_of", counted)
+    reads = "\n".join("OpenAI().responses.create(model=NAME)" for _ in range(300))
+    result = scan(
+        tmp_path,
+        {
+            "once.py": "import os\nfrom openai import OpenAI\n"
+            f'NAME = os.getenv("CHAT_MODEL", default="gpt-4o")\n{reads}\n'
+        },
+    )
+    assert set(models(result)) == {"gpt-4o"}
+    assert len(calls) == 1
+
+
+def test_text_built_from_itself_is_read_as_far_as_it_is_written_and_the_rest_is_a_gap(
+    tmp_path: Path,
+):
+    result = scan(
+        tmp_path,
+        {
+            "grow.py": "from openai import OpenAI\n"
+            'NAME = "gpt-4o"\nNAME = NAME + "-mini"\nOpenAI().responses.create(model=NAME)\n'
+        },
+    )
+    # Run again, as in a loop, the second binding would grow the text further.
+    assert set(models(result)) == {"gpt-4o", "gpt-4o-mini"}
+    assert list(result.surfaces_excluded) == [unread("grow.py", 4)]
+
+
+def test_text_built_in_a_cycle_reads_the_same_whichever_name_is_read_first(tmp_path: Path):
+    body = 'from openai import OpenAI\nA = "gpt-4o"\nB = "o3"\nA = B + "-a"\nB = A + "-b"\n'
+    first = scan(
+        tmp_path / "first",
+        {
+            "run.py": body
+            + "OpenAI().responses.create(model=A)\nOpenAI().responses.create(model=B)\n"
+        },
+    )
+    second = scan(
+        tmp_path / "second",
+        {
+            "run.py": body
+            + "OpenAI().responses.create(model=B)\nOpenAI().responses.create(model=A)\n"
+        },
+    )
+    assert (
+        set(models(first))
+        == set(models(second))
+        == {
+            "gpt-4o",
+            "o3",
+            "o3-a",
+            "gpt-4o-b",
+            "gpt-4o-b-a",
+            "o3-a-b",
+        }
+    )
+    assert (
+        list(first.surfaces_excluded) == list(second.surfaces_excluded) == [unread("run.py", 6, 2)]
+    )
+
+
+@pytest.mark.parametrize(
+    ("argument", "kept"),
+    [
+        (" or ".join(f"a{index}" for index in range(20)), 16),
+        ('f"{left}-{right}"', 16),
+    ],
+    ids=["candidates", "joined"],
+)
+def test_more_values_than_are_kept_for_one_argument_says_so(
+    tmp_path: Path, argument: str, kept: int
+):
+    names = "\n".join(f'a{index} = "gpt-4o-{index}"' for index in range(20))
+    result = scan(
+        tmp_path,
+        {
+            "wide.py": f"from openai import OpenAI\n{names}\n"
+            "left = a0 or a1 or a2 or a3 or a4\nright = a5 or a6 or a7 or a8\n"
+            f"OpenAI().responses.create(model={argument})\n"
+        },
+    )
+    assert len(models(result)) == kept
+    assert list(result.surfaces_excluded) == [f"wide.py:1: {CUT}"]
+
+
+def test_three_by_three_joined_values_are_all_kept(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "from openai import OpenAI\n"
+            'SIZE = "a" if x else ("b" if y else "c")\n'
+            'TIER = "1" if x else ("2" if y else "3")\n'
+            'OpenAI().responses.create(model=f"{SIZE}-{TIER}")\n'
+        },
+    )
+    assert set(models(result)) == {f"{size}-{tier}" for size in "abc" for tier in "123"}
+    assert not result.surfaces_excluded
+
+
+def test_many_bindings_read_many_times_cost_their_sum_not_their_product(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # 2,000 bindings read 2,000 times: followed in full at each read that is four
+    # million steps; within the bound it is a few more than the values kept per read.
+    walked: list[int] = []
+    follow = source_python.PythonReader._follow_into
+
+    def counted(self, value, out, seen, depth):  # type: ignore[no-untyped-def]
+        walked.append(1)
+        follow(self, value, out, seen, depth)
+
+    monkeypatch.setattr(source_python.PythonReader, "_follow_into", counted)
+    bound = "\n".join('NAME = "gpt-4o"' for _ in range(2000))
+    reads = "\n".join("OpenAI().responses.create(model=NAME)" for _ in range(2000))
+    result = scan(tmp_path, {"big.py": f"from openai import OpenAI\n{bound}\n{reads}\n"})
+    assert set(models(result)) == {"gpt-4o"}
+    assert list(result.surfaces_excluded) == [f"big.py:1: {CUT}"]
+    assert len(walked) < 2000 * (source_python.MAX_CANDIDATES + 4)
+
+
+def test_a_wide_expression_read_at_many_places_costs_its_bound_at_each(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    walked: list[int] = []
+    follow = source_python.PythonReader._follow_into
+
+    def counted(self, value, out, seen, depth):  # type: ignore[no-untyped-def]
+        walked.append(1)
+        follow(self, value, out, seen, depth)
+
+    monkeypatch.setattr(source_python.PythonReader, "_follow_into", counted)
+    wide = " or ".join(f'"gpt-4o-{index}"' for index in range(400))
+    reads = "\n".join("OpenAI().responses.create(model=W)" for _ in range(400))
+    result = scan(tmp_path, {"wide.py": f"from openai import OpenAI\nW = {wide}\n{reads}\n"})
+    assert len(models(result)) == source_python.MAX_CANDIDATES
+    assert list(result.surfaces_excluded) == [f"wide.py:1: {CUT}"]
+    # Walked in full at each read this is 400 x 400 steps.
+    assert len(walked) < 400 * (source_python.MAX_CANDIDATES + 4)
+
+
+def test_text_nested_past_the_depth_bound_is_not_read(tmp_path: Path):
+    nested = '"o"'
+    for _ in range(source_python.MAX_DEPTH + 2):
+        nested = f'("g" + {nested})'
+    result = scan(
+        tmp_path,
+        {"run.py": f"from openai import OpenAI\nOpenAI().responses.create(model={nested})\n"},
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [unread("run.py", 2), f"run.py:1: {CUT}"]
+
+
+BINDINGS = """\
+import os
+from openai import OpenAI
+
+client = OpenAI()
+name = "claude"
+name += "-sonnet-4-5"
+client.responses.create(model=name)
+size = "gpt-4o"
+size *= 2
+client.responses.create(model=size)
+looped = "gpt-4.1"
+for looped in os.environ:
+    client.responses.create(model=looped)
+inner = "module-level-thing"
+[client.responses.create(model=inner) for inner in os.environ]
+paired, other = os.environ.popitem()
+paired = "o3"
+client.responses.create(model=paired)
+try:
+    pass
+except ValueError as caught:
+    client.responses.create(model=caught)
+with open(__file__) as (first, second):
+    client.responses.create(model=first)
+match os.environ:
+    case {"MODEL": captured}:
+        client.responses.create(model=captured)
+"""
+
+
+def test_a_name_with_a_binding_the_reader_cannot_give_is_a_gap(tmp_path: Path):
+    result = scan(tmp_path, {"bind.py": BINDINGS})
+    # ``+=`` joins, and may join again; every other binding below the first is one the
+    # reader cannot give: ``*=``, a loop and a comprehension variable, a name unpacked
+    # from a call, an exception, a name unpacked from a context and a pattern capture.
+    # Every value the reader could give is still recorded, and a comprehension's own
+    # variable is not the module's name of the same spelling.
+    assert set(models(result)) == {"claude", "claude-sonnet-4-5", "gpt-4o", "gpt-4.1", "o3"}
+    assert list(result.surfaces_excluded) == [unread("bind.py", 7, 8)]
+
+
+def test_bindings_past_the_bound_are_not_skipped_in_silence(tmp_path: Path):
+    bound = "\n".join(["NAME = NAME"] * 16 + ['NAME = "gpt-4o"', 'NAME = "o3"'])
+    result = scan(
+        tmp_path,
+        {"rest.py": f"from openai import OpenAI\n{bound}\nOpenAI().responses.create(model=NAME)\n"},
+    )
+    # Bindings of the name to itself spend the depth bound; what is left is a gap.
+    assert set(models(result)) == {"gpt-4o"}
+    assert list(result.surfaces_excluded) == [unread("rest.py", 20), f"rest.py:1: {CUT}"]
+
+
+def test_conditionals_nested_past_the_depth_bound_say_so(tmp_path: Path):
+    nested = '"m-0"'
+    for index in range(1, 30):
+        nested = f'("m-{index}" if flag else {nested})'
+    result = scan(
+        tmp_path,
+        {
+            "cond.py": f"from openai import OpenAI\nflag = 1\nOpenAI().responses.create(model={nested})\n"
+        },
+    )
+    found = set(models(result))
+    assert "m-29" in found and "m-0" not in found
+    assert list(result.surfaces_excluded) == [unread("cond.py", 3), f"cond.py:1: {CUT}"]
+
+
+TEXT_CALLS = """\
+import os
+from openai import OpenAI
+
+client = OpenAI()
+client.responses.create(model=str("o3"))
+client.responses.create(model="GPT-4O".lower())
+client.responses.create(model=" gpt-4.1 ".strip())
+client.responses.create(model=cfg.field("llm-tier"))
+client.responses.create(model="{}-{}".format("gpt", "4o"))
+client.responses.create(model=os.getenv("M"))
+client.responses.create(model="my model v2")
+client.responses.create(model="weights/final.pickle")
+client.responses.create(model="default")
+"""
+
+
+def test_text_a_call_gives_back_is_read_only_where_its_callee_is_known(tmp_path: Path):
+    result = scan(tmp_path, {"text.py": TEXT_CALLS})
+    assert set(models(result)) == {"o3", "gpt-4o", "gpt-4.1"}
+    # A call of anything else, a format, a variable named so it is not exported and text
+    # that is no identifier are unread; ``default`` and a weight file name no hosted model.
+    assert list(result.surfaces_excluded) == [unread("text.py", 8, 4)]
+
+
+def test_a_token_is_not_exported_through_a_change_of_case(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": f'from openai import OpenAI\nKEY = "{PLANTED}"\n'
+            "OpenAI().responses.create(model=KEY.upper())\n"
+            "OpenAI().responses.create(model=KEY.lower())\n"
+            'OpenAI().responses.create(model=(" " + KEY).strip())\n'
+        },
+    )
+    assert result.components == []
+    assert PLANTED.upper() not in exported(result) and "Zq7Zq7".lower() not in exported(result)
+    assert list(result.surfaces_excluded) == [unread("run.py", 3, 3)]
+
+
+EDGES = """\
+import os
+from openai import OpenAI
+
+client = OpenAI()
+first, *rest = ["gpt-4o", "o3"]
+client.responses.create(model=rest)
+[(chosen := "gpt-4.1") for _ in range(1)]
+client.responses.create(model=chosen)
+client.responses.create(model=f"{'gpt-4o'!r}")
+client.responses.create(model=f"{'gpt':>8}")
+client.responses.create(model="ft:gpt-4o-mini:acme::abc123")
+match {"MODEL": "o1"}:
+    case {"MODEL": _, **others}:
+        client.responses.create(model=others)
+"""
+
+
+def test_the_rules_at_the_edges_of_a_binding(tmp_path: Path):
+    result = scan(tmp_path, {"edges.py": EDGES})
+    found = models(result)
+    # An assignment expression in a comprehension binds the name around it.
+    assert set(found) == {"gpt-4.1", "ft:gpt-4o-mini:acme::abc123"}
+    assert found["ft:gpt-4o-mini:acme::abc123"].model_type == "fine-tuned"
+    # A starred name, a converted or formatted value and a pattern's rest are unread.
+    assert list(result.surfaces_excluded) == [unread("edges.py", 6, 4)]
+
+
+def test_more_texts_than_one_argument_keeps_say_so(tmp_path: Path):
+    names = "\n".join(f'A{index} = "gpt-4o-{index}"' for index in range(10))
+    choose = "A = " + " or ".join(f"A{index}" for index in range(10))
+    halves = 'L = "a" or "b" or "c" or "d"\nR = "e" or "f"\n'
+    joined = "\n".join('N = f"{L}-{R}"' for _ in range(3))
+    result = scan(
+        tmp_path,
+        {
+            "many.py": f"import os\nfrom openai import OpenAI\n{names}\n{choose}\n{halves}"
+            f"{joined}\n"
+            'OpenAI().responses.create(model=os.getenv("CHAT_MODEL", A))\n'
+            "OpenAI().responses.create(model=N)\n"
+        },
+    )
+    # All ten defaults, and the eight texts each of the three bindings joins to, of which
+    # sixteen are kept for the argument.
+    assert len(models(result)) == 10 + 8
+    assert list(result.surfaces_excluded) == [f"many.py:1: {CUT}"]
+
+
+def test_a_dict_spread_into_a_call_is_read_where_nothing_else_may_change_it(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from openai import OpenAI
+
+client = OpenAI()
+client.responses.create(**{"model": "superseded", "model": "gpt-4o"})
+client.responses.create(**dict(model="o3"))
+REQUEST = {"model": "gpt-4.1"}
+client.responses.create(**REQUEST)
+CHANGED = {"model": "gpt-4.1-mini"}
+CHANGED["model"] = pick()
+client.responses.create(**CHANGED)
+PASSED = {"model": "gpt-4.1-nano"}
+log(PASSED)
+client.responses.create(**PASSED)
+BASE = {"temperature": 0}
+client.responses.create(**{**BASE})
+TWICE = {"model": "o1"}
+TWICE = {"temperature": 0}
+client.responses.create(**TWICE)
+
+
+def run(**options):
+    client.responses.create(**options)
+"""
+        },
+    )
+    # A dict written out, there or bound once to a name the file only spreads, is read,
+    # and of a key written twice, the value Python keeps.
+    # One changed, handed on, spread from another or bound twice may hold anything, and
+    # so may a parameter.
+    assert set(models(result)) == {"gpt-4o", "o3", "gpt-4.1"}
+    assert list(result.surfaces_excluded) == [unread("run.py", 10, 5)]
+
+
+def test_an_object_a_library_makes_is_no_gap_wherever_it_is_bound(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from langchain_openai import ChatOpenAI
+from pydantic_ai import Agent
+
+llm = ChatOpenAI(model="gpt-4o")
+fallback = llm if fast else ChatOpenAI(model="o3")
+Agent(model=llm)
+Agent(model=fallback)
+"""
+        },
+    )
+    assert set(models(result)) == {"gpt-4o", "o3"}
+    assert not result.surfaces_excluded
+
+
+@pytest.mark.parametrize(
+    ("name", "accepted"),
+    [
+        ("CHAT_MODEL", True),
+        ("model", True),
+        ("1MODEL", False),
+        ("has space", False),
+        (PLANTED, False),
+        (7, False),
+    ],
+)
+def test_which_names_are_exported_as_environment_variables(name: object, accepted: bool):
+    assert (environment_name(name) is not None) is accepted
+
+
+def test_joining_text_is_charged_to_the_allowance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(source_python.PythonReader, "_allowance", staticmethod(lambda module: 200))
+    left = " or ".join(f'"{"l" * 199}{index:x}"' for index in range(16))
+    right = " or ".join(f'"{"r" * 99}{index:x}"' for index in range(16))
+    result = scan(
+        tmp_path,
+        {
+            "run.py": f"from openai import OpenAI\nL = {left}\nR = {right}\n"
+            'OpenAI().responses.create(model=f"{L}{R}")\n'
+        },
+    )
+    # No joined text is short enough to keep, yet each of the 256 was made and is a
+    # step, which this allowance does not cover.
+    assert list(result.surfaces_excluded) == [unread("run.py", 4), f"run.py:1: {CUT}"]
+
+
+def test_a_default_in_one_file_does_not_stand_for_a_read_another_file_needs(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "a.py": "import os\nfrom openai import OpenAI\n"
+            'OpenAI().responses.create(model=os.getenv("CHAT_MODEL", "gpt-4o"))\n',
+            "b.py": "import os\nfrom openai import OpenAI\n"
+            'OpenAI().responses.create(model=os.environ["CHAT_MODEL"])\n',
+        },
+    )
+    assert set(models(result)) == {"gpt-4o"}
+    assert list(result.surfaces_excluded) == [
+        "b.py:3: model set only by environment variable CHAT_MODEL; not inventoried"
+    ]
+
+
+def test_a_call_given_one_keyword_twice_gives_no_model(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "from openai import OpenAI\nclient = OpenAI()\n"
+            + 'client.responses.create(model="gpt-4o", **{"model": "o3"})\n'
+            + 'client.responses.create(**{"model": "gpt-4.1"}, **dict(model="o4-mini"))\n'
+            + 'client.responses.create(model="gpt-4o-mini", **{"temperature": 0})\n'
+        },
+    )
+    # Python refuses a call given one keyword twice; a key given once is no conflict.
+    assert set(models(result)) == {"gpt-4o-mini"}
+    assert not result.surfaces_excluded
+
+
+def test_a_spread_is_charged_for_every_entry_it_walks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(source_python.PythonReader, "_allowance", staticmethod(lambda module: 300))
+    entries = ", ".join('"model": "gpt-4o"' for _ in range(200))
+    result = scan(
+        tmp_path,
+        {
+            "run.py": f"from openai import OpenAI\nREQUEST = {{{entries}}}\n"
+            + "OpenAI().responses.create(**REQUEST)\n" * 2
+        },
+    )
+    # Two walks of 200 entries are more steps than this allowance holds.
+    assert f"run.py:1: {CUT}" in result.surfaces_excluded
+
+
+def test_a_default_that_names_no_model_leaves_it_to_the_environment(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom openai import OpenAI\n"
+            + 'OpenAI().responses.create(model=os.getenv("CHAT_MODEL", None))\n'
+            + 'OpenAI().responses.create(model=os.environ.get("FAST_MODEL", ""))\n'
+        },
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [
+        "run.py:3: model set only by environment variable CHAT_MODEL; not inventoried",
+        "run.py:4: model set only by environment variable FAST_MODEL; not inventoried",
+    ]
+
+
+def test_two_variables_that_share_a_fallback_are_both_kept(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom openai import OpenAI\n"
+            + 'FALLBACK = "gpt-4o"\n'
+            + 'M = (os.getenv("PRIMARY_MODEL") or FALLBACK) if fast else '
+            + '(os.getenv("BACKUP_MODEL") or FALLBACK)\n'
+            + "OpenAI().responses.create(model=M)\n"
+        },
+    )
+    variables = models(result)["gpt-4o"].properties["environment_variables"]
+    assert variables == ["BACKUP_MODEL", "PRIMARY_MODEL"]
+
+
 def test_a_folded_import_statement_longer_than_a_slice_is_found(tmp_path: Path):
     names = ", ".join(f"m{index}" for index in range(1500))
     (tmp_path / "run.py").write_text(
@@ -1941,6 +2818,159 @@ def test_a_text_longer_than_any_identifier_is_judged_and_not_kept():
     assert list(found._written) == ["gpt-4o"]
 
 
+ONLY_BY = "model set only by environment variable OPENAI_MODEL; not inventoried"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        'os.getenv("OPENAI_MODEL", "")',
+        'os.environ.get("OPENAI_MODEL", None)',
+        'config("OPENAI_MODEL", default=None)',
+        'os.getenv("OPENAI_MODEL") or None',
+        'os.getenv("OPENAI_MODEL", "default")',
+        'os.getenv("OPENAI_MODEL", "./models/local.gguf")',
+    ],
+    ids=["empty", "none", "decouple-none", "or-none", "placeholder", "project-file"],
+)
+def test_a_model_only_the_environment_names_is_a_gap_whatever_names_no_model_beside_it(
+    tmp_path: Path, value: str
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom decouple import config\nfrom openai import OpenAI\n"
+            f"OpenAI().responses.create(model={value})\n"
+        },
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [f"run.py:4: {ONLY_BY}"]
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        'try:\n    from settings import MODEL\nexcept ImportError:\n    MODEL = "gpt-4o"\n',
+        'MODEL = "gpt-4o"\nfrom settings_local import *\n',
+    ],
+    ids=["optional-import", "star-import"],
+)
+def test_an_import_may_bind_a_name_in_place_of_the_value_read(tmp_path: Path, binding: str):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": f"from openai import OpenAI\n{binding}"
+            "OpenAI().responses.create(model=MODEL)\n",
+            "settings.py": 'MODEL = "o3"\n',
+        },
+    )
+    line = binding.count("\n") + 2
+    assert set(models(result)) == {"gpt-4o"}
+    assert list(result.surfaces_excluded) == [unread("run.py", line)]
+
+
+def test_a_parameter_annotated_with_an_sdk_class_holds_an_object_it_makes(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from crewai import LLM, Agent
+from langchain_core.language_models import BaseChatModel
+from langgraph.prebuilt import create_react_agent
+
+
+def build(llm: BaseChatModel, tools):
+    return create_react_agent(model=llm, tools=tools)
+
+
+def make(llm: LLM):
+    return Agent(role="r", goal="g", backstory="b", llm=llm)
+"""
+        },
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == []
+
+
+def test_a_variable_read_past_the_bound_is_cut_and_never_dropped_unseen(tmp_path: Path):
+    reads = 'M = os.getenv("CHAT_MODEL")\n' * 17
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom openai import OpenAI\n"
+            + reads
+            + 'M = "o3"\nOpenAI().responses.create(model=M or "gpt-4o")\n'
+        },
+    )
+    assert f"run.py:1: {CUT}" in result.surfaces_excluded
+
+
+def test_options_bound_once_to_a_dict_are_read_where_they_are_given(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": """\
+from langchain_huggingface import HuggingFaceEmbeddings
+from sentence_transformers import SentenceTransformer
+
+model_kwargs = {"device": "cpu"}
+encode_kwargs = {"normalize_embeddings": False}
+HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    model_kwargs=model_kwargs,
+    encode_kwargs=encode_kwargs,
+)
+TRUSTED = {"trust_remote_code": True}
+SentenceTransformer("someorg/trusted", model_kwargs=TRUSTED)
+CHANGED = {"device": "cpu"}
+CHANGED.update(trust_remote_code=True)
+SentenceTransformer("someorg/changed", model_kwargs=CHANGED)
+"""
+        },
+    )
+    found = models(result)
+    assert found["sentence-transformers/all-MiniLM-L6-v2"].trust_remote_code is None
+    assert found["someorg/trusted"].trust_remote_code is True
+    assert found["someorg/changed"].trust_remote_code is None
+    # A dict the file changes may hold anything by the time it is given.
+    assert list(result.surfaces_excluded) == [f"run.py:15: {REMOTE}"]
+
+
+def test_the_variables_of_one_text_are_bounded_and_the_rest_cut(tmp_path: Path):
+    parts = "".join(f"{{os.getenv('MODEL_PART_{index:02d}', 'g-')}}" for index in range(20))
+    result = scan(
+        tmp_path,
+        {
+            "run.py": f'import os\nfrom openai import OpenAI\nE = f"{parts}"\n'
+            + 'OpenAI().responses.create(model=E + "x")\n'
+        },
+    )
+    (model,) = models(result).values()
+    assert len(model.properties["environment_variables"]) == source_python.MAX_VARIABLES
+    assert list(result.surfaces_excluded) == [f"run.py:1: {CUT}"]
+
+
+def test_a_variable_is_checked_once_for_a_model_however_often_it_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    checked: list[object] = []
+    exported = source_references.environment_name
+
+    def counted(name: object) -> str | None:
+        checked.append(name)
+        return exported(name)
+
+    monkeypatch.setattr(source_references, "environment_name", counted)
+    calls = "OpenAI().responses.create(model=M)\n" * 50
+    scan(
+        tmp_path,
+        {
+            "run.py": f'import os\nfrom openai import OpenAI\nM = os.getenv("CHAT_MODEL", "gpt-4o")\n{calls}'
+        },
+    )
+    assert checked == ["CHAT_MODEL"]
+
+
 def test_the_answers_kept_across_files_are_bounded(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(source_python, "MAX_CACHED", 10)
     files = {
@@ -2070,6 +3100,197 @@ def plan(model: KnownModelName):
     assert list(result.surfaces_excluded) == [unread("run.py", 9, 2)]
 
 
+@pytest.mark.parametrize(
+    ("files", "where"),
+    [
+        (
+            {
+                "app/__init__.py": "",
+                "app/hf.py": "def allow(model_kwargs):\n    model_kwargs.update(trust_remote_code=True)\n",
+                "app/embed.py": "from sentence_transformers import SentenceTransformer\n\n"
+                "from app.hf import allow\n\noptions = {'device': 'cpu'}\nallow(model_kwargs=options)\n"
+                "SentenceTransformer('someorg/custom-7b', model_kwargs=options)\n",
+            },
+            "app/embed.py:7",
+        ),
+        (
+            {
+                "settings_local.py": "MODEL_KWARGS = {'trust_remote_code': True}\n",
+                "app.py": "from sentence_transformers import SentenceTransformer\n\ntry:\n"
+                "    from settings_local import MODEL_KWARGS\nexcept ImportError:\n"
+                "    MODEL_KWARGS = {'device': 'cpu'}\n\n"
+                "SentenceTransformer('someorg/custom-7b', model_kwargs=MODEL_KWARGS)\n",
+            },
+            "app.py:8",
+        ),
+        (
+            {
+                "app.py": "from sentence_transformers import SentenceTransformer\n\n"
+                "options = defaults = {'device': 'cpu'}\ndefaults['trust_remote_code'] = True\n"
+                "SentenceTransformer('someorg/custom-7b', model_kwargs=options)\n",
+            },
+            "app.py:5",
+        ),
+    ],
+    ids=[
+        "changed-by-the-callee-it-is-handed-to",
+        "an-import-may-bind-it",
+        "changed-through-another-name",
+    ],
+)
+def test_options_another_name_or_callee_may_change_are_a_gap(
+    tmp_path: Path, files: dict[str, str], where: str
+):
+    result = scan(tmp_path, files)
+    assert models(result)["someorg/custom-7b"].trust_remote_code is None
+    assert list(result.surfaces_excluded) == [f"{where}: {REMOTE}"]
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "try:\n    from settings import LLM_KWARGS\nexcept ImportError:\n    LLM_KWARGS = {'model': 'gpt-4o'}\n",
+        "LLM_KWARGS = {'model': 'gpt-4o'}\nfrom settings_local import *\n",
+    ],
+    ids=["optional-import", "star-import"],
+)
+def test_an_import_may_bind_a_spread_dict_in_place_of_the_one_read(tmp_path: Path, binding: str):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": f"from openai import OpenAI\n{binding}"
+            "OpenAI().chat.completions.create(messages=[], **LLM_KWARGS)\n",
+            "settings.py": "LLM_KWARGS = {'model': 'o3'}\n",
+        },
+    )
+    assert list(result.surfaces_excluded) == [unread("run.py", binding.count("\n") + 2)]
+
+
+@pytest.mark.parametrize(
+    ("read", "gap"),
+    [
+        ('os.getenv("OPENAI_MODEL", DEFAULT_MODEL)', ONLY_BY),
+        ('os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)', ONLY_BY),
+        ('config("OPENAI_MODEL", default=DEFAULT_MODEL)', ONLY_BY),
+        # Through ``str()`` it is read as a value the reader cannot tell, never as silence.
+        ('str(os.getenv("OPENAI_MODEL", DEFAULT_MODEL))', f"a model argument is {UNREAD}"),
+    ],
+    ids=["getenv", "environ-get", "decouple", "str"],
+)
+def test_a_default_bound_to_what_names_no_model_leaves_it_to_the_environment(
+    tmp_path: Path, read: str, gap: str
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom decouple import config\nfrom openai import OpenAI\n"
+            f"DEFAULT_MODEL = None\nOpenAI().responses.create(model={read})\n"
+        },
+    )
+    assert result.components == []
+    assert list(result.surfaces_excluded) == [f"run.py:5: {gap}"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["a94a8fe5ccb19ba61c4c0873d391e987982fbbd3", "Qx7rT2mLk9VwZp4NsYb8HcJd3FgEa6Ru"],
+    ids=["hex", "mixed-case-run"],
+)
+def test_a_variable_named_like_a_key_is_never_exported(tmp_path: Path, name: str):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom openai import OpenAI\n"
+            f'OpenAI().responses.create(model=os.getenv("{name}") or None)\n'
+            f'OpenAI().responses.create(model=os.getenv("{name}", "gpt-4o"))\n'
+        },
+    )
+    assert name not in exported(result) and name not in " ".join(result.surfaces_excluded)
+    assert set(models(result)) == {"gpt-4o"}
+    assert list(result.surfaces_excluded) == [unread("run.py", 3, 2)]
+
+
+def test_an_environment_variable_is_checked_once_however_many_operands_read_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    checked: list[str] = []
+    unchanged = source_references.unchanged_by_redaction
+
+    def counted(text: str) -> bool:
+        checked.append(text)
+        return unchanged(text)
+
+    source_references.environment_name.cache_clear()
+    monkeypatch.setattr(source_references, "unchanged_by_redaction", counted)
+    chain = " or ".join(["M"] * 200)
+    scan(
+        tmp_path,
+        {
+            "run.py": "import os\nfrom openai import OpenAI\n"
+            f'M = os.getenv("CHAT_MODEL_NAME")\nX = {chain} or "gpt-4o"\n'
+            + "OpenAI().responses.create(model=X)\n"
+            * 50
+        },
+    )
+    assert checked.count("CHAT_MODEL_NAME") == 1
+
+
+@pytest.mark.parametrize(
+    ("annotation", "gaps"),
+    [
+        ("Optional[BaseChatModel] = None", 0),
+        ("BaseChatModel | None = None", 0),
+        ("Union[ChatOpenAI, ChatAnthropic]", 0),
+        ("Optional[ChatModel] = None", 1),
+        ('Union[BaseChatModel, "str"]', 1),
+        ('Optional[Union["PendingType", BaseChatModel]]', 1),
+        ('"BaseChatModel"', 1),
+    ],
+    ids=[
+        "optional",
+        "or-none",
+        "union-of-sdk-classes",
+        "optional-model-name",
+        "union-with-forward-reference",
+        "nested-forward-reference",
+        "quoted-annotation",
+    ],
+)
+def test_a_parameter_that_may_be_none_is_judged_by_its_class(
+    tmp_path: Path, annotation: str, gaps: int
+):
+    result = scan(
+        tmp_path,
+        {
+            "run.py": "from typing import Optional, Union\n"
+            "from langchain_anthropic import ChatAnthropic\n"
+            "from langchain_core.language_models import BaseChatModel\n"
+            "from langchain_openai import ChatOpenAI\nfrom langgraph.prebuilt import create_react_agent\n"
+            "from openai.types import ChatModel\n\n\n"
+            f"def build(tools, llm: {annotation}):\n"
+            "    return create_react_agent(model=llm, tools=tools)\n"
+        },
+    )
+    assert list(result.surfaces_excluded) == ([unread("run.py", 10)] if gaps else [])
+
+
+def test_a_variable_with_an_unread_fallback_does_not_set_the_model_alone(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "app/__init__.py": "",
+            "app/settings.py": "DEFAULT_MODEL = 'gpt-4o'\n",
+            "app/llm.py": "import os\n\nfrom langchain_openai import ChatOpenAI\n\n"
+            "from app import settings\n\n"
+            "llm = ChatOpenAI(model=os.getenv('OPENAI_MODEL') or settings.DEFAULT_MODEL)\n",
+        },
+    )
+    assert list(result.surfaces_excluded) == [
+        "app/llm.py:7: model argument is bound in another module of the project, which the "
+        + "collector does not follow; not inventoried"
+    ]
+
+
 def test_a_router_and_a_crews_other_models_are_read_or_a_gap(tmp_path: Path):
     result = scan(
         tmp_path,
@@ -2134,6 +3355,19 @@ def test_a_model_given_when_a_partial_is_called_is_read(tmp_path: Path):
     assert set(models(result)) == {"gpt-4o", "o3"}
 
 
+def test_the_variables_of_one_model_are_listed_up_to_the_bound(tmp_path: Path):
+    calls = "".join(
+        f'OpenAI().responses.create(model=os.getenv("MODEL_{index:03d}", "gpt-4o"))\n'
+        for index in range(40)
+    )
+    result = scan(tmp_path, {"run.py": f"import os\nfrom openai import OpenAI\n{calls}"})
+    (model,) = models(result).values()
+    assert model.properties["environment_variables"] == [
+        f"MODEL_{index:03d}" for index in range(16)
+    ]
+    assert model.properties["environment_variables_unlisted"] is True
+
+
 def test_ambiguous_source_encoding_uses_the_collectors_sdk_vocabulary(tmp_path: Path):
     (tmp_path / "dual.py").write_bytes(
         "# coding: latin-1\n# coding: utf-8\nimport openai\n# café\n".encode()
@@ -2173,3 +3407,77 @@ def test_global_callee_is_resolved_in_the_module(tmp_path: Path):
     )
     assert set(models(result)) == {"sample-model"}
     assert not result.surfaces_excluded
+
+
+def test_union_annotation_beyond_candidate_limit_marks_coverage_gap(tmp_path: Path):
+    annotation = " | ".join(["int"] * (source_python.MAX_CANDIDATES + 1))
+    result = scan(
+        tmp_path,
+        {
+            "app.py": f"import openai\ndef query(client: {annotation}):\n"
+            "    client.responses.create(model='sample-model')\n"
+        },
+    )
+    assert f"app.py:1: {CUT}" in result.surfaces_excluded
+
+
+def test_nonlocal_write_reaches_lexical_owner_even_if_bound_later(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "app.py": """from litellm import completion
+def outer():
+    def middle():
+        def inner():
+            nonlocal model
+            model = "second-model"
+        inner()
+    model = "first-model"
+    middle()
+    completion(model=model)
+"""
+        },
+    )
+    assert set(models(result)) == {"first-model", "second-model"}
+    assert not result.surfaces_excluded
+
+
+@pytest.mark.parametrize("import_line", ["from settings import model", "from settings import *"])
+def test_imported_value_is_not_assumed_to_be_an_environment_read(tmp_path: Path, import_line: str):
+    result = scan(
+        tmp_path,
+        {
+            "app.py": "import os\nfrom litellm import completion\n"
+            "model = os.getenv('CHOICE')\n"
+            f"{import_line}\ncompletion(model=model or 'sample-model')\n"
+        },
+    )
+    assert "sample-model" in models(result)
+    assert "environment_variables" not in models(result)["sample-model"].properties
+    assert result.surfaces_excluded
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("os.getenv(key='CHOICE', **{'default': 'sample-model'})", "sample-model"),
+        ("config('CHOICE', 'sample-model', cast=str)", "sample-model"),
+        ("config('CHOICE', 'sample-model', cast=transform)", None),
+        ("os.getenv('CHOICE', **config_options)", None),
+    ],
+)
+def test_environment_reader_accounts_for_options(
+    tmp_path: Path, expression: str, expected: str | None
+):
+    result = scan(
+        tmp_path,
+        {
+            "app.py": "import os\nfrom decouple import config\nfrom litellm import completion\n"
+            f"completion(model={expression})\n"
+        },
+    )
+    if expected is None:
+        assert not result.components and result.surfaces_excluded
+    else:
+        assert models(result)[expected].properties["environment_variables"] == ["CHOICE"]
+        assert not result.surfaces_excluded
