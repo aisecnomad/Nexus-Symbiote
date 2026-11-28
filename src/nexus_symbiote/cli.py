@@ -68,7 +68,7 @@ if TYPE_CHECKING:
     from nexus_symbiote.utils.crypto import SigstoreArtifactPolicy
 
 DEBUG_KEY = "nexus_symbiote.debug"
-BUILTIN_SCANNERS = "mcp, model, prompt, rag, registry, a2a, ide_agents, shadowscan"
+BUILTIN_SCANNERS = "mcp, model, prompt, rag, registry, a2a, ide_agents, shadowscan, source"
 # Gate reports name the agent manifest and the graph check like collectors.
 MANIFEST = "agent.yaml"
 
@@ -557,6 +557,7 @@ def _get_scanners() -> dict[str, type]:
         from nexus_symbiote.scanners.rag import RAGScanner
         from nexus_symbiote.scanners.registry import RegistryScanner
         from nexus_symbiote.scanners.shadowscan import ShadowScanImporter
+        from nexus_symbiote.scanners.source import SourceScanner
 
         SCANNER_REGISTRY.update(
             {
@@ -568,6 +569,7 @@ def _get_scanners() -> dict[str, type]:
                 "registry": RegistryScanner,
                 "a2a": A2AScanner,
                 "ide_agents": IDEAgentScanner,
+                "source": SourceScanner,
             }
         )
     return SCANNER_REGISTRY
@@ -2217,6 +2219,7 @@ def validate(
     # Only the reconciliation below may claim that the inventory was compared with the project.
     basis = "project-not-reconciled" if root is not None else "supplied-bom"
     bound_imports: frozenset[str] = frozenset()
+    bound_references: frozenset[str] = frozenset()
     supplier_observed: frozenset[str] = frozenset()
     completeness: dict[str, Any] = {"status": "skipped", "skipped_by": "policy"}
     if policy.validation.require_completeness:
@@ -2234,6 +2237,7 @@ def validate(
         )
         completeness = {"status": "pass" if c_report.is_complete else "fail", **c_report.to_dict()}
         bound_imports = c_report.bound_imports
+        bound_references = c_report.bound_references
         supplier_observed = c_report.supplier_observed
         if root is not None:
             # The risk command's vocabulary: reconciled, with supplier claims, or failed.
@@ -2243,7 +2247,11 @@ def validate(
     if not skip_integrity:
         if policy.validation.require_integrity:
             i_report = IntegrityValidator(signature_policies=signature_policies).validate(
-                bom, root, exclude_paths=policy.scan.exclude_paths, bound_imports=bound_imports
+                bom,
+                root,
+                exclude_paths=policy.scan.exclude_paths,
+                bound_imports=bound_imports,
+                bound_references=bound_references,
             )
             integrity = i_report.to_dict()
             passed = passed and i_report.is_valid

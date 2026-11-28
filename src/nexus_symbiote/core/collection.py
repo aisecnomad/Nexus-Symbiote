@@ -10,16 +10,25 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from nexus_symbiote.core.enums import AssuranceLevel
+from nexus_symbiote.core.enums import AssuranceLevel, SerializationSafety
 from nexus_symbiote.core.identifiers import neutralize_identifiers
 from nexus_symbiote.core.models import (
     AnyComponent,
     ClaimEvidence,
+    ModelComponent,
     PromptComponent,
     ToolComponent,
 )
 
 IMPORTED_MODE = "imported-unverified-report"
+SOURCE_REFERENCE_MODE = "static-source-reference"
+# What a model component can claim that only its artifact can establish.
+_ARTIFACT_FIELDS = (
+    *("source_path", "resolved_revision", "serialization_format", "signing_status"),
+    *("signing_identity", "base_model_ref", "derivation_type", "quantization_method"),
+    *("tokenizer_hash", "chat_template_hash", "tensor_inventory_hash"),
+    *("safetensors_header_hash", "trust_remote_code"),
+)
 PRESENCE_CLAIM = "repository_presence"
 DISCOVERY_CLAIM = "discovery_report_entry"
 # On an imported model: where a scan read the identifier that a report cites.
@@ -29,6 +38,21 @@ IMPORTING_COLLECTORS = frozenset({"shadowscan"})
 
 def is_imported(component: AnyComponent) -> bool:
     return component.properties.get("collection_mode") == IMPORTED_MODE
+
+
+def is_source_reference(component: AnyComponent) -> bool:
+    """Whether a model is an identifier the source collector read, with no artifact.
+
+    Such a model names no weight file: it has no digest, no path and none of the
+    properties that only an artifact gives, only the line of source that names it.
+    """
+    return (
+        isinstance(component, ModelComponent)
+        and component.properties.get("collection_mode") == SOURCE_REFERENCE_MODE
+        and not component.hashes
+        and component.serialization_safety is SerializationSafety.UNKNOWN
+        and all(getattr(component, name) is None for name in _ARTIFACT_FIELDS)
+    )
 
 
 def measured_assurance(component: AnyComponent) -> AssuranceLevel:

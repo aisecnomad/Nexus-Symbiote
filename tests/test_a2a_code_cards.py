@@ -23,6 +23,7 @@ from nexus_symbiote.scanners.a2a import A2AScanner
 from nexus_symbiote.utils import confined
 
 BUILT = "A2A agent card built in Python code is not inventoried"
+SOURCE_UNREAD = "source file is larger than the file-bytes limit; not read"
 UNPARSED = (
     "Python source that names AgentCard could not be parsed; "
     "an agent card it builds is not inventoried"
@@ -97,8 +98,12 @@ def test_card_module_one_byte_past_file_bytes_fails_every_gate(tmp_path, relativ
     scan = _scan(project, after)
     assert scan.exit_code == 1, scan.output
     completeness = _completeness(after)
-    assert completeness["surfaces_excluded"] == [f"{relative}: {UNPARSED}"]
+    # The source collector cannot tell what a file it did not read holds either.
+    assert completeness["surfaces_excluded"] == sorted(
+        [f"{relative}: {UNPARSED}", f"{relative}: {SOURCE_UNREAD}"]
+    )
     assert completeness["scanner_status"]["a2a"] == "partial"
+    assert completeness["scanner_status"]["source"] == "partial"
     diff = CliRunner().invoke(main, ["diff", str(before), str(after), "--fail-on-alert"])
     assert diff.exit_code == 1, diff.output
     validate = CliRunner().invoke(
@@ -115,7 +120,9 @@ def test_lowered_file_bytes_never_hides_a_card_module(tmp_path):
     run = _scan(project, output, "--limit", "file-bytes=64KiB")
     assert run.exit_code == 1, run.output
     completeness = _completeness(output)
-    assert completeness["surfaces_excluded"] == [f"agent_server.py: {BUILT}"]
+    assert completeness["surfaces_excluded"] == sorted(
+        [f"agent_server.py: {BUILT}", f"agent_server.py: {SOURCE_UNREAD}"]
+    )
     assert completeness["scanner_status"]["a2a"] == "partial"
 
 

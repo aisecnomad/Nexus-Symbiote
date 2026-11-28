@@ -288,7 +288,7 @@ def _maximal_policy_yaml(suppressions: int) -> str:
     lines = [
         'version: "1.0"',
         "scan:",
-        '  scanners: ["mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents"]',
+        '  scanners: ["mcp", "model", "prompt", "rag", "registry", "shadowscan", "a2a", "ide_agents", "source"]',
         "  exclude_paths:",
         *(f"    - generated/dir_{index}" for index in range(MAX_POLICY_LIST_ITEMS)),
         '  failure_mode: "report-only"',

@@ -80,6 +80,7 @@ Recorded architectural boundaries (see [docs/decisions.md](docs/decisions.md) fo
 | Inventory envelope encryption | **Not planned** | Inventories store secret references, never values; encryption at rest belongs to the artifact store |
 | Escaping symlinks during collection | **Fail closed (confinement unchanged)** | Following or inspecting links outside the scan root violates confinement; replace with regular files or in-root relative links |
 | Broadest scanner / CVE DB / MCP firewall | **Non-goals** | Import broader discovery (ShadowScan, CycloneDX/SPDX) and enforce contracts through external gateways ([runtime contract reference](docs/runtime-contract-reference.md)) |
+| Reading declarations in application source (`source` collector) | **Accepted, static and declared only** | An inventory that cannot name the models a project's own code asks for is not an agent inventory. The collector parses and never imports or runs, records at `declared` assurance with file and line, exports no value of a secret, and adds no dependency. It reads declarations made through a known SDK, literal values only; ShadowScan remains the wider discovery engine and its reports import unchanged ([collector reference](docs/collectors.md#declarations-in-application-source)) |
 | Proving an agent or model benign | **Non-goal** | Absence of findings is unknown, not verified safety |
 
 ## Contributing

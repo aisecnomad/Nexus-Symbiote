@@ -16,6 +16,7 @@ from nexus_symbiote.core.aibom import AIBOM, DependencyEdge
 from nexus_symbiote.core.collection import (
     IMPORTED_MODE,
     is_imported,
+    is_source_reference,
     merge_collected,
 )
 from nexus_symbiote.core.coverage import assess_coverage
@@ -160,6 +161,8 @@ class CompletenessReport:
     local_subjects: int | None = None
     supplier_claims: list[SupplierClaim] = field(default_factory=list)
     bound_imports: frozenset[str] = frozenset()
+    bound_references: frozenset[str] = frozenset()
+    """Model references the local collection read again from the project's source."""
     supplier_observed: frozenset[str] = frozenset()
     """Matched components whose observed composition only supplier additions establish."""
     issues_omitted: int = 0
@@ -407,11 +410,17 @@ class CompletenessValidator:
                     incomplete(scanner.name, reason)
                 if not problems:
                     report.bound_imports = frozenset(c.bom_ref for c in local.components)
+            references = {c.bom_ref for c in local.components if is_source_reference(c)}
             failed = bool(local.scan_failures)
             for component in local.components:
                 if merge_collected(collected, component, scanner.name, None) == "conflict":
                     incomplete(scanner.name, f"Conflicting local reference: {component.bom_ref}")
+                    # A reference that another collector's component contradicts vouches
+                    # for neither of them.
+                    references.discard(component.bom_ref)
                     failed = True
+            if scanner.name == "source":
+                report.bound_references = frozenset(references)
             surfaces.extend(local.surfaces_scanned)
             excluded.extend(local.surfaces_excluded)
             accepted_default_exclusions.update(local.accepted_default_exclusions)

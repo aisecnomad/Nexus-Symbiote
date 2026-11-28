@@ -16,8 +16,61 @@ Every path is relative to the project root. Each collector also bounds what it r
 | `a2a` | `agent.json` and `agent-card.json` in any `.well-known` directory and in the root, and `a2a/agent.json`. At the root, client configuration in `a2a.json`, `a2a.yaml`, `a2a.yml` or `a2a_config.json`. Python files outside directories named `tests`, `test`, `dist`, `build`, `docs`, `benchmarks` or `examples`, for SDK references. A card or client configuration that is a symlink to a file whose name or directory says it holds credentials (including `.aws/`, `.ssh/`, `.gnupg/`, `.kube/`, `.docker/`, `.azure/`, `.gcloud/`, `.vault/`, `vault/`, and `.config/<store>/`), or a regular file inside a dotted or XDG credential store, is a coverage gap and is not read; a regular `.well-known` card under a plain service directory such as `services/credentials/.well-known/agent-card.json` remains inventoried. A card's `url` or `endpoint`, or an interface URL, such as `http:host/x` or `ht\ttp://host/x` is checked and exported as `http://host/x`, as WHATWG parsers read it; client configuration URLs and a security scheme's `tokenUrl` are not normalised |
 | `ide_agents` | Marker files and settings of Claude Code (also `.claude` settings in subdirectories, plugin manifests and the hook files `.claude-plugin/plugin.json` names in `hooks`, and the `hooks` front matter of project subagents in `.claude/agents` and skills in `.claude/skills`), Codex (`.codex/config.toml` and `.codex/config.json`), Cursor (including `.cursor/hooks.json` and `.cursor/cli.json`), Gemini CLI (`.gemini/settings.json`), Windsurf, Cline, Copilot (`.github/copilot-extensions.json`), Antigravity and xAI; `.vscode/extensions.json`, for recommended AI extensions |
 | `shadowscan` | A report at `.shadowscan/report.json`, `shadowscan-report.json` or `shadowscan.json`; reports at more than one of them are a failure |
+| `source` | At any depth, outside directories named `tests`, `test`, `__tests__`, `dist`, `build`, `docs`, `benchmarks` and `examples`: Python files other than `test_*.py`, `*_test.py` and `conftest.py`, and a link only when what it reaches is not one of these. A file named as one that holds credentials is read: the collector exports no value but a model identifier that passes its checks |
 
 An optional [`agent.yaml` manifest](agent-manifest.md) at the project root names the agent and declares further instruction files and models.
+
+## Declarations in application source
+
+The `source` collector uses CPython's source encoding rules and parses files whose imports may name
+a known SDK. It never imports or executes project code or contacts the SDK. Project modules take
+precedence when an import resolves to them, including a local `agents` package or `agents.researcher`.
+
+The collector reads model keywords (`model=` and variants, deployment names, `llm=` and
+CrewAI's `*_llm=`, and model-specific `repo_id=` or `id=`) and positional model arguments
+of entry points such as `init_chat_model` and `litellm.completion`. It resolves scoped
+imports, SDK-typed parameters, SDK subclasses' `super()` calls and callbacks passed to
+`functools.partial`, `asyncio.to_thread` or an executor. Calls on unknown objects such
+as framework state count when their names suggest an SDK method (e.g. `chat`, `create`,
+`invoke` or `generate_content`). An unknown callee can take a model argument but forwarding
+opaque keywords through a wrapper provides no declaration. A library function, a method of
+its result and a library class's method are skipped. A project class's method is a gap.
+
+A model identifier written as a literal argument becomes one `model` component for the
+project at `declared` assurance. Its `source_reference` claim names the file and the
+line of the argument, up to 16 places, and `references_unlisted` counts the rest. The
+identifier is kept as written, routing prefix and all, and no provider is recorded. Any
+`trust_remote_code` but a false literal, given to a call or in a dict of its options,
+such as `model_kwargs`, records that the model may run its own code. A relative path or a
+weight file names a file in the project, which the model collector reads.
+
+What the reader knows is there and cannot read is a coverage gap:
+
+- a file it cannot open, read or decode, one larger than `file-bytes`, and a link to a
+  test, documentation or build output, whatever they hold;
+- a file that may import an SDK and cannot be parsed, is larger than `syntax-bytes` or
+  holds more syntax nodes than `python-nodes`;
+- a file that imports an SDK by a name a module of the project also has;
+- a model argument bound in another module of the project;
+- a model argument that is not a literal, unless it is an object an SDK makes rather
+  than text or a path one returns: a name, an attribute, a parameter, a call of another
+  library, joined text, `**options` without a model, a starred positional argument, a
+  path on a host, behind a routing prefix or not, or text that is no identifier;
+- options that a library loading a model here is given and the reader cannot read, such
+  as `model_kwargs=options` or `**options`, which may let the model run its own code (a
+  hosted endpoint, a hub client and a GGUF or ONNX runtime run none);
+- a model argument given to a function or class the project defines, or to a method of
+  one of its classes, which the reader does not follow;
+- a bound the reader reached: a callee depth of 32, the directories it looks in for a
+  module, a dotted name of 256 characters, or the steps one file allows.
+
+Unread arguments, and those given to the project's callees, are each counted in one gap
+for the file, at the first of them; an argument bound in another module is a gap of its own.
+
+`validate --project` reports the missing artifact of a reference it read again from
+source as information, as it does for a cited model of an imported report. Without
+`--project`, when another collector's component contradicts the reference, or when the
+model may run its own code, it stays unknown.
 
 ## MCP servers declared in source
 

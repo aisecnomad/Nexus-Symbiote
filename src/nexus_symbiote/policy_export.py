@@ -217,7 +217,11 @@ def corroborate_against_project(
     if not c_report.is_complete:
         raise click.ClickException("inventory failed completeness reconciliation against --project")
     i_report = IntegrityValidator(signature_policies=sig_policies).validate(
-        bom, root, exclude_paths=excluded, bound_imports=c_report.bound_imports
+        bom,
+        root,
+        exclude_paths=excluded,
+        bound_imports=c_report.bound_imports,
+        bound_references=c_report.bound_references,
     )
     if i_report.status == "fail" or bool(i_report.omitted_severities & _UNVERIFIED_SEVERITIES):
         raise click.ClickException("inventory failed integrity validation against --project")

@@ -12,7 +12,7 @@ from typing import Literal
 
 from nexus_symbiote import limits
 from nexus_symbiote.core.aibom import AIBOM
-from nexus_symbiote.core.collection import is_imported
+from nexus_symbiote.core.collection import is_imported, is_source_reference
 from nexus_symbiote.core.enums import SerializationSafety
 from nexus_symbiote.core.hashing import (
     TOOL_DEFINITION_HASH_VERSION,
@@ -322,6 +322,7 @@ class IntegrityValidator:
         *,
         exclude_paths: Sequence[str] = (),
         bound_imports: frozenset[str] = frozenset(),
+        bound_references: frozenset[str] = frozenset(),
     ) -> IntegrityReport:
         """Check every component; ``bound_imports`` names imported discovery claims.
 
@@ -329,6 +330,11 @@ class IntegrityValidator:
         may be passed as ``bound_imports``. Those are judged as imported claims: their
         unavailable local evidence is reported without blocking, while intrinsic findings
         such as an unsafe loading format still fail.
+
+        ``bound_references`` names the model identifiers that reconciliation read again
+        from the project's own source. Such a model has no artifact to verify, so the
+        same absences are reported without blocking; without reconciliation they stay
+        unknown.
         """
         report = IntegrityReport(basis="supplied-bom" if project_root is None else "project")
         self._digests = _ArtifactDigests(self.byte_budget)
@@ -400,6 +406,13 @@ class IntegrityValidator:
                     if issue.severity == "unknown" and issue.category in _IMPORTED_EVIDENCE_GAPS:
                         issue.severity = "info"
                         issue.detail = "Imported discovery claim without local evidence: " + (
+                            issue.detail
+                        )
+            elif comp.bom_ref in bound_references and is_source_reference(comp):
+                for issue in report.issues[first_issue:]:
+                    if issue.severity == "unknown" and issue.category in _IMPORTED_EVIDENCE_GAPS:
+                        issue.severity = "info"
+                        issue.detail = "Model identifier declared in source, with no artifact: " + (
                             issue.detail
                         )
         if project_root is not None:

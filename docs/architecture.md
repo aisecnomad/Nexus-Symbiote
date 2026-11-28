@@ -85,7 +85,7 @@ built-in policy.
 | `modes.py` | Keep every command offline unless the operator selects live mode for a live command; enforce it with patched entry points and a CPython audit hook |
 | `limits.py` | The operator's [collection limits](collection-limits.md), from `--limit` and `NEXUS_SYMBIOTE_LIMITS` only |
 | `utils/confined.py` | The only way collectors read the checkout: descriptor-relative and bounded, regular files only, with identity checked again after each read |
-| `scanners/` | One collector per surface: `mcp`, `model`, `prompt`, `rag`, `registry`, `a2a`, `ide_agents` and `shadowscan`. They parse statically and never execute, import or load what they read |
+| `scanners/` | One collector per surface: `mcp`, `model`, `prompt`, `rag`, `registry`, `a2a`, `ide_agents`, `shadowscan` and `source`. They parse statically and never execute, import or load what they read |
 | `core/` | Pydantic models of the native format (`models.py`, `aibom.py`), RFC 8785 hashing of tool definitions and SHA-256 of files (`hashing.py`), and the coverage assessment that `validate` and `risk` share (`coverage.py`) |
 | `validators/` | Completeness and reconciliation with a fresh collection (`completeness.py`), digests and operator signatures (`integrity.py`), and risk scoring (`risk.py`) |
 | `policy.py`, `signature_policy.py` | The project policy a trusted checkout may supply, and the operator's signer policy, which is refused inside the scanned project |
