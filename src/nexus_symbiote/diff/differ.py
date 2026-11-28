@@ -23,6 +23,7 @@ from nexus_symbiote.core.models import (
     UNBOUND_VALUES_DETAIL,
     AnyComponent,
     CompletenessClaim,
+    CredentialComponent,
     MCPServerComponent,
     check_spec_version,
 )
@@ -826,6 +827,20 @@ class AIBOMDiffer:
             handled.add("version_pinned")
         if old_hash or new_hash:
             handled.add("definition_hash_version")
+        if (
+            isinstance(old, CredentialComponent)
+            and isinstance(new, CredentialComponent)
+            and new.value_in_checkout
+            and not old.value_in_checkout
+        ):
+            modifications.append(
+                {
+                    "detail": "A value for this credential is now committed in the checkout. "
+                    "Remove it and rotate the credential.",
+                    "severity": "high",
+                }
+            )
+            handled.add("value_in_checkout")
         old_fields = old.model_dump(mode="json")
         new_fields = new.model_dump(mode="json")
         modifications.extend(self._risk_changes(old_fields["risks"], new_fields["risks"]))

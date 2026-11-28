@@ -134,7 +134,7 @@ class TestModels:
 
     def test_metadata_defaults(self):
         meta = AIBOMMetadata()
-        assert meta.spec_version == "1.1.0"
+        assert meta.spec_version == "1.2.0"
         assert meta.tool_name == "nexus-symbiote"
 
     def test_model_roundtrip(self):

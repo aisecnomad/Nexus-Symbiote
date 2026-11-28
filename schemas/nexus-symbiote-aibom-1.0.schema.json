@@ -332,7 +332,7 @@
       "properties": {
         "spec_version": {
           "default": "1.0.0",
-          "description": "Native format version. This build reads 1.0.x and 1.1.x; 1.1.0 records scan-root-relative paths",
+          "description": "Native format version. This build reads 1.0.x, 1.1.x and 1.2.x; 1.1.0 records scan-root-relative paths, and 1.2.0 adds credential components, which no earlier version carries",
           "title": "Spec Version",
           "type": "string"
         },
@@ -1344,6 +1344,222 @@
         "scope"
       ],
       "title": "CompletenessClaim",
+      "type": "object"
+    },
+    "CredentialComponent": {
+      "additionalProperties": false,
+      "description": "A credential that a component authenticates with, recorded by name, never by value.\n\nThe name is what holds the credential: an environment variable, the label under\nwhich a workflow tool stores it, or the parameter a literal is passed as. No field\nholds a value: ``properties`` is limited to ``CredentialProperties``, and a record\nwith any text shaped like a credential value, or with any digest, is refused when it\nis built and again by every export (``core.aibom.prepare``), which a record changed\nafter it was built cannot bypass. Free text whose value has no known shape cannot be\ntold from a name, so collectors never read values. Only format 1.2.0 and later\ndocuments carry a credential.",
+      "properties": {
+        "bom_ref": {
+          "description": "Unique reference within this BOM",
+          "maxLength": 16384,
+          "title": "Bom Ref",
+          "type": "string"
+        },
+        "component_type": {
+          "const": "credential",
+          "title": "Component Type",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        },
+        "supplier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Supplier"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "hashes": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Always empty: an unkeyed digest of a secret can be checked against a guessed or leaked value",
+          "maxProperties": 0,
+          "title": "Hashes",
+          "type": "object"
+        },
+        "trust_tier": {
+          "$ref": "#/$defs/TrustTier",
+          "default": "unknown"
+        },
+        "assurance_level": {
+          "$ref": "#/$defs/AssuranceLevel",
+          "default": "declared",
+          "description": "declared: stated by configuration, a manifest or a supplier; observed: a named collector measured the component's identity from bytes (a file, weight or descriptor digest); verified: established by cryptographic verification, which offline collection never assigns"
+        },
+        "source_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Where this was discovered: a POSIX path relative to the scan root (native format 1.1.0 and later), or a URL. Format 1.0.0 recorded absolute scan-host paths",
+          "title": "Source Path"
+        },
+        "properties": {
+          "additionalProperties": false,
+          "description": "The only properties a credential records: how and where it was collected.\n\nA closed set, so no property can hold a value: a collector that needs another one\nadds it here, typed, where review sees it.",
+          "properties": {
+            "collection_mode": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "environment-key-reference",
+                    "imported-unverified-report",
+                    "live-observation",
+                    "lockfile-resolution-claim",
+                    "manifest-reference",
+                    "recommended-extension",
+                    "static-agent-card",
+                    "static-config",
+                    "static-file-digest",
+                    "static-import-reference",
+                    "static-project-configuration",
+                    "static-source-declaration",
+                    "static-source-reference",
+                    "static-syntax-reference"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Collection Mode"
+            },
+            "declaration_line": {
+              "anyOf": [
+                {
+                  "maximum": 2147483647,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "The 1-based source line the reference is declared on",
+              "title": "Declaration Line"
+            },
+            "neutralized_raw_sha256": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "pattern": "^sha256:[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "propertyNames": {
+                    "enum": [
+                      "name",
+                      "description",
+                      "supplier",
+                      "trimmed_name"
+                    ]
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Digests of the raw text of fields that terminal neutralization rewrote (core.identifiers.RAW_DIGESTS)",
+              "title": "Neutralized Raw Sha256"
+            }
+          },
+          "title": "CredentialProperties",
+          "type": "object"
+        },
+        "claims": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ClaimEvidence"
+          },
+          "title": "Claims",
+          "type": "object"
+        },
+        "credential_kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "environment-variable",
+                "workflow-credential",
+                "source-literal"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "What the name is: environment-variable (a variable that source reads, a .env template lists or a ${NAME} placeholder names), workflow-credential (the label under which a workflow tool stores the credential) or source-literal (the parameter a literal value is passed as in source)",
+          "title": "Credential Kind"
+        },
+        "value_in_checkout": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whether a literal value sits beside the reference in the scanned checkout; the value itself is never recorded",
+          "title": "Value In Checkout"
+        },
+        "risks": {
+          "items": {
+            "$ref": "#/$defs/RiskAssessment"
+          },
+          "title": "Risks",
+          "type": "array"
+        }
+      },
+      "required": [
+        "bom_ref",
+        "component_type",
+        "name"
+      ],
+      "title": "CredentialComponent",
       "type": "object"
     },
     "DataSourceComponent": {
@@ -4347,6 +4563,26 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Agent Bill of Materials \u2014 a supply chain inventory.\n\nIts metadata.completeness claim says what it covers.",
+  "if": {
+    "properties": {
+      "components": {
+        "contains": {
+          "properties": {
+            "component_type": {
+              "const": "credential"
+            }
+          },
+          "required": [
+            "component_type"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    "required": [
+      "components"
+    ]
+  },
   "properties": {
     "metadata": {
       "$ref": "#/$defs/AIBOMMetadata"
@@ -4358,6 +4594,7 @@
             "a2a-client": "#/$defs/A2AClientComponent",
             "a2a-server": "#/$defs/A2AServerComponent",
             "agent": "#/$defs/AgentComponent",
+            "credential": "#/$defs/CredentialComponent",
             "data-source": "#/$defs/DataSourceComponent",
             "guardrail-policy": "#/$defs/GuardrailComponent",
             "ide-agent": "#/$defs/IDEAgentComponent",
@@ -4422,6 +4659,9 @@
           },
           {
             "$ref": "#/$defs/VerifiedExtensionComponent"
+          },
+          {
+            "$ref": "#/$defs/CredentialComponent"
           }
         ]
       },
@@ -4435,6 +4675,23 @@
       "title": "Dependencies",
       "type": "array"
     }
+  },
+  "then": {
+    "properties": {
+      "metadata": {
+        "properties": {
+          "spec_version": {
+            "pattern": "^1\\.(?:[2-9]|[1-9][0-9]{1,3})\\.(?:0|[1-9][0-9]{0,5})$"
+          }
+        },
+        "required": [
+          "spec_version"
+        ]
+      }
+    },
+    "required": [
+      "metadata"
+    ]
   },
   "title": "AIBOM",
   "type": "object"

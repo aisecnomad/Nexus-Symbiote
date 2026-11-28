@@ -234,6 +234,7 @@ _CREDENTIAL_NAME = re.compile(
     r"|dsn|connection_?str|conn_?str|jwt|bearer|header|(?:^|_)pat(?:_|$)"
 )
 _URL_USERINFO = re.compile(r"://[^/\s@?#]*@")
+_NETWORK_USERINFO = re.compile(r"(?<![\w./-])//[^/\s@?#]*@")
 _PLAIN_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s@?#]+")
 # The authority a URL's shown origin is taken from, as urlsplit delimits it.
 _NETLOC = re.compile(r"[^/?#]*")
@@ -351,6 +352,22 @@ def authorization_header(name: str) -> bool:
 def private_key_block(value: str) -> bool:
     """Whether ``value`` holds a PEM private key block, terminated or not."""
     return next(iter(_private_key_spans(value)), None) is not None
+
+
+def holds_credential_value(text: str) -> bool:
+    """Recognize credential values while preserving ordinary URLs and variable references."""
+    if holds_token_shape(text) or _NETWORK_USERINFO.search(text):
+        return True
+    # Generic redaction also shortens public URLs. Only its credential spans are
+    # evidence of a value in a record; URL rewrites by themselves are not.
+    spans, _ = _rule_matches(text, identifier=False, cookie=False)
+    for start, end in spans:
+        value = text[start:end]
+        if len(value) >= 2 and value[0] in {"'", '"'} and value[-1] == value[0]:
+            value = value[1:-1]
+        if value != REDACTED and not names_reference(value):
+            return True
+    return False
 
 
 def credential_shaped(value: str) -> bool:

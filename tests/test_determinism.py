@@ -189,7 +189,7 @@ def test_vex_has_deterministic_serial() -> None:
     first = VEXGenerator().generate_json(first_bom)
     assert first == VEXGenerator().generate_json(second_bom)
     document = json.loads(first)
-    assert document["serialNumber"] == "urn:uuid:ba81bf78-55da-5d50-a929-69204e539334"
+    assert document["serialNumber"] == "urn:uuid:9ac8f944-9e53-527e-bbb8-29ba20aac98f"
     inventory_uuid = str(first_bom.metadata.serial_number).removeprefix("urn:uuid:")
     assert (
         document["externalReferences"][0]["url"]

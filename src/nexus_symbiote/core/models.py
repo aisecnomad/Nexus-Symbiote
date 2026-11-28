@@ -8,6 +8,7 @@ registry trust, and authorization records.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -17,8 +18,11 @@ from pydantic import (
     SerializerFunctionWrapHandler,
     StrictBool,
     StrictInt,
+    ValidationError,
+    WithJsonSchema,
     field_validator,
     model_serializer,
+    model_validator,
 )
 
 from nexus_symbiote.core.enums import (
@@ -34,11 +38,13 @@ from nexus_symbiote.core.enums import (
     TrustTier,
 )
 from nexus_symbiote.core.evidence import DeploymentProfile, Timestamp
+from nexus_symbiote.utils.secrets import holds_credential_value
 
-NATIVE_SPEC_VERSION = "1.1.0"
-"""Version written by this build. 1.1.0 records scan-root-relative POSIX paths."""
+NATIVE_SPEC_VERSION = "1.2.0"
+"""Version written by this build. 1.1.0 records scan-root-relative POSIX paths; 1.2.0 adds
+credential components, which record a credential by name and never by value."""
 
-SUPPORTED_SPEC_MINORS = {1: (0, 1)}
+SUPPORTED_SPEC_MINORS = {1: (0, 1, 2)}
 """Native format versions this build reads, as major -> supported minor versions."""
 
 MAX_REFERENCE_CHARS = 16_384
@@ -78,6 +84,20 @@ def check_spec_version(value: object) -> None:
         f"Native format {shown} is not supported by this build (supported: "
         f"{supported_spec_versions()}); upgrade nexus-symbiote or re-collect the inventory."
     )
+
+
+CREDENTIAL_SPEC_VERSION = (1, 2)
+"""The first native format version, as (major, minor), whose documents carry credentials."""
+
+CREDENTIAL_FORMAT_REFUSAL = "credential components need native format 1.2.0 or later"
+
+CREDENTIAL_SPEC_VERSION_PATTERN = r"^1\.(?:[2-9]|[1-9][0-9]{1,3})\.(?:0|[1-9][0-9]{0,5})$"
+"""A supported 1.x version at or after ``CREDENTIAL_SPEC_VERSION``, for the native schema."""
+
+
+def admits_credentials(spec_version: str) -> bool:
+    match = _SPEC_VERSION.fullmatch(spec_version)
+    return match is not None and (int(match[1]), int(match[2])) >= CREDENTIAL_SPEC_VERSION
 
 
 class InventoryModel(BaseModel):
@@ -580,6 +600,137 @@ class VerifiedExtensionComponent(ComponentBase):
     risks: list[RiskAssessment] = Field(default_factory=list)
 
 
+CredentialKind = Literal["environment-variable", "workflow-credential", "source-literal"]
+
+CollectionMode = Literal[
+    "environment-key-reference",
+    "imported-unverified-report",
+    "live-observation",
+    "lockfile-resolution-claim",
+    "manifest-reference",
+    "recommended-extension",
+    "static-agent-card",
+    "static-config",
+    "static-file-digest",
+    "static-import-reference",
+    "static-project-configuration",
+    "static-source-declaration",
+    "static-source-reference",
+    "static-syntax-reference",
+]
+
+
+class CredentialProperties(InventoryModel):
+    """The only properties a credential records: how and where it was collected.
+
+    A closed set, so no property can hold a value: a collector that needs another one
+    adds it here, typed, where review sees it.
+    """
+
+    collection_mode: CollectionMode | None = None
+    declaration_line: Annotated[StrictInt, Field(ge=1, le=2**31 - 1)] | None = Field(
+        default=None, description="The 1-based source line the reference is declared on"
+    )
+    neutralized_raw_sha256: (
+        dict[
+            Literal["name", "description", "supplier", "trimmed_name"],
+            Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")],
+        ]
+        | None
+    ) = Field(
+        default=None,
+        description=(
+            "Digests of the raw text of fields that terminal neutralization rewrote "
+            "(core.identifiers.RAW_DIGESTS)"
+        ),
+    )
+
+
+class CredentialComponent(ComponentBase):
+    """A credential that a component authenticates with, recorded by name, never by value.
+
+    The name is what holds the credential: an environment variable, the label under
+    which a workflow tool stores it, or the parameter a literal is passed as. No field
+    holds a value: ``properties`` is limited to ``CredentialProperties``, and a record
+    with any text shaped like a credential value, or with any digest, is refused when it
+    is built and again by every export (``core.aibom.prepare``), which a record changed
+    after it was built cannot bypass. Free text whose value has no known shape cannot be
+    told from a name, so collectors never read values. Only format 1.2.0 and later
+    documents carry a credential.
+    """
+
+    # Errors never quote the record, which may hold what was refused.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    component_type: Literal[ComponentType.CREDENTIAL] = ComponentType.CREDENTIAL
+    properties: Annotated[
+        dict[str, Any], WithJsonSchema(CredentialProperties.model_json_schema())
+    ] = Field(default_factory=dict)
+    hashes: dict[str, str] = Field(
+        default_factory=dict,
+        max_length=0,
+        description=(
+            "Always empty: an unkeyed digest of a secret can be checked against a guessed or "
+            "leaked value"
+        ),
+    )
+    credential_kind: CredentialKind | None = Field(
+        default=None,
+        description=(
+            "What the name is: environment-variable (a variable that source reads, a .env "
+            "template lists or a ${NAME} placeholder names), workflow-credential (the label "
+            "under which a workflow tool stores the credential) or source-literal (the "
+            "parameter a literal value is passed as in source)"
+        ),
+    )
+    value_in_checkout: StrictBool | None = Field(
+        default=None,
+        description=(
+            "Whether a literal value sits beside the reference in the scanned checkout; "
+            "the value itself is never recorded"
+        ),
+    )
+    risks: list[RiskAssessment] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _holds_no_value(self) -> CredentialComponent:
+        problem = credential_value_problem(self)
+        if problem is not None:
+            raise ValueError(problem)
+        return self
+
+
+def credential_value_problem(component: CredentialComponent) -> str | None:
+    """Why a credential record may not be written, as fixed text, or ``None``."""
+    if component.hashes:
+        return "a credential records no digest of its value"
+    try:
+        CredentialProperties.model_validate(component.properties)
+    except ValidationError:
+        return "a credential's properties record only how and where it was collected"
+    if any(holds_credential_value(text) for text in _texts(component.model_dump(mode="json"))):
+        return "a credential record holds text shaped like a credential value"
+    return None
+
+
+def _texts(value: Any, field: str = "") -> Iterator[str]:
+    if isinstance(value, str):
+        # In a reference field, the component namespace is syntax. Still check
+        # its entire payload, including credential assignments and URL userinfo.
+        if field in {"bom_ref", "evidence_refs", "references"}:
+            namespace, separator, payload = value.partition(":")
+            if separator and namespace.lower() == "credential":
+                value = payload
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield str(key)
+            yield from _texts(item, key)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _texts(item, field)
+
+
 class DiscoveryVerification(InventoryModel):
     """How imported ShadowScan discovery evidence was authenticated at import.
 
@@ -707,8 +858,9 @@ class AIBOMMetadata(InventoryModel):
     spec_version: str = Field(
         default=NATIVE_SPEC_VERSION,
         description=(
-            "Native format version. This build reads 1.0.x and 1.1.x; 1.1.0 records "
-            "scan-root-relative paths"
+            "Native format version. This build reads 1.0.x, 1.1.x and 1.2.x; 1.1.0 records "
+            "scan-root-relative paths, and 1.2.0 adds credential components, which no earlier "
+            "version carries"
         ),
     )
     serial_number: str | None = None
@@ -756,6 +908,7 @@ AnyComponent = Annotated[
         | A2AServerComponent
         | IDEAgentComponent
         | VerifiedExtensionComponent
+        | CredentialComponent
     ),
     Field(discriminator="component_type"),
 ]

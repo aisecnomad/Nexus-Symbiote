@@ -202,6 +202,12 @@ def loss_report(bom: AIBOM, target: str, native: dict[str, Any] | None = None) -
                     "Risk findings are not standard inventory fields; SARIF and VEX "
                     "output project them separately",
                 )
+            if target.startswith("spdx-") and component.get("component_type") == "credential":
+                add(
+                    f"/components/{index}",
+                    "SPDX 3.0.1 has no class for a credential; the credential and the "
+                    "relationships that reach it are carried only in the embedded native document",
+                )
             model = typed.get(component["bom_ref"])
             if model is not None and requested_version(model) is not None:
                 add(

@@ -21,6 +21,7 @@ from nexus_symbiote.core.models import (
     AgentComponent,
     AnyComponent,
     ComponentBase,
+    CredentialComponent,
     IDEAgentComponent,
     MCPServerComponent,
     ModelComponent,
@@ -191,10 +192,30 @@ def finding_fingerprint(
     return "sha256:" + hashlib.sha256(text.encode("ascii")).hexdigest()
 
 
+def _intrinsic_credential_risks(component: CredentialComponent) -> list[RiskAssessment]:
+    """A value committed beside a credential reference is exposed, with or without a finding."""
+    risks = list(component.risks)
+    if component.value_in_checkout is True and not any(
+        r.category == "credential_exposure" and r.severity == RiskSeverity.HIGH for r in risks
+    ):
+        risks.append(
+            RiskAssessment(
+                severity=RiskSeverity.HIGH,
+                category="credential_exposure",
+                detail="A value for this credential is committed in the checkout.",
+                recommendation="Remove the value, rotate the credential and load it from a "
+                "secret store.",
+            )
+        )
+    return risks
+
+
 def effective_component_risks(component: AnyComponent) -> list[RiskAssessment]:
     """Return declared risks together with intrinsic security-fact risks."""
     if isinstance(component, ModelComponent):
         return _intrinsic_model_risks(component)
+    if isinstance(component, CredentialComponent):
+        return _intrinsic_credential_risks(component)
     return list(getattr(component, "risks", []))
 
 

@@ -35,14 +35,13 @@ from nexus_symbiote.core.hashing import hash_bytes
 from nexus_symbiote.core.models import (
     AnyComponent,
     CompletenessClaim,
-    ModelComponent,
     RiskAssessment,
 )
 from nexus_symbiote.generators._common import coverage_aggregate
 from nexus_symbiote.graph import _references, blast_radius, validate_graph
 from nexus_symbiote.risk_classes import RiskClass, RiskClassification, classify
 from nexus_symbiote.utils.terminal import neutralize
-from nexus_symbiote.validators.risk import _intrinsic_model_risks
+from nexus_symbiote.validators.risk import effective_component_risks
 
 FORMAT = "nexus-symbiote/graph-view/v1"
 MAX_SOURCES = 200
@@ -115,6 +114,7 @@ _COLUMNS: tuple[tuple[str, tuple[ComponentType, ...]], ...] = (
             ComponentType.GUARDRAIL_POLICY,
         ),
     ),
+    ("Credentials", (ComponentType.CREDENTIAL,)),
     ("Packages and extensions", (ComponentType.REGISTRY_ENTRY, ComponentType.VERIFIED_EXTENSION)),
 )
 _PLACE = {
@@ -288,13 +288,6 @@ def build_view(bom: AIBOM, *, max_nodes: int, focus: str | None = None) -> Graph
     )
 
 
-def _risks(component: AnyComponent) -> list[RiskAssessment]:
-    # A model's recorded fields stand even when its findings were edited away, as in `risk`.
-    if isinstance(component, ModelComponent):
-        return _intrinsic_model_risks(component)
-    return list(getattr(component, "risks", []))
-
-
 def _findings(risks: Sequence[RiskAssessment]) -> FindingSummary:
     ordered = sorted(risks, key=lambda r: (_SEVERITY_RANK[r.severity], r.category, r.detail))
     counts = Counter(risk.severity for risk in ordered)
@@ -327,7 +320,7 @@ def _facts(component: AnyComponent) -> tuple[tuple[str, str | bool], ...]:
 
 
 def _node(index: int, component: AnyComponent) -> Node:
-    risks = _risks(component)
+    risks = effective_component_risks(component)
     return Node(
         index=index,
         ref=component.bom_ref,
@@ -997,6 +990,7 @@ _GLYPHS = {
     ComponentType.DATA_SOURCE: "DS",
     ComponentType.MEMORY_STORE: "MEM",
     ComponentType.GUARDRAIL_POLICY: "GR",
+    ComponentType.CREDENTIAL: "KEY",
     ComponentType.REGISTRY_ENTRY: "PKG",
     ComponentType.VERIFIED_EXTENSION: "EXT",
 }

@@ -27,6 +27,7 @@ from nexus_symbiote.core.models import (
     AnyComponent,
     ClaimEvidence,
     CompletenessClaim,
+    CredentialComponent,
     MCPServerComponent,
     ModelComponent,
     PromptComponent,
@@ -544,10 +545,15 @@ class CompletenessValidator:
             if is_imported(extra):
                 continue  # _discovery_mismatches binds every imported claim to the report.
             # Supplementary runtime observations have their own provenance. Missing
-            # repository subjects cannot be explained by an unrelated observation.
+            # repository subjects cannot be explained by an unrelated observation, and
+            # whether a credential's value sits in the checkout is a fact about the
+            # checkout, which only local collection can corroborate.
             local_path = extra.source_path is not None and not _remote_source(extra.source_path)
             local_claim = any(claim.scope in LOCAL_CLAIM_SCOPES for claim in extra.claims.values())
-            if local_path or local_claim or not extra.claims:
+            checkout_fact = (
+                isinstance(extra, CredentialComponent) and extra.value_in_checkout is not None
+            )
+            if local_path or local_claim or checkout_fact or not extra.claims:
                 incomplete(
                     extra.bom_ref,
                     f"Supplied component has no matching local evidence: {extra.bom_ref}",
@@ -827,6 +833,10 @@ class CompletenessValidator:
             fields -= {"tool_refs", "tool_count"}
         if isinstance(local, AgentComponent):
             fields -= set(AGENT_REFERENCE_FIELDS)
+        if isinstance(local, CredentialComponent):
+            # Only local collection establishes whether a value sits in the checkout; a
+            # supplier cannot fill in what the collector left unknown.
+            fields.add("value_in_checkout")
         if CompletenessValidator._signing_corroborated(supplied, local):
             # A newly supplied operator policy may corroborate an initially unsigned inventory.
             fields -= {"signing_status", "signing_identity", "trust_tier"}

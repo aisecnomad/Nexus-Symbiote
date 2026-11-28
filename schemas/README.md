@@ -4,7 +4,7 @@ JSON Schemas (draft 2020-12) for the native Nexus SymBiote formats. Generated fr
 
 | File | Describes | Kept in sync by |
 | --- | --- | --- |
-| [`nexus-symbiote-aibom-1.0.schema.json`](nexus-symbiote-aibom-1.0.schema.json) | A native AgentBOM document of format 1.x (this build writes 1.1.0): `metadata`, `components` and `dependencies` | `tests/test_native_contract.py` |
+| [`nexus-symbiote-aibom-1.0.schema.json`](nexus-symbiote-aibom-1.0.schema.json) | A native AgentBOM document of format 1.x (this build writes 1.2.0): `metadata`, `components` and `dependencies` | `tests/test_native_contract.py` |
 | [`deployment-profile-1.0.schema.json`](deployment-profile-1.0.schema.json) | The optional `deployment_profile` on an agent component; see [deployment evidence](../docs/deployment-evidence.md) | `tests/test_deployment_evidence_profile.py` |
 | [`agent-manifest-1.0.schema.json`](agent-manifest-1.0.schema.json) | The optional `agent.yaml` at a project root; see [agent manifest](../docs/agent-manifest.md) | `tests/test_agent_manifest.py` |
 | [`examples/minimal-aibom.json`](examples/minimal-aibom.json) | A minimal schema-valid AgentBOM: one agent, an MCP server and its tools, a model, a prompt and a registry entry | `tests/test_native_contract.py` |
@@ -46,11 +46,12 @@ Unknown fields are rejected on every object, including dependency edges, so a pr
 | Version | Written by | Change |
 | --- | --- | --- |
 | 1.0.0 | 0.1.0 | Initial format. Collectors recorded absolute scan-host paths. |
-| 1.1.0 | this build | Collectors record POSIX paths relative to the scan root (`source_path`, claim locators, `surfaces_scanned`), so the same tree produces the same inventory wherever it is checked out. Adds `metadata.policy_source` and `metadata.policy_weakened`, and on the completeness claim `discovery_verification` (how an imported ShadowScan report was authenticated) and `source_report_path` (the report's location relative to the scan root, or its file name when imported from outside one); dependency edges refuse unknown fields; `bom_ref` and edge endpoints are limited to 16,384 characters. |
+| 1.1.0 | 0.2.0 | Collectors record POSIX paths relative to the scan root (`source_path`, claim locators, `surfaces_scanned`), so the same tree produces the same inventory wherever it is checked out. Adds `metadata.policy_source` and `metadata.policy_weakened`, and on the completeness claim `discovery_verification` (how an imported ShadowScan report was authenticated) and `source_report_path` (the report's location relative to the scan root, or its file name when imported from outside one); dependency edges refuse unknown fields; `bom_ref` and edge endpoints are limited to 16,384 characters. |
+| 1.2.0 | this build | Adds the `credential` component type: a credential is recorded by the name that holds it (`credential_kind` `environment-variable`, `workflow-credential` or `source-literal`) and whether a value sits in the checkout (`value_in_checkout`), never by its value or a digest of it; a credential record with any text shaped like a credential value, or with `hashes`, is refused, when it is built and by every export. Its `properties` are limited to `collection_mode`, `declaration_line` and `neutralized_raw_sha256`. A 1.0.x or 1.1.x document, or one that declares no version, may not carry a credential. |
 
 The rule for readers:
 
-- A build reads every minor version of its major version up to its own. This build reads 1.0.x and 1.1.x.
+- A build reads every minor version of its major version up to its own. This build reads 1.0.x, 1.1.x and 1.2.x.
 - A newer minor or major version, or a malformed version, is refused with a message that names the supported versions, rather than the generic schema error an unknown field would cause. Upgrade the tool or re-collect the inventory.
 - A minor version only adds optional fields or narrows what collectors record; a major version changes or removes meaning.
 

@@ -96,8 +96,8 @@ print one JSON line; key IDs and times differ on every run, and the digests are 
 of this tree's scan of the demo:
 
 ```text
-{"key_id": "04dd7d9aae8c50a5198c1d0afb768051addeda362dfcdf2d795fd36258205f39", "encrypted": false}
-{"out": "reviewed.json.att", "subject_sha256": "106b5dee4516a7e8f2ffc109c9baa0f9cce61f6edddfbadf60d8c802caffaa6c", "subject_format": "nexus-symbiote-aibom", "content_digest": "sha256:f17c7343b1217b4908030a5a088ad1f2b20918cd495431fda5ce0e9f253a1231", "purpose": "reviewed", "signers": ["04dd7d9aae8c50a5198c1d0afb768051addeda362dfcdf2d795fd36258205f39"], "signed": true}
+{"key_id": "5a8e304679c8aa4d4e0de8f09224ecc75b81b3923ef1897d3747ef1b9a614cc4", "encrypted": false}
+{"out": "reviewed.json.att", "subject_sha256": "b441c1633703a9331df28dee1f88f3c2ceebffeb4aeda94d62a8d12171673137", "subject_format": "nexus-symbiote-aibom", "content_digest": "sha256:5260acfe902aeb58a16071cfb65b0bc1bdb47c929bbca0993018203470e2d61f", "purpose": "reviewed", "signers": ["5a8e304679c8aa4d4e0de8f09224ecc75b81b3923ef1897d3747ef1b9a614cc4"], "signed": true}
 ```
 
 Verify it with the public key:
@@ -108,12 +108,12 @@ nexus-symbiote verify-attestation reviewed.json reviewed.json.att --trusted-key 
 
 ```text
 Attestation verified: purpose reviewed, 1 trusted key. It does not establish that the file is accurate, complete or safe.
-Signer key ID: 04dd7d9aae8c50a5198c1d0afb768051addeda362dfcdf2d795fd36258205f39
-Subject SHA-256: 106b5dee4516a7e8f2ffc109c9baa0f9cce61f6edddfbadf60d8c802caffaa6c
+Signer key ID: 5a8e304679c8aa4d4e0de8f09224ecc75b81b3923ef1897d3747ef1b9a614cc4
+Subject SHA-256: b441c1633703a9331df28dee1f88f3c2ceebffeb4aeda94d62a8d12171673137
 Match: bytes
-Subject format: nexus-symbiote-aibom 1.1.0
-Content digest: sha256:f17c7343b1217b4908030a5a088ad1f2b20918cd495431fda5ce0e9f253a1231 (nexus-symbiote/inventory-content/v1)
-Signed at (signer's clock): 2026-11-12T11:09:57Z
+Subject format: nexus-symbiote-aibom 1.2.0
+Content digest: sha256:5260acfe902aeb58a16071cfb65b0bc1bdb47c929bbca0993018203470e2d61f (nexus-symbiote/inventory-content/v1)
+Signed at (signer's clock): 2026-11-27T12:22:02Z
 ```
 
 Change one byte, the inventory's `version` from 1 to 2, and the same check fails with
@@ -142,12 +142,12 @@ nexus-symbiote verify-attestation candidate.json reviewed.json.att --trusted-key
 
 ```text
 Attestation verified: purpose reviewed, 1 trusted key. It does not establish that the file is accurate, complete or safe.
-Signer key ID: 04dd7d9aae8c50a5198c1d0afb768051addeda362dfcdf2d795fd36258205f39
-Subject SHA-256: 32c56688a31252e03188d7d1b1f04387c85f2a3000f7316031fbc9a0693a0a02
-Match: content; the attested file's SHA-256 is 106b5dee4516a7e8f2ffc109c9baa0f9cce61f6edddfbadf60d8c802caffaa6c
-Subject format: nexus-symbiote-aibom 1.1.0
-Content digest: sha256:f17c7343b1217b4908030a5a088ad1f2b20918cd495431fda5ce0e9f253a1231 (nexus-symbiote/inventory-content/v1)
-Signed at (signer's clock): 2026-11-12T11:09:57Z
+Signer key ID: 5a8e304679c8aa4d4e0de8f09224ecc75b81b3923ef1897d3747ef1b9a614cc4
+Subject SHA-256: b4a4fda5e8f928c00c683db76cd83c50127f9cd6d7c19af3b0ab81ef2903e470
+Match: content; the attested file's SHA-256 is b441c1633703a9331df28dee1f88f3c2ceebffeb4aeda94d62a8d12171673137
+Subject format: nexus-symbiote-aibom 1.2.0
+Content digest: sha256:5260acfe902aeb58a16071cfb65b0bc1bdb47c929bbca0993018203470e2d61f (nexus-symbiote/inventory-content/v1)
+Signed at (signer's clock): 2026-11-27T12:22:02Z
 ```
 
 `--json-output` prints the same facts as one JSON object, with `subject_sha256` (the

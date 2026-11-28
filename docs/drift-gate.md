@@ -75,6 +75,7 @@ request with itself, and that gate can never fail.
 - **Recollect v1 RAG baselines once.** Under RAG structure profile v2, `static_config_hash` changes once per RAG source (alerting high in `diff` and failing `validate --project`); take a new baseline at the reviewed commit ([RAG sources](verification-source-binding.md#rag-sources)).
 - **Paths are root-relative.** Snapshots compare cleanly across checkout paths. Without a manifest `id`, the repository agent is `agent:repository:cdb4ee2aea69cc6a83331bbe` (`repository`); add an [agent manifest](agent-manifest.md) `id` for a stable named reference.
 - **Upgrading from 0.1.0:** Re-create baselines at their reviewed commit (0.1.0 recorded absolute paths and `spec_version` 1.0.0 vs. 1.1.0).
+- **Upgrading from 0.2.0:** Re-create baselines at their reviewed commit: a 1.1.0 baseline still loads and reconciles, but comparing it with a 1.2.0 snapshot raises a high `spec_version` alert.
 - **ShadowScan reports** compare by normalized content ([ShadowScan integration](shadowscan-integration.md#compare-discovery-across-reruns)).
 
 ## What the alerts mean
@@ -93,6 +94,7 @@ Security alerts appear first in text output, followed by notes and component/rel
 | Risk findings added | highest added severity, at least medium |
 | Risk findings removed; any other field or producer metadata (`tool_name`, `tool_vendor`) changed | medium |
 | Values unbound in either snapshot without `NEXUS_SYMBIOTE_SOURCE_BINDING_KEY` (raised on every comparison, naming no value: `MCP server launch values are unbound in one snapshot; argument, environment and endpoint-path drift is undetectable. Set NEXUS_SYMBIOTE_SOURCE_BINDING_KEY during both collections.` or `Values are unbound in one snapshot without the binding key; a change to them is undetectable and no value is recorded. Set NEXUS_SYMBIOTE_SOURCE_BINDING_KEY during both collections.`) | medium |
+| Credential value newly committed (`A value for this credential is now committed in the checkout. Remove it and rotate the credential.`) | high |
 | Relationship added | medium; high for `invokes`, `delegates-to`, `acts-as-identity` |
 | Relationship removed | medium; high for `uses-guardrail`, `approved-under` |
 | Relationship assurance or conditions changed | high |
