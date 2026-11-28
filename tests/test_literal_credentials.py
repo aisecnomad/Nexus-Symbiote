@@ -408,17 +408,29 @@ def test_a_long_next_line_is_inspected_as_a_separate_window() -> None:
     long_line = "a" * _JOIN_CHARS
     windows = list(_literal_windows('description = "first\n' + long_line))
     assert [window[0] for window in windows] == [1, 2]
-    assert windows[0][3]
+    assert not windows[0][3]
     assert windows[1][1] == long_line
 
 
-@pytest.mark.parametrize("prefix", ["npm_", "AIza", "AKIA", "ASIA", "hf_", "ghp_", "sk-proj-"])
-def test_a_documented_prefix_at_a_window_limit_marks_collection_incomplete(
-    tmp_path: Path, prefix: str
+@pytest.mark.parametrize(
+    ("prefix", "body_size"),
+    [
+        ("npm_", 36),
+        ("AIza", 35),
+        ("AKIA", 16),
+        ("ASIA", 16),
+        ("hf_", 30),
+        ("ghp_", 36),
+        ("sk-proj-", 20),
+    ],
+)
+def test_a_token_body_after_a_window_limit_marks_collection_incomplete(
+    tmp_path: Path, prefix: str, body_size: int
 ) -> None:
     from nexus_symbiote.literal_credentials import _JOIN_LINES
 
-    lines = ['description = "Guide'] + ["Notes."] * (_JOIN_LINES - 2) + [prefix, 'End of guide."']
+    body = ("A1B2" * body_size)[:body_size]
+    lines = ['description = "Guide'] + ["Notes."] * (_JOIN_LINES - 2) + [prefix, f'{body}"']
     (tmp_path / "guide.py").write_text("\n".join(lines))
     server = _server("guide.py")
     failures: list[str] = []
@@ -429,6 +441,71 @@ def test_a_documented_prefix_at_a_window_limit_marks_collection_incomplete(
     assert len(failures) == 1
     assert "bounded source window" in failures[0]
     assert prefix not in failures[0]
+
+
+@pytest.mark.parametrize("word", ["ghp_", "sk-learn", "hf_hub_download"])
+def test_an_ordinary_docstring_after_a_window_limit_stays_collected(
+    tmp_path: Path, word: str
+) -> None:
+    from nexus_symbiote.literal_credentials import _JOIN_LINES
+
+    lines = ['description = """Guide'] + ["Notes."] * (_JOIN_LINES - 2)
+    lines.extend((word, 'End of guide."""'))
+    (tmp_path / "guide.py").write_text("\n".join(lines))
+    server = _server("guide.py")
+    failures: list[str] = []
+    assert (
+        apply_literal_credential_findings(AIBOM(components=[server]), tmp_path, failures=failures)
+        == 0
+    )
+    assert not server.risks and not failures
+
+
+def test_a_continued_package_list_does_not_fail_the_scan_gate(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from nexus_symbiote.cli import main
+
+    packages = ["torch", "transformers", "accelerate", "datasets", "safetensors", "sentencepiece"]
+    packages.extend(("hf_transfer", "peft"))
+    install = " \\\n    ".join(["RUN pip install --no-cache-dir", *packages])
+    (tmp_path / "Dockerfile").write_text(f"FROM vllm/vllm-openai@sha256:{'a' * 64}\n{install}\n")
+
+    result = CliRunner().invoke(main, ["scan", str(tmp_path), "--no-project-policy", "--check"])
+    assert result.exit_code == 0, result.output
+
+
+def test_a_token_extending_through_an_explicit_join_is_still_incomplete(tmp_path: Path) -> None:
+    from nexus_symbiote.literal_credentials import _JOIN_LINES
+
+    lines = ['description = "Guide'] + ["Notes."] * (_JOIN_LINES - 2)
+    lines.extend((f'{_TOKEN}" +', '"a1b2"'))
+    (tmp_path / "guide.py").write_text("\n".join(lines))
+    server = _server("guide.py")
+    failures: list[str] = []
+    assert (
+        apply_literal_credential_findings(AIBOM(components=[server]), tmp_path, failures=failures)
+        == 0
+    )
+    assert not server.risks
+    assert len(failures) == 1 and "bounded source window" in failures[0]
+    assert _TOKEN not in failures[0]
+
+
+def test_an_oversized_continuation_stays_incomplete(tmp_path: Path) -> None:
+    from nexus_symbiote.literal_credentials import _CANDIDATE_CHARS, _JOIN_LINES
+
+    lines = ['description = "Guide'] + ["Notes."] * (_JOIN_LINES - 2)
+    lines.extend(("hf_transfer", "ordinary words " + "a" * _CANDIDATE_CHARS + '"'))
+    (tmp_path / "guide.py").write_text("\n".join(lines))
+    server = _server("guide.py")
+    failures: list[str] = []
+    assert (
+        apply_literal_credential_findings(AIBOM(components=[server]), tmp_path, failures=failures)
+        == 0
+    )
+    assert not server.risks
+    assert len(failures) == 1 and "bounded source window" in failures[0]
 
 
 def test_explanatory_words_after_a_short_label_are_not_credentials(tmp_path: Path) -> None:
@@ -472,3 +549,60 @@ def test_an_explicit_join_cannot_bind_a_known_shape_early(monkeypatch: pytest.Mo
     for value in ["label_example", "label_" + "a" * 300]:
         assert not literals._cut_off_token('description = "' + value)
         assert literals._cut_off_token('description = "' + value + '" +')
+
+
+@pytest.mark.parametrize("operator", ["", "+ "])
+def test_parenthesized_python_string_joins_keep_location(tmp_path: Path, operator: str) -> None:
+    (tmp_path / "app.py").write_text(
+        f'key = (\n    "{_TOKEN[:12]}"\n    {operator}"{_TOKEN[12:]}"\n)\n'
+    )
+    server = _server("app.py")
+    assert apply_literal_credential_findings(AIBOM(components=[server]), tmp_path) == 1
+    assert "app.py:2:" in server.risks[0].detail
+
+
+@pytest.mark.parametrize("prefix", ["gsk_", "r8_", "lsv2_pt_", "tvly-", "fw_", "xai-"])
+def test_whitespace_recovery_covers_vendor_families(tmp_path: Path, prefix: str) -> None:
+    (tmp_path / "app.py").write_text(f'key = "{prefix}Aa12Bb34 Cc56Dd78Ee90"\n')
+    server = _server("app.py")
+    assert apply_literal_credential_findings(AIBOM(components=[server]), tmp_path) == 1
+
+
+def test_vendor_prefix_can_be_separated_from_an_opaque_body(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text('key = "gsk_ Aa12Bb34Cc56Dd78Ee90"\n')
+    server = _server("app.py")
+    assert apply_literal_credential_findings(AIBOM(components=[server]), tmp_path) == 1
+
+
+@pytest.mark.parametrize("opening", ["'", "r'", "u'"])
+def test_python_join_uses_literal_boundaries_for_mixed_delimiters_and_prefixes(
+    tmp_path: Path, opening: str
+) -> None:
+    (tmp_path / "app.py").write_text(
+        f'key = (\n    "{_TOKEN[:12]}"\n    {opening}{_TOKEN[12:]}\'\n)\n'
+    )
+    server = _server("app.py")
+    assert apply_literal_credential_findings(AIBOM(components=[server]), tmp_path) == 1
+    assert "app.py:2:" in server.risks[0].detail
+
+
+def test_mixed_quote_join_does_not_extend_past_the_final_literal(tmp_path: Path) -> None:
+    source = (
+        """x = (
+    "alpha"
+    'beta'
+)
+"""
+        + "# documentation\n" * 4
+        + "# ghp_\n# "
+        + "ordinary words " * 50
+    )
+    (tmp_path / "app.py").write_text(source)
+    failures: list[str] = []
+    assert (
+        apply_literal_credential_findings(
+            AIBOM(components=[_server("app.py")]), tmp_path, failures=failures
+        )
+        == 0
+    )
+    assert not failures

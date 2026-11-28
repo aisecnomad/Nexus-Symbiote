@@ -13,7 +13,7 @@ Suppression is a file at the scan root, not a key in `.nexus-symbiote.yaml` (tha
 
 A checkout can request credential suppressions. Pass `--accept-project-policy` to apply a reviewed allowlist to `scan`, `validate --project`, and `risk --project`. Each command records the accepted relaxation in `policy_weakened`. An operator policy withholds checkout credential suppressions. The MCP collector still redacts recognized literals from output, including reviewed samples.
 
-A missing file suppresses nothing. Both names at once, a file over 64 KiB, undecodable bytes, or a document that is not the mapping below suppresses nothing and is a collection failure. `--no-project-policy` does not load the file.
+A missing file suppresses nothing. A case variant of either filename, both names at once, a file over 64 KiB, undecodable bytes, or a document that is not the mapping below suppresses nothing and is a collection failure. `--no-project-policy` does not load the file.
 
 ```yaml
 allow:
@@ -33,3 +33,5 @@ Each entry has a `reason` (one line, at most 200 characters, not blank) and exac
 A path entry suppresses every vendor-shaped token in each matching file. A fingerprint entry suppresses that spelling wherever the active file path is set. At most 256 entries.
 
 The finding still does not contain the token. An allowlist entry does not either: it names a digest or a path.
+
+Fingerprint entries are portable and use an unkeyed digest. Anyone with the allowlist can test guesses offline. Use fingerprints only for reviewed, publicly known sample tokens. A narrowly scoped path entry lets a reviewer allow a fixture without publishing a fingerprint.

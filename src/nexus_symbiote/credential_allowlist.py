@@ -138,6 +138,10 @@ def load_credential_allowlist(
             exclude_paths=exclude_paths,
             max_file_bytes=min(_MAX_BYTES, limits.current().file_bytes),
         ) as files:
+            if any(files.case_variants(name) for name in ALLOWLIST_NAMES):
+                return CredentialAllowlist(), (
+                    "credential allowlist: unexpected filename case; nothing is suppressed"
+                )
             present = [name for name in ALLOWLIST_NAMES if files.entry_exists(name)]
             if len(present) > 1:
                 return CredentialAllowlist(), (
