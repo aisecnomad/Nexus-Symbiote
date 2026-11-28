@@ -6,6 +6,7 @@ is never executed, and no value the collector may not export leaves the file.
 
 from __future__ import annotations
 
+import ast
 import json
 import pickle
 import tracemalloc
@@ -2036,14 +2037,19 @@ def test_a_name_bound_more_often_than_is_followed_is_read_in_part_and_says_so(tm
 def test_an_expression_is_read_once_however_many_names_read_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    calls: list[int] = []
-    keywords = source_python._keywords
+    calls: list[ast.Call] = []
+    read = source_python.PythonReader._environment_read_of
 
-    def counted(call):  # type: ignore[no-untyped-def]
-        calls.append(1)
-        return keywords(call)
+    def counted(reader, module, node):  # type: ignore[no-untyped-def]
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "getenv"
+        ):
+            calls.append(node)
+        return read(reader, module, node)
 
-    monkeypatch.setattr(source_python, "_keywords", counted)
+    monkeypatch.setattr(source_python.PythonReader, "_environment_read_of", counted)
     reads = "\n".join("OpenAI().responses.create(model=NAME)" for _ in range(300))
     result = scan(
         tmp_path,
@@ -2053,9 +2059,7 @@ def test_an_expression_is_read_once_however_many_names_read_it(
         },
     )
     assert set(models(result)) == {"gpt-4o"}
-    # One reading for each of the 600 calls into the SDK, and one of the default; the
-    # call that reads the environment is not one whose arguments name models.
-    assert len(calls) == 601
+    assert len(calls) == 1
 
 
 def test_text_built_from_itself_is_read_as_far_as_it_is_written_and_the_rest_is_a_gap(
@@ -3351,3 +3355,118 @@ def test_the_variables_of_one_model_are_listed_up_to_the_bound(tmp_path: Path):
         f"MODEL_{index:03d}" for index in range(16)
     ]
     assert model.properties["environment_variables_unlisted"] is True
+
+
+def test_ambiguous_source_encoding_uses_the_collectors_sdk_vocabulary(tmp_path: Path):
+    (tmp_path / "dual.py").write_bytes(
+        "# coding: latin-1\n# coding: utf-8\nimport openai\n# café\n".encode()
+    )
+    result = SourceScanner().scan(tmp_path)
+    assert len(result.surfaces_excluded) == 1
+    assert result.surfaces_excluded[0].startswith("dual.py: source file cannot be decoded")
+
+
+def test_invalid_first_line_still_checks_the_skipped_interpretation(tmp_path: Path):
+    (tmp_path / "alternate.py").write_bytes(b"#\xff\n" + "import ｏｐｅｎａｉ\n".encode())
+    result = SourceScanner().scan(tmp_path)
+    assert len(result.surfaces_excluded) == 1
+    assert result.surfaces_excluded[0].startswith("alternate.py: source file cannot be decoded")
+
+
+def test_import_accounting_includes_unicode_identifier_continuations():
+    from nexus_symbiote.scanners.source_python_tables import DOTTED, IMPORTED
+
+    name = "a\u0300.service"
+    imported = IMPORTED.search(f"import {name}")
+    assert imported is not None and DOTTED.fullmatch(imported[1])
+    assert imported[1] == name
+
+
+def test_global_callee_is_resolved_in_the_module(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "app.py": "from litellm import completion as call\n"
+            "def outer():\n"
+            "    from logging import info as call\n"
+            "    def inner():\n"
+            "        global call\n"
+            "        call(model='sample-model')\n"
+        },
+    )
+    assert set(models(result)) == {"sample-model"}
+    assert not result.surfaces_excluded
+
+
+def test_union_annotation_beyond_candidate_limit_marks_coverage_gap(tmp_path: Path):
+    annotation = " | ".join(["int"] * (source_python.MAX_CANDIDATES + 1))
+    result = scan(
+        tmp_path,
+        {
+            "app.py": f"import openai\ndef query(client: {annotation}):\n"
+            "    client.responses.create(model='sample-model')\n"
+        },
+    )
+    assert f"app.py:1: {CUT}" in result.surfaces_excluded
+
+
+def test_nonlocal_write_reaches_lexical_owner_even_if_bound_later(tmp_path: Path):
+    result = scan(
+        tmp_path,
+        {
+            "app.py": """from litellm import completion
+def outer():
+    def middle():
+        def inner():
+            nonlocal model
+            model = "second-model"
+        inner()
+    model = "first-model"
+    middle()
+    completion(model=model)
+"""
+        },
+    )
+    assert set(models(result)) == {"first-model", "second-model"}
+    assert not result.surfaces_excluded
+
+
+@pytest.mark.parametrize("import_line", ["from settings import model", "from settings import *"])
+def test_imported_value_is_not_assumed_to_be_an_environment_read(tmp_path: Path, import_line: str):
+    result = scan(
+        tmp_path,
+        {
+            "app.py": "import os\nfrom litellm import completion\n"
+            "model = os.getenv('CHOICE')\n"
+            f"{import_line}\ncompletion(model=model or 'sample-model')\n"
+        },
+    )
+    assert "sample-model" in models(result)
+    assert "environment_variables" not in models(result)["sample-model"].properties
+    assert result.surfaces_excluded
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("os.getenv(key='CHOICE', **{'default': 'sample-model'})", "sample-model"),
+        ("config('CHOICE', 'sample-model', cast=str)", "sample-model"),
+        ("config('CHOICE', 'sample-model', cast=transform)", None),
+        ("os.getenv('CHOICE', **config_options)", None),
+    ],
+)
+def test_environment_reader_accounts_for_options(
+    tmp_path: Path, expression: str, expected: str | None
+):
+    result = scan(
+        tmp_path,
+        {
+            "app.py": "import os\nfrom decouple import config\nfrom litellm import completion\n"
+            f"completion(model={expression})\n"
+        },
+    )
+    if expected is None:
+        assert not result.components and result.surfaces_excluded
+    else:
+        assert models(result)[expected].properties["environment_variables"] == ["CHOICE"]
+        assert not result.surfaces_excluded

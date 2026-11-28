@@ -22,28 +22,19 @@ An optional [`agent.yaml` manifest](agent-manifest.md) at the project root names
 
 ## Declarations in application source
 
-The `source` collector reads the model identifiers that a project's Python code gives
-an SDK. It never imports, runs or contacts anything. A file is decoded as CPython
-decodes it and parsed to a syntax tree only when an import statement in it, however it
-is spelled, may name a known SDK; the tree then decides. A module of the project at an
-import root named like an SDK, such as its own `agents` package, is not taken for the
-SDK, and a path only the project has, such as `agents.researcher`, is the project's.
+The `source` collector uses CPython's source encoding rules and parses files whose imports may name
+a known SDK. It never imports or executes project code or contacts the SDK. Project modules take
+precedence when an import resolves to them, including a local `agents` package or `agents.researcher`.
 
-It reads the model arguments of a call (`model=` and its variants, a deployment name,
-`llm=` and CrewAI's `*_llm=`, `repo_id=` or `id=` where they name a model) and the first
-argument of an entry point such as `init_chat_model` or `litellm.completion`. What
-a callee is comes from the names, attributes and calls it is reached through, each
-import in the scope it binds: a client made in the file, a parameter annotated with an
-SDK class, a method handed to `functools.partial`, `asyncio.to_thread` or an executor,
-and `super()` in a subclass of an SDK class. A call into a known SDK is read. A function
-of another library or of Python, such as a logger, and a method of what one returns are
-not. Of an object the reader cannot tell, such as an untyped or `Any` parameter or a
-framework's state, a call is read when it is named as SDK calls are (`create`, `chat`,
-`completions`, `invoke`, `generate_content` and the like), so a metrics label or an
-ORM query is not. A call of a name the reader cannot tell, such as a class chosen at run
-time, is read, but not a `**` spread a wrapper hands a function it was given. A method
-reached through a class, as an ORM's manager is, is the class's: a library's is not
-read, and a project's is a gap.
+The collector reads model keywords (`model=` and variants, deployment names, `llm=` and
+CrewAI's `*_llm=`, and model-specific `repo_id=` or `id=`) and positional model arguments
+of entry points such as `init_chat_model` and `litellm.completion`. It resolves scoped
+imports, SDK-typed parameters, SDK subclasses' `super()` calls and callbacks passed to
+`functools.partial`, `asyncio.to_thread` or an executor. Calls on unknown objects such
+as framework state count when their names suggest an SDK method (e.g. `chat`, `create`,
+`invoke` or `generate_content`). An unknown callee can take a model argument but forwarding
+opaque keywords through a wrapper provides no declaration. A library function, a method of
+its result and a library class's method are skipped. A project class's method is a gap.
 
 A model argument is followed within its file, to each text it can hold: through names
 and `:=`, conditionals (`if`/`else`, `or`, `and`), an environment variable's default

@@ -123,7 +123,7 @@ class Module:
     # Names a scope declares ``global`` or ``nonlocal``, which bind in another scope.
     declared: dict[ast.AST | None, dict[str, str]] = field(default_factory=dict)
     bindings: dict[ast.AST | None, dict[str, list[ast.AST]]] = field(default_factory=dict)
-    definitions: dict[ast.AST | None, dict[str, ast.AST]] = field(default_factory=dict)
+    nonlocal_writes: dict[tuple[ast.AST, str], list[ast.AST]] = field(default_factory=dict)
     parameters: dict[ast.AST, dict[str, ast.arg]] = field(default_factory=dict)
     # Names the file reads other than by spreading them into a call with ``**`` or giving
     # them as a call's options, and whether an import with ``*`` may bind any name.
@@ -256,22 +256,31 @@ def _outside(node: ast.AST) -> list[ast.AST]:
     return []
 
 
-def _members(annotation: ast.expr | None) -> list[ast.expr]:
-    """The classes an annotation names: each of ``Optional[X]``, ``Union[...]`` and ``X | Y``
-    but ``None``; none for a string or no annotation."""
-    if annotation is None or isinstance(annotation, ast.Constant):
-        return []
-    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
-        parts = [*_members(annotation.left), *_members(annotation.right)]
-    elif isinstance(annotation, ast.Subscript) and _named(annotation.value) in (
-        "Optional",
-        "Union",
-    ):
-        inner = annotation.slice
-        parts = [*(inner.elts if isinstance(inner, ast.Tuple) else [inner])]
-    else:
-        return [annotation]
-    return [part for part in parts if not (isinstance(part, ast.Constant) and part.value is None)]
+def _members(annotation: ast.expr | None) -> list[ast.expr] | None:
+    """Flatten union annotations within the same bound as other candidate lists."""
+    pending = [annotation] if annotation is not None else []
+    members: list[ast.expr] = []
+    remaining = MAX_CANDIDATES * 3
+    while pending:
+        remaining -= 1
+        if remaining < 0:
+            return None
+        item = pending.pop()
+        if isinstance(item, ast.BinOp) and isinstance(item.op, ast.BitOr):
+            pending.extend((item.right, item.left))
+        elif isinstance(item, ast.Subscript) and _named(item.value) in ("Optional", "Union"):
+            inner = item.slice
+            if isinstance(inner, ast.Tuple):
+                if len(inner.elts) > MAX_CANDIDATES:
+                    return None
+                pending.extend(reversed(inner.elts))
+            else:
+                pending.append(inner)
+        elif not isinstance(item, ast.Constant):
+            members.append(item)
+            if len(members) > MAX_CANDIDATES:
+                return None
+    return members
 
 
 def _named(node: ast.expr) -> str | None:
@@ -395,6 +404,17 @@ class PythonReader:
         package = PurePosixPath(module.path).parent.parts
         for node in module.nodes:
             self._bind(module, node, package)
+        # An enclosing binding can occur below the nested function in source order.
+        for (inner, name), values in module.nonlocal_writes.items():
+            owner = module.scopes.get(inner)
+            while owner is not None:
+                if isinstance(owner, _FUNCTIONS) and (
+                    name in module.bindings.get(owner, {})
+                    or name in module.parameters.get(owner, {})
+                ):
+                    module.bindings.setdefault(owner, {}).setdefault(name, []).extend(values)
+                    break
+                owner = module.scopes.get(owner)
         return True
 
     def _bind(self, module: Module, node: ast.AST, package: tuple[str, ...]) -> None:
@@ -440,7 +460,7 @@ class PythonReader:
         elif isinstance(node, ast.MatchMapping) and node.rest:
             self._bind_name(module, node.rest, node, module.scopes.get(node))
         elif isinstance(node, _DEFINITIONS):
-            module.definitions.setdefault(module.scopes.get(node), {})[node.name] = node
+            self._bind_name(module, node.name, node, module.scopes.get(node))
         if isinstance(node, _FUNCTIONS):
             arguments = node.args
             positional = [*arguments.posonlyargs, *arguments.args]
@@ -476,10 +496,9 @@ class PythonReader:
         kind = module.declared.get(scope, {}).get(name)
         if kind == "global":
             scope = None
-        elif kind == "nonlocal":
-            scope = module.scopes.get(scope) if scope is not None else None
-            while scope is not None and not isinstance(scope, _FUNCTIONS):
-                scope = module.scopes.get(scope)
+        elif kind == "nonlocal" and scope is not None:
+            module.nonlocal_writes.setdefault((scope, name), []).append(value)
+            return
         module.bindings.setdefault(scope, {}).setdefault(name, []).append(value)
 
     def _bind_target(
@@ -597,9 +616,6 @@ class PythonReader:
             found = [
                 _Value(module, value) for value in module.bindings.get(scope, {}).get(name, ())
             ]
-            definition = module.definitions.get(scope, {}).get(name)
-            if definition is not None:
-                found.append(_Value(module, definition))
             parameter = None if scope is None else module.parameters.get(scope, {}).get(name)
             if parameter is not None:
                 # A caller may pass any value, whatever the default and the body bind.
@@ -620,6 +636,8 @@ class PythonReader:
             while True:
                 self._steps -= 1
                 if scope is None or nearest or not isinstance(scope, ast.ClassDef):
+                    if module.declared.get(scope, {}).get(name) == "global":
+                        scope = None
                     values = self._in_scope(module, scope, name)
                     if values is not None:
                         found = (_scope_key(module, scope, name), values)
@@ -739,9 +757,11 @@ class PythonReader:
             dotted = value.module.imported.get(node)
             return self._dotted_origin(value.module, dotted) if dotted else None
         if isinstance(node, ast.arg):
-            bases = [
-                self.origin(value.module, part, depth + 1) for part in _members(node.annotation)
-            ]
+            members = _members(node.annotation)
+            if members is None:
+                self._cut = True
+                return None
+            bases = [self.origin(value.module, part, depth + 1) for part in members]
             # ``Any``, ``object`` and a type stub's class say nothing of what an SDK makes, and
             # of several classes only SDK classes do.
             if not bases or any(b is None or b in _ANYTHING or b.startswith(_STUBS) for b in bases):
@@ -820,7 +840,15 @@ class PythonReader:
         reads: list[ast.AST] = [node]
         if isinstance(node, ast.Name) and self._steps > 0:
             resolved = self._resolve(module, node.id, node)
-            reads = [] if resolved is None else [bound.node for bound in resolved[1]]
+            if resolved is None or (
+                resolved[0] == _scope_key(module, None, node.id)
+                and (node.id in module.imports or module.starred)
+            ):
+                return None
+            if len(resolved[1]) > MAX_CANDIDATES:
+                self._cut = True
+                return None
+            reads = [bound.node for bound in resolved[1]]
         self._steps -= len(reads)
         if len(reads) > MAX_CANDIDATES or self._steps <= 0:
             # Past the bound an operand is followed as any other, so nothing is dropped.
@@ -852,13 +880,31 @@ class PythonReader:
             if isinstance(name, str) and self.origin(module, node.value) == "os.environ":
                 return name, None
             return None
-        if not isinstance(node, ast.Call) or not node.args:
+        if not isinstance(node, ast.Call):
             return None
-        name = _constant(node.args[0])
-        if not isinstance(name, str) or self.origin(module, node.func) not in ENVIRONMENT_READS:
+        origin = self.origin(module, node.func)
+        if origin not in ENVIRONMENT_READS:
             return None
-        default = node.args[1] if len(node.args) > 1 else _keywords(node).get("default")
-        return name, default
+        fields = (
+            ("option", "default", "cast") if origin == "decouple.config" else ("key", "default")
+        )
+        if len(node.args) > len(fields) or any(isinstance(arg, ast.Starred) for arg in node.args):
+            return None
+        options = dict(zip(fields, node.args, strict=False))
+        for keyword in node.keywords:
+            more = (
+                self._spread(module, keyword.value)
+                if keyword.arg is None
+                else {keyword.arg: keyword.value}
+            )
+            if more is None or options.keys() & more.keys() or not more.keys() <= set(fields):
+                return None
+            options.update(more)
+        cast = options.get("cast")
+        if cast is not None and self.origin(module, cast) != "builtins.str":
+            return None
+        name = _constant(options.get(fields[0]))
+        return (name, options.get("default")) if isinstance(name, str) else None
 
     def _strings(self, module: Module, node: ast.AST, depth: int) -> _Spelling:
         """The texts ``node`` can stand for through names and conditionals, and whether
