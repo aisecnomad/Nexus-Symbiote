@@ -8,6 +8,7 @@ import bisect
 import heapq
 import re
 import string
+import unicodedata
 from collections.abc import Iterable, Iterator, Mapping
 from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
@@ -140,6 +141,24 @@ _PROVIDER_SK_BODY = re.compile(
 )
 _DECIMAL_DIGIT = re.compile(r"\d")
 _JWT_PAYLOAD_START = re.compile(r"\.[\w-]{8}")
+
+
+def ignored_credential_char(char: str) -> bool:
+    """Format characters, variation selectors, and Unicode or ASCII whitespace."""
+    if char.isspace() or unicodedata.category(char) in {"Cf", "Zs"}:
+        return True
+    code = ord(char)
+    return 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF
+
+
+def normalize_credential(value: str) -> str:
+    """NFKC, then drop Cf, variation selectors and whitespace.
+
+    Applied to a stored credential and to the text it is matched against, so a clean
+    password scrubs a marked sibling and a marked password scrubs the clean spelling.
+    """
+    text = unicodedata.normalize("NFKC", value)
+    return "".join(char for char in text if not ignored_credential_char(char))
 
 
 def holds_token_shape(text: str, *, require_sk_boundary: bool = False) -> bool:

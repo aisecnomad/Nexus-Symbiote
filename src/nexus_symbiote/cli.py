@@ -202,6 +202,44 @@ def _warn_unapplied_project_policy(path: Path) -> dict[str, str]:
     return {"file": path.name, "reason": "not-accepted"}
 
 
+def _bind_project_credential_policy(
+    root: Path | None,
+    policy: Policy,
+    weakened: list[str],
+    *,
+    ignore_project: bool,
+    allow_weakening: bool,
+    operator: Policy | None,
+) -> str | None:
+    """Apply reviewed suppressions for this command and its local recollection."""
+    from nexus_symbiote.credential_allowlist import (
+        bind_credential_allowlist,
+        load_credential_allowlist,
+    )
+
+    accepted = None
+    error = None
+    if root is not None and not ignore_project:
+        proposed, error = load_credential_allowlist(root, exclude_paths=policy.scan.exclude_paths)
+        if proposed.allow:
+            if operator is not None:
+                echo_line(
+                    "WARNING: operator policy withholds checkout credential suppressions.", err=True
+                )
+                _LAST_CLAMPED_SETTINGS.set((*_LAST_CLAMPED_SETTINGS.get(), "credential allowlist"))
+            elif allow_weakening:
+                accepted = proposed
+                weakened.append("project credential allowlist")
+                echo_line("WARNING: applying reviewed checkout credential suppressions.", err=True)
+            else:
+                echo_line(
+                    "WARNING: checkout credential suppressions require --accept-project-policy.",
+                    err=True,
+                )
+    click.get_current_context().with_resource(bind_credential_allowlist(accepted))
+    return error
+
+
 def _policy_with_source(
     root: Path,
     *,
@@ -302,7 +340,7 @@ def _inventory_policy(
 
     _LAST_CLAMPED_SETTINGS.set(())
     if project is not None:
-        return _policy_with_source(
+        result = _policy_with_source(
             project,
             ignore_project=ignore_project,
             warn=warn,
@@ -311,6 +349,17 @@ def _inventory_policy(
             operator_digest=operator_digest,
             operator_signers=operator_signers,
         )
+        policy, _, weakened, _ = result
+        if error := _bind_project_credential_policy(
+            project,
+            policy,
+            weakened,
+            ignore_project=ignore_project,
+            allow_weakening=allow_weakening,
+            operator=operator,
+        ):
+            raise click.ClickException(error)
+        return result
     if operator is not None and operator_digest is not None:
         return (
             operator,
@@ -1190,6 +1239,14 @@ def scan(
         operator_digest=op_digest,
         operator_signers=op_signers,
     )
+    allowlist_error = _bind_project_credential_policy(
+        root,
+        policy,
+        policy_weakened,
+        ignore_project=no_project_policy,
+        allow_weakening=accept_project_policy,
+        operator=op_policy,
+    )
     signature_policies = _signer_policies(signature_policy, root)
     output_format = output_format or policy.output.default_format
     all_scanners = _get_scanners()
@@ -1226,6 +1283,8 @@ def scan(
     accepted_default_exclusions: set[str] = set()
     accepted_default_names: set[str] = set()
     scan_failures: list[str] = []
+    if allowlist_error:
+        scan_failures.append(allowlist_error)
     failures_by: dict[str, list[str]] = {}
     excluded_by: dict[str, list[str]] = {}
     completed: list[str] = []

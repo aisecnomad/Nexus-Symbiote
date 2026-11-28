@@ -1069,9 +1069,6 @@ def test_password_and_token_shapes_stay_literals(name, value):
         ("not-needed", RANDOM),
         ("PasteTokenFromSettings", RANDOM),
         ("TODO-JIRA-4521", RANDOM),
-        ("sk-your-openai-api-key-here", "sk-" + RANDOM),
-        ("ghp_" + "x" * 36, VENDOR_TOKEN),
-        ("AKIAIOSFODNN7EXAMPLE", VENDOR_TOKEN),
         # Word phrases and short settings under a name that is not a password's.
         ("oauth2-client-secret", "oauth2-client-secret-98765"),
         ("hmac-sha256-secret", "hmac-sha256-" + RANDOM),
@@ -1090,6 +1087,22 @@ def test_password_and_token_shapes_stay_literals(name, value):
 def test_each_value_rule_has_a_credential_twin_under_the_same_name(benign, credential):
     assert _positions({"command": "npx", "env": {"API_TOKEN": benign}}) == []
     assert _positions({"command": "npx", "env": {"API_TOKEN": credential}})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "sk-your-openai-api-key-here",
+        "ghp_" + "x" * 36,
+        "AKIAIOSFODNN7EXAMPLE",
+    ],
+)
+def test_a_vendor_shape_that_looks_like_an_example_is_still_a_credential(value):
+    assert _positions({"command": "npx", "env": {"API_TOKEN": value}}) == [
+        ("env API_TOKEN", "a vendor token shape")
+    ]
+    rendered = str(_positions({"command": "npx", "env": {"API_TOKEN": value}}))
+    assert value not in rendered
 
 
 @pytest.mark.parametrize(

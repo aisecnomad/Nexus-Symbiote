@@ -40,16 +40,37 @@ def test_a_vendor_shape_in_source_is_a_fingerprint_finding(tmp_path: Path) -> No
     assert _TOKEN not in (risk.recommendation or "")
 
 
-def test_a_placeholder_shape_and_a_config_file_raise_nothing(tmp_path: Path) -> None:
-    (tmp_path / "docs.md").write_text(f"example key {_EXAMPLE}\n", encoding="utf-8")
+def test_an_example_looking_vendor_shape_is_still_a_finding(tmp_path: Path) -> None:
+    (tmp_path / "docs.md").write_text(f'key = "{_EXAMPLE}"\n', encoding="utf-8")
+    docs = PromptComponent(bom_ref="prompt:docs", name="docs", source_path="docs.md")
+    added = apply_literal_credential_findings(AIBOM(components=[docs]), tmp_path)
+    assert added == 1
+    assert _EXAMPLE not in docs.risks[0].detail
+    assert "value unbound" in docs.risks[0].detail
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "set KEY=<YOUR_API_KEY>\n",
+        "the docs say sk-...\n",
+        "padding xxxx is not a token\n",
+        "sk-short\n",
+    ],
+)
+def test_a_pure_placeholder_that_is_not_a_token_stays_quiet(tmp_path: Path, text: str) -> None:
+    (tmp_path / "docs.md").write_text(text, encoding="utf-8")
+    docs = PromptComponent(bom_ref="prompt:docs", name="docs", source_path="docs.md")
+    assert apply_literal_credential_findings(AIBOM(components=[docs]), tmp_path) == 0
+
+
+def test_a_config_file_and_env_are_not_read_here(tmp_path: Path) -> None:
     (tmp_path / "mcp.json").write_text('{"env": {"TOKEN": "' + _TOKEN + '"}}\n', encoding="utf-8")
     (tmp_path / ".env").write_text(f"OPENAI_API_KEY={_TOKEN}\n", encoding="utf-8")
-    docs = PromptComponent(bom_ref="prompt:docs", name="docs", source_path="docs.md")
     config = _server("mcp.json", "mcp:cfg")
     env = _server(".env", "mcp:env")
-    added = apply_literal_credential_findings(AIBOM(components=[docs, config, env]), tmp_path)
+    added = apply_literal_credential_findings(AIBOM(components=[config, env]), tmp_path)
     assert added == 0
-    assert docs.risks == []
     assert config.risks == []
     assert env.risks == []
 

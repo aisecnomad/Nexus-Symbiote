@@ -24,12 +24,9 @@ from nexus_symbiote.core.aibom import AIBOM
 from nexus_symbiote.core.collection import is_imported
 from nexus_symbiote.core.enums import RiskSeverity
 from nexus_symbiote.core.models import RiskAssessment
+from nexus_symbiote.credential_allowlist import credential_suppressed
 from nexus_symbiote.scanners.credential_files import credential_gap, credential_shaped
-from nexus_symbiote.scanners.mcp_credentials import (
-    credential_name,
-    normalize_credential,
-    placeholder,
-)
+from nexus_symbiote.scanners.mcp_credentials import credential_name, normalize_credential
 from nexus_symbiote.scanners.source_binding import BindingError, value_binding
 from nexus_symbiote.utils.confined import ConfinedCollection
 from nexus_symbiote.utils.secrets import TOKEN_SHAPE, holds_token_shape
@@ -403,7 +400,7 @@ def apply_literal_credential_findings(
     failures: list[str] | None = None,
     exclusions: list[str] | None = None,
 ) -> int:
-    """Append one ``credential_exposure`` per non-placeholder vendor token shape.
+    """Append one ``credential_exposure`` per vendor token shape.
 
     ``root`` is the scan root. Without a directory, nothing is read. Findings are
     added to one component that already names the file, the lowest ``bom_ref``, so
@@ -452,7 +449,7 @@ def apply_literal_credential_findings(
                 seen: set[tuple[int, str]] = set()
                 for offset, literal in _literals(normalized):
                     location = (first_line + bisect_right(boundaries, offset), literal)
-                    if location in seen or placeholder(literal):
+                    if location in seen or credential_suppressed(literal, rel_path=rel_path):
                         continue
                     seen.add(location)
                     found.append(location)
